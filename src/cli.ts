@@ -517,7 +517,7 @@ Options:
   -h, --help            this help
 
 Exit codes: 0 = produced ideas (synthesis printed) · 1 = no usable output (every
-voice failed) · 3 = usage error.`;
+voice failed) · 3 = usage or an unexpected operational error.`;
 
 // One brainstorm rendered for the terminal: the three rounds, each line passed
 // through clean() (reviewer/voice text is untrusted — a crafted reply could carry
@@ -570,7 +570,7 @@ function printBrainstorm(r: BrainstormResult): void {
   for (const ri of s.ranked) {
     out.push('');
     out.push(
-      `  ${ri.rank}. ${clean(ri.title)}${ri.contributors.length ? `  [${ri.contributors.join(', ')}]` : ''}`
+      `  ${ri.rank}. ${clean(ri.title)}${ri.contributors.length ? `  [${ri.contributors.map(clean).join(', ')}]` : ''}`
     );
     if (ri.why) out.push(`     why:  ${clean(ri.why).slice(0, 300)}`);
     if (ri.risks) out.push(`     risk: ${clean(ri.risks).slice(0, 240)}`);
@@ -656,6 +656,18 @@ async function brainstormCommand(args: string[]): Promise<number> {
     synthesizer = values.synthesizer;
   }
 
+  // --synthesizer must be IN the effective roster: pickSynthesizer only honors an
+  // in-roster request and SILENTLY falls back to another voice otherwise, so an
+  // out-of-roster id would be dropped without a word. Fail closed, exactly like
+  // --voices does for an unknown id.
+  const roster = voices ?? VOICE_IDS;
+  if (synthesizer && !roster.includes(synthesizer)) {
+    console.error(
+      `ensemble-ai brainstorm: --synthesizer "${synthesizer}" is not in the voices roster (${roster.join(', ')})`
+    );
+    return 3;
+  }
+
   let timeoutMs: number | undefined;
   if (typeof values.timeout === 'string') {
     const secs = Number(values.timeout);
@@ -664,6 +676,13 @@ async function brainstormCommand(args: string[]): Promise<number> {
       return 3;
     }
     timeoutMs = Math.round(secs * 1000);
+    if (timeoutMs < 1) {
+      // A sub-millisecond value rounds to 0, and `timeoutMs ?? DEFAULT` does NOT restore
+      // the default for a present-but-falsy 0 — the watchdog would fire at 0ms and kill
+      // every voice instantly. Reject it as out of range.
+      console.error('ensemble-ai brainstorm: --timeout is too small (rounds to 0ms)');
+      return 3;
+    }
   }
 
   let result: BrainstormResult;
@@ -679,8 +698,11 @@ async function brainstormCommand(args: string[]): Promise<number> {
         typeof values['voices-file'] === 'string' ? values['voices-file'] : undefined,
     });
   } catch (e) {
+    // An unexpected orchestration failure is NOT "every voice failed" (exit 1, the
+    // graceful all-voices-empty outcome below) — it is an operational error. Exit 3,
+    // matching review mode's runReviewMode catch, so the two modes don't drift.
     console.error(`ensemble-ai brainstorm: ${(e as Error).message}`);
-    return 1;
+    return 3;
   }
 
   if (values.json) console.log(JSON.stringify(result, null, 2));

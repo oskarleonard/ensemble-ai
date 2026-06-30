@@ -132,7 +132,9 @@ describe('mode dispatch + usage', () => {
     expect(mockRun).not.toHaveBeenCalled();
   });
 
-  it('a planned-but-unimplemented mode (brainstorm) → exit 3', async () => {
+  it('brainstorm dispatches to its own command, not the review engine', async () => {
+    // brainstorm is implemented now: `brainstorm` with no topic hits its OWN usage
+    // error (exit 3) and the review engine is never invoked.
     expect(await main(['brainstorm'])).toBe(3);
     expect(mockRun).not.toHaveBeenCalled();
   });
@@ -298,6 +300,31 @@ describe('brainstorm dispatch + arg parsing', () => {
     expect(mockBrainstorm).toHaveBeenCalledWith(
       expect.objectContaining({ timeoutMs: 30_000, voices: ['codex', 'grok'] })
     );
+  });
+
+  it('--timeout that rounds to 0ms → usage error (exit 3), nothing fired', async () => {
+    expect(await main(['brainstorm', 'x', '--timeout', '0.0001'])).toBe(3);
+    expect(mockBrainstorm).not.toHaveBeenCalled();
+  });
+
+  it('--synthesizer outside the --voices roster → usage error (exit 3), fail closed', async () => {
+    expect(
+      await main(['brainstorm', 'x', '--voices', 'codex,grok', '--synthesizer', 'claude'])
+    ).toBe(3);
+    expect(mockBrainstorm).not.toHaveBeenCalled();
+  });
+
+  it('--synthesizer inside the roster is threaded to the engine', async () => {
+    mockBrainstorm.mockResolvedValue(brainstormResult());
+    await main(['brainstorm', 'x', '--voices', 'codex,grok', '--synthesizer', 'grok']);
+    expect(mockBrainstorm).toHaveBeenCalledWith(
+      expect.objectContaining({ synthesizer: 'grok', voices: ['codex', 'grok'] })
+    );
+  });
+
+  it('an unexpected orchestration throw → exit 3 (operational error, not the all-empty 1)', async () => {
+    mockBrainstorm.mockRejectedValue(new Error('boom'));
+    expect(await main(['brainstorm', 'x'])).toBe(3);
   });
 
   it('every voice failed (no ideas) → exit 1', async () => {

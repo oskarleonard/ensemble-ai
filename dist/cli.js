@@ -2295,7 +2295,7 @@ Options:
   -h, --help            this help
 
 Exit codes: 0 = produced ideas (synthesis printed) \xB7 1 = no usable output (every
-voice failed) \xB7 3 = usage error.`;
+voice failed) \xB7 3 = usage or an unexpected operational error.`;
 function printBrainstorm(r) {
   const out = [];
   out.push("");
@@ -2344,7 +2344,7 @@ function printBrainstorm(r) {
   for (const ri of s.ranked) {
     out.push("");
     out.push(
-      `  ${ri.rank}. ${clean(ri.title)}${ri.contributors.length ? `  [${ri.contributors.join(", ")}]` : ""}`
+      `  ${ri.rank}. ${clean(ri.title)}${ri.contributors.length ? `  [${ri.contributors.map(clean).join(", ")}]` : ""}`
     );
     if (ri.why) out.push(`     why:  ${clean(ri.why).slice(0, 300)}`);
     if (ri.risks) out.push(`     risk: ${clean(ri.risks).slice(0, 240)}`);
@@ -2421,6 +2421,13 @@ async function brainstormCommand(args) {
     }
     synthesizer = values.synthesizer;
   }
+  const roster = voices ?? VOICE_IDS;
+  if (synthesizer && !roster.includes(synthesizer)) {
+    console.error(
+      `ensemble-ai brainstorm: --synthesizer "${synthesizer}" is not in the voices roster (${roster.join(", ")})`
+    );
+    return 3;
+  }
   let timeoutMs;
   if (typeof values.timeout === "string") {
     const secs = Number(values.timeout);
@@ -2429,6 +2436,10 @@ async function brainstormCommand(args) {
       return 3;
     }
     timeoutMs = Math.round(secs * 1e3);
+    if (timeoutMs < 1) {
+      console.error("ensemble-ai brainstorm: --timeout is too small (rounds to 0ms)");
+      return 3;
+    }
   }
   let result;
   try {
@@ -2443,7 +2454,7 @@ async function brainstormCommand(args) {
     });
   } catch (e) {
     console.error(`ensemble-ai brainstorm: ${e.message}`);
-    return 1;
+    return 3;
   }
   if (values.json) console.log(JSON.stringify(result, null, 2));
   else printBrainstorm(result);
