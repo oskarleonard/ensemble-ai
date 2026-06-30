@@ -24,7 +24,7 @@ var CONFIDENCES = ["high", "medium", "low"];
 
 // src/modes/index.ts
 var MODES = ["review", "brainstorm", "security"];
-var IMPLEMENTED_MODES = ["review"];
+var IMPLEMENTED_MODES = ["review", "security"];
 function isMode(v) {
   return MODES.includes(v);
 }
@@ -303,11 +303,102 @@ function assembleCodePacket(input) {
   };
 }
 
+// src/modes/review/profile.ts
+var SECURITY_OBJECTIVE = "Adversarial cross-vendor SECURITY audit of a code diff \u2014 hunt for exploitable vulnerabilities a same-vendor author might miss: injection, XSS, broken authn/authz, secret leakage, supply-chain risk, unsafe deserialization/eval, SSRF, path traversal, and crypto misuse.";
+var SECURITY_CLASSES = [
+  {
+    id: "injection",
+    label: "Injection",
+    keywords: ["sql", "sqli", "injection", "command inject", "shell inject", "os command", "unsanitiz", "parameteriz", "prepared statement"]
+  },
+  {
+    id: "xss",
+    label: "XSS",
+    keywords: ["xss", "cross-site script", "innerhtml", "dangerouslysetinnerhtml", "unescaped", "html escap"]
+  },
+  {
+    id: "authz",
+    label: "AuthN/AuthZ",
+    keywords: ["authoriz", "authentic", "permission", "access control", "privilege", "idor", "rbac", "session fixation", "jwt", "auth bypass", "unauthenticated"]
+  },
+  {
+    id: "secret-leak",
+    label: "Secret leak",
+    keywords: ["secret", "credential", "api key", "apikey", "hardcoded password", "hardcoded", "token leak", "private key", "leaked"]
+  },
+  {
+    id: "supply-chain",
+    label: "Supply chain",
+    keywords: ["supply chain", "dependency", "transitive", "malicious package", "typosquat", "postinstall", "lockfile", "unpinned"]
+  },
+  {
+    id: "deserialization",
+    label: "Unsafe deserialization/eval",
+    keywords: ["deserializ", "eval(", "new function", "pickle", "yaml.load", "unserialize", "unmarshal", "vm.runin", "arbitrary code", "rce", "code execution"]
+  },
+  {
+    id: "ssrf",
+    label: "SSRF",
+    keywords: ["ssrf", "server-side request", "request forgery", "open redirect", "url allowlist", "url validation"]
+  },
+  {
+    id: "path-traversal",
+    label: "Path traversal",
+    keywords: ["path traversal", "directory traversal", "zip slip", "arbitrary file read", "arbitrary file write", "../"]
+  },
+  {
+    id: "crypto",
+    label: "Crypto misuse",
+    keywords: ["crypto", "cipher", "md5", "sha1", "insecure random", "weak hash", "weak algorithm", "ecb mode", "hardcoded iv", "static iv", "nonce reuse", "certificate valid"]
+  },
+  { id: "other", label: "Other", keywords: [] }
+];
+var KNOWN_CLASS_IDS = new Set(SECURITY_CLASSES.map((c) => c.id));
+var LEADING_TAG = /^\s*\[([a-z-]+)\]\s*/i;
+function classifySecurityFinding(f) {
+  const tag = f.title.match(LEADING_TAG)?.[1]?.toLowerCase();
+  if (tag && KNOWN_CLASS_IDS.has(tag)) return tag;
+  const hay = `${f.title} ${f.body}`.toLowerCase();
+  for (const c of SECURITY_CLASSES) {
+    if (c.keywords.some((k) => hay.includes(k))) return c.id;
+  }
+  return "other";
+}
+function stripSecurityTag(title) {
+  const tag = title.match(LEADING_TAG)?.[1]?.toLowerCase();
+  return tag && KNOWN_CLASS_IDS.has(tag) ? title.replace(LEADING_TAG, "") : title;
+}
+
 // src/core/prompt.ts
-function renderReviewPrompt(packet) {
+var CODE_ASK = [
+  "## Your task",
+  "Find correctness bugs, security issues, broken conventions, and risky",
+  "choices IN THE DIFF. Be concrete and cite file + line. Do not nitpick style",
+  "the conventions already allow. Prefer a few high-signal findings over many",
+  "weak ones \u2014 false positives waste the arbiter\u2019s time."
+].join("\n");
+function securityAsk() {
+  const classes = SECURITY_CLASSES.filter((c) => c.id !== "other").map((c) => `  - [${c.id}] ${c.label}`).join("\n");
+  return [
+    "## Your task \u2014 SECURITY AUDIT",
+    "You are auditing this diff ADVERSARIALLY for exploitable security",
+    "vulnerabilities a same-vendor author might miss. Think like an attacker:",
+    "how could untrusted input reach a dangerous sink? Focus on these classes:",
+    classes,
+    "",
+    'For EACH finding, lead the "title" with the matching class tag in brackets,',
+    'e.g. "[injection] user id concatenated into SQL". Cite the exact file + line',
+    "and name the attack: the untrusted source, the sink, and the exploit. Prefer a",
+    "few high-signal, exploitable findings over many theoretical ones \u2014 but do NOT",
+    "stay silent on a real vulnerability to keep the list short. Pure code-quality",
+    "nits that are not security-relevant belong in a normal review, not here."
+  ].join("\n");
+}
+function renderReviewPrompt(packet, profile = "code") {
   const subject = packet.pr > 0 ? `Repository: ${packet.repo} \xB7 Pull request #${packet.pr}` : packet.subject ? `Under review: ${packet.subject}` : `Repository: ${packet.repo || "(a working tree)"} \xB7 reviewing the diff below`;
+  const role = profile === "security" ? "You are an adversarial SECURITY auditor from a DIFFERENT vendor than the author." : "You are an adversarial code reviewer from a DIFFERENT vendor than the author.";
   const head = [
-    "You are an adversarial code reviewer from a DIFFERENT vendor than the author.",
+    role,
     "You have NO prior memory: your own memory, the repository, and every earlier",
     "conversation are unknown to you EXCEPT what is embedded below. Review only",
     "what is here; do not assume facts not present.",
@@ -324,11 +415,7 @@ ${s.body}` : `${header}
 (not available)`;
   }).join("\n\n");
   const ask = [
-    "## Your task",
-    "Find correctness bugs, security issues, broken conventions, and risky",
-    "choices IN THE DIFF. Be concrete and cite file + line. Do not nitpick style",
-    "the conventions already allow. Prefer a few high-signal findings over many",
-    "weak ones \u2014 false positives waste the arbiter\u2019s time.",
+    profile === "security" ? securityAsk() : CODE_ASK,
     "",
     FINDINGS_INSTRUCTIONS
   ].join("\n");
@@ -887,6 +974,96 @@ function acquireDiff(opts) {
   };
 }
 
+// src/modes/review/dep-surface.ts
+var MANIFEST_PATTERNS = [
+  { label: "npm", re: /(^|\/)package\.json$/ },
+  { label: "npm-lock", lock: true, re: /(^|\/)(package-lock\.json|npm-shrinkwrap\.json)$/ },
+  { label: "yarn-lock", lock: true, re: /(^|\/)yarn\.lock$/ },
+  { label: "pnpm-lock", lock: true, re: /(^|\/)pnpm-lock\.yaml$/ },
+  { label: "bun-lock", lock: true, re: /(^|\/)bun\.lockb$/ },
+  { label: "python-requirements", re: /(^|\/)requirements[^/]*\.txt$/ },
+  { label: "python-pyproject", re: /(^|\/)pyproject\.toml$/ },
+  { label: "python-pipfile", re: /(^|\/)Pipfile$/ },
+  { label: "python-pipfile-lock", lock: true, re: /(^|\/)Pipfile\.lock$/ },
+  { label: "go-mod", re: /(^|\/)go\.mod$/ },
+  { label: "go-sum", lock: true, re: /(^|\/)go\.sum$/ },
+  { label: "rust-cargo", re: /(^|\/)Cargo\.toml$/ },
+  { label: "rust-cargo-lock", lock: true, re: /(^|\/)Cargo\.lock$/ },
+  { label: "ruby-gemfile", re: /(^|\/)Gemfile$/ },
+  { label: "ruby-gemfile-lock", lock: true, re: /(^|\/)Gemfile\.lock$/ },
+  { label: "php-composer", re: /(^|\/)composer\.json$/ },
+  { label: "php-composer-lock", lock: true, re: /(^|\/)composer\.lock$/ },
+  { label: "gradle", re: /(^|\/)build\.gradle(\.kts)?$/ },
+  { label: "maven", re: /(^|\/)pom\.xml$/ }
+];
+var RISKY_PATTERNS = [
+  { cls: "deserialization", label: "eval()", re: /\beval\s*\(/ },
+  { cls: "deserialization", label: "new Function()", re: /\bnew\s+Function\s*\(/ },
+  { cls: "deserialization", label: "vm module", re: /\bvm\.runIn|require\(\s*['"]vm['"]\s*\)|from\s+['"]vm['"]/ },
+  { cls: "deserialization", label: "pickle.load (py)", re: /\bpickle\.loads?\s*\(/ },
+  { cls: "deserialization", label: "yaml.load (py, unsafe)", re: /\byaml\.load\s*\(/ },
+  { cls: "deserialization", label: "unserialize (php)", re: /\bunserialize\s*\(/ },
+  { cls: "injection", label: "child_process", re: /\bchild_process\b|\bexecSync?\s*\(|\bspawnSync?\s*\(|\bexecFileSync?\s*\(/ },
+  { cls: "injection", label: "os.system / subprocess (py)", re: /\bos\.system\s*\(|\bsubprocess\.(Popen|call|run|check_output)\s*\(/ },
+  { cls: "xss", label: "dangerouslySetInnerHTML", re: /dangerouslySetInnerHTML/ },
+  { cls: "xss", label: "innerHTML assignment", re: /\.innerHTML\s*=/ },
+  { cls: "xss", label: "document.write", re: /document\.write\s*\(/ }
+];
+function addedContentLines(section2) {
+  const out = [];
+  let newLine = 0;
+  for (const l of section2.split("\n")) {
+    const hunk = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      newLine = Number(hunk[1]);
+      continue;
+    }
+    if (l.startsWith("+++")) continue;
+    if (l.startsWith("+")) {
+      out.push({ line: newLine, text: l.slice(1) });
+      newLine++;
+    } else if (l.startsWith("-") && !l.startsWith("---")) {
+    } else if (l.startsWith(" ")) {
+      newLine++;
+    }
+  }
+  return out;
+}
+function scanDependencySurface(files) {
+  const manifests = [];
+  const riskyImports = [];
+  for (const f of files) {
+    if (f.isBinary) continue;
+    const added = addedContentLines(f.raw);
+    const m = MANIFEST_PATTERNS.find((p) => p.re.test(f.path));
+    if (m) {
+      manifests.push({
+        added: added.length,
+        isLockfile: Boolean(m.lock),
+        label: m.label,
+        path: f.path,
+        samples: m.lock ? [] : added.map((a) => a.text.trim()).filter(Boolean).slice(0, 5)
+      });
+    }
+    if (f.kind !== "source") continue;
+    const seen = /* @__PURE__ */ new Set();
+    for (const a of added) {
+      for (const r of RISKY_PATTERNS) {
+        if (!seen.has(r.label) && r.re.test(a.text)) {
+          seen.add(r.label);
+          riskyImports.push({
+            cls: r.cls,
+            label: r.label,
+            line: a.line || void 0,
+            path: f.path
+          });
+        }
+      }
+    }
+  }
+  return { manifests, riskyImports };
+}
+
 // src/modes/review/receipt.ts
 import fs6 from "fs";
 import os5 from "os";
@@ -1103,6 +1280,7 @@ async function runReviewMode(opts) {
   const log = opts.onProgress ?? (() => {
   });
   const ceilingBytes = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
+  const profile = opts.profile ?? "code";
   const reviewers = opts.reviewers && opts.reviewers.length > 0 ? opts.reviewers : [...REVIEWER_IDS];
   const sourceLabel = opts.diffText !== void 0 ? opts.diffMode ?? "raw" : opts.staged ? "staged" : opts.workingTree ? "working-tree" : "commit";
   log(`Acquiring diff (${sourceLabel} mode)\u2026`);
@@ -1118,6 +1296,7 @@ async function runReviewMode(opts) {
   log(
     `Diff: ${acquired.coverage.totalFiles} file(s), ${acquired.coverage.includedFiles} covered, ${acquired.coverage.omittedFiles} omitted \xB7 digest ${acquired.canonicalDigest.slice(0, 19)}\u2026`
   );
+  const depSurface = profile === "security" ? scanDependencySurface(acquired.files) : void 0;
   const secretScan = scanDiffForSecrets(acquired.files, {
     allowSensitive: opts.allowSensitive
   });
@@ -1132,6 +1311,7 @@ async function runReviewMode(opts) {
       acquired,
       blocked: true,
       blockedReason: reason,
+      depSurface,
       reviews: [],
       secretScan
     };
@@ -1140,11 +1320,11 @@ async function runReviewMode(opts) {
     agentsMd: opts.agentsMd,
     authorSummary: opts.authorSummary,
     diff: acquired.diff,
-    objective: opts.objective ?? DEFAULT_OBJECTIVE,
+    objective: opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE),
     pr: 0,
     repo: acquired.repoId ?? ""
   });
-  const prompt = renderReviewPrompt(packet);
+  const prompt = renderReviewPrompt(packet, profile);
   if (!packet.complete) {
     log("Packet incomplete (no usable diff) \u2014 persisting an empty review.");
   }
@@ -1191,10 +1371,10 @@ async function runReviewMode(opts) {
     const store = opts.receiptStore ?? defaultReceiptStore();
     const file = writeReceipt(store, built.receipt);
     log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    return { acquired, blocked: false, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, depSurface, receiptError: built.error, reviews, secretScan };
 }
 
 // src/modes/review/source.ts
@@ -1244,10 +1424,12 @@ Usage:
 
 Modes:
   review       Cross-vendor review of a code diff (implemented).
+  security     Cross-vendor SECURITY audit of a code diff (implemented) \u2014
+               the review engine with a security-auditor lens + a local
+               dependency-surface flag; findings tagged by security class.
   brainstorm   (planned)
-  security     (planned)
 
-Run \`ensemble-ai review --help\` for review options.`;
+Run \`ensemble-ai review --help\` or \`ensemble-ai security --help\` for options.`;
 var REVIEW_USAGE = `ensemble-ai review \u2014 review a diff with ALL configured AI reviewers.
 
 Runs every reviewer in the registry (codex + grok) by default and prints their
@@ -1277,6 +1459,25 @@ Options:
 Exit codes: 0 = completed, no HIGH (or gate disabled) \xB7 1 = a reviewer failed
 (crash/timeout/no-parse) \xB7 2 = blocked by the secret-scan \xB7 3 = usage / no diff \xB7
 4 = completed WITH a HIGH finding (the gate; disable with --no-fail-on-high).`;
+var SECURITY_USAGE = `ensemble-ai security \u2014 adversarial SECURITY audit of a diff with ALL reviewers.
+
+A thin PROFILE over \`review\`: the SAME engine + diff sources + receipt + HIGH gate,
+but the reviewers run under a security-auditor lens (injection \xB7 XSS \xB7 authn/authz \xB7
+secret-leak \xB7 supply-chain \xB7 unsafe deserialization/eval \xB7 SSRF \xB7 path-traversal \xB7
+crypto misuse) and findings are tagged by security class in the grouped output. It
+also runs a LOCAL dependency-surface flag (manifest changes + risky imports in the
+diff \u2014 NO network / no vuln DB) and reuses the engine's secret-scan.
+
+Diff source (give at most ONE; default = current branch):
+  (default)            <base>...HEAD \u2014 the current branch vs its merge-base with
+                       the default branch (origin/main; resolved like \`gh pr create\`)
+  --pr <N>             the diff of GitHub PR #N (via \`gh pr diff <N>\`)
+  --staged             staged changes (\`git diff --cached\`)
+  --working-tree       uncommitted tracked changes vs HEAD (\`git diff HEAD\`)
+  --diff-file <path>   a raw unified diff read from a file
+  (stdin)              a piped diff, e.g. \`git diff main...HEAD | ensemble-ai security\`
+
+Options + exit codes are identical to \`ensemble-ai review\` (run \`review --help\`).`;
 function genRunId() {
   const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
   return `${stamp}-${crypto2.randomBytes(4).toString("hex")}`;
@@ -1385,7 +1586,15 @@ function evidenceRef(file, line) {
   const f = clean(file);
   return line ? `${f}:${line}` : f;
 }
-function reviewerBlock(r) {
+function findingLine(f, profile) {
+  const ref = evidenceRef(f.evidence.file, f.evidence.line);
+  if (profile === "security") {
+    const cls = classifySecurityFinding(f);
+    return `       [${cls}] ${ref}  ${clean(stripSecurityTag(f.title))}`;
+  }
+  return `       ${ref}  ${clean(f.title)}`;
+}
+function reviewerBlock(r, profile) {
   const id = r.reviewerId ?? r.reviewer.vendor;
   const out = [];
   out.push("");
@@ -1404,17 +1613,31 @@ function reviewerBlock(r) {
     const group = r.findings.filter((f) => f.severity === sev);
     if (group.length === 0) continue;
     out.push(`     ${SEVERITY_LABEL[sev]}`);
-    for (const f of group) {
-      out.push(`       ${evidenceRef(f.evidence.file, f.evidence.line)}  ${clean(f.title)}`);
-    }
+    for (const f of group) out.push(findingLine(f, profile));
   }
   return out;
 }
-function printSummary(result) {
+function depSurfaceBlock(d) {
+  const out = ["  dependency surface:"];
+  if (d.manifests.length === 0 && d.riskyImports.length === 0) {
+    out.push("     none \u2014 no manifest changes or risky imports in the diff");
+    return out;
+  }
+  for (const m of d.manifests) {
+    const kind = m.isLockfile ? "lockfile" : "manifest";
+    out.push(`     ${kind} ${m.label}: ${clean(m.path)} (+${m.added} line(s))`);
+    for (const s of m.samples) out.push(`         + ${clean(s).slice(0, 100)}`);
+  }
+  for (const r of d.riskyImports) {
+    out.push(`     risky [${r.cls}] ${r.label} \u2014 ${evidenceRef(r.path, r.line)}`);
+  }
+  return out;
+}
+function printSummary(result, profile) {
   const a = result.acquired;
   const out = [];
   out.push("");
-  out.push(`ensemble-ai review \u2014 ${a.mode} mode`);
+  out.push(`ensemble-ai ${profile === "security" ? "security" : "review"} \u2014 ${a.mode} mode`);
   if (a.repoId) out.push(`  repo:    ${a.repoId}`);
   if (a.baseRef) out.push(`  base:    ${a.baseRef} (${a.baseSha ?? "?"})`);
   out.push(`  head:    ${a.headSha}`);
@@ -1431,12 +1654,13 @@ function printSummary(result) {
       `  secrets: ${ss.sensitivePaths.length} sensitive path(s), ${ss.inlineSecrets.length} inline${ss.overridden ? " (overridden)" : ""}`
     );
   }
+  if (result.depSurface) out.push(...depSurfaceBlock(result.depSurface));
   if (result.blocked) {
     out.push(`  BLOCKED: ${result.blockedReason}`);
     console.error(out.join("\n"));
     return;
   }
-  for (const r of result.reviews) out.push(...reviewerBlock(r));
+  for (const r of result.reviews) out.push(...reviewerBlock(r, profile));
   out.push("");
   if (result.receipt) {
     out.push(`  receipt: ${result.receiptPath}`);
@@ -1451,7 +1675,9 @@ function printSummary(result) {
   out.push("");
   console.log(out.join("\n"));
 }
-async function reviewCommand(args) {
+async function reviewCommand(args, profile = "code") {
+  const usage = profile === "security" ? SECURITY_USAGE : REVIEW_USAGE;
+  const cmd = profile === "security" ? "security" : "review";
   let values;
   try {
     ({ values } = parseArgs({
@@ -1475,12 +1701,12 @@ async function reviewCommand(args) {
       }
     }));
   } catch (e) {
-    console.error(`ensemble-ai review: ${e.message}`);
-    console.error(REVIEW_USAGE);
+    console.error(`ensemble-ai ${cmd}: ${e.message}`);
+    console.error(usage);
     return 3;
   }
   if (values.help) {
-    console.log(REVIEW_USAGE);
+    console.log(usage);
     return 0;
   }
   const cwd = values.cwd ? path6.resolve(String(values.cwd)) : process.cwd();
@@ -1493,7 +1719,7 @@ async function reviewCommand(args) {
   const stdinContent = hasExplicitSource(sourceFlags) ? void 0 : readStdinIfPiped();
   const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== void 0 });
   if (isDiffSourceError(selection)) {
-    console.error(`ensemble-ai review: ${selection.error}`);
+    console.error(`ensemble-ai ${cmd}: ${selection.error}`);
     return 3;
   }
   const source = resolveSource(selection, cwd, stdinContent);
@@ -1504,7 +1730,7 @@ async function reviewCommand(args) {
     const unknown = requested.filter((id) => !isReviewerId(id));
     if (unknown.length > 0 || requested.length === 0) {
       console.error(
-        `ensemble-ai review: --reviewers "${values.reviewers}" ${unknown.length ? `has unknown id(s): ${unknown.join(", ")}` : "is empty"} (known: ${REVIEWER_IDS.join(", ")})`
+        `ensemble-ai ${cmd}: --reviewers "${values.reviewers}" ${unknown.length ? `has unknown id(s): ${unknown.join(", ")}` : "is empty"} (known: ${REVIEWER_IDS.join(", ")})`
       );
       return 3;
     }
@@ -1514,7 +1740,7 @@ async function reviewCommand(args) {
   const out = typeof values.out === "string" ? path6.resolve(values.out) : path6.join(os6.tmpdir(), "ensemble-ai", runId);
   const ceilingBytes = typeof values.ceiling === "string" ? Number(values.ceiling) : void 0;
   if (ceilingBytes !== void 0 && (!Number.isFinite(ceilingBytes) || ceilingBytes <= 0)) {
-    console.error("ensemble-ai review: --ceiling must be a positive number");
+    console.error(`ensemble-ai ${cmd}: --ceiling must be a positive number`);
     return 3;
   }
   let result;
@@ -1528,6 +1754,7 @@ async function reviewCommand(args) {
       diffText: source.diffText,
       onProgress: (m) => console.error(`\xB7 ${m}`),
       out,
+      profile,
       reviewers,
       runId,
       sandbox: typeof values.sandbox === "string" ? values.sandbox : void 0,
@@ -1535,10 +1762,10 @@ async function reviewCommand(args) {
       workingTree: source.workingTree
     });
   } catch (e) {
-    console.error(`ensemble-ai review: ${e.message}`);
+    console.error(`ensemble-ai ${cmd}: ${e.message}`);
     return 3;
   }
-  printSummary(result);
+  printSummary(result, profile);
   console.error(`trail: ${out}`);
   if (result.blocked) return 2;
   const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
@@ -1552,7 +1779,8 @@ async function main(argv) {
     console.log(USAGE);
     return mode ? 0 : 1;
   }
-  if (mode === "review") return reviewCommand(argv.slice(1));
+  if (mode === "review") return reviewCommand(argv.slice(1), "code");
+  if (mode === "security") return reviewCommand(argv.slice(1), "security");
   if (isMode(mode) && !isImplemented(mode)) {
     console.error(`ensemble-ai: mode "${mode}" is planned but not implemented yet.`);
     return 3;

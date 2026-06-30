@@ -19,6 +19,11 @@ import {
   type DiffMode,
 } from './diff';
 import {
+  type DepSurfaceResult,
+  scanDependencySurface,
+} from './dep-surface';
+import { type ReviewProfile, SECURITY_OBJECTIVE } from './profile';
+import {
   buildDiffReceipt,
   type DiffReviewReceipt,
   defaultReceiptStore,
@@ -39,6 +44,10 @@ export interface ReviewModeOptions {
   objective?: string;
   onProgress?: (msg: string) => void;
   out: string;
+  // The review PROFILE: 'code' (default, general review) or 'security' (a
+  // security-auditor framing + the local dependency-surface flag). A profile is a
+  // thin variation — the engine, coverage, spawn, parse, and receipt are unchanged.
+  profile?: ReviewProfile;
   receiptStore?: string;
   reviewers?: ReviewerId[];
   reviewersFile?: string;
@@ -56,6 +65,9 @@ export interface ReviewModeResult {
   acquired: AcquiredDiff;
   blocked: boolean;
   blockedReason?: string;
+  // The local dependency-surface scan — present ONLY for the 'security' profile
+  // (manifest changes + risky imports drawn from the diff; no network).
+  depSurface?: DepSurfaceResult;
   receipt?: DiffReviewReceipt;
   receiptError?: string;
   receiptPath?: string;
@@ -146,6 +158,7 @@ export async function runReviewMode(
 ): Promise<ReviewModeResult> {
   const log = opts.onProgress ?? (() => {});
   const ceilingBytes = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
+  const profile: ReviewProfile = opts.profile ?? 'code';
   const reviewers =
     opts.reviewers && opts.reviewers.length > 0
       ? opts.reviewers
@@ -172,6 +185,12 @@ export async function runReviewMode(
     `Diff: ${acquired.coverage.totalFiles} file(s), ${acquired.coverage.includedFiles} covered, ${acquired.coverage.omittedFiles} omitted · digest ${acquired.canonicalDigest.slice(0, 19)}…`
   );
 
+  // The security profile adds a LOCAL dependency-surface flag over the FULL parsed
+  // diff (manifest changes + risky imports) — no network, computed once and surfaced
+  // in every return path (including a secret-scan block) so the reader always sees it.
+  const depSurface =
+    profile === 'security' ? scanDependencySurface(acquired.files) : undefined;
+
   // Secret-scan the FULL canonical diff (the change identity), not just the
   // covered subset — the payload + the manifest must reflect the whole change.
   // (acquireDiff already parsed these files for coverage — reuse, don't re-parse.)
@@ -189,6 +208,7 @@ export async function runReviewMode(
       acquired,
       blocked: true,
       blockedReason: reason,
+      depSurface,
       reviews: [],
       secretScan,
     };
@@ -198,11 +218,13 @@ export async function runReviewMode(
     agentsMd: opts.agentsMd,
     authorSummary: opts.authorSummary,
     diff: acquired.diff,
-    objective: opts.objective ?? DEFAULT_OBJECTIVE,
+    objective:
+      opts.objective ??
+      (profile === 'security' ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE),
     pr: 0,
     repo: acquired.repoId ?? '',
   });
-  const prompt = renderReviewPrompt(packet);
+  const prompt = renderReviewPrompt(packet, profile);
   if (!packet.complete) {
     log('Packet incomplete (no usable diff) — persisting an empty review.');
   }
@@ -256,8 +278,8 @@ export async function runReviewMode(
     const store = opts.receiptStore ?? defaultReceiptStore();
     const file = writeReceipt(store, built.receipt);
     log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    return { acquired, blocked: false, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
   }
   log(`No receipt — ${built.error}`);
-  return { acquired, blocked: false, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, depSurface, receiptError: built.error, reviews, secretScan };
 }

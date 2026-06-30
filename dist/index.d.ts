@@ -1,5 +1,5 @@
-import { ReviewerId, ReviewerConfig, ReviewFinding, ReviewPacket, TerminalState, StoredReview } from './contracts.js';
-export { CONFIDENCES, Confidence, DIFF_USEFUL_FLOOR, Evidence, FINDINGS_INSTRUCTIONS, ManifestEntry, PACKET_BUDGETS, PacketInput, PacketSection, ParsedReview, REVIEWER_IDS, SEVERITIES, Severity, TERMINAL_STATES, assembleCodePacket, extractJsonBlock, isReviewerId, parseFindings, parseReviewerIds, renderReviewPrompt, section, titleCase } from './contracts.js';
+import { R as ReviewerId, a as ReviewerConfig, b as ReviewFinding, c as ReviewPacket, T as TerminalState, S as StoredReview, d as ReviewProfile } from './contracts-DiONsSpR.js';
+export { C as CONFIDENCES, e as Confidence, D as DIFF_USEFUL_FLOOR, E as Evidence, F as FINDINGS_INSTRUCTIONS, M as ManifestEntry, P as PACKET_BUDGETS, f as PacketInput, g as PacketSection, h as ParsedReview, i as REVIEWER_IDS, j as REVIEW_PROFILES, k as SECURITY_CLASSES, l as SECURITY_OBJECTIVE, m as SEVERITIES, n as SecurityClass, o as Severity, p as TERMINAL_STATES, q as assembleCodePacket, r as classifySecurityFinding, s as extractJsonBlock, t as isReviewProfile, u as isReviewerId, v as parseFindings, w as parseReviewerIds, x as renderReviewPrompt, y as section, z as securityClassLabel, A as stripSecurityTag, B as titleCase } from './contracts-DiONsSpR.js';
 
 declare const REVIEWERS_FILE: string;
 declare const REVIEWER_DEFAULTS: Record<ReviewerId, ReviewerConfig>;
@@ -157,6 +157,26 @@ interface AcquireDiffOpts {
 }
 declare function acquireDiff(opts: AcquireDiffOpts): AcquiredDiff;
 
+interface DepManifestHit {
+    added: number;
+    isLockfile: boolean;
+    label: string;
+    path: string;
+    samples: string[];
+}
+interface RiskyImportHit {
+    cls: string;
+    label: string;
+    line?: number;
+    path: string;
+}
+interface DepSurfaceResult {
+    manifests: DepManifestHit[];
+    riskyImports: RiskyImportHit[];
+}
+declare function scanDependencySurface(files: FileDiff[]): DepSurfaceResult;
+declare function hasDepSurface(r: DepSurfaceResult): boolean;
+
 interface ReceiptCoverage {
     includedFiles: number;
     omitted: {
@@ -268,6 +288,7 @@ interface ReviewModeOptions {
     objective?: string;
     onProgress?: (msg: string) => void;
     out: string;
+    profile?: ReviewProfile;
     receiptStore?: string;
     reviewers?: ReviewerId[];
     reviewersFile?: string;
@@ -280,6 +301,7 @@ interface ReviewModeResult {
     acquired: AcquiredDiff;
     blocked: boolean;
     blockedReason?: string;
+    depSurface?: DepSurfaceResult;
     receipt?: DiffReviewReceipt;
     receiptError?: string;
     receiptPath?: string;
@@ -294,4 +316,4 @@ declare const IMPLEMENTED_MODES: readonly ModeName[];
 declare function isMode(v: string): v is ModeName;
 declare function isImplemented(mode: ModeName): boolean;
 
-export { type AcquireDiffOpts, type AcquiredDiff, type BuildReceiptResult, type CodexReviewResult, type Coverage, type CoverageFileEntry, type CoveragePolicy, DEFAULT_COVERAGE_CEILING, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type FileDiff, type FileKind, IMPLEMENTED_MODES, type InlineSecretHit, MODES, type ModeName, type OmitReason, type PersistReviewInput, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type ReceiptCoverage, type ReceiptKey, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RunReviewOpts, type SecretScanResult, type SensitivePathHit, StoredReview, TerminalState, acquireDiff, buildCodexReviewArgs, buildDiffReceipt, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, computeCoverage, computePolicyHash, coverageShortfall, defaultReceiptStore, diffDigest, ensureSandboxProfile, extractGrokText, isDiffReviewed, isImplemented, isMode, keyOf, killTree, listReviewers, loadReviewers, makeEscalatingKill, parseDiffFiles, parseReviewers, persistReview, readReceipt, readReview, readReviewsForRun, receiptKeyHash, receiptPath, resolveBase, resolveBin, resolveCodexBin, resolveGrokBin, resolveRepoId, resolveReviewSandbox, resolveReviewer, reviewDir, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, sanitizePathSegment, scanDiffForSecrets, sha256Hex, summarizeCoverage, writeReceipt };
+export { type AcquireDiffOpts, type AcquiredDiff, type BuildReceiptResult, type CodexReviewResult, type Coverage, type CoverageFileEntry, type CoveragePolicy, DEFAULT_COVERAGE_CEILING, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type FileDiff, type FileKind, IMPLEMENTED_MODES, type InlineSecretHit, MODES, type ModeName, type OmitReason, type PersistReviewInput, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type ReceiptCoverage, type ReceiptKey, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunReviewOpts, type SecretScanResult, type SensitivePathHit, StoredReview, TerminalState, acquireDiff, buildCodexReviewArgs, buildDiffReceipt, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, computeCoverage, computePolicyHash, coverageShortfall, defaultReceiptStore, diffDigest, ensureSandboxProfile, extractGrokText, hasDepSurface, isDiffReviewed, isImplemented, isMode, keyOf, killTree, listReviewers, loadReviewers, makeEscalatingKill, parseDiffFiles, parseReviewers, persistReview, readReceipt, readReview, readReviewsForRun, receiptKeyHash, receiptPath, resolveBase, resolveBin, resolveCodexBin, resolveGrokBin, resolveRepoId, resolveReviewSandbox, resolveReviewer, reviewDir, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, sha256Hex, summarizeCoverage, writeReceipt };

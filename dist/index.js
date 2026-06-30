@@ -228,11 +228,109 @@ function assembleCodePacket(input) {
   };
 }
 
+// src/modes/review/profile.ts
+var REVIEW_PROFILES = ["code", "security"];
+function isReviewProfile(v) {
+  return REVIEW_PROFILES.includes(v);
+}
+var SECURITY_OBJECTIVE = "Adversarial cross-vendor SECURITY audit of a code diff \u2014 hunt for exploitable vulnerabilities a same-vendor author might miss: injection, XSS, broken authn/authz, secret leakage, supply-chain risk, unsafe deserialization/eval, SSRF, path traversal, and crypto misuse.";
+var SECURITY_CLASSES = [
+  {
+    id: "injection",
+    label: "Injection",
+    keywords: ["sql", "sqli", "injection", "command inject", "shell inject", "os command", "unsanitiz", "parameteriz", "prepared statement"]
+  },
+  {
+    id: "xss",
+    label: "XSS",
+    keywords: ["xss", "cross-site script", "innerhtml", "dangerouslysetinnerhtml", "unescaped", "html escap"]
+  },
+  {
+    id: "authz",
+    label: "AuthN/AuthZ",
+    keywords: ["authoriz", "authentic", "permission", "access control", "privilege", "idor", "rbac", "session fixation", "jwt", "auth bypass", "unauthenticated"]
+  },
+  {
+    id: "secret-leak",
+    label: "Secret leak",
+    keywords: ["secret", "credential", "api key", "apikey", "hardcoded password", "hardcoded", "token leak", "private key", "leaked"]
+  },
+  {
+    id: "supply-chain",
+    label: "Supply chain",
+    keywords: ["supply chain", "dependency", "transitive", "malicious package", "typosquat", "postinstall", "lockfile", "unpinned"]
+  },
+  {
+    id: "deserialization",
+    label: "Unsafe deserialization/eval",
+    keywords: ["deserializ", "eval(", "new function", "pickle", "yaml.load", "unserialize", "unmarshal", "vm.runin", "arbitrary code", "rce", "code execution"]
+  },
+  {
+    id: "ssrf",
+    label: "SSRF",
+    keywords: ["ssrf", "server-side request", "request forgery", "open redirect", "url allowlist", "url validation"]
+  },
+  {
+    id: "path-traversal",
+    label: "Path traversal",
+    keywords: ["path traversal", "directory traversal", "zip slip", "arbitrary file read", "arbitrary file write", "../"]
+  },
+  {
+    id: "crypto",
+    label: "Crypto misuse",
+    keywords: ["crypto", "cipher", "md5", "sha1", "insecure random", "weak hash", "weak algorithm", "ecb mode", "hardcoded iv", "static iv", "nonce reuse", "certificate valid"]
+  },
+  { id: "other", label: "Other", keywords: [] }
+];
+var KNOWN_CLASS_IDS = new Set(SECURITY_CLASSES.map((c) => c.id));
+var LEADING_TAG = /^\s*\[([a-z-]+)\]\s*/i;
+function classifySecurityFinding(f) {
+  const tag = f.title.match(LEADING_TAG)?.[1]?.toLowerCase();
+  if (tag && KNOWN_CLASS_IDS.has(tag)) return tag;
+  const hay = `${f.title} ${f.body}`.toLowerCase();
+  for (const c of SECURITY_CLASSES) {
+    if (c.keywords.some((k) => hay.includes(k))) return c.id;
+  }
+  return "other";
+}
+function stripSecurityTag(title) {
+  const tag = title.match(LEADING_TAG)?.[1]?.toLowerCase();
+  return tag && KNOWN_CLASS_IDS.has(tag) ? title.replace(LEADING_TAG, "") : title;
+}
+function securityClassLabel(id) {
+  return SECURITY_CLASSES.find((c) => c.id === id)?.label ?? id;
+}
+
 // src/core/prompt.ts
-function renderReviewPrompt(packet) {
+var CODE_ASK = [
+  "## Your task",
+  "Find correctness bugs, security issues, broken conventions, and risky",
+  "choices IN THE DIFF. Be concrete and cite file + line. Do not nitpick style",
+  "the conventions already allow. Prefer a few high-signal findings over many",
+  "weak ones \u2014 false positives waste the arbiter\u2019s time."
+].join("\n");
+function securityAsk() {
+  const classes = SECURITY_CLASSES.filter((c) => c.id !== "other").map((c) => `  - [${c.id}] ${c.label}`).join("\n");
+  return [
+    "## Your task \u2014 SECURITY AUDIT",
+    "You are auditing this diff ADVERSARIALLY for exploitable security",
+    "vulnerabilities a same-vendor author might miss. Think like an attacker:",
+    "how could untrusted input reach a dangerous sink? Focus on these classes:",
+    classes,
+    "",
+    'For EACH finding, lead the "title" with the matching class tag in brackets,',
+    'e.g. "[injection] user id concatenated into SQL". Cite the exact file + line',
+    "and name the attack: the untrusted source, the sink, and the exploit. Prefer a",
+    "few high-signal, exploitable findings over many theoretical ones \u2014 but do NOT",
+    "stay silent on a real vulnerability to keep the list short. Pure code-quality",
+    "nits that are not security-relevant belong in a normal review, not here."
+  ].join("\n");
+}
+function renderReviewPrompt(packet, profile = "code") {
   const subject = packet.pr > 0 ? `Repository: ${packet.repo} \xB7 Pull request #${packet.pr}` : packet.subject ? `Under review: ${packet.subject}` : `Repository: ${packet.repo || "(a working tree)"} \xB7 reviewing the diff below`;
+  const role = profile === "security" ? "You are an adversarial SECURITY auditor from a DIFFERENT vendor than the author." : "You are an adversarial code reviewer from a DIFFERENT vendor than the author.";
   const head = [
-    "You are an adversarial code reviewer from a DIFFERENT vendor than the author.",
+    role,
     "You have NO prior memory: your own memory, the repository, and every earlier",
     "conversation are unknown to you EXCEPT what is embedded below. Review only",
     "what is here; do not assume facts not present.",
@@ -249,11 +347,7 @@ ${s.body}` : `${header}
 (not available)`;
   }).join("\n\n");
   const ask = [
-    "## Your task",
-    "Find correctness bugs, security issues, broken conventions, and risky",
-    "choices IN THE DIFF. Be concrete and cite file + line. Do not nitpick style",
-    "the conventions already allow. Prefer a few high-signal findings over many",
-    "weak ones \u2014 false positives waste the arbiter\u2019s time.",
+    profile === "security" ? securityAsk() : CODE_ASK,
     "",
     FINDINGS_INSTRUCTIONS
   ].join("\n");
@@ -898,6 +992,99 @@ function acquireDiff(opts) {
   };
 }
 
+// src/modes/review/dep-surface.ts
+var MANIFEST_PATTERNS = [
+  { label: "npm", re: /(^|\/)package\.json$/ },
+  { label: "npm-lock", lock: true, re: /(^|\/)(package-lock\.json|npm-shrinkwrap\.json)$/ },
+  { label: "yarn-lock", lock: true, re: /(^|\/)yarn\.lock$/ },
+  { label: "pnpm-lock", lock: true, re: /(^|\/)pnpm-lock\.yaml$/ },
+  { label: "bun-lock", lock: true, re: /(^|\/)bun\.lockb$/ },
+  { label: "python-requirements", re: /(^|\/)requirements[^/]*\.txt$/ },
+  { label: "python-pyproject", re: /(^|\/)pyproject\.toml$/ },
+  { label: "python-pipfile", re: /(^|\/)Pipfile$/ },
+  { label: "python-pipfile-lock", lock: true, re: /(^|\/)Pipfile\.lock$/ },
+  { label: "go-mod", re: /(^|\/)go\.mod$/ },
+  { label: "go-sum", lock: true, re: /(^|\/)go\.sum$/ },
+  { label: "rust-cargo", re: /(^|\/)Cargo\.toml$/ },
+  { label: "rust-cargo-lock", lock: true, re: /(^|\/)Cargo\.lock$/ },
+  { label: "ruby-gemfile", re: /(^|\/)Gemfile$/ },
+  { label: "ruby-gemfile-lock", lock: true, re: /(^|\/)Gemfile\.lock$/ },
+  { label: "php-composer", re: /(^|\/)composer\.json$/ },
+  { label: "php-composer-lock", lock: true, re: /(^|\/)composer\.lock$/ },
+  { label: "gradle", re: /(^|\/)build\.gradle(\.kts)?$/ },
+  { label: "maven", re: /(^|\/)pom\.xml$/ }
+];
+var RISKY_PATTERNS = [
+  { cls: "deserialization", label: "eval()", re: /\beval\s*\(/ },
+  { cls: "deserialization", label: "new Function()", re: /\bnew\s+Function\s*\(/ },
+  { cls: "deserialization", label: "vm module", re: /\bvm\.runIn|require\(\s*['"]vm['"]\s*\)|from\s+['"]vm['"]/ },
+  { cls: "deserialization", label: "pickle.load (py)", re: /\bpickle\.loads?\s*\(/ },
+  { cls: "deserialization", label: "yaml.load (py, unsafe)", re: /\byaml\.load\s*\(/ },
+  { cls: "deserialization", label: "unserialize (php)", re: /\bunserialize\s*\(/ },
+  { cls: "injection", label: "child_process", re: /\bchild_process\b|\bexecSync?\s*\(|\bspawnSync?\s*\(|\bexecFileSync?\s*\(/ },
+  { cls: "injection", label: "os.system / subprocess (py)", re: /\bos\.system\s*\(|\bsubprocess\.(Popen|call|run|check_output)\s*\(/ },
+  { cls: "xss", label: "dangerouslySetInnerHTML", re: /dangerouslySetInnerHTML/ },
+  { cls: "xss", label: "innerHTML assignment", re: /\.innerHTML\s*=/ },
+  { cls: "xss", label: "document.write", re: /document\.write\s*\(/ }
+];
+function addedContentLines(section2) {
+  const out = [];
+  let newLine = 0;
+  for (const l of section2.split("\n")) {
+    const hunk = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      newLine = Number(hunk[1]);
+      continue;
+    }
+    if (l.startsWith("+++")) continue;
+    if (l.startsWith("+")) {
+      out.push({ line: newLine, text: l.slice(1) });
+      newLine++;
+    } else if (l.startsWith("-") && !l.startsWith("---")) {
+    } else if (l.startsWith(" ")) {
+      newLine++;
+    }
+  }
+  return out;
+}
+function scanDependencySurface(files) {
+  const manifests = [];
+  const riskyImports = [];
+  for (const f of files) {
+    if (f.isBinary) continue;
+    const added = addedContentLines(f.raw);
+    const m = MANIFEST_PATTERNS.find((p) => p.re.test(f.path));
+    if (m) {
+      manifests.push({
+        added: added.length,
+        isLockfile: Boolean(m.lock),
+        label: m.label,
+        path: f.path,
+        samples: m.lock ? [] : added.map((a) => a.text.trim()).filter(Boolean).slice(0, 5)
+      });
+    }
+    if (f.kind !== "source") continue;
+    const seen = /* @__PURE__ */ new Set();
+    for (const a of added) {
+      for (const r of RISKY_PATTERNS) {
+        if (!seen.has(r.label) && r.re.test(a.text)) {
+          seen.add(r.label);
+          riskyImports.push({
+            cls: r.cls,
+            label: r.label,
+            line: a.line || void 0,
+            path: f.path
+          });
+        }
+      }
+    }
+  }
+  return { manifests, riskyImports };
+}
+function hasDepSurface(r) {
+  return r.manifests.length > 0 || r.riskyImports.length > 0;
+}
+
 // src/modes/review/receipt.ts
 import fs6 from "fs";
 import os5 from "os";
@@ -1143,6 +1330,7 @@ async function runReviewMode(opts) {
   const log = opts.onProgress ?? (() => {
   });
   const ceilingBytes = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
+  const profile = opts.profile ?? "code";
   const reviewers = opts.reviewers && opts.reviewers.length > 0 ? opts.reviewers : [...REVIEWER_IDS];
   const sourceLabel = opts.diffText !== void 0 ? opts.diffMode ?? "raw" : opts.staged ? "staged" : opts.workingTree ? "working-tree" : "commit";
   log(`Acquiring diff (${sourceLabel} mode)\u2026`);
@@ -1158,6 +1346,7 @@ async function runReviewMode(opts) {
   log(
     `Diff: ${acquired.coverage.totalFiles} file(s), ${acquired.coverage.includedFiles} covered, ${acquired.coverage.omittedFiles} omitted \xB7 digest ${acquired.canonicalDigest.slice(0, 19)}\u2026`
   );
+  const depSurface = profile === "security" ? scanDependencySurface(acquired.files) : void 0;
   const secretScan = scanDiffForSecrets(acquired.files, {
     allowSensitive: opts.allowSensitive
   });
@@ -1172,6 +1361,7 @@ async function runReviewMode(opts) {
       acquired,
       blocked: true,
       blockedReason: reason,
+      depSurface,
       reviews: [],
       secretScan
     };
@@ -1180,11 +1370,11 @@ async function runReviewMode(opts) {
     agentsMd: opts.agentsMd,
     authorSummary: opts.authorSummary,
     diff: acquired.diff,
-    objective: opts.objective ?? DEFAULT_OBJECTIVE,
+    objective: opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE),
     pr: 0,
     repo: acquired.repoId ?? ""
   });
-  const prompt = renderReviewPrompt(packet);
+  const prompt = renderReviewPrompt(packet, profile);
   if (!packet.complete) {
     log("Packet incomplete (no usable diff) \u2014 persisting an empty review.");
   }
@@ -1231,15 +1421,15 @@ async function runReviewMode(opts) {
     const store = opts.receiptStore ?? defaultReceiptStore();
     const file = writeReceipt(store, built.receipt);
     log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    return { acquired, blocked: false, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, depSurface, receiptError: built.error, reviews, secretScan };
 }
 
 // src/modes/index.ts
 var MODES = ["review", "brainstorm", "security"];
-var IMPLEMENTED_MODES = ["review"];
+var IMPLEMENTED_MODES = ["review", "security"];
 function isMode(v) {
   return MODES.includes(v);
 }
@@ -1258,7 +1448,10 @@ export {
   REVIEWER_DEFAULTS,
   REVIEWER_IDS,
   REVIEW_ADAPTERS,
+  REVIEW_PROFILES,
   REVIEW_TIMEOUT_MS,
+  SECURITY_CLASSES,
+  SECURITY_OBJECTIVE,
   SEVERITIES,
   TERMINAL_STATES,
   acquireDiff,
@@ -1268,6 +1461,7 @@ export {
   buildGrokReviewArgs,
   canonicalizeDiff,
   classifyFileKind,
+  classifySecurityFinding,
   computeCoverage,
   computePolicyHash,
   coverageShortfall,
@@ -1276,9 +1470,11 @@ export {
   ensureSandboxProfile,
   extractGrokText,
   extractJsonBlock,
+  hasDepSurface,
   isDiffReviewed,
   isImplemented,
   isMode,
+  isReviewProfile,
   isReviewerId,
   keyOf,
   killTree,
@@ -1309,9 +1505,12 @@ export {
   runReviewMode,
   runReviewerExec,
   sanitizePathSegment,
+  scanDependencySurface,
   scanDiffForSecrets,
   section,
+  securityClassLabel,
   sha256Hex,
+  stripSecurityTag,
   summarizeCoverage,
   titleCase,
   writeReceipt

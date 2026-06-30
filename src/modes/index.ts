@@ -5,7 +5,7 @@
 export const MODES = ['review', 'brainstorm', 'security'] as const;
 export type ModeName = (typeof MODES)[number];
 
-export const IMPLEMENTED_MODES: readonly ModeName[] = ['review'];
+export const IMPLEMENTED_MODES: readonly ModeName[] = ['review', 'security'];
 
 export function isMode(v: string): v is ModeName {
   return (MODES as readonly string[]).includes(v);
