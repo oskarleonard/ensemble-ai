@@ -131,6 +131,11 @@ describe('mode dispatch + usage', () => {
     expect(mockRun).not.toHaveBeenCalled();
   });
 
+  it('security --help → exit 0 (no review fired)', async () => {
+    expect(await main(['security', '--help'])).toBe(0);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+
   it('an unknown review flag → usage error, exit 3 (no review fired)', async () => {
     expect(await main(['review', '--definitely-not-a-flag'])).toBe(3);
     expect(mockRun).not.toHaveBeenCalled();
@@ -149,6 +154,50 @@ describe('flag threading', () => {
     expect(mockRun).toHaveBeenCalledWith(
       expect.objectContaining({ allowSensitive: true, reviewers: ['codex'], workingTree: true })
     );
+  });
+});
+
+describe('profile selection (review vs security — same engine)', () => {
+  it('review threads profile: "code" to the engine', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
+    await main(['review', '--working-tree']);
+    expect(mockRun).toHaveBeenCalledWith(expect.objectContaining({ profile: 'code' }));
+  });
+
+  it('security threads profile: "security" to the engine (same diff-source flags)', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
+    const code = await main(['security', '--working-tree']);
+    expect(code).toBe(0);
+    expect(mockRun).toHaveBeenCalledWith(
+      expect.objectContaining({ profile: 'security', workingTree: true })
+    );
+  });
+
+  it('security honors the SAME HIGH gate (exit 4) as review', async () => {
+    mockRun.mockResolvedValue(
+      result({ reviews: [storedReview('codex', 'reviewed', 1, 'high')] })
+    );
+    expect(await main(['security', '--working-tree'])).toBe(4);
+  });
+
+  it('security rejects two explicit diff sources (exit 3), no review fired', async () => {
+    expect(await main(['security', '--pr', '5', '--staged'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+
+  it('security renders the dependency-surface block without crashing', async () => {
+    mockRun.mockResolvedValue(
+      result({
+        depSurface: {
+          manifests: [
+            { added: 2, isLockfile: false, label: 'npm', path: 'package.json', samples: ['"left-pad": "^1.3.0"'] },
+          ],
+          riskyImports: [{ cls: 'deserialization', label: 'eval()', line: 12, path: 'src/run.ts' }],
+        },
+        reviews: [storedReview('codex', 'reviewed')],
+      })
+    );
+    expect(await main(['security', '--working-tree'])).toBe(0);
   });
 });
 

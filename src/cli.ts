@@ -17,7 +17,13 @@ import {
 } from './core/types';
 import { isImplemented, isMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
+import type { DepSurfaceResult } from './modes/review/dep-surface';
 import type { DiffMode } from './modes/review/diff';
+import {
+  classifySecurityFinding,
+  type ReviewProfile,
+  stripSecurityTag,
+} from './modes/review/profile';
 import {
   type DiffSourceSelection,
   hasExplicitSource,
@@ -32,10 +38,12 @@ Usage:
 
 Modes:
   review       Cross-vendor review of a code diff (implemented).
+  security     Cross-vendor SECURITY audit of a code diff (implemented) —
+               the review engine with a security-auditor lens + a local
+               dependency-surface flag; findings tagged by security class.
   brainstorm   (planned)
-  security     (planned)
 
-Run \`ensemble-ai review --help\` for review options.`;
+Run \`ensemble-ai review --help\` or \`ensemble-ai security --help\` for options.`;
 
 const REVIEW_USAGE = `ensemble-ai review — review a diff with ALL configured AI reviewers.
 
@@ -66,6 +74,26 @@ Options:
 Exit codes: 0 = completed, no HIGH (or gate disabled) · 1 = a reviewer failed
 (crash/timeout/no-parse) · 2 = blocked by the secret-scan · 3 = usage / no diff ·
 4 = completed WITH a HIGH finding (the gate; disable with --no-fail-on-high).`;
+
+const SECURITY_USAGE = `ensemble-ai security — adversarial SECURITY audit of a diff with ALL reviewers.
+
+A thin PROFILE over \`review\`: the SAME engine + diff sources + receipt + HIGH gate,
+but the reviewers run under a security-auditor lens (injection · XSS · authn/authz ·
+secret-leak · supply-chain · unsafe deserialization/eval · SSRF · path-traversal ·
+crypto misuse) and findings are tagged by security class in the grouped output. It
+also runs a LOCAL dependency-surface flag (manifest changes + risky imports in the
+diff — NO network / no vuln DB) and reuses the engine's secret-scan.
+
+Diff source (give at most ONE; default = current branch):
+  (default)            <base>...HEAD — the current branch vs its merge-base with
+                       the default branch (origin/main; resolved like \`gh pr create\`)
+  --pr <N>             the diff of GitHub PR #N (via \`gh pr diff <N>\`)
+  --staged             staged changes (\`git diff --cached\`)
+  --working-tree       uncommitted tracked changes vs HEAD (\`git diff HEAD\`)
+  --diff-file <path>   a raw unified diff read from a file
+  (stdin)              a piped diff, e.g. \`git diff main...HEAD | ensemble-ai security\`
+
+Options + exit codes are identical to \`ensemble-ai review\` (run \`review --help\`).`;
 
 function genRunId(): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -219,9 +247,24 @@ function evidenceRef(file?: string, line?: number): string {
   return line ? `${f}:${line}` : f;
 }
 
+// One finding line: `file:line  title`, with a `[class]` security-class tag prepended
+// in the security profile (the reviewer's own leading [tag] is stripped to avoid
+// duplication, then re-rendered from the canonical class).
+function findingLine(
+  f: StoredReview['findings'][number],
+  profile: ReviewProfile
+): string {
+  const ref = evidenceRef(f.evidence.file, f.evidence.line);
+  if (profile === 'security') {
+    const cls = classifySecurityFinding(f);
+    return `       [${cls}] ${ref}  ${clean(stripSecurityTag(f.title))}`;
+  }
+  return `       ${ref}  ${clean(f.title)}`;
+}
+
 // Per-reviewer findings grouped by severity (HIGH → MED → LOW), each line carrying
 // its file:line evidence so a finding is actionable straight from stdout.
-function reviewerBlock(r: StoredReview): string[] {
+function reviewerBlock(r: StoredReview, profile: ReviewProfile): string[] {
   const id = r.reviewerId ?? r.reviewer.vendor;
   const out: string[] = [];
   out.push('');
@@ -240,18 +283,36 @@ function reviewerBlock(r: StoredReview): string[] {
     const group = r.findings.filter((f) => f.severity === sev);
     if (group.length === 0) continue;
     out.push(`     ${SEVERITY_LABEL[sev]}`);
-    for (const f of group) {
-      out.push(`       ${evidenceRef(f.evidence.file, f.evidence.line)}  ${clean(f.title)}`);
-    }
+    for (const f of group) out.push(findingLine(f, profile));
   }
   return out;
 }
 
-function printSummary(result: ReviewModeResult): void {
+// The local dependency-surface block (security profile only): manifest changes +
+// risky imports drawn straight from the diff. Surfaced even when empty so a reader
+// sees the check ran and found nothing.
+function depSurfaceBlock(d: DepSurfaceResult): string[] {
+  const out: string[] = ['  dependency surface:'];
+  if (d.manifests.length === 0 && d.riskyImports.length === 0) {
+    out.push('     none — no manifest changes or risky imports in the diff');
+    return out;
+  }
+  for (const m of d.manifests) {
+    const kind = m.isLockfile ? 'lockfile' : 'manifest';
+    out.push(`     ${kind} ${m.label}: ${clean(m.path)} (+${m.added} line(s))`);
+    for (const s of m.samples) out.push(`         + ${clean(s).slice(0, 100)}`);
+  }
+  for (const r of d.riskyImports) {
+    out.push(`     risky [${r.cls}] ${r.label} — ${evidenceRef(r.path, r.line)}`);
+  }
+  return out;
+}
+
+function printSummary(result: ReviewModeResult, profile: ReviewProfile): void {
   const a = result.acquired;
   const out: string[] = [];
   out.push('');
-  out.push(`ensemble-ai review — ${a.mode} mode`);
+  out.push(`ensemble-ai ${profile === 'security' ? 'security' : 'review'} — ${a.mode} mode`);
   if (a.repoId) out.push(`  repo:    ${a.repoId}`);
   if (a.baseRef) out.push(`  base:    ${a.baseRef} (${a.baseSha ?? '?'})`);
   out.push(`  head:    ${a.headSha}`);
@@ -268,12 +329,13 @@ function printSummary(result: ReviewModeResult): void {
       `  secrets: ${ss.sensitivePaths.length} sensitive path(s), ${ss.inlineSecrets.length} inline${ss.overridden ? ' (overridden)' : ''}`
     );
   }
+  if (result.depSurface) out.push(...depSurfaceBlock(result.depSurface));
   if (result.blocked) {
     out.push(`  BLOCKED: ${result.blockedReason}`);
     console.error(out.join('\n'));
     return;
   }
-  for (const r of result.reviews) out.push(...reviewerBlock(r));
+  for (const r of result.reviews) out.push(...reviewerBlock(r, profile));
   out.push('');
   if (result.receipt) {
     out.push(`  receipt: ${result.receiptPath}`);
@@ -289,7 +351,15 @@ function printSummary(result: ReviewModeResult): void {
   console.log(out.join('\n'));
 }
 
-async function reviewCommand(args: string[]): Promise<number> {
+// Shared by `review` (profile 'code') and `security` (profile 'security'): both run
+// the SAME engine + diff-source resolution + exit-code contract; the profile only
+// swaps the reviewer framing, adds the dependency-surface flag, and labels the usage.
+async function reviewCommand(
+  args: string[],
+  profile: ReviewProfile = 'code'
+): Promise<number> {
+  const usage = profile === 'security' ? SECURITY_USAGE : REVIEW_USAGE;
+  const cmd = profile === 'security' ? 'security' : 'review';
   let values: Record<string, string | boolean | undefined>;
   try {
     ({ values } = parseArgs({
@@ -313,12 +383,12 @@ async function reviewCommand(args: string[]): Promise<number> {
       },
     }));
   } catch (e) {
-    console.error(`ensemble-ai review: ${(e as Error).message}`);
-    console.error(REVIEW_USAGE);
+    console.error(`ensemble-ai ${cmd}: ${(e as Error).message}`);
+    console.error(usage);
     return 3;
   }
   if (values.help) {
-    console.log(REVIEW_USAGE);
+    console.log(usage);
     return 0;
   }
 
@@ -338,7 +408,7 @@ async function reviewCommand(args: string[]): Promise<number> {
   const stdinContent = hasExplicitSource(sourceFlags) ? undefined : readStdinIfPiped();
   const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== undefined });
   if (isDiffSourceError(selection)) {
-    console.error(`ensemble-ai review: ${selection.error}`);
+    console.error(`ensemble-ai ${cmd}: ${selection.error}`);
     return 3;
   }
   const source = resolveSource(selection, cwd, stdinContent);
@@ -357,7 +427,7 @@ async function reviewCommand(args: string[]): Promise<number> {
     const unknown = requested.filter((id) => !isReviewerId(id));
     if (unknown.length > 0 || requested.length === 0) {
       console.error(
-        `ensemble-ai review: --reviewers "${values.reviewers}" ${
+        `ensemble-ai ${cmd}: --reviewers "${values.reviewers}" ${
           unknown.length ? `has unknown id(s): ${unknown.join(', ')}` : 'is empty'
         } (known: ${REVIEWER_IDS.join(', ')})`
       );
@@ -373,7 +443,7 @@ async function reviewCommand(args: string[]): Promise<number> {
   const ceilingBytes =
     typeof values.ceiling === 'string' ? Number(values.ceiling) : undefined;
   if (ceilingBytes !== undefined && (!Number.isFinite(ceilingBytes) || ceilingBytes <= 0)) {
-    console.error('ensemble-ai review: --ceiling must be a positive number');
+    console.error(`ensemble-ai ${cmd}: --ceiling must be a positive number`);
     return 3;
   }
 
@@ -388,6 +458,7 @@ async function reviewCommand(args: string[]): Promise<number> {
       diffText: source.diffText,
       onProgress: (m) => console.error(`· ${m}`),
       out,
+      profile,
       reviewers,
       runId,
       sandbox: typeof values.sandbox === 'string' ? values.sandbox : undefined,
@@ -395,11 +466,11 @@ async function reviewCommand(args: string[]): Promise<number> {
       workingTree: source.workingTree,
     });
   } catch (e) {
-    console.error(`ensemble-ai review: ${(e as Error).message}`);
+    console.error(`ensemble-ai ${cmd}: ${(e as Error).message}`);
     return 3;
   }
 
-  printSummary(result);
+  printSummary(result, profile);
   console.error(`trail: ${out}`);
   if (result.blocked) return 2;
   // 1 = a reviewer failed to complete (crash / timeout / no parse) — the review is
@@ -420,7 +491,8 @@ export async function main(argv: string[]): Promise<number> {
     console.log(USAGE);
     return mode ? 0 : 1;
   }
-  if (mode === 'review') return reviewCommand(argv.slice(1));
+  if (mode === 'review') return reviewCommand(argv.slice(1), 'code');
+  if (mode === 'security') return reviewCommand(argv.slice(1), 'security');
   if (isMode(mode) && !isImplemented(mode)) {
     console.error(`ensemble-ai: mode "${mode}" is planned but not implemented yet.`);
     return 3;

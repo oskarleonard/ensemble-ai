@@ -32,6 +32,9 @@ export * from './modes/review';
 export * from './modes/review/diff';
 export * from './modes/review/secret-scan';
 export * from './modes/review/receipt';
+// ── Review PROFILES (code · security) + the security dependency-surface flag ──
+export * from './modes/review/profile';
+export * from './modes/review/dep-surface';
 
 // ── Mode registry (mode-first) ───────────────────────────────────────────────
 export * from './modes';

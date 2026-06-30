@@ -228,11 +228,87 @@ function assembleCodePacket(input) {
   };
 }
 
+// src/modes/review/profile.ts
+var SECURITY_CLASSES = [
+  {
+    id: "injection",
+    label: "Injection",
+    keywords: ["sql", "sqli", "injection", "command inject", "shell inject", "os command", "unsanitiz", "parameteriz", "prepared statement"]
+  },
+  {
+    id: "xss",
+    label: "XSS",
+    keywords: ["xss", "cross-site script", "innerhtml", "dangerouslysetinnerhtml", "unescaped", "html escap"]
+  },
+  {
+    id: "authz",
+    label: "AuthN/AuthZ",
+    keywords: ["authoriz", "authentic", "permission", "access control", "privilege", "idor", "rbac", "session fixation", "jwt", "auth bypass", "unauthenticated"]
+  },
+  {
+    id: "secret-leak",
+    label: "Secret leak",
+    keywords: ["secret", "credential", "api key", "apikey", "hardcoded password", "hardcoded", "token leak", "private key", "leaked"]
+  },
+  {
+    id: "supply-chain",
+    label: "Supply chain",
+    keywords: ["supply chain", "dependency", "transitive", "malicious package", "typosquat", "postinstall", "lockfile", "unpinned"]
+  },
+  {
+    id: "deserialization",
+    label: "Unsafe deserialization/eval",
+    keywords: ["deserializ", "eval(", "new function", "pickle", "yaml.load", "unserialize", "unmarshal", "vm.runin", "arbitrary code", "rce", "code execution"]
+  },
+  {
+    id: "ssrf",
+    label: "SSRF",
+    keywords: ["ssrf", "server-side request", "request forgery", "open redirect", "url allowlist", "url validation"]
+  },
+  {
+    id: "path-traversal",
+    label: "Path traversal",
+    keywords: ["path traversal", "directory traversal", "zip slip", "arbitrary file read", "arbitrary file write", "../"]
+  },
+  {
+    id: "crypto",
+    label: "Crypto misuse",
+    keywords: ["crypto", "cipher", "md5", "sha1", "insecure random", "weak hash", "weak algorithm", "ecb mode", "hardcoded iv", "static iv", "nonce reuse", "certificate valid"]
+  },
+  { id: "other", label: "Other", keywords: [] }
+];
+var KNOWN_CLASS_IDS = new Set(SECURITY_CLASSES.map((c) => c.id));
+
 // src/core/prompt.ts
-function renderReviewPrompt(packet) {
+var CODE_ASK = [
+  "## Your task",
+  "Find correctness bugs, security issues, broken conventions, and risky",
+  "choices IN THE DIFF. Be concrete and cite file + line. Do not nitpick style",
+  "the conventions already allow. Prefer a few high-signal findings over many",
+  "weak ones \u2014 false positives waste the arbiter\u2019s time."
+].join("\n");
+function securityAsk() {
+  const classes = SECURITY_CLASSES.filter((c) => c.id !== "other").map((c) => `  - [${c.id}] ${c.label}`).join("\n");
+  return [
+    "## Your task \u2014 SECURITY AUDIT",
+    "You are auditing this diff ADVERSARIALLY for exploitable security",
+    "vulnerabilities a same-vendor author might miss. Think like an attacker:",
+    "how could untrusted input reach a dangerous sink? Focus on these classes:",
+    classes,
+    "",
+    'For EACH finding, lead the "title" with the matching class tag in brackets,',
+    'e.g. "[injection] user id concatenated into SQL". Cite the exact file + line',
+    "and name the attack: the untrusted source, the sink, and the exploit. Prefer a",
+    "few high-signal, exploitable findings over many theoretical ones \u2014 but do NOT",
+    "stay silent on a real vulnerability to keep the list short. Pure code-quality",
+    "nits that are not security-relevant belong in a normal review, not here."
+  ].join("\n");
+}
+function renderReviewPrompt(packet, profile = "code") {
   const subject = packet.pr > 0 ? `Repository: ${packet.repo} \xB7 Pull request #${packet.pr}` : packet.subject ? `Under review: ${packet.subject}` : `Repository: ${packet.repo || "(a working tree)"} \xB7 reviewing the diff below`;
+  const role = profile === "security" ? "You are an adversarial SECURITY auditor from a DIFFERENT vendor than the author." : "You are an adversarial code reviewer from a DIFFERENT vendor than the author.";
   const head = [
-    "You are an adversarial code reviewer from a DIFFERENT vendor than the author.",
+    role,
     "You have NO prior memory: your own memory, the repository, and every earlier",
     "conversation are unknown to you EXCEPT what is embedded below. Review only",
     "what is here; do not assume facts not present.",
@@ -249,11 +325,7 @@ ${s.body}` : `${header}
 (not available)`;
   }).join("\n\n");
   const ask = [
-    "## Your task",
-    "Find correctness bugs, security issues, broken conventions, and risky",
-    "choices IN THE DIFF. Be concrete and cite file + line. Do not nitpick style",
-    "the conventions already allow. Prefer a few high-signal findings over many",
-    "weak ones \u2014 false positives waste the arbiter\u2019s time.",
+    profile === "security" ? securityAsk() : CODE_ASK,
     "",
     FINDINGS_INSTRUCTIONS
   ].join("\n");
