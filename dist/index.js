@@ -1448,7 +1448,7 @@ function str2(v) {
   return typeof v === "string" ? v.trim() : "";
 }
 function asStance(v) {
-  return CRITIQUE_STANCES.includes(v) ? v : "concern";
+  return oneOf(CRITIQUE_STANCES, v, "concern");
 }
 function parseRawIdeas(arr, placeholder) {
   if (!Array.isArray(arr)) return [];
@@ -1994,6 +1994,7 @@ export {
   loadReviewers,
   loadVoices,
   makeEscalatingKill,
+  oneOf,
   parseCritique,
   parseDiffFiles,
   parseFindings,

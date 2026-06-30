@@ -1,4 +1,4 @@
-import { extractJsonBlock } from '../../core/findings';
+import { extractJsonBlock, oneOf } from '../../core/findings';
 
 import {
   type Critique,
@@ -20,9 +20,7 @@ function str(v: unknown): string {
 }
 
 function asStance(v: unknown): CritiqueStance {
-  return (CRITIQUE_STANCES as readonly string[]).includes(v as string)
-    ? (v as CritiqueStance)
-    : 'concern';
+  return oneOf(CRITIQUE_STANCES, v, 'concern');
 }
 
 // Pull a {title, body} list out of a raw value's named array field. Drops entries

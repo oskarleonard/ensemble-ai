@@ -347,6 +347,7 @@ export {
   assembleCodePacket,
   extractJsonBlock,
   isReviewerId,
+  oneOf,
   parseFindings,
   parseReviewerIds,
   renderReviewPrompt,

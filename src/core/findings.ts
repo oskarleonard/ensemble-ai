@@ -36,9 +36,9 @@ export interface ParsedReview {
 }
 
 // Coerce an untrusted value to a member of `set`, else `fallback` — the ONE
-// membership-check rule, shared by the severity + confidence coercers so they
-// can't drift.
-function oneOf<T extends string>(set: readonly T[], v: unknown, fallback: T): T {
+// membership-check rule, shared by the severity + confidence coercers (and the
+// brainstorm stance coercer) so they can't drift.
+export function oneOf<T extends string>(set: readonly T[], v: unknown, fallback: T): T {
   return (set as readonly string[]).includes(v as string) ? (v as T) : fallback;
 }
 
