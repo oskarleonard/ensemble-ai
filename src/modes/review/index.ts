@@ -16,6 +16,7 @@ import {
   acquireDiff,
   type AcquiredDiff,
   DEFAULT_COVERAGE_CEILING,
+  type DiffMode,
 } from './diff';
 import {
   buildDiffReceipt,
@@ -32,6 +33,8 @@ export interface ReviewModeOptions {
   base?: string;
   ceilingBytes?: number;
   cwd: string;
+  // Mode label for a pre-supplied diffText (e.g. a `gh pr diff` capture → 'pr').
+  diffMode?: DiffMode;
   diffText?: string;
   objective?: string;
   onProgress?: (msg: string) => void;
@@ -44,6 +47,8 @@ export interface ReviewModeOptions {
   // still pins it to a deny-by-default profile (a weaker value falls back), so
   // this can tighten but never weaken the boundary.
   sandbox?: string;
+  // Review staged changes (`git diff --cached`) vs HEAD.
+  staged?: boolean;
   workingTree?: boolean;
 }
 
@@ -146,12 +151,21 @@ export async function runReviewMode(
       ? opts.reviewers
       : [...REVIEWER_IDS];
 
-  log(`Acquiring diff (${opts.workingTree ? 'working-tree' : opts.diffText !== undefined ? 'raw' : 'commit'} mode)…`);
+  const sourceLabel = opts.diffText !== undefined
+    ? (opts.diffMode ?? 'raw')
+    : opts.staged
+      ? 'staged'
+      : opts.workingTree
+        ? 'working-tree'
+        : 'commit';
+  log(`Acquiring diff (${sourceLabel} mode)…`);
   const acquired = acquireDiff({
     base: opts.base,
     ceilingBytes,
     cwd: opts.cwd,
+    diffMode: opts.diffMode,
     diffText: opts.diffText,
+    staged: opts.staged,
     workingTree: opts.workingTree,
   });
   log(

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 // src/cli.ts
+import { execFileSync as execFileSync3 } from "child_process";
 import crypto2 from "crypto";
 import fs7 from "fs";
 import os6 from "os";
@@ -464,14 +465,14 @@ function killTree(child, signal, signalGroup = (pid, sig) => process.kill(-pid, 
 }
 function runReviewerExec(opts) {
   const { bin, args, outFile, timeoutMs, stderrLimit, onSpawn } = opts;
-  const capture = opts.capture ?? "outfile";
+  const capture2 = opts.capture ?? "outfile";
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
       cwd: os2.tmpdir(),
       detached: true,
       // stdout is piped ONLY when we read the reply from it (grok); codex keeps
       // it 'ignore' (its reply is the -o file) exactly as the proven path did.
-      stdio: ["ignore", capture === "stdout" ? "pipe" : "ignore", "pipe"]
+      stdio: ["ignore", capture2 === "stdout" ? "pipe" : "ignore", "pipe"]
     });
     const killer = makeEscalatingKill(
       { kill: (sig) => killTree(child, sig) },
@@ -488,7 +489,7 @@ function runReviewerExec(opts) {
       stderrTail = (stderrTail + chunk.toString("utf8")).slice(-stderrLimit);
     });
     let stdoutBuf = "";
-    if (capture === "stdout") {
+    if (capture2 === "stdout") {
       child.stdout?.on("data", (chunk) => {
         stdoutBuf += chunk.toString("utf8");
       });
@@ -503,7 +504,7 @@ function runReviewerExec(opts) {
       if (exitDrain) clearTimeout(exitDrain);
       killer.clear();
       let raw = null;
-      if (capture === "stdout") {
+      if (capture2 === "stdout") {
         const text = stdoutBuf.trim();
         if (text) raw = text;
       } else {
@@ -519,7 +520,7 @@ function runReviewerExec(opts) {
     const backstop = setTimeout(settle, timeoutMs + KILL_GRACE_MS + 5e3);
     child.on(
       "exit",
-      capture === "stdout" ? () => {
+      capture2 === "stdout" ? () => {
         exitDrain = setTimeout(settle, EXIT_DRAIN_GRACE_MS);
       } : settle
     );
@@ -838,9 +839,15 @@ function acquireDiff(opts) {
   let baseSha = null;
   let headSha;
   if (opts.diffText !== void 0) {
-    mode = "raw";
+    mode = opts.diffMode ?? "raw";
     rawDiff = opts.diffText;
-    headSha = "working-tree (no commit identity)";
+    headSha = mode === "pr" ? "gh pr diff (no local commit identity)" : "working-tree (no commit identity)";
+  } else if (opts.staged) {
+    mode = "staged";
+    rawDiff = git(opts.cwd, ["diff", "--cached"]);
+    baseSha = gitOrNull(opts.cwd, ["rev-parse", "HEAD"]);
+    baseRef = "HEAD";
+    headSha = "staged/index (no commit identity)";
   } else if (opts.workingTree) {
     mode = "working-tree";
     rawDiff = git(opts.cwd, ["diff", "HEAD"]);
@@ -1097,12 +1104,15 @@ async function runReviewMode(opts) {
   });
   const ceilingBytes = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
   const reviewers = opts.reviewers && opts.reviewers.length > 0 ? opts.reviewers : [...REVIEWER_IDS];
-  log(`Acquiring diff (${opts.workingTree ? "working-tree" : opts.diffText !== void 0 ? "raw" : "commit"} mode)\u2026`);
+  const sourceLabel = opts.diffText !== void 0 ? opts.diffMode ?? "raw" : opts.staged ? "staged" : opts.workingTree ? "working-tree" : "commit";
+  log(`Acquiring diff (${sourceLabel} mode)\u2026`);
   const acquired = acquireDiff({
     base: opts.base,
     ceilingBytes,
     cwd: opts.cwd,
+    diffMode: opts.diffMode,
     diffText: opts.diffText,
+    staged: opts.staged,
     workingTree: opts.workingTree
   });
   log(
@@ -1187,6 +1197,43 @@ async function runReviewMode(opts) {
   return { acquired, blocked: false, receiptError: built.error, reviews, secretScan };
 }
 
+// src/modes/review/source.ts
+function isDiffSourceError(v) {
+  return "error" in v;
+}
+var FLAG_LABEL = {
+  "diff-file": "--diff-file",
+  pr: "--pr",
+  staged: "--staged",
+  "working-tree": "--working-tree"
+};
+function selectDiffSource(flags) {
+  const explicit = [];
+  if (flags.pr !== void 0) explicit.push("pr");
+  if (flags.diffFile !== void 0) explicit.push("diff-file");
+  if (flags.staged) explicit.push("staged");
+  if (flags.workingTree) explicit.push("working-tree");
+  if (explicit.length > 1) {
+    return {
+      error: `choose at most ONE diff source \u2014 got ${explicit.map((k) => FLAG_LABEL[k]).join(", ")}`
+    };
+  }
+  if (explicit.length === 1) {
+    const kind = explicit[0];
+    if (kind === "pr") {
+      const n = Number(flags.pr);
+      if (!Number.isInteger(n) || n <= 0) {
+        return { error: `--pr must be a positive integer (got "${flags.pr}")` };
+      }
+      return { kind, pr: n };
+    }
+    if (kind === "diff-file") return { diffFile: flags.diffFile, kind };
+    return { kind };
+  }
+  if (flags.stdinPiped) return { kind: "stdin" };
+  return { kind: "commit" };
+}
+
 // src/cli.ts
 var USAGE = `ensemble-ai \u2014 convene multiple AI models on a task, read-only.
 
@@ -1199,17 +1246,24 @@ Modes:
   security     (planned)
 
 Run \`ensemble-ai review --help\` for review options.`;
-var REVIEW_USAGE = `ensemble-ai review \u2014 cross-vendor review of a code diff.
+var REVIEW_USAGE = `ensemble-ai review \u2014 review a diff with ALL configured AI reviewers.
 
-Diff source (first match wins):
-  --diff-file <path>   review a raw unified diff from a file
-  (stdin)              piped diff, e.g. \`git diff main...HEAD | ensemble-ai review\`
-  --working-tree       review uncommitted tracked changes vs HEAD
-  (default)            review <base>...HEAD (base auto-resolved like \`gh pr create\`)
+Runs every reviewer in the registry (codex + grok) by default and prints their
+findings grouped by severity. With NO source flag it reviews the current branch.
+
+Diff source (give at most ONE; default = current branch):
+  (default)            <base>...HEAD \u2014 the current branch vs its merge-base with
+                       the default branch (origin/main; resolved like \`gh pr create\`)
+  --pr <N>             the diff of GitHub PR #N (via \`gh pr diff <N>\`)
+  --staged             staged changes (\`git diff --cached\`)
+  --working-tree       uncommitted tracked changes vs HEAD (\`git diff HEAD\`)
+  --diff-file <path>   a raw unified diff read from a file
+  (stdin)              a piped diff, e.g. \`git diff main...HEAD | ensemble-ai review\`
 
 Options:
   --base <ref>          base ref for the default (commit) mode
   --reviewers <ids>     comma-separated reviewer ids (default: all configured)
+  --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
   --out <dir>           trail output dir (default: a temp dir, printed)
   --sandbox <profile>   reviewer sandbox profile override (deny-by-default only)
   --allow-sensitive     review even if the diff carries secrets/sensitive paths
@@ -1218,8 +1272,9 @@ Options:
   --run-id <id>         trail/receipt run id (default: generated)
   -h, --help            this help
 
-Exit codes: 0 = review completed (even WITH findings) \xB7 1 = a reviewer failed
-(crash/timeout/no-parse) \xB7 2 = blocked by the secret-scan \xB7 3 = usage / no diff.`;
+Exit codes: 0 = completed, no HIGH (or gate disabled) \xB7 1 = a reviewer failed
+(crash/timeout/no-parse) \xB7 2 = blocked by the secret-scan \xB7 3 = usage / no diff \xB7
+4 = completed WITH a HIGH finding (the gate; disable with --no-fail-on-high).`;
 function genRunId() {
   const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
   return `${stamp}-${crypto2.randomBytes(4).toString("hex")}`;
@@ -1232,6 +1287,111 @@ function readStdinIfPiped() {
   } catch {
     return void 0;
   }
+}
+function capture(cmd, cmdArgs, cwd) {
+  try {
+    const text = execFileSync3(cmd, cmdArgs, {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 256 * 1024 * 1024
+    });
+    return { ok: true, text };
+  } catch (e) {
+    const err = e;
+    const stderr = err.stderr ? String(err.stderr).trim() : "";
+    return { error: stderr || err.message || "command failed", ok: false };
+  }
+}
+function resolveSource(selection, cwd, stdinContent) {
+  switch (selection.kind) {
+    case "pr": {
+      const cap = capture("gh", ["pr", "diff", String(selection.pr)], cwd);
+      if (!cap.ok) {
+        console.error(
+          `ensemble-ai review: \`gh pr diff ${selection.pr}\` failed: ${cap.error}`
+        );
+        return { code: 3 };
+      }
+      if (!cap.text.trim()) {
+        console.error(`ensemble-ai review: PR #${selection.pr} has an empty diff`);
+        return { code: 3 };
+      }
+      return { diffMode: "pr", diffText: cap.text };
+    }
+    case "diff-file": {
+      try {
+        return { diffText: fs7.readFileSync(String(selection.diffFile), "utf8") };
+      } catch (e) {
+        console.error(
+          `ensemble-ai review: cannot read --diff-file: ${e.message}`
+        );
+        return { code: 3 };
+      }
+    }
+    case "stdin":
+      return { diffText: stdinContent };
+    case "staged":
+      return { staged: true };
+    case "working-tree":
+      return { workingTree: true };
+    case "commit":
+      return {};
+  }
+}
+var SEVERITY_LABEL = {
+  high: "HIGH",
+  low: "LOW",
+  medium: "MED"
+};
+var SEVERITY_ORDER = ["high", "medium", "low"];
+function hasHighFinding(reviews) {
+  return reviews.some(
+    (r) => r.terminalState === "reviewed" && r.findings.some((f) => f.severity === "high")
+  );
+}
+function reviewerTally(r) {
+  const id = r.reviewerId ?? r.reviewer.vendor;
+  if (r.terminalState !== "reviewed") return `${id} failed`;
+  const counts = { high: 0, low: 0, medium: 0 };
+  for (const f of r.findings) counts[f.severity]++;
+  const parts = SEVERITY_ORDER.filter((s) => counts[s] > 0).map(
+    (s) => `${counts[s]}${SEVERITY_LABEL[s][0]}`
+  );
+  return `${id} ${parts.length ? parts.join("/") : "clean"}`;
+}
+function oneLineSummary(result) {
+  const tallies = result.reviews.map(reviewerTally).join(" \xB7 ");
+  const receipt = result.receipt ? `receipt ${result.receipt.diffDigest.slice(0, 19)}\u2026` : "receipt none";
+  return `${tallies} \xB7 ${receipt}`;
+}
+function evidenceRef(file, line) {
+  if (!file) return "(uncited)";
+  return line ? `${file}:${line}` : file;
+}
+function reviewerBlock(r) {
+  const id = r.reviewerId ?? r.reviewer.vendor;
+  const out = [];
+  out.push("");
+  out.push(
+    `  \u2500\u2500 ${id} [${r.reviewer.vendor} \xB7 ${r.reviewer.model}] \u2014 ${r.terminalState} \u2500\u2500`
+  );
+  if (r.terminalState !== "reviewed") {
+    out.push(`     ${r.summary.replace(/\s+/g, " ").slice(0, 200)}`);
+    return out;
+  }
+  if (r.findings.length === 0) {
+    out.push("     no findings");
+    return out;
+  }
+  for (const sev of SEVERITY_ORDER) {
+    const group = r.findings.filter((f) => f.severity === sev);
+    if (group.length === 0) continue;
+    out.push(`     ${SEVERITY_LABEL[sev]}`);
+    for (const f of group) {
+      out.push(`       ${evidenceRef(f.evidence.file, f.evidence.line)}  ${f.title}`);
+    }
+  }
+  return out;
 }
 function printSummary(result) {
   const a = result.acquired;
@@ -1259,14 +1419,7 @@ function printSummary(result) {
     console.error(out.join("\n"));
     return;
   }
-  out.push("");
-  for (const r of result.reviews) {
-    const high = r.findings.filter((f) => f.severity === "high").length;
-    out.push(
-      `  ${r.reviewerId} [${r.reviewer.vendor} \xB7 ${r.reviewer.model}]: ${r.terminalState} \u2014 ${r.findings.length} finding(s)${high ? `, ${high} high` : ""}`
-    );
-    if (r.summary) out.push(`      ${r.summary.replace(/\s+/g, " ").slice(0, 200)}`);
-  }
+  for (const r of result.reviews) out.push(...reviewerBlock(r));
   out.push("");
   if (result.receipt) {
     out.push(`  receipt: ${result.receiptPath}`);
@@ -1276,6 +1429,8 @@ function printSummary(result) {
   } else {
     out.push(`  receipt: none \u2014 ${result.receiptError ?? "not qualified"}`);
   }
+  out.push("");
+  out.push(`  ${oneLineSummary(result)}`);
   out.push("");
   console.log(out.join("\n"));
 }
@@ -1292,10 +1447,13 @@ async function reviewCommand(args) {
         cwd: { type: "string" },
         "diff-file": { type: "string" },
         help: { short: "h", type: "boolean" },
+        "no-fail-on-high": { type: "boolean" },
         out: { type: "string" },
+        pr: { type: "string" },
         reviewers: { type: "string" },
         "run-id": { type: "string" },
         sandbox: { type: "string" },
+        staged: { type: "boolean" },
         "working-tree": { type: "boolean" }
       }
     }));
@@ -1309,18 +1467,20 @@ async function reviewCommand(args) {
     return 0;
   }
   const cwd = values.cwd ? path6.resolve(String(values.cwd)) : process.cwd();
-  let diffText;
-  const diffFile = values["diff-file"];
-  if (typeof diffFile === "string") {
-    try {
-      diffText = fs7.readFileSync(diffFile, "utf8");
-    } catch (e) {
-      console.error(`ensemble-ai review: cannot read --diff-file: ${e.message}`);
-      return 3;
-    }
-  } else if (!values["working-tree"]) {
-    diffText = readStdinIfPiped();
+  const stdinContent = readStdinIfPiped();
+  const selection = selectDiffSource({
+    diffFile: typeof values["diff-file"] === "string" ? values["diff-file"] : void 0,
+    pr: typeof values.pr === "string" ? values.pr : void 0,
+    staged: Boolean(values.staged),
+    stdinPiped: stdinContent !== void 0,
+    workingTree: Boolean(values["working-tree"])
+  });
+  if (isDiffSourceError(selection)) {
+    console.error(`ensemble-ai review: ${selection.error}`);
+    return 3;
   }
+  const source = resolveSource(selection, cwd, stdinContent);
+  if ("code" in source) return source.code;
   let reviewers;
   if (typeof values.reviewers === "string") {
     const requested = values.reviewers.split(",").map((s) => s.trim()).filter(Boolean);
@@ -1347,13 +1507,15 @@ async function reviewCommand(args) {
       base: typeof values.base === "string" ? values.base : void 0,
       ceilingBytes,
       cwd,
-      diffText,
+      diffMode: source.diffMode,
+      diffText: source.diffText,
       onProgress: (m) => console.error(`\xB7 ${m}`),
       out,
       reviewers,
       runId,
       sandbox: typeof values.sandbox === "string" ? values.sandbox : void 0,
-      workingTree: Boolean(values["working-tree"])
+      staged: source.staged,
+      workingTree: source.workingTree
     });
   } catch (e) {
     console.error(`ensemble-ai review: ${e.message}`);
@@ -1363,7 +1525,9 @@ async function reviewCommand(args) {
   console.error(`trail: ${out}`);
   if (result.blocked) return 2;
   const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
-  return allReviewed ? 0 : 1;
+  if (!allReviewed) return 1;
+  if (!values["no-fail-on-high"] && hasHighFinding(result.reviews)) return 4;
+  return 0;
 }
 async function main(argv) {
   const mode = argv[0];

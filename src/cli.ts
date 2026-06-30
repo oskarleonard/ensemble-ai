@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -11,9 +12,17 @@ import {
   parseReviewerIds,
   REVIEWER_IDS,
   type ReviewerId,
+  type Severity,
+  type StoredReview,
 } from './core/types';
 import { isImplemented, isMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
+import type { DiffMode } from './modes/review/diff';
+import {
+  type DiffSourceSelection,
+  isDiffSourceError,
+  selectDiffSource,
+} from './modes/review/source';
 
 const USAGE = `ensemble-ai — convene multiple AI models on a task, read-only.
 
@@ -27,17 +36,24 @@ Modes:
 
 Run \`ensemble-ai review --help\` for review options.`;
 
-const REVIEW_USAGE = `ensemble-ai review — cross-vendor review of a code diff.
+const REVIEW_USAGE = `ensemble-ai review — review a diff with ALL configured AI reviewers.
 
-Diff source (first match wins):
-  --diff-file <path>   review a raw unified diff from a file
-  (stdin)              piped diff, e.g. \`git diff main...HEAD | ensemble-ai review\`
-  --working-tree       review uncommitted tracked changes vs HEAD
-  (default)            review <base>...HEAD (base auto-resolved like \`gh pr create\`)
+Runs every reviewer in the registry (codex + grok) by default and prints their
+findings grouped by severity. With NO source flag it reviews the current branch.
+
+Diff source (give at most ONE; default = current branch):
+  (default)            <base>...HEAD — the current branch vs its merge-base with
+                       the default branch (origin/main; resolved like \`gh pr create\`)
+  --pr <N>             the diff of GitHub PR #N (via \`gh pr diff <N>\`)
+  --staged             staged changes (\`git diff --cached\`)
+  --working-tree       uncommitted tracked changes vs HEAD (\`git diff HEAD\`)
+  --diff-file <path>   a raw unified diff read from a file
+  (stdin)              a piped diff, e.g. \`git diff main...HEAD | ensemble-ai review\`
 
 Options:
   --base <ref>          base ref for the default (commit) mode
   --reviewers <ids>     comma-separated reviewer ids (default: all configured)
+  --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
   --out <dir>           trail output dir (default: a temp dir, printed)
   --sandbox <profile>   reviewer sandbox profile override (deny-by-default only)
   --allow-sensitive     review even if the diff carries secrets/sensitive paths
@@ -46,8 +62,9 @@ Options:
   --run-id <id>         trail/receipt run id (default: generated)
   -h, --help            this help
 
-Exit codes: 0 = review completed (even WITH findings) · 1 = a reviewer failed
-(crash/timeout/no-parse) · 2 = blocked by the secret-scan · 3 = usage / no diff.`;
+Exit codes: 0 = completed, no HIGH (or gate disabled) · 1 = a reviewer failed
+(crash/timeout/no-parse) · 2 = blocked by the secret-scan · 3 = usage / no diff ·
+4 = completed WITH a HIGH finding (the gate; disable with --no-fail-on-high).`;
 
 function genRunId(): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -62,6 +79,150 @@ function readStdinIfPiped(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+// Capture a child command's stdout (e.g. `gh pr diff N`). A PR diff can be large,
+// so the buffer ceiling is generous; a non-zero exit / missing binary returns the
+// error text so the CLI can fail with a clear message (exit 3) instead of throwing.
+function capture(
+  cmd: string,
+  cmdArgs: string[],
+  cwd: string
+): { error: string; ok: false } | { ok: true; text: string } {
+  try {
+    const text = execFileSync(cmd, cmdArgs, {
+      cwd,
+      encoding: 'utf8',
+      maxBuffer: 256 * 1024 * 1024,
+    });
+    return { ok: true, text };
+  } catch (e) {
+    const err = e as { stderr?: Buffer | string; message?: string };
+    const stderr = err.stderr ? String(err.stderr).trim() : '';
+    return { error: stderr || err.message || 'command failed', ok: false };
+  }
+}
+
+// Turn the resolved diff-source SELECTION into the engine inputs, running the
+// git/gh I/O each source needs. Returns a usage-error code (3) on any failure so
+// the caller can return it directly.
+function resolveSource(
+  selection: DiffSourceSelection,
+  cwd: string,
+  stdinContent: string | undefined
+):
+  | { code: number }
+  | {
+      diffMode?: DiffMode;
+      diffText?: string;
+      staged?: boolean;
+      workingTree?: boolean;
+    } {
+  switch (selection.kind) {
+    case 'pr': {
+      const cap = capture('gh', ['pr', 'diff', String(selection.pr)], cwd);
+      if (!cap.ok) {
+        console.error(
+          `ensemble-ai review: \`gh pr diff ${selection.pr}\` failed: ${cap.error}`
+        );
+        return { code: 3 };
+      }
+      if (!cap.text.trim()) {
+        console.error(`ensemble-ai review: PR #${selection.pr} has an empty diff`);
+        return { code: 3 };
+      }
+      return { diffMode: 'pr', diffText: cap.text };
+    }
+    case 'diff-file': {
+      try {
+        return { diffText: fs.readFileSync(String(selection.diffFile), 'utf8') };
+      } catch (e) {
+        console.error(
+          `ensemble-ai review: cannot read --diff-file: ${(e as Error).message}`
+        );
+        return { code: 3 };
+      }
+    }
+    case 'stdin':
+      return { diffText: stdinContent };
+    case 'staged':
+      return { staged: true };
+    case 'working-tree':
+      return { workingTree: true };
+    case 'commit':
+      return {};
+  }
+}
+
+const SEVERITY_LABEL: Record<Severity, string> = {
+  high: 'HIGH',
+  low: 'LOW',
+  medium: 'MED',
+};
+const SEVERITY_ORDER: Severity[] = ['high', 'medium', 'low'];
+
+// True iff any COMPLETED reviewer surfaced a HIGH finding — the gate signal.
+function hasHighFinding(reviews: StoredReview[]): boolean {
+  return reviews.some(
+    (r) =>
+      r.terminalState === 'reviewed' &&
+      r.findings.some((f) => f.severity === 'high')
+  );
+}
+
+// The per-reviewer one-line tally for the gate-friendly summary, e.g. `codex 1H/2M`,
+// `grok 2H`, `codex clean`, `grok failed`.
+function reviewerTally(r: StoredReview): string {
+  const id = r.reviewerId ?? r.reviewer.vendor;
+  if (r.terminalState !== 'reviewed') return `${id} failed`;
+  const counts: Record<Severity, number> = { high: 0, low: 0, medium: 0 };
+  for (const f of r.findings) counts[f.severity]++;
+  const parts = SEVERITY_ORDER.filter((s) => counts[s] > 0).map(
+    (s) => `${counts[s]}${SEVERITY_LABEL[s][0]}`
+  );
+  return `${id} ${parts.length ? parts.join('/') : 'clean'}`;
+}
+
+// `codex 1H/2M · grok 2H · receipt sha256:abc…` — one line a gate/log can grep.
+function oneLineSummary(result: ReviewModeResult): string {
+  const tallies = result.reviews.map(reviewerTally).join(' · ');
+  const receipt = result.receipt
+    ? `receipt ${result.receipt.diffDigest.slice(0, 19)}…`
+    : 'receipt none';
+  return `${tallies} · ${receipt}`;
+}
+
+function evidenceRef(file?: string, line?: number): string {
+  if (!file) return '(uncited)';
+  return line ? `${file}:${line}` : file;
+}
+
+// Per-reviewer findings grouped by severity (HIGH → MED → LOW), each line carrying
+// its file:line evidence so a finding is actionable straight from stdout.
+function reviewerBlock(r: StoredReview): string[] {
+  const id = r.reviewerId ?? r.reviewer.vendor;
+  const out: string[] = [];
+  out.push('');
+  out.push(
+    `  ── ${id} [${r.reviewer.vendor} · ${r.reviewer.model}] — ${r.terminalState} ──`
+  );
+  if (r.terminalState !== 'reviewed') {
+    out.push(`     ${r.summary.replace(/\s+/g, ' ').slice(0, 200)}`);
+    return out;
+  }
+  if (r.findings.length === 0) {
+    out.push('     no findings');
+    return out;
+  }
+  for (const sev of SEVERITY_ORDER) {
+    const group = r.findings.filter((f) => f.severity === sev);
+    if (group.length === 0) continue;
+    out.push(`     ${SEVERITY_LABEL[sev]}`);
+    for (const f of group) {
+      out.push(`       ${evidenceRef(f.evidence.file, f.evidence.line)}  ${f.title}`);
+    }
+  }
+  return out;
 }
 
 function printSummary(result: ReviewModeResult): void {
@@ -90,14 +251,7 @@ function printSummary(result: ReviewModeResult): void {
     console.error(out.join('\n'));
     return;
   }
-  out.push('');
-  for (const r of result.reviews) {
-    const high = r.findings.filter((f) => f.severity === 'high').length;
-    out.push(
-      `  ${r.reviewerId} [${r.reviewer.vendor} · ${r.reviewer.model}]: ${r.terminalState} — ${r.findings.length} finding(s)${high ? `, ${high} high` : ''}`
-    );
-    if (r.summary) out.push(`      ${r.summary.replace(/\s+/g, ' ').slice(0, 200)}`);
-  }
+  for (const r of result.reviews) out.push(...reviewerBlock(r));
   out.push('');
   if (result.receipt) {
     out.push(`  receipt: ${result.receiptPath}`);
@@ -107,6 +261,8 @@ function printSummary(result: ReviewModeResult): void {
   } else {
     out.push(`  receipt: none — ${result.receiptError ?? 'not qualified'}`);
   }
+  out.push('');
+  out.push(`  ${oneLineSummary(result)}`);
   out.push('');
   console.log(out.join('\n'));
 }
@@ -124,10 +280,13 @@ async function reviewCommand(args: string[]): Promise<number> {
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
+        'no-fail-on-high': { type: 'boolean' },
         out: { type: 'string' },
+        pr: { type: 'string' },
         reviewers: { type: 'string' },
         'run-id': { type: 'string' },
         sandbox: { type: 'string' },
+        staged: { type: 'boolean' },
         'working-tree': { type: 'boolean' },
       },
     }));
@@ -142,18 +301,24 @@ async function reviewCommand(args: string[]): Promise<number> {
   }
 
   const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
-  let diffText: string | undefined;
-  const diffFile = values['diff-file'];
-  if (typeof diffFile === 'string') {
-    try {
-      diffText = fs.readFileSync(diffFile, 'utf8');
-    } catch (e) {
-      console.error(`ensemble-ai review: cannot read --diff-file: ${(e as Error).message}`);
-      return 3;
-    }
-  } else if (!values['working-tree']) {
-    diffText = readStdinIfPiped();
+
+  // Resolve the diff source: at most one explicit flag (--pr/--staged/--working-tree/
+  // --diff-file), else a piped diff, else the default current-branch range. The
+  // selector is PURE; this then runs the git/gh I/O the chosen source needs.
+  const stdinContent = readStdinIfPiped();
+  const selection = selectDiffSource({
+    diffFile: typeof values['diff-file'] === 'string' ? values['diff-file'] : undefined,
+    pr: typeof values.pr === 'string' ? values.pr : undefined,
+    staged: Boolean(values.staged),
+    stdinPiped: stdinContent !== undefined,
+    workingTree: Boolean(values['working-tree']),
+  });
+  if (isDiffSourceError(selection)) {
+    console.error(`ensemble-ai review: ${selection.error}`);
+    return 3;
   }
+  const source = resolveSource(selection, cwd, stdinContent);
+  if ('code' in source) return source.code;
 
   // "no --reviewers" → undefined → run the full default set. But if --reviewers IS
   // given, EVERY token must be a known id: a typo like `codex,grokk` must error,
@@ -195,13 +360,15 @@ async function reviewCommand(args: string[]): Promise<number> {
       base: typeof values.base === 'string' ? values.base : undefined,
       ceilingBytes,
       cwd,
-      diffText,
+      diffMode: source.diffMode,
+      diffText: source.diffText,
       onProgress: (m) => console.error(`· ${m}`),
       out,
       reviewers,
       runId,
       sandbox: typeof values.sandbox === 'string' ? values.sandbox : undefined,
-      workingTree: Boolean(values['working-tree']),
+      staged: source.staged,
+      workingTree: source.workingTree,
     });
   } catch (e) {
     console.error(`ensemble-ai review: ${(e as Error).message}`);
@@ -211,12 +378,16 @@ async function reviewCommand(args: string[]): Promise<number> {
   printSummary(result);
   console.error(`trail: ${out}`);
   if (result.blocked) return 2;
-  // Exit code = EXECUTION status, never a gate verdict: 0 even WITH findings; 1
-  // only when a reviewer failed to complete (crash / timeout / no parse).
+  // 1 = a reviewer failed to complete (crash / timeout / no parse) — the review is
+  // not trustworthy, so this outranks the findings gate below.
   const allReviewed =
     result.reviews.length > 0 &&
     result.reviews.every((r) => r.terminalState === 'reviewed');
-  return allReviewed ? 0 : 1;
+  if (!allReviewed) return 1;
+  // 4 = the findings GATE: a completed review surfaced a HIGH. Gate-usable by
+  // default (a pre-PR hook can fail on it); --no-fail-on-high opts out → 0.
+  if (!values['no-fail-on-high'] && hasHighFinding(result.reviews)) return 4;
+  return 0;
 }
 
 export async function main(argv: string[]): Promise<number> {

@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ReviewerId, StoredReview, TerminalState } from './core/types';
+import type {
+  ReviewerId,
+  Severity,
+  StoredReview,
+  TerminalState,
+} from './core/types';
 import type { ReviewModeResult } from './modes/review';
 
 // Mock the engine so the CLI's arg-parsing + exit-code CONTRACT is tested without
@@ -15,7 +20,8 @@ const mockRun = vi.mocked(runReviewMode);
 function storedReview(
   reviewerId: ReviewerId,
   terminalState: TerminalState,
-  findings = 0
+  findings = 0,
+  severity: Severity = 'high'
 ): StoredReview {
   return {
     findings: Array.from({ length: findings }, (_, i) => ({
@@ -23,7 +29,7 @@ function storedReview(
       confidence: 'high',
       evidence: { file: 'a.ts' },
       id: `f${i + 1}`,
-      severity: 'high',
+      severity,
       title: 't',
     })),
     packet: { complete: true, manifest: [] },
@@ -65,15 +71,36 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('exit code = execution status, never a gate verdict', () => {
-  it('exits 0 on a completed review EVEN WITH findings', async () => {
-    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed', 3)] }));
+describe('exit code', () => {
+  it('exits 0 on a completed review with NO high findings (med/low only)', async () => {
+    mockRun.mockResolvedValue(
+      result({ reviews: [storedReview('codex', 'reviewed', 3, 'medium')] })
+    );
     expect(await main(['review', '--working-tree'])).toBe(0);
   });
 
-  it('exits 1 when a reviewer FAILED (crash/timeout/no-parse)', async () => {
+  it('exits 4 (the gate) on a completed review WITH a HIGH finding', async () => {
     mockRun.mockResolvedValue(
-      result({ reviews: [storedReview('codex', 'reviewed'), storedReview('grok', 'failed-reviewer')] })
+      result({ reviews: [storedReview('codex', 'reviewed', 1, 'high')] })
+    );
+    expect(await main(['review', '--working-tree'])).toBe(4);
+  });
+
+  it('--no-fail-on-high downgrades the HIGH gate back to 0', async () => {
+    mockRun.mockResolvedValue(
+      result({ reviews: [storedReview('codex', 'reviewed', 1, 'high')] })
+    );
+    expect(await main(['review', '--working-tree', '--no-fail-on-high'])).toBe(0);
+  });
+
+  it('a reviewer FAILURE (exit 1) outranks the HIGH gate', async () => {
+    mockRun.mockResolvedValue(
+      result({
+        reviews: [
+          storedReview('codex', 'reviewed', 1, 'high'),
+          storedReview('grok', 'failed-reviewer'),
+        ],
+      })
     );
     expect(await main(['review', '--working-tree'])).toBe(1);
   });
@@ -122,5 +149,42 @@ describe('flag threading', () => {
     expect(mockRun).toHaveBeenCalledWith(
       expect.objectContaining({ allowSensitive: true, reviewers: ['codex'], workingTree: true })
     );
+  });
+});
+
+describe('diff-source resolution → engine inputs (all reviewers by default)', () => {
+  it('NO --reviewers → reviewers undefined (engine runs ALL configured)', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
+    await main(['review', '--working-tree']);
+    expect(mockRun).toHaveBeenCalledWith(
+      expect.objectContaining({ reviewers: undefined })
+    );
+  });
+
+  it('no source flag → commit mode (no diffText / staged / workingTree)', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
+    await main(['review']);
+    const opts = mockRun.mock.calls[0][0];
+    expect(opts.diffText).toBeUndefined();
+    expect(opts.staged).toBeFalsy();
+    expect(opts.workingTree).toBeFalsy();
+  });
+
+  it('--staged threads staged:true to the engine', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
+    await main(['review', '--staged']);
+    expect(mockRun).toHaveBeenCalledWith(
+      expect.objectContaining({ staged: true })
+    );
+  });
+
+  it('--pr with a non-numeric value → usage error (exit 3), no review fired', async () => {
+    expect(await main(['review', '--pr', 'abc'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+
+  it('two explicit sources (--pr + --staged) → usage error (exit 3), no review fired', async () => {
+    expect(await main(['review', '--pr', '5', '--staged'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
   });
 });
