@@ -77,7 +77,14 @@ function parseFindings(raw) {
   }
   const o = obj;
   const summary = typeof o.summary === "string" ? o.summary : "";
-  const rawFindings = Array.isArray(o.findings) ? o.findings : [];
+  if (!Array.isArray(o.findings)) {
+    return {
+      findings: [],
+      parseError: 'reviewer output has no "findings" array \u2014 not a conforming review',
+      summary
+    };
+  }
+  const rawFindings = o.findings;
   const findings = [];
   rawFindings.forEach((rf, i) => {
     if (!rf || typeof rf !== "object") return;
@@ -101,7 +108,7 @@ function parseFindings(raw) {
 var PACKET_BUDGETS = {
   agents: 12e3,
   constraints: 4e3,
-  diff: 12e4,
+  diff: 2e5,
   files: 4e4,
   history: 4e3,
   objective: 2e3,

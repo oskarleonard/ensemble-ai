@@ -61,6 +61,7 @@ const BASE = {
   coveragePolicy: { ceilingBytes: 200_000 },
   diffDigest: 'sha256:deadbeef',
   diffMode: 'commit' as const,
+  diffTruncated: false,
   headSha: 'bbb',
   repo: 'https://example/repo',
   runId: 'run-1',
@@ -129,6 +130,18 @@ describe('buildDiffReceipt', () => {
     });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/src\/big\.ts/);
+  });
+
+  it('does NOT qualify when the diff was truncated to fit the prompt budget', () => {
+    const r = buildDiffReceipt({
+      ...BASE,
+      coverage: coverage(),
+      diffTruncated: true,
+      required: ['codex', 'grok'],
+      reviews: [review('codex', 'openai'), review('grok', 'xai')],
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/truncated/);
   });
 });
 

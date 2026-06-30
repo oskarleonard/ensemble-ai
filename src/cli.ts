@@ -6,7 +6,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { parseReviewerIds, REVIEWER_IDS, type ReviewerId } from './core/types';
+import {
+  isReviewerId,
+  parseReviewerIds,
+  REVIEWER_IDS,
+  type ReviewerId,
+} from './core/types';
 import { isImplemented, isMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
 
@@ -150,18 +155,26 @@ async function reviewCommand(args: string[]): Promise<number> {
     diffText = readStdinIfPiped();
   }
 
-  // Distinguish "no --reviewers" (→ undefined → run the full default set) from
-  // "--reviewers given but NOTHING valid" (a typo). The latter must NOT silently
-  // widen to all reviewers — the user asked to narrow, so fail closed.
+  // "no --reviewers" → undefined → run the full default set. But if --reviewers IS
+  // given, EVERY token must be a known id: a typo like `codex,grokk` must error,
+  // never silently drop the unknown and run a narrower set than the user asked for
+  // (which would also mint a receipt under a weaker policy). Fail closed.
   let reviewers: ReviewerId[] | undefined;
   if (typeof values.reviewers === 'string') {
-    reviewers = parseReviewerIds(values.reviewers.split(',').map((s) => s.trim()));
-    if (!reviewers) {
+    const requested = values.reviewers
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const unknown = requested.filter((id) => !isReviewerId(id));
+    if (unknown.length > 0 || requested.length === 0) {
       console.error(
-        `ensemble-ai review: --reviewers "${values.reviewers}" names no known reviewer (known: ${REVIEWER_IDS.join(', ')})`
+        `ensemble-ai review: --reviewers "${values.reviewers}" ${
+          unknown.length ? `has unknown id(s): ${unknown.join(', ')}` : 'is empty'
+        } (known: ${REVIEWER_IDS.join(', ')})`
       );
       return 3;
     }
+    reviewers = parseReviewerIds(requested);
   }
   const runId = typeof values['run-id'] === 'string' ? values['run-id'] : genRunId();
   const out =

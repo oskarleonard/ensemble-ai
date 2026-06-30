@@ -26,7 +26,9 @@ const SENSITIVE_PATH_PATTERNS: { label: string; re: RegExp }[] = [
 
 // Inline credential patterns — high-precision only (to avoid false-positive
 // noise): private-key headers + a few well-shaped provider tokens. Matched on
-// ADDED diff lines (the payload being introduced).
+// EVERY transmitted diff line (added, removed, AND context) — see payloadLines:
+// the whole diff section is sent to the provider, so a secret on a deleted or
+// unchanged-context line leaks just as readily as one on an added line.
 const INLINE_SECRET_PATTERNS: { label: string; re: RegExp }[] = [
   { label: 'private-key-block', re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
   { label: 'aws-access-key', re: /\bAKIA[0-9A-Z]{16}\b/ },
@@ -57,10 +59,19 @@ export interface SecretScanResult {
   sensitivePaths: SensitivePathHit[];
 }
 
-function addedLines(section: string): string[] {
+// Every CONTENT line of the diff section actually transmitted to the reviewer:
+// added (+), removed (-), AND context ( ) lines, minus the +++/--- file headers
+// (the @@/diff --git/index metadata lines start with none of +/-/space). The
+// leading +/-/space marker is stripped so a pattern matches the bare content.
+function payloadLines(section: string): string[] {
   return section
     .split('\n')
-    .filter((l) => l.startsWith('+') && !l.startsWith('+++'))
+    .filter(
+      (l) =>
+        (l.startsWith('+') && !l.startsWith('+++')) ||
+        (l.startsWith('-') && !l.startsWith('---')) ||
+        l.startsWith(' ')
+    )
     .map((l) => l.slice(1));
 }
 
@@ -76,9 +87,9 @@ export function scanDiffForSecrets(
       if (re.test(f.path)) sensitivePaths.push({ label, path: f.path });
     }
     if (f.isBinary) continue;
-    const added = addedLines(f.raw);
+    const lines = payloadLines(f.raw);
     for (const { label, re } of INLINE_SECRET_PATTERNS) {
-      if (added.some((line) => re.test(line))) {
+      if (lines.some((line) => re.test(line))) {
         inlineSecrets.push({ label, path: f.path });
       }
     }

@@ -98,7 +98,18 @@ export function parseFindings(raw: string): ParsedReview {
   }
   const o = obj as Record<string, unknown>;
   const summary = typeof o.summary === 'string' ? o.summary : '';
-  const rawFindings = Array.isArray(o.findings) ? o.findings : [];
+  // A conforming review carries a `findings` ARRAY (possibly empty). A JSON object
+  // that lacks one — `{}`, `{"error":"quota exceeded"}`, or prose that parsed to the
+  // wrong braces — is NOT a review: return a parseError so the caller records
+  // failed-reviewer, never a falsely-"reviewed" run with zero findings.
+  if (!Array.isArray(o.findings)) {
+    return {
+      findings: [],
+      parseError: 'reviewer output has no "findings" array — not a conforming review',
+      summary,
+    };
+  }
+  const rawFindings = o.findings;
   const findings: ReviewFinding[] = [];
   rawFindings.forEach((rf, i) => {
     if (!rf || typeof rf !== 'object') return;

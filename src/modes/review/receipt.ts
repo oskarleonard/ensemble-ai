@@ -182,8 +182,10 @@ export interface BuildReceiptResult {
 
 // PURE: at write time, decide whether the review QUALIFIES the diff and, if so,
 // build the receipt. Enforces: every required reviewer reached terminalState
-// 'reviewed' (facts — NO gate) AND coverage has no omitted source file. Builds
-// exactly the receipt isDiffReviewed will then accept.
+// 'reviewed' (facts — NO gate) AND coverage has no omitted source file AND the
+// diff was NOT truncated to fit the prompt (a truncated payload means the reviewer
+// saw only head+tail, so the receipt would over-claim). Builds exactly the receipt
+// isDiffReviewed will then accept.
 export function buildDiffReceipt(args: {
   baseRef: string | null;
   baseSha: string | null;
@@ -191,6 +193,9 @@ export function buildDiffReceipt(args: {
   coveragePolicy: CoveragePolicy;
   diffDigest: string;
   diffMode: DiffMode;
+  // True when the covered diff exceeded the prompt budget and was truncated, so
+  // the reviewer did NOT see the whole change → must not qualify a receipt.
+  diffTruncated: boolean;
   headSha: string;
   repo: string | null;
   required: ReviewerId[];
@@ -202,6 +207,13 @@ export function buildDiffReceipt(args: {
   if (shortfall.length > 0) {
     return {
       error: `coverage incomplete — omitted source file(s): ${shortfall.join(', ')}`,
+      ok: false,
+    };
+  }
+  if (args.diffTruncated) {
+    return {
+      error:
+        'coverage incomplete — the diff exceeded the prompt budget and was truncated, so the reviewer saw only its head+tail, not the whole change',
       ok: false,
     };
   }

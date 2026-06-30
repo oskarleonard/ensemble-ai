@@ -130,13 +130,18 @@ export function ensureSandboxProfile(
     const updated = existing.includes(REVIEW_PROFILE_HEADER)
       ? replaceReviewSection(existing) // stale block → replace in place
       : null;
-    fs.writeFileSync(
-      file,
+    const content =
       updated ??
-        (existing.trim()
-          ? `${existing.trimEnd()}\n\n${REVIEW_PROFILE}`
-          : REVIEW_PROFILE)
-    );
+      (existing.trim()
+        ? `${existing.trimEnd()}\n\n${REVIEW_PROFILE}`
+        : REVIEW_PROFILE);
+    // Atomic write (tmp + rename): a crash/SIGKILL mid-write must never leave the
+    // user's sandbox.toml truncated — that would corrupt OTHER profiles in the file
+    // or break ensemble-review so the next grok review fails closed. (Same rule as
+    // writeAtomic for the run artifacts.)
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, content);
+    fs.renameSync(tmp, file);
   } catch {
     // best-effort; grok fail-closes if the profile is still absent
   }

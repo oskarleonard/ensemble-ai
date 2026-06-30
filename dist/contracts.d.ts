@@ -81,7 +81,7 @@ declare function parseFindings(raw: string): ParsedReview;
 declare const PACKET_BUDGETS: {
     readonly agents: 12000;
     readonly constraints: 4000;
-    readonly diff: 120000;
+    readonly diff: 200000;
     readonly files: 40000;
     readonly history: 4000;
     readonly objective: 2000;

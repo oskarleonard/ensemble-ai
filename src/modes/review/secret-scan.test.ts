@@ -56,6 +56,23 @@ describe('scanDiffForSecrets — inline secrets', () => {
     expect(r.blocked).toBe(true);
   });
 
+  it('flags a secret on a REMOVED line, not just added lines (the whole diff is transmitted)', () => {
+    // A secret being DELETED is still in the diff payload sent to the provider, so
+    // the scan must catch it — it must not only look at '+' lines.
+    const removed = `diff --git a/src/c.ts b/src/c.ts
+index 111..222 100644
+--- a/src/c.ts
++++ b/src/c.ts
+@@ -1,3 +1,2 @@
+ const ok = 1;
+-const k = "AKIAIOSFODNN7EXAMPLE";
+ export { ok };
+`;
+    const r = scanDiffForSecrets(parseDiffFiles(removed));
+    expect(r.inlineSecrets.map((s) => s.label)).toContain('aws-access-key');
+    expect(r.blocked).toBe(true);
+  });
+
   it('flags a private-key block header', () => {
     const files = parseDiffFiles(
       diffFor('key.txt', ['-----BEGIN RSA PRIVATE KEY-----'])

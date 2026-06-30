@@ -3,11 +3,15 @@ import type { PacketSection, ReviewPacket } from './types';
 // Per-section character budgets — bound the prompt BY CONSTRUCTION (the
 // "prompt-too-big" risk). Windows are large now, so these are generous, but the
 // diff is the signal: it gets the lion's share and surrounding context is capped
-// so it can't drown it.
+// so it can't drown it. The diff budget is kept >= the coverage ceiling
+// (DEFAULT_COVERAGE_CEILING, 200k) so a diff coverage marked fully-included is
+// shipped WHOLE, not silently truncated to head+tail — else the receipt would
+// certify code the reviewer never saw. (A diff still over this budget is truncated
+// and the receipt is then disqualified — see buildDiffReceipt's diffTruncated.)
 export const PACKET_BUDGETS = {
   agents: 12_000,
   constraints: 4_000,
-  diff: 120_000,
+  diff: 200_000,
   files: 40_000,
   history: 4_000,
   objective: 2_000,

@@ -4,7 +4,7 @@ Cross-vendor AI CLI — convene multiple models (Codex, Grok, …) on a task, **
 
 Modes (architected mode-first): **`review`** — a code diff — is implemented; `brainstorm` and `security` are reserved.
 
-It's the portable engine behind a cross-vendor *code review* workflow: give it a `git diff`, it runs each configured reviewer in an **OS-enforced, deny-by-default-reads sandbox**, parses their output into typed findings, and writes a self-describing trail plus a content-tied receipt. It emits **facts** (findings + per-reviewer execution status + coverage + a receipt) — **never a gate verdict**. The gate policy belongs to whatever consumes it (a terminal, a pre-PR hook, a dashboard).
+It's the portable engine behind a cross-vendor *code review* workflow: give it a `git diff`, it runs each configured reviewer **read-only in an OS-enforced sandbox**, parses their output into typed findings, and writes a self-describing trail plus a content-tied receipt. It emits **facts** (findings + per-reviewer execution status + coverage + a receipt) — **never a gate verdict**. The gate policy belongs to whatever consumes it (a terminal, a pre-PR hook, a dashboard).
 
 ## Install
 
@@ -45,7 +45,7 @@ Options: `--base <ref>` · `--reviewers <ids>` · `--out <dir>` · `--sandbox <p
 ## Design
 
 - **Vendor-neutral by construction** — a reviewer is config (`id · model · effort · sandbox`); adding one is a registry entry, not a rewrite.
-- **Read-only, deny-by-default reads** — a reviewer can never mutate the work, and can't read secrets *outside* the diff packet (an OS-enforced sandbox, kernel-fail-closed — not tool-denial).
+- **Read-only, OS-enforced** — a reviewer can never mutate the work (kernel-fail-closed, not tool-denial). Grok additionally runs under a *deny-by-default-reads* profile (`ensemble-review`), so it can't read secrets *outside* the diff packet; Codex runs under its own `-s read-only` (writes + network blocked) and the equivalent read-confinement for Codex is tracked as follow-up. The diff-payload secret-scan (below) is the cross-cutting guard for secrets *inside* the payload.
 - **Diff-payload secret-scan** — the diff itself is the payload sent to a provider, so a preflight scan default-rejects diffs that carry secrets / sensitive paths (override with `--allow-sensitive`); every match is named in the manifest.
 - **Facts, not verdicts** — the engine reports findings + execution status + coverage; the consumer computes the gate.
 - **A verifiable trail** — per-reviewer typed findings JSON + a manifest recording base/head, the canonical-diff content digest (distinct from any commit SHA), each reviewer's model/effort + execution status, and **coverage** (omitted paths named — binary / generated / over-limit — never silently dropped).

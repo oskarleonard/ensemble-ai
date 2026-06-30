@@ -1,6 +1,6 @@
 import { persistReview } from '../../core/artifacts';
 import { parseFindings } from '../../core/findings';
-import { assembleCodePacket } from '../../core/packet';
+import { assembleCodePacket, PACKET_BUDGETS } from '../../core/packet';
 import { renderReviewPrompt } from '../../core/prompt';
 import { loadReviewers } from '../../core/reviewers';
 import {
@@ -229,6 +229,9 @@ export async function runReviewMode(
     coveragePolicy: { ceilingBytes },
     diffDigest: acquired.canonicalDigest,
     diffMode: acquired.mode,
+    // The covered diff is truncated in the packet when it exceeds the diff budget;
+    // a truncated payload must not qualify a receipt (the reviewer saw head+tail).
+    diffTruncated: acquired.diff.length > PACKET_BUDGETS.diff,
     headSha: acquired.headSha,
     repo: acquired.repoId,
     required: reviewers,

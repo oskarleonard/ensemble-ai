@@ -111,4 +111,15 @@ describe('parseFindings', () => {
     expect(r.findings).toEqual([]);
     expect(r.summary).toBe('looks good');
   });
+
+  it('rejects a JSON object with no findings array as a parseError, not a clean review', () => {
+    // An error/quota blob or a stray-braces parse is NOT a review: it must fail
+    // closed (→ failed-reviewer), never a 0-finding "reviewed" run that could
+    // qualify a receipt for a review that did not actually happen.
+    for (const raw of ['{}', '{"error":"quota exceeded"}', '{"summary":"hi"}']) {
+      const r = parseFindings(raw);
+      expect(r.parseError).toBeDefined();
+      expect(r.findings).toEqual([]);
+    }
+  });
 });

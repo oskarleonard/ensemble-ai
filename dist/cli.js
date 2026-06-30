@@ -151,7 +151,14 @@ function parseFindings(raw) {
   }
   const o = obj;
   const summary = typeof o.summary === "string" ? o.summary : "";
-  const rawFindings = Array.isArray(o.findings) ? o.findings : [];
+  if (!Array.isArray(o.findings)) {
+    return {
+      findings: [],
+      parseError: 'reviewer output has no "findings" array \u2014 not a conforming review',
+      summary
+    };
+  }
+  const rawFindings = o.findings;
   const findings = [];
   rawFindings.forEach((rf, i) => {
     if (!rf || typeof rf !== "object") return;
@@ -175,7 +182,7 @@ function parseFindings(raw) {
 var PACKET_BUDGETS = {
   agents: 12e3,
   constraints: 4e3,
-  diff: 12e4,
+  diff: 2e5,
   files: 4e4,
   history: 4e3,
   objective: 2e3,
@@ -616,12 +623,12 @@ function ensureSandboxProfile(profile, file = path4.join(os4.homedir(), ".grok",
     if (existing.includes(REVIEW_PROFILE_BLOCK)) return;
     fs5.mkdirSync(path4.dirname(file), { recursive: true });
     const updated = existing.includes(REVIEW_PROFILE_HEADER) ? replaceReviewSection(existing) : null;
-    fs5.writeFileSync(
-      file,
-      updated ?? (existing.trim() ? `${existing.trimEnd()}
+    const content = updated ?? (existing.trim() ? `${existing.trimEnd()}
 
-${REVIEW_PROFILE}` : REVIEW_PROFILE)
-    );
+${REVIEW_PROFILE}` : REVIEW_PROFILE);
+    const tmp = `${file}.tmp`;
+    fs5.writeFileSync(tmp, content);
+    fs5.renameSync(tmp, file);
   } catch {
   }
 }
@@ -950,6 +957,12 @@ function buildDiffReceipt(args) {
       ok: false
     };
   }
+  if (args.diffTruncated) {
+    return {
+      error: "coverage incomplete \u2014 the diff exceeded the prompt budget and was truncated, so the reviewer saw only its head+tail, not the whole change",
+      ok: false
+    };
+  }
   const vendors = [];
   for (const id of args.required) {
     const r = args.reviews.find((x) => x.reviewerId === id);
@@ -1004,8 +1017,10 @@ var INLINE_SECRET_PATTERNS = [
   { label: "openai-key", re: /\bsk-[A-Za-z0-9]{20,}\b/ },
   { label: "google-api-key", re: /\bAIza[0-9A-Za-z_-]{35}\b/ }
 ];
-function addedLines(section2) {
-  return section2.split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++")).map((l) => l.slice(1));
+function payloadLines(section2) {
+  return section2.split("\n").filter(
+    (l) => l.startsWith("+") && !l.startsWith("+++") || l.startsWith("-") && !l.startsWith("---") || l.startsWith(" ")
+  ).map((l) => l.slice(1));
 }
 function scanDiffForSecrets(files, opts = {}) {
   const sensitivePaths = [];
@@ -1015,9 +1030,9 @@ function scanDiffForSecrets(files, opts = {}) {
       if (re.test(f.path)) sensitivePaths.push({ label, path: f.path });
     }
     if (f.isBinary) continue;
-    const added = addedLines(f.raw);
+    const lines = payloadLines(f.raw);
     for (const { label, re } of INLINE_SECRET_PATTERNS) {
-      if (added.some((line) => re.test(line))) {
+      if (lines.some((line) => re.test(line))) {
         inlineSecrets.push({ label, path: f.path });
       }
     }
@@ -1153,6 +1168,9 @@ async function runReviewMode(opts) {
     coveragePolicy: { ceilingBytes },
     diffDigest: acquired.canonicalDigest,
     diffMode: acquired.mode,
+    // The covered diff is truncated in the packet when it exceeds the diff budget;
+    // a truncated payload must not qualify a receipt (the reviewer saw head+tail).
+    diffTruncated: acquired.diff.length > PACKET_BUDGETS.diff,
     headSha: acquired.headSha,
     repo: acquired.repoId,
     required: reviewers,
@@ -1305,13 +1323,15 @@ async function reviewCommand(args) {
   }
   let reviewers;
   if (typeof values.reviewers === "string") {
-    reviewers = parseReviewerIds(values.reviewers.split(",").map((s) => s.trim()));
-    if (!reviewers) {
+    const requested = values.reviewers.split(",").map((s) => s.trim()).filter(Boolean);
+    const unknown = requested.filter((id) => !isReviewerId(id));
+    if (unknown.length > 0 || requested.length === 0) {
       console.error(
-        `ensemble-ai review: --reviewers "${values.reviewers}" names no known reviewer (known: ${REVIEWER_IDS.join(", ")})`
+        `ensemble-ai review: --reviewers "${values.reviewers}" ${unknown.length ? `has unknown id(s): ${unknown.join(", ")}` : "is empty"} (known: ${REVIEWER_IDS.join(", ")})`
       );
       return 3;
     }
+    reviewers = parseReviewerIds(requested);
   }
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
   const out = typeof values.out === "string" ? path6.resolve(values.out) : path6.join(os6.tmpdir(), "ensemble-ai", runId);

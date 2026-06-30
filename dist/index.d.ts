@@ -214,6 +214,7 @@ declare function buildDiffReceipt(args: {
     coveragePolicy: CoveragePolicy;
     diffDigest: string;
     diffMode: DiffMode;
+    diffTruncated: boolean;
     headSha: string;
     repo: string | null;
     required: ReviewerId[];
