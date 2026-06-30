@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { isDiffSourceError, selectDiffSource } from './source';
+import { hasExplicitSource, isDiffSourceError, selectDiffSource } from './source';
 
 describe('selectDiffSource — diff-source resolution', () => {
   it('no flags, no stdin → commit mode (current branch vs base)', () => {
@@ -64,5 +64,19 @@ describe('selectDiffSource — diff-source resolution', () => {
   it('--diff-file + --working-tree → conflict error', () => {
     const r = selectDiffSource({ diffFile: 'x', workingTree: true });
     expect(isDiffSourceError(r)).toBe(true);
+  });
+});
+
+describe('hasExplicitSource — gates whether the CLI reads stdin', () => {
+  it('false with no source flags (stdin may be read)', () => {
+    expect(hasExplicitSource({})).toBe(false);
+    expect(hasExplicitSource({ stdinPiped: true })).toBe(false);
+  });
+
+  it('true for each explicit source flag (stdin must NOT be read)', () => {
+    expect(hasExplicitSource({ pr: '5' })).toBe(true);
+    expect(hasExplicitSource({ diffFile: 'x' })).toBe(true);
+    expect(hasExplicitSource({ staged: true })).toBe(true);
+    expect(hasExplicitSource({ workingTree: true })).toBe(true);
   });
 });

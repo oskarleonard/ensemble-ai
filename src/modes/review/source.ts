@@ -56,6 +56,18 @@ const FLAG_LABEL: Record<'diff-file' | 'pr' | 'staged' | 'working-tree', string>
   'working-tree': '--working-tree',
 };
 
+// True when the user named an explicit diff source (so the CLI must NOT read stdin
+// — reading a pipe it won't use can block). The one definition of "explicit",
+// shared by the stdin-gating in the CLI and the selection below.
+export function hasExplicitSource(flags: DiffSourceFlags): boolean {
+  return (
+    flags.pr !== undefined ||
+    flags.diffFile !== undefined ||
+    Boolean(flags.staged) ||
+    Boolean(flags.workingTree)
+  );
+}
+
 export function selectDiffSource(
   flags: DiffSourceFlags
 ): DiffSourceSelection | DiffSourceError {

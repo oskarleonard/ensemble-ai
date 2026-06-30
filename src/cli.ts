@@ -20,6 +20,7 @@ import { runReviewMode, type ReviewModeResult } from './modes/review';
 import type { DiffMode } from './modes/review/diff';
 import {
   type DiffSourceSelection,
+  hasExplicitSource,
   isDiffSourceError,
   selectDiffSource,
 } from './modes/review/source';
@@ -137,14 +138,22 @@ function resolveSource(
       return { diffMode: 'pr', diffText: cap.text };
     }
     case 'diff-file': {
+      let text: string;
       try {
-        return { diffText: fs.readFileSync(String(selection.diffFile), 'utf8') };
+        text = fs.readFileSync(String(selection.diffFile), 'utf8');
       } catch (e) {
         console.error(
           `ensemble-ai review: cannot read --diff-file: ${(e as Error).message}`
         );
         return { code: 3 };
       }
+      if (!text.trim()) {
+        console.error(
+          `ensemble-ai review: --diff-file ${selection.diffFile} is empty`
+        );
+        return { code: 3 };
+      }
+      return { diffText: text };
     }
     case 'stdin':
       return { diffText: stdinContent };
@@ -220,7 +229,7 @@ function reviewerBlock(r: StoredReview): string[] {
     `  ── ${id} [${r.reviewer.vendor} · ${r.reviewer.model}] — ${r.terminalState} ──`
   );
   if (r.terminalState !== 'reviewed') {
-    out.push(`     ${r.summary.replace(/\s+/g, ' ').slice(0, 200)}`);
+    out.push(`     ${clean(r.summary).slice(0, 200)}`);
     return out;
   }
   if (r.findings.length === 0) {
@@ -318,21 +327,16 @@ async function reviewCommand(args: string[]): Promise<number> {
   // Resolve the diff source: at most one explicit flag (--pr/--staged/--working-tree/
   // --diff-file), else a piped diff, else the default current-branch range. The
   // selector is PURE; this then runs the git/gh I/O the chosen source needs.
-  const hasExplicitSource =
-    typeof values['diff-file'] === 'string' ||
-    typeof values.pr === 'string' ||
-    Boolean(values.staged) ||
-    Boolean(values['working-tree']);
-  // Only consume stdin when NO explicit source is set — otherwise a CI shell that
-  // leaves stdin attached to a pipe would BLOCK reading input the run never uses.
-  const stdinContent = hasExplicitSource ? undefined : readStdinIfPiped();
-  const selection = selectDiffSource({
+  const sourceFlags = {
     diffFile: typeof values['diff-file'] === 'string' ? values['diff-file'] : undefined,
     pr: typeof values.pr === 'string' ? values.pr : undefined,
     staged: Boolean(values.staged),
-    stdinPiped: stdinContent !== undefined,
     workingTree: Boolean(values['working-tree']),
-  });
+  };
+  // Only consume stdin when NO explicit source is set — otherwise a CI shell that
+  // leaves stdin attached to a pipe would BLOCK reading input the run never uses.
+  const stdinContent = hasExplicitSource(sourceFlags) ? undefined : readStdinIfPiped();
+  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== undefined });
   if (isDiffSourceError(selection)) {
     console.error(`ensemble-ai review: ${selection.error}`);
     return 3;

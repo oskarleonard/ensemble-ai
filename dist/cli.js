@@ -841,7 +841,7 @@ function acquireDiff(opts) {
   if (opts.diffText !== void 0) {
     mode = opts.diffMode ?? "raw";
     rawDiff = opts.diffText;
-    headSha = mode === "pr" ? "gh pr diff (no local commit identity)" : "working-tree (no commit identity)";
+    headSha = mode === "pr" ? "gh pr diff (no local commit identity)" : "raw diff (no commit identity)";
   } else if (opts.staged) {
     mode = "staged";
     rawDiff = git(opts.cwd, ["diff", "--cached"]);
@@ -1207,6 +1207,9 @@ var FLAG_LABEL = {
   staged: "--staged",
   "working-tree": "--working-tree"
 };
+function hasExplicitSource(flags) {
+  return flags.pr !== void 0 || flags.diffFile !== void 0 || Boolean(flags.staged) || Boolean(flags.workingTree);
+}
 function selectDiffSource(flags) {
   const explicit = [];
   if (flags.pr !== void 0) explicit.push("pr");
@@ -1321,14 +1324,22 @@ function resolveSource(selection, cwd, stdinContent) {
       return { diffMode: "pr", diffText: cap.text };
     }
     case "diff-file": {
+      let text;
       try {
-        return { diffText: fs7.readFileSync(String(selection.diffFile), "utf8") };
+        text = fs7.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai review: cannot read --diff-file: ${e.message}`
         );
         return { code: 3 };
       }
+      if (!text.trim()) {
+        console.error(
+          `ensemble-ai review: --diff-file ${selection.diffFile} is empty`
+        );
+        return { code: 3 };
+      }
+      return { diffText: text };
     }
     case "stdin":
       return { diffText: stdinContent };
@@ -1382,7 +1393,7 @@ function reviewerBlock(r) {
     `  \u2500\u2500 ${id} [${r.reviewer.vendor} \xB7 ${r.reviewer.model}] \u2014 ${r.terminalState} \u2500\u2500`
   );
   if (r.terminalState !== "reviewed") {
-    out.push(`     ${r.summary.replace(/\s+/g, " ").slice(0, 200)}`);
+    out.push(`     ${clean(r.summary).slice(0, 200)}`);
     return out;
   }
   if (r.findings.length === 0) {
@@ -1473,15 +1484,14 @@ async function reviewCommand(args) {
     return 0;
   }
   const cwd = values.cwd ? path6.resolve(String(values.cwd)) : process.cwd();
-  const hasExplicitSource = typeof values["diff-file"] === "string" || typeof values.pr === "string" || Boolean(values.staged) || Boolean(values["working-tree"]);
-  const stdinContent = hasExplicitSource ? void 0 : readStdinIfPiped();
-  const selection = selectDiffSource({
+  const sourceFlags = {
     diffFile: typeof values["diff-file"] === "string" ? values["diff-file"] : void 0,
     pr: typeof values.pr === "string" ? values.pr : void 0,
     staged: Boolean(values.staged),
-    stdinPiped: stdinContent !== void 0,
     workingTree: Boolean(values["working-tree"])
-  });
+  };
+  const stdinContent = hasExplicitSource(sourceFlags) ? void 0 : readStdinIfPiped();
+  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== void 0 });
   if (isDiffSourceError(selection)) {
     console.error(`ensemble-ai review: ${selection.error}`);
     return 3;

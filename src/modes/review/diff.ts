@@ -281,7 +281,7 @@ export function acquireDiff(opts: AcquireDiffOpts): AcquiredDiff {
     headSha =
       mode === 'pr'
         ? 'gh pr diff (no local commit identity)'
-        : 'working-tree (no commit identity)';
+        : 'raw diff (no commit identity)';
   } else if (opts.staged) {
     mode = 'staged';
     rawDiff = git(opts.cwd, ['diff', '--cached']);
