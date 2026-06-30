@@ -94,7 +94,7 @@ declare function runGrokReview(prompt: string, config: ReviewerConfig, opts?: Ru
 
 declare const REVIEW_ADAPTERS: Record<ReviewerId, (prompt: string, config: ReviewerConfig, opts?: RunReviewOpts) => Promise<CodexReviewResult>>;
 
-type DiffMode = 'commit' | 'working-tree' | 'raw';
+type DiffMode = 'commit' | 'working-tree' | 'staged' | 'pr' | 'raw';
 type FileKind = 'source' | 'generated' | 'binary';
 type OmitReason = 'binary' | 'generated' | 'over-limit';
 declare const DEFAULT_COVERAGE_CEILING = 200000;
@@ -150,7 +150,9 @@ interface AcquireDiffOpts {
     base?: string;
     ceilingBytes?: number;
     cwd: string;
+    diffMode?: DiffMode;
     diffText?: string;
+    staged?: boolean;
     workingTree?: boolean;
 }
 declare function acquireDiff(opts: AcquireDiffOpts): AcquiredDiff;
@@ -261,6 +263,7 @@ interface ReviewModeOptions {
     base?: string;
     ceilingBytes?: number;
     cwd: string;
+    diffMode?: DiffMode;
     diffText?: string;
     objective?: string;
     onProgress?: (msg: string) => void;
@@ -270,6 +273,7 @@ interface ReviewModeOptions {
     reviewersFile?: string;
     runId: string;
     sandbox?: string;
+    staged?: boolean;
     workingTree?: boolean;
 }
 interface ReviewModeResult {

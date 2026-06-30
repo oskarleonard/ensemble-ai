@@ -850,9 +850,15 @@ function acquireDiff(opts) {
   let baseSha = null;
   let headSha;
   if (opts.diffText !== void 0) {
-    mode = "raw";
+    mode = opts.diffMode ?? "raw";
     rawDiff = opts.diffText;
-    headSha = "working-tree (no commit identity)";
+    headSha = mode === "pr" ? "gh pr diff (no local commit identity)" : "raw diff (no commit identity)";
+  } else if (opts.staged) {
+    mode = "staged";
+    rawDiff = git(opts.cwd, ["diff", "--cached"]);
+    baseSha = gitOrNull(opts.cwd, ["rev-parse", "HEAD"]);
+    baseRef = "HEAD";
+    headSha = "staged/index (no commit identity)";
   } else if (opts.workingTree) {
     mode = "working-tree";
     rawDiff = git(opts.cwd, ["diff", "HEAD"]);
@@ -1138,12 +1144,15 @@ async function runReviewMode(opts) {
   });
   const ceilingBytes = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
   const reviewers = opts.reviewers && opts.reviewers.length > 0 ? opts.reviewers : [...REVIEWER_IDS];
-  log(`Acquiring diff (${opts.workingTree ? "working-tree" : opts.diffText !== void 0 ? "raw" : "commit"} mode)\u2026`);
+  const sourceLabel = opts.diffText !== void 0 ? opts.diffMode ?? "raw" : opts.staged ? "staged" : opts.workingTree ? "working-tree" : "commit";
+  log(`Acquiring diff (${sourceLabel} mode)\u2026`);
   const acquired = acquireDiff({
     base: opts.base,
     ceilingBytes,
     cwd: opts.cwd,
+    diffMode: opts.diffMode,
     diffText: opts.diffText,
+    staged: opts.staged,
     workingTree: opts.workingTree
   });
   log(

@@ -11,7 +11,7 @@ import { sha256Hex } from '../../core/hash';
 // omitted, never silently dropped — so the headline "verifiable manifest" can't
 // lie about what the reviewer actually saw.
 
-export type DiffMode = 'commit' | 'working-tree' | 'raw';
+export type DiffMode = 'commit' | 'working-tree' | 'staged' | 'pr' | 'raw';
 export type FileKind = 'source' | 'generated' | 'binary';
 export type OmitReason = 'binary' | 'generated' | 'over-limit';
 
@@ -249,8 +249,15 @@ export interface AcquireDiffOpts {
   base?: string;
   ceilingBytes?: number;
   cwd: string;
-  // A pre-supplied raw diff (mode 'raw'): no git resolution, no commit identity.
+  // The mode LABEL for a pre-supplied diffText (default 'raw'). A `gh pr diff`
+  // capture passes 'pr' so the manifest/receipt name the source honestly; the text
+  // is still treated as raw (no git resolution, no local commit identity).
+  diffMode?: DiffMode;
+  // A pre-supplied raw diff (mode 'raw' unless diffMode overrides): no git
+  // resolution, no commit identity.
   diffText?: string;
+  // Review staged changes (`git diff --cached`) vs HEAD.
+  staged?: boolean;
   // Review uncommitted tracked changes vs HEAD instead of base...HEAD.
   workingTree?: boolean;
 }
@@ -269,9 +276,18 @@ export function acquireDiff(opts: AcquireDiffOpts): AcquiredDiff {
   let headSha: string;
 
   if (opts.diffText !== undefined) {
-    mode = 'raw';
+    mode = opts.diffMode ?? 'raw';
     rawDiff = opts.diffText;
-    headSha = 'working-tree (no commit identity)';
+    headSha =
+      mode === 'pr'
+        ? 'gh pr diff (no local commit identity)'
+        : 'raw diff (no commit identity)';
+  } else if (opts.staged) {
+    mode = 'staged';
+    rawDiff = git(opts.cwd, ['diff', '--cached']);
+    baseSha = gitOrNull(opts.cwd, ['rev-parse', 'HEAD']);
+    baseRef = 'HEAD';
+    headSha = 'staged/index (no commit identity)';
   } else if (opts.workingTree) {
     mode = 'working-tree';
     rawDiff = git(opts.cwd, ['diff', 'HEAD']);
