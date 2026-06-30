@@ -13,17 +13,6 @@ function parseReviewerIds(raw) {
 }
 var SEVERITIES = ["high", "medium", "low"];
 var CONFIDENCES = ["high", "medium", "low"];
-var DISPOSITION_VERDICTS = [
-  "accepted",
-  "partially-accepted",
-  "dismissed"
-];
-var REASON_CATEGORIES = [
-  "factually-wrong",
-  "out-of-scope",
-  "already-handled",
-  "tradeoff"
-];
 var TERMINAL_STATES = ["reviewed", "failed-reviewer"];
 
 // src/core/findings.ts
@@ -394,19 +383,6 @@ function persistReview(baseDir, input) {
   };
   writeAtomic(dir, reviewJson(id), JSON.stringify(stored, null, 2));
   return stored;
-}
-function persistDispositions(baseDir, runId, reviewerId, dispositions, gate) {
-  const dir = reviewDir(baseDir, runId);
-  const stored = readReview(baseDir, runId, reviewerId);
-  if (!stored) return null;
-  writeAtomic(
-    dir,
-    `dispositions.${reviewerId}.json`,
-    JSON.stringify(dispositions, null, 2)
-  );
-  const updated = { ...stored, dispositions, gate };
-  writeAtomic(dir, reviewJson(reviewerId), JSON.stringify(updated, null, 2));
-  return updated;
 }
 function readReview(baseDir, runId, reviewerId = "codex") {
   const dir = reviewDir(baseDir, runId);
@@ -1227,12 +1203,10 @@ export {
   CONFIDENCES,
   DEFAULT_COVERAGE_CEILING,
   DIFF_USEFUL_FLOOR,
-  DISPOSITION_VERDICTS,
   FINDINGS_INSTRUCTIONS,
   IMPLEMENTED_MODES,
   MODES,
   PACKET_BUDGETS,
-  REASON_CATEGORIES,
   REVIEWERS_FILE,
   REVIEWER_DEFAULTS,
   REVIEWER_IDS,
@@ -1269,7 +1243,6 @@ export {
   parseFindings,
   parseReviewerIds,
   parseReviewers,
-  persistDispositions,
   persistReview,
   readReceipt,
   readReview,

@@ -3,19 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import {
-  persistDispositions,
-  persistReview,
-  readReview,
-  readReviewsForRun,
-} from './artifacts';
-import type {
-  Disposition,
-  ReviewerConfig,
-  ReviewFinding,
-  ReviewGate,
-  ReviewPacket,
-} from './types';
+import { persistReview, readReview, readReviewsForRun } from './artifacts';
+import type { ReviewerConfig, ReviewFinding, ReviewPacket } from './types';
 
 // baseDir is now an explicit first arg (no env-driven path) — give every test a
 // fresh tmp dir to write artifacts into, and clean it up.
@@ -58,15 +47,6 @@ const packet = (): ReviewPacket => ({
   sections: [],
 });
 
-const disp = (verdict: Disposition['verdict']): Disposition => ({
-  findingId: 'f1',
-  reason: '',
-  reasonCategory: verdict === 'accepted' ? undefined : 'tradeoff',
-  verdict,
-});
-
-const GATE: ReviewGate = { reasons: [], surfaceToHuman: false };
-
 describe('per-reviewer artifacts', () => {
   it('keys by (runId, reviewerId) so a codex-f1 and a grok-f1 never collide', () => {
     const runId = 'run-1';
@@ -82,25 +62,19 @@ describe('per-reviewer artifacts', () => {
         terminalState: 'reviewed',
       });
     }
-    // SAME findingId f1 in both, but DIFFERENT dispositions → must route to the
-    // correct reviewer's artifact (the (runId, reviewerId, findingId) key holds).
-    persistDispositions(baseDir, runId, 'codex', [disp('dismissed')], GATE);
-    persistDispositions(baseDir, runId, 'grok', [disp('accepted')], GATE);
-
+    // SAME findingId f1 in both, written to SEPARATE per-reviewer artifacts — so a
+    // codex finding never overwrites a grok one (the (runId, reviewerId) key holds).
     const reviews = readReviewsForRun(baseDir, runId);
     expect(reviews.map((r) => r.reviewerId)).toEqual(['codex', 'grok']);
     const codex = reviews.find((r) => r.reviewerId === 'codex');
     const grok = reviews.find((r) => r.reviewerId === 'grok');
-    expect(codex?.dispositions?.[0]).toMatchObject({
-      findingId: 'f1',
-      verdict: 'dismissed',
-    });
-    expect(grok?.dispositions?.[0]).toMatchObject({
-      findingId: 'f1',
-      verdict: 'accepted',
-    });
+    expect(codex?.findings[0]?.id).toBe('f1');
+    expect(grok?.findings[0]?.id).toBe('f1');
     expect(codex?.summary).toBe('codex');
     expect(grok?.summary).toBe('grok');
+    // each reviewer wrote its OWN review.<id>.json (no shared review.json)
+    expect(fs.existsSync(path.join(baseDir, runId, 'review.codex.json'))).toBe(true);
+    expect(fs.existsSync(path.join(baseDir, runId, 'review.grok.json'))).toBe(true);
   });
 
   it('backfills reviewerId from a legacy bare review.json (pre-fan-out run)', () => {

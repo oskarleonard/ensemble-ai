@@ -2,13 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import {
-  type Disposition,
   type ManifestEntry,
   REVIEWER_IDS,
   type ReviewerConfig,
   type ReviewerId,
   type ReviewFinding,
-  type ReviewGate,
   type ReviewPacket,
   type StoredReview,
   type TerminalState,
@@ -112,29 +110,10 @@ export function persistReview(
   return stored;
 }
 
-// Phase-2 write (dispositions submitted): fold a reviewer's dispositions + the
-// (union) gate into its stored review and rewrite it. A GENERIC writer — the
-// gate VALUE is computed by the host's policy, not here. Returns the updated
-// record, or null if phase 1 never ran for this (run, reviewer).
-export function persistDispositions(
-  baseDir: string,
-  runId: string,
-  reviewerId: ReviewerId,
-  dispositions: Disposition[],
-  gate: ReviewGate
-): StoredReview | null {
-  const dir = reviewDir(baseDir, runId);
-  const stored = readReview(baseDir, runId, reviewerId);
-  if (!stored) return null;
-  writeAtomic(
-    dir,
-    `dispositions.${reviewerId}.json`,
-    JSON.stringify(dispositions, null, 2)
-  );
-  const updated: StoredReview = { ...stored, dispositions, gate };
-  writeAtomic(dir, reviewJson(reviewerId), JSON.stringify(updated, null, 2));
-  return updated;
-}
+// NOTE: folding an arbiter's dispositions + a gate into a stored review is HOST
+// POLICY (it certifies a host's arbitration), so it is intentionally NOT here —
+// a host reads its own StoredReview, adds those fields, and rewrites the file.
+// The core only ever writes the FACTS (persistReview, above).
 
 // Read ONE reviewer's stored review. `reviewerId` defaults to Codex, and falls
 // back to the legacy bare `review.json` for pre-fan-out runs (backfilling

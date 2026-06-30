@@ -70,31 +70,11 @@ export interface ReviewFinding {
   uncited?: boolean;
 }
 
-export const DISPOSITION_VERDICTS = [
-  'accepted',
-  'partially-accepted',
-  'dismissed',
-] as const;
-export type DispositionVerdict = (typeof DISPOSITION_VERDICTS)[number];
-
-export const REASON_CATEGORIES = [
-  'factually-wrong',
-  'out-of-scope',
-  'already-handled',
-  'tradeoff',
-] as const;
-export type ReasonCategory = (typeof REASON_CATEGORIES)[number];
-
-// An arbiter's verdict on one finding. A non-accepted verdict REQUIRES a
-// reason-category (why it wasn't simply taken) — that requirement is what keeps
-// the arbitration honest rather than a silent rubber-stamp. Lives here as a TYPE
-// (the contract); the arbitration LOGIC is the consuming host's, not the core's.
-export interface Disposition {
-  findingId: string;
-  reason: string;
-  reasonCategory?: ReasonCategory;
-  verdict: DispositionVerdict;
-}
+// NOTE: an arbiter's dispositions + a "gate" (surface-to-a-human) are HOST
+// POLICY, deliberately NOT modeled here — the core emits FACTS (findings +
+// per-reviewer execution status + coverage), and each consuming host computes its
+// own gate from those facts (spec §Scope-OUT / f3). So there is no Disposition /
+// ReviewGate / gate verdict in this portable contract.
 
 // One assembled+bounded section of the review packet, carrying its own manifest
 // line: WHY it's here and whether it was truncated, so a UI can prove what the
@@ -128,14 +108,6 @@ export interface ReviewPacket {
 export const TERMINAL_STATES = ['reviewed', 'failed-reviewer'] as const;
 export type TerminalState = (typeof TERMINAL_STATES)[number];
 
-// Does this completed review PAUSE for a human, or proceed? A TYPE only — the
-// core emits facts (findings + execution status + coverage); a host computes its
-// OWN gate from those facts. Kept here because StoredReview can carry a host's gate.
-export interface ReviewGate {
-  reasons: string[];
-  surfaceToHuman: boolean;
-}
-
 // One packet-section's manifest line (no body): enough for a UI to PROVE what the
 // reviewer saw without re-shipping the whole packet.
 export interface ManifestEntry {
@@ -145,17 +117,16 @@ export interface ManifestEntry {
   truncated: boolean;
 }
 
-// The review index a host serves + a UI renders. A PURE shape (lives here, not in
-// the node-only artifacts module) so any consumer can import it. `dispositions`/
-// `gate` are absent until a host's disposition pass lands. ONE StoredReview per
-// (runId, reviewerId) — a run fans out to N reviewers, each writing its own
+// The review index a host serves + a UI renders — the FACTS shape. A PURE shape
+// (lives here, not in the node-only artifacts module) so any consumer can import
+// it. A host MAY extend it with its own arbitration fields (dispositions / a gate)
+// — those are host policy, not part of this portable contract. ONE StoredReview
+// per (runId, reviewerId) — a run fans out to N reviewers, each writing its own
 // independent artifact, so a codex-`f1` never collides with a grok-`f1`.
 // `reviewerId` is optional only for back-compat reads of pre-fan-out artifacts;
 // new writes always set it.
 export interface StoredReview {
-  dispositions?: Disposition[];
   findings: ReviewFinding[];
-  gate?: ReviewGate;
   packet: { complete: boolean; manifest: ManifestEntry[] };
   reviewer: { effort: string; model: string; vendor: string };
   reviewerId?: ReviewerId;

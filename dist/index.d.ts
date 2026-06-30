@@ -29,16 +29,6 @@ interface ReviewFinding {
     title: string;
     uncited?: boolean;
 }
-declare const DISPOSITION_VERDICTS: readonly ["accepted", "partially-accepted", "dismissed"];
-type DispositionVerdict = (typeof DISPOSITION_VERDICTS)[number];
-declare const REASON_CATEGORIES: readonly ["factually-wrong", "out-of-scope", "already-handled", "tradeoff"];
-type ReasonCategory = (typeof REASON_CATEGORIES)[number];
-interface Disposition {
-    findingId: string;
-    reason: string;
-    reasonCategory?: ReasonCategory;
-    verdict: DispositionVerdict;
-}
 interface PacketSection {
     body: string;
     included: boolean;
@@ -56,10 +46,6 @@ interface ReviewPacket {
 }
 declare const TERMINAL_STATES: readonly ["reviewed", "failed-reviewer"];
 type TerminalState = (typeof TERMINAL_STATES)[number];
-interface ReviewGate {
-    reasons: string[];
-    surfaceToHuman: boolean;
-}
 interface ManifestEntry {
     included: boolean;
     note: string;
@@ -67,9 +53,7 @@ interface ManifestEntry {
     truncated: boolean;
 }
 interface StoredReview {
-    dispositions?: Disposition[];
     findings: ReviewFinding[];
-    gate?: ReviewGate;
     packet: {
         complete: boolean;
         manifest: ManifestEntry[];
@@ -142,7 +126,6 @@ interface PersistReviewInput {
     terminalState: TerminalState;
 }
 declare function persistReview(baseDir: string, input: PersistReviewInput): StoredReview;
-declare function persistDispositions(baseDir: string, runId: string, reviewerId: ReviewerId, dispositions: Disposition[], gate: ReviewGate): StoredReview | null;
 declare function readReview(baseDir: string, runId: string, reviewerId?: ReviewerId): StoredReview | null;
 declare function readReviewsForRun(baseDir: string, runId: string): StoredReview[];
 
@@ -413,4 +396,4 @@ declare const IMPLEMENTED_MODES: readonly ModeName[];
 declare function isMode(v: string): v is ModeName;
 declare function isImplemented(mode: ModeName): boolean;
 
-export { type AcquireDiffOpts, type AcquiredDiff, type BuildReceiptResult, CONFIDENCES, type CodexExecOpts, type CodexExecResult, type CodexReviewResult, type Confidence, type Coverage, type CoverageFileEntry, type CoveragePolicy, DEFAULT_COVERAGE_CEILING, DIFF_USEFUL_FLOOR, DISPOSITION_VERDICTS, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type Disposition, type DispositionVerdict, type Evidence, FINDINGS_INSTRUCTIONS, type FileDiff, type FileKind, IMPLEMENTED_MODES, type InlineSecretHit, MODES, type ManifestEntry, type ModeName, type OmitReason, PACKET_BUDGETS, type PacketInput, type PacketSection, type ParsedReview, type PersistReviewInput, REASON_CATEGORIES, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEWER_IDS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type ReasonCategory, type ReceiptCoverage, type ReceiptKey, type ReviewFinding, type ReviewGate, type ReviewModeOptions, type ReviewModeResult, type ReviewPacket, type ReviewerConfig, type ReviewerExecOpts, type ReviewerId, type RunReviewOpts, SEVERITIES, type SecretScanResult, type SensitivePathHit, type Severity, type StoredReview, TERMINAL_STATES, type TerminalState, acquireDiff, asTrimmed, assembleCodePacket, buildCodexReviewArgs, buildDiffReceipt, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, computeCoverage, computePolicyHash, coverageShortfall, defaultReceiptStore, diffDigest, ensureSandboxProfile, extractGrokText, extractJsonBlock, isDiffReviewed, isImplemented, isMode, isReviewerId, keyOf, killTree, listReviewers, loadReviewers, makeEscalatingKill, parseDiffFiles, parseFindings, parseReviewerIds, parseReviewers, persistDispositions, persistReview, readReceipt, readReview, readReviewsForRun, receiptKeyHash, receiptPath, renderReviewPrompt, resolveBase, resolveBin, resolveCodexBin, resolveGrokBin, resolveRepoId, resolveReviewSandbox, resolveReviewer, reviewDir, runCodexExec, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, scanDiffForSecrets, section, summarizeCoverage, titleCase, writeReceipt };
+export { type AcquireDiffOpts, type AcquiredDiff, type BuildReceiptResult, CONFIDENCES, type CodexExecOpts, type CodexExecResult, type CodexReviewResult, type Confidence, type Coverage, type CoverageFileEntry, type CoveragePolicy, DEFAULT_COVERAGE_CEILING, DIFF_USEFUL_FLOOR, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type Evidence, FINDINGS_INSTRUCTIONS, type FileDiff, type FileKind, IMPLEMENTED_MODES, type InlineSecretHit, MODES, type ManifestEntry, type ModeName, type OmitReason, PACKET_BUDGETS, type PacketInput, type PacketSection, type ParsedReview, type PersistReviewInput, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEWER_IDS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type ReceiptCoverage, type ReceiptKey, type ReviewFinding, type ReviewModeOptions, type ReviewModeResult, type ReviewPacket, type ReviewerConfig, type ReviewerExecOpts, type ReviewerId, type RunReviewOpts, SEVERITIES, type SecretScanResult, type SensitivePathHit, type Severity, type StoredReview, TERMINAL_STATES, type TerminalState, acquireDiff, asTrimmed, assembleCodePacket, buildCodexReviewArgs, buildDiffReceipt, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, computeCoverage, computePolicyHash, coverageShortfall, defaultReceiptStore, diffDigest, ensureSandboxProfile, extractGrokText, extractJsonBlock, isDiffReviewed, isImplemented, isMode, isReviewerId, keyOf, killTree, listReviewers, loadReviewers, makeEscalatingKill, parseDiffFiles, parseFindings, parseReviewerIds, parseReviewers, persistReview, readReceipt, readReview, readReviewsForRun, receiptKeyHash, receiptPath, renderReviewPrompt, resolveBase, resolveBin, resolveCodexBin, resolveGrokBin, resolveRepoId, resolveReviewSandbox, resolveReviewer, reviewDir, runCodexExec, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, scanDiffForSecrets, section, summarizeCoverage, titleCase, writeReceipt };
