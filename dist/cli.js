@@ -1221,11 +1221,10 @@ function selectDiffSource(flags) {
   if (explicit.length === 1) {
     const kind = explicit[0];
     if (kind === "pr") {
-      const n = Number(flags.pr);
-      if (!Number.isInteger(n) || n <= 0) {
+      if (!/^[1-9][0-9]*$/.test(String(flags.pr))) {
         return { error: `--pr must be a positive integer (got "${flags.pr}")` };
       }
-      return { kind, pr: n };
+      return { kind, pr: Number(flags.pr) };
     }
     if (kind === "diff-file") return { diffFile: flags.diffFile, kind };
     return { kind };
@@ -1293,7 +1292,10 @@ function capture(cmd, cmdArgs, cwd) {
     const text = execFileSync3(cmd, cmdArgs, {
       cwd,
       encoding: "utf8",
-      maxBuffer: 256 * 1024 * 1024
+      maxBuffer: 256 * 1024 * 1024,
+      // Bound the call so a wedged `gh` (auth prompt, network hang) can't hang the
+      // gate forever — fail with a clear error instead.
+      timeout: 12e4
     });
     return { ok: true, text };
   } catch (e) {
@@ -1364,9 +1366,13 @@ function oneLineSummary(result) {
   const receipt = result.receipt ? `receipt ${result.receipt.diffDigest.slice(0, 19)}\u2026` : "receipt none";
   return `${tallies} \xB7 ${receipt}`;
 }
+function clean(s) {
+  return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
+}
 function evidenceRef(file, line) {
   if (!file) return "(uncited)";
-  return line ? `${file}:${line}` : file;
+  const f = clean(file);
+  return line ? `${f}:${line}` : f;
 }
 function reviewerBlock(r) {
   const id = r.reviewerId ?? r.reviewer.vendor;
@@ -1388,7 +1394,7 @@ function reviewerBlock(r) {
     if (group.length === 0) continue;
     out.push(`     ${SEVERITY_LABEL[sev]}`);
     for (const f of group) {
-      out.push(`       ${evidenceRef(f.evidence.file, f.evidence.line)}  ${f.title}`);
+      out.push(`       ${evidenceRef(f.evidence.file, f.evidence.line)}  ${clean(f.title)}`);
     }
   }
   return out;
@@ -1467,7 +1473,8 @@ async function reviewCommand(args) {
     return 0;
   }
   const cwd = values.cwd ? path6.resolve(String(values.cwd)) : process.cwd();
-  const stdinContent = readStdinIfPiped();
+  const hasExplicitSource = typeof values["diff-file"] === "string" || typeof values.pr === "string" || Boolean(values.staged) || Boolean(values["working-tree"]);
+  const stdinContent = hasExplicitSource ? void 0 : readStdinIfPiped();
   const selection = selectDiffSource({
     diffFile: typeof values["diff-file"] === "string" ? values["diff-file"] : void 0,
     pr: typeof values.pr === "string" ? values.pr : void 0,

@@ -94,6 +94,9 @@ function capture(
       cwd,
       encoding: 'utf8',
       maxBuffer: 256 * 1024 * 1024,
+      // Bound the call so a wedged `gh` (auth prompt, network hang) can't hang the
+      // gate forever — fail with a clear error instead.
+      timeout: 120_000,
     });
     return { ok: true, text };
   } catch (e) {
@@ -192,9 +195,19 @@ function oneLineSummary(result: ReviewModeResult): string {
   return `${tallies} · ${receipt}`;
 }
 
+// Strip C0/DEL control characters from reviewer-controlled text before it hits the
+// terminal — a crafted diff could induce a reviewer to emit ANSI escapes in a
+// finding title/path; printed raw they could rewrite the terminal. Whitespace is
+// collapsed so a finding stays one tidy line.
+function clean(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 function evidenceRef(file?: string, line?: number): string {
   if (!file) return '(uncited)';
-  return line ? `${file}:${line}` : file;
+  const f = clean(file);
+  return line ? `${f}:${line}` : f;
 }
 
 // Per-reviewer findings grouped by severity (HIGH → MED → LOW), each line carrying
@@ -219,7 +232,7 @@ function reviewerBlock(r: StoredReview): string[] {
     if (group.length === 0) continue;
     out.push(`     ${SEVERITY_LABEL[sev]}`);
     for (const f of group) {
-      out.push(`       ${evidenceRef(f.evidence.file, f.evidence.line)}  ${f.title}`);
+      out.push(`       ${evidenceRef(f.evidence.file, f.evidence.line)}  ${clean(f.title)}`);
     }
   }
   return out;
@@ -305,7 +318,14 @@ async function reviewCommand(args: string[]): Promise<number> {
   // Resolve the diff source: at most one explicit flag (--pr/--staged/--working-tree/
   // --diff-file), else a piped diff, else the default current-branch range. The
   // selector is PURE; this then runs the git/gh I/O the chosen source needs.
-  const stdinContent = readStdinIfPiped();
+  const hasExplicitSource =
+    typeof values['diff-file'] === 'string' ||
+    typeof values.pr === 'string' ||
+    Boolean(values.staged) ||
+    Boolean(values['working-tree']);
+  // Only consume stdin when NO explicit source is set — otherwise a CI shell that
+  // leaves stdin attached to a pipe would BLOCK reading input the run never uses.
+  const stdinContent = hasExplicitSource ? undefined : readStdinIfPiped();
   const selection = selectDiffSource({
     diffFile: typeof values['diff-file'] === 'string' ? values['diff-file'] : undefined,
     pr: typeof values.pr === 'string' ? values.pr : undefined,

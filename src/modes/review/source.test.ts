@@ -45,6 +45,13 @@ describe('selectDiffSource — diff-source resolution', () => {
     }
   });
 
+  it('--pr rejects hex / exponent / whitespace-padded values that Number() would accept', () => {
+    for (const bad of ['0x10', '1e3', ' 5 ', '5abc', '+5']) {
+      const r = selectDiffSource({ pr: bad });
+      expect(isDiffSourceError(r)).toBe(true);
+    }
+  });
+
   it('two explicit sources → conflict error naming BOTH flags', () => {
     const r = selectDiffSource({ pr: '5', staged: true });
     expect(isDiffSourceError(r)).toBe(true);

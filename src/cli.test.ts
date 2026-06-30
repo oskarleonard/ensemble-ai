@@ -164,7 +164,7 @@ describe('diff-source resolution → engine inputs (all reviewers by default)', 
   it('no source flag → commit mode (no diffText / staged / workingTree)', async () => {
     mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
     await main(['review']);
-    const opts = mockRun.mock.calls[0][0];
+    const opts = mockRun.mock.lastCall![0];
     expect(opts.diffText).toBeUndefined();
     expect(opts.staged).toBeFalsy();
     expect(opts.workingTree).toBeFalsy();

@@ -76,11 +76,12 @@ export function selectDiffSource(
   if (explicit.length === 1) {
     const kind = explicit[0];
     if (kind === 'pr') {
-      const n = Number(flags.pr);
-      if (!Number.isInteger(n) || n <= 0) {
+      // Strict decimal integer ONLY — `Number()` would accept '0x10', '1e3', and
+      // whitespace-padded values, none of which are a PR number a user typed.
+      if (!/^[1-9][0-9]*$/.test(String(flags.pr))) {
         return { error: `--pr must be a positive integer (got "${flags.pr}")` };
       }
-      return { kind, pr: n };
+      return { kind, pr: Number(flags.pr) };
     }
     if (kind === 'diff-file') return { diffFile: flags.diffFile, kind };
     return { kind };
