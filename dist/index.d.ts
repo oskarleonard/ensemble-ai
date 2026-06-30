@@ -310,10 +310,138 @@ interface ReviewModeResult {
 }
 declare function runReviewMode(opts: ReviewModeOptions): Promise<ReviewModeResult>;
 
+declare const VOICE_IDS: readonly ["codex", "grok", "claude"];
+type VoiceId = (typeof VOICE_IDS)[number];
+declare function isVoiceId(v: unknown): v is VoiceId;
+declare function parseVoiceIds(raw: unknown): VoiceId[] | undefined;
+interface VoiceConfig {
+    cmd: string;
+    effort: string;
+    id: VoiceId;
+    model: string;
+    sandbox?: string;
+    vendor: string;
+}
+interface Idea {
+    body: string;
+    id: string;
+    title: string;
+    voiceId?: VoiceId;
+}
+interface RawIdea {
+    body: string;
+    title: string;
+}
+declare const CRITIQUE_STANCES: readonly ["support", "concern", "extend"];
+type CritiqueStance = (typeof CRITIQUE_STANCES)[number];
+interface Critique {
+    assessment: string;
+    stance: CritiqueStance;
+    target: string;
+}
+interface RankedIdea {
+    contributors: string[];
+    rank: number;
+    risks?: string;
+    title: string;
+    why: string;
+}
+interface VoiceGenerateResult {
+    error?: string;
+    ideas: Idea[];
+    ok: boolean;
+    raw: string | null;
+    summary: string;
+    timedOut?: boolean;
+    voiceId: VoiceId;
+}
+interface VoiceCritiqueResult {
+    critiques: Critique[];
+    error?: string;
+    extensions: RawIdea[];
+    ok: boolean;
+    raw: string | null;
+    summary: string;
+    timedOut?: boolean;
+    voiceId: VoiceId;
+}
+interface SynthesisResult {
+    by: VoiceId | null;
+    degraded: boolean;
+    error?: string;
+    ok: boolean;
+    ranked: RankedIdea[];
+    raw: string | null;
+    summary: string;
+}
+interface BrainstormResult {
+    critique: VoiceCritiqueResult[];
+    generate: VoiceGenerateResult[];
+    roster: VoiceId[];
+    synthesis: SynthesisResult;
+    topic: string;
+}
+
+type VoiceRunResult = CodexReviewResult;
+declare const VOICE_DEFAULTS: Record<VoiceId, VoiceConfig>;
+declare const VOICE_ADAPTERS: Record<VoiceId, (prompt: string, config: VoiceConfig, opts?: RunReviewOpts) => Promise<VoiceRunResult>>;
+declare const VOICES_FILE: string;
+declare function parseVoices(raw: unknown): Record<VoiceId, VoiceConfig>;
+declare function loadVoices(file?: string): Record<VoiceId, VoiceConfig>;
+declare function listVoices(file?: string): VoiceConfig[];
+
+declare const DEFAULT_VOICE_TIMEOUT_MS = 300000;
+type Adapters = Record<VoiceId, (prompt: string, config: VoiceConfig, opts?: {
+    onSpawn?: (kill: () => void) => void;
+    timeoutMs?: number;
+}) => Promise<VoiceRunResult>>;
+interface BrainstormOptions {
+    adapters?: Adapters;
+    fileContext?: string;
+    onProgress?: (msg: string) => void;
+    synthesizer?: VoiceId;
+    timeoutMs?: number;
+    topic: string;
+    voiceConfigs?: Record<VoiceId, VoiceConfig>;
+    voices?: VoiceId[];
+    voicesFile?: string;
+}
+declare function fallbackSynthesis(allIdeas: Idea[]): SynthesisResult;
+declare function pickSynthesizer(roster: VoiceId[], requested: VoiceId | undefined, generate: VoiceGenerateResult[]): VoiceId | null;
+declare function runBrainstormMode(opts: BrainstormOptions): Promise<BrainstormResult>;
+
+declare function resolveClaudeBin(): string;
+declare function buildClaudeVoiceArgs(prompt: string): string[];
+declare function runClaudeVoice(prompt: string, _config: VoiceConfig, opts?: RunReviewOpts): Promise<CodexReviewResult>;
+
+declare function renderGeneratePrompt(topic: string, fileContext?: string): string;
+declare function renderCritiquePrompt(topic: string, peerIdeas: Idea[], fileContext?: string): string;
+declare function renderSynthesisPrompt(topic: string, allIdeas: Idea[], critiqueResults: VoiceCritiqueResult[]): string;
+
+interface ParsedIdeas {
+    ideas: RawIdea[];
+    parseError?: string;
+    summary: string;
+}
+declare function parseIdeas(raw: string): ParsedIdeas;
+interface ParsedCritique {
+    critiques: Critique[];
+    extensions: RawIdea[];
+    parseError?: string;
+    summary: string;
+}
+declare function parseCritique(raw: string): ParsedCritique;
+interface ParsedSynthesis {
+    parseError?: string;
+    ranked: RankedIdea[];
+    summary: string;
+}
+declare function parseSynthesis(raw: string): ParsedSynthesis;
+
 declare const MODES: readonly ["review", "brainstorm", "security"];
 type ModeName = (typeof MODES)[number];
 declare const IMPLEMENTED_MODES: readonly ModeName[];
 declare function isMode(v: string): v is ModeName;
 declare function isImplemented(mode: ModeName): boolean;
 
-export { type AcquireDiffOpts, type AcquiredDiff, type BuildReceiptResult, type CodexReviewResult, type Coverage, type CoverageFileEntry, type CoveragePolicy, DEFAULT_COVERAGE_CEILING, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type FileDiff, type FileKind, IMPLEMENTED_MODES, type InlineSecretHit, MODES, type ModeName, type OmitReason, type PersistReviewInput, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type ReceiptCoverage, type ReceiptKey, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunReviewOpts, type SecretScanResult, type SensitivePathHit, StoredReview, TerminalState, acquireDiff, buildCodexReviewArgs, buildDiffReceipt, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, computeCoverage, computePolicyHash, coverageShortfall, defaultReceiptStore, diffDigest, ensureSandboxProfile, extractGrokText, hasDepSurface, isDiffReviewed, isImplemented, isMode, keyOf, killTree, listReviewers, loadReviewers, makeEscalatingKill, parseDiffFiles, parseReviewers, persistReview, readReceipt, readReview, readReviewsForRun, receiptKeyHash, receiptPath, resolveBase, resolveBin, resolveCodexBin, resolveGrokBin, resolveRepoId, resolveReviewSandbox, resolveReviewer, reviewDir, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, sha256Hex, summarizeCoverage, writeReceipt };
+export { type AcquireDiffOpts, type AcquiredDiff, type BrainstormOptions, type BrainstormResult, type BuildReceiptResult, CRITIQUE_STANCES, type CodexReviewResult, type Coverage, type CoverageFileEntry, type CoveragePolicy, type Critique, type CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type FileDiff, type FileKind, IMPLEMENTED_MODES, type Idea, type InlineSecretHit, MODES, type ModeName, type OmitReason, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PersistReviewInput, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type RankedIdea, type RawIdea, type ReceiptCoverage, type ReceiptKey, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunReviewOpts, type SecretScanResult, type SensitivePathHit, StoredReview, type SynthesisResult, TerminalState, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, VOICE_IDS, type VoiceConfig, type VoiceCritiqueResult, type VoiceGenerateResult, type VoiceId, type VoiceRunResult, acquireDiff, buildClaudeVoiceArgs, buildCodexReviewArgs, buildDiffReceipt, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, computeCoverage, computePolicyHash, coverageShortfall, defaultReceiptStore, diffDigest, ensureSandboxProfile, extractGrokText, fallbackSynthesis, hasDepSurface, isDiffReviewed, isImplemented, isMode, isVoiceId, keyOf, killTree, listReviewers, listVoices, loadReviewers, loadVoices, makeEscalatingKill, parseCritique, parseDiffFiles, parseIdeas, parseReviewers, parseSynthesis, parseVoiceIds, parseVoices, persistReview, pickSynthesizer, readReceipt, readReview, readReviewsForRun, receiptKeyHash, receiptPath, renderCritiquePrompt, renderGeneratePrompt, renderSynthesisPrompt, resolveBase, resolveBin, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveRepoId, resolveReviewSandbox, resolveReviewer, reviewDir, runBrainstormMode, runClaudeVoice, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, sha256Hex, summarizeCoverage, writeReceipt };

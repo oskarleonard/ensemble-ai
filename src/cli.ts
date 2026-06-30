@@ -15,6 +15,14 @@ import {
   type Severity,
   type StoredReview,
 } from './core/types';
+import { runBrainstormMode } from './modes/brainstorm';
+import {
+  type BrainstormResult,
+  isVoiceId,
+  parseVoiceIds,
+  VOICE_IDS,
+  type VoiceId,
+} from './modes/brainstorm/types';
 import { isImplemented, isMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
@@ -41,9 +49,12 @@ Modes:
   security     Cross-vendor SECURITY audit of a code diff (implemented) —
                the review engine with a security-auditor lens + a local
                dependency-surface flag; findings tagged by security class.
-  brainstorm   (planned)
+  brainstorm   Cross-vendor ideation on a TOPIC (implemented) — each voice
+               generates ideas independently, critiques the others, then one
+               synthesizes a ranked, de-duplicated recommendation.
 
-Run \`ensemble-ai review --help\` or \`ensemble-ai security --help\` for options.`;
+Run \`ensemble-ai review --help\`, \`ensemble-ai security --help\`, or
+\`ensemble-ai brainstorm --help\` for options.`;
 
 const REVIEW_USAGE = `ensemble-ai review — review a diff with ALL configured AI reviewers.
 
@@ -485,6 +496,201 @@ async function reviewCommand(
   return 0;
 }
 
+const BRAINSTORM_USAGE = `ensemble-ai brainstorm — convene multiple AI voices on a TOPIC.
+
+Usage:
+  ensemble-ai brainstorm "<topic>" [options]
+
+Three rounds: (1) each voice generates ideas INDEPENDENTLY (no anchoring), (2) each
+critiques + extends the OTHERS' ideas, (3) one voice synthesizes a ranked,
+de-duplicated recommendation. Voices: codex + grok + claude by default (Claude joins
+as a voice here — there is no independence concern, unlike review).
+
+Options:
+  --file <path>         include a file's contents as shared context for every voice
+  --voices <ids>        comma-separated voice ids (default: codex,grok,claude)
+  --synthesizer <id>    which voice runs round 3 (default: claude if present)
+  --timeout <seconds>   per-voice timeout (default 300)
+  --voices-file <path>  voices config json (default ~/.ensemble-ai/voices.json)
+  --json                print the full result as JSON instead of formatted text
+  --cwd <dir>           working dir for --file resolution (default: cwd)
+  -h, --help            this help
+
+Exit codes: 0 = produced ideas (synthesis printed) · 1 = no usable output (every
+voice failed) · 3 = usage error.`;
+
+// One brainstorm rendered for the terminal: the three rounds, each line passed
+// through clean() (reviewer/voice text is untrusted — a crafted reply could carry
+// ANSI escapes). Mirrors printSummary's grouped, scannable shape.
+function printBrainstorm(r: BrainstormResult): void {
+  const out: string[] = [];
+  out.push('');
+  out.push(`ensemble-ai brainstorm — ${clean(r.topic).slice(0, 200)}`);
+  out.push(`  voices: ${r.roster.join(', ')}`);
+  out.push('');
+  out.push('Round 1 · independent ideas');
+  for (const g of r.generate) {
+    out.push('');
+    out.push(`  ── ${g.voiceId} ──`);
+    if (!g.ok) {
+      out.push(`     (no ideas — ${clean(g.error ?? 'failed').slice(0, 160)})`);
+      continue;
+    }
+    if (g.summary) out.push(`     ${clean(g.summary).slice(0, 240)}`);
+    for (const idea of g.ideas) {
+      out.push(`     • [${idea.id}] ${clean(idea.title)}`);
+      if (idea.body) out.push(`         ${clean(idea.body).slice(0, 300)}`);
+    }
+  }
+  if (r.critique.length > 0) {
+    out.push('');
+    out.push('Round 2 · cross-critique');
+    for (const c of r.critique) {
+      out.push('');
+      out.push(`  ── ${c.voiceId} ──`);
+      if (!c.ok) {
+        out.push(`     (no critique — ${clean(c.error ?? 'failed').slice(0, 160)})`);
+        continue;
+      }
+      for (const cr of c.critiques) {
+        out.push(`     [${cr.stance}] ${clean(cr.target)} — ${clean(cr.assessment).slice(0, 260)}`);
+      }
+      for (const ex of c.extensions) {
+        out.push(`     + ${clean(ex.title)}`);
+        if (ex.body) out.push(`         ${clean(ex.body).slice(0, 260)}`);
+      }
+    }
+  }
+  out.push('');
+  const s = r.synthesis;
+  out.push(
+    `Round 3 · synthesis${s.by ? ` (by ${s.by})` : ''}${s.degraded ? ' — DEGRADED (deterministic fallback)' : ''}`
+  );
+  if (s.summary) out.push(`  ${clean(s.summary).slice(0, 400)}`);
+  for (const ri of s.ranked) {
+    out.push('');
+    out.push(
+      `  ${ri.rank}. ${clean(ri.title)}${ri.contributors.length ? `  [${ri.contributors.join(', ')}]` : ''}`
+    );
+    if (ri.why) out.push(`     why:  ${clean(ri.why).slice(0, 300)}`);
+    if (ri.risks) out.push(`     risk: ${clean(ri.risks).slice(0, 240)}`);
+  }
+  out.push('');
+  console.log(out.join('\n'));
+}
+
+async function brainstormCommand(args: string[]): Promise<number> {
+  let parsed: ReturnType<typeof parseArgs>;
+  try {
+    parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        cwd: { type: 'string' },
+        file: { type: 'string' },
+        help: { short: 'h', type: 'boolean' },
+        json: { type: 'boolean' },
+        synthesizer: { type: 'string' },
+        timeout: { type: 'string' },
+        voices: { type: 'string' },
+        'voices-file': { type: 'string' },
+      },
+    });
+  } catch (e) {
+    console.error(`ensemble-ai brainstorm: ${(e as Error).message}`);
+    console.error(BRAINSTORM_USAGE);
+    return 3;
+  }
+  const { positionals, values } = parsed;
+  if (values.help) {
+    console.log(BRAINSTORM_USAGE);
+    return 0;
+  }
+  const topic = positionals.join(' ').trim();
+  if (!topic) {
+    console.error(
+      'ensemble-ai brainstorm: a topic is required, e.g. ensemble-ai brainstorm "naming options for X"'
+    );
+    console.error(BRAINSTORM_USAGE);
+    return 3;
+  }
+
+  const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
+  let fileContext: string | undefined;
+  if (typeof values.file === 'string') {
+    try {
+      fileContext = fs.readFileSync(path.resolve(cwd, values.file), 'utf8');
+    } catch (e) {
+      console.error(
+        `ensemble-ai brainstorm: cannot read --file ${values.file}: ${(e as Error).message}`
+      );
+      return 3;
+    }
+  }
+
+  // --voices: fail CLOSED on an unknown id (a typo must error, never silently run a
+  // narrower roster than asked). Absent → undefined → the default roster.
+  let voices: VoiceId[] | undefined;
+  if (typeof values.voices === 'string') {
+    const requested = values.voices.split(',').map((s) => s.trim()).filter(Boolean);
+    const unknown = requested.filter((id) => !isVoiceId(id));
+    if (unknown.length > 0 || requested.length === 0) {
+      console.error(
+        `ensemble-ai brainstorm: --voices "${values.voices}" ${
+          unknown.length ? `has unknown id(s): ${unknown.join(', ')}` : 'is empty'
+        } (known: ${VOICE_IDS.join(', ')})`
+      );
+      return 3;
+    }
+    voices = parseVoiceIds(requested);
+  }
+
+  let synthesizer: VoiceId | undefined;
+  if (typeof values.synthesizer === 'string') {
+    if (!isVoiceId(values.synthesizer)) {
+      console.error(
+        `ensemble-ai brainstorm: --synthesizer "${values.synthesizer}" is not a known voice (known: ${VOICE_IDS.join(', ')})`
+      );
+      return 3;
+    }
+    synthesizer = values.synthesizer;
+  }
+
+  let timeoutMs: number | undefined;
+  if (typeof values.timeout === 'string') {
+    const secs = Number(values.timeout);
+    if (!Number.isFinite(secs) || secs <= 0) {
+      console.error('ensemble-ai brainstorm: --timeout must be a positive number of seconds');
+      return 3;
+    }
+    timeoutMs = Math.round(secs * 1000);
+  }
+
+  let result: BrainstormResult;
+  try {
+    result = await runBrainstormMode({
+      fileContext,
+      onProgress: (m) => console.error(`· ${m}`),
+      synthesizer,
+      timeoutMs,
+      topic,
+      voices,
+      voicesFile:
+        typeof values['voices-file'] === 'string' ? values['voices-file'] : undefined,
+    });
+  } catch (e) {
+    console.error(`ensemble-ai brainstorm: ${(e as Error).message}`);
+    return 1;
+  }
+
+  if (values.json) console.log(JSON.stringify(result, null, 2));
+  else printBrainstorm(result);
+
+  // 1 = nothing usable came back (every voice failed to produce ideas).
+  const anyIdeas = result.generate.some((g) => g.ok && g.ideas.length > 0);
+  return anyIdeas ? 0 : 1;
+}
+
 export async function main(argv: string[]): Promise<number> {
   const mode = argv[0];
   if (!mode || mode === '-h' || mode === '--help') {
@@ -493,6 +699,7 @@ export async function main(argv: string[]): Promise<number> {
   }
   if (mode === 'review') return reviewCommand(argv.slice(1), 'code');
   if (mode === 'security') return reviewCommand(argv.slice(1), 'security');
+  if (mode === 'brainstorm') return brainstormCommand(argv.slice(1));
   if (isMode(mode) && !isImplemented(mode)) {
     console.error(`ensemble-ai: mode "${mode}" is planned but not implemented yet.`);
     return 3;
