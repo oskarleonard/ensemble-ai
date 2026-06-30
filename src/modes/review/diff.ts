@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import crypto from 'node:crypto';
+
+import { sha256Hex } from '../../core/hash';
 
 // Diff acquisition + the canonical-diff content digest + per-file COVERAGE.
 //
@@ -177,11 +178,7 @@ export function canonicalizeDiff(raw: string): string {
 }
 
 export function diffDigest(raw: string): string {
-  const digest = crypto
-    .createHash('sha256')
-    .update(canonicalizeDiff(raw), 'utf8')
-    .digest('hex');
-  return `sha256:${digest}`;
+  return `sha256:${sha256Hex(canonicalizeDiff(raw))}`;
 }
 
 // ── git I/O ────────────────────────────────────────────────────────────────
@@ -238,6 +235,9 @@ export interface AcquiredDiff {
   coverage: Coverage;
   // The COVERED diff (included files only) — exactly what the reviewer sees.
   diff: string;
+  // The parsed per-file diffs (the full set, pre-coverage) — computed here for
+  // coverage and reused by the caller's secret-scan, so the raw diff is parsed once.
+  files: FileDiff[];
   headSha: string;
   mode: DiffMode;
   // The full base...HEAD diff before coverage filtering (the digest is over this).
@@ -301,7 +301,12 @@ export function acquireDiff(opts: AcquireDiffOpts): AcquiredDiff {
     baseSha,
     canonicalDigest: diffDigest(rawDiff),
     coverage,
-    diff: includedDiff || rawDiff,
+    // The COVERED diff ONLY — never fall back to rawDiff. When coverage included
+    // nothing (every file generated/binary), includedDiff is '' and the packet must
+    // stay empty → incomplete → skipped, NOT silently carry the omitted files the
+    // manifest swears the reviewer never saw (and possibly blow the prompt budget).
+    diff: includedDiff,
+    files,
     headSha,
     mode,
     rawDiff,

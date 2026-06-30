@@ -35,17 +35,15 @@ export interface ParsedReview {
   summary: string;
 }
 
-function asSeverity(v: unknown): Severity {
-  return (SEVERITIES as readonly string[]).includes(v as string)
-    ? (v as Severity)
-    : 'medium';
+// Coerce an untrusted value to a member of `set`, else `fallback` — the ONE
+// membership-check rule, shared by the severity + confidence coercers so they
+// can't drift.
+function oneOf<T extends string>(set: readonly T[], v: unknown, fallback: T): T {
+  return (set as readonly string[]).includes(v as string) ? (v as T) : fallback;
 }
 
-function asConfidence(v: unknown): Confidence {
-  return (CONFIDENCES as readonly string[]).includes(v as string)
-    ? (v as Confidence)
-    : 'low';
-}
+const asSeverity = (v: unknown): Severity => oneOf(SEVERITIES, v, 'medium');
+const asConfidence = (v: unknown): Confidence => oneOf(CONFIDENCES, v, 'low');
 
 function asEvidence(v: unknown): Evidence {
   if (!v || typeof v !== 'object') return {};

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/cli.ts
-import crypto3 from "crypto";
+import crypto2 from "crypto";
 import fs7 from "fs";
 import os6 from "os";
 import path6 from "path";
@@ -34,9 +34,11 @@ function isImplemented(mode) {
 // src/core/artifacts.ts
 import fs from "fs";
 import path from "path";
+function sanitizePathSegment(s) {
+  return s.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
 function reviewDir(baseDir, runId) {
-  const safe = runId.replace(/[^a-zA-Z0-9._-]/g, "_") || "unknown";
-  return path.join(baseDir, safe);
+  return path.join(baseDir, sanitizePathSegment(runId) || "unknown");
 }
 function writeAtomic(dir, name, content) {
   fs.mkdirSync(dir, { recursive: true });
@@ -106,12 +108,11 @@ Rules: cite a concrete file in every finding's "evidence" (an uncited finding is
 discounted). "severity" = the impact IF the finding is real; "confidence" = how
 sure you are it is real. If the change looks correct, return an empty "findings"
 array with a "summary" that says so. Do not invent issues to fill the list.`;
-function asSeverity(v) {
-  return SEVERITIES.includes(v) ? v : "medium";
+function oneOf(set, v, fallback) {
+  return set.includes(v) ? v : fallback;
 }
-function asConfidence(v) {
-  return CONFIDENCES.includes(v) ? v : "low";
-}
+var asSeverity = (v) => oneOf(SEVERITIES, v, "medium");
+var asConfidence = (v) => oneOf(CONFIDENCES, v, "low");
 function asEvidence(v) {
   if (!v || typeof v !== "object") return {};
   const e = v;
@@ -386,9 +387,6 @@ function loadReviewers(file = REVIEWERS_FILE) {
     return { ...REVIEWER_DEFAULTS };
   }
 }
-function resolveReviewer(id, file = REVIEWERS_FILE) {
-  return loadReviewers(file)[id] ?? REVIEWER_DEFAULTS[id];
-}
 
 // src/reviewers/codex.ts
 import os3 from "os";
@@ -650,7 +648,7 @@ function buildGrokReviewArgs(config, prompt, cwd) {
 function extractGrokText(stdout) {
   try {
     const env = JSON.parse(stdout);
-    if (typeof env.text === "string" && env.text.trim()) return env.text;
+    return typeof env.text === "string" && env.text.trim() ? env.text : null;
   } catch {
   }
   const trimmed = stdout.trim();
@@ -686,7 +684,14 @@ var REVIEW_ADAPTERS = {
 
 // src/modes/review/diff.ts
 import { execFileSync as execFileSync2 } from "child_process";
+
+// src/core/hash.ts
 import crypto from "crypto";
+function sha256Hex(input) {
+  return crypto.createHash("sha256").update(input, "utf8").digest("hex");
+}
+
+// src/modes/review/diff.ts
 var DEFAULT_COVERAGE_CEILING = 2e5;
 var GENERATED_PATTERNS = [
   /(^|\/)package-lock\.json$/,
@@ -784,8 +789,7 @@ function canonicalizeDiff(raw) {
   return raw.replace(/\r\n?/g, "\n").replace(/\n*$/, "\n");
 }
 function diffDigest(raw) {
-  const digest = crypto.createHash("sha256").update(canonicalizeDiff(raw), "utf8").digest("hex");
-  return `sha256:${digest}`;
+  return `sha256:${sha256Hex(canonicalizeDiff(raw))}`;
 }
 function git(cwd, args) {
   return execFileSync2("git", args, { cwd, encoding: "utf8" });
@@ -856,7 +860,12 @@ function acquireDiff(opts) {
     baseSha,
     canonicalDigest: diffDigest(rawDiff),
     coverage,
-    diff: includedDiff || rawDiff,
+    // The COVERED diff ONLY — never fall back to rawDiff. When coverage included
+    // nothing (every file generated/binary), includedDiff is '' and the packet must
+    // stay empty → incomplete → skipped, NOT silently carry the omitted files the
+    // manifest swears the reviewer never saw (and possibly blow the prompt budget).
+    diff: includedDiff,
+    files,
     headSha,
     mode,
     rawDiff,
@@ -865,7 +874,6 @@ function acquireDiff(opts) {
 }
 
 // src/modes/review/receipt.ts
-import crypto2 from "crypto";
 import fs6 from "fs";
 import os5 from "os";
 import path5 from "path";
@@ -875,7 +883,7 @@ function computePolicyHash(args) {
     diffMode: args.diffMode,
     reviewerPolicy: [...args.reviewerPolicy].sort()
   });
-  return `sha256:${crypto2.createHash("sha256").update(canonical, "utf8").digest("hex")}`;
+  return `sha256:${sha256Hex(canonical)}`;
 }
 function receiptKeyHash(key) {
   const canonical = JSON.stringify({
@@ -885,10 +893,10 @@ function receiptKeyHash(key) {
     policyHash: key.policyHash,
     repo: key.repo
   });
-  return crypto2.createHash("sha256").update(canonical, "utf8").digest("hex");
+  return sha256Hex(canonical);
 }
 function slug(s) {
-  return (s ?? "unknown").replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80) || "x";
+  return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
   return process.env.ENSEMBLE_RECEIPTS_DIR || path5.join(os5.homedir(), ".ensemble-ai", "receipts");
@@ -1035,11 +1043,26 @@ async function reviewOne(out, runId, reviewer, prompt, packetComplete, packet) {
       raw: null,
       reviewer,
       runId,
-      summary: `Skipped the ${reviewer.id} review \u2014 the diff could not be assembled, so the packet is incomplete. Surfaced for review.`,
-      terminalState: "reviewed"
+      summary: `Did not review with ${reviewer.id} \u2014 the diff could not be assembled (incomplete packet), so no trustworthy review ran. Surfaced for review.`,
+      terminalState: "failed-reviewer"
     });
   }
-  const result = await REVIEW_ADAPTERS[reviewer.id](prompt, reviewer);
+  const adapter = REVIEW_ADAPTERS[reviewer.id];
+  let result;
+  try {
+    result = await adapter(prompt, reviewer);
+  } catch (e) {
+    return persistReview(out, {
+      findings: [],
+      packet,
+      prompt,
+      raw: null,
+      reviewer,
+      runId,
+      summary: `The ${reviewer.id} reviewer could not run: ${e.message}`,
+      terminalState: "failed-reviewer"
+    });
+  }
   const parsed = result.raw ? parseFindings(result.raw) : null;
   const terminalState = parsed && !parsed.parseError && !result.timedOut ? "reviewed" : "failed-reviewer";
   const summary = result.timedOut ? "The reviewer timed out before completing \u2014 its output is incomplete and not trusted." : parsed?.summary || "The reviewer produced no parseable findings.";
@@ -1070,8 +1093,7 @@ async function runReviewMode(opts) {
   log(
     `Diff: ${acquired.coverage.totalFiles} file(s), ${acquired.coverage.includedFiles} covered, ${acquired.coverage.omittedFiles} omitted \xB7 digest ${acquired.canonicalDigest.slice(0, 19)}\u2026`
   );
-  const files = parseDiffFiles(acquired.rawDiff);
-  const secretScan = scanDiffForSecrets(files, {
+  const secretScan = scanDiffForSecrets(acquired.files, {
     allowSensitive: opts.allowSensitive
   });
   if (secretScan.blocked) {
@@ -1102,10 +1124,11 @@ async function runReviewMode(opts) {
     log("Packet incomplete (no usable diff) \u2014 persisting an empty review.");
   }
   log(`Running ${reviewers.length} reviewer(s): ${reviewers.join(", ")}\u2026`);
+  const resolved = loadReviewers(opts.reviewersFile);
   const reviews = await Promise.all(
     reviewers.map(async (id) => {
       const reviewer = {
-        ...resolveReviewer(id, opts.reviewersFile),
+        ...resolved[id],
         ...opts.sandbox ? { sandbox: opts.sandbox } : {}
       };
       log(`  \xB7 ${id} (${reviewer.vendor} \xB7 ${reviewer.model})\u2026`);
@@ -1181,7 +1204,7 @@ Exit codes: 0 = review completed (even WITH findings) \xB7 1 = a reviewer failed
 (crash/timeout/no-parse) \xB7 2 = blocked by the secret-scan \xB7 3 = usage / no diff.`;
 function genRunId() {
   const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
-  return `${stamp}-${crypto3.randomBytes(4).toString("hex")}`;
+  return `${stamp}-${crypto2.randomBytes(4).toString("hex")}`;
 }
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
@@ -1280,7 +1303,16 @@ async function reviewCommand(args) {
   } else if (!values["working-tree"]) {
     diffText = readStdinIfPiped();
   }
-  const reviewers = typeof values.reviewers === "string" ? parseReviewerIds(values.reviewers.split(",").map((s) => s.trim())) : void 0;
+  let reviewers;
+  if (typeof values.reviewers === "string") {
+    reviewers = parseReviewerIds(values.reviewers.split(",").map((s) => s.trim()));
+    if (!reviewers) {
+      console.error(
+        `ensemble-ai review: --reviewers "${values.reviewers}" names no known reviewer (known: ${REVIEWER_IDS.join(", ")})`
+      );
+      return 3;
+    }
+  }
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
   const out = typeof values.out === "string" ? path6.resolve(values.out) : path6.join(os6.tmpdir(), "ensemble-ai", runId);
   const ceilingBytes = typeof values.ceiling === "string" ? Number(values.ceiling) : void 0;

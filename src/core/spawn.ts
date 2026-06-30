@@ -101,10 +101,7 @@ export interface ReviewerExecOpts {
   timeoutMs: number;
 }
 
-/** @deprecated use ReviewerExecOpts — kept for any external importer. */
-export type CodexExecOpts = ReviewerExecOpts;
-
-export interface CodexExecResult {
+export interface ReviewerExecResult {
   /** The reply (the -o file, or accumulated stdout) — or null if none produced. */
   raw: string | null;
   stderrTail: string;
@@ -132,7 +129,7 @@ export interface CodexExecResult {
 // settle-on-exit + absolute backstop) is shared so the two paths can't drift.
 export function runReviewerExec(
   opts: ReviewerExecOpts
-): Promise<CodexExecResult> {
+): Promise<ReviewerExecResult> {
   const { bin, args, outFile, timeoutMs, stderrLimit, onSpawn } = opts;
   const capture = opts.capture ?? 'outfile';
   return new Promise((resolve) => {
@@ -205,6 +202,3 @@ export function runReviewerExec(
     child.on('error', settle);
   });
 }
-
-/** @deprecated use runReviewerExec — the spawn primitive is vendor-neutral now. */
-export const runCodexExec = runReviewerExec;

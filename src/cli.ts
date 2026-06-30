@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { parseReviewerIds } from './core/types';
+import { parseReviewerIds, REVIEWER_IDS, type ReviewerId } from './core/types';
 import { isImplemented, isMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
 
@@ -136,9 +136,7 @@ async function reviewCommand(args: string[]): Promise<number> {
     return 0;
   }
 
-  const cwd = values.cwd
-    ? path.resolve(String(values.cwd))
-    : process.cwd();
+  const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
   let diffText: string | undefined;
   const diffFile = values['diff-file'];
   if (typeof diffFile === 'string') {
@@ -152,10 +150,19 @@ async function reviewCommand(args: string[]): Promise<number> {
     diffText = readStdinIfPiped();
   }
 
-  const reviewers =
-    typeof values.reviewers === 'string'
-      ? parseReviewerIds(values.reviewers.split(',').map((s) => s.trim()))
-      : undefined;
+  // Distinguish "no --reviewers" (→ undefined → run the full default set) from
+  // "--reviewers given but NOTHING valid" (a typo). The latter must NOT silently
+  // widen to all reviewers — the user asked to narrow, so fail closed.
+  let reviewers: ReviewerId[] | undefined;
+  if (typeof values.reviewers === 'string') {
+    reviewers = parseReviewerIds(values.reviewers.split(',').map((s) => s.trim()));
+    if (!reviewers) {
+      console.error(
+        `ensemble-ai review: --reviewers "${values.reviewers}" names no known reviewer (known: ${REVIEWER_IDS.join(', ')})`
+      );
+      return 3;
+    }
+  }
   const runId = typeof values['run-id'] === 'string' ? values['run-id'] : genRunId();
   const out =
     typeof values.out === 'string'

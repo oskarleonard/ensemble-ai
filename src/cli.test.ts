@@ -43,6 +43,7 @@ function result(over: Partial<ReviewModeResult>): ReviewModeResult {
       canonicalDigest: 'sha256:x',
       coverage: { files: [], includedBytes: 0, includedFiles: 0, omittedFiles: 0, totalBytes: 0, totalFiles: 0 },
       diff: '',
+      files: [],
       headSha: 'h',
       mode: 'working-tree',
       rawDiff: '',

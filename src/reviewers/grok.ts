@@ -183,9 +183,14 @@ export function buildGrokReviewArgs(
 export function extractGrokText(stdout: string): string | null {
   try {
     const env = JSON.parse(stdout) as { text?: unknown };
-    if (typeof env.text === 'string' && env.text.trim()) return env.text;
+    // It parsed as grok's envelope — the review is `.text`. An empty/absent text
+    // (a refusal or length-stop still emits a valid envelope with text: "") means
+    // grok produced no usable reply: return null so the caller records
+    // failed-reviewer, NOT the envelope JSON itself — which parseFindings would
+    // otherwise read as an empty, falsely-"reviewed" findings object.
+    return typeof env.text === 'string' && env.text.trim() ? env.text : null;
   } catch {
-    // not JSON — fall through to the raw stdout
+    // Not the JSON envelope (a plain-format surprise) — degrade to the raw stdout.
   }
   const trimmed = stdout.trim();
   return trimmed || null;

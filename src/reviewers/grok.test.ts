@@ -144,6 +144,14 @@ describe('extractGrokText', () => {
   it('returns null for empty stdout', () => {
     expect(extractGrokText('   ')).toBeNull();
   });
+
+  it('returns null (not the envelope JSON) when the envelope parses but .text is empty', () => {
+    // A refusal / length-stop emits a VALID envelope with text: "". The reply must
+    // be treated as "no usable review" → null (→ failed-reviewer), never returned
+    // verbatim — else parseFindings reads the envelope as an empty "reviewed" run.
+    expect(extractGrokText('{"text":"","stopReason":"refusal"}')).toBeNull();
+    expect(extractGrokText('{"stopReason":"length"}')).toBeNull();
+  });
 });
 
 describe('ensureSandboxProfile', () => {

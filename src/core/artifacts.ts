@@ -23,11 +23,16 @@ import {
 // `--out` dir; a host (e.g. a dashboard) injects its own artifacts root — so one
 // persistence implementation serves both with identical on-disk shapes.
 
+// Reduce an untrusted string to a safe single path segment: collapse anything
+// outside [A-Za-z0-9._-] to '_', so a crafted id (path separators, `..`) can't
+// escape its base dir. ONE copy of this traversal defense — every on-disk key
+// (the run trail, the receipt store) routes through it so they can't drift.
+export function sanitizePathSegment(s: string): string {
+  return s.replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
 export function reviewDir(baseDir: string, runId: string): string {
-  // runId may come from an untrusted caller — strip path separators defensively
-  // so a crafted id can't escape the base dir.
-  const safe = runId.replace(/[^a-zA-Z0-9._-]/g, '_') || 'unknown';
-  return path.join(baseDir, safe);
+  return path.join(baseDir, sanitizePathSegment(runId) || 'unknown');
 }
 
 function writeAtomic(dir: string, name: string, content: string): void {

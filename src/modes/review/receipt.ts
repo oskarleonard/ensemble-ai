@@ -1,8 +1,9 @@
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { sanitizePathSegment } from '../../core/artifacts';
+import { sha256Hex } from '../../core/hash';
 import type { ReviewerId, StoredReview } from '../../core/types';
 
 import type { Coverage, DiffMode } from './diff';
@@ -65,7 +66,7 @@ export function computePolicyHash(args: {
     diffMode: args.diffMode,
     reviewerPolicy: [...args.reviewerPolicy].sort(),
   });
-  return `sha256:${crypto.createHash('sha256').update(canonical, 'utf8').digest('hex')}`;
+  return `sha256:${sha256Hex(canonical)}`;
 }
 
 // The full reviewed identity (Codex f5): keyed by repo + BOTH SHAs + the diff
@@ -87,11 +88,11 @@ export function receiptKeyHash(key: ReceiptKey): string {
     policyHash: key.policyHash,
     repo: key.repo,
   });
-  return crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
+  return sha256Hex(canonical);
 }
 
 function slug(s: string | null): string {
-  return (s ?? 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'x';
+  return sanitizePathSegment(s ?? 'unknown').slice(0, 80) || 'x';
 }
 
 export function defaultReceiptStore(): string {

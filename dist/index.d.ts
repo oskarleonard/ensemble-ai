@@ -8,6 +8,7 @@ declare function loadReviewers(file?: string): Record<ReviewerId, ReviewerConfig
 declare function resolveReviewer(id: ReviewerId, file?: string): ReviewerConfig;
 declare function listReviewers(file?: string): ReviewerConfig[];
 
+declare function sanitizePathSegment(s: string): string;
 declare function reviewDir(baseDir: string, runId: string): string;
 interface PersistReviewInput {
     findings: ReviewFinding[];
@@ -55,22 +56,20 @@ interface ReviewerExecOpts {
     /** Watchdog timeout; on expiry the whole process GROUP is SIGTERM→SIGKILLed. */
     timeoutMs: number;
 }
-/** @deprecated use ReviewerExecOpts — kept for any external importer. */
-type CodexExecOpts = ReviewerExecOpts;
-interface CodexExecResult {
+interface ReviewerExecResult {
     /** The reply (the -o file, or accumulated stdout) — or null if none produced. */
     raw: string | null;
     stderrTail: string;
     timedOut: boolean;
 }
-declare function runReviewerExec(opts: ReviewerExecOpts): Promise<CodexExecResult>;
-/** @deprecated use runReviewerExec — the spawn primitive is vendor-neutral now. */
-declare const runCodexExec: typeof runReviewerExec;
+declare function runReviewerExec(opts: ReviewerExecOpts): Promise<ReviewerExecResult>;
 
 declare function resolveBin(name: string, opts?: {
     candidates?: string[];
     envVar?: string;
 }): string;
+
+declare function sha256Hex(input: string): string;
 
 declare const REVIEW_TIMEOUT_MS = 720000;
 interface CodexReviewResult {
@@ -94,7 +93,6 @@ declare function extractGrokText(stdout: string): string | null;
 declare function runGrokReview(prompt: string, config: ReviewerConfig, opts?: RunReviewOpts): Promise<CodexReviewResult>;
 
 declare const REVIEW_ADAPTERS: Record<ReviewerId, (prompt: string, config: ReviewerConfig, opts?: RunReviewOpts) => Promise<CodexReviewResult>>;
-declare function asTrimmed(v: unknown): string | undefined;
 
 type DiffMode = 'commit' | 'working-tree' | 'raw';
 type FileKind = 'source' | 'generated' | 'binary';
@@ -142,6 +140,7 @@ interface AcquiredDiff {
     canonicalDigest: string;
     coverage: Coverage;
     diff: string;
+    files: FileDiff[];
     headSha: string;
     mode: DiffMode;
     rawDiff: string;
@@ -290,4 +289,4 @@ declare const IMPLEMENTED_MODES: readonly ModeName[];
 declare function isMode(v: string): v is ModeName;
 declare function isImplemented(mode: ModeName): boolean;
 
-export { type AcquireDiffOpts, type AcquiredDiff, type BuildReceiptResult, type CodexExecOpts, type CodexExecResult, type CodexReviewResult, type Coverage, type CoverageFileEntry, type CoveragePolicy, DEFAULT_COVERAGE_CEILING, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type FileDiff, type FileKind, IMPLEMENTED_MODES, type InlineSecretHit, MODES, type ModeName, type OmitReason, type PersistReviewInput, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type ReceiptCoverage, type ReceiptKey, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewerConfig, type ReviewerExecOpts, ReviewerId, type RunReviewOpts, type SecretScanResult, type SensitivePathHit, StoredReview, TerminalState, acquireDiff, asTrimmed, buildCodexReviewArgs, buildDiffReceipt, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, computeCoverage, computePolicyHash, coverageShortfall, defaultReceiptStore, diffDigest, ensureSandboxProfile, extractGrokText, isDiffReviewed, isImplemented, isMode, keyOf, killTree, listReviewers, loadReviewers, makeEscalatingKill, parseDiffFiles, parseReviewers, persistReview, readReceipt, readReview, readReviewsForRun, receiptKeyHash, receiptPath, resolveBase, resolveBin, resolveCodexBin, resolveGrokBin, resolveRepoId, resolveReviewSandbox, resolveReviewer, reviewDir, runCodexExec, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, scanDiffForSecrets, summarizeCoverage, writeReceipt };
+export { type AcquireDiffOpts, type AcquiredDiff, type BuildReceiptResult, type CodexReviewResult, type Coverage, type CoverageFileEntry, type CoveragePolicy, DEFAULT_COVERAGE_CEILING, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type FileDiff, type FileKind, IMPLEMENTED_MODES, type InlineSecretHit, MODES, type ModeName, type OmitReason, type PersistReviewInput, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type ReceiptCoverage, type ReceiptKey, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RunReviewOpts, type SecretScanResult, type SensitivePathHit, StoredReview, TerminalState, acquireDiff, buildCodexReviewArgs, buildDiffReceipt, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, computeCoverage, computePolicyHash, coverageShortfall, defaultReceiptStore, diffDigest, ensureSandboxProfile, extractGrokText, isDiffReviewed, isImplemented, isMode, keyOf, killTree, listReviewers, loadReviewers, makeEscalatingKill, parseDiffFiles, parseReviewers, persistReview, readReceipt, readReview, readReviewsForRun, receiptKeyHash, receiptPath, resolveBase, resolveBin, resolveCodexBin, resolveGrokBin, resolveRepoId, resolveReviewSandbox, resolveReviewer, reviewDir, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, sanitizePathSegment, scanDiffForSecrets, sha256Hex, summarizeCoverage, writeReceipt };

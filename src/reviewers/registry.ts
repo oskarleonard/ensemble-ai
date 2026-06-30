@@ -20,9 +20,3 @@ export const REVIEW_ADAPTERS: Record<
   codex: runCodexReview,
   grok: runGrokReview,
 };
-
-// Coerce an optional/untrusted field to a trimmed non-empty string (or
-// undefined). Shared so the input-coercion rule can't drift between callers.
-export function asTrimmed(v: unknown): string | undefined {
-  return typeof v === 'string' && v.trim() ? v : undefined;
-}

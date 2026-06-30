@@ -2,7 +2,7 @@ import { persistReview } from '../../core/artifacts';
 import { parseFindings } from '../../core/findings';
 import { assembleCodePacket } from '../../core/packet';
 import { renderReviewPrompt } from '../../core/prompt';
-import { resolveReviewer } from '../../core/reviewers';
+import { loadReviewers } from '../../core/reviewers';
 import {
   REVIEWER_IDS,
   type ReviewerConfig,
@@ -16,7 +16,6 @@ import {
   acquireDiff,
   type AcquiredDiff,
   DEFAULT_COVERAGE_CEILING,
-  parseDiffFiles,
 } from './diff';
 import {
   buildDiffReceipt,
@@ -75,6 +74,11 @@ async function reviewOne(
   packet: ReturnType<typeof assembleCodePacket>
 ): Promise<StoredReview> {
   if (!packetComplete) {
+    // No usable diff → the reviewer is NOT run, and this is recorded as a
+    // NON-completion (never 'reviewed'). buildDiffReceipt and isDiffReviewed both
+    // key "did this reviewer complete?" off terminalState === 'reviewed'; marking a
+    // skipped reviewer 'reviewed' would qualify a receipt for a change no reviewer
+    // ever saw (fail-OPEN). 'failed-reviewer' keeps a blind/empty packet fail-closed.
     return persistReview(out, {
       findings: [],
       packet,
@@ -82,11 +86,30 @@ async function reviewOne(
       raw: null,
       reviewer,
       runId,
-      summary: `Skipped the ${reviewer.id} review — the diff could not be assembled, so the packet is incomplete. Surfaced for review.`,
-      terminalState: 'reviewed',
+      summary: `Did not review with ${reviewer.id} — the diff could not be assembled (incomplete packet), so no trustworthy review ran. Surfaced for review.`,
+      terminalState: 'failed-reviewer',
     });
   }
-  const result = await REVIEW_ADAPTERS[reviewer.id](prompt, reviewer);
+  // Isolate a per-reviewer failure (e.g. its CLI binary can't be resolved, which
+  // throws): record it as THIS reviewer's failed-reviewer instead of rejecting the
+  // whole Promise.all fan-out, so one missing or broken vendor can't take down the
+  // others' reviews.
+  const adapter = REVIEW_ADAPTERS[reviewer.id];
+  let result: Awaited<ReturnType<typeof adapter>>;
+  try {
+    result = await adapter(prompt, reviewer);
+  } catch (e) {
+    return persistReview(out, {
+      findings: [],
+      packet,
+      prompt,
+      raw: null,
+      reviewer,
+      runId,
+      summary: `The ${reviewer.id} reviewer could not run: ${(e as Error).message}`,
+      terminalState: 'failed-reviewer',
+    });
+  }
   const parsed = result.raw ? parseFindings(result.raw) : null;
   const terminalState: TerminalState =
     parsed && !parsed.parseError && !result.timedOut
@@ -137,8 +160,8 @@ export async function runReviewMode(
 
   // Secret-scan the FULL canonical diff (the change identity), not just the
   // covered subset — the payload + the manifest must reflect the whole change.
-  const files = parseDiffFiles(acquired.rawDiff);
-  const secretScan = scanDiffForSecrets(files, {
+  // (acquireDiff already parsed these files for coverage — reuse, don't re-parse.)
+  const secretScan = scanDiffForSecrets(acquired.files, {
     allowSensitive: opts.allowSensitive,
   });
   if (secretScan.blocked) {
@@ -171,10 +194,13 @@ export async function runReviewMode(
   }
 
   log(`Running ${reviewers.length} reviewer(s): ${reviewers.join(', ')}…`);
+  // Load the reviewers config ONCE per run (a file read + JSON parse), then index
+  // it per reviewer — not once per reviewer inside the fan-out.
+  const resolved = loadReviewers(opts.reviewersFile);
   const reviews = await Promise.all(
     reviewers.map(async (id) => {
       const reviewer: ReviewerConfig = {
-        ...resolveReviewer(id, opts.reviewersFile),
+        ...resolved[id],
         ...(opts.sandbox ? { sandbox: opts.sandbox } : {}),
       };
       log(`  · ${id} (${reviewer.vendor} · ${reviewer.model})…`);

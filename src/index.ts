@@ -20,6 +20,7 @@ export * from './core/artifacts';
 // ── Spawn primitive + bin resolution (the watchdog'd, group-killed contract) ──
 export * from './core/spawn';
 export * from './core/bin';
+export * from './core/hash';
 
 // ── Reviewer adapters (codex · grok) + the adapter registry ──────────────────
 export * from './reviewers/codex';

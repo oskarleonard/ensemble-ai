@@ -34,12 +34,11 @@ Rules: cite a concrete file in every finding's "evidence" (an uncited finding is
 discounted). "severity" = the impact IF the finding is real; "confidence" = how
 sure you are it is real. If the change looks correct, return an empty "findings"
 array with a "summary" that says so. Do not invent issues to fill the list.`;
-function asSeverity(v) {
-  return SEVERITIES.includes(v) ? v : "medium";
+function oneOf(set, v, fallback) {
+  return set.includes(v) ? v : fallback;
 }
-function asConfidence(v) {
-  return CONFIDENCES.includes(v) ? v : "low";
-}
+var asSeverity = (v) => oneOf(SEVERITIES, v, "medium");
+var asConfidence = (v) => oneOf(CONFIDENCES, v, "low");
 function asEvidence(v) {
   if (!v || typeof v !== "object") return {};
   const e = v;
