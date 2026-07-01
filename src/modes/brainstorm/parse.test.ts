@@ -34,8 +34,22 @@ describe('parseCritique', () => {
     expect(out.critiques).toEqual([{ assessment: 'weak', stance: 'concern', target: 'g1' }]);
     expect(out.extensions).toEqual([{ body: 'bx', title: 'X' }]);
   });
-  it('tolerates missing arrays', () => {
+  it('flags a reply with NEITHER a critiques nor an extensions array (e.g. {} or an error blob)', () => {
     const out = parseCritique('{"summary":"only"}');
+    expect(out.parseError).toBeTruthy();
+    expect(out.critiques).toEqual([]);
+    expect(out.extensions).toEqual([]);
+    // an error blob that parses to an object is a FAILED critique, not an empty success
+    expect(parseCritique('{"error":"quota"}').parseError).toBeTruthy();
+  });
+  it('accepts a reply with only ONE of the two arrays (extensions present, no critiques)', () => {
+    const out = parseCritique('{"extensions":[{"title":"X","body":"bx"}]}');
+    expect(out.parseError).toBeUndefined();
+    expect(out.critiques).toEqual([]);
+    expect(out.extensions).toEqual([{ body: 'bx', title: 'X' }]);
+  });
+  it('accepts a conforming "nothing to add" reply (both arrays present but empty)', () => {
+    const out = parseCritique('{"critiques":[],"extensions":[]}');
     expect(out.parseError).toBeUndefined();
     expect(out.critiques).toEqual([]);
     expect(out.extensions).toEqual([]);

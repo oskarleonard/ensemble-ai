@@ -78,6 +78,21 @@ export function parseCritique(raw: string): ParsedCritique {
   }
   const o = obj as Record<string, unknown>;
   const summary = str(o.summary);
+  // A conforming critique reply carries at least ONE of the two content arrays
+  // (critiques and/or extensions). A reply with NEITHER — `{}`, an error blob like
+  // `{"error":"quota"}`, or prose that parsed to the wrong braces — is not a critique:
+  // return a parseError so the orchestrator records the voice FAILED, never a falsely
+  // "ok" empty critique that lets synthesis proceed as if the cross-critique happened.
+  // (parseIdeas/parseSynthesis apply the same "no conforming array → failed" rule; a
+  // genuine "nothing to add" still sends empty arrays, which pass.)
+  if (!Array.isArray(o.critiques) && !Array.isArray(o.extensions)) {
+    return {
+      critiques: [],
+      extensions: [],
+      parseError: 'output has neither a "critiques" nor an "extensions" array',
+      summary,
+    };
+  }
   const critiques: Critique[] = [];
   if (Array.isArray(o.critiques)) {
     for (const rc of o.critiques) {

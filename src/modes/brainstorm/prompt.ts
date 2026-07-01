@@ -95,12 +95,24 @@ Be specific and cite the idea ids. An empty "extensions" array is fine if you ha
 `;
 }
 
+// Cap each free-text field folded into the round-3 synthesis prompt. Ideas and
+// critiques are UNTRUSTED model output of unbounded length; only the file context was
+// budgeted before, so a verbose round 1/2 could grow the synthesis prompt (passed as a
+// single argv element to the voice CLI) past sane/OS limits. Generous — a real idea
+// body or assessment is a few hundred chars.
+const SYNTHESIS_FIELD_BUDGET = 2000;
+function cap(s: string): string {
+  return s.length > SYNTHESIS_FIELD_BUDGET
+    ? `${s.slice(0, SYNTHESIS_FIELD_BUDGET)}…[truncated]`
+    : s;
+}
+
 // Render every idea (with its author) and every critique (with its critic) for the
 // synthesizer. Authors/critics ARE labelled here (round 1's independence already
 // happened) so the synthesis can credit contributors.
 function allIdeasBlock(allIdeas: Idea[]): string {
   return allIdeas
-    .map((i) => `[${i.id}] (${i.voiceId ?? '?'}) ${i.title}: ${i.body}`)
+    .map((i) => `[${i.id}] (${i.voiceId ?? '?'}) ${cap(i.title)}: ${cap(i.body)}`)
     .join('\n');
 }
 
@@ -109,10 +121,10 @@ function critiquesBlock(critiqueResults: VoiceCritiqueResult[]): string {
   for (const c of critiqueResults) {
     if (!c.ok) continue;
     for (const cr of c.critiques) {
-      lines.push(`(${c.voiceId}) ${cr.stance} on ${cr.target}: ${cr.assessment}`);
+      lines.push(`(${c.voiceId}) ${cr.stance} on ${cap(cr.target)}: ${cap(cr.assessment)}`);
     }
     for (const ex of c.extensions) {
-      lines.push(`(${c.voiceId}) extension — ${ex.title}: ${ex.body}`);
+      lines.push(`(${c.voiceId}) extension — ${cap(ex.title)}: ${cap(ex.body)}`);
     }
   }
   return lines.length ? lines.join('\n') : '(no critiques)';

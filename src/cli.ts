@@ -579,6 +579,11 @@ function printBrainstorm(r: BrainstormResult): void {
   console.log(out.join('\n'));
 }
 
+// Hard cap on a --file read. Only the first FILE_CONTEXT_BUDGET (24k) is ever embedded
+// in a prompt, but fs.readFileSync pulls the WHOLE file into the heap first, so an
+// unbounded --file is an OOM vector; 10 MiB is generous for any real context file.
+const MAX_BRAINSTORM_FILE_BYTES = 10 * 1024 * 1024;
+
 async function brainstormCommand(args: string[]): Promise<number> {
   let parsed: ReturnType<typeof parseArgs>;
   try {
@@ -618,8 +623,16 @@ async function brainstormCommand(args: string[]): Promise<number> {
   const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
   let fileContext: string | undefined;
   if (typeof values.file === 'string') {
+    const filePath = path.resolve(cwd, values.file);
     try {
-      fileContext = fs.readFileSync(path.resolve(cwd, values.file), 'utf8');
+      const bytes = fs.statSync(filePath).size;
+      if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
+        console.error(
+          `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
+        );
+        return 3;
+      }
+      fileContext = fs.readFileSync(filePath, 'utf8');
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${(e as Error).message}`

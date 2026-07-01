@@ -1487,6 +1487,14 @@ function parseCritique(raw) {
   }
   const o = obj;
   const summary = str2(o.summary);
+  if (!Array.isArray(o.critiques) && !Array.isArray(o.extensions)) {
+    return {
+      critiques: [],
+      extensions: [],
+      parseError: 'output has neither a "critiques" nor an "extensions" array',
+      summary
+    };
+  }
   const critiques = [];
   if (Array.isArray(o.critiques)) {
     for (const rc of o.critiques) {
@@ -1603,18 +1611,22 @@ ${JSON_RULE}
 Be specific and cite the idea ids. An empty "extensions" array is fine if you have nothing to add.
 `;
 }
+var SYNTHESIS_FIELD_BUDGET = 2e3;
+function cap(s) {
+  return s.length > SYNTHESIS_FIELD_BUDGET ? `${s.slice(0, SYNTHESIS_FIELD_BUDGET)}\u2026[truncated]` : s;
+}
 function allIdeasBlock(allIdeas) {
-  return allIdeas.map((i) => `[${i.id}] (${i.voiceId ?? "?"}) ${i.title}: ${i.body}`).join("\n");
+  return allIdeas.map((i) => `[${i.id}] (${i.voiceId ?? "?"}) ${cap(i.title)}: ${cap(i.body)}`).join("\n");
 }
 function critiquesBlock(critiqueResults) {
   const lines = [];
   for (const c of critiqueResults) {
     if (!c.ok) continue;
     for (const cr of c.critiques) {
-      lines.push(`(${c.voiceId}) ${cr.stance} on ${cr.target}: ${cr.assessment}`);
+      lines.push(`(${c.voiceId}) ${cr.stance} on ${cap(cr.target)}: ${cap(cr.assessment)}`);
     }
     for (const ex of c.extensions) {
-      lines.push(`(${c.voiceId}) extension \u2014 ${ex.title}: ${ex.body}`);
+      lines.push(`(${c.voiceId}) extension \u2014 ${cap(ex.title)}: ${cap(ex.body)}`);
     }
   }
   return lines.length ? lines.join("\n") : "(no critiques)";
@@ -1662,13 +1674,17 @@ import path6 from "path";
 function resolveClaudeBin() {
   return resolveBin("claude", { envVar: "CLAUDE_BIN" });
 }
-function buildClaudeVoiceArgs(prompt) {
-  return ["-p", prompt, "--output-format", "text"];
+var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
+function buildClaudeVoiceArgs(prompt, config) {
+  const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
+  if (config?.model && config.model !== "default") args.push("--model", config.model);
+  if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
+  return args;
 }
-function runClaudeVoice(prompt, _config, opts = {}) {
+function runClaudeVoice(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   return runReviewerExec({
-    args: buildClaudeVoiceArgs(prompt),
+    args: buildClaudeVoiceArgs(prompt, config),
     bin: resolveClaudeBin(),
     capture: "stdout",
     onSpawn: opts.onSpawn,

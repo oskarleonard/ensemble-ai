@@ -64,4 +64,12 @@ describe('renderSynthesisPrompt', () => {
     ];
     expect(renderSynthesisPrompt('t', ideas(), failed)).toContain('(no critiques)');
   });
+  it('caps a pathologically long idea body so the synthesis prompt stays bounded', () => {
+    const huge: Idea[] = [
+      { body: 'x'.repeat(10_000), id: 'codex-1', title: 'big', voiceId: 'codex' },
+    ];
+    const p = renderSynthesisPrompt('t', huge, []);
+    expect(p).toContain('…[truncated]');
+    expect(p).not.toContain('x'.repeat(3000));
+  });
 });

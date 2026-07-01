@@ -337,4 +337,46 @@ describe('brainstorm dispatch + arg parsing', () => {
     );
     expect(await main(['brainstorm', 'x'])).toBe(1);
   });
+
+  it('printBrainstorm strips control/ANSI escapes from untrusted voice output', async () => {
+    const ESC = '\u001b';
+    mockBrainstorm.mockResolvedValue(
+      brainstormResult({
+        generate: [
+          {
+            ideas: [{ body: `body${ESC}[31m`, id: 'codex-1', title: `t${ESC}[0m`, voiceId: 'codex' }],
+            ok: true,
+            raw: '{}',
+            summary: `sum${ESC}[1m`,
+            voiceId: 'codex',
+          },
+        ],
+        critique: [
+          {
+            critiques: [{ assessment: `weak${ESC}[5m`, stance: 'concern', target: `codex-1${ESC}[7m` }],
+            extensions: [],
+            ok: true,
+            raw: null,
+            summary: '',
+            voiceId: 'grok',
+          },
+        ],
+        synthesis: {
+          by: 'claude',
+          degraded: false,
+          ok: true,
+          raw: null,
+          summary: `final${ESC}[2m`,
+          // contributors + title + why + risks are UNTRUSTED synthesizer output.
+          ranked: [
+            { contributors: [`codex${ESC}[31m`, `grok${ESC}[0m`], rank: 1, title: `Winner${ESC}[0m`, why: `w${ESC}[4m`, risks: `r${ESC}[9m` },
+          ],
+        },
+      })
+    );
+    expect(await main(['brainstorm', 'x'])).toBe(0);
+    const printed = vi.mocked(console.log).mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(printed).not.toContain(ESC); // no escape char reached the terminal
+    expect(printed).toContain('Winner'); // the cleaned content is still rendered
+  });
 });

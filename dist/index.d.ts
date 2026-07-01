@@ -411,8 +411,8 @@ declare function pickSynthesizer(roster: VoiceId[], requested: VoiceId | undefin
 declare function runBrainstormMode(opts: BrainstormOptions): Promise<BrainstormResult>;
 
 declare function resolveClaudeBin(): string;
-declare function buildClaudeVoiceArgs(prompt: string): string[];
-declare function runClaudeVoice(prompt: string, _config: VoiceConfig, opts?: RunReviewOpts): Promise<CodexReviewResult>;
+declare function buildClaudeVoiceArgs(prompt: string, config?: VoiceConfig): string[];
+declare function runClaudeVoice(prompt: string, config: VoiceConfig, opts?: RunReviewOpts): Promise<CodexReviewResult>;
 
 declare function renderGeneratePrompt(topic: string, fileContext?: string): string;
 declare function renderCritiquePrompt(topic: string, peerIdeas: Idea[], fileContext?: string): string;
