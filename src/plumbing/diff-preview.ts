@@ -5,6 +5,7 @@
 // (default objective per profile, pr 0, repoId) — so the preview never drifts from
 // the real payload. No spawn, no network, no config read.
 
+import type { ConventionManifest } from '../core/conventions';
 import { assembleCodePacket } from '../core/packet';
 import { renderReviewPrompt } from '../core/prompt';
 import type { ReviewPacket } from '../core/types';
@@ -19,14 +20,16 @@ export interface PacketPreview {
 }
 
 // Assemble the packet + render the prompt exactly as runReviewMode does for the
-// given profile. PURE: a function of the acquired diff + profile, so "it assembles
-// without spawning a reviewer" is true by construction (this module imports no
-// reviewer adapter).
+// given profile. PURE: a function of the acquired diff + profile (+ the gathered
+// conventions text, if any), so "it assembles without spawning a reviewer" is true
+// by construction (this module imports no reviewer adapter).
 export function buildPacketPreview(
   acquired: AcquiredDiff,
-  profile: ReviewProfile
+  profile: ReviewProfile,
+  agentsMd?: string
 ): PacketPreview {
   const packet = assembleCodePacket({
+    agentsMd,
     diff: acquired.diff,
     objective: profile === 'security' ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE,
     pr: 0,
@@ -35,13 +38,39 @@ export function buildPacketPreview(
   return { packet, prompt: renderReviewPrompt(packet, profile) };
 }
 
+// The gathered convention files, rendered for the `diff` preview + review summary —
+// which files fed the reviewers, and which were truncated/omitted over the cap. One
+// renderer so the preview and the review summary can't drift on the wording.
+export function renderConventionManifest(m: ConventionManifest): string[] {
+  const out: string[] = [];
+  const inc = m.files.filter((f) => f.included).length;
+  out.push(
+    `  conventions:  ${inc}/${m.files.length} file(s) gathered, ${m.totalBytes} bytes (cap ${m.capBytes})`
+  );
+  for (const f of m.files) {
+    const flag = f.included ? (f.truncated ? '~' : '✓') : '·';
+    const tag = f.truncated
+      ? ' (truncated — over cap)'
+      : !f.included
+        ? ' (omitted — over cap)'
+        : '';
+    out.push(`    ${flag} ${f.path} (${f.bytes} bytes)${tag}`);
+  }
+  return out;
+}
+
 // The formatted preview: the diff identity + coverage + the per-section manifest
 // (what the reviewer will and won't see) + the prompt-size cost preview. With
 // `full`, the entire rendered prompt is appended (the literal payload). PURE.
 export function renderPacketPreview(
   acquired: AcquiredDiff,
   preview: PacketPreview,
-  opts: { full: boolean; profile: ReviewProfile; reviewers: string[] }
+  opts: {
+    conventions?: ConventionManifest;
+    full: boolean;
+    profile: ReviewProfile;
+    reviewers: string[];
+  }
 ): string {
   const c = acquired.coverage;
   const out: string[] = [];
@@ -63,6 +92,10 @@ export function renderPacketPreview(
   for (const s of preview.packet.sections) {
     const flag = s.included ? (s.truncated ? '~' : '✓') : '·';
     out.push(`    ${flag} ${s.title} — ${s.note}`);
+  }
+  if (opts.conventions) {
+    out.push('');
+    out.push(...renderConventionManifest(opts.conventions));
   }
   out.push('');
   out.push(`  packet complete: ${preview.packet.complete ? 'yes' : 'NO — a blind review (diff missing/too small)'}`);

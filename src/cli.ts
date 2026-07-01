@@ -6,6 +6,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 
+import {
+  type ConventionManifest,
+  type ConventionReader,
+  fsConventionReader,
+  gatherConventions,
+} from './core/conventions';
 import { isEntrypoint } from './core/entrypoint';
 import { listReviewers, REVIEWERS_FILE } from './core/reviewers';
 import {
@@ -58,7 +64,11 @@ import {
   isDiffSourceError,
   selectDiffSource,
 } from './modes/review/source';
-import { buildPacketPreview, renderPacketPreview } from './plumbing/diff-preview';
+import {
+  buildPacketPreview,
+  renderConventionManifest,
+  renderPacketPreview,
+} from './plumbing/diff-preview';
 import { renderRegistry, type RegistryView } from './plumbing/registry';
 import {
   formatReceipt,
@@ -118,6 +128,8 @@ Diff source (give at most ONE; default = current branch):
 Options:
   --base <ref>          base ref for the default (commit) mode
   --reviewers <ids>     comma-separated reviewer ids (default: all configured)
+  --conventions <paths> extra convention files to gather (comma-separated, in-repo)
+  --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
   --out <dir>           trail output dir (default: a temp dir, printed)
   --sandbox <profile>   reviewer sandbox profile override (deny-by-default only)
@@ -197,6 +209,70 @@ function capture(
   }
 }
 
+// The git repo root of cwd, or null when cwd isn't in a work tree (e.g. reviewing
+// a PR URL from /tmp) — then local convention gathering is simply skipped.
+function gitToplevel(cwd: string): string | null {
+  try {
+    const top = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return top || null;
+  } catch {
+    return null;
+  }
+}
+
+// A gh-backed convention reader (the `--pr <url>` path) — reads repo-relative files
+// + lists dirs from the PR repo at a fixed ref via `gh api …/contents`. Mirrors the
+// dashboard's own gh reader, so both feed the SAME pure gatherConventions. Any gh
+// failure degrades to null/[] (a missing convention file is not fatal).
+function ghConventionReader(
+  repoSlug: string,
+  ref: string,
+  cwd: string
+): ConventionReader {
+  return {
+    async read(rel) {
+      const cap = capture(
+        'gh',
+        ['api', `repos/${repoSlug}/contents/${rel}?ref=${ref}`, '--jq', '.content'],
+        cwd
+      );
+      if (!cap.ok || !cap.text.trim()) return null;
+      try {
+        return Buffer.from(cap.text.replace(/\s/g, ''), 'base64').toString('utf8');
+      } catch {
+        return null;
+      }
+    },
+    async list(dirRel) {
+      const cap = capture(
+        'gh',
+        ['api', `repos/${repoSlug}/contents/${dirRel}?ref=${ref}`, '--jq', '.[].path'],
+        cwd
+      );
+      if (!cap.ok) return [];
+      return cap.text
+        .split('\n')
+        .map((s) => s.trim())
+        .filter((s) => s.endsWith('.md'));
+    },
+  };
+}
+
+// Pick the reader for the diff source: gh (URL PR, at the PR head) else the local
+// checkout (fs from the cwd's git root). null → gather nothing (non-repo cwd).
+function buildConventionReader(
+  cwd: string,
+  ctx?: { ref: string; repoSlug: string }
+): ConventionReader | null {
+  if (ctx) return ghConventionReader(ctx.repoSlug, ctx.ref, cwd);
+  const root = gitToplevel(cwd);
+  return root ? fsConventionReader(root) : null;
+}
+
 // Turn the resolved diff-source SELECTION into the engine inputs, running the
 // git/gh I/O each source needs. Returns a usage-error code (3) on any failure so
 // the caller can return it directly.
@@ -208,9 +284,17 @@ function resolveSource(
 ):
   | { code: number }
   | {
+      // Where a `--pr <url>` review gathers its conventions from — the PR's repo at
+      // its resolved head SHA (via gh). Absent for local/bare-PR sources, which
+      // gather from the cwd's local checkout instead.
+      conventionsCtx?: { ref: string; repoSlug: string };
       diffMode?: DiffMode;
       diffText?: string;
       headShaOverride?: string;
+      // A URL PR reviews a DIFFERENT repo than the cwd. When its head SHA can't be
+      // resolved (no gh ref to read conventions at), suppress the LOCAL-repo fallback:
+      // gather NOTHING rather than the wrong repo's conventions.
+      noLocalConventions?: boolean;
       staged?: boolean;
       workingTree?: boolean;
     } {
@@ -280,16 +364,24 @@ function resolveSource(
             ],
             cwd
           );
-          return prResult(cmp, label, headSha);
+          const r = prResult(cmp, label, headSha);
+          // A URL PR review gathers conventions from the PR repo at its exact head SHA
+          // (same reach as the diff) — so the reviewer sees the change's own conventions
+          // even when fired from a bare terminal / non-repo cwd.
+          return 'code' in r ? r : { ...r, conventionsCtx: { ref: headSha, repoSlug } };
         }
-        // SHAs unresolved → unbound `gh pr diff -R` (no SHA binding, generic label).
+        // SHAs unresolved → unbound `gh pr diff -R` (no SHA binding, generic label). A
+        // URL PR reviews a DIFFERENT repo than the cwd, so its conventions must come ONLY
+        // from the PR repo — but with no resolved head SHA there is no ref to read them
+        // at. Suppress the local-repo fallback: EMPTY conventions, never the wrong repo's.
         const label = `gh pr diff ${selection.pr} -R ${repoSlug}`;
         const cap = capture(
           'gh',
           ['pr', 'diff', String(selection.pr), '-R', repoSlug],
           cwd
         );
-        return prResult(cap, label);
+        const r = prResult(cap, label);
+        return 'code' in r ? r : { ...r, noLocalConventions: true };
       }
 
       // Bare integer PR: the cwd's repo, current head — unchanged (no SHA binding).
@@ -453,6 +545,9 @@ function printSummary(result: ReviewModeResult, profile: ReviewProfile): void {
   for (const f of a.coverage.files.filter((x) => !x.included)) {
     out.push(`             ${omittedLine({ kind: f.kind, path: f.path, reason: f.omitReason })}`);
   }
+  if (result.conventionManifest && result.conventionManifest.files.length > 0) {
+    out.push(...renderConventionManifest(result.conventionManifest));
+  }
   const ss = result.secretScan;
   if (ss.sensitivePaths.length || ss.inlineSecrets.length) {
     out.push(
@@ -571,9 +666,11 @@ async function reviewCommand(
         'allow-sensitive': { type: 'boolean' },
         base: { type: 'string' },
         ceiling: { type: 'string' },
+        conventions: { type: 'string' },
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
+        'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
         out: { type: 'string' },
         pr: { type: 'string' },
@@ -598,6 +695,23 @@ async function reviewCommand(
 
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ('code' in source) return source.code;
+
+  // Convention gathering: the reviewers see the repo's real md web (root + touched
+  // packages + linked/swept docs). Off with --no-conventions; a fs reader for local
+  // sources, a gh reader (PR head) for a `--pr <url>`.
+  const noConventions = Boolean(values['no-conventions']);
+  const conventionPaths = parseConventionPaths(values.conventions);
+  // A URL PR whose head SHA couldn't be resolved must NOT borrow the LOCAL cwd's
+  // conventions — that's a different repo. Gather NOTHING (with a note) instead.
+  if (source.noLocalConventions && !noConventions) {
+    console.error(
+      "· conventions: skipped — a URL PR's head SHA was unresolvable, so its conventions can't be fetched and the local repo's belong to a DIFFERENT repo"
+    );
+  }
+  const conventionReader =
+    noConventions || source.noLocalConventions
+      ? null
+      : buildConventionReader(cwd, source.conventionsCtx);
 
   // "no --reviewers" → undefined → run the full default set. But if --reviewers IS
   // given, EVERY token must be a known id: a typo like `codex,grokk` must error,
@@ -627,10 +741,13 @@ async function reviewCommand(
       allowSensitive: Boolean(values['allow-sensitive']),
       base: typeof values.base === 'string' ? values.base : undefined,
       ceilingBytes,
+      conventionPaths,
+      conventionReader,
       cwd,
       diffMode: source.diffMode,
       diffText: source.diffText,
       headShaOverride: source.headShaOverride,
+      noConventions,
       onProgress: (m) => console.error(`· ${m}`),
       out,
       profile,
@@ -643,6 +760,20 @@ async function reviewCommand(
   } catch (e) {
     console.error(`ensemble-ai ${cmd}: ${(e as Error).message}`);
     return 3;
+  }
+
+  // The gathered-conventions manifest joins the trail so the receipt's evidence dir
+  // records which convention files the reviewers saw (best-effort — never fatal).
+  if (result.conventionManifest) {
+    try {
+      fs.mkdirSync(out, { recursive: true });
+      fs.writeFileSync(
+        path.join(out, 'conventions.json'),
+        JSON.stringify(result.conventionManifest, null, 2)
+      );
+    } catch {
+      /* trail write is best-effort */
+    }
   }
 
   printSummary(result, profile);
@@ -1157,6 +1288,16 @@ function parseRequiredReviewers(
   return raw === undefined ? [...REVIEWER_IDS] : parseReviewerList(raw, cmd);
 }
 
+// Parse `--conventions a.md,b.md` into an explicit path list (the config lever for
+// non-standard layouts) — additive to auto-detection. Empty/absent → undefined.
+function parseConventionPaths(
+  raw: string | boolean | undefined
+): string[] | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const list = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  return list.length ? list : undefined;
+}
+
 function positiveCeiling(
   raw: string | undefined,
   cmd: string
@@ -1471,6 +1612,8 @@ Options:
   --base <ref>          base ref for the default (commit) mode
   --profile <p>         packet profile: code (default) | security
   --reviewers <ids>     reviewers to size the cost preview against (default: all)
+  --conventions <paths> extra convention files to gather (comma-separated, in-repo)
+  --no-conventions      do NOT gather the repo's conventions into the packet
   --ceiling <bytes>     coverage byte ceiling (default 200000)
   --full                print the ENTIRE rendered prompt (the literal payload)
   --json                print { packet, prompt } as JSON
@@ -1487,11 +1630,13 @@ async function diffCommand(args: string[]): Promise<number> {
       options: {
         base: { type: 'string' },
         ceiling: { type: 'string' },
+        conventions: { type: 'string' },
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
         full: { type: 'boolean' },
         help: { short: 'h', type: 'boolean' },
         json: { type: 'boolean' },
+        'no-conventions': { type: 'boolean' },
         pr: { type: 'string' },
         profile: { type: 'string' },
         reviewers: { type: 'string' },
@@ -1550,11 +1695,47 @@ async function diffCommand(args: string[]): Promise<number> {
     console.error(`ensemble-ai diff: ${(e as Error).message}`);
     return 3;
   }
-  const preview = buildPacketPreview(acquired, profile);
+
+  // Gather the conventions the reviewers WOULD see — through the SAME gatherer the
+  // review path uses, so this preview never drifts from the real payload. Off with
+  // --no-conventions; fs reader for local sources, gh reader for a `--pr <url>`.
+  let agentsMd: string | undefined;
+  let conventions: ConventionManifest | undefined;
+  // Same rule as the review path: an unresolvable URL PR gathers NOTHING rather than
+  // the local (different) repo's conventions — a resolved URL PR still gathers from the
+  // PR repo via source.conventionsCtx (the gh reader), so the preview matches the review.
+  if (!values['no-conventions'] && !source.noLocalConventions) {
+    const reader = buildConventionReader(cwd, source.conventionsCtx);
+    if (reader) {
+      const changed = acquired.files
+        .map((f) => f.path)
+        .filter((p) => p && p !== 'unknown');
+      const gathered = await gatherConventions(reader, changed, {
+        conventions: parseConventionPaths(values.conventions),
+      });
+      if (gathered.text.trim()) agentsMd = gathered.text;
+      conventions = gathered.manifest;
+    }
+  }
+
+  const preview = buildPacketPreview(acquired, profile, agentsMd);
   if (values.json) {
-    console.log(JSON.stringify({ packet: preview.packet, prompt: preview.prompt }, null, 2));
+    console.log(
+      JSON.stringify(
+        { conventions, packet: preview.packet, prompt: preview.prompt },
+        null,
+        2
+      )
+    );
   } else {
-    console.log(renderPacketPreview(acquired, preview, { full: Boolean(values.full), profile, reviewers }));
+    console.log(
+      renderPacketPreview(acquired, preview, {
+        conventions,
+        full: Boolean(values.full),
+        profile,
+        reviewers,
+      })
+    );
   }
   return 0;
 }
