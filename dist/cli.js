@@ -1868,7 +1868,7 @@ function acquireDiff(opts) {
   if (opts.diffText !== void 0) {
     mode = opts.diffMode ?? "raw";
     rawDiff = opts.diffText;
-    headSha = mode === "pr" ? "gh pr diff (no local commit identity)" : "raw diff (no commit identity)";
+    headSha = opts.headShaOverride ?? (mode === "pr" ? "gh pr diff (no local commit identity)" : "raw diff (no commit identity)");
   } else if (opts.staged) {
     mode = "staged";
     rawDiff = git(opts.cwd, ["diff", "--cached"]);
@@ -2297,6 +2297,7 @@ async function runReviewMode(opts) {
     cwd: opts.cwd,
     diffMode: opts.diffMode,
     diffText: opts.diffText,
+    headShaOverride: opts.headShaOverride,
     staged: opts.staged,
     workingTree: opts.workingTree
   });
@@ -2385,6 +2386,13 @@ async function runReviewMode(opts) {
 }
 
 // src/modes/review/source.ts
+function parsePrUrl(s) {
+  const m = /^https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/([1-9][0-9]*)(?:\/(?:files|commits))?\/?(?:[?#].*)?$/i.exec(
+    s.trim()
+  );
+  if (!m) return null;
+  return { owner: m[1], pr: Number(m[3]), repo: m[2] };
+}
 function isDiffSourceError(v) {
   return "error" in v;
 }
@@ -2411,10 +2419,17 @@ function selectDiffSource(flags) {
   if (explicit.length === 1) {
     const kind = explicit[0];
     if (kind === "pr") {
-      if (!/^[1-9][0-9]*$/.test(String(flags.pr))) {
-        return { error: `--pr must be a positive integer (got "${flags.pr}")` };
+      const raw = String(flags.pr);
+      if (/^[1-9][0-9]*$/.test(raw)) {
+        return { kind, pr: Number(raw) };
       }
-      return { kind, pr: Number(flags.pr) };
+      const ref = parsePrUrl(raw);
+      if (ref) {
+        return { kind, owner: ref.owner, pr: ref.pr, repo: ref.repo };
+      }
+      return {
+        error: `--pr must be a positive integer or a GitHub PR URL (https://github.com/<owner>/<repo>/pull/<N>) \u2014 got "${raw}"`
+      };
     }
     if (kind === "diff-file") return { diffFile: flags.diffFile, kind };
     return { kind };
@@ -2599,10 +2614,18 @@ var REVIEW_USAGE = `ensemble-ai review \u2014 review a diff with ALL configured 
 Runs every reviewer in the registry (codex + grok) by default and prints their
 findings grouped by severity. With NO source flag it reviews the current branch.
 
+Usage:
+  ensemble-ai review [<pr-url>] [options]
+
 Diff source (give at most ONE; default = current branch):
   (default)            <base>...HEAD \u2014 the current branch vs its merge-base with
                        the default branch (origin/main; resolved like \`gh pr create\`)
-  --pr <N>             the diff of GitHub PR #N (via \`gh pr diff <N>\`)
+  <pr-url>             a positional GitHub PR URL \u2014 sugar for \`--pr <url>\`, so you
+                       can \`ensemble-ai review https://github.com/o/r/pull/7\` from ANY dir
+  --pr <N|url>         the diff of a GitHub PR. A bare integer N \u2192 \`gh pr diff <N>\`
+                       in the cwd's repo; a full URL (github.com/<owner>/<repo>/pull/<N>)
+                       \u2192 \`gh pr diff <N> -R <owner>/<repo>\`, reviewable from ANY
+                       directory with NO branch checkout
   --staged             staged changes (\`git diff --cached\`)
   --working-tree       uncommitted tracked changes vs HEAD (\`git diff HEAD\`)
   --diff-file <path>   a raw unified diff read from a file
@@ -2632,10 +2655,16 @@ crypto misuse) and findings are tagged by security class in the grouped output. 
 also runs a LOCAL dependency-surface flag (manifest changes + risky imports in the
 diff \u2014 NO network / no vuln DB) and reuses the engine's secret-scan.
 
+Usage:
+  ensemble-ai security [<pr-url>] [options]
+
 Diff source (give at most ONE; default = current branch):
   (default)            <base>...HEAD \u2014 the current branch vs its merge-base with
                        the default branch (origin/main; resolved like \`gh pr create\`)
-  --pr <N>             the diff of GitHub PR #N (via \`gh pr diff <N>\`)
+  <pr-url>             a positional GitHub PR URL \u2014 sugar for \`--pr <url>\`
+  --pr <N|url>         the diff of a GitHub PR. A bare integer N \u2192 \`gh pr diff <N>\`
+                       in the cwd's repo; a full URL (github.com/<owner>/<repo>/pull/<N>)
+                       \u2192 \`gh pr diff <N> -R <owner>/<repo>\`, reviewable from ANY dir
   --staged             staged changes (\`git diff --cached\`)
   --working-tree       uncommitted tracked changes vs HEAD (\`git diff HEAD\`)
   --diff-file <path>   a raw unified diff read from a file
@@ -2675,18 +2704,36 @@ function capture(cmd, cmdArgs, cwd) {
 function resolveSource(selection, cwd, stdinContent, cmd = "review") {
   switch (selection.kind) {
     case "pr": {
-      const cap3 = capture("gh", ["pr", "diff", String(selection.pr)], cwd);
-      if (!cap3.ok) {
-        console.error(
-          `ensemble-ai ${cmd}: \`gh pr diff ${selection.pr}\` failed: ${cap3.error}`
+      const repoFlag = selection.owner && selection.repo ? ["-R", `${selection.owner}/${selection.repo}`] : [];
+      const label = repoFlag.length > 0 ? `gh pr diff ${selection.pr} ${repoFlag.join(" ")}` : `gh pr diff ${selection.pr}`;
+      const fetchHeadRefOid = () => {
+        if (repoFlag.length === 0) return void 0;
+        const view = capture(
+          "gh",
+          ["pr", "view", String(selection.pr), ...repoFlag, "--json", "headRefOid"],
+          cwd
         );
+        if (!view.ok) return void 0;
+        try {
+          const oid = JSON.parse(view.text).headRefOid;
+          return typeof oid === "string" && oid.trim() ? oid.trim() : void 0;
+        } catch {
+          return void 0;
+        }
+      };
+      const headBefore = fetchHeadRefOid();
+      const cap3 = capture("gh", ["pr", "diff", String(selection.pr), ...repoFlag], cwd);
+      if (!cap3.ok) {
+        console.error(`ensemble-ai ${cmd}: \`${label}\` failed: ${cap3.error}`);
         return { code: 3 };
       }
       if (!cap3.text.trim()) {
         console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
         return { code: 3 };
       }
-      return { diffMode: "pr", diffText: cap3.text };
+      const headAfter = fetchHeadRefOid();
+      const headShaOverride = headBefore && headBefore === headAfter ? headBefore : void 0;
+      return { diffMode: "pr", diffText: cap3.text, headShaOverride };
     }
     case "diff-file": {
       let text;
@@ -2837,14 +2884,57 @@ function printSummary(result, profile) {
   out.push("");
   console.log(out.join("\n"));
 }
+function resolvePositionalPr(positionals, prFlag, cmd) {
+  if (positionals.length === 0) return { pr: prFlag };
+  if (positionals.length > 1) {
+    return {
+      error: `too many arguments (expected at most one GitHub PR URL): ${positionals.join(" ")}`
+    };
+  }
+  const arg = positionals[0].trim();
+  if (!/^https?:\/\//i.test(arg)) {
+    return {
+      error: `unexpected argument "${arg}" \u2014 a positional accepts only a GitHub PR URL (https://github.com/<owner>/<repo>/pull/<N>); use \`${cmd} --pr <N>\` for a PR number`
+    };
+  }
+  if (prFlag !== void 0) {
+    return { error: "choose at most ONE diff source \u2014 got a positional URL AND --pr" };
+  }
+  return { pr: arg };
+}
+function resolveDiffSourceForCommand(values, positionals, cmd, cwd) {
+  const positionalPr = resolvePositionalPr(
+    positionals,
+    typeof values.pr === "string" ? values.pr : void 0,
+    cmd
+  );
+  if ("error" in positionalPr) {
+    console.error(`ensemble-ai ${cmd}: ${positionalPr.error}`);
+    return { code: 3 };
+  }
+  const sourceFlags = {
+    diffFile: typeof values["diff-file"] === "string" ? values["diff-file"] : void 0,
+    pr: positionalPr.pr,
+    staged: Boolean(values.staged),
+    workingTree: Boolean(values["working-tree"])
+  };
+  const stdinContent = hasExplicitSource(sourceFlags) ? void 0 : readStdinIfPiped();
+  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== void 0 });
+  if (isDiffSourceError(selection)) {
+    console.error(`ensemble-ai ${cmd}: ${selection.error}`);
+    return { code: 3 };
+  }
+  return resolveSource(selection, cwd, stdinContent, cmd);
+}
 async function reviewCommand(args, profile = "code") {
   const usage = profile === "security" ? SECURITY_USAGE : REVIEW_USAGE;
   const cmd = profile === "security" ? "security" : "review";
   let values;
+  let positionals;
   try {
-    ({ values } = parseArgs({
+    ({ positionals, values } = parseArgs({
       args,
-      allowPositionals: false,
+      allowPositionals: true,
       options: {
         "allow-sensitive": { type: "boolean" },
         base: { type: "string" },
@@ -2872,19 +2962,7 @@ async function reviewCommand(args, profile = "code") {
     return 0;
   }
   const cwd = values.cwd ? path7.resolve(String(values.cwd)) : process.cwd();
-  const sourceFlags = {
-    diffFile: typeof values["diff-file"] === "string" ? values["diff-file"] : void 0,
-    pr: typeof values.pr === "string" ? values.pr : void 0,
-    staged: Boolean(values.staged),
-    workingTree: Boolean(values["working-tree"])
-  };
-  const stdinContent = hasExplicitSource(sourceFlags) ? void 0 : readStdinIfPiped();
-  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== void 0 });
-  if (isDiffSourceError(selection)) {
-    console.error(`ensemble-ai ${cmd}: ${selection.error}`);
-    return 3;
-  }
-  const source = resolveSource(selection, cwd, stdinContent, cmd);
+  const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
   let reviewers;
   if (typeof values.reviewers === "string") {
@@ -2909,6 +2987,7 @@ async function reviewCommand(args, profile = "code") {
       cwd,
       diffMode: source.diffMode,
       diffText: source.diffText,
+      headShaOverride: source.headShaOverride,
       onProgress: (m) => console.error(`\xB7 ${m}`),
       out,
       profile,
@@ -3595,7 +3674,7 @@ async function reviewersCommand(args) {
 var DIFF_USAGE = `ensemble-ai diff \u2014 show the assembled review packet WITHOUT running a reviewer.
 
 Usage:
-  ensemble-ai diff [<diff-source>] [options]
+  ensemble-ai diff [<pr-url>] [options]
 
 A cost-preview / debug of the EXACT packet the reviewers would receive: the diff
 identity + coverage, the per-section manifest (what the reviewer sees), and the
@@ -3603,7 +3682,9 @@ prompt size \u2014 no vendor is called, nothing is spent.
 
 Diff source (give at most ONE; default = current branch, like \`ensemble-ai review\`):
   (default)            <base>...HEAD \u2014 the current branch vs origin/HEAD
-  --pr <N>             the diff of GitHub PR #N (via \`gh pr diff <N>\`)
+  <pr-url>             a positional GitHub PR URL \u2014 sugar for \`--pr <url>\`
+  --pr <N|url>         the diff of a GitHub PR: a bare integer N (\`gh pr diff <N>\` in
+                       the cwd) OR a full URL \u2192 \`gh pr diff <N> -R <owner>/<repo>\`
   --staged             staged changes (\`git diff --cached\`)
   --working-tree       uncommitted tracked changes vs HEAD
   --diff-file <path>   a raw unified diff from a file
@@ -3620,10 +3701,11 @@ Options:
   -h, --help            this help`;
 async function diffCommand(args) {
   let values;
+  let positionals;
   try {
-    ({ values } = parseArgs({
+    ({ positionals, values } = parseArgs({
       args,
-      allowPositionals: false,
+      allowPositionals: true,
       options: {
         base: { type: "string" },
         ceiling: { type: "string" },
@@ -3669,19 +3751,7 @@ async function diffCommand(args) {
   );
   if (typeof ceiling === "object") return ceiling.code;
   const cwd = values.cwd ? path7.resolve(String(values.cwd)) : process.cwd();
-  const sourceFlags = {
-    diffFile: typeof values["diff-file"] === "string" ? values["diff-file"] : void 0,
-    pr: typeof values.pr === "string" ? values.pr : void 0,
-    staged: Boolean(values.staged),
-    workingTree: Boolean(values["working-tree"])
-  };
-  const stdinContent = hasExplicitSource(sourceFlags) ? void 0 : readStdinIfPiped();
-  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== void 0 });
-  if (isDiffSourceError(selection)) {
-    console.error(`ensemble-ai diff: ${selection.error}`);
-    return 3;
-  }
-  const source = resolveSource(selection, cwd, stdinContent, "diff");
+  const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
   let acquired;
   try {
@@ -3691,6 +3761,7 @@ async function diffCommand(args) {
       cwd,
       diffMode: source.diffMode,
       diffText: source.diffText,
+      headShaOverride: source.headShaOverride,
       staged: source.staged,
       workingTree: source.workingTree
     });

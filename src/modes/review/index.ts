@@ -41,6 +41,9 @@ export interface ReviewModeOptions {
   // Mode label for a pre-supplied diffText (e.g. a `gh pr diff` capture → 'pr').
   diffMode?: DiffMode;
   diffText?: string;
+  // Override the headSha for a pre-supplied diffText (a URL PR's resolved head SHA,
+  // so the receipt is content-tied to the exact PR head). See AcquireDiffOpts.
+  headShaOverride?: string;
   objective?: string;
   onProgress?: (msg: string) => void;
   out: string;
@@ -181,6 +184,7 @@ export async function runReviewMode(
     cwd: opts.cwd,
     diffMode: opts.diffMode,
     diffText: opts.diffText,
+    headShaOverride: opts.headShaOverride,
     staged: opts.staged,
     workingTree: opts.workingTree,
   });

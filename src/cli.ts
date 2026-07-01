@@ -98,10 +98,18 @@ const REVIEW_USAGE = `ensemble-ai review — review a diff with ALL configured A
 Runs every reviewer in the registry (codex + grok) by default and prints their
 findings grouped by severity. With NO source flag it reviews the current branch.
 
+Usage:
+  ensemble-ai review [<pr-url>] [options]
+
 Diff source (give at most ONE; default = current branch):
   (default)            <base>...HEAD — the current branch vs its merge-base with
                        the default branch (origin/main; resolved like \`gh pr create\`)
-  --pr <N>             the diff of GitHub PR #N (via \`gh pr diff <N>\`)
+  <pr-url>             a positional GitHub PR URL — sugar for \`--pr <url>\`, so you
+                       can \`ensemble-ai review https://github.com/o/r/pull/7\` from ANY dir
+  --pr <N|url>         the diff of a GitHub PR. A bare integer N → \`gh pr diff <N>\`
+                       in the cwd's repo; a full URL (github.com/<owner>/<repo>/pull/<N>)
+                       → \`gh pr diff <N> -R <owner>/<repo>\`, reviewable from ANY
+                       directory with NO branch checkout
   --staged             staged changes (\`git diff --cached\`)
   --working-tree       uncommitted tracked changes vs HEAD (\`git diff HEAD\`)
   --diff-file <path>   a raw unified diff read from a file
@@ -132,10 +140,16 @@ crypto misuse) and findings are tagged by security class in the grouped output. 
 also runs a LOCAL dependency-surface flag (manifest changes + risky imports in the
 diff — NO network / no vuln DB) and reuses the engine's secret-scan.
 
+Usage:
+  ensemble-ai security [<pr-url>] [options]
+
 Diff source (give at most ONE; default = current branch):
   (default)            <base>...HEAD — the current branch vs its merge-base with
                        the default branch (origin/main; resolved like \`gh pr create\`)
-  --pr <N>             the diff of GitHub PR #N (via \`gh pr diff <N>\`)
+  <pr-url>             a positional GitHub PR URL — sugar for \`--pr <url>\`
+  --pr <N|url>         the diff of a GitHub PR. A bare integer N → \`gh pr diff <N>\`
+                       in the cwd's repo; a full URL (github.com/<owner>/<repo>/pull/<N>)
+                       → \`gh pr diff <N> -R <owner>/<repo>\`, reviewable from ANY dir
   --staged             staged changes (\`git diff --cached\`)
   --working-tree       uncommitted tracked changes vs HEAD (\`git diff HEAD\`)
   --diff-file <path>   a raw unified diff read from a file
@@ -196,23 +210,61 @@ function resolveSource(
   | {
       diffMode?: DiffMode;
       diffText?: string;
+      headShaOverride?: string;
       staged?: boolean;
       workingTree?: boolean;
     } {
   switch (selection.kind) {
     case 'pr': {
-      const cap = capture('gh', ['pr', 'diff', String(selection.pr)], cwd);
-      if (!cap.ok) {
-        console.error(
-          `ensemble-ai ${cmd}: \`gh pr diff ${selection.pr}\` failed: ${cap.error}`
+      // A URL PR carries owner/repo → `-R <owner>/<repo>` makes `gh` fetch the diff
+      // from ANY cwd (even outside the repo, no branch checkout). A bare integer has
+      // no repo → `gh pr diff <N>` resolves against the cwd's repo (unchanged).
+      const repoFlag =
+        selection.owner && selection.repo
+          ? ['-R', `${selection.owner}/${selection.repo}`]
+          : [];
+      const label =
+        repoFlag.length > 0
+          ? `gh pr diff ${selection.pr} ${repoFlag.join(' ')}`
+          : `gh pr diff ${selection.pr}`;
+      // For a URL PR, content-tie the receipt to the exact PR head via `gh pr view
+      // --json headRefOid`. Read it BEFORE and AFTER the diff and only trust it if it
+      // didn't move across the fetch — otherwise the diff and the head label could
+      // come from DIFFERENT PR heads (a TOCTOU that would mislabel the receipt). A
+      // move, or any gh failure, degrades to the generic label. Best-effort, never
+      // blocks. A bare integer (no repoFlag) resolves no head (unchanged behavior).
+      const fetchHeadRefOid = (): string | undefined => {
+        if (repoFlag.length === 0) return undefined;
+        const view = capture(
+          'gh',
+          ['pr', 'view', String(selection.pr), ...repoFlag, '--json', 'headRefOid'],
+          cwd
         );
+        if (!view.ok) return undefined;
+        try {
+          const oid = (JSON.parse(view.text) as { headRefOid?: unknown }).headRefOid;
+          return typeof oid === 'string' && oid.trim() ? oid.trim() : undefined;
+        } catch {
+          return undefined;
+        }
+      };
+      const headBefore = fetchHeadRefOid();
+      const cap = capture('gh', ['pr', 'diff', String(selection.pr), ...repoFlag], cwd);
+      if (!cap.ok) {
+        console.error(`ensemble-ai ${cmd}: \`${label}\` failed: ${cap.error}`);
         return { code: 3 };
       }
       if (!cap.text.trim()) {
         console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
         return { code: 3 };
       }
-      return { diffMode: 'pr', diffText: cap.text };
+      // Only label the receipt with the head when it read IDENTICAL immediately before
+      // AND after the diff fetch — proof the diff belongs to that exact head. Each call
+      // is a separate `gh pr view`, so this equality is the actual TOCTOU guard.
+      const headAfter = fetchHeadRefOid();
+      const headShaOverride =
+        headBefore && headBefore === headAfter ? headBefore : undefined;
+      return { diffMode: 'pr', diffText: cap.text, headShaOverride };
     }
     case 'diff-file': {
       let text: string;
@@ -398,6 +450,77 @@ function printSummary(result: ReviewModeResult, profile: ReviewProfile): void {
   console.log(out.join('\n'));
 }
 
+// A bare positional GitHub PR URL is sugar for `--pr <url>` — so a PR can be reviewed
+// with just `ensemble-ai review <url>` from any dir. Route ONLY a URL (something with a
+// URL scheme); a bare number stays ambiguous with a path and is refused. Enforce it
+// doesn't collide with an explicit --pr or a second positional. Returns the effective
+// `--pr` source string (which selectDiffSource then validates), or a usage error.
+function resolvePositionalPr(
+  positionals: string[],
+  prFlag: string | undefined,
+  cmd: string
+): { error: string } | { pr: string | undefined } {
+  if (positionals.length === 0) return { pr: prFlag };
+  if (positionals.length > 1) {
+    return {
+      error: `too many arguments (expected at most one GitHub PR URL): ${positionals.join(' ')}`,
+    };
+  }
+  const arg = positionals[0].trim();
+  if (!/^https?:\/\//i.test(arg)) {
+    return {
+      error: `unexpected argument "${arg}" — a positional accepts only a GitHub PR URL (https://github.com/<owner>/<repo>/pull/<N>); use \`${cmd} --pr <N>\` for a PR number`,
+    };
+  }
+  if (prFlag !== undefined) {
+    // "URL", not "PR URL": at this point arg has only passed the scheme check; whether
+    // it's a *valid* PR URL is decided later in parsePrUrl. Two sources is the error here.
+    return { error: 'choose at most ONE diff source — got a positional URL AND --pr' };
+  }
+  return { pr: arg };
+}
+
+// The ONE diff-source resolution shared by `review`, `security`, and `diff`: fold a
+// bare positional PR URL into `--pr`, assemble the source flags, gate stdin, run the
+// PURE selector, then perform the git/gh I/O the chosen source needs. Returns the
+// engine inputs, or an exit code (3) already reported to stderr. Kept in one place so
+// the three commands can't drift on what "the diff under review" means.
+function resolveDiffSourceForCommand(
+  values: Record<string, string | boolean | undefined>,
+  positionals: string[],
+  cmd: string,
+  cwd: string
+): ReturnType<typeof resolveSource> {
+  // A bare positional PR URL (`<cmd> <url>`) is sugar for `--pr <url>`.
+  const positionalPr = resolvePositionalPr(
+    positionals,
+    typeof values.pr === 'string' ? values.pr : undefined,
+    cmd
+  );
+  if ('error' in positionalPr) {
+    console.error(`ensemble-ai ${cmd}: ${positionalPr.error}`);
+    return { code: 3 };
+  }
+
+  // At most one explicit flag (--pr/--staged/--working-tree/--diff-file), else a piped
+  // diff, else the default current-branch range.
+  const sourceFlags = {
+    diffFile: typeof values['diff-file'] === 'string' ? values['diff-file'] : undefined,
+    pr: positionalPr.pr,
+    staged: Boolean(values.staged),
+    workingTree: Boolean(values['working-tree']),
+  };
+  // Only consume stdin when NO explicit source is set — otherwise a CI shell that
+  // leaves stdin attached to a pipe would BLOCK reading input the run never uses.
+  const stdinContent = hasExplicitSource(sourceFlags) ? undefined : readStdinIfPiped();
+  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== undefined });
+  if (isDiffSourceError(selection)) {
+    console.error(`ensemble-ai ${cmd}: ${selection.error}`);
+    return { code: 3 };
+  }
+  return resolveSource(selection, cwd, stdinContent, cmd);
+}
+
 // Shared by `review` (profile 'code') and `security` (profile 'security'): both run
 // the SAME engine + diff-source resolution + exit-code contract; the profile only
 // swaps the reviewer framing, adds the dependency-surface flag, and labels the usage.
@@ -408,10 +531,11 @@ async function reviewCommand(
   const usage = profile === 'security' ? SECURITY_USAGE : REVIEW_USAGE;
   const cmd = profile === 'security' ? 'security' : 'review';
   let values: Record<string, string | boolean | undefined>;
+  let positionals: string[];
   try {
-    ({ values } = parseArgs({
+    ({ positionals, values } = parseArgs({
       args,
-      allowPositionals: false,
+      allowPositionals: true,
       options: {
         'allow-sensitive': { type: 'boolean' },
         base: { type: 'string' },
@@ -441,24 +565,7 @@ async function reviewCommand(
 
   const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
 
-  // Resolve the diff source: at most one explicit flag (--pr/--staged/--working-tree/
-  // --diff-file), else a piped diff, else the default current-branch range. The
-  // selector is PURE; this then runs the git/gh I/O the chosen source needs.
-  const sourceFlags = {
-    diffFile: typeof values['diff-file'] === 'string' ? values['diff-file'] : undefined,
-    pr: typeof values.pr === 'string' ? values.pr : undefined,
-    staged: Boolean(values.staged),
-    workingTree: Boolean(values['working-tree']),
-  };
-  // Only consume stdin when NO explicit source is set — otherwise a CI shell that
-  // leaves stdin attached to a pipe would BLOCK reading input the run never uses.
-  const stdinContent = hasExplicitSource(sourceFlags) ? undefined : readStdinIfPiped();
-  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== undefined });
-  if (isDiffSourceError(selection)) {
-    console.error(`ensemble-ai ${cmd}: ${selection.error}`);
-    return 3;
-  }
-  const source = resolveSource(selection, cwd, stdinContent, cmd);
+  const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ('code' in source) return source.code;
 
   // "no --reviewers" → undefined → run the full default set. But if --reviewers IS
@@ -492,6 +599,7 @@ async function reviewCommand(
       cwd,
       diffMode: source.diffMode,
       diffText: source.diffText,
+      headShaOverride: source.headShaOverride,
       onProgress: (m) => console.error(`· ${m}`),
       out,
       profile,
@@ -1312,7 +1420,7 @@ async function reviewersCommand(args: string[]): Promise<number> {
 const DIFF_USAGE = `ensemble-ai diff — show the assembled review packet WITHOUT running a reviewer.
 
 Usage:
-  ensemble-ai diff [<diff-source>] [options]
+  ensemble-ai diff [<pr-url>] [options]
 
 A cost-preview / debug of the EXACT packet the reviewers would receive: the diff
 identity + coverage, the per-section manifest (what the reviewer sees), and the
@@ -1320,7 +1428,9 @@ prompt size — no vendor is called, nothing is spent.
 
 Diff source (give at most ONE; default = current branch, like \`ensemble-ai review\`):
   (default)            <base>...HEAD — the current branch vs origin/HEAD
-  --pr <N>             the diff of GitHub PR #N (via \`gh pr diff <N>\`)
+  <pr-url>             a positional GitHub PR URL — sugar for \`--pr <url>\`
+  --pr <N|url>         the diff of a GitHub PR: a bare integer N (\`gh pr diff <N>\` in
+                       the cwd) OR a full URL → \`gh pr diff <N> -R <owner>/<repo>\`
   --staged             staged changes (\`git diff --cached\`)
   --working-tree       uncommitted tracked changes vs HEAD
   --diff-file <path>   a raw unified diff from a file
@@ -1338,10 +1448,11 @@ Options:
 
 async function diffCommand(args: string[]): Promise<number> {
   let values: Record<string, string | boolean | undefined>;
+  let positionals: string[];
   try {
-    ({ values } = parseArgs({
+    ({ positionals, values } = parseArgs({
       args,
-      allowPositionals: false,
+      allowPositionals: true,
       options: {
         base: { type: 'string' },
         ceiling: { type: 'string' },
@@ -1389,19 +1500,7 @@ async function diffCommand(args: string[]): Promise<number> {
   if (typeof ceiling === 'object') return ceiling.code;
   const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
 
-  const sourceFlags = {
-    diffFile: typeof values['diff-file'] === 'string' ? values['diff-file'] : undefined,
-    pr: typeof values.pr === 'string' ? values.pr : undefined,
-    staged: Boolean(values.staged),
-    workingTree: Boolean(values['working-tree']),
-  };
-  const stdinContent = hasExplicitSource(sourceFlags) ? undefined : readStdinIfPiped();
-  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== undefined });
-  if (isDiffSourceError(selection)) {
-    console.error(`ensemble-ai diff: ${selection.error}`);
-    return 3;
-  }
-  const source = resolveSource(selection, cwd, stdinContent, 'diff');
+  const source = resolveDiffSourceForCommand(values, positionals, 'diff', cwd);
   if ('code' in source) return source.code;
 
   let acquired: AcquiredDiff;
@@ -1412,6 +1511,7 @@ async function diffCommand(args: string[]): Promise<number> {
       cwd,
       diffMode: source.diffMode,
       diffText: source.diffText,
+      headShaOverride: source.headShaOverride,
       staged: source.staged,
       workingTree: source.workingTree,
     });
