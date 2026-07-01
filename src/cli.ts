@@ -4,9 +4,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
+import { isEntrypoint } from './core/entrypoint';
 import { listReviewers, REVIEWERS_FILE } from './core/reviewers';
 import {
   isReviewerId,
@@ -1456,17 +1456,7 @@ export async function main(argv: string[]): Promise<number> {
 // Auto-run ONLY when invoked as the actual entry (the `ensemble-ai` bin) — not
 // when imported (e.g. by a unit test importing `main`), so tests don't trigger a
 // real review against the process's argv.
-function isEntrypoint(): boolean {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  try {
-    return path.resolve(entry) === fileURLToPath(import.meta.url);
-  } catch {
-    return false;
-  }
-}
-
-if (isEntrypoint()) {
+if (isEntrypoint(import.meta.url)) {
   main(process.argv.slice(2)).then(
     (code) => {
       process.exitCode = code;
