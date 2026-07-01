@@ -9,6 +9,11 @@ import path7 from "path";
 import { fileURLToPath } from "url";
 import { parseArgs } from "util";
 
+// src/core/reviewers.ts
+import fs from "fs";
+import os from "os";
+import path from "path";
+
 // src/core/types.ts
 var REVIEWER_IDS = ["codex", "grok"];
 function isReviewerId(v) {
@@ -21,6 +26,63 @@ function parseReviewerIds(raw) {
 }
 var SEVERITIES = ["high", "medium", "low"];
 var CONFIDENCES = ["high", "medium", "low"];
+
+// src/core/reviewers.ts
+var REVIEWERS_FILE = process.env.ENSEMBLE_REVIEWERS_FILE || path.join(os.homedir(), ".ensemble-ai", "reviewers.json");
+var REVIEWER_DEFAULTS = {
+  codex: {
+    cmd: "codex",
+    effort: "xhigh",
+    id: "codex",
+    model: "gpt-5.5",
+    vendor: "openai"
+  },
+  // Grok (xAI) — the second cross-vendor lens. grok-build is the stronger of the
+  // two CLI-available models; `sandbox` names the OS-enforced read-only profile it
+  // runs under (kernel-blocked writes + secret-read deny — see reviewers/grok.ts).
+  grok: {
+    cmd: "grok",
+    effort: "high",
+    id: "grok",
+    model: "grok-build",
+    sandbox: "ensemble-review",
+    vendor: "xai"
+  }
+};
+function str(v, fallback) {
+  return typeof v === "string" && v.trim() ? v.trim() : fallback;
+}
+function parseReviewers(raw) {
+  const out = { ...REVIEWER_DEFAULTS };
+  if (!raw || typeof raw !== "object") return out;
+  const o = raw;
+  for (const id of REVIEWER_IDS) {
+    const e = o[id];
+    if (!e || typeof e !== "object") continue;
+    const r = e;
+    const sandbox = str(r.sandbox, REVIEWER_DEFAULTS[id].sandbox ?? "");
+    out[id] = {
+      cmd: str(r.cmd, REVIEWER_DEFAULTS[id].cmd),
+      effort: str(r.effort, REVIEWER_DEFAULTS[id].effort),
+      id,
+      model: str(r.model, REVIEWER_DEFAULTS[id].model),
+      vendor: str(r.vendor, REVIEWER_DEFAULTS[id].vendor),
+      ...sandbox ? { sandbox } : {}
+    };
+  }
+  return out;
+}
+function loadReviewers(file = REVIEWERS_FILE) {
+  try {
+    return parseReviewers(JSON.parse(fs.readFileSync(file, "utf8")));
+  } catch {
+    return { ...REVIEWER_DEFAULTS };
+  }
+}
+function listReviewers(file = REVIEWERS_FILE) {
+  const all = loadReviewers(file);
+  return REVIEWER_IDS.map((id) => all[id]);
+}
 
 // src/core/findings.ts
 var FINDINGS_INSTRUCTIONS = `## Output format \u2014 STRICT
@@ -128,7 +190,7 @@ function parseVoiceIds(raw) {
 var CRITIQUE_STANCES = ["support", "concern", "extend"];
 
 // src/modes/brainstorm/parse.ts
-function str(v) {
+function str2(v) {
   return typeof v === "string" ? v.trim() : "";
 }
 function asStance(v) {
@@ -140,8 +202,8 @@ function parseRawIdeas(arr, placeholder) {
   arr.forEach((ri, i) => {
     if (!ri || typeof ri !== "object") return;
     const r = ri;
-    const title = str(r.title);
-    const body = str(r.body);
+    const title = str2(r.title);
+    const body = str2(r.body);
     if (!title && !body) return;
     out.push({ body, title: title || `${placeholder} ${i + 1}` });
   });
@@ -153,7 +215,7 @@ function parseIdeas(raw) {
     return { ideas: [], parseError: "no parseable JSON block in the output", summary: "" };
   }
   const o = obj;
-  const summary = str(o.summary);
+  const summary = str2(o.summary);
   if (!Array.isArray(o.ideas)) {
     return { ideas: [], parseError: 'output has no "ideas" array', summary };
   }
@@ -170,7 +232,7 @@ function parseCritique(raw) {
     };
   }
   const o = obj;
-  const summary = str(o.summary);
+  const summary = str2(o.summary);
   if (!Array.isArray(o.critiques) && !Array.isArray(o.extensions)) {
     return {
       critiques: [],
@@ -184,8 +246,8 @@ function parseCritique(raw) {
     for (const rc of o.critiques) {
       if (!rc || typeof rc !== "object") continue;
       const c = rc;
-      const target = str(c.target);
-      const assessment = str(c.assessment);
+      const target = str2(c.target);
+      const assessment = str2(c.assessment);
       if (!target && !assessment) continue;
       critiques.push({
         assessment,
@@ -198,7 +260,7 @@ function parseCritique(raw) {
 }
 function asContributors(v) {
   if (!Array.isArray(v)) return [];
-  return [...new Set(v.map(str).filter(Boolean))];
+  return [...new Set(v.map(str2).filter(Boolean))];
 }
 function parseSynthesis(raw) {
   const obj = extractJsonBlock(raw);
@@ -206,7 +268,7 @@ function parseSynthesis(raw) {
     return { parseError: "no parseable JSON block in the output", ranked: [], summary: "" };
   }
   const o = obj;
-  const summary = str(o.summary);
+  const summary = str2(o.summary);
   if (!Array.isArray(o.ranked)) {
     return { parseError: 'output has no "ranked" array', ranked: [], summary };
   }
@@ -214,10 +276,10 @@ function parseSynthesis(raw) {
   o.ranked.forEach((rr) => {
     if (!rr || typeof rr !== "object") return;
     const r = rr;
-    const title = str(r.title);
-    const why = str(r.why);
+    const title = str2(r.title);
+    const why = str2(r.why);
     if (!title && !why) return;
-    const risks = str(r.risks);
+    const risks = str2(r.risks);
     ranked.push({
       contributors: asContributors(r.contributors),
       rank: ranked.length + 1,
@@ -350,22 +412,22 @@ a tight ranked list of the genuinely strong ideas over a long one.
 }
 
 // src/modes/brainstorm/voices.ts
-import fs4 from "fs";
-import os4 from "os";
-import path3 from "path";
+import fs5 from "fs";
+import os5 from "os";
+import path4 from "path";
 
 // src/reviewers/codex.ts
-import os2 from "os";
-import path from "path";
+import os3 from "os";
+import path2 from "path";
 
 // src/core/spawn.ts
 import { spawn } from "child_process";
-import fs2 from "fs";
-import os from "os";
+import fs3 from "fs";
+import os2 from "os";
 
 // src/core/bin.ts
 import { execFileSync } from "child_process";
-import fs from "fs";
+import fs2 from "fs";
 var binCache = /* @__PURE__ */ new Map();
 function resolveBin(name, opts = {}) {
   const cached = binCache.get(name);
@@ -375,7 +437,7 @@ function resolveBin(name, opts = {}) {
     ...opts.candidates ?? []
   ].filter((c) => Boolean(c));
   for (const c of candidates) {
-    if (fs.existsSync(c)) {
+    if (fs2.existsSync(c)) {
       binCache.set(name, c);
       return c;
     }
@@ -426,7 +488,7 @@ function runReviewerExec(opts) {
   const capture2 = opts.capture ?? "outfile";
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
-      cwd: os.tmpdir(),
+      cwd: os2.tmpdir(),
       detached: true,
       // stdout is piped ONLY when we read the reply from it (grok); codex keeps
       // it 'ignore' (its reply is the -o file) exactly as the proven path did.
@@ -467,9 +529,9 @@ function runReviewerExec(opts) {
         if (text) raw = text;
       } else {
         try {
-          const text = fs2.readFileSync(outFile ?? "", "utf8").trim();
+          const text = fs3.readFileSync(outFile ?? "", "utf8").trim();
           if (text) raw = text;
-          fs2.unlinkSync(outFile ?? "");
+          fs3.unlinkSync(outFile ?? "");
         } catch {
         }
       }
@@ -509,8 +571,8 @@ function buildCodexReviewArgs(config, outFile, prompt) {
 }
 function runCodexReview(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  const outFile = path.join(
-    os2.tmpdir(),
+  const outFile = path2.join(
+    os3.tmpdir(),
     `codex-review-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
   );
   return runReviewerExec({
@@ -529,10 +591,10 @@ function runCodexReview(prompt, config, opts = {}) {
 }
 
 // src/reviewers/grok.ts
-import fs3 from "fs";
-import os3 from "os";
-import path2 from "path";
-var GROK_BIN_CANDIDATES = [path2.join(os3.homedir(), ".grok", "bin", "grok")];
+import fs4 from "fs";
+import os4 from "os";
+import path3 from "path";
+var GROK_BIN_CANDIDATES = [path3.join(os4.homedir(), ".grok", "bin", "grok")];
 function resolveGrokBin() {
   return resolveBin("grok", {
     candidates: GROK_BIN_CANDIDATES,
@@ -575,19 +637,19 @@ function replaceReviewSection(content) {
   const after = lines.slice(to).join("\n").replace(/^\n+/, "");
   return [before, REVIEW_PROFILE.trimEnd(), after].filter((s) => s.length > 0).join("\n\n") + "\n";
 }
-function ensureSandboxProfile(profile, file = path2.join(os3.homedir(), ".grok", "sandbox.toml")) {
+function ensureSandboxProfile(profile, file = path3.join(os4.homedir(), ".grok", "sandbox.toml")) {
   if (BUILTIN_SANDBOXES.has(profile) || profile !== REVIEW_PROFILE_NAME) return;
   try {
-    const existing = fs3.existsSync(file) ? fs3.readFileSync(file, "utf8") : "";
+    const existing = fs4.existsSync(file) ? fs4.readFileSync(file, "utf8") : "";
     if (existing.includes(REVIEW_PROFILE_BLOCK)) return;
-    fs3.mkdirSync(path2.dirname(file), { recursive: true });
+    fs4.mkdirSync(path3.dirname(file), { recursive: true });
     const updated = existing.includes(REVIEW_PROFILE_HEADER) ? replaceReviewSection(existing) : null;
     const content = updated ?? (existing.trim() ? `${existing.trimEnd()}
 
 ${REVIEW_PROFILE}` : REVIEW_PROFILE);
     const tmp = `${file}.tmp`;
-    fs3.writeFileSync(tmp, content);
-    fs3.renameSync(tmp, file);
+    fs4.writeFileSync(tmp, content);
+    fs4.renameSync(tmp, file);
   } catch {
   }
 }
@@ -624,7 +686,7 @@ function runGrokReview(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const sandbox = resolveReviewSandbox(config.sandbox);
   ensureSandboxProfile(sandbox);
-  const cwd = fs3.mkdtempSync(path2.join(os3.tmpdir(), "grok-review-"));
+  const cwd = fs4.mkdtempSync(path3.join(os4.tmpdir(), "grok-review-"));
   return runReviewerExec({
     args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
     bin: resolveGrokBin(),
@@ -634,7 +696,7 @@ function runGrokReview(prompt, config, opts = {}) {
     timeoutMs
   }).then(({ raw, stderrTail, timedOut }) => {
     try {
-      fs3.rmSync(cwd, { force: true, recursive: true });
+      fs4.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
     const text = raw ? extractGrokText(raw) : null;
@@ -710,8 +772,8 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), o),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), o)
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path3.join(os4.homedir(), ".ensemble-ai", "voices.json");
-function str2(v, fallback) {
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path4.join(os5.homedir(), ".ensemble-ai", "voices.json");
+function str3(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
 function parseVoices(raw) {
@@ -722,13 +784,13 @@ function parseVoices(raw) {
     const e = o[id];
     if (!e || typeof e !== "object") continue;
     const r = e;
-    const sandbox = str2(r.sandbox, VOICE_DEFAULTS[id].sandbox ?? "");
+    const sandbox = str3(r.sandbox, VOICE_DEFAULTS[id].sandbox ?? "");
     out[id] = {
-      cmd: str2(r.cmd, VOICE_DEFAULTS[id].cmd),
-      effort: str2(r.effort, VOICE_DEFAULTS[id].effort),
+      cmd: str3(r.cmd, VOICE_DEFAULTS[id].cmd),
+      effort: str3(r.effort, VOICE_DEFAULTS[id].effort),
       id,
-      model: str2(r.model, VOICE_DEFAULTS[id].model),
-      vendor: str2(r.vendor, VOICE_DEFAULTS[id].vendor),
+      model: str3(r.model, VOICE_DEFAULTS[id].model),
+      vendor: str3(r.vendor, VOICE_DEFAULTS[id].vendor),
       ...sandbox ? { sandbox } : {}
     };
   }
@@ -736,10 +798,14 @@ function parseVoices(raw) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs4.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs5.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
+}
+function listVoices(file = VOICES_FILE) {
+  const all = loadVoices(file);
+  return VOICE_IDS.map((id) => all[id]);
 }
 
 // src/modes/brainstorm/index.ts
@@ -910,7 +976,7 @@ async function runBrainstormMode(opts) {
 }
 
 // src/modes/consult/parse.ts
-function str3(v) {
+function str4(v) {
   return typeof v === "string" ? v.trim() : "";
 }
 function asStance2(v) {
@@ -918,7 +984,7 @@ function asStance2(v) {
 }
 function strList(v) {
   if (!Array.isArray(v)) return [];
-  return [...new Set(v.map(str3).filter(Boolean))];
+  return [...new Set(v.map(str4).filter(Boolean))];
 }
 function parseAnswer(raw) {
   const obj = extractJsonBlock(raw);
@@ -926,8 +992,8 @@ function parseAnswer(raw) {
     return { answer: "", keyPoints: [], parseError: "no parseable JSON block in the output", summary: "" };
   }
   const o = obj;
-  const summary = str3(o.summary);
-  const answer = str3(o.answer);
+  const summary = str4(o.summary);
+  const answer = str4(o.answer);
   const keyPoints = strList(o.keyPoints);
   if (!summary && !answer) {
     return { answer: "", keyPoints, parseError: 'output has no "answer" or "summary"', summary: "" };
@@ -940,7 +1006,7 @@ function parseCritique2(raw) {
     return { notes: [], parseError: "no parseable JSON block in the output", summary: "" };
   }
   const o = obj;
-  const summary = str3(o.summary);
+  const summary = str4(o.summary);
   if (!Array.isArray(o.notes)) {
     return { notes: [], parseError: 'output has no "notes" array', summary };
   }
@@ -948,8 +1014,8 @@ function parseCritique2(raw) {
   for (const rn of o.notes) {
     if (!rn || typeof rn !== "object") continue;
     const n = rn;
-    const target = str3(n.target);
-    const assessment = str3(n.assessment);
+    const target = str4(n.target);
+    const assessment = str4(n.assessment);
     if (!target && !assessment) continue;
     notes.push({ assessment, stance: asStance2(n.stance), target: target || "(unspecified)" });
   }
@@ -961,7 +1027,7 @@ function parseAgreements(v) {
   for (const ra of v) {
     if (!ra || typeof ra !== "object") continue;
     const a = ra;
-    const point = str3(a.point);
+    const point = str4(a.point);
     if (!point) continue;
     out.push({ point, voices: strList(a.voices) });
   }
@@ -973,7 +1039,7 @@ function parseDivergences(v) {
   for (const rd of v) {
     if (!rd || typeof rd !== "object") continue;
     const d = rd;
-    const point = str3(d.point);
+    const point = str4(d.point);
     if (!point) continue;
     out.push({ point, positions: strList(d.positions) });
   }
@@ -991,8 +1057,8 @@ function parseConsultSynthesis(raw) {
     };
   }
   const o = obj;
-  const summary = str3(o.summary);
-  const recommendation = str3(o.recommendation);
+  const summary = str4(o.summary);
+  const recommendation = str4(o.recommendation);
   const agreements = parseAgreements(o.agreements);
   const divergences = parseDivergences(o.divergences);
   if (!recommendation && !summary) {
@@ -1305,20 +1371,27 @@ function isImplemented(mode) {
 }
 
 // src/core/artifacts.ts
-import fs5 from "fs";
-import path4 from "path";
+import fs6 from "fs";
+import path5 from "path";
 function sanitizePathSegment(s) {
   return s.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 function reviewDir(baseDir, runId) {
-  return path4.join(baseDir, sanitizePathSegment(runId) || "unknown");
+  return path5.join(baseDir, sanitizePathSegment(runId) || "unknown");
 }
 function writeAtomic(dir, name, content) {
-  fs5.mkdirSync(dir, { recursive: true });
-  const target = path4.join(dir, name);
+  fs6.mkdirSync(dir, { recursive: true });
+  const target = path5.join(dir, name);
   const tmp = `${target}.tmp`;
-  fs5.writeFileSync(tmp, content);
-  fs5.renameSync(tmp, target);
+  fs6.writeFileSync(tmp, content);
+  fs6.renameSync(tmp, target);
+}
+function readJson(file) {
+  try {
+    return JSON.parse(fs6.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
 }
 function manifestOf(packet) {
   return packet.sections.map((s) => ({
@@ -1360,6 +1433,16 @@ function persistReview(baseDir, input) {
   };
   writeAtomic(dir, reviewJson(id), JSON.stringify(stored, null, 2));
   return stored;
+}
+function readReview(baseDir, runId, reviewerId = "codex") {
+  const dir = reviewDir(baseDir, runId);
+  const perId = readJson(path5.join(dir, reviewJson(reviewerId)));
+  if (perId) return perId.reviewerId ? perId : { ...perId, reviewerId };
+  if (reviewerId === "codex") {
+    const legacy = readJson(path5.join(dir, "review.json"));
+    if (legacy) return { ...legacy, reviewerId: "codex" };
+  }
+  return null;
 }
 
 // src/core/packet.ts
@@ -1608,62 +1691,6 @@ ${body}
 
 ${ask}
 `;
-}
-
-// src/core/reviewers.ts
-import fs6 from "fs";
-import os5 from "os";
-import path5 from "path";
-var REVIEWERS_FILE = process.env.ENSEMBLE_REVIEWERS_FILE || path5.join(os5.homedir(), ".ensemble-ai", "reviewers.json");
-var REVIEWER_DEFAULTS = {
-  codex: {
-    cmd: "codex",
-    effort: "xhigh",
-    id: "codex",
-    model: "gpt-5.5",
-    vendor: "openai"
-  },
-  // Grok (xAI) — the second cross-vendor lens. grok-build is the stronger of the
-  // two CLI-available models; `sandbox` names the OS-enforced read-only profile it
-  // runs under (kernel-blocked writes + secret-read deny — see reviewers/grok.ts).
-  grok: {
-    cmd: "grok",
-    effort: "high",
-    id: "grok",
-    model: "grok-build",
-    sandbox: "ensemble-review",
-    vendor: "xai"
-  }
-};
-function str4(v, fallback) {
-  return typeof v === "string" && v.trim() ? v.trim() : fallback;
-}
-function parseReviewers(raw) {
-  const out = { ...REVIEWER_DEFAULTS };
-  if (!raw || typeof raw !== "object") return out;
-  const o = raw;
-  for (const id of REVIEWER_IDS) {
-    const e = o[id];
-    if (!e || typeof e !== "object") continue;
-    const r = e;
-    const sandbox = str4(r.sandbox, REVIEWER_DEFAULTS[id].sandbox ?? "");
-    out[id] = {
-      cmd: str4(r.cmd, REVIEWER_DEFAULTS[id].cmd),
-      effort: str4(r.effort, REVIEWER_DEFAULTS[id].effort),
-      id,
-      model: str4(r.model, REVIEWER_DEFAULTS[id].model),
-      vendor: str4(r.vendor, REVIEWER_DEFAULTS[id].vendor),
-      ...sandbox ? { sandbox } : {}
-    };
-  }
-  return out;
-}
-function loadReviewers(file = REVIEWERS_FILE) {
-  try {
-    return parseReviewers(JSON.parse(fs6.readFileSync(file, "utf8")));
-  } catch {
-    return { ...REVIEWER_DEFAULTS };
-  }
 }
 
 // src/reviewers/registry.ts
@@ -2012,6 +2039,15 @@ function writeReceipt(storeDir, receipt) {
   fs7.renameSync(tmp, file);
   return file;
 }
+function readReceipt(storeDir, key) {
+  try {
+    return JSON.parse(
+      fs7.readFileSync(receiptPath(storeDir, key), "utf8")
+    );
+  } catch {
+    return null;
+  }
+}
 function coverageShortfall(coverage) {
   return coverage.omitted.filter((o) => o.kind !== "generated" && o.kind !== "binary").map((o) => o.path);
 }
@@ -2071,6 +2107,26 @@ function buildDiffReceipt(args) {
       vendors: [...new Set(vendors)]
     }
   };
+}
+function isDiffReviewed(live, deps) {
+  const receipt = deps.readReceipt(live.key);
+  if (!receipt) return { reason: "no-receipt", receipt: null, reviewed: false };
+  if (receipt.diffDigest !== live.key.diffDigest) {
+    return { reason: "stale", receipt, reviewed: false };
+  }
+  if (!live.required.every((id) => receipt.completed.includes(id))) {
+    return { reason: "incomplete-policy", receipt, reviewed: false };
+  }
+  if (coverageShortfall(summarizeCoverage(live.coverage)).length > 0) {
+    return { reason: "incomplete-coverage", receipt, reviewed: false };
+  }
+  for (const id of live.required) {
+    const r = deps.readReview(receipt.runId, id);
+    if (!r || r.terminalState !== "reviewed") {
+      return { reason: "artifact-missing", receipt, reviewed: false };
+    }
+  }
+  return { reason: "reviewed", receipt, reviewed: true };
 }
 
 // src/modes/review/secret-scan.ts
@@ -2311,6 +2367,151 @@ function selectDiffSource(flags) {
   return { kind: "commit" };
 }
 
+// src/plumbing/diff-preview.ts
+function buildPacketPreview(acquired, profile) {
+  const packet = assembleCodePacket({
+    diff: acquired.diff,
+    objective: profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE,
+    pr: 0,
+    repo: acquired.repoId ?? ""
+  });
+  return { packet, prompt: renderReviewPrompt(packet, profile) };
+}
+function renderPacketPreview(acquired, preview, opts) {
+  const c = acquired.coverage;
+  const out = [];
+  out.push("");
+  out.push(`ensemble-ai diff \u2014 the assembled ${opts.profile} review packet (no reviewer run)`);
+  if (acquired.repoId) out.push(`  repo:    ${acquired.repoId}`);
+  if (acquired.baseRef) out.push(`  base:    ${acquired.baseRef} (${acquired.baseSha ?? "?"})`);
+  out.push(`  head:    ${acquired.headSha}`);
+  out.push(`  mode:    ${acquired.mode}`);
+  out.push(`  digest:  ${acquired.canonicalDigest}`);
+  out.push(
+    `  files:   ${c.totalFiles} total \xB7 ${c.includedFiles} reviewed \xB7 ${c.omittedFiles} omitted \xB7 ${c.includedBytes}/${c.totalBytes} bytes covered`
+  );
+  for (const f of c.files.filter((x) => !x.included)) {
+    out.push(`             omitted: ${f.path} (${f.omitReason}/${f.kind})`);
+  }
+  out.push("");
+  out.push("  packet sections (what the reviewer sees):");
+  for (const s of preview.packet.sections) {
+    const flag = s.included ? s.truncated ? "~" : "\u2713" : "\xB7";
+    out.push(`    ${flag} ${s.title} \u2014 ${s.note}`);
+  }
+  out.push("");
+  out.push(`  packet complete: ${preview.packet.complete ? "yes" : "NO \u2014 a blind review (diff missing/too small)"}`);
+  out.push(
+    `  cost preview:    ~${preview.prompt.length} prompt chars \xD7 ${opts.reviewers.length} reviewer(s) [${opts.reviewers.join(", ")}]`
+  );
+  if (opts.full) {
+    out.push("");
+    out.push("  \u2500\u2500 rendered prompt \u2500\u2500");
+    out.push(preview.prompt);
+  } else {
+    out.push("  (pass --full to print the entire rendered prompt)");
+  }
+  out.push("");
+  return out.join("\n");
+}
+
+// src/plumbing/registry.ts
+function agentLine(c) {
+  const sandbox = c.sandbox ? ` \xB7 sandbox ${c.sandbox}` : "";
+  return `    ${c.id.padEnd(7)} ${c.vendor} \xB7 ${c.model} @ ${c.effort}${sandbox}`;
+}
+function sourceNote(file, exists) {
+  return exists ? file : `${file} \u2014 not present, using baked defaults`;
+}
+function renderRegistry(view) {
+  const out = [];
+  out.push("");
+  out.push("ensemble-ai registry \u2014 the configured cross-vendor agents (read-only)");
+  out.push("");
+  out.push("  review \xB7 security  (reviewers \u2014 the other vendor arbitrated by Munin)");
+  out.push(`    config: ${sourceNote(view.reviewersFile, view.reviewersFileExists)}`);
+  for (const r of view.reviewers) out.push(agentLine(r));
+  out.push("");
+  out.push("  brainstorm \xB7 consult  (voices \u2014 Claude joins; no independence concern)");
+  out.push(`    config: ${sourceNote(view.voicesFile, view.voicesFileExists)}`);
+  for (const v of view.voices) out.push(agentLine(v));
+  out.push("");
+  return out.join("\n");
+}
+
+// src/plumbing/verify.ts
+function receiptBackedReadReview(receipt) {
+  return (runId, id) => receipt.completed.includes(id) ? {
+    findings: [],
+    packet: { complete: true, manifest: [] },
+    reviewer: { effort: "", model: "", vendor: "" },
+    reviewerId: id,
+    runId,
+    summary: "receipt-backed (no trail dir provided)",
+    terminalState: "reviewed"
+  } : null;
+}
+function verifyReceipt(live, deps) {
+  const receipt = deps.readReceipt(live.key);
+  const trailDir = deps.trailDir;
+  const readReviewFn = trailDir ? (runId, id) => readReview(trailDir, runId, id) : receipt ? receiptBackedReadReview(receipt) : () => null;
+  return isDiffReviewed(live, {
+    readReceipt: () => receipt,
+    readReview: readReviewFn
+  });
+}
+function verifyExitCode(state) {
+  return state.reviewed ? 0 : 3;
+}
+var REASON_EXPLANATION = {
+  "artifact-missing": "ARTIFACT MISSING \u2014 a required reviewer artifact is absent or did not complete (pass --trail <dir>)",
+  "incomplete-coverage": "INCOMPLETE COVERAGE \u2014 the current diff omits a source file the review did not cover",
+  "incomplete-policy": "INCOMPLETE POLICY \u2014 the receipt does not cover every required reviewer",
+  "no-receipt": "NO RECEIPT \u2014 the current diff identity has no review receipt; it has not been reviewed",
+  reviewed: "VALID & CURRENT \u2014 the current diff matches a qualifying cross-vendor review receipt",
+  stale: "STALE \u2014 a receipt exists but its diff digest no longer matches the current state (commits since review)"
+};
+function formatVerify(state, key) {
+  const out = [];
+  out.push("");
+  out.push(`ensemble-ai receipt verify \u2014 ${state.reviewed ? "PASS" : "FAIL"}`);
+  out.push(`  repo:    ${key.repo ?? "(none)"}`);
+  out.push(`  head:    ${key.headSha}`);
+  out.push(`  digest:  ${key.diffDigest}`);
+  out.push(`  verdict: ${REASON_EXPLANATION[state.reason]}`);
+  if (state.receipt) {
+    out.push(
+      `  receipt: runId ${state.receipt.runId} \xB7 completed ${state.receipt.completed.join(", ")} \xB7 vendors ${state.receipt.vendors.join(", ")}`
+    );
+  }
+  out.push("");
+  return out.join("\n");
+}
+function formatReceipt(receipt) {
+  const c = receipt.coverage;
+  const out = [];
+  out.push("");
+  out.push("ensemble-ai receipt show");
+  out.push(`  repo:      ${receipt.repo ?? "(none)"}`);
+  out.push(`  base:      ${receipt.baseRef ?? "(none)"} (${receipt.baseSha ?? "?"})`);
+  out.push(`  head:      ${receipt.headSha}`);
+  out.push(`  mode:      ${receipt.diffMode}`);
+  out.push(`  digest:    ${receipt.diffDigest}`);
+  out.push(`  policy:    ${receipt.policyHash}`);
+  out.push(`  reviewers: ${receipt.reviewerPolicy.join(", ")} (policy)`);
+  out.push(`  completed: ${receipt.completed.join(", ")}`);
+  out.push(`  vendors:   ${receipt.vendors.join(", ")}`);
+  out.push(`  runId:     ${receipt.runId}`);
+  out.push(
+    `  coverage:  ${c.totalFiles} total \xB7 ${c.includedFiles} reviewed \xB7 ${c.omittedFiles} omitted`
+  );
+  for (const o of c.omitted) {
+    out.push(`               omitted: ${o.path} (${o.reason}/${o.kind})`);
+  }
+  out.push("");
+  return out.join("\n");
+}
+
 // src/cli.ts
 var USAGE = `ensemble-ai \u2014 convene multiple AI models on a task, read-only.
 
@@ -2329,8 +2530,13 @@ Modes:
                voice answers independently, then one synthesizes what they AGREE
                on (confident) vs where they DIVERGE (look closer).
 
-Run \`ensemble-ai review --help\`, \`ensemble-ai security --help\`,
-\`ensemble-ai brainstorm --help\`, or \`ensemble-ai consult --help\` for options.`;
+Plumbing (no reviewer runs \u2014 inspect the engine):
+  receipt      verify | show a content-tied diff receipt (the pre-PR gate primitive):
+               \`receipt verify\` exits 0 iff the current diff is reviewed & current.
+  reviewers    (alias: config) list the configured cross-vendor registry (read-only).
+  diff         show the assembled review packet that WOULD be sent \u2014 cost-preview/debug.
+
+Run \`ensemble-ai <mode|command> --help\` for options.`;
 var REVIEW_USAGE = `ensemble-ai review \u2014 review a diff with ALL configured AI reviewers.
 
 Runs every reviewer in the registry (codex + grok) by default and prints their
@@ -2409,18 +2615,18 @@ function capture(cmd, cmdArgs, cwd) {
     return { error: stderr || err.message || "command failed", ok: false };
   }
 }
-function resolveSource(selection, cwd, stdinContent) {
+function resolveSource(selection, cwd, stdinContent, cmd = "review") {
   switch (selection.kind) {
     case "pr": {
       const cap3 = capture("gh", ["pr", "diff", String(selection.pr)], cwd);
       if (!cap3.ok) {
         console.error(
-          `ensemble-ai review: \`gh pr diff ${selection.pr}\` failed: ${cap3.error}`
+          `ensemble-ai ${cmd}: \`gh pr diff ${selection.pr}\` failed: ${cap3.error}`
         );
         return { code: 3 };
       }
       if (!cap3.text.trim()) {
-        console.error(`ensemble-ai review: PR #${selection.pr} has an empty diff`);
+        console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
         return { code: 3 };
       }
       return { diffMode: "pr", diffText: cap3.text };
@@ -2431,13 +2637,13 @@ function resolveSource(selection, cwd, stdinContent) {
         text = fs8.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
-          `ensemble-ai review: cannot read --diff-file: ${e.message}`
+          `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
         );
         return { code: 3 };
       }
       if (!text.trim()) {
         console.error(
-          `ensemble-ai review: --diff-file ${selection.diffFile} is empty`
+          `ensemble-ai ${cmd}: --diff-file ${selection.diffFile} is empty`
         );
         return { code: 3 };
       }
@@ -3076,12 +3282,343 @@ async function consultCommand(args) {
   const anyAnswers = result.answers.some((a) => a.ok);
   return anyAnswers ? 0 : 1;
 }
+function parseRequiredReviewers(raw, cmd) {
+  if (raw === void 0) return [...REVIEWER_IDS];
+  const requested = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  const unknown = requested.filter((id) => !isReviewerId(id));
+  if (unknown.length > 0 || requested.length === 0) {
+    console.error(
+      `ensemble-ai ${cmd}: --reviewers "${raw}" ${unknown.length ? `has unknown id(s): ${unknown.join(", ")}` : "is empty"} (known: ${REVIEWER_IDS.join(", ")})`
+    );
+    return { code: 3 };
+  }
+  return parseReviewerIds(requested);
+}
+function positiveCeiling(raw, cmd) {
+  if (raw === void 0) return void 0;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.error(`ensemble-ai ${cmd}: --ceiling must be a positive number`);
+    return { code: 3 };
+  }
+  return n;
+}
+var RECEIPT_USAGE = `ensemble-ai receipt \u2014 the content-tied diff-receipt gate primitive.
+
+Usage:
+  ensemble-ai receipt verify [<path>] [options]   check the CURRENT diff is reviewed
+  ensemble-ai receipt show   [<path>] [options]   pretty-print a receipt
+
+verify recomputes the current diff's identity (repo \xB7 base/head \xB7 content digest)
+and checks it against the stored (or --path) receipt: exit 0 = reviewed & current;
+NON-ZERO (3) = missing / stale (commits since review) / under-policy / under-coverage,
+with the reason printed. This is what a pre-PR \`gh pr create\` hook calls.
+show prints a receipt's fields (given a <path>, else looked up for the current diff).
+
+Options:
+  --base <ref>          base ref for the current-branch diff (default: origin/HEAD)
+  --staged              use the staged diff (\`git diff --cached\`) as the current state
+  --working-tree        use uncommitted tracked changes (\`git diff HEAD\`)
+  --reviewers <ids>     required reviewer policy (default: all configured)
+  --ceiling <bytes>     coverage byte ceiling (default 200000)
+  --store <dir>         receipt store dir (default: ~/.ensemble-ai/receipts)
+  --trail <dir>         a run trail dir to PROVE the immutable reviewer artifacts
+                        (default: trust the receipt's completed[] \u2014 see receipt.ts)
+  --cwd <dir>           repo working dir (default: cwd)
+  -h, --help            this help`;
+async function receiptCommand(args) {
+  const sub = args[0];
+  if (!sub || sub === "-h" || sub === "--help") {
+    console.log(RECEIPT_USAGE);
+    return sub ? 0 : 3;
+  }
+  if (sub !== "verify" && sub !== "show") {
+    console.error(
+      `ensemble-ai receipt: unknown subcommand "${sub}" (expected: verify | show)`
+    );
+    console.error(RECEIPT_USAGE);
+    return 3;
+  }
+  let values;
+  let positionals;
+  try {
+    ({ positionals, values } = parseArgs({
+      args: args.slice(1),
+      allowPositionals: true,
+      options: {
+        base: { type: "string" },
+        ceiling: { type: "string" },
+        cwd: { type: "string" },
+        help: { short: "h", type: "boolean" },
+        reviewers: { type: "string" },
+        staged: { type: "boolean" },
+        store: { type: "string" },
+        "trail": { type: "string" },
+        "working-tree": { type: "boolean" }
+      }
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai receipt: ${e.message}`);
+    console.error(RECEIPT_USAGE);
+    return 3;
+  }
+  if (values.help) {
+    console.log(RECEIPT_USAGE);
+    return 0;
+  }
+  const receiptPathArg = typeof positionals[0] === "string" ? path7.resolve(positionals[0]) : void 0;
+  const readReceiptFile = (p) => {
+    try {
+      return JSON.parse(fs8.readFileSync(p, "utf8"));
+    } catch {
+      return null;
+    }
+  };
+  if (sub === "show" && receiptPathArg) {
+    const receipt = readReceiptFile(receiptPathArg);
+    if (!receipt) {
+      console.error(`ensemble-ai receipt show: cannot read receipt ${receiptPathArg}`);
+      return 3;
+    }
+    console.log(formatReceipt(receipt));
+    return 0;
+  }
+  const required = parseRequiredReviewers(
+    typeof values.reviewers === "string" ? values.reviewers : void 0,
+    "receipt"
+  );
+  if ("code" in required) return required.code;
+  const ceiling = positiveCeiling(
+    typeof values.ceiling === "string" ? values.ceiling : void 0,
+    "receipt"
+  );
+  if (typeof ceiling === "object") return ceiling.code;
+  const cwd = values.cwd ? path7.resolve(String(values.cwd)) : process.cwd();
+  let acquired;
+  try {
+    acquired = acquireDiff({
+      base: typeof values.base === "string" ? values.base : void 0,
+      ceilingBytes: ceiling,
+      cwd,
+      staged: Boolean(values.staged),
+      workingTree: Boolean(values["working-tree"])
+    });
+  } catch (e) {
+    console.error(`ensemble-ai receipt ${sub}: ${e.message}`);
+    return 3;
+  }
+  const key = {
+    baseSha: acquired.baseSha,
+    diffDigest: acquired.canonicalDigest,
+    headSha: acquired.headSha,
+    policyHash: computePolicyHash({
+      coveragePolicy: { ceilingBytes: ceiling ?? DEFAULT_COVERAGE_CEILING },
+      diffMode: acquired.mode,
+      reviewerPolicy: required
+    }),
+    repo: acquired.repoId
+  };
+  const store = values.store ? path7.resolve(String(values.store)) : defaultReceiptStore();
+  if (sub === "show") {
+    const receipt = readReceipt(store, key);
+    if (!receipt) {
+      console.error(
+        `ensemble-ai receipt show: no receipt for the current diff (repo ${key.repo ?? "(none)"}, head ${key.headSha}) in ${store}`
+      );
+      return 3;
+    }
+    console.log(formatReceipt(receipt));
+    return 0;
+  }
+  const explicit = receiptPathArg ? readReceiptFile(receiptPathArg) : void 0;
+  if (receiptPathArg && !explicit) {
+    console.error(`ensemble-ai receipt verify: cannot read receipt ${receiptPathArg}`);
+    return 3;
+  }
+  const state = verifyReceipt(
+    { coverage: acquired.coverage, key, required },
+    {
+      readReceipt: receiptPathArg ? () => explicit ?? null : (k) => readReceipt(store, k),
+      trailDir: typeof values.trail === "string" ? path7.resolve(values.trail) : void 0
+    }
+  );
+  console.log(formatVerify(state, key));
+  return verifyExitCode(state);
+}
+var REVIEWERS_USAGE = `ensemble-ai reviewers \u2014 list the configured cross-vendor registry (read-only).
+
+Usage:
+  ensemble-ai reviewers [options]
+  ensemble-ai config    [options]      (alias)
+
+Prints the review/security reviewers (from reviewers.json) and the brainstorm/
+consult voices (from voices.json) \u2014 id \xB7 vendor \xB7 model \xB7 effort \xB7 sandbox \u2014 plus
+which config file each came from (or "baked defaults"). No mutation.
+
+Options:
+  --reviewers-file <path>   reviewers config (default ~/.ensemble-ai/reviewers.json)
+  --voices-file <path>      voices config (default ~/.ensemble-ai/voices.json)
+  --json                    print the resolved registry as JSON
+  -h, --help                this help`;
+async function reviewersCommand(args) {
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args,
+      allowPositionals: false,
+      options: {
+        help: { short: "h", type: "boolean" },
+        json: { type: "boolean" },
+        "reviewers-file": { type: "string" },
+        "voices-file": { type: "string" }
+      }
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai reviewers: ${e.message}`);
+    console.error(REVIEWERS_USAGE);
+    return 3;
+  }
+  if (values.help) {
+    console.log(REVIEWERS_USAGE);
+    return 0;
+  }
+  const reviewersFile = typeof values["reviewers-file"] === "string" ? path7.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
+  const voicesFile = typeof values["voices-file"] === "string" ? path7.resolve(values["voices-file"]) : VOICES_FILE;
+  const view = {
+    reviewers: listReviewers(reviewersFile),
+    reviewersFile,
+    reviewersFileExists: fs8.existsSync(reviewersFile),
+    voices: listVoices(voicesFile),
+    voicesFile,
+    voicesFileExists: fs8.existsSync(voicesFile)
+  };
+  if (values.json) console.log(JSON.stringify(view, null, 2));
+  else console.log(renderRegistry(view));
+  return 0;
+}
+var DIFF_USAGE = `ensemble-ai diff \u2014 show the assembled review packet WITHOUT running a reviewer.
+
+Usage:
+  ensemble-ai diff [<diff-source>] [options]
+
+A cost-preview / debug of the EXACT packet the reviewers would receive: the diff
+identity + coverage, the per-section manifest (what the reviewer sees), and the
+prompt size \u2014 no vendor is called, nothing is spent.
+
+Diff source (give at most ONE; default = current branch, like \`ensemble-ai review\`):
+  (default)            <base>...HEAD \u2014 the current branch vs origin/HEAD
+  --pr <N>             the diff of GitHub PR #N (via \`gh pr diff <N>\`)
+  --staged             staged changes (\`git diff --cached\`)
+  --working-tree       uncommitted tracked changes vs HEAD
+  --diff-file <path>   a raw unified diff from a file
+  (stdin)              a piped diff
+
+Options:
+  --base <ref>          base ref for the default (commit) mode
+  --profile <p>         packet profile: code (default) | security
+  --reviewers <ids>     reviewers to size the cost preview against (default: all)
+  --ceiling <bytes>     coverage byte ceiling (default 200000)
+  --full                print the ENTIRE rendered prompt (the literal payload)
+  --json                print { packet, prompt } as JSON
+  --cwd <dir>           repo working dir (default: cwd)
+  -h, --help            this help`;
+async function diffCommand(args) {
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args,
+      allowPositionals: false,
+      options: {
+        base: { type: "string" },
+        ceiling: { type: "string" },
+        cwd: { type: "string" },
+        "diff-file": { type: "string" },
+        full: { type: "boolean" },
+        help: { short: "h", type: "boolean" },
+        json: { type: "boolean" },
+        pr: { type: "string" },
+        profile: { type: "string" },
+        reviewers: { type: "string" },
+        staged: { type: "boolean" },
+        "working-tree": { type: "boolean" }
+      }
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai diff: ${e.message}`);
+    console.error(DIFF_USAGE);
+    return 3;
+  }
+  if (values.help) {
+    console.log(DIFF_USAGE);
+    return 0;
+  }
+  let profile = "code";
+  if (typeof values.profile === "string") {
+    if (values.profile !== "code" && values.profile !== "security") {
+      console.error(
+        `ensemble-ai diff: --profile must be "code" or "security" (got "${values.profile}")`
+      );
+      return 3;
+    }
+    profile = values.profile;
+  }
+  const reviewers = parseRequiredReviewers(
+    typeof values.reviewers === "string" ? values.reviewers : void 0,
+    "diff"
+  );
+  if ("code" in reviewers) return reviewers.code;
+  const ceiling = positiveCeiling(
+    typeof values.ceiling === "string" ? values.ceiling : void 0,
+    "diff"
+  );
+  if (typeof ceiling === "object") return ceiling.code;
+  const cwd = values.cwd ? path7.resolve(String(values.cwd)) : process.cwd();
+  const sourceFlags = {
+    diffFile: typeof values["diff-file"] === "string" ? values["diff-file"] : void 0,
+    pr: typeof values.pr === "string" ? values.pr : void 0,
+    staged: Boolean(values.staged),
+    workingTree: Boolean(values["working-tree"])
+  };
+  const stdinContent = hasExplicitSource(sourceFlags) ? void 0 : readStdinIfPiped();
+  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== void 0 });
+  if (isDiffSourceError(selection)) {
+    console.error(`ensemble-ai diff: ${selection.error}`);
+    return 3;
+  }
+  const source = resolveSource(selection, cwd, stdinContent, "diff");
+  if ("code" in source) return source.code;
+  let acquired;
+  try {
+    acquired = acquireDiff({
+      base: typeof values.base === "string" ? values.base : void 0,
+      ceilingBytes: ceiling,
+      cwd,
+      diffMode: source.diffMode,
+      diffText: source.diffText,
+      staged: source.staged,
+      workingTree: source.workingTree
+    });
+  } catch (e) {
+    console.error(`ensemble-ai diff: ${e.message}`);
+    return 3;
+  }
+  const preview = buildPacketPreview(acquired, profile);
+  if (values.json) {
+    console.log(JSON.stringify({ packet: preview.packet, prompt: preview.prompt }, null, 2));
+  } else {
+    console.log(renderPacketPreview(acquired, preview, { full: Boolean(values.full), profile, reviewers }));
+  }
+  return 0;
+}
 async function main(argv) {
   const raw = argv[0];
   if (!raw || raw === "-h" || raw === "--help") {
     console.log(USAGE);
     return raw ? 0 : 1;
   }
+  if (raw === "receipt") return receiptCommand(argv.slice(1));
+  if (raw === "reviewers" || raw === "config") return reviewersCommand(argv.slice(1));
+  if (raw === "diff") return diffCommand(argv.slice(1));
   const mode = resolveMode(raw);
   if (mode === "review") return reviewCommand(argv.slice(1), "code");
   if (mode === "security") return reviewCommand(argv.slice(1), "security");

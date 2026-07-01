@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
+import { listReviewers, REVIEWERS_FILE } from './core/reviewers';
 import {
   isReviewerId,
   parseReviewerIds,
@@ -16,6 +17,7 @@ import {
   type StoredReview,
 } from './core/types';
 import { runBrainstormMode } from './modes/brainstorm';
+import { listVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
   type BrainstormResult,
   isVoiceId,
@@ -28,18 +30,38 @@ import type { ConsultResult } from './modes/consult/types';
 import { isImplemented, isMode, resolveMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
-import type { DiffMode } from './modes/review/diff';
+import {
+  acquireDiff,
+  type AcquiredDiff,
+  DEFAULT_COVERAGE_CEILING,
+  type DiffMode,
+} from './modes/review/diff';
 import {
   classifySecurityFinding,
   type ReviewProfile,
   stripSecurityTag,
 } from './modes/review/profile';
 import {
+  computePolicyHash,
+  defaultReceiptStore,
+  type DiffReviewReceipt,
+  readReceipt,
+  type ReceiptKey,
+} from './modes/review/receipt';
+import {
   type DiffSourceSelection,
   hasExplicitSource,
   isDiffSourceError,
   selectDiffSource,
 } from './modes/review/source';
+import { buildPacketPreview, renderPacketPreview } from './plumbing/diff-preview';
+import { renderRegistry, type RegistryView } from './plumbing/registry';
+import {
+  formatReceipt,
+  formatVerify,
+  verifyExitCode,
+  verifyReceipt,
+} from './plumbing/verify';
 
 const USAGE = `ensemble-ai — convene multiple AI models on a task, read-only.
 
@@ -58,8 +80,13 @@ Modes:
                voice answers independently, then one synthesizes what they AGREE
                on (confident) vs where they DIVERGE (look closer).
 
-Run \`ensemble-ai review --help\`, \`ensemble-ai security --help\`,
-\`ensemble-ai brainstorm --help\`, or \`ensemble-ai consult --help\` for options.`;
+Plumbing (no reviewer runs — inspect the engine):
+  receipt      verify | show a content-tied diff receipt (the pre-PR gate primitive):
+               \`receipt verify\` exits 0 iff the current diff is reviewed & current.
+  reviewers    (alias: config) list the configured cross-vendor registry (read-only).
+  diff         show the assembled review packet that WOULD be sent — cost-preview/debug.
+
+Run \`ensemble-ai <mode|command> --help\` for options.`;
 
 const REVIEW_USAGE = `ensemble-ai review — review a diff with ALL configured AI reviewers.
 
@@ -157,7 +184,8 @@ function capture(
 function resolveSource(
   selection: DiffSourceSelection,
   cwd: string,
-  stdinContent: string | undefined
+  stdinContent: string | undefined,
+  cmd = 'review'
 ):
   | { code: number }
   | {
@@ -171,12 +199,12 @@ function resolveSource(
       const cap = capture('gh', ['pr', 'diff', String(selection.pr)], cwd);
       if (!cap.ok) {
         console.error(
-          `ensemble-ai review: \`gh pr diff ${selection.pr}\` failed: ${cap.error}`
+          `ensemble-ai ${cmd}: \`gh pr diff ${selection.pr}\` failed: ${cap.error}`
         );
         return { code: 3 };
       }
       if (!cap.text.trim()) {
-        console.error(`ensemble-ai review: PR #${selection.pr} has an empty diff`);
+        console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
         return { code: 3 };
       }
       return { diffMode: 'pr', diffText: cap.text };
@@ -187,13 +215,13 @@ function resolveSource(
         text = fs.readFileSync(String(selection.diffFile), 'utf8');
       } catch (e) {
         console.error(
-          `ensemble-ai review: cannot read --diff-file: ${(e as Error).message}`
+          `ensemble-ai ${cmd}: cannot read --diff-file: ${(e as Error).message}`
         );
         return { code: 3 };
       }
       if (!text.trim()) {
         console.error(
-          `ensemble-ai review: --diff-file ${selection.diffFile} is empty`
+          `ensemble-ai ${cmd}: --diff-file ${selection.diffFile} is empty`
         );
         return { code: 3 };
       }
@@ -965,12 +993,388 @@ async function consultCommand(args: string[]): Promise<number> {
   return anyAnswers ? 0 : 1;
 }
 
+// ── Plumbing commands (no reviewer runs) ─────────────────────────────────────
+
+// Parse a fail-closed `--reviewers` list, defaulting to the FULL registry. Unlike
+// review mode (where absent → undefined → "run all"), the gate/preview need a
+// CONCRETE required set, so absent → [...REVIEWER_IDS]. A typo still errors (never
+// silently narrows the policy). Returns the ids or a usage-error code.
+function parseRequiredReviewers(
+  raw: string | undefined,
+  cmd: string
+): ReviewerId[] | { code: number } {
+  if (raw === undefined) return [...REVIEWER_IDS];
+  const requested = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  const unknown = requested.filter((id) => !isReviewerId(id));
+  if (unknown.length > 0 || requested.length === 0) {
+    console.error(
+      `ensemble-ai ${cmd}: --reviewers "${raw}" ${
+        unknown.length ? `has unknown id(s): ${unknown.join(', ')}` : 'is empty'
+      } (known: ${REVIEWER_IDS.join(', ')})`
+    );
+    return { code: 3 };
+  }
+  return parseReviewerIds(requested) as ReviewerId[];
+}
+
+function positiveCeiling(
+  raw: string | undefined,
+  cmd: string
+): number | undefined | { code: number } {
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.error(`ensemble-ai ${cmd}: --ceiling must be a positive number`);
+    return { code: 3 };
+  }
+  return n;
+}
+
+const RECEIPT_USAGE = `ensemble-ai receipt — the content-tied diff-receipt gate primitive.
+
+Usage:
+  ensemble-ai receipt verify [<path>] [options]   check the CURRENT diff is reviewed
+  ensemble-ai receipt show   [<path>] [options]   pretty-print a receipt
+
+verify recomputes the current diff's identity (repo · base/head · content digest)
+and checks it against the stored (or --path) receipt: exit 0 = reviewed & current;
+NON-ZERO (3) = missing / stale (commits since review) / under-policy / under-coverage,
+with the reason printed. This is what a pre-PR \`gh pr create\` hook calls.
+show prints a receipt's fields (given a <path>, else looked up for the current diff).
+
+Options:
+  --base <ref>          base ref for the current-branch diff (default: origin/HEAD)
+  --staged              use the staged diff (\`git diff --cached\`) as the current state
+  --working-tree        use uncommitted tracked changes (\`git diff HEAD\`)
+  --reviewers <ids>     required reviewer policy (default: all configured)
+  --ceiling <bytes>     coverage byte ceiling (default 200000)
+  --store <dir>         receipt store dir (default: ~/.ensemble-ai/receipts)
+  --trail <dir>         a run trail dir to PROVE the immutable reviewer artifacts
+                        (default: trust the receipt's completed[] — see receipt.ts)
+  --cwd <dir>           repo working dir (default: cwd)
+  -h, --help            this help`;
+
+async function receiptCommand(args: string[]): Promise<number> {
+  const sub = args[0];
+  if (!sub || sub === '-h' || sub === '--help') {
+    console.log(RECEIPT_USAGE);
+    return sub ? 0 : 3;
+  }
+  if (sub !== 'verify' && sub !== 'show') {
+    console.error(
+      `ensemble-ai receipt: unknown subcommand "${sub}" (expected: verify | show)`
+    );
+    console.error(RECEIPT_USAGE);
+    return 3;
+  }
+  let values: Record<string, string | boolean | undefined>;
+  let positionals: string[];
+  try {
+    ({ positionals, values } = parseArgs({
+      args: args.slice(1),
+      allowPositionals: true,
+      options: {
+        base: { type: 'string' },
+        ceiling: { type: 'string' },
+        cwd: { type: 'string' },
+        help: { short: 'h', type: 'boolean' },
+        reviewers: { type: 'string' },
+        staged: { type: 'boolean' },
+        store: { type: 'string' },
+        'trail': { type: 'string' },
+        'working-tree': { type: 'boolean' },
+      },
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai receipt: ${(e as Error).message}`);
+    console.error(RECEIPT_USAGE);
+    return 3;
+  }
+  if (values.help) {
+    console.log(RECEIPT_USAGE);
+    return 0;
+  }
+
+  const receiptPathArg =
+    typeof positionals[0] === 'string' ? path.resolve(positionals[0]) : undefined;
+  const readReceiptFile = (p: string): DiffReviewReceipt | null => {
+    try {
+      return JSON.parse(fs.readFileSync(p, 'utf8')) as DiffReviewReceipt;
+    } catch {
+      return null;
+    }
+  };
+
+  // `show <path>` needs no git — just read + print the receipt file.
+  if (sub === 'show' && receiptPathArg) {
+    const receipt = readReceiptFile(receiptPathArg);
+    if (!receipt) {
+      console.error(`ensemble-ai receipt show: cannot read receipt ${receiptPathArg}`);
+      return 3;
+    }
+    console.log(formatReceipt(receipt));
+    return 0;
+  }
+
+  const required = parseRequiredReviewers(
+    typeof values.reviewers === 'string' ? values.reviewers : undefined,
+    'receipt'
+  );
+  if ('code' in required) return required.code;
+  const ceiling = positiveCeiling(
+    typeof values.ceiling === 'string' ? values.ceiling : undefined,
+    'receipt'
+  );
+  if (typeof ceiling === 'object') return ceiling.code;
+  const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
+
+  // Both `verify` and `show`-without-path need the LIVE diff identity to derive the
+  // receipt key. Fail closed (exit 3) if the base can't be resolved.
+  let acquired: AcquiredDiff;
+  try {
+    acquired = acquireDiff({
+      base: typeof values.base === 'string' ? values.base : undefined,
+      ceilingBytes: ceiling,
+      cwd,
+      staged: Boolean(values.staged),
+      workingTree: Boolean(values['working-tree']),
+    });
+  } catch (e) {
+    console.error(`ensemble-ai receipt ${sub}: ${(e as Error).message}`);
+    return 3;
+  }
+  const key: ReceiptKey = {
+    baseSha: acquired.baseSha,
+    diffDigest: acquired.canonicalDigest,
+    headSha: acquired.headSha,
+    policyHash: computePolicyHash({
+      coveragePolicy: { ceilingBytes: ceiling ?? DEFAULT_COVERAGE_CEILING },
+      diffMode: acquired.mode,
+      reviewerPolicy: required,
+    }),
+    repo: acquired.repoId,
+  };
+  const store = values.store ? path.resolve(String(values.store)) : defaultReceiptStore();
+
+  if (sub === 'show') {
+    const receipt = readReceipt(store, key);
+    if (!receipt) {
+      console.error(
+        `ensemble-ai receipt show: no receipt for the current diff (repo ${key.repo ?? '(none)'}, head ${key.headSha}) in ${store}`
+      );
+      return 3;
+    }
+    console.log(formatReceipt(receipt));
+    return 0;
+  }
+
+  // verify: read the receipt from --path (explicit) or the store (by key), then run
+  // the SAME live validation the engine ships (isDiffReviewed via verifyReceipt).
+  const explicit = receiptPathArg ? readReceiptFile(receiptPathArg) : undefined;
+  if (receiptPathArg && !explicit) {
+    console.error(`ensemble-ai receipt verify: cannot read receipt ${receiptPathArg}`);
+    return 3;
+  }
+  const state = verifyReceipt(
+    { coverage: acquired.coverage, key, required },
+    {
+      readReceipt: receiptPathArg ? () => explicit ?? null : (k) => readReceipt(store, k),
+      trailDir: typeof values.trail === 'string' ? path.resolve(values.trail) : undefined,
+    }
+  );
+  console.log(formatVerify(state, key));
+  return verifyExitCode(state);
+}
+
+const REVIEWERS_USAGE = `ensemble-ai reviewers — list the configured cross-vendor registry (read-only).
+
+Usage:
+  ensemble-ai reviewers [options]
+  ensemble-ai config    [options]      (alias)
+
+Prints the review/security reviewers (from reviewers.json) and the brainstorm/
+consult voices (from voices.json) — id · vendor · model · effort · sandbox — plus
+which config file each came from (or "baked defaults"). No mutation.
+
+Options:
+  --reviewers-file <path>   reviewers config (default ~/.ensemble-ai/reviewers.json)
+  --voices-file <path>      voices config (default ~/.ensemble-ai/voices.json)
+  --json                    print the resolved registry as JSON
+  -h, --help                this help`;
+
+async function reviewersCommand(args: string[]): Promise<number> {
+  let values: Record<string, string | boolean | undefined>;
+  try {
+    ({ values } = parseArgs({
+      args,
+      allowPositionals: false,
+      options: {
+        help: { short: 'h', type: 'boolean' },
+        json: { type: 'boolean' },
+        'reviewers-file': { type: 'string' },
+        'voices-file': { type: 'string' },
+      },
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai reviewers: ${(e as Error).message}`);
+    console.error(REVIEWERS_USAGE);
+    return 3;
+  }
+  if (values.help) {
+    console.log(REVIEWERS_USAGE);
+    return 0;
+  }
+  const reviewersFile =
+    typeof values['reviewers-file'] === 'string'
+      ? path.resolve(values['reviewers-file'])
+      : REVIEWERS_FILE;
+  const voicesFile =
+    typeof values['voices-file'] === 'string'
+      ? path.resolve(values['voices-file'])
+      : VOICES_FILE;
+  const view: RegistryView = {
+    reviewers: listReviewers(reviewersFile),
+    reviewersFile,
+    reviewersFileExists: fs.existsSync(reviewersFile),
+    voices: listVoices(voicesFile),
+    voicesFile,
+    voicesFileExists: fs.existsSync(voicesFile),
+  };
+  if (values.json) console.log(JSON.stringify(view, null, 2));
+  else console.log(renderRegistry(view));
+  return 0;
+}
+
+const DIFF_USAGE = `ensemble-ai diff — show the assembled review packet WITHOUT running a reviewer.
+
+Usage:
+  ensemble-ai diff [<diff-source>] [options]
+
+A cost-preview / debug of the EXACT packet the reviewers would receive: the diff
+identity + coverage, the per-section manifest (what the reviewer sees), and the
+prompt size — no vendor is called, nothing is spent.
+
+Diff source (give at most ONE; default = current branch, like \`ensemble-ai review\`):
+  (default)            <base>...HEAD — the current branch vs origin/HEAD
+  --pr <N>             the diff of GitHub PR #N (via \`gh pr diff <N>\`)
+  --staged             staged changes (\`git diff --cached\`)
+  --working-tree       uncommitted tracked changes vs HEAD
+  --diff-file <path>   a raw unified diff from a file
+  (stdin)              a piped diff
+
+Options:
+  --base <ref>          base ref for the default (commit) mode
+  --profile <p>         packet profile: code (default) | security
+  --reviewers <ids>     reviewers to size the cost preview against (default: all)
+  --ceiling <bytes>     coverage byte ceiling (default 200000)
+  --full                print the ENTIRE rendered prompt (the literal payload)
+  --json                print { packet, prompt } as JSON
+  --cwd <dir>           repo working dir (default: cwd)
+  -h, --help            this help`;
+
+async function diffCommand(args: string[]): Promise<number> {
+  let values: Record<string, string | boolean | undefined>;
+  try {
+    ({ values } = parseArgs({
+      args,
+      allowPositionals: false,
+      options: {
+        base: { type: 'string' },
+        ceiling: { type: 'string' },
+        cwd: { type: 'string' },
+        'diff-file': { type: 'string' },
+        full: { type: 'boolean' },
+        help: { short: 'h', type: 'boolean' },
+        json: { type: 'boolean' },
+        pr: { type: 'string' },
+        profile: { type: 'string' },
+        reviewers: { type: 'string' },
+        staged: { type: 'boolean' },
+        'working-tree': { type: 'boolean' },
+      },
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai diff: ${(e as Error).message}`);
+    console.error(DIFF_USAGE);
+    return 3;
+  }
+  if (values.help) {
+    console.log(DIFF_USAGE);
+    return 0;
+  }
+
+  let profile: ReviewProfile = 'code';
+  if (typeof values.profile === 'string') {
+    if (values.profile !== 'code' && values.profile !== 'security') {
+      console.error(
+        `ensemble-ai diff: --profile must be "code" or "security" (got "${values.profile}")`
+      );
+      return 3;
+    }
+    profile = values.profile;
+  }
+  const reviewers = parseRequiredReviewers(
+    typeof values.reviewers === 'string' ? values.reviewers : undefined,
+    'diff'
+  );
+  if ('code' in reviewers) return reviewers.code;
+  const ceiling = positiveCeiling(
+    typeof values.ceiling === 'string' ? values.ceiling : undefined,
+    'diff'
+  );
+  if (typeof ceiling === 'object') return ceiling.code;
+  const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
+
+  const sourceFlags = {
+    diffFile: typeof values['diff-file'] === 'string' ? values['diff-file'] : undefined,
+    pr: typeof values.pr === 'string' ? values.pr : undefined,
+    staged: Boolean(values.staged),
+    workingTree: Boolean(values['working-tree']),
+  };
+  const stdinContent = hasExplicitSource(sourceFlags) ? undefined : readStdinIfPiped();
+  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== undefined });
+  if (isDiffSourceError(selection)) {
+    console.error(`ensemble-ai diff: ${selection.error}`);
+    return 3;
+  }
+  const source = resolveSource(selection, cwd, stdinContent, 'diff');
+  if ('code' in source) return source.code;
+
+  let acquired: AcquiredDiff;
+  try {
+    acquired = acquireDiff({
+      base: typeof values.base === 'string' ? values.base : undefined,
+      ceilingBytes: ceiling,
+      cwd,
+      diffMode: source.diffMode,
+      diffText: source.diffText,
+      staged: source.staged,
+      workingTree: source.workingTree,
+    });
+  } catch (e) {
+    console.error(`ensemble-ai diff: ${(e as Error).message}`);
+    return 3;
+  }
+  const preview = buildPacketPreview(acquired, profile);
+  if (values.json) {
+    console.log(JSON.stringify({ packet: preview.packet, prompt: preview.prompt }, null, 2));
+  } else {
+    console.log(renderPacketPreview(acquired, preview, { full: Boolean(values.full), profile, reviewers }));
+  }
+  return 0;
+}
+
 export async function main(argv: string[]): Promise<number> {
   const raw = argv[0];
   if (!raw || raw === '-h' || raw === '--help') {
     console.log(USAGE);
     return raw ? 0 : 1;
   }
+  // Plumbing commands (no reviewer runs) dispatch before the mode registry.
+  if (raw === 'receipt') return receiptCommand(argv.slice(1));
+  if (raw === 'reviewers' || raw === 'config') return reviewersCommand(argv.slice(1));
+  if (raw === 'diff') return diffCommand(argv.slice(1));
+
   const mode = resolveMode(raw);
   if (mode === 'review') return reviewCommand(argv.slice(1), 'code');
   if (mode === 'security') return reviewCommand(argv.slice(1), 'security');

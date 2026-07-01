@@ -75,7 +75,10 @@ export interface ReviewModeResult {
   secretScan: SecretScanResult;
 }
 
-const DEFAULT_OBJECTIVE =
+// The default `code`-profile review objective. Exported so the `diff` plumbing
+// command assembles the SAME packet the engine would send — one objective string,
+// no drift between the preview and the real review.
+export const DEFAULT_OBJECTIVE =
   'Adversarial cross-vendor review of a code diff — find correctness, security, and convention issues a same-vendor author might miss.';
 
 // Run ONE reviewer over the prepared prompt + persist its per-reviewer artifact.
