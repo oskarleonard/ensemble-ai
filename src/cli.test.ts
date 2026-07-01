@@ -171,6 +171,32 @@ describe('flag threading', () => {
   });
 });
 
+describe('--with-claude roster wiring (no spawn — mocked engine returns no prompt)', () => {
+  it('--with-claude alone keeps the full core (reviewers undefined → engine runs all)', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
+    const code = await main(['review', '--working-tree', '--with-claude']);
+    expect(code).toBe(0);
+    expect(mockRun).toHaveBeenCalledWith(expect.objectContaining({ reviewers: undefined }));
+  });
+
+  it('--reviewers codex,claude --with-claude threads ONLY the core (codex) to the engine', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
+    await main(['review', '--working-tree', '--reviewers', 'codex,claude', '--with-claude']);
+    expect(mockRun).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ['codex'] }));
+  });
+
+  it('"claude" as a --reviewers id WITHOUT --with-claude fails closed (exit 3, no engine run)', async () => {
+    expect(await main(['review', '--working-tree', '--reviewers', 'claude'])).toBe(3);
+    expect(await main(['review', '--working-tree', '--reviewers', 'codex,claude'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+
+  it('--reviewers claude --with-claude (no core) fails closed — claude is additive', async () => {
+    expect(await main(['review', '--working-tree', '--reviewers', 'claude', '--with-claude'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+});
+
 describe('profile selection (review vs security — same engine)', () => {
   it('review threads profile: "code" to the engine', async () => {
     mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));

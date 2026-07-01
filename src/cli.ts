@@ -23,7 +23,7 @@ import {
   type StoredReview,
 } from './core/types';
 import { runBrainstormMode } from './modes/brainstorm';
-import { listVoices, VOICES_FILE } from './modes/brainstorm/voices';
+import { listVoices, loadVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
   type BrainstormResult,
   isVoiceId,
@@ -35,6 +35,12 @@ import { runConsultMode } from './modes/consult';
 import type { ConsultResult } from './modes/consult/types';
 import { isImplemented, isMode, resolveMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
+import {
+  enforceTrailBoundary,
+  renderClaudeLayer,
+  resolveReviewRoster,
+  runClaudeReviewLayer,
+} from './modes/review/with-claude';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
 import {
   acquireDiff,
@@ -127,7 +133,14 @@ Diff source (give at most ONE; default = current branch):
 
 Options:
   --base <ref>          base ref for the default (commit) mode
-  --reviewers <ids>     comma-separated reviewer ids (default: all configured)
+  --reviewers <ids>     comma-separated reviewer ids (default: all configured; with
+                        --with-claude, "claude" is a valid id to subset the roster)
+  --with-claude         ALSO run a cold headless \`claude -p\` reviewer + a separate
+                        \`claude -p\` SYNTHESIS pass (dedupe · agree/disagree · per-finding
+                        sanity-check · bottom line). Off by default — inside a Claude
+                        session prefer the /ensemble-ai-review skill (that session IS the
+                        ensemble's Claude, and bills the right account). Inherits the
+                        ambient CLAUDE_CONFIG_DIR. REVIEW-ONLY — never edits code.
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
@@ -678,6 +691,7 @@ async function reviewCommand(
         'run-id': { type: 'string' },
         sandbox: { type: 'string' },
         staged: { type: 'boolean' },
+        'with-claude': { type: 'boolean' },
         'working-tree': { type: 'boolean' },
       },
     }));
@@ -713,21 +727,38 @@ async function reviewCommand(
       ? null
       : buildConventionReader(cwd, source.conventionsCtx);
 
-  // "no --reviewers" → undefined → run the full default set. But if --reviewers IS
-  // given, EVERY token must be a known id: a typo like `codex,grokk` must error,
-  // never silently drop the unknown and run a narrower set than the user asked for
-  // (which would also mint a receipt under a weaker policy). Fail closed.
-  let reviewers: ReviewerId[] | undefined;
-  if (typeof values.reviewers === 'string') {
-    const parsed = parseReviewerList(values.reviewers, cmd);
-    if ('code' in parsed) return parsed.code;
-    reviewers = parsed;
+  // Resolve the roster: the cross-vendor CORE (codex/grok — subset with `--reviewers`,
+  // fail-closed on a typo) + whether the CLAUDE voice runs (only under --with-claude).
+  // "no --reviewers" → the full default core; `--with-claude` widens the accepted ids
+  // to include `claude`. Fail closed so a typo can never silently narrow the policy.
+  const withClaude = Boolean(values['with-claude']);
+  const requestedReviewers =
+    typeof values.reviewers === 'string'
+      ? values.reviewers.split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined;
+  const roster = resolveReviewRoster(requestedReviewers, withClaude);
+  if ('error' in roster) {
+    console.error(`ensemble-ai ${cmd}: --reviewers "${values.reviewers}" — ${roster.error}`);
+    return 3;
   }
+  // Preserve the "no --reviewers → undefined → engine runs ALL configured" contract;
+  // an explicit list threads the resolved core subset.
+  const reviewers: ReviewerId[] | undefined =
+    requestedReviewers === undefined ? undefined : roster.core;
   const runId = typeof values['run-id'] === 'string' ? values['run-id'] : genRunId();
-  const out =
+  let out =
     typeof values.out === 'string'
       ? path.resolve(values.out)
       : path.join(os.tmpdir(), 'ensemble-ai', runId);
+  // Brain-separation guard: a `_work` repo's trail is fenced out of the personal brain
+  // (boundaries rule 14) — force it to a local temp dir if `--out` would land in ~/brain.
+  const boundary = enforceTrailBoundary(cwd, out, runId);
+  if (boundary.overridden) {
+    console.error(
+      `· trail: a _work repo's trail is fenced OUT of the personal brain → ${boundary.out}`
+    );
+    out = boundary.out;
+  }
   const ceiling = positiveCeiling(
     typeof values.ceiling === 'string' ? values.ceiling : undefined,
     cmd
@@ -778,6 +809,34 @@ async function reviewCommand(
 
   printSummary(result, profile);
   console.error(`trail: ${out}`);
+
+  // The `--with-claude` layer: a cold headless claude reviewer (when in the roster) +
+  // a claude SYNTHESIS pass over every voice. Additive INSIGHT only — it never edits
+  // code and never changes the exit-code gate (that stays the codex+grok core). The
+  // claude voice + synthesizer inherit the ambient CLAUDE_CONFIG_DIR (bills the right
+  // account). Best-effort: a failure degrades, never taking down the review.
+  if (withClaude && !result.blocked && result.prompt) {
+    const voiceConfigs = loadVoices();
+    const layer = await runClaudeReviewLayer({
+      claudeConfig: voiceConfigs.claude,
+      coreReviews: result.reviews,
+      includeClaudeReviewer: roster.claude,
+      log: (m) => console.error(`· ${m}`),
+      reviewPrompt: result.prompt,
+      synthConfig: voiceConfigs.claude,
+    });
+    console.log(renderClaudeLayer(layer).join('\n'));
+    try {
+      fs.mkdirSync(out, { recursive: true });
+      fs.writeFileSync(
+        path.join(out, 'claude-synthesis.json'),
+        JSON.stringify(layer, null, 2)
+      );
+    } catch {
+      /* trail write is best-effort */
+    }
+  }
+
   if (result.blocked) return 2;
   // 1 = a reviewer failed to complete (crash / timeout / no parse) — the review is
   // not trustworthy, so this outranks the findings gate below.
