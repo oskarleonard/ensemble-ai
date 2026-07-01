@@ -1144,10 +1144,45 @@ function writeReceipt(storeDir, receipt) {
   fs6.renameSync(tmp, file);
   return file;
 }
+function validateReceiptShape(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("receipt is not a JSON object");
+  }
+  const o = value;
+  const isStr = (v) => typeof v === "string";
+  const isStrOrNull = (v) => v === null || typeof v === "string";
+  const isStrArr = (v) => Array.isArray(v) && v.every((x) => typeof x === "string");
+  const errs = [];
+  if (!isStr(o.diffDigest)) errs.push("diffDigest (string)");
+  if (!isStr(o.diffMode)) errs.push("diffMode (string)");
+  if (!isStr(o.headSha)) errs.push("headSha (string)");
+  if (!isStr(o.policyHash)) errs.push("policyHash (string)");
+  if (!isStr(o.runId)) errs.push("runId (string)");
+  if (!isStrOrNull(o.repo)) errs.push("repo (string|null)");
+  if (!isStrOrNull(o.baseRef)) errs.push("baseRef (string|null)");
+  if (!isStrOrNull(o.baseSha)) errs.push("baseSha (string|null)");
+  if (!isStrArr(o.completed)) errs.push("completed (string[])");
+  if (!isStrArr(o.reviewerPolicy)) errs.push("reviewerPolicy (string[])");
+  if (!isStrArr(o.vendors)) errs.push("vendors (string[])");
+  const c = o.coverage;
+  if (c === null || typeof c !== "object" || Array.isArray(c)) {
+    errs.push("coverage (object)");
+  } else {
+    const cov = c;
+    if (typeof cov.totalFiles !== "number") errs.push("coverage.totalFiles (number)");
+    if (typeof cov.includedFiles !== "number") errs.push("coverage.includedFiles (number)");
+    if (typeof cov.omittedFiles !== "number") errs.push("coverage.omittedFiles (number)");
+    if (!Array.isArray(cov.omitted)) errs.push("coverage.omitted (array)");
+  }
+  if (errs.length > 0) {
+    throw new Error(`malformed receipt \u2014 missing/invalid field(s): ${errs.join(", ")}`);
+  }
+  return value;
+}
 function readReceipt(storeDir, key) {
   try {
-    return JSON.parse(
-      fs6.readFileSync(receiptPath(storeDir, key), "utf8")
+    return validateReceiptShape(
+      JSON.parse(fs6.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -2455,5 +2490,6 @@ export {
   stripSecurityTag,
   summarizeCoverage,
   titleCase,
+  validateReceiptShape,
   writeReceipt
 };

@@ -47,6 +47,7 @@ import {
   type DiffReviewReceipt,
   readReceipt,
   type ReceiptKey,
+  validateReceiptShape,
 } from './modes/review/receipt';
 import {
   type DiffSourceSelection,
@@ -59,6 +60,7 @@ import { renderRegistry, type RegistryView } from './plumbing/registry';
 import {
   formatReceipt,
   formatVerify,
+  isAttestedOnly,
   verifyExitCode,
   verifyReceipt,
 } from './plumbing/verify';
@@ -1042,6 +1044,13 @@ NON-ZERO (3) = missing / stale (commits since review) / under-policy / under-cov
 with the reason printed. This is what a pre-PR \`gh pr create\` hook calls.
 show prints a receipt's fields (given a <path>, else looked up for the current diff).
 
+TRUST: by default a pass is TRUSTED BY ATTESTATION (the receipt's completed[]), NOT
+proven by reviewer artifacts — a hand-written receipt with a matching diff digest
+would also pass, so verify prints a loud warning. A pre-PR gate MUST use --strict
+(--require-artifacts) with --trail <dir>, which requires the real per-reviewer
+artifacts and FAILS CLOSED (non-zero) on an attestation-only receipt. (Cryptographic
+receipt signing — proof against a fabricated receipt+artifacts — is a documented v2.)
+
 Options:
   --base <ref>          base ref for the current-branch diff (default: origin/HEAD)
   --staged              use the staged diff (\`git diff --cached\`) as the current state
@@ -1051,6 +1060,9 @@ Options:
   --store <dir>         receipt store dir (default: ~/.ensemble-ai/receipts)
   --trail <dir>         a run trail dir to PROVE the immutable reviewer artifacts
                         (default: trust the receipt's completed[] — see receipt.ts)
+  --strict, --require-artifacts
+                        REQUIRE the real trail artifacts (use with --trail): an
+                        attestation-only receipt FAILS CLOSED. The pre-PR hook's mode.
   --cwd <dir>           repo working dir (default: cwd)
   -h, --help            this help`;
 
@@ -1078,9 +1090,11 @@ async function receiptCommand(args: string[]): Promise<number> {
         ceiling: { type: 'string' },
         cwd: { type: 'string' },
         help: { short: 'h', type: 'boolean' },
+        'require-artifacts': { type: 'boolean' },
         reviewers: { type: 'string' },
         staged: { type: 'boolean' },
         store: { type: 'string' },
+        strict: { type: 'boolean' },
         'trail': { type: 'string' },
         'working-tree': { type: 'boolean' },
       },
@@ -1097,22 +1111,40 @@ async function receiptCommand(args: string[]): Promise<number> {
 
   const receiptPathArg =
     typeof positionals[0] === 'string' ? path.resolve(positionals[0]) : undefined;
-  const readReceiptFile = (p: string): DiffReviewReceipt | null => {
+  // Read + SHAPE-VALIDATE an explicit receipt file (Codex LOW: no blind cast). Returns
+  // a discriminated result so the caller can print WHY a malformed/partial file failed
+  // — unreadable, non-JSON, or the specific missing/invalid fields — not a blank "cannot
+  // read". Not a trust check (a well-formed forged receipt still parses → strict verify).
+  const readReceiptFile = (
+    p: string
+  ): { receipt: DiffReviewReceipt } | { error: string } => {
+    let raw: string;
     try {
-      return JSON.parse(fs.readFileSync(p, 'utf8')) as DiffReviewReceipt;
-    } catch {
-      return null;
+      raw = fs.readFileSync(p, 'utf8');
+    } catch (e) {
+      return { error: `cannot read receipt ${p}: ${(e as Error).message}` };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      return { error: `receipt ${p} is not valid JSON: ${(e as Error).message}` };
+    }
+    try {
+      return { receipt: validateReceiptShape(parsed) };
+    } catch (e) {
+      return { error: `receipt ${p}: ${(e as Error).message}` };
     }
   };
 
   // `show <path>` needs no git — just read + print the receipt file.
   if (sub === 'show' && receiptPathArg) {
-    const receipt = readReceiptFile(receiptPathArg);
-    if (!receipt) {
-      console.error(`ensemble-ai receipt show: cannot read receipt ${receiptPathArg}`);
+    const res = readReceiptFile(receiptPathArg);
+    if ('error' in res) {
+      console.error(`ensemble-ai receipt show: ${res.error}`);
       return 3;
     }
-    console.log(formatReceipt(receipt));
+    console.log(formatReceipt(res.receipt));
     return 0;
   }
 
@@ -1170,19 +1202,32 @@ async function receiptCommand(args: string[]): Promise<number> {
 
   // verify: read the receipt from --path (explicit) or the store (by key), then run
   // the SAME live validation the engine ships (isDiffReviewed via verifyReceipt).
-  const explicit = receiptPathArg ? readReceiptFile(receiptPathArg) : undefined;
-  if (receiptPathArg && !explicit) {
-    console.error(`ensemble-ai receipt verify: cannot read receipt ${receiptPathArg}`);
-    return 3;
-  }
-  const state = verifyReceipt(
-    { coverage: acquired.coverage, key, required },
-    {
-      readReceipt: receiptPathArg ? () => explicit ?? null : (k) => readReceipt(store, k),
-      trailDir: typeof values.trail === 'string' ? path.resolve(values.trail) : undefined,
+  let explicit: DiffReviewReceipt | null = null;
+  if (receiptPathArg) {
+    const res = readReceiptFile(receiptPathArg);
+    if ('error' in res) {
+      console.error(`ensemble-ai receipt verify: ${res.error}`);
+      return 3;
     }
-  );
+    explicit = res.receipt;
+  }
+  const verifyDeps = {
+    readReceipt: receiptPathArg
+      ? () => explicit
+      : (k: ReceiptKey) => readReceipt(store, k),
+    strict: Boolean(values.strict || values['require-artifacts']),
+    trailDir: typeof values.trail === 'string' ? path.resolve(values.trail) : undefined,
+  };
+  const state = verifyReceipt({ coverage: acquired.coverage, key, required }, verifyDeps);
   console.log(formatVerify(state, key));
+  // A PASS with no artifact proof (default mode, no --trail) is trusted-by-attestation
+  // and thus forgeable — say so LOUDLY so it is never a silent gate. A strict/--trail
+  // pass is artifact-proven → no warning.
+  if (state.reviewed && isAttestedOnly(verifyDeps)) {
+    console.error(
+      'WARNING: this PASS is TRUSTED BY ATTESTATION (the receipt\'s completed[]), NOT proven by reviewer artifacts — a hand-written receipt with a matching diff digest would also pass. For an artifact-proven gate (e.g. a pre-PR hook) run with --strict (--require-artifacts) and --trail <run-trail-dir>.'
+    );
+  }
   return verifyExitCode(state);
 }
 

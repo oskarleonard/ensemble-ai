@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-import type { ReviewerId } from '../core/types';
+import { afterEach, describe, expect, it } from 'vitest';
+
+import { reviewDir } from '../core/artifacts';
+import type { ReviewerId, StoredReview } from '../core/types';
 import type { Coverage } from '../modes/review/diff';
 import {
   computePolicyHash,
@@ -11,6 +16,7 @@ import {
 import {
   formatReceipt,
   formatVerify,
+  isAttestedOnly,
   receiptBackedReadReview,
   verifyExitCode,
   verifyReceipt,
@@ -96,6 +102,70 @@ describe('verifyReceipt (receipt-backed, no trail dir)', () => {
     );
     expect(state.reason).toBe('incomplete-coverage');
     expect(verifyExitCode(state)).toBe(3);
+  });
+});
+
+describe('strict mode (--require-artifacts): artifacts are the proof, not completed[]', () => {
+  const tmpDirs: string[] = [];
+  afterEach(() => {
+    for (const d of tmpDirs.splice(0)) fs.rmSync(d, { force: true, recursive: true });
+  });
+
+  // Write a real per-reviewer artifact trail so readReview(trailDir, runId, id) resolves.
+  function seedTrail(runId: string, ids: ReviewerId[]): string {
+    const trailDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-trail-'));
+    tmpDirs.push(trailDir);
+    const dir = reviewDir(trailDir, runId);
+    fs.mkdirSync(dir, { recursive: true });
+    for (const id of ids) {
+      const stored: StoredReview = {
+        findings: [],
+        packet: { complete: true, manifest: [] },
+        reviewer: { effort: '', model: '', vendor: '' },
+        reviewerId: id,
+        runId,
+        summary: 'real artifact',
+        terminalState: 'reviewed',
+      };
+      fs.writeFileSync(path.join(dir, `review.${id}.json`), JSON.stringify(stored));
+    }
+    return trailDir;
+  }
+
+  it('FAILS CLOSED on an attestation-only receipt (strict, no trail) → artifact-missing, exit 3', () => {
+    const state = verifyReceipt(
+      { coverage: cleanCoverage(), key, required },
+      { readReceipt: () => receipt, strict: true }
+    );
+    expect(state.reason).toBe('artifact-missing');
+    expect(state.reviewed).toBe(false);
+    expect(verifyExitCode(state)).toBe(3);
+  });
+
+  it('PASSES when the real per-reviewer artifacts are present (strict + trail) → exit 0', () => {
+    const trailDir = seedTrail(receipt.runId, required);
+    const state = verifyReceipt(
+      { coverage: cleanCoverage(), key, required },
+      { readReceipt: () => receipt, strict: true, trailDir }
+    );
+    expect(state).toMatchObject({ reason: 'reviewed', reviewed: true });
+    expect(verifyExitCode(state)).toBe(0);
+  });
+
+  it('FAILS in strict + trail when an artifact is missing (one reviewer only) → artifact-missing', () => {
+    const trailDir = seedTrail(receipt.runId, ['codex']); // grok artifact absent
+    const state = verifyReceipt(
+      { coverage: cleanCoverage(), key, required },
+      { readReceipt: () => receipt, strict: true, trailDir }
+    );
+    expect(state.reason).toBe('artifact-missing');
+    expect(verifyExitCode(state)).toBe(3);
+  });
+
+  it('isAttestedOnly: true only for default + no trail (the forgeable pass the CLI warns on)', () => {
+    expect(isAttestedOnly({ readReceipt: () => receipt })).toBe(true);
+    expect(isAttestedOnly({ readReceipt: () => receipt, strict: true })).toBe(false);
+    expect(isAttestedOnly({ readReceipt: () => receipt, trailDir: '/x' })).toBe(false);
   });
 });
 

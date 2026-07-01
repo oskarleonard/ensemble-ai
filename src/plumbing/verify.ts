@@ -16,14 +16,28 @@ import {
   type ReceiptKey,
 } from '../modes/review/receipt';
 
-// When no trail dir is supplied, the receipt's own `completed[]` IS the record: a
-// receipt is only ever written after every required reviewer completed AND coverage
-// held (see buildDiffReceipt), so trusting it here is honest — the gate's realistic
-// defense (stale / copied / under-policy / under-coverage) still runs against the
-// LIVE diff. This synthesizes a 'reviewed' StoredReview for each claimed-complete
-// id so isDiffReviewed's artifact loop passes exactly for the covered reviewers.
-// With a trail dir, the real immutable artifacts are read instead (the deeper proof
-// against a deleted-artifact-but-kept-receipt case).
+// TRUST MODEL — two modes, by design:
+//
+//   • DEFAULT (attested): with no trail dir, the receipt's own `completed[]` IS the
+//     record. A receipt is only ever written after every required reviewer completed
+//     AND coverage held (see buildDiffReceipt), so trusting a receipt the ENGINE
+//     wrote is honest, and the realistic defenses (stale / copied / under-policy /
+//     under-coverage) still run against the LIVE diff. BUT this is NOT forgery-proof:
+//     a hand-written receipt JSON carrying the right diff digest would also pass,
+//     because completed[] is a CLAIM, not a proof. So attested mode emits a LOUD
+//     warning (see the CLI) and MUST NOT be the mode a pre-PR gate relies on.
+//   • STRICT (--strict / --require-artifacts): the real immutable per-(runId,
+//     reviewerId) artifacts are the proof. A receipt that is only completed[]-attested
+//     — no resolvable trail — FAILS CLOSED (artifact-missing). This is the mode the
+//     pre-PR HOOK must use.
+//
+// Cryptographic receipt SIGNING (a receipt no local actor can fabricate) is the
+// documented v2 hardening — out of v1 scope; see receipt.ts. This function stays
+// pure; the CLI owns the warning + flag wiring.
+//
+// receiptBackedReadReview synthesizes a 'reviewed' StoredReview for each
+// claimed-complete id so isDiffReviewed's artifact loop passes exactly for the
+// covered reviewers — used ONLY in default (attested) mode.
 export function receiptBackedReadReview(
   receipt: DiffReviewReceipt
 ): (runId: string, id: ReviewerId) => StoredReview | null {
@@ -43,9 +57,23 @@ export function receiptBackedReadReview(
 
 export interface VerifyDeps {
   readReceipt: (key: ReceiptKey) => DiffReviewReceipt | null;
-  // Optional trail dir of the immutable per-reviewer artifacts. When omitted, the
-  // receipt's completed[] is trusted (receiptBackedReadReview).
+  // When true, REQUIRE the real per-reviewer trail artifacts to prove the review:
+  // attestation-only (completed[]) never satisfies the gate, and a receipt without a
+  // resolvable artifact trail FAILS CLOSED (artifact-missing). This is the mode the
+  // pre-PR hook must use — the receipt's completed[] is a claim; the artifact is proof.
+  strict?: boolean;
+  // Optional trail dir of the immutable per-reviewer artifacts. When omitted in the
+  // DEFAULT mode, the receipt's completed[] is trusted (receiptBackedReadReview);
+  // when omitted in STRICT mode, verification fails closed.
   trailDir?: string;
+}
+
+// Did this verification PASS by attestation alone (no artifact proof)? True only in
+// default mode with no trail dir — the CLI uses this to emit the loud warning that a
+// pass is trusted-by-attestation, not artifact-proven, so it is never silently
+// forgeable. (A strict pass, or any trail-dir pass, is artifact-proven → no warning.)
+export function isAttestedOnly(deps: VerifyDeps): boolean {
+  return !deps.strict && !deps.trailDir;
 }
 
 // Validate the live diff against a receipt (from an explicit path or the store).
@@ -56,12 +84,18 @@ export function verifyReceipt(
 ): DiffReviewState {
   const receipt = deps.readReceipt(live.key);
   const trailDir = deps.trailDir;
+  // Resolve HOW a reviewer's terminal state is proven:
+  //   trail dir → read the real immutable artifacts (strongest proof);
+  //   strict + no trail → () => null, so isDiffReviewed reports artifact-missing (fail closed);
+  //   default + no trail → trust the receipt's completed[] (attested).
   const readReviewFn: (runId: string, id: ReviewerId) => StoredReview | null =
     trailDir
       ? (runId, id) => readReview(trailDir, runId, id)
-      : receipt
-        ? receiptBackedReadReview(receipt)
-        : () => null;
+      : deps.strict
+        ? () => null
+        : receipt
+          ? receiptBackedReadReview(receipt)
+          : () => null;
   return isDiffReviewed(live, {
     readReceipt: () => receipt,
     readReview: readReviewFn,

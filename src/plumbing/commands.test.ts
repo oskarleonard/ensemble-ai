@@ -125,6 +125,24 @@ describe('receipt command', () => {
     expect(await main(['receipt', 'show', '/nonexistent/r.json'])).toBe(3);
   });
 
+  it('receipt show <malformed file> → exit 3 with a clear shape error (no blind cast)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-receipt-'));
+    const file = path.join(dir, 'bad.json');
+    fs.writeFileSync(file, JSON.stringify({ runId: 'run-1' })); // partial → invalid
+    const code = await main(['receipt', 'show', file]);
+    expect(code).toBe(3);
+    expect(errored).toContain('malformed receipt');
+    expect(errored).toContain('diffDigest');
+    fs.rmSync(dir, { force: true, recursive: true });
+  });
+
+  it('receipt --help documents --strict / --require-artifacts + the attestation trust note', async () => {
+    await main(['receipt', '--help']);
+    expect(logged).toContain('--strict');
+    expect(logged).toContain('--require-artifacts');
+    expect(logged).toContain('TRUSTED BY ATTESTATION');
+  });
+
   it('an unknown subcommand → usage error (exit 3)', async () => {
     expect(await main(['receipt', 'frobnicate'])).toBe(3);
     expect(errored).toContain('unknown subcommand');

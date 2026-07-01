@@ -2039,10 +2039,45 @@ function writeReceipt(storeDir, receipt) {
   fs7.renameSync(tmp, file);
   return file;
 }
+function validateReceiptShape(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("receipt is not a JSON object");
+  }
+  const o = value;
+  const isStr = (v) => typeof v === "string";
+  const isStrOrNull = (v) => v === null || typeof v === "string";
+  const isStrArr = (v) => Array.isArray(v) && v.every((x) => typeof x === "string");
+  const errs = [];
+  if (!isStr(o.diffDigest)) errs.push("diffDigest (string)");
+  if (!isStr(o.diffMode)) errs.push("diffMode (string)");
+  if (!isStr(o.headSha)) errs.push("headSha (string)");
+  if (!isStr(o.policyHash)) errs.push("policyHash (string)");
+  if (!isStr(o.runId)) errs.push("runId (string)");
+  if (!isStrOrNull(o.repo)) errs.push("repo (string|null)");
+  if (!isStrOrNull(o.baseRef)) errs.push("baseRef (string|null)");
+  if (!isStrOrNull(o.baseSha)) errs.push("baseSha (string|null)");
+  if (!isStrArr(o.completed)) errs.push("completed (string[])");
+  if (!isStrArr(o.reviewerPolicy)) errs.push("reviewerPolicy (string[])");
+  if (!isStrArr(o.vendors)) errs.push("vendors (string[])");
+  const c = o.coverage;
+  if (c === null || typeof c !== "object" || Array.isArray(c)) {
+    errs.push("coverage (object)");
+  } else {
+    const cov = c;
+    if (typeof cov.totalFiles !== "number") errs.push("coverage.totalFiles (number)");
+    if (typeof cov.includedFiles !== "number") errs.push("coverage.includedFiles (number)");
+    if (typeof cov.omittedFiles !== "number") errs.push("coverage.omittedFiles (number)");
+    if (!Array.isArray(cov.omitted)) errs.push("coverage.omitted (array)");
+  }
+  if (errs.length > 0) {
+    throw new Error(`malformed receipt \u2014 missing/invalid field(s): ${errs.join(", ")}`);
+  }
+  return value;
+}
 function readReceipt(storeDir, key) {
   try {
-    return JSON.parse(
-      fs7.readFileSync(receiptPath(storeDir, key), "utf8")
+    return validateReceiptShape(
+      JSON.parse(fs7.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -2451,10 +2486,13 @@ function receiptBackedReadReview(receipt) {
     terminalState: "reviewed"
   } : null;
 }
+function isAttestedOnly(deps) {
+  return !deps.strict && !deps.trailDir;
+}
 function verifyReceipt(live, deps) {
   const receipt = deps.readReceipt(live.key);
   const trailDir = deps.trailDir;
-  const readReviewFn = trailDir ? (runId, id) => readReview(trailDir, runId, id) : receipt ? receiptBackedReadReview(receipt) : () => null;
+  const readReviewFn = trailDir ? (runId, id) => readReview(trailDir, runId, id) : deps.strict ? () => null : receipt ? receiptBackedReadReview(receipt) : () => null;
   return isDiffReviewed(live, {
     readReceipt: () => receipt,
     readReview: readReviewFn
@@ -3315,6 +3353,13 @@ NON-ZERO (3) = missing / stale (commits since review) / under-policy / under-cov
 with the reason printed. This is what a pre-PR \`gh pr create\` hook calls.
 show prints a receipt's fields (given a <path>, else looked up for the current diff).
 
+TRUST: by default a pass is TRUSTED BY ATTESTATION (the receipt's completed[]), NOT
+proven by reviewer artifacts \u2014 a hand-written receipt with a matching diff digest
+would also pass, so verify prints a loud warning. A pre-PR gate MUST use --strict
+(--require-artifacts) with --trail <dir>, which requires the real per-reviewer
+artifacts and FAILS CLOSED (non-zero) on an attestation-only receipt. (Cryptographic
+receipt signing \u2014 proof against a fabricated receipt+artifacts \u2014 is a documented v2.)
+
 Options:
   --base <ref>          base ref for the current-branch diff (default: origin/HEAD)
   --staged              use the staged diff (\`git diff --cached\`) as the current state
@@ -3324,6 +3369,9 @@ Options:
   --store <dir>         receipt store dir (default: ~/.ensemble-ai/receipts)
   --trail <dir>         a run trail dir to PROVE the immutable reviewer artifacts
                         (default: trust the receipt's completed[] \u2014 see receipt.ts)
+  --strict, --require-artifacts
+                        REQUIRE the real trail artifacts (use with --trail): an
+                        attestation-only receipt FAILS CLOSED. The pre-PR hook's mode.
   --cwd <dir>           repo working dir (default: cwd)
   -h, --help            this help`;
 async function receiptCommand(args) {
@@ -3350,9 +3398,11 @@ async function receiptCommand(args) {
         ceiling: { type: "string" },
         cwd: { type: "string" },
         help: { short: "h", type: "boolean" },
+        "require-artifacts": { type: "boolean" },
         reviewers: { type: "string" },
         staged: { type: "boolean" },
         store: { type: "string" },
+        strict: { type: "boolean" },
         "trail": { type: "string" },
         "working-tree": { type: "boolean" }
       }
@@ -3368,19 +3418,31 @@ async function receiptCommand(args) {
   }
   const receiptPathArg = typeof positionals[0] === "string" ? path7.resolve(positionals[0]) : void 0;
   const readReceiptFile = (p) => {
+    let raw;
     try {
-      return JSON.parse(fs8.readFileSync(p, "utf8"));
-    } catch {
-      return null;
+      raw = fs8.readFileSync(p, "utf8");
+    } catch (e) {
+      return { error: `cannot read receipt ${p}: ${e.message}` };
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      return { error: `receipt ${p} is not valid JSON: ${e.message}` };
+    }
+    try {
+      return { receipt: validateReceiptShape(parsed) };
+    } catch (e) {
+      return { error: `receipt ${p}: ${e.message}` };
     }
   };
   if (sub === "show" && receiptPathArg) {
-    const receipt = readReceiptFile(receiptPathArg);
-    if (!receipt) {
-      console.error(`ensemble-ai receipt show: cannot read receipt ${receiptPathArg}`);
+    const res = readReceiptFile(receiptPathArg);
+    if ("error" in res) {
+      console.error(`ensemble-ai receipt show: ${res.error}`);
       return 3;
     }
-    console.log(formatReceipt(receipt));
+    console.log(formatReceipt(res.receipt));
     return 0;
   }
   const required = parseRequiredReviewers(
@@ -3430,19 +3492,27 @@ async function receiptCommand(args) {
     console.log(formatReceipt(receipt));
     return 0;
   }
-  const explicit = receiptPathArg ? readReceiptFile(receiptPathArg) : void 0;
-  if (receiptPathArg && !explicit) {
-    console.error(`ensemble-ai receipt verify: cannot read receipt ${receiptPathArg}`);
-    return 3;
-  }
-  const state = verifyReceipt(
-    { coverage: acquired.coverage, key, required },
-    {
-      readReceipt: receiptPathArg ? () => explicit ?? null : (k) => readReceipt(store, k),
-      trailDir: typeof values.trail === "string" ? path7.resolve(values.trail) : void 0
+  let explicit = null;
+  if (receiptPathArg) {
+    const res = readReceiptFile(receiptPathArg);
+    if ("error" in res) {
+      console.error(`ensemble-ai receipt verify: ${res.error}`);
+      return 3;
     }
-  );
+    explicit = res.receipt;
+  }
+  const verifyDeps = {
+    readReceipt: receiptPathArg ? () => explicit : (k) => readReceipt(store, k),
+    strict: Boolean(values.strict || values["require-artifacts"]),
+    trailDir: typeof values.trail === "string" ? path7.resolve(values.trail) : void 0
+  };
+  const state = verifyReceipt({ coverage: acquired.coverage, key, required }, verifyDeps);
   console.log(formatVerify(state, key));
+  if (state.reviewed && isAttestedOnly(verifyDeps)) {
+    console.error(
+      "WARNING: this PASS is TRUSTED BY ATTESTATION (the receipt's completed[]), NOT proven by reviewer artifacts \u2014 a hand-written receipt with a matching diff digest would also pass. For an artifact-proven gate (e.g. a pre-PR hook) run with --strict (--require-artifacts) and --trail <run-trail-dir>."
+    );
+  }
   return verifyExitCode(state);
 }
 var REVIEWERS_USAGE = `ensemble-ai reviewers \u2014 list the configured cross-vendor registry (read-only).

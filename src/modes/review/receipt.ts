@@ -17,10 +17,13 @@ import type { Coverage, DiffMode } from './diff';
 //
 // Honest scope (NOT "anti-forgery"): the live check defends against the realistic
 // failures — a STALE receipt (post-commit), a COPIED receipt (wrong digest), a
-// codex-only / partial receipt (under-policy / under-coverage). It is NOT a
-// trust boundary against a malicious local actor who fabricates both receipt AND
-// artifacts (same user as the gate → such an actor could equally remove the gate).
-// A signed / external-status receipt is the later hardening, out of v1 scope.
+// codex-only / partial receipt (under-policy / under-coverage). The STRICT verify mode
+// (--require-artifacts, see plumbing/verify.ts) additionally requires the immutable
+// per-reviewer artifacts, so a hand-written completed[]-only receipt fails closed. What
+// remains out of scope is a malicious local actor who fabricates BOTH receipt AND
+// artifacts (same user as the gate → such an actor could equally remove the gate):
+// closing that needs CRYPTOGRAPHIC receipt SIGNING (a receipt no local actor can forge)
+// or an external status check — the documented v2 hardening, deliberately NOT in v1.
 //
 // KEY difference from the spec receipt: the core emits FACTS, so a reviewer
 // "completed" means terminalState === 'reviewed' — NO `gate` requirement (the
@@ -136,14 +139,56 @@ export function writeReceipt(
   return file;
 }
 
+// Lightweight structural validation of a receipt read from untrusted JSON — reject a
+// malformed / partial file with a CLEAR error instead of blind-casting it (Codex LOW).
+// This is a shape check, NOT a trust boundary: a well-formed but FORGED receipt still
+// parses (that's the attestation caveat above → guard with strict verify). It only
+// catches corrupt / truncated / hand-broken files before they reach the gate logic.
+export function validateReceiptShape(value: unknown): DiffReviewReceipt {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('receipt is not a JSON object');
+  }
+  const o = value as Record<string, unknown>;
+  const isStr = (v: unknown): boolean => typeof v === 'string';
+  const isStrOrNull = (v: unknown): boolean => v === null || typeof v === 'string';
+  const isStrArr = (v: unknown): boolean =>
+    Array.isArray(v) && v.every((x) => typeof x === 'string');
+  const errs: string[] = [];
+  if (!isStr(o.diffDigest)) errs.push('diffDigest (string)');
+  if (!isStr(o.diffMode)) errs.push('diffMode (string)');
+  if (!isStr(o.headSha)) errs.push('headSha (string)');
+  if (!isStr(o.policyHash)) errs.push('policyHash (string)');
+  if (!isStr(o.runId)) errs.push('runId (string)');
+  if (!isStrOrNull(o.repo)) errs.push('repo (string|null)');
+  if (!isStrOrNull(o.baseRef)) errs.push('baseRef (string|null)');
+  if (!isStrOrNull(o.baseSha)) errs.push('baseSha (string|null)');
+  if (!isStrArr(o.completed)) errs.push('completed (string[])');
+  if (!isStrArr(o.reviewerPolicy)) errs.push('reviewerPolicy (string[])');
+  if (!isStrArr(o.vendors)) errs.push('vendors (string[])');
+  const c = o.coverage;
+  if (c === null || typeof c !== 'object' || Array.isArray(c)) {
+    errs.push('coverage (object)');
+  } else {
+    const cov = c as Record<string, unknown>;
+    if (typeof cov.totalFiles !== 'number') errs.push('coverage.totalFiles (number)');
+    if (typeof cov.includedFiles !== 'number') errs.push('coverage.includedFiles (number)');
+    if (typeof cov.omittedFiles !== 'number') errs.push('coverage.omittedFiles (number)');
+    if (!Array.isArray(cov.omitted)) errs.push('coverage.omitted (array)');
+  }
+  if (errs.length > 0) {
+    throw new Error(`malformed receipt — missing/invalid field(s): ${errs.join(', ')}`);
+  }
+  return value as DiffReviewReceipt;
+}
+
 export function readReceipt(
   storeDir: string,
   key: ReceiptKey
 ): DiffReviewReceipt | null {
   try {
-    return JSON.parse(
-      fs.readFileSync(receiptPath(storeDir, key), 'utf8')
-    ) as DiffReviewReceipt;
+    return validateReceiptShape(
+      JSON.parse(fs.readFileSync(receiptPath(storeDir, key), 'utf8'))
+    );
   } catch {
     return null;
   }
