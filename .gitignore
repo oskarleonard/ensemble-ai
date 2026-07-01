@@ -5,3 +5,6 @@ coverage/
 *.tsbuildinfo
 .idea/
 .vscode/
+
+# local ensemble-ai review trail / receipt cache (never committed)
+.ensemble-ai/
