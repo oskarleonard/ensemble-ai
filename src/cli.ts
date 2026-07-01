@@ -473,7 +473,9 @@ function resolvePositionalPr(
     };
   }
   if (prFlag !== undefined) {
-    return { error: 'choose at most ONE diff source — got a positional PR URL AND --pr' };
+    // "URL", not "PR URL": at this point arg has only passed the scheme check; whether
+    // it's a *valid* PR URL is decided later in parsePrUrl. Two sources is the error here.
+    return { error: 'choose at most ONE diff source — got a positional URL AND --pr' };
   }
   return { pr: arg };
 }

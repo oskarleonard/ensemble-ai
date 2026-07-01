@@ -2898,7 +2898,7 @@ function resolvePositionalPr(positionals, prFlag, cmd) {
     };
   }
   if (prFlag !== void 0) {
-    return { error: "choose at most ONE diff source \u2014 got a positional PR URL AND --pr" };
+    return { error: "choose at most ONE diff source \u2014 got a positional URL AND --pr" };
   }
   return { pr: arg };
 }
