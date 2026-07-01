@@ -5,9 +5,26 @@ import type { ReviewFinding } from '../../core/types';
 import {
   fallbackReviewSynthesis,
   parseReviewSynthesis,
+  reconcileSynthesis,
   renderReviewSynthesisPrompt,
+  type ReviewSynthesis,
   type VoiceReview,
 } from './synthesis';
+
+function synth(over: Partial<ReviewSynthesis> = {}): ReviewSynthesis {
+  return {
+    agreements: [],
+    bottomLine: 'bl',
+    by: 'claude',
+    degraded: false,
+    disagreements: [],
+    ok: true,
+    raw: null,
+    sanityChecks: [],
+    summary: 's',
+    ...over,
+  };
+}
 
 function finding(over: Partial<ReviewFinding> = {}): ReviewFinding {
   return {
@@ -105,5 +122,51 @@ describe('fallbackReviewSynthesis — deterministic, flagged degraded', () => {
     const fb = fallbackReviewSynthesis([review('codex', { ok: false })]);
     expect(fb.disagreements).toEqual([]);
     expect(fb.summary).toMatch(/No reviews/i);
+  });
+});
+
+describe('reconcileSynthesis — no invented consensus (validate vs real voices)', () => {
+  const reviews = [review('codex'), review('grok')];
+
+  it('keeps a genuine agreement (≥2 real concurring voices), stripping only phantom ids', () => {
+    const { synthesis, demoted } = reconcileSynthesis(
+      synth({ agreements: [{ point: 'real bug', voices: ['codex', 'grok', 'phantom'] }] }),
+      reviews
+    );
+    expect(demoted).toBe(0);
+    expect(synthesis.agreements).toEqual([{ point: 'real bug', voices: ['codex', 'grok'] }]);
+  });
+
+  it('demotes an agreement crediting a voice that never reviewed (phantom consensus)', () => {
+    const { synthesis, demoted } = reconcileSynthesis(
+      synth({ agreements: [{ point: 'fabricated', voices: ['codex', 'claude'] }] }),
+      reviews // claude never reviewed
+    );
+    expect(demoted).toBe(1);
+    expect(synthesis.agreements).toEqual([]);
+    expect(synthesis.disagreements[0].point).toBe('fabricated');
+    expect(synthesis.disagreements[0].positions).toEqual(['codex: raised']);
+  });
+
+  it('demotes an agreement with no corroborating voice at all', () => {
+    const { synthesis } = reconcileSynthesis(
+      synth({ agreements: [{ point: 'unsupported', voices: [] }] }),
+      reviews
+    );
+    expect(synthesis.agreements).toEqual([]);
+    expect(synthesis.disagreements[0].positions[0]).toMatch(/unverified/i);
+  });
+
+  it('matches voice ids case-insensitively', () => {
+    const { demoted } = reconcileSynthesis(
+      synth({ agreements: [{ point: 'p', voices: ['CODEX', 'Grok'] }] }),
+      reviews
+    );
+    expect(demoted).toBe(0);
+  });
+
+  it('leaves a degraded (deterministic) synthesis untouched', () => {
+    const d = synth({ agreements: [{ point: 'p', voices: ['x'] }], degraded: true });
+    expect(reconcileSynthesis(d, reviews)).toEqual({ synthesis: d, demoted: 0 });
   });
 });

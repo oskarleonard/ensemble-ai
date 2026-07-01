@@ -222,6 +222,54 @@ export function parseReviewSynthesis(raw: string): ParsedReviewSynthesis {
   return { agreements, bottomLine, disagreements, sanityChecks, summary };
 }
 
+// Guard against a synthesizer that fabricates CONFIDENT CONSENSUS. An AGREEMENT is only
+// legitimate if ≥2 DISTINCT voices that ACTUALLY produced a review concur — so we
+// validate the synthesizer's claims against the real per-voice reviews, never trusting
+// the model's self-report. For each agreement: drop any credited voice id that did not
+// review (a hallucinated/phantom voice — e.g. crediting "claude" when it never ran), and
+// if fewer than 2 real voices remain, DEMOTE it to a disagreement ("look closer") rather
+// than silently presenting invented agreement as high-signal. Voice ids match
+// case-insensitively (the model may echo a different case). Returns the corrected
+// synthesis + the demotion count (for logging). The deterministic fallback already makes
+// no agreement claim, so it passes through untouched.
+export function reconcileSynthesis(
+  synth: ReviewSynthesis,
+  reviews: VoiceReview[]
+): { synthesis: ReviewSynthesis; demoted: number } {
+  if (synth.degraded) return { synthesis: synth, demoted: 0 };
+  const realVoices = new Set(
+    reviews.filter((r) => r.ok).map((r) => r.voiceId.trim().toLowerCase())
+  );
+  const isReal = (v: string): boolean => realVoices.has(v.trim().toLowerCase());
+
+  const agreements: ReviewAgreement[] = [];
+  const demoted: ReviewDisagreement[] = [];
+  for (const a of synth.agreements) {
+    const credited = [...new Set(a.voices)].filter(isReal);
+    if (credited.length >= 2) {
+      agreements.push({ point: a.point, voices: credited });
+    } else {
+      demoted.push({
+        point: a.point,
+        positions:
+          credited.length > 0
+            ? credited.map((v) => `${v}: raised`)
+            : ['unverified — no reviewing voice corroborates this as a shared finding'],
+      });
+    }
+  }
+  // Always return the CLEANED agreements (phantom voice ids stripped) even when nothing
+  // was demoted, so a kept agreement never credits a voice that did not review.
+  return {
+    synthesis: {
+      ...synth,
+      agreements,
+      disagreements: demoted.length ? [...synth.disagreements, ...demoted] : synth.disagreements,
+    },
+    demoted: demoted.length,
+  };
+}
+
 // Deterministic synthesis when the synthesizer voice is unavailable/unparseable:
 // present each voice's findings as-is (as "look closer" positions), make NO agreement
 // claim, and flag degraded=true — separating signal needs a model, and a reader must

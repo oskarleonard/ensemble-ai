@@ -105,6 +105,7 @@ describe('synthesizeReviews — injected runner, deterministic degrade', () => {
   const reviews: VoiceReview[] = [
     { findings: [], ok: true, summary: 'codex', voiceId: 'codex' },
     { findings: [], ok: true, summary: 'grok', voiceId: 'grok' },
+    { findings: [], ok: true, summary: 'claude', voiceId: 'claude' },
   ];
 
   it('parses a conforming synthesis into the agree/disagree/sanity/bottom-line structure', async () => {
@@ -115,6 +116,19 @@ describe('synthesizeReviews — injected runner, deterministic degrade', () => {
     expect(s.agreements[0].voices).toEqual(['codex', 'claude']);
     expect(s.sanityChecks[0].verdict).toBe('likely-real');
     expect(s.bottomLine).toBe('fix then merge');
+  });
+
+  it('DEMOTES a fabricated agreement (a phantom voice / <2 real voices) to look-closer', async () => {
+    // SYNTH credits ['codex','claude'] — run it with ONLY codex present, so "claude" is a
+    // phantom voice and the agreement no longer clears the ≥2-real-voices bar.
+    const { run } = makeRunner();
+    const s = await synthesizeReviews(
+      [{ findings: [], ok: true, summary: 'codex', voiceId: 'codex' }],
+      run,
+      CFG
+    );
+    expect(s.agreements).toHaveLength(0);
+    expect(s.disagreements.some((d) => d.point === 'shared bug')).toBe(true);
   });
 
   it('degrades to the deterministic fallback when the synthesizer throws / is empty / unparseable', async () => {

@@ -36,21 +36,33 @@ ensemble-ai review $ARGUMENTS
 - Capture the CLI's stdout (the per-reviewer findings + the receipt/trail paths). If it
   exits non-zero for a reason OTHER than `4`, report the exit code + stderr and stop.
 
-## 2 · Review the SAME diff yourself, independently
+## 2 · Review the SAME diff yourself, independently — from the SAME packet
 
-Before reading the CLI's findings closely, get the same diff the reviewers saw and form
-your OWN opinion — a fresh, cold review finds real issues even on a re-read:
+Before reading the CLI's findings closely, form your OWN opinion on the SAME payload the
+reviewers saw — not a strictly-thinner view. The CLI writes the exact packet it fed
+Codex + Grok (the diff **plus** the gathered conventions) to `<trail>/packet.md`, where
+`<trail>` is the `trail:` path the CLI printed. Read it first so your review has the same
+grounding they did:
+
+```bash
+cat <trail>/packet.md          # the exact diff + conventions Codex/Grok reviewed
+```
+
+If for any reason `packet.md` is absent, reconstruct the same context yourself — the diff
+AND the repo conventions the CLI gathered (it lists them; see `<trail>/conventions.json`):
 
 ```bash
 # whatever the user pointed the CLI at — mirror it. Examples:
 git diff $(git merge-base origin/HEAD HEAD)...HEAD   # default: current branch
 # or:  gh pr diff <N>            (for --pr N / a PR URL)
 # or:  git diff --cached         (for --staged)
+# then also read the repo's root + touched-package CLAUDE.md / AGENTS.md
 ```
 
-Read the diff and list your own findings (`file:line` · severity · why it matters · the
-fix). This is a genuine review, not a rubber-stamp of the CLI output — disagree with
-Codex/Grok where you have reason to.
+Read it and list your own findings (`file:line` · severity · why it matters · the fix).
+This is a genuine review, not a rubber-stamp of the CLI output — disagree with Codex/Grok
+where you have reason to. **Your review is a full voice: a HIGH you raise counts toward
+the merge gate exactly like a Codex/Grok HIGH — never wave your own HIGH through.**
 
 ## 3 · Synthesize every voice — "make sense of it"
 

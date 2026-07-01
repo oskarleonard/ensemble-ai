@@ -36,6 +36,7 @@ import type { ConsultResult } from './modes/consult/types';
 import { isImplemented, isMode, resolveMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
 import {
+  type ClaudeLayerResult,
   enforceTrailBoundary,
   renderClaudeLayer,
   resolveReviewRoster,
@@ -447,6 +448,14 @@ function hasHighFinding(reviews: StoredReview[]): boolean {
   );
 }
 
+// The Claude voice (the cold `--with-claude` reviewer) is a full reviewer, so its HIGH
+// findings count toward the SAME exit-code gate as codex/grok — a Claude-only HIGH must
+// not slip through as exit 0. Only a COMPLETED (ok) claude review counts.
+function claudeLayerHasHigh(layer: ClaudeLayerResult | null): boolean {
+  const cr = layer?.claudeReview;
+  return Boolean(cr?.ok && cr.findings.some((f) => f.severity === 'high'));
+}
+
 // The per-reviewer one-line tally for the gate-friendly summary, e.g. `codex 1H/2M`,
 // `grok 2H`, `codex clean`, `grok failed`.
 function reviewerTally(r: StoredReview): string {
@@ -807,17 +816,34 @@ async function reviewCommand(
     }
   }
 
+  // Write the EXACT packet the cross-vendor reviewers saw (diff + gathered conventions)
+  // to the trail, so the session-Claude running the /ensemble-ai-review skill can review
+  // from the identical payload — same context as codex/grok, not strictly less. Best-
+  // effort; the `_work` fence already redirected `out` out of the brain if needed.
+  if (result.prompt) {
+    try {
+      fs.mkdirSync(out, { recursive: true });
+      fs.writeFileSync(path.join(out, 'packet.md'), result.prompt);
+    } catch {
+      /* trail write is best-effort */
+    }
+  }
+
   printSummary(result, profile);
   console.error(`trail: ${out}`);
 
-  // The `--with-claude` layer: a cold headless claude reviewer (when in the roster) +
-  // a claude SYNTHESIS pass over every voice. Additive INSIGHT only — it never edits
-  // code and never changes the exit-code gate (that stays the codex+grok core). The
-  // claude voice + synthesizer inherit the ambient CLAUDE_CONFIG_DIR (bills the right
-  // account). Best-effort: a failure degrades, never taking down the review.
-  if (withClaude && !result.blocked && result.prompt) {
+  // The `--with-claude` layer: a cold headless claude reviewer + a claude SYNTHESIS pass
+  // over every voice. Additive INSIGHT only — it never edits code. Run it ONLY when
+  // claude is actually in the roster (`roster.claude`): an explicit `--reviewers`
+  // WITHOUT claude opts the voice out, so we must not inject a (paid) claude call the
+  // user excluded. The claude voice + synthesizer inherit the ambient CLAUDE_CONFIG_DIR
+  // (bills the right account). Best-effort: a failure degrades, never taking down the
+  // review. NOTE: the claude reviewer IS a reviewer, so its HIGH findings feed the same
+  // exit-code gate below — a Claude-only HIGH does not slip through as exit 0.
+  let claudeLayer: ClaudeLayerResult | null = null;
+  if (withClaude && roster.claude && !result.blocked && result.prompt) {
     const voiceConfigs = loadVoices();
-    const layer = await runClaudeReviewLayer({
+    claudeLayer = await runClaudeReviewLayer({
       claudeConfig: voiceConfigs.claude,
       coreReviews: result.reviews,
       includeClaudeReviewer: roster.claude,
@@ -825,12 +851,12 @@ async function reviewCommand(
       reviewPrompt: result.prompt,
       synthConfig: voiceConfigs.claude,
     });
-    console.log(renderClaudeLayer(layer).join('\n'));
+    console.log(renderClaudeLayer(claudeLayer).join('\n'));
     try {
       fs.mkdirSync(out, { recursive: true });
       fs.writeFileSync(
         path.join(out, 'claude-synthesis.json'),
-        JSON.stringify(layer, null, 2)
+        JSON.stringify(claudeLayer, null, 2)
       );
     } catch {
       /* trail write is best-effort */
@@ -844,9 +870,15 @@ async function reviewCommand(
     result.reviews.length > 0 &&
     result.reviews.every((r) => r.terminalState === 'reviewed');
   if (!allReviewed) return 1;
-  // 4 = the findings GATE: a completed review surfaced a HIGH. Gate-usable by
-  // default (a pre-PR hook can fail on it); --no-fail-on-high opts out → 0.
-  if (!values['no-fail-on-high'] && hasHighFinding(result.reviews)) return 4;
+  // 4 = the findings GATE: a completed review surfaced a HIGH — from ANY reviewer,
+  // including the Claude voice (--with-claude). Gate-usable by default (a pre-PR hook can
+  // fail on it); --no-fail-on-high opts out → 0.
+  if (
+    !values['no-fail-on-high'] &&
+    (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))
+  ) {
+    return 4;
+  }
   return 0;
 }
 

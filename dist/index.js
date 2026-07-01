@@ -1938,8 +1938,19 @@ function resolveClaudeBin() {
   return resolveBin("claude", { envVar: "CLAUDE_BIN" });
 }
 var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
+var CLAUDE_READONLY_ARGS = [
+  "--tools",
+  "",
+  "--disallowed-tools",
+  "Bash",
+  "Edit",
+  "Write",
+  "NotebookEdit",
+  "--permission-mode",
+  "default"
+];
 function buildClaudeVoiceArgs(prompt, config) {
-  const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
+  const args = ["-p", prompt, "--output-format", "text", ...CLAUDE_READONLY_ARGS];
   if (config?.model && config.model !== "default") args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
   return args;

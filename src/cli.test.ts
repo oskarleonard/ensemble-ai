@@ -15,8 +15,17 @@ vi.mock('./modes/review', () => ({ runReviewMode: vi.fn() }));
 vi.mock('./modes/brainstorm', () => ({ runBrainstormMode: vi.fn() }));
 // Same for consult: test the dispatch + arg-parsing + alias contract, never spawn.
 vi.mock('./modes/consult', () => ({ runConsultMode: vi.fn() }));
+// Mock ONLY the claude layer's spawn entrypoint (keep the real roster/boundary/render
+// helpers) so the --with-claude exit-gate contract is tested without spawning `claude`.
+vi.mock('./modes/review/with-claude', async (importActual) => ({
+  ...(await importActual<typeof import('./modes/review/with-claude')>()),
+  runClaudeReviewLayer: vi.fn(),
+}));
 
 import { main } from './cli';
+import { runClaudeReviewLayer } from './modes/review/with-claude';
+import type { ClaudeLayerResult } from './modes/review/with-claude';
+import type { VoiceReview } from './modes/review/synthesis';
 import { runBrainstormMode } from './modes/brainstorm';
 import type { BrainstormResult } from './modes/brainstorm/types';
 import { runConsultMode } from './modes/consult';
@@ -26,6 +35,24 @@ import { runReviewMode } from './modes/review';
 const mockRun = vi.mocked(runReviewMode);
 const mockBrainstorm = vi.mocked(runBrainstormMode);
 const mockConsult = vi.mocked(runConsultMode);
+const mockLayer = vi.mocked(runClaudeReviewLayer);
+
+// A claude-layer result with the given claude review + a benign synthesis.
+function layer(claudeReview: VoiceReview | null): ClaudeLayerResult {
+  return {
+    claudeReview,
+    synthesis: {
+      agreements: [], bottomLine: '', by: 'claude', degraded: false,
+      disagreements: [], ok: true, raw: null, sanityChecks: [], summary: '',
+    },
+  };
+}
+function claudeVoice(severity: Severity, ok = true): VoiceReview {
+  return {
+    findings: [{ body: '', confidence: 'high', evidence: { file: 'a.ts' }, id: 'c1', severity, title: 't' }],
+    ok, summary: 's', voiceId: 'claude',
+  };
+}
 
 function storedReview(
   reviewerId: ReviewerId,
@@ -76,6 +103,7 @@ beforeEach(() => {
   mockRun.mockReset();
   mockBrainstorm.mockReset();
   mockConsult.mockReset();
+  mockLayer.mockReset();
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
 });
@@ -194,6 +222,39 @@ describe('--with-claude roster wiring (no spawn — mocked engine returns no pro
   it('--reviewers claude --with-claude (no core) fails closed — claude is additive', async () => {
     expect(await main(['review', '--working-tree', '--reviewers', 'claude', '--with-claude'])).toBe(3);
     expect(mockRun).not.toHaveBeenCalled();
+  });
+});
+
+describe('--with-claude exit gate + roster gating (claude counts, exclusion skips)', () => {
+  it('a Claude-only HIGH trips the gate (exit 4) even when codex/grok are clean', async () => {
+    mockRun.mockResolvedValue(result({ prompt: 'PACKET', reviews: [storedReview('codex', 'reviewed', 0)] }));
+    mockLayer.mockResolvedValue(layer(claudeVoice('high')));
+    expect(await main(['review', '--working-tree', '--with-claude'])).toBe(4);
+    expect(mockLayer).toHaveBeenCalledTimes(1);
+  });
+
+  it('a Claude MED (no HIGH anywhere) stays exit 0', async () => {
+    mockRun.mockResolvedValue(result({ prompt: 'PACKET', reviews: [storedReview('codex', 'reviewed', 0)] }));
+    mockLayer.mockResolvedValue(layer(claudeVoice('medium')));
+    expect(await main(['review', '--working-tree', '--with-claude'])).toBe(0);
+  });
+
+  it('--no-fail-on-high downgrades a Claude-only HIGH back to 0', async () => {
+    mockRun.mockResolvedValue(result({ prompt: 'PACKET', reviews: [storedReview('codex', 'reviewed', 0)] }));
+    mockLayer.mockResolvedValue(layer(claudeVoice('high')));
+    expect(await main(['review', '--working-tree', '--with-claude', '--no-fail-on-high'])).toBe(0);
+  });
+
+  it('a FAILED claude reviewer HIGH does NOT count (only a completed review gates)', async () => {
+    mockRun.mockResolvedValue(result({ prompt: 'PACKET', reviews: [storedReview('codex', 'reviewed', 0)] }));
+    mockLayer.mockResolvedValue(layer(claudeVoice('high', false)));
+    expect(await main(['review', '--working-tree', '--with-claude'])).toBe(0);
+  });
+
+  it('does NOT inject the claude layer when claude is EXCLUDED via --reviewers', async () => {
+    mockRun.mockResolvedValue(result({ prompt: 'PACKET', reviews: [storedReview('codex', 'reviewed', 0)] }));
+    await main(['review', '--working-tree', '--reviewers', 'codex', '--with-claude']);
+    expect(mockLayer).not.toHaveBeenCalled();
   });
 });
 

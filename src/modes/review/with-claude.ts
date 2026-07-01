@@ -3,8 +3,12 @@
 // stands alone from a plain terminal with no Claude session. Off by default (the
 // SKILL path, where the invoking session's Claude IS the ensemble's Claude, is the
 // default UX). Registry-driven; `--reviewers` subsets the roster; every voice
-// failure degrades gracefully. REVIEW-ONLY — the claude voice runs `--tools ""`
-// (provably cannot read/write/execute), and this layer writes only the trail.
+// failure degrades gracefully. REVIEW-ONLY, and enforced not merely asserted: both
+// the cold reviewer and the synthesizer spawn through runClaudeVoice, which applies
+// the layered read-only policy (`--tools ""` disables every tool + an explicit
+// `--disallowed-tools` deny of Bash/Edit/Write/NotebookEdit + `--permission-mode
+// default` — see buildClaudeVoiceArgs), so this voice provably cannot read/write/
+// execute. This layer itself writes only the (fenced) trail.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -20,6 +24,7 @@ import type { RunReviewOpts } from '../../reviewers/codex';
 import {
   fallbackReviewSynthesis,
   parseReviewSynthesis,
+  reconcileSynthesis,
   renderReviewSynthesisPrompt,
   type ReviewSynthesis,
   type VoiceReview,
@@ -124,20 +129,31 @@ export async function synthesizeReviews(
     log(`  · synthesis not parseable (${parsed.parseError}) — deterministic fallback`);
     return { ...fallbackReviewSynthesis(reviews), error: parsed.parseError, raw: res.raw };
   }
-  log(
-    `  · synthesis: ${parsed.agreements.length} agreement(s), ${parsed.disagreements.length} disagreement(s), ${parsed.sanityChecks.length} sanity-check(s)`
+  // Validate the synthesizer's claims against the ACTUAL per-voice reviews so it can't
+  // fabricate confident agreement (invented consensus / phantom voices).
+  const { synthesis, demoted } = reconcileSynthesis(
+    {
+      agreements: parsed.agreements,
+      bottomLine: parsed.bottomLine,
+      by: 'claude',
+      degraded: false,
+      disagreements: parsed.disagreements,
+      ok: true,
+      raw: res.raw,
+      sanityChecks: parsed.sanityChecks,
+      summary: parsed.summary,
+    },
+    reviews
   );
-  return {
-    agreements: parsed.agreements,
-    bottomLine: parsed.bottomLine,
-    by: 'claude',
-    degraded: false,
-    disagreements: parsed.disagreements,
-    ok: true,
-    raw: res.raw,
-    sanityChecks: parsed.sanityChecks,
-    summary: parsed.summary,
-  };
+  if (demoted > 0) {
+    log(
+      `  · synthesis: ${demoted} unverifiable "agreement(s)" demoted to look-closer (not corroborated by ≥2 real voices)`
+    );
+  }
+  log(
+    `  · synthesis: ${synthesis.agreements.length} agreement(s), ${synthesis.disagreements.length} disagreement(s), ${synthesis.sanityChecks.length} sanity-check(s)`
+  );
+  return synthesis;
 }
 
 // ── The whole layer: claude reviewer + synthesis ──────────────────────────────
@@ -220,27 +236,52 @@ async function runClaudeReviewer(
 
 // ── Trail boundary guard (brain separation for `_work` repos) ─────────────────
 
+// Resolve a path through symlinks WITHOUT requiring it to exist yet (the trail out-dir
+// is created later): realpath the nearest existing ancestor, then re-append the missing
+// tail. A pure `path.resolve` is a STRING op that a symlink can defeat — e.g. a `_work`
+// out dir symlinked into ~/brain would resolve to a non-brain string and slip the guard.
+// Mirrors Part A's convention-boundary symlink fix.
+function realpathBestEffort(p: string): string {
+  let cur = path.resolve(p);
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      const real = fs.realpathSync(cur);
+      return tail.length ? path.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return path.resolve(p); // hit the root without resolving
+      tail.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
 // True iff a path lies under a `_work` fence — the employer-side repo bucket. The
-// review of such a repo must never write its trail into the personal brain.
+// review of such a repo must never write its trail into the personal brain. Realpath
+// first so a symlinked repo path can't hide the `_work` segment.
 export function isUnderWorkPath(p: string): boolean {
-  return path
-    .resolve(p)
+  return realpathBestEffort(p)
     .split(path.sep)
     .some((seg) => seg === '_work' || seg.startsWith('_work-'));
 }
 
-// PURE: would writing the trail to `outDir` for a review of `cwd` cross the brain
+// PURE-ish: would writing the trail to `outDir` for a review of `cwd` cross the brain
 // boundary? True iff the repo is a `_work` repo AND the out dir resolves under one of
-// the personal-brain roots. (Injectable roots keep this unit-testable.)
+// the personal-brain roots. Both sides are realpath'd (not string-resolved) so a
+// symlinked out dir can't slip the fence. (Injectable roots keep this unit-testable.)
 export function trailBoundaryViolation(
   cwd: string,
   outDir: string,
   brainRoots: string[]
 ): boolean {
   if (!isUnderWorkPath(cwd)) return false;
-  const out = path.resolve(outDir);
+  const out = realpathBestEffort(outDir);
+  // Realpath BOTH sides through the same resolver so any symlink transform (e.g. macOS
+  // `/home` autofs) applies identically to out and the roots — a string-only compare
+  // would spuriously miss/hit once one side is resolved.
   return brainRoots.some((root) => {
-    const r = path.resolve(root);
+    const r = realpathBestEffort(root);
     return out === r || out.startsWith(r + path.sep);
   });
 }

@@ -901,8 +901,19 @@ function resolveClaudeBin() {
   return resolveBin("claude", { envVar: "CLAUDE_BIN" });
 }
 var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
+var CLAUDE_READONLY_ARGS = [
+  "--tools",
+  "",
+  "--disallowed-tools",
+  "Bash",
+  "Edit",
+  "Write",
+  "NotebookEdit",
+  "--permission-mode",
+  "default"
+];
 function buildClaudeVoiceArgs(prompt, config) {
-  const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
+  const args = ["-p", prompt, "--output-format", "text", ...CLAUDE_READONLY_ARGS];
   if (config?.model && config.model !== "default") args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
   return args;
@@ -2719,6 +2730,34 @@ function parseReviewSynthesis(raw) {
   }
   return { agreements, bottomLine, disagreements, sanityChecks, summary };
 }
+function reconcileSynthesis(synth, reviews) {
+  if (synth.degraded) return { synthesis: synth, demoted: 0 };
+  const realVoices = new Set(
+    reviews.filter((r) => r.ok).map((r) => r.voiceId.trim().toLowerCase())
+  );
+  const isReal = (v) => realVoices.has(v.trim().toLowerCase());
+  const agreements = [];
+  const demoted = [];
+  for (const a of synth.agreements) {
+    const credited = [...new Set(a.voices)].filter(isReal);
+    if (credited.length >= 2) {
+      agreements.push({ point: a.point, voices: credited });
+    } else {
+      demoted.push({
+        point: a.point,
+        positions: credited.length > 0 ? credited.map((v) => `${v}: raised`) : ["unverified \u2014 no reviewing voice corroborates this as a shared finding"]
+      });
+    }
+  }
+  return {
+    synthesis: {
+      ...synth,
+      agreements,
+      disagreements: demoted.length ? [...synth.disagreements, ...demoted] : synth.disagreements
+    },
+    demoted: demoted.length
+  };
+}
 function fallbackReviewSynthesis(reviews) {
   const ok = reviews.filter((r) => r.ok);
   const disagreements = [];
@@ -2802,20 +2841,29 @@ async function synthesizeReviews(reviews, run, config, opts = {}) {
     log(`  \xB7 synthesis not parseable (${parsed.parseError}) \u2014 deterministic fallback`);
     return { ...fallbackReviewSynthesis(reviews), error: parsed.parseError, raw: res.raw };
   }
-  log(
-    `  \xB7 synthesis: ${parsed.agreements.length} agreement(s), ${parsed.disagreements.length} disagreement(s), ${parsed.sanityChecks.length} sanity-check(s)`
+  const { synthesis, demoted } = reconcileSynthesis(
+    {
+      agreements: parsed.agreements,
+      bottomLine: parsed.bottomLine,
+      by: "claude",
+      degraded: false,
+      disagreements: parsed.disagreements,
+      ok: true,
+      raw: res.raw,
+      sanityChecks: parsed.sanityChecks,
+      summary: parsed.summary
+    },
+    reviews
   );
-  return {
-    agreements: parsed.agreements,
-    bottomLine: parsed.bottomLine,
-    by: "claude",
-    degraded: false,
-    disagreements: parsed.disagreements,
-    ok: true,
-    raw: res.raw,
-    sanityChecks: parsed.sanityChecks,
-    summary: parsed.summary
-  };
+  if (demoted > 0) {
+    log(
+      `  \xB7 synthesis: ${demoted} unverifiable "agreement(s)" demoted to look-closer (not corroborated by \u22652 real voices)`
+    );
+  }
+  log(
+    `  \xB7 synthesis: ${synthesis.agreements.length} agreement(s), ${synthesis.disagreements.length} disagreement(s), ${synthesis.sanityChecks.length} sanity-check(s)`
+  );
+  return synthesis;
 }
 async function runClaudeReviewLayer(opts) {
   const log = opts.log ?? (() => {
@@ -2857,14 +2905,29 @@ async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log) {
   log(`  \xB7 claude: reviewed \u2014 ${parsed.findings.length} finding(s)`);
   return { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: "claude" };
 }
+function realpathBestEffort(p) {
+  let cur = path8.resolve(p);
+  const tail = [];
+  for (; ; ) {
+    try {
+      const real = fs10.realpathSync(cur);
+      return tail.length ? path8.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path8.dirname(cur);
+      if (parent === cur) return path8.resolve(p);
+      tail.push(path8.basename(cur));
+      cur = parent;
+    }
+  }
+}
 function isUnderWorkPath(p) {
-  return path8.resolve(p).split(path8.sep).some((seg) => seg === "_work" || seg.startsWith("_work-"));
+  return realpathBestEffort(p).split(path8.sep).some((seg) => seg === "_work" || seg.startsWith("_work-"));
 }
 function trailBoundaryViolation(cwd, outDir, brainRoots) {
   if (!isUnderWorkPath(cwd)) return false;
-  const out = path8.resolve(outDir);
+  const out = realpathBestEffort(outDir);
   return brainRoots.some((root) => {
-    const r = path8.resolve(root);
+    const r = realpathBestEffort(root);
     return out === r || out.startsWith(r + path8.sep);
   });
 }
@@ -3430,6 +3493,10 @@ function hasHighFinding(reviews) {
     (r) => r.terminalState === "reviewed" && r.findings.some((f) => f.severity === "high")
   );
 }
+function claudeLayerHasHigh(layer) {
+  const cr = layer?.claudeReview;
+  return Boolean(cr?.ok && cr.findings.some((f) => f.severity === "high"));
+}
 function reviewerTally(r) {
   const id = r.reviewerId ?? r.reviewer.vendor;
   if (r.terminalState !== "reviewed") return `${id} failed`;
@@ -3693,11 +3760,19 @@ async function reviewCommand(args, profile = "code") {
     } catch {
     }
   }
+  if (result.prompt) {
+    try {
+      fs11.mkdirSync(out, { recursive: true });
+      fs11.writeFileSync(path9.join(out, "packet.md"), result.prompt);
+    } catch {
+    }
+  }
   printSummary(result, profile);
   console.error(`trail: ${out}`);
-  if (withClaude && !result.blocked && result.prompt) {
+  let claudeLayer = null;
+  if (withClaude && roster.claude && !result.blocked && result.prompt) {
     const voiceConfigs = loadVoices();
-    const layer = await runClaudeReviewLayer({
+    claudeLayer = await runClaudeReviewLayer({
       claudeConfig: voiceConfigs.claude,
       coreReviews: result.reviews,
       includeClaudeReviewer: roster.claude,
@@ -3705,12 +3780,12 @@ async function reviewCommand(args, profile = "code") {
       reviewPrompt: result.prompt,
       synthConfig: voiceConfigs.claude
     });
-    console.log(renderClaudeLayer(layer).join("\n"));
+    console.log(renderClaudeLayer(claudeLayer).join("\n"));
     try {
       fs11.mkdirSync(out, { recursive: true });
       fs11.writeFileSync(
         path9.join(out, "claude-synthesis.json"),
-        JSON.stringify(layer, null, 2)
+        JSON.stringify(claudeLayer, null, 2)
       );
     } catch {
     }
@@ -3718,7 +3793,9 @@ async function reviewCommand(args, profile = "code") {
   if (result.blocked) return 2;
   const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
   if (!allReviewed) return 1;
-  if (!values["no-fail-on-high"] && hasHighFinding(result.reviews)) return 4;
+  if (!values["no-fail-on-high"] && (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))) {
+    return 4;
+  }
   return 0;
 }
 var BRAINSTORM_USAGE = `ensemble-ai brainstorm \u2014 convene multiple AI voices on a TOPIC.
