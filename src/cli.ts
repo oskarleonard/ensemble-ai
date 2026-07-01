@@ -233,7 +233,7 @@ function resolveSource(
       // come from DIFFERENT PR heads (a TOCTOU that would mislabel the receipt). A
       // move, or any gh failure, degrades to the generic label. Best-effort, never
       // blocks. A bare integer (no repoFlag) resolves no head (unchanged behavior).
-      const readHead = (): string | undefined => {
+      const fetchHeadRefOid = (): string | undefined => {
         if (repoFlag.length === 0) return undefined;
         const view = capture(
           'gh',
@@ -248,7 +248,7 @@ function resolveSource(
           return undefined;
         }
       };
-      const headBefore = readHead();
+      const headBefore = fetchHeadRefOid();
       const cap = capture('gh', ['pr', 'diff', String(selection.pr), ...repoFlag], cwd);
       if (!cap.ok) {
         console.error(`ensemble-ai ${cmd}: \`${label}\` failed: ${cap.error}`);
@@ -258,10 +258,12 @@ function resolveSource(
         console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
         return { code: 3 };
       }
-      // Only label the receipt with the head when it was IDENTICAL immediately before
-      // and after the diff fetch — proof the diff belongs to that exact head.
+      // Only label the receipt with the head when it read IDENTICAL immediately before
+      // AND after the diff fetch — proof the diff belongs to that exact head. Each call
+      // is a separate `gh pr view`, so this equality is the actual TOCTOU guard.
+      const headAfter = fetchHeadRefOid();
       const headShaOverride =
-        headBefore && headBefore === readHead() ? headBefore : undefined;
+        headBefore && headBefore === headAfter ? headBefore : undefined;
       return { diffMode: 'pr', diffText: cap.text, headShaOverride };
     }
     case 'diff-file': {
@@ -476,6 +478,47 @@ function resolvePositionalPr(
   return { pr: arg };
 }
 
+// The ONE diff-source resolution shared by `review`, `security`, and `diff`: fold a
+// bare positional PR URL into `--pr`, assemble the source flags, gate stdin, run the
+// PURE selector, then perform the git/gh I/O the chosen source needs. Returns the
+// engine inputs, or an exit code (3) already reported to stderr. Kept in one place so
+// the three commands can't drift on what "the diff under review" means.
+function resolveDiffSourceForCommand(
+  values: Record<string, string | boolean | undefined>,
+  positionals: string[],
+  cmd: string,
+  cwd: string
+): ReturnType<typeof resolveSource> {
+  // A bare positional PR URL (`<cmd> <url>`) is sugar for `--pr <url>`.
+  const positionalPr = resolvePositionalPr(
+    positionals,
+    typeof values.pr === 'string' ? values.pr : undefined,
+    cmd
+  );
+  if ('error' in positionalPr) {
+    console.error(`ensemble-ai ${cmd}: ${positionalPr.error}`);
+    return { code: 3 };
+  }
+
+  // At most one explicit flag (--pr/--staged/--working-tree/--diff-file), else a piped
+  // diff, else the default current-branch range.
+  const sourceFlags = {
+    diffFile: typeof values['diff-file'] === 'string' ? values['diff-file'] : undefined,
+    pr: positionalPr.pr,
+    staged: Boolean(values.staged),
+    workingTree: Boolean(values['working-tree']),
+  };
+  // Only consume stdin when NO explicit source is set — otherwise a CI shell that
+  // leaves stdin attached to a pipe would BLOCK reading input the run never uses.
+  const stdinContent = hasExplicitSource(sourceFlags) ? undefined : readStdinIfPiped();
+  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== undefined });
+  if (isDiffSourceError(selection)) {
+    console.error(`ensemble-ai ${cmd}: ${selection.error}`);
+    return { code: 3 };
+  }
+  return resolveSource(selection, cwd, stdinContent, cmd);
+}
+
 // Shared by `review` (profile 'code') and `security` (profile 'security'): both run
 // the SAME engine + diff-source resolution + exit-code contract; the profile only
 // swaps the reviewer framing, adds the dependency-surface flag, and labels the usage.
@@ -520,35 +563,7 @@ async function reviewCommand(
 
   const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
 
-  // A bare positional PR URL (`review <url>`) is sugar for `--pr <url>`.
-  const positionalPr = resolvePositionalPr(
-    positionals,
-    typeof values.pr === 'string' ? values.pr : undefined,
-    cmd
-  );
-  if ('error' in positionalPr) {
-    console.error(`ensemble-ai ${cmd}: ${positionalPr.error}`);
-    return 3;
-  }
-
-  // Resolve the diff source: at most one explicit flag (--pr/--staged/--working-tree/
-  // --diff-file), else a piped diff, else the default current-branch range. The
-  // selector is PURE; this then runs the git/gh I/O the chosen source needs.
-  const sourceFlags = {
-    diffFile: typeof values['diff-file'] === 'string' ? values['diff-file'] : undefined,
-    pr: positionalPr.pr,
-    staged: Boolean(values.staged),
-    workingTree: Boolean(values['working-tree']),
-  };
-  // Only consume stdin when NO explicit source is set — otherwise a CI shell that
-  // leaves stdin attached to a pipe would BLOCK reading input the run never uses.
-  const stdinContent = hasExplicitSource(sourceFlags) ? undefined : readStdinIfPiped();
-  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== undefined });
-  if (isDiffSourceError(selection)) {
-    console.error(`ensemble-ai ${cmd}: ${selection.error}`);
-    return 3;
-  }
-  const source = resolveSource(selection, cwd, stdinContent, cmd);
+  const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ('code' in source) return source.code;
 
   // "no --reviewers" → undefined → run the full default set. But if --reviewers IS
@@ -1483,30 +1498,7 @@ async function diffCommand(args: string[]): Promise<number> {
   if (typeof ceiling === 'object') return ceiling.code;
   const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
 
-  // A bare positional PR URL (`diff <url>`) is sugar for `--pr <url>`.
-  const positionalPr = resolvePositionalPr(
-    positionals,
-    typeof values.pr === 'string' ? values.pr : undefined,
-    'diff'
-  );
-  if ('error' in positionalPr) {
-    console.error(`ensemble-ai diff: ${positionalPr.error}`);
-    return 3;
-  }
-
-  const sourceFlags = {
-    diffFile: typeof values['diff-file'] === 'string' ? values['diff-file'] : undefined,
-    pr: positionalPr.pr,
-    staged: Boolean(values.staged),
-    workingTree: Boolean(values['working-tree']),
-  };
-  const stdinContent = hasExplicitSource(sourceFlags) ? undefined : readStdinIfPiped();
-  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== undefined });
-  if (isDiffSourceError(selection)) {
-    console.error(`ensemble-ai diff: ${selection.error}`);
-    return 3;
-  }
-  const source = resolveSource(selection, cwd, stdinContent, 'diff');
+  const source = resolveDiffSourceForCommand(values, positionals, 'diff', cwd);
   if ('code' in source) return source.code;
 
   let acquired: AcquiredDiff;

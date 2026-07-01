@@ -2706,7 +2706,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "pr": {
       const repoFlag = selection.owner && selection.repo ? ["-R", `${selection.owner}/${selection.repo}`] : [];
       const label = repoFlag.length > 0 ? `gh pr diff ${selection.pr} ${repoFlag.join(" ")}` : `gh pr diff ${selection.pr}`;
-      const readHead = () => {
+      const fetchHeadRefOid = () => {
         if (repoFlag.length === 0) return void 0;
         const view = capture(
           "gh",
@@ -2721,7 +2721,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
           return void 0;
         }
       };
-      const headBefore = readHead();
+      const headBefore = fetchHeadRefOid();
       const cap3 = capture("gh", ["pr", "diff", String(selection.pr), ...repoFlag], cwd);
       if (!cap3.ok) {
         console.error(`ensemble-ai ${cmd}: \`${label}\` failed: ${cap3.error}`);
@@ -2731,7 +2731,8 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
         console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
         return { code: 3 };
       }
-      const headShaOverride = headBefore && headBefore === readHead() ? headBefore : void 0;
+      const headAfter = fetchHeadRefOid();
+      const headShaOverride = headBefore && headBefore === headAfter ? headBefore : void 0;
       return { diffMode: "pr", diffText: cap3.text, headShaOverride };
     }
     case "diff-file": {
@@ -2901,6 +2902,30 @@ function resolvePositionalPr(positionals, prFlag, cmd) {
   }
   return { pr: arg };
 }
+function resolveDiffSourceForCommand(values, positionals, cmd, cwd) {
+  const positionalPr = resolvePositionalPr(
+    positionals,
+    typeof values.pr === "string" ? values.pr : void 0,
+    cmd
+  );
+  if ("error" in positionalPr) {
+    console.error(`ensemble-ai ${cmd}: ${positionalPr.error}`);
+    return { code: 3 };
+  }
+  const sourceFlags = {
+    diffFile: typeof values["diff-file"] === "string" ? values["diff-file"] : void 0,
+    pr: positionalPr.pr,
+    staged: Boolean(values.staged),
+    workingTree: Boolean(values["working-tree"])
+  };
+  const stdinContent = hasExplicitSource(sourceFlags) ? void 0 : readStdinIfPiped();
+  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== void 0 });
+  if (isDiffSourceError(selection)) {
+    console.error(`ensemble-ai ${cmd}: ${selection.error}`);
+    return { code: 3 };
+  }
+  return resolveSource(selection, cwd, stdinContent, cmd);
+}
 async function reviewCommand(args, profile = "code") {
   const usage = profile === "security" ? SECURITY_USAGE : REVIEW_USAGE;
   const cmd = profile === "security" ? "security" : "review";
@@ -2937,28 +2962,7 @@ async function reviewCommand(args, profile = "code") {
     return 0;
   }
   const cwd = values.cwd ? path7.resolve(String(values.cwd)) : process.cwd();
-  const positionalPr = resolvePositionalPr(
-    positionals,
-    typeof values.pr === "string" ? values.pr : void 0,
-    cmd
-  );
-  if ("error" in positionalPr) {
-    console.error(`ensemble-ai ${cmd}: ${positionalPr.error}`);
-    return 3;
-  }
-  const sourceFlags = {
-    diffFile: typeof values["diff-file"] === "string" ? values["diff-file"] : void 0,
-    pr: positionalPr.pr,
-    staged: Boolean(values.staged),
-    workingTree: Boolean(values["working-tree"])
-  };
-  const stdinContent = hasExplicitSource(sourceFlags) ? void 0 : readStdinIfPiped();
-  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== void 0 });
-  if (isDiffSourceError(selection)) {
-    console.error(`ensemble-ai ${cmd}: ${selection.error}`);
-    return 3;
-  }
-  const source = resolveSource(selection, cwd, stdinContent, cmd);
+  const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
   let reviewers;
   if (typeof values.reviewers === "string") {
@@ -3747,28 +3751,7 @@ async function diffCommand(args) {
   );
   if (typeof ceiling === "object") return ceiling.code;
   const cwd = values.cwd ? path7.resolve(String(values.cwd)) : process.cwd();
-  const positionalPr = resolvePositionalPr(
-    positionals,
-    typeof values.pr === "string" ? values.pr : void 0,
-    "diff"
-  );
-  if ("error" in positionalPr) {
-    console.error(`ensemble-ai diff: ${positionalPr.error}`);
-    return 3;
-  }
-  const sourceFlags = {
-    diffFile: typeof values["diff-file"] === "string" ? values["diff-file"] : void 0,
-    pr: positionalPr.pr,
-    staged: Boolean(values.staged),
-    workingTree: Boolean(values["working-tree"])
-  };
-  const stdinContent = hasExplicitSource(sourceFlags) ? void 0 : readStdinIfPiped();
-  const selection = selectDiffSource({ ...sourceFlags, stdinPiped: stdinContent !== void 0 });
-  if (isDiffSourceError(selection)) {
-    console.error(`ensemble-ai diff: ${selection.error}`);
-    return 3;
-  }
-  const source = resolveSource(selection, cwd, stdinContent, "diff");
+  const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
   let acquired;
   try {
