@@ -1,4 +1,9 @@
 import { persistReview } from '../../core/artifacts';
+import {
+  type ConventionManifest,
+  type ConventionReader,
+  gatherConventions,
+} from '../../core/conventions';
 import { parseFindings } from '../../core/findings';
 import { assembleCodePacket, PACKET_BUDGETS } from '../../core/packet';
 import { renderReviewPrompt } from '../../core/prompt';
@@ -37,6 +42,14 @@ export interface ReviewModeOptions {
   authorSummary?: string;
   base?: string;
   ceilingBytes?: number;
+  // Cap (bytes) on the gathered conventions text (default in gatherConventions).
+  conventionCapBytes?: number;
+  // Explicit convention paths (`.ensemble-ai.json` / `--conventions`) — additive.
+  conventionPaths?: string[];
+  // The reader the conventions gatherer resolves the repo's md web through — fs for
+  // local mode, gh for a `--pr <url>`. Absent OR noConventions → the packet keeps
+  // opts.agentsMd (or nothing). One gatherer, injected I/O = no drift with the dashboard.
+  conventionReader?: ConventionReader | null;
   cwd: string;
   // Mode label for a pre-supplied diffText (e.g. a `gh pr diff` capture → 'pr').
   diffMode?: DiffMode;
@@ -44,6 +57,8 @@ export interface ReviewModeOptions {
   // Override the headSha for a pre-supplied diffText (a URL PR's resolved head SHA,
   // so the receipt is content-tied to the exact PR head). See AcquireDiffOpts.
   headShaOverride?: string;
+  // Opt out of convention gathering entirely (`--no-conventions`).
+  noConventions?: boolean;
   objective?: string;
   onProgress?: (msg: string) => void;
   out: string;
@@ -68,6 +83,9 @@ export interface ReviewModeResult {
   acquired: AcquiredDiff;
   blocked: boolean;
   blockedReason?: string;
+  // The gathered-conventions manifest (which convention files the reviewers saw,
+  // which were truncated/omitted over the cap) — present when gathering ran.
+  conventionManifest?: ConventionManifest;
   // The local dependency-surface scan — present ONLY for the 'security' profile
   // (manifest changes + risky imports drawn from the diff; no network).
   depSurface?: DepSurfaceResult;
@@ -221,8 +239,30 @@ export async function runReviewMode(
     };
   }
 
+  // Gather the repo's convention web (root + touched packages + the linked/swept md)
+  // through the injected reader — the SAME pure gatherer the dashboard calls. Feeds
+  // the packet's conventions slot; a NAMED-truncated set beats today's empty one.
+  // Falls back to opts.agentsMd when gathering is off or yields nothing.
+  let agentsMd = opts.agentsMd;
+  let conventionManifest: ConventionManifest | undefined;
+  if (!opts.noConventions && opts.conventionReader) {
+    const changed = acquired.files
+      .map((f) => f.path)
+      .filter((p) => p && p !== 'unknown');
+    const gathered = await gatherConventions(opts.conventionReader, changed, {
+      capBytes: opts.conventionCapBytes,
+      conventions: opts.conventionPaths,
+    });
+    if (gathered.text.trim()) agentsMd = gathered.text;
+    conventionManifest = gathered.manifest;
+    const inc = gathered.manifest.files.filter((f) => f.included).length;
+    log(
+      `Conventions: ${inc}/${gathered.manifest.files.length} file(s), ${gathered.manifest.totalBytes} bytes gathered`
+    );
+  }
+
   const packet = assembleCodePacket({
-    agentsMd: opts.agentsMd,
+    agentsMd,
     authorSummary: opts.authorSummary,
     diff: acquired.diff,
     objective:
@@ -285,8 +325,8 @@ export async function runReviewMode(
     const store = opts.receiptStore ?? defaultReceiptStore();
     const file = writeReceipt(store, built.receipt);
     log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
   }
   log(`No receipt — ${built.error}`);
-  return { acquired, blocked: false, depSurface, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, receiptError: built.error, reviews, secretScan };
 }

@@ -3,28 +3,182 @@
 // src/cli.ts
 import { execFileSync as execFileSync3 } from "child_process";
 import crypto2 from "crypto";
-import fs9 from "fs";
+import fs10 from "fs";
 import os7 from "os";
-import path7 from "path";
+import path8 from "path";
 import { parseArgs } from "util";
 
-// src/core/entrypoint.ts
+// src/core/conventions.ts
 import fs from "fs";
+import path from "path";
+var DEFAULT_CAP_BYTES = 8e4;
+var DEFAULT_MAX_FILES = 60;
+var ENTRY_FILES = ["CLAUDE.md", "AGENTS.md"];
+var COMMON_DOCS = ["CONTRIBUTING.md", "ARCHITECTURE.md", "TECH_DESIGN.md"];
+var SWEEP_DIRS = ["docs", "ai-spec"];
+function resolveInRepo(fromDir, ref) {
+  const first = ref.trim().split(/[#?\s]/)[0];
+  if (!first) return null;
+  if (first.startsWith("/") || first.startsWith("~")) return null;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(first)) return null;
+  const joined = path.posix.normalize(path.posix.join(fromDir || ".", first));
+  if (joined === ".." || joined.startsWith("../")) return null;
+  if (joined.startsWith("/")) return null;
+  return joined === "." ? "" : joined.replace(/^\.\//, "");
+}
+function dirOf(relPath) {
+  const d = path.posix.dirname(relPath);
+  return d === "." ? "" : d;
+}
+function joinDir(dir, file) {
+  return dir === "" ? file : `${dir}/${file}`;
+}
+function ancestorDirs(relPath) {
+  const dirs = [];
+  let d = dirOf(relPath);
+  for (; ; ) {
+    dirs.push(d);
+    if (d === "") break;
+    d = dirOf(d);
+  }
+  return dirs;
+}
+function extractRefs(content) {
+  const refs = /* @__PURE__ */ new Set();
+  for (const m of content.matchAll(/(?:^|\s)@([^\s)]+\.md)/gm)) refs.add(m[1]);
+  for (const m of content.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) refs.add(m[1]);
+  for (const m of content.matchAll(/\b(?:see|read|per|in)\s+`?([\w./-]+\.md)`?/gi)) {
+    refs.add(m[1]);
+  }
+  return [...refs];
+}
+function sliceBytes(s, maxBytes) {
+  const buf = Buffer.from(s, "utf8");
+  if (buf.length <= maxBytes) return s;
+  return buf.subarray(0, maxBytes).toString("utf8").replace(/�$/, "");
+}
+function fileHeader(rel) {
+  return `
+
+===== ${rel} =====
+`;
+}
+async function gatherConventions(reader, changedPaths, config = {}) {
+  const capBytes = config.capBytes ?? DEFAULT_CAP_BYTES;
+  const maxFiles = config.maxFiles ?? DEFAULT_MAX_FILES;
+  const dirs = /* @__PURE__ */ new Set([""]);
+  for (const p of changedPaths) {
+    const rel = resolveInRepo("", p);
+    if (rel === null || rel === "") continue;
+    for (const d of ancestorDirs(rel)) dirs.add(d);
+  }
+  const orderedDirs = [...dirs].sort(
+    (a, b) => a.length - b.length || (a < b ? -1 : 1)
+  );
+  const seen = /* @__PURE__ */ new Set();
+  const queue = [];
+  const enqueue = (rel) => {
+    if (!rel || !rel.endsWith(".md")) return;
+    if (seen.has(rel) || seen.size >= maxFiles) return;
+    seen.add(rel);
+    queue.push(rel);
+  };
+  for (const d of orderedDirs) {
+    for (const f of ENTRY_FILES) enqueue(joinDir(d, f));
+  }
+  for (const c of config.conventions ?? []) enqueue(resolveInRepo("", c));
+  for (const d of orderedDirs) {
+    for (const f of COMMON_DOCS) enqueue(joinDir(d, f));
+    for (const sweepDir of SWEEP_DIRS) {
+      for (const item of await reader.list(joinDir(d, sweepDir))) {
+        enqueue(resolveInRepo("", item));
+      }
+    }
+  }
+  const files = [];
+  const chunks = [];
+  let used = 0;
+  while (queue.length > 0) {
+    const rel = queue.shift();
+    const content = await reader.read(rel);
+    if (content === null) continue;
+    const bytes = Buffer.byteLength(content, "utf8");
+    const dir = dirOf(rel);
+    for (const ref of extractRefs(content)) enqueue(resolveInRepo(dir, ref));
+    const remaining = capBytes - used;
+    if (remaining <= 0) {
+      files.push({ path: rel, bytes, included: false, truncated: false, reason: "over-cap" });
+      continue;
+    }
+    if (bytes <= remaining) {
+      chunks.push(fileHeader(rel) + content);
+      used += bytes;
+      files.push({ path: rel, bytes, included: true, truncated: false });
+    } else {
+      const head = sliceBytes(content, remaining);
+      chunks.push(
+        `${fileHeader(rel)}${head}
+
+\u2026[${bytes - Buffer.byteLength(head, "utf8")} bytes truncated \u2014 over the ${capBytes}-byte conventions cap]\u2026
+`
+      );
+      used += Buffer.byteLength(head, "utf8");
+      files.push({ path: rel, bytes, included: true, truncated: true, reason: "over-cap" });
+    }
+  }
+  return {
+    text: chunks.join("").replace(/^\n+/, ""),
+    manifest: { capBytes, files, totalBytes: used }
+  };
+}
+function fsConventionReader(repoRoot) {
+  const root = path.resolve(repoRoot);
+  const within = (rel) => {
+    const abs = path.resolve(root, rel);
+    const back = path.relative(root, abs);
+    if (back.startsWith("..") || path.isAbsolute(back)) return null;
+    return abs;
+  };
+  return {
+    async read(rel) {
+      const abs = within(rel);
+      if (!abs) return null;
+      try {
+        if (!fs.statSync(abs).isFile()) return null;
+        return fs.readFileSync(abs, "utf8");
+      } catch {
+        return null;
+      }
+    },
+    async list(dirRel) {
+      const abs = within(dirRel);
+      if (!abs) return [];
+      try {
+        return fs.readdirSync(abs).filter((n) => n.endsWith(".md")).map((n) => joinDir(dirRel, n));
+      } catch {
+        return [];
+      }
+    }
+  };
+}
+
+// src/core/entrypoint.ts
+import fs2 from "fs";
 import { fileURLToPath } from "url";
 function isEntrypoint(importMetaUrl) {
   const entry = process.argv[1];
   if (!entry) return false;
   try {
-    return fs.realpathSync(entry) === fs.realpathSync(fileURLToPath(importMetaUrl));
+    return fs2.realpathSync(entry) === fs2.realpathSync(fileURLToPath(importMetaUrl));
   } catch {
     return false;
   }
 }
 
 // src/core/reviewers.ts
-import fs2 from "fs";
+import fs3 from "fs";
 import os from "os";
-import path from "path";
+import path2 from "path";
 
 // src/core/types.ts
 var REVIEWER_IDS = ["codex", "grok"];
@@ -40,7 +194,7 @@ var SEVERITIES = ["high", "medium", "low"];
 var CONFIDENCES = ["high", "medium", "low"];
 
 // src/core/reviewers.ts
-var REVIEWERS_FILE = process.env.ENSEMBLE_REVIEWERS_FILE || path.join(os.homedir(), ".ensemble-ai", "reviewers.json");
+var REVIEWERS_FILE = process.env.ENSEMBLE_REVIEWERS_FILE || path2.join(os.homedir(), ".ensemble-ai", "reviewers.json");
 var REVIEWER_DEFAULTS = {
   codex: {
     cmd: "codex",
@@ -86,7 +240,7 @@ function parseReviewers(raw) {
 }
 function loadReviewers(file = REVIEWERS_FILE) {
   try {
-    return parseReviewers(JSON.parse(fs2.readFileSync(file, "utf8")));
+    return parseReviewers(JSON.parse(fs3.readFileSync(file, "utf8")));
   } catch {
     return { ...REVIEWER_DEFAULTS };
   }
@@ -424,22 +578,22 @@ a tight ranked list of the genuinely strong ideas over a long one.
 }
 
 // src/modes/brainstorm/voices.ts
-import fs6 from "fs";
+import fs7 from "fs";
 import os5 from "os";
-import path4 from "path";
+import path5 from "path";
 
 // src/reviewers/codex.ts
 import os3 from "os";
-import path2 from "path";
+import path3 from "path";
 
 // src/core/spawn.ts
 import { spawn } from "child_process";
-import fs4 from "fs";
+import fs5 from "fs";
 import os2 from "os";
 
 // src/core/bin.ts
 import { execFileSync } from "child_process";
-import fs3 from "fs";
+import fs4 from "fs";
 var binCache = /* @__PURE__ */ new Map();
 function resolveBin(name, opts = {}) {
   const cached = binCache.get(name);
@@ -449,7 +603,7 @@ function resolveBin(name, opts = {}) {
     ...opts.candidates ?? []
   ].filter((c) => Boolean(c));
   for (const c of candidates) {
-    if (fs3.existsSync(c)) {
+    if (fs4.existsSync(c)) {
       binCache.set(name, c);
       return c;
     }
@@ -541,9 +695,9 @@ function runReviewerExec(opts) {
         if (text) raw = text;
       } else {
         try {
-          const text = fs4.readFileSync(outFile ?? "", "utf8").trim();
+          const text = fs5.readFileSync(outFile ?? "", "utf8").trim();
           if (text) raw = text;
-          fs4.unlinkSync(outFile ?? "");
+          fs5.unlinkSync(outFile ?? "");
         } catch {
         }
       }
@@ -583,7 +737,7 @@ function buildCodexReviewArgs(config, outFile, prompt) {
 }
 function runCodexReview(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  const outFile = path2.join(
+  const outFile = path3.join(
     os3.tmpdir(),
     `codex-review-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
   );
@@ -603,10 +757,10 @@ function runCodexReview(prompt, config, opts = {}) {
 }
 
 // src/reviewers/grok.ts
-import fs5 from "fs";
+import fs6 from "fs";
 import os4 from "os";
-import path3 from "path";
-var GROK_BIN_CANDIDATES = [path3.join(os4.homedir(), ".grok", "bin", "grok")];
+import path4 from "path";
+var GROK_BIN_CANDIDATES = [path4.join(os4.homedir(), ".grok", "bin", "grok")];
 function resolveGrokBin() {
   return resolveBin("grok", {
     candidates: GROK_BIN_CANDIDATES,
@@ -649,19 +803,19 @@ function replaceReviewSection(content) {
   const after = lines.slice(to).join("\n").replace(/^\n+/, "");
   return [before, REVIEW_PROFILE.trimEnd(), after].filter((s) => s.length > 0).join("\n\n") + "\n";
 }
-function ensureSandboxProfile(profile, file = path3.join(os4.homedir(), ".grok", "sandbox.toml")) {
+function ensureSandboxProfile(profile, file = path4.join(os4.homedir(), ".grok", "sandbox.toml")) {
   if (BUILTIN_SANDBOXES.has(profile) || profile !== REVIEW_PROFILE_NAME) return;
   try {
-    const existing = fs5.existsSync(file) ? fs5.readFileSync(file, "utf8") : "";
+    const existing = fs6.existsSync(file) ? fs6.readFileSync(file, "utf8") : "";
     if (existing.includes(REVIEW_PROFILE_BLOCK)) return;
-    fs5.mkdirSync(path3.dirname(file), { recursive: true });
+    fs6.mkdirSync(path4.dirname(file), { recursive: true });
     const updated = existing.includes(REVIEW_PROFILE_HEADER) ? replaceReviewSection(existing) : null;
     const content = updated ?? (existing.trim() ? `${existing.trimEnd()}
 
 ${REVIEW_PROFILE}` : REVIEW_PROFILE);
     const tmp = `${file}.tmp`;
-    fs5.writeFileSync(tmp, content);
-    fs5.renameSync(tmp, file);
+    fs6.writeFileSync(tmp, content);
+    fs6.renameSync(tmp, file);
   } catch {
   }
 }
@@ -698,7 +852,7 @@ function runGrokReview(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const sandbox = resolveReviewSandbox(config.sandbox);
   ensureSandboxProfile(sandbox);
-  const cwd = fs5.mkdtempSync(path3.join(os4.tmpdir(), "grok-review-"));
+  const cwd = fs6.mkdtempSync(path4.join(os4.tmpdir(), "grok-review-"));
   return runReviewerExec({
     args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
     bin: resolveGrokBin(),
@@ -708,7 +862,7 @@ function runGrokReview(prompt, config, opts = {}) {
     timeoutMs
   }).then(({ raw, stderrTail, timedOut }) => {
     try {
-      fs5.rmSync(cwd, { force: true, recursive: true });
+      fs6.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
     const text = raw ? extractGrokText(raw) : null;
@@ -784,7 +938,7 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), o),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), o)
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path4.join(os5.homedir(), ".ensemble-ai", "voices.json");
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path5.join(os5.homedir(), ".ensemble-ai", "voices.json");
 function str3(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
@@ -810,7 +964,7 @@ function parseVoices(raw) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs6.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs7.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
@@ -1383,24 +1537,24 @@ function isImplemented(mode) {
 }
 
 // src/core/artifacts.ts
-import fs7 from "fs";
-import path5 from "path";
+import fs8 from "fs";
+import path6 from "path";
 function sanitizePathSegment(s) {
   return s.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 function reviewDir(baseDir, runId) {
-  return path5.join(baseDir, sanitizePathSegment(runId) || "unknown");
+  return path6.join(baseDir, sanitizePathSegment(runId) || "unknown");
 }
 function writeAtomic(dir, name, content) {
-  fs7.mkdirSync(dir, { recursive: true });
-  const target = path5.join(dir, name);
+  fs8.mkdirSync(dir, { recursive: true });
+  const target = path6.join(dir, name);
   const tmp = `${target}.tmp`;
-  fs7.writeFileSync(tmp, content);
-  fs7.renameSync(tmp, target);
+  fs8.writeFileSync(tmp, content);
+  fs8.renameSync(tmp, target);
 }
 function readJson(file) {
   try {
-    return JSON.parse(fs7.readFileSync(file, "utf8"));
+    return JSON.parse(fs8.readFileSync(file, "utf8"));
   } catch {
     return null;
   }
@@ -1448,10 +1602,10 @@ function persistReview(baseDir, input) {
 }
 function readReview(baseDir, runId, reviewerId = "codex") {
   const dir = reviewDir(baseDir, runId);
-  const perId = readJson(path5.join(dir, reviewJson(reviewerId)));
+  const perId = readJson(path6.join(dir, reviewJson(reviewerId)));
   if (perId) return perId.reviewerId ? perId : { ...perId, reviewerId };
   if (reviewerId === "codex") {
-    const legacy = readJson(path5.join(dir, "review.json"));
+    const legacy = readJson(path6.join(dir, "review.json"));
     if (legacy) return { ...legacy, reviewerId: "codex" };
   }
   return null;
@@ -1738,9 +1892,9 @@ var GENERATED_PATTERNS = [
   /\.(js|css)\.map$/,
   /\.snap$/
 ];
-function classifyFileKind(path8, isBinary) {
+function classifyFileKind(path9, isBinary) {
   if (isBinary) return "binary";
-  return GENERATED_PATTERNS.some((re) => re.test(path8)) ? "generated" : "source";
+  return GENERATED_PATTERNS.some((re) => re.test(path9)) ? "generated" : "source";
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -1758,7 +1912,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path8 = pathOfSection(section2);
+    const path9 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -1769,8 +1923,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path8, isBinary),
-      path: path8,
+      kind: classifyFileKind(path9, isBinary),
+      path: path9,
       raw: section2,
       removed
     };
@@ -2009,9 +2163,9 @@ function scanDependencySurface(files) {
 }
 
 // src/modes/review/receipt.ts
-import fs8 from "fs";
+import fs9 from "fs";
 import os6 from "os";
-import path6 from "path";
+import path7 from "path";
 function computePolicyHash(args) {
   const canonical = JSON.stringify({
     coveragePolicy: args.coveragePolicy,
@@ -2034,10 +2188,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path6.join(os6.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path7.join(os6.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path6.join(
+  return path7.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -2058,10 +2212,10 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs8.mkdirSync(path6.dirname(file), { recursive: true });
+  fs9.mkdirSync(path7.dirname(file), { recursive: true });
   const tmp = `${file}.tmp`;
-  fs8.writeFileSync(tmp, JSON.stringify(receipt, null, 2));
-  fs8.renameSync(tmp, file);
+  fs9.writeFileSync(tmp, JSON.stringify(receipt, null, 2));
+  fs9.renameSync(tmp, file);
   return file;
 }
 function validateReceiptShape(value) {
@@ -2102,7 +2256,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs8.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs9.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -2328,8 +2482,23 @@ async function runReviewMode(opts) {
       secretScan
     };
   }
+  let agentsMd = opts.agentsMd;
+  let conventionManifest;
+  if (!opts.noConventions && opts.conventionReader) {
+    const changed = acquired.files.map((f) => f.path).filter((p) => p && p !== "unknown");
+    const gathered = await gatherConventions(opts.conventionReader, changed, {
+      capBytes: opts.conventionCapBytes,
+      conventions: opts.conventionPaths
+    });
+    if (gathered.text.trim()) agentsMd = gathered.text;
+    conventionManifest = gathered.manifest;
+    const inc = gathered.manifest.files.filter((f) => f.included).length;
+    log(
+      `Conventions: ${inc}/${gathered.manifest.files.length} file(s), ${gathered.manifest.totalBytes} bytes gathered`
+    );
+  }
   const packet = assembleCodePacket({
-    agentsMd: opts.agentsMd,
+    agentsMd,
     authorSummary: opts.authorSummary,
     diff: acquired.diff,
     objective: opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE),
@@ -2383,10 +2552,10 @@ async function runReviewMode(opts) {
     const store = opts.receiptStore ?? defaultReceiptStore();
     const file = writeReceipt(store, built.receipt);
     log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, depSurface, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, receiptError: built.error, reviews, secretScan };
 }
 
 // src/modes/review/source.ts
@@ -2443,14 +2612,28 @@ function selectDiffSource(flags) {
 }
 
 // src/plumbing/diff-preview.ts
-function buildPacketPreview(acquired, profile) {
+function buildPacketPreview(acquired, profile, agentsMd) {
   const packet = assembleCodePacket({
+    agentsMd,
     diff: acquired.diff,
     objective: profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE,
     pr: 0,
     repo: acquired.repoId ?? ""
   });
   return { packet, prompt: renderReviewPrompt(packet, profile) };
+}
+function renderConventionManifest(m) {
+  const out = [];
+  const inc = m.files.filter((f) => f.included).length;
+  out.push(
+    `  conventions:  ${inc}/${m.files.length} file(s) gathered, ${m.totalBytes} bytes (cap ${m.capBytes})`
+  );
+  for (const f of m.files) {
+    const flag = f.included ? f.truncated ? "~" : "\u2713" : "\xB7";
+    const tag = f.truncated ? " (truncated \u2014 over cap)" : !f.included ? " (omitted \u2014 over cap)" : "";
+    out.push(`    ${flag} ${f.path} (${f.bytes} bytes)${tag}`);
+  }
+  return out;
 }
 function renderPacketPreview(acquired, preview, opts) {
   const c = acquired.coverage;
@@ -2473,6 +2656,10 @@ function renderPacketPreview(acquired, preview, opts) {
   for (const s of preview.packet.sections) {
     const flag = s.included ? s.truncated ? "~" : "\u2713" : "\xB7";
     out.push(`    ${flag} ${s.title} \u2014 ${s.note}`);
+  }
+  if (opts.conventions) {
+    out.push("");
+    out.push(...renderConventionManifest(opts.conventions));
   }
   out.push("");
   out.push(`  packet complete: ${preview.packet.complete ? "yes" : "NO \u2014 a blind review (diff missing/too small)"}`);
@@ -2638,6 +2825,8 @@ Diff source (give at most ONE; default = current branch):
 Options:
   --base <ref>          base ref for the default (commit) mode
   --reviewers <ids>     comma-separated reviewer ids (default: all configured)
+  --conventions <paths> extra convention files to gather (comma-separated, in-repo)
+  --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
   --out <dir>           trail output dir (default: a temp dir, printed)
   --sandbox <profile>   reviewer sandbox profile override (deny-by-default only)
@@ -2682,7 +2871,7 @@ function genRunId() {
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
   try {
-    const s = fs9.readFileSync(0, "utf8");
+    const s = fs10.readFileSync(0, "utf8");
     return s.trim() ? s : void 0;
   } catch {
     return void 0;
@@ -2704,6 +2893,49 @@ function capture(cmd, cmdArgs, cwd) {
     const stderr = err.stderr ? String(err.stderr).trim() : "";
     return { error: stderr || err.message || "command failed", ok: false };
   }
+}
+function gitToplevel(cwd) {
+  try {
+    const top = execFileSync3("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+    return top || null;
+  } catch {
+    return null;
+  }
+}
+function ghConventionReader(repoSlug, ref, cwd) {
+  return {
+    async read(rel) {
+      const cap3 = capture(
+        "gh",
+        ["api", `repos/${repoSlug}/contents/${rel}?ref=${ref}`, "--jq", ".content"],
+        cwd
+      );
+      if (!cap3.ok || !cap3.text.trim()) return null;
+      try {
+        return Buffer.from(cap3.text.replace(/\s/g, ""), "base64").toString("utf8");
+      } catch {
+        return null;
+      }
+    },
+    async list(dirRel) {
+      const cap3 = capture(
+        "gh",
+        ["api", `repos/${repoSlug}/contents/${dirRel}?ref=${ref}`, "--jq", ".[].path"],
+        cwd
+      );
+      if (!cap3.ok) return [];
+      return cap3.text.split("\n").map((s) => s.trim()).filter((s) => s.endsWith(".md"));
+    }
+  };
+}
+function buildConventionReader(cwd, ctx) {
+  if (ctx) return ghConventionReader(ctx.repoSlug, ctx.ref, cwd);
+  const root = gitToplevel(cwd);
+  return root ? fsConventionReader(root) : null;
 }
 function resolveSource(selection, cwd, stdinContent, cmd = "review") {
   switch (selection.kind) {
@@ -2753,7 +2985,8 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
             ],
             cwd
           );
-          return prResult(cmp, label3, headSha);
+          const r = prResult(cmp, label3, headSha);
+          return "code" in r ? r : { ...r, conventionsCtx: { ref: headSha, repoSlug } };
         }
         const label2 = `gh pr diff ${selection.pr} -R ${repoSlug}`;
         const cap4 = capture(
@@ -2770,7 +3003,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "diff-file": {
       let text;
       try {
-        text = fs9.readFileSync(String(selection.diffFile), "utf8");
+        text = fs10.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
@@ -2889,6 +3122,9 @@ function printSummary(result, profile) {
   for (const f of a.coverage.files.filter((x) => !x.included)) {
     out.push(`             ${omittedLine({ kind: f.kind, path: f.path, reason: f.omitReason })}`);
   }
+  if (result.conventionManifest && result.conventionManifest.files.length > 0) {
+    out.push(...renderConventionManifest(result.conventionManifest));
+  }
   const ss = result.secretScan;
   if (ss.sensitivePaths.length || ss.inlineSecrets.length) {
     out.push(
@@ -2971,9 +3207,11 @@ async function reviewCommand(args, profile = "code") {
         "allow-sensitive": { type: "boolean" },
         base: { type: "string" },
         ceiling: { type: "string" },
+        conventions: { type: "string" },
         cwd: { type: "string" },
         "diff-file": { type: "string" },
         help: { short: "h", type: "boolean" },
+        "no-conventions": { type: "boolean" },
         "no-fail-on-high": { type: "boolean" },
         out: { type: "string" },
         pr: { type: "string" },
@@ -2993,9 +3231,12 @@ async function reviewCommand(args, profile = "code") {
     console.log(usage);
     return 0;
   }
-  const cwd = values.cwd ? path7.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
+  const noConventions = Boolean(values["no-conventions"]);
+  const conventionPaths = parseConventionPaths(values.conventions);
+  const conventionReader = noConventions ? null : buildConventionReader(cwd, source.conventionsCtx);
   let reviewers;
   if (typeof values.reviewers === "string") {
     const parsed = parseReviewerList(values.reviewers, cmd);
@@ -3003,7 +3244,7 @@ async function reviewCommand(args, profile = "code") {
     reviewers = parsed;
   }
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-  const out = typeof values.out === "string" ? path7.resolve(values.out) : path7.join(os7.tmpdir(), "ensemble-ai", runId);
+  const out = typeof values.out === "string" ? path8.resolve(values.out) : path8.join(os7.tmpdir(), "ensemble-ai", runId);
   const ceiling = positiveCeiling(
     typeof values.ceiling === "string" ? values.ceiling : void 0,
     cmd
@@ -3016,10 +3257,13 @@ async function reviewCommand(args, profile = "code") {
       allowSensitive: Boolean(values["allow-sensitive"]),
       base: typeof values.base === "string" ? values.base : void 0,
       ceilingBytes,
+      conventionPaths,
+      conventionReader,
       cwd,
       diffMode: source.diffMode,
       diffText: source.diffText,
       headShaOverride: source.headShaOverride,
+      noConventions,
       onProgress: (m) => console.error(`\xB7 ${m}`),
       out,
       profile,
@@ -3032,6 +3276,16 @@ async function reviewCommand(args, profile = "code") {
   } catch (e) {
     console.error(`ensemble-ai ${cmd}: ${e.message}`);
     return 3;
+  }
+  if (result.conventionManifest) {
+    try {
+      fs10.mkdirSync(out, { recursive: true });
+      fs10.writeFileSync(
+        path8.join(out, "conventions.json"),
+        JSON.stringify(result.conventionManifest, null, 2)
+      );
+    } catch {
+    }
   }
   printSummary(result, profile);
   console.error(`trail: ${out}`);
@@ -3155,19 +3409,19 @@ async function brainstormCommand(args) {
     console.error(BRAINSTORM_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path7.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path7.resolve(cwd, values.file);
+    const filePath = path8.resolve(cwd, values.file);
     try {
-      const bytes = fs9.statSync(filePath).size;
+      const bytes = fs10.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs9.readFileSync(filePath, "utf8");
+      fileContext = fs10.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${e.message}`
@@ -3360,19 +3614,19 @@ async function consultCommand(args) {
     console.error(CONSULT_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path7.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path7.resolve(cwd, values.file);
+    const filePath = path8.resolve(cwd, values.file);
     try {
-      const bytes = fs9.statSync(filePath).size;
+      const bytes = fs10.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs9.readFileSync(filePath, "utf8");
+      fileContext = fs10.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai consult: cannot read --file ${values.file}: ${e.message}`
@@ -3456,6 +3710,11 @@ function parseReviewerList(raw, cmd) {
 }
 function parseRequiredReviewers(raw, cmd) {
   return raw === void 0 ? [...REVIEWER_IDS] : parseReviewerList(raw, cmd);
+}
+function parseConventionPaths(raw) {
+  if (typeof raw !== "string") return void 0;
+  const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  return list.length ? list : void 0;
 }
 function positiveCeiling(raw, cmd) {
   if (raw === void 0) return void 0;
@@ -3541,11 +3800,11 @@ async function receiptCommand(args) {
     console.log(RECEIPT_USAGE);
     return 0;
   }
-  const receiptPathArg = typeof positionals[0] === "string" ? path7.resolve(positionals[0]) : void 0;
+  const receiptPathArg = typeof positionals[0] === "string" ? path8.resolve(positionals[0]) : void 0;
   const readReceiptFile = (p) => {
     let raw;
     try {
-      raw = fs9.readFileSync(p, "utf8");
+      raw = fs10.readFileSync(p, "utf8");
     } catch (e) {
       return { error: `cannot read receipt ${p}: ${e.message}` };
     }
@@ -3581,7 +3840,7 @@ async function receiptCommand(args) {
   );
   if (typeof ceiling === "object") return ceiling.code;
   const ceilingBytes = ceiling ?? DEFAULT_COVERAGE_CEILING;
-  const cwd = values.cwd ? path7.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
   if (Boolean(values.staged) && Boolean(values["working-tree"])) {
     console.error(
       `ensemble-ai receipt ${sub}: choose at most one of --staged / --working-tree`
@@ -3612,7 +3871,7 @@ async function receiptCommand(args) {
     }),
     repo: acquired.repoId
   };
-  const store = values.store ? path7.resolve(String(values.store)) : defaultReceiptStore();
+  const store = values.store ? path8.resolve(String(values.store)) : defaultReceiptStore();
   if (sub === "show") {
     const receipt = readReceipt(store, key);
     if (!receipt) {
@@ -3641,7 +3900,7 @@ async function receiptCommand(args) {
     // with isDiffReviewed so a digest-only drift still reports `stale`.
     readReceipt: receiptPathArg ? (k) => explicit && receiptIdentityMatches(explicit, k) ? explicit : null : (k) => readReceipt(store, k),
     strict: Boolean(values.strict || values["require-artifacts"]),
-    trailDir: typeof values.trail === "string" ? path7.resolve(values.trail) : void 0
+    trailDir: typeof values.trail === "string" ? path8.resolve(values.trail) : void 0
   };
   const state = verifyReceipt({ coverage: acquired.coverage, key, required }, verifyDeps);
   console.log(formatVerify(state, key));
@@ -3689,15 +3948,15 @@ async function reviewersCommand(args) {
     console.log(REVIEWERS_USAGE);
     return 0;
   }
-  const reviewersFile = typeof values["reviewers-file"] === "string" ? path7.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
-  const voicesFile = typeof values["voices-file"] === "string" ? path7.resolve(values["voices-file"]) : VOICES_FILE;
+  const reviewersFile = typeof values["reviewers-file"] === "string" ? path8.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
+  const voicesFile = typeof values["voices-file"] === "string" ? path8.resolve(values["voices-file"]) : VOICES_FILE;
   const view = {
     reviewers: listReviewers(reviewersFile),
     reviewersFile,
-    reviewersFileExists: fs9.existsSync(reviewersFile),
+    reviewersFileExists: fs10.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
     voicesFile,
-    voicesFileExists: fs9.existsSync(voicesFile)
+    voicesFileExists: fs10.existsSync(voicesFile)
   };
   if (values.json) console.log(JSON.stringify(view, null, 2));
   else console.log(renderRegistry(view));
@@ -3726,6 +3985,8 @@ Options:
   --base <ref>          base ref for the default (commit) mode
   --profile <p>         packet profile: code (default) | security
   --reviewers <ids>     reviewers to size the cost preview against (default: all)
+  --conventions <paths> extra convention files to gather (comma-separated, in-repo)
+  --no-conventions      do NOT gather the repo's conventions into the packet
   --ceiling <bytes>     coverage byte ceiling (default 200000)
   --full                print the ENTIRE rendered prompt (the literal payload)
   --json                print { packet, prompt } as JSON
@@ -3741,11 +4002,13 @@ async function diffCommand(args) {
       options: {
         base: { type: "string" },
         ceiling: { type: "string" },
+        conventions: { type: "string" },
         cwd: { type: "string" },
         "diff-file": { type: "string" },
         full: { type: "boolean" },
         help: { short: "h", type: "boolean" },
         json: { type: "boolean" },
+        "no-conventions": { type: "boolean" },
         pr: { type: "string" },
         profile: { type: "string" },
         reviewers: { type: "string" },
@@ -3782,7 +4045,7 @@ async function diffCommand(args) {
     "diff"
   );
   if (typeof ceiling === "object") return ceiling.code;
-  const cwd = values.cwd ? path7.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
   let acquired;
@@ -3801,11 +4064,37 @@ async function diffCommand(args) {
     console.error(`ensemble-ai diff: ${e.message}`);
     return 3;
   }
-  const preview = buildPacketPreview(acquired, profile);
+  let agentsMd;
+  let conventions;
+  if (!values["no-conventions"]) {
+    const reader = buildConventionReader(cwd, source.conventionsCtx);
+    if (reader) {
+      const changed = acquired.files.map((f) => f.path).filter((p) => p && p !== "unknown");
+      const gathered = await gatherConventions(reader, changed, {
+        conventions: parseConventionPaths(values.conventions)
+      });
+      if (gathered.text.trim()) agentsMd = gathered.text;
+      conventions = gathered.manifest;
+    }
+  }
+  const preview = buildPacketPreview(acquired, profile, agentsMd);
   if (values.json) {
-    console.log(JSON.stringify({ packet: preview.packet, prompt: preview.prompt }, null, 2));
+    console.log(
+      JSON.stringify(
+        { conventions, packet: preview.packet, prompt: preview.prompt },
+        null,
+        2
+      )
+    );
   } else {
-    console.log(renderPacketPreview(acquired, preview, { full: Boolean(values.full), profile, reviewers }));
+    console.log(
+      renderPacketPreview(acquired, preview, {
+        conventions,
+        full: Boolean(values.full),
+        profile,
+        reviewers
+      })
+    );
   }
   return 0;
 }

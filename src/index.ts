@@ -8,10 +8,14 @@
 // ── Contracts (vendor-neutral wire shapes) ──────────────────────────────────
 export * from './core/types';
 
-// ── Pure engine (packet · prompt · findings) ────────────────────────────────
+// ── Pure engine (packet · prompt · findings · conventions gatherer) ──────────
 export * from './core/findings';
 export * from './core/packet';
 export * from './core/prompt';
+// The conventions gatherer (the repo's linked md web) — consumed by BOTH the CLI
+// and the dashboard so there is ONE gatherer, no drift. Node-backed (fs reader),
+// so it lives on the main entry, not the browser-safe ./contracts.
+export * from './core/conventions';
 
 // ── Reviewer config + persistence ───────────────────────────────────────────
 export * from './core/reviewers';

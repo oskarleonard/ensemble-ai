@@ -365,11 +365,178 @@ ${ask}
 `;
 }
 
-// src/core/reviewers.ts
+// src/core/conventions.ts
 import fs from "fs";
-import os from "os";
 import path from "path";
-var REVIEWERS_FILE = process.env.ENSEMBLE_REVIEWERS_FILE || path.join(os.homedir(), ".ensemble-ai", "reviewers.json");
+var DEFAULT_CAP_BYTES = 8e4;
+var DEFAULT_MAX_FILES = 60;
+var ENTRY_FILES = ["CLAUDE.md", "AGENTS.md"];
+var COMMON_DOCS = ["CONTRIBUTING.md", "ARCHITECTURE.md", "TECH_DESIGN.md"];
+var SWEEP_DIRS = ["docs", "ai-spec"];
+function resolveInRepo(fromDir, ref) {
+  const first = ref.trim().split(/[#?\s]/)[0];
+  if (!first) return null;
+  if (first.startsWith("/") || first.startsWith("~")) return null;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(first)) return null;
+  const joined = path.posix.normalize(path.posix.join(fromDir || ".", first));
+  if (joined === ".." || joined.startsWith("../")) return null;
+  if (joined.startsWith("/")) return null;
+  return joined === "." ? "" : joined.replace(/^\.\//, "");
+}
+function dirOf(relPath) {
+  const d = path.posix.dirname(relPath);
+  return d === "." ? "" : d;
+}
+function joinDir(dir, file) {
+  return dir === "" ? file : `${dir}/${file}`;
+}
+function ancestorDirs(relPath) {
+  const dirs = [];
+  let d = dirOf(relPath);
+  for (; ; ) {
+    dirs.push(d);
+    if (d === "") break;
+    d = dirOf(d);
+  }
+  return dirs;
+}
+function extractRefs(content) {
+  const refs = /* @__PURE__ */ new Set();
+  for (const m of content.matchAll(/(?:^|\s)@([^\s)]+\.md)/gm)) refs.add(m[1]);
+  for (const m of content.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) refs.add(m[1]);
+  for (const m of content.matchAll(/\b(?:see|read|per|in)\s+`?([\w./-]+\.md)`?/gi)) {
+    refs.add(m[1]);
+  }
+  return [...refs];
+}
+function sliceBytes(s, maxBytes) {
+  const buf = Buffer.from(s, "utf8");
+  if (buf.length <= maxBytes) return s;
+  return buf.subarray(0, maxBytes).toString("utf8").replace(/�$/, "");
+}
+function fileHeader(rel) {
+  return `
+
+===== ${rel} =====
+`;
+}
+async function gatherConventions(reader, changedPaths, config = {}) {
+  const capBytes = config.capBytes ?? DEFAULT_CAP_BYTES;
+  const maxFiles = config.maxFiles ?? DEFAULT_MAX_FILES;
+  const dirs = /* @__PURE__ */ new Set([""]);
+  for (const p of changedPaths) {
+    const rel = resolveInRepo("", p);
+    if (rel === null || rel === "") continue;
+    for (const d of ancestorDirs(rel)) dirs.add(d);
+  }
+  const orderedDirs = [...dirs].sort(
+    (a, b) => a.length - b.length || (a < b ? -1 : 1)
+  );
+  const seen = /* @__PURE__ */ new Set();
+  const queue = [];
+  const enqueue = (rel) => {
+    if (!rel || !rel.endsWith(".md")) return;
+    if (seen.has(rel) || seen.size >= maxFiles) return;
+    seen.add(rel);
+    queue.push(rel);
+  };
+  for (const d of orderedDirs) {
+    for (const f of ENTRY_FILES) enqueue(joinDir(d, f));
+  }
+  for (const c of config.conventions ?? []) enqueue(resolveInRepo("", c));
+  for (const d of orderedDirs) {
+    for (const f of COMMON_DOCS) enqueue(joinDir(d, f));
+    for (const sweepDir of SWEEP_DIRS) {
+      for (const item of await reader.list(joinDir(d, sweepDir))) {
+        enqueue(resolveInRepo("", item));
+      }
+    }
+  }
+  const files = [];
+  const chunks = [];
+  let used = 0;
+  while (queue.length > 0) {
+    const rel = queue.shift();
+    const content = await reader.read(rel);
+    if (content === null) continue;
+    const bytes = Buffer.byteLength(content, "utf8");
+    const dir = dirOf(rel);
+    for (const ref of extractRefs(content)) enqueue(resolveInRepo(dir, ref));
+    const remaining = capBytes - used;
+    if (remaining <= 0) {
+      files.push({ path: rel, bytes, included: false, truncated: false, reason: "over-cap" });
+      continue;
+    }
+    if (bytes <= remaining) {
+      chunks.push(fileHeader(rel) + content);
+      used += bytes;
+      files.push({ path: rel, bytes, included: true, truncated: false });
+    } else {
+      const head = sliceBytes(content, remaining);
+      chunks.push(
+        `${fileHeader(rel)}${head}
+
+\u2026[${bytes - Buffer.byteLength(head, "utf8")} bytes truncated \u2014 over the ${capBytes}-byte conventions cap]\u2026
+`
+      );
+      used += Buffer.byteLength(head, "utf8");
+      files.push({ path: rel, bytes, included: true, truncated: true, reason: "over-cap" });
+    }
+  }
+  return {
+    text: chunks.join("").replace(/^\n+/, ""),
+    manifest: { capBytes, files, totalBytes: used }
+  };
+}
+function fsConventionReader(repoRoot) {
+  const root = path.resolve(repoRoot);
+  const within = (rel) => {
+    const abs = path.resolve(root, rel);
+    const back = path.relative(root, abs);
+    if (back.startsWith("..") || path.isAbsolute(back)) return null;
+    return abs;
+  };
+  return {
+    async read(rel) {
+      const abs = within(rel);
+      if (!abs) return null;
+      try {
+        if (!fs.statSync(abs).isFile()) return null;
+        return fs.readFileSync(abs, "utf8");
+      } catch {
+        return null;
+      }
+    },
+    async list(dirRel) {
+      const abs = within(dirRel);
+      if (!abs) return [];
+      try {
+        return fs.readdirSync(abs).filter((n) => n.endsWith(".md")).map((n) => joinDir(dirRel, n));
+      } catch {
+        return [];
+      }
+    }
+  };
+}
+function memoryConventionReader(fileMap) {
+  return {
+    async read(rel) {
+      return Object.prototype.hasOwnProperty.call(fileMap, rel) ? fileMap[rel] : null;
+    },
+    async list(dirRel) {
+      const prefix = dirRel === "" ? "" : `${dirRel}/`;
+      return Object.keys(fileMap).filter(
+        (p) => p.endsWith(".md") && p.startsWith(prefix) && !p.slice(prefix.length).includes("/")
+      );
+    }
+  };
+}
+
+// src/core/reviewers.ts
+import fs2 from "fs";
+import os from "os";
+import path2 from "path";
+var REVIEWERS_FILE = process.env.ENSEMBLE_REVIEWERS_FILE || path2.join(os.homedir(), ".ensemble-ai", "reviewers.json");
 var REVIEWER_DEFAULTS = {
   codex: {
     cmd: "codex",
@@ -415,7 +582,7 @@ function parseReviewers(raw) {
 }
 function loadReviewers(file = REVIEWERS_FILE) {
   try {
-    return parseReviewers(JSON.parse(fs.readFileSync(file, "utf8")));
+    return parseReviewers(JSON.parse(fs2.readFileSync(file, "utf8")));
   } catch {
     return { ...REVIEWER_DEFAULTS };
   }
@@ -429,24 +596,24 @@ function listReviewers(file = REVIEWERS_FILE) {
 }
 
 // src/core/artifacts.ts
-import fs2 from "fs";
-import path2 from "path";
+import fs3 from "fs";
+import path3 from "path";
 function sanitizePathSegment(s) {
   return s.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 function reviewDir(baseDir, runId) {
-  return path2.join(baseDir, sanitizePathSegment(runId) || "unknown");
+  return path3.join(baseDir, sanitizePathSegment(runId) || "unknown");
 }
 function writeAtomic(dir, name, content) {
-  fs2.mkdirSync(dir, { recursive: true });
-  const target = path2.join(dir, name);
+  fs3.mkdirSync(dir, { recursive: true });
+  const target = path3.join(dir, name);
   const tmp = `${target}.tmp`;
-  fs2.writeFileSync(tmp, content);
-  fs2.renameSync(tmp, target);
+  fs3.writeFileSync(tmp, content);
+  fs3.renameSync(tmp, target);
 }
 function readJson(file) {
   try {
-    return JSON.parse(fs2.readFileSync(file, "utf8"));
+    return JSON.parse(fs3.readFileSync(file, "utf8"));
   } catch {
     return null;
   }
@@ -494,10 +661,10 @@ function persistReview(baseDir, input) {
 }
 function readReview(baseDir, runId, reviewerId = "codex") {
   const dir = reviewDir(baseDir, runId);
-  const perId = readJson(path2.join(dir, reviewJson(reviewerId)));
+  const perId = readJson(path3.join(dir, reviewJson(reviewerId)));
   if (perId) return perId.reviewerId ? perId : { ...perId, reviewerId };
   if (reviewerId === "codex") {
-    const legacy = readJson(path2.join(dir, "review.json"));
+    const legacy = readJson(path3.join(dir, "review.json"));
     if (legacy) return { ...legacy, reviewerId: "codex" };
   }
   return null;
@@ -513,12 +680,12 @@ function readReviewsForRun(baseDir, runId) {
 
 // src/core/spawn.ts
 import { spawn } from "child_process";
-import fs4 from "fs";
+import fs5 from "fs";
 import os2 from "os";
 
 // src/core/bin.ts
 import { execFileSync } from "child_process";
-import fs3 from "fs";
+import fs4 from "fs";
 var binCache = /* @__PURE__ */ new Map();
 function resolveBin(name, opts = {}) {
   const cached = binCache.get(name);
@@ -528,7 +695,7 @@ function resolveBin(name, opts = {}) {
     ...opts.candidates ?? []
   ].filter((c) => Boolean(c));
   for (const c of candidates) {
-    if (fs3.existsSync(c)) {
+    if (fs4.existsSync(c)) {
       binCache.set(name, c);
       return c;
     }
@@ -620,9 +787,9 @@ function runReviewerExec(opts) {
         if (text) raw = text;
       } else {
         try {
-          const text = fs4.readFileSync(outFile ?? "", "utf8").trim();
+          const text = fs5.readFileSync(outFile ?? "", "utf8").trim();
           if (text) raw = text;
-          fs4.unlinkSync(outFile ?? "");
+          fs5.unlinkSync(outFile ?? "");
         } catch {
         }
       }
@@ -648,7 +815,7 @@ function sha256Hex(input) {
 
 // src/reviewers/codex.ts
 import os3 from "os";
-import path3 from "path";
+import path4 from "path";
 var REVIEW_TIMEOUT_MS = 72e4;
 function buildCodexReviewArgs(config, outFile, prompt) {
   return [
@@ -670,7 +837,7 @@ function buildCodexReviewArgs(config, outFile, prompt) {
 }
 function runCodexReview(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  const outFile = path3.join(
+  const outFile = path4.join(
     os3.tmpdir(),
     `codex-review-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
   );
@@ -690,10 +857,10 @@ function runCodexReview(prompt, config, opts = {}) {
 }
 
 // src/reviewers/grok.ts
-import fs5 from "fs";
+import fs6 from "fs";
 import os4 from "os";
-import path4 from "path";
-var GROK_BIN_CANDIDATES = [path4.join(os4.homedir(), ".grok", "bin", "grok")];
+import path5 from "path";
+var GROK_BIN_CANDIDATES = [path5.join(os4.homedir(), ".grok", "bin", "grok")];
 function resolveGrokBin() {
   return resolveBin("grok", {
     candidates: GROK_BIN_CANDIDATES,
@@ -736,19 +903,19 @@ function replaceReviewSection(content) {
   const after = lines.slice(to).join("\n").replace(/^\n+/, "");
   return [before, REVIEW_PROFILE.trimEnd(), after].filter((s) => s.length > 0).join("\n\n") + "\n";
 }
-function ensureSandboxProfile(profile, file = path4.join(os4.homedir(), ".grok", "sandbox.toml")) {
+function ensureSandboxProfile(profile, file = path5.join(os4.homedir(), ".grok", "sandbox.toml")) {
   if (BUILTIN_SANDBOXES.has(profile) || profile !== REVIEW_PROFILE_NAME) return;
   try {
-    const existing = fs5.existsSync(file) ? fs5.readFileSync(file, "utf8") : "";
+    const existing = fs6.existsSync(file) ? fs6.readFileSync(file, "utf8") : "";
     if (existing.includes(REVIEW_PROFILE_BLOCK)) return;
-    fs5.mkdirSync(path4.dirname(file), { recursive: true });
+    fs6.mkdirSync(path5.dirname(file), { recursive: true });
     const updated = existing.includes(REVIEW_PROFILE_HEADER) ? replaceReviewSection(existing) : null;
     const content = updated ?? (existing.trim() ? `${existing.trimEnd()}
 
 ${REVIEW_PROFILE}` : REVIEW_PROFILE);
     const tmp = `${file}.tmp`;
-    fs5.writeFileSync(tmp, content);
-    fs5.renameSync(tmp, file);
+    fs6.writeFileSync(tmp, content);
+    fs6.renameSync(tmp, file);
   } catch {
   }
 }
@@ -785,7 +952,7 @@ function runGrokReview(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const sandbox = resolveReviewSandbox(config.sandbox);
   ensureSandboxProfile(sandbox);
-  const cwd = fs5.mkdtempSync(path4.join(os4.tmpdir(), "grok-review-"));
+  const cwd = fs6.mkdtempSync(path5.join(os4.tmpdir(), "grok-review-"));
   return runReviewerExec({
     args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
     bin: resolveGrokBin(),
@@ -795,7 +962,7 @@ function runGrokReview(prompt, config, opts = {}) {
     timeoutMs
   }).then(({ raw, stderrTail, timedOut }) => {
     try {
-      fs5.rmSync(cwd, { force: true, recursive: true });
+      fs6.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
     const text = raw ? extractGrokText(raw) : null;
@@ -828,9 +995,9 @@ var GENERATED_PATTERNS = [
   /\.(js|css)\.map$/,
   /\.snap$/
 ];
-function classifyFileKind(path7, isBinary) {
+function classifyFileKind(path8, isBinary) {
   if (isBinary) return "binary";
-  return GENERATED_PATTERNS.some((re) => re.test(path7)) ? "generated" : "source";
+  return GENERATED_PATTERNS.some((re) => re.test(path8)) ? "generated" : "source";
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -848,7 +1015,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path7 = pathOfSection(section2);
+    const path8 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -859,8 +1026,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path7, isBinary),
-      path: path7,
+      kind: classifyFileKind(path8, isBinary),
+      path: path8,
       raw: section2,
       removed
     };
@@ -1102,9 +1269,9 @@ function hasDepSurface(r) {
 }
 
 // src/modes/review/receipt.ts
-import fs6 from "fs";
+import fs7 from "fs";
 import os5 from "os";
-import path5 from "path";
+import path6 from "path";
 function computePolicyHash(args) {
   const canonical = JSON.stringify({
     coveragePolicy: args.coveragePolicy,
@@ -1127,10 +1294,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path5.join(os5.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path6.join(os5.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path5.join(
+  return path6.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -1151,10 +1318,10 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs6.mkdirSync(path5.dirname(file), { recursive: true });
+  fs7.mkdirSync(path6.dirname(file), { recursive: true });
   const tmp = `${file}.tmp`;
-  fs6.writeFileSync(tmp, JSON.stringify(receipt, null, 2));
-  fs6.renameSync(tmp, file);
+  fs7.writeFileSync(tmp, JSON.stringify(receipt, null, 2));
+  fs7.renameSync(tmp, file);
   return file;
 }
 function validateReceiptShape(value) {
@@ -1195,7 +1362,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs6.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs7.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -1421,8 +1588,23 @@ async function runReviewMode(opts) {
       secretScan
     };
   }
+  let agentsMd = opts.agentsMd;
+  let conventionManifest;
+  if (!opts.noConventions && opts.conventionReader) {
+    const changed = acquired.files.map((f) => f.path).filter((p) => p && p !== "unknown");
+    const gathered = await gatherConventions(opts.conventionReader, changed, {
+      capBytes: opts.conventionCapBytes,
+      conventions: opts.conventionPaths
+    });
+    if (gathered.text.trim()) agentsMd = gathered.text;
+    conventionManifest = gathered.manifest;
+    const inc = gathered.manifest.files.filter((f) => f.included).length;
+    log(
+      `Conventions: ${inc}/${gathered.manifest.files.length} file(s), ${gathered.manifest.totalBytes} bytes gathered`
+    );
+  }
   const packet = assembleCodePacket({
-    agentsMd: opts.agentsMd,
+    agentsMd,
     authorSummary: opts.authorSummary,
     diff: acquired.diff,
     objective: opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE),
@@ -1476,10 +1658,10 @@ async function runReviewMode(opts) {
     const store = opts.receiptStore ?? defaultReceiptStore();
     const file = writeReceipt(store, built.receipt);
     log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, depSurface, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, receiptError: built.error, reviews, secretScan };
 }
 
 // src/modes/brainstorm/types.ts
@@ -1721,9 +1903,9 @@ a tight ranked list of the genuinely strong ideas over a long one.
 }
 
 // src/modes/brainstorm/voices.ts
-import fs7 from "fs";
+import fs8 from "fs";
 import os6 from "os";
-import path6 from "path";
+import path7 from "path";
 
 // src/modes/brainstorm/claude.ts
 function resolveClaudeBin() {
@@ -1793,7 +1975,7 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), o),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), o)
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path6.join(os6.homedir(), ".ensemble-ai", "voices.json");
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path7.join(os6.homedir(), ".ensemble-ai", "voices.json");
 function str3(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
@@ -1819,7 +2001,7 @@ function parseVoices(raw) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs7.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs8.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
@@ -2444,7 +2626,10 @@ export {
   ensureSandboxProfile,
   extractGrokText,
   extractJsonBlock,
+  extractRefs,
   fallbackSynthesis,
+  fsConventionReader,
+  gatherConventions,
   hasDepSurface,
   isDiffReviewed,
   isImplemented,
@@ -2459,6 +2644,7 @@ export {
   loadReviewers,
   loadVoices,
   makeEscalatingKill,
+  memoryConventionReader,
   omittedLine,
   oneOf,
   parseCritique,
@@ -2487,6 +2673,7 @@ export {
   resolveClaudeBin,
   resolveCodexBin,
   resolveGrokBin,
+  resolveInRepo,
   resolveMode,
   resolveRepoId,
   resolveReviewSandbox,
