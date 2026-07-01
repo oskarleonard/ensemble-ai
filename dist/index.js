@@ -1,3 +1,9 @@
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+
 // src/core/types.ts
 var REVIEWER_IDS = ["codex", "grok"];
 function isReviewerId(v) {
@@ -1941,13 +1947,403 @@ async function runBrainstormMode(opts) {
   return { critique, generate, roster, synthesis, topic: opts.topic };
 }
 
+// src/modes/consult/index.ts
+var consult_exports = {};
+__export(consult_exports, {
+  DEFAULT_VOICE_TIMEOUT_MS: () => DEFAULT_VOICE_TIMEOUT_MS2,
+  fallbackSynthesis: () => fallbackSynthesis2,
+  pickSynthesizer: () => pickSynthesizer2,
+  runConsultMode: () => runConsultMode
+});
+
+// src/modes/consult/parse.ts
+function str4(v) {
+  return typeof v === "string" ? v.trim() : "";
+}
+function asStance2(v) {
+  return oneOf(CRITIQUE_STANCES, v, "concern");
+}
+function strList(v) {
+  if (!Array.isArray(v)) return [];
+  return [...new Set(v.map(str4).filter(Boolean))];
+}
+function parseAnswer(raw) {
+  const obj = extractJsonBlock(raw);
+  if (!obj || typeof obj !== "object") {
+    return { answer: "", keyPoints: [], parseError: "no parseable JSON block in the output", summary: "" };
+  }
+  const o = obj;
+  const summary = str4(o.summary);
+  const answer = str4(o.answer);
+  const keyPoints = strList(o.keyPoints);
+  if (!summary && !answer) {
+    return { answer: "", keyPoints, parseError: 'output has no "answer" or "summary"', summary: "" };
+  }
+  return { answer, keyPoints, summary };
+}
+function parseCritique2(raw) {
+  const obj = extractJsonBlock(raw);
+  if (!obj || typeof obj !== "object") {
+    return { notes: [], parseError: "no parseable JSON block in the output", summary: "" };
+  }
+  const o = obj;
+  const summary = str4(o.summary);
+  if (!Array.isArray(o.notes)) {
+    return { notes: [], parseError: 'output has no "notes" array', summary };
+  }
+  const notes = [];
+  for (const rn of o.notes) {
+    if (!rn || typeof rn !== "object") continue;
+    const n = rn;
+    const target = str4(n.target);
+    const assessment = str4(n.assessment);
+    if (!target && !assessment) continue;
+    notes.push({ assessment, stance: asStance2(n.stance), target: target || "(unspecified)" });
+  }
+  return { notes, summary };
+}
+function parseAgreements(v) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const ra of v) {
+    if (!ra || typeof ra !== "object") continue;
+    const a = ra;
+    const point = str4(a.point);
+    if (!point) continue;
+    out.push({ point, voices: strList(a.voices) });
+  }
+  return out;
+}
+function parseDivergences(v) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const rd of v) {
+    if (!rd || typeof rd !== "object") continue;
+    const d = rd;
+    const point = str4(d.point);
+    if (!point) continue;
+    out.push({ point, positions: strList(d.positions) });
+  }
+  return out;
+}
+function parseConsultSynthesis(raw) {
+  const obj = extractJsonBlock(raw);
+  if (!obj || typeof obj !== "object") {
+    return {
+      agreements: [],
+      divergences: [],
+      parseError: "no parseable JSON block in the output",
+      recommendation: "",
+      summary: ""
+    };
+  }
+  const o = obj;
+  const summary = str4(o.summary);
+  const recommendation = str4(o.recommendation);
+  const agreements = parseAgreements(o.agreements);
+  const divergences = parseDivergences(o.divergences);
+  if (!recommendation && !summary) {
+    return {
+      agreements,
+      divergences,
+      parseError: 'output has no "recommendation" or "summary"',
+      recommendation: "",
+      summary: ""
+    };
+  }
+  return { agreements, divergences, recommendation, summary };
+}
+
+// src/modes/consult/prompt.ts
+var JSON_RULE2 = "Respond with ONE fenced ```json block and NOTHING else, matching:";
+var FILE_CONTEXT_BUDGET2 = 24e3;
+function contextBlock2(fileContext) {
+  if (!fileContext || !fileContext.trim()) return "";
+  const trimmed = fileContext.trimEnd();
+  const body = trimmed.length > FILE_CONTEXT_BUDGET2 ? `${trimmed.slice(0, FILE_CONTEXT_BUDGET2)}
+\u2026[context truncated]` : trimmed;
+  return `
+## Context
+${body}
+`;
+}
+function renderAnswerPrompt(question, fileContext) {
+  return `You are an independent expert answering a question inside a multi-model
+consultation. Work ENTIRELY ON YOUR OWN: you have no knowledge of anyone else's
+answer \u2014 do not hedge toward, anticipate, or defer to a consensus. Give YOUR honest,
+reasoned answer. Where you are uncertain, say so plainly.
+
+## Question
+${question.trim()}
+${contextBlock2(fileContext)}
+## Output format \u2014 STRICT
+${JSON_RULE2}
+{
+  "summary": "<your bottom-line answer in one sentence>",
+  "answer": "<your full reasoned answer: the recommendation and the WHY>",
+  "keyPoints": ["<a discrete claim or consideration behind your answer>"]
+}
+Give 2-5 keyPoints \u2014 the load-bearing claims of your answer, each a standalone
+sentence (these are what the ensemble compares across voices). Be decisive; do not
+pad.
+`;
+}
+function peerAnswersBlock(peers) {
+  return peers.map(
+    (p) => `[${p.voiceId}] ${p.summary}
+${p.answer}${p.keyPoints.length ? `
+- ${p.keyPoints.join("\n- ")}` : ""}`
+  ).join("\n\n");
+}
+function renderCritiquePrompt2(question, peers, fileContext) {
+  return `You are a sharp, candid participant in a multi-model consultation. Below are
+answers from the OTHER voices (you did not write these) to the question. For the
+strongest points, say where you AGREE, where you have a CONCERN or disagree, and where
+an answer should be REFINED. Be specific \u2014 this sharpens the final synthesis.
+
+## Question
+${question.trim()}
+${contextBlock2(fileContext)}
+## Answers from the other voices
+${peerAnswersBlock(peers)}
+
+## Output format \u2014 STRICT
+${JSON_RULE2}
+{
+  "summary": "<your overall read of where the voices land>",
+  "notes": [
+    {
+      "target": "<the [voice] or claim you are addressing>",
+      "stance": "support" | "concern" | "extend",
+      "assessment": "<concrete: what you agree with, what you doubt, how to refine>"
+    }
+  ]
+}
+An empty "notes" array is fine if you have nothing to add.
+`;
+}
+var SYNTHESIS_FIELD_BUDGET2 = 2500;
+function cap2(s) {
+  return s.length > SYNTHESIS_FIELD_BUDGET2 ? `${s.slice(0, SYNTHESIS_FIELD_BUDGET2)}\u2026[truncated]` : s;
+}
+function answersBlock(answers) {
+  return answers.filter((a) => a.ok).map(
+    (a) => `[${a.voiceId}] ${cap2(a.summary)}
+${cap2(a.answer)}${a.keyPoints.length ? `
+key points:
+- ${a.keyPoints.map(cap2).join("\n- ")}` : ""}`
+  ).join("\n\n");
+}
+function critiqueBlock(critique) {
+  const lines = [];
+  for (const c of critique) {
+    if (!c.ok) continue;
+    for (const n of c.notes) {
+      lines.push(`(${c.voiceId}) ${n.stance} on ${cap2(n.target)}: ${cap2(n.assessment)}`);
+    }
+  }
+  return lines.length ? `
+
+## Cross-critique notes
+${lines.join("\n")}` : "";
+}
+function renderSynthesisPrompt2(question, answers, critique) {
+  return `You are the SYNTHESIZER for a multi-model consultation. Several models each
+answered the SAME question INDEPENDENTLY (they did not see each other's answers).
+Compare them and separate the signal:
+- AGREEMENTS: substantive points the voices CONCUR on \u2014 these are the confident core.
+- DIVERGENCES: points they answered DIFFERENTLY \u2014 flag these as "look closer", and
+  record who took which position.
+Then give ONE bottom-line recommendation, noting how much of it rests on agreement
+vs on a judgement call between diverging views.
+
+## Question
+${question.trim()}
+
+## Independent answers
+${answersBlock(answers)}${critiqueBlock(critique)}
+
+## Output format \u2014 STRICT
+${JSON_RULE2}
+{
+  "summary": "<the headline answer in 2-3 sentences>",
+  "agreements": [
+    { "point": "<a substantive point the voices agree on>", "voices": ["codex", "grok"] }
+  ],
+  "divergences": [
+    { "point": "<the question they split on>", "positions": ["codex: X", "grok: Y"] }
+  ],
+  "recommendation": "<the bottom-line answer, and how confident given agree vs diverge>"
+}
+Only list a REAL agreement (genuine concurrence, not a superficial overlap) and a
+REAL divergence (a substantive split, not wording). Empty arrays are fine.
+`;
+}
+
+// src/modes/consult/index.ts
+var DEFAULT_VOICE_TIMEOUT_MS2 = 3e5;
+async function runAnswer(voiceId, adapters, configs, prompt, timeoutMs, log) {
+  const config = configs[voiceId];
+  log(`  \xB7 ${voiceId} (${config.vendor} \xB7 ${config.model}) answering\u2026`);
+  let res;
+  try {
+    res = await adapters[voiceId](prompt, config, { timeoutMs });
+  } catch (e) {
+    log(`  \xB7 ${voiceId}: failed to run \u2014 ${e.message}`);
+    return { answer: "", error: e.message, keyPoints: [], ok: false, raw: null, summary: "", voiceId };
+  }
+  if (!res.raw || res.timedOut) {
+    const error = res.timedOut ? "timed out" : "produced no output";
+    log(`  \xB7 ${voiceId}: ${error}`);
+    return { answer: "", error, keyPoints: [], ok: false, raw: res.raw, summary: "", timedOut: res.timedOut, voiceId };
+  }
+  const parsed = parseAnswer(res.raw);
+  if (parsed.parseError) {
+    log(`  \xB7 ${voiceId}: ${parsed.parseError}`);
+    return { answer: "", error: parsed.parseError, keyPoints: [], ok: false, raw: res.raw, summary: parsed.summary, voiceId };
+  }
+  log(`  \xB7 ${voiceId}: answered (${parsed.keyPoints.length} key point(s))`);
+  return {
+    answer: parsed.answer,
+    keyPoints: parsed.keyPoints,
+    ok: true,
+    raw: res.raw,
+    summary: parsed.summary,
+    voiceId
+  };
+}
+async function runCritique2(voiceId, adapters, configs, question, answers, fileContext, timeoutMs, log) {
+  const config = configs[voiceId];
+  const peers = answers.filter((a) => a.ok && a.voiceId !== voiceId);
+  const prompt = renderCritiquePrompt2(question, peers, fileContext);
+  log(`  \xB7 ${voiceId} reviewing ${peers.length} peer answer(s)\u2026`);
+  let res;
+  try {
+    res = await adapters[voiceId](prompt, config, { timeoutMs });
+  } catch (e) {
+    return { error: e.message, notes: [], ok: false, raw: null, summary: "", voiceId };
+  }
+  if (!res.raw || res.timedOut) {
+    const error = res.timedOut ? "timed out" : "produced no output";
+    return { error, notes: [], ok: false, raw: res.raw, summary: "", timedOut: res.timedOut, voiceId };
+  }
+  const parsed = parseCritique2(res.raw);
+  if (parsed.parseError) {
+    return { error: parsed.parseError, notes: [], ok: false, raw: res.raw, summary: parsed.summary, voiceId };
+  }
+  log(`  \xB7 ${voiceId}: ${parsed.notes.length} note(s)`);
+  return { notes: parsed.notes, ok: true, raw: res.raw, summary: parsed.summary, voiceId };
+}
+function fallbackSynthesis2(answers) {
+  const ok = answers.filter((a) => a.ok);
+  return {
+    agreements: [],
+    by: null,
+    degraded: true,
+    divergences: ok.map((a) => ({
+      point: a.summary || `${a.voiceId}'s answer`,
+      positions: [`${a.voiceId}: ${(a.summary || a.answer).slice(0, 200)}`]
+    })),
+    ok: false,
+    raw: null,
+    recommendation: "",
+    summary: ok.length > 0 ? `Synthesizer unavailable \u2014 ${ok.length} answer(s) shown as-is, NOT compared for agreement.` : "No answers were produced."
+  };
+}
+async function runSynthesis2(synthId, adapters, configs, question, answers, critique, timeoutMs, log) {
+  const okAnswers = answers.filter((a) => a.ok);
+  if (!synthId || okAnswers.length === 0) return fallbackSynthesis2(answers);
+  const prompt = renderSynthesisPrompt2(question, answers, critique);
+  log(`Synthesizing with ${synthId} \u2014 agreement vs divergence\u2026`);
+  let res;
+  try {
+    res = await adapters[synthId](prompt, configs[synthId], { timeoutMs });
+  } catch (e) {
+    log(`  \xB7 synthesis failed (${synthId}) \u2014 using the deterministic fallback`);
+    return { ...fallbackSynthesis2(answers), error: e.message };
+  }
+  if (!res.raw || res.timedOut) {
+    log(`  \xB7 synthesis produced no usable output \u2014 using the deterministic fallback`);
+    return {
+      ...fallbackSynthesis2(answers),
+      error: res.timedOut ? "synthesis timed out" : "synthesis produced no output"
+    };
+  }
+  const parsed = parseConsultSynthesis(res.raw);
+  if (parsed.parseError) {
+    log(`  \xB7 synthesis output not parseable \u2014 using the deterministic fallback`);
+    return { ...fallbackSynthesis2(answers), error: parsed.parseError, raw: res.raw };
+  }
+  log(
+    `  \xB7 synthesis: ${parsed.agreements.length} agreement(s), ${parsed.divergences.length} divergence(s)`
+  );
+  return {
+    agreements: parsed.agreements,
+    by: synthId,
+    degraded: false,
+    divergences: parsed.divergences,
+    ok: true,
+    raw: res.raw,
+    recommendation: parsed.recommendation,
+    summary: parsed.summary
+  };
+}
+function pickSynthesizer2(roster, requested, answers) {
+  if (requested && roster.includes(requested)) return requested;
+  const healthy = answers.filter((a) => a.ok).map((a) => a.voiceId);
+  if (healthy.includes("claude")) return "claude";
+  return healthy[0] ?? null;
+}
+async function runConsultMode(opts) {
+  const log = opts.onProgress ?? (() => {
+  });
+  const roster = opts.voices && opts.voices.length > 0 ? opts.voices : [...VOICE_IDS];
+  const adapters = opts.adapters ?? VOICE_ADAPTERS;
+  const configs = opts.voiceConfigs ?? loadVoices(opts.voicesFile);
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_VOICE_TIMEOUT_MS2;
+  log(`Round 1 \xB7 independent answers \u2014 ${roster.length} voice(s): ${roster.join(", ")}`);
+  const answerPrompt = renderAnswerPrompt(opts.question, opts.fileContext);
+  const answers = await Promise.all(
+    roster.map((id) => runAnswer(id, adapters, configs, answerPrompt, timeoutMs, log))
+  );
+  const participants = answers.filter((a) => a.ok).map((a) => a.voiceId);
+  let critique = [];
+  if (opts.critique && participants.length >= 2) {
+    log(`Round 2 \xB7 cross-critique \u2014 ${participants.length} voice(s)`);
+    critique = await Promise.all(
+      participants.map(
+        (id) => runCritique2(id, adapters, configs, opts.question, answers, opts.fileContext, timeoutMs, log)
+      )
+    );
+  } else if (opts.critique) {
+    log(`Round 2 \xB7 skipped \u2014 need \u22652 voices with answers (have ${participants.length})`);
+  }
+  const synthId = pickSynthesizer2(roster, opts.synthesizer, answers);
+  const synthesis = await runSynthesis2(
+    synthId,
+    adapters,
+    configs,
+    opts.question,
+    answers,
+    critique,
+    timeoutMs,
+    log
+  );
+  return { answers, critique, question: opts.question, roster, synthesis };
+}
+
 // src/modes/index.ts
-var MODES = ["review", "brainstorm", "security"];
+var MODES = ["review", "brainstorm", "security", "consult"];
 var IMPLEMENTED_MODES = [
   "review",
   "security",
-  "brainstorm"
+  "brainstorm",
+  "consult"
 ];
+var MODE_ALIASES = { ask: "consult" };
+function resolveMode(v) {
+  return MODE_ALIASES[v] ?? v;
+}
 function isMode(v) {
   return MODES.includes(v);
 }
@@ -1963,6 +2359,7 @@ export {
   FINDINGS_INSTRUCTIONS,
   IMPLEMENTED_MODES,
   MODES,
+  MODE_ALIASES,
   PACKET_BUDGETS,
   REVIEWERS_FILE,
   REVIEWER_DEFAULTS,
@@ -1989,6 +2386,7 @@ export {
   classifySecurityFinding,
   computeCoverage,
   computePolicyHash,
+  consult_exports as consult,
   coverageShortfall,
   defaultReceiptStore,
   diffDigest,
@@ -2036,6 +2434,7 @@ export {
   resolveClaudeBin,
   resolveCodexBin,
   resolveGrokBin,
+  resolveMode,
   resolveRepoId,
   resolveReviewSandbox,
   resolveReviewer,

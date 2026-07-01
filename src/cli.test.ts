@@ -13,14 +13,19 @@ import type { ReviewModeResult } from './modes/review';
 vi.mock('./modes/review', () => ({ runReviewMode: vi.fn() }));
 // Same for brainstorm: test the dispatch + arg-parsing contract, never spawn voices.
 vi.mock('./modes/brainstorm', () => ({ runBrainstormMode: vi.fn() }));
+// Same for consult: test the dispatch + arg-parsing + alias contract, never spawn.
+vi.mock('./modes/consult', () => ({ runConsultMode: vi.fn() }));
 
 import { main } from './cli';
 import { runBrainstormMode } from './modes/brainstorm';
 import type { BrainstormResult } from './modes/brainstorm/types';
+import { runConsultMode } from './modes/consult';
+import type { ConsultResult } from './modes/consult/types';
 import { runReviewMode } from './modes/review';
 
 const mockRun = vi.mocked(runReviewMode);
 const mockBrainstorm = vi.mocked(runBrainstormMode);
+const mockConsult = vi.mocked(runConsultMode);
 
 function storedReview(
   reviewerId: ReviewerId,
@@ -70,6 +75,7 @@ function result(over: Partial<ReviewModeResult>): ReviewModeResult {
 beforeEach(() => {
   mockRun.mockReset();
   mockBrainstorm.mockReset();
+  mockConsult.mockReset();
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
 });
@@ -378,5 +384,119 @@ describe('brainstorm dispatch + arg parsing', () => {
     const printed = vi.mocked(console.log).mock.calls.map((c) => c.join(' ')).join('\n');
     expect(printed).not.toContain(ESC); // no escape char reached the terminal
     expect(printed).toContain('Winner'); // the cleaned content is still rendered
+  });
+});
+
+describe('consult dispatch + arg parsing (+ ask alias)', () => {
+  function consultResult(over: Partial<ConsultResult> = {}): ConsultResult {
+    return {
+      answers: [
+        { answer: 'a', keyPoints: ['p'], ok: true, raw: '{}', summary: 's', voiceId: 'codex' },
+      ],
+      critique: [],
+      question: 'q',
+      roster: ['codex', 'grok', 'claude'],
+      synthesis: {
+        agreements: [],
+        by: 'claude',
+        degraded: false,
+        divergences: [],
+        ok: true,
+        raw: null,
+        recommendation: 'do X',
+        summary: 's',
+      },
+      ...over,
+    };
+  }
+
+  it('a question → fires consult and exits 0', async () => {
+    mockConsult.mockResolvedValue(consultResult());
+    expect(await main(['consult', 'Postgres', 'or', 'SQLite?'])).toBe(0);
+    expect(mockConsult).toHaveBeenCalledWith(
+      expect.objectContaining({ critique: false, question: 'Postgres or SQLite?' })
+    );
+  });
+
+  it('the `ask` alias routes to consult', async () => {
+    mockConsult.mockResolvedValue(consultResult());
+    expect(await main(['ask', 'should I ship it?'])).toBe(0);
+    expect(mockConsult).toHaveBeenCalledWith(
+      expect.objectContaining({ question: 'should I ship it?' })
+    );
+  });
+
+  it('no question → usage error (exit 3), nothing fired', async () => {
+    expect(await main(['consult'])).toBe(3);
+    expect(mockConsult).not.toHaveBeenCalled();
+  });
+
+  it('--help → exit 0, nothing fired', async () => {
+    expect(await main(['consult', '--help'])).toBe(0);
+    expect(mockConsult).not.toHaveBeenCalled();
+  });
+
+  it('--critique flag is threaded to the engine', async () => {
+    mockConsult.mockResolvedValue(consultResult());
+    await main(['consult', 'q', '--critique']);
+    expect(mockConsult).toHaveBeenCalledWith(expect.objectContaining({ critique: true }));
+  });
+
+  it('--voices with an unknown id → usage error (exit 3), fail closed', async () => {
+    expect(await main(['consult', 'q', '--voices', 'codex,gemini'])).toBe(3);
+    expect(mockConsult).not.toHaveBeenCalled();
+  });
+
+  it('--synthesizer outside the --voices roster → usage error (exit 3)', async () => {
+    expect(await main(['consult', 'q', '--voices', 'codex,grok', '--synthesizer', 'claude'])).toBe(3);
+    expect(mockConsult).not.toHaveBeenCalled();
+  });
+
+  it('--timeout seconds → milliseconds threaded to the engine', async () => {
+    mockConsult.mockResolvedValue(consultResult());
+    await main(['consult', 'q', '--timeout', '45', '--voices', 'codex,grok']);
+    expect(mockConsult).toHaveBeenCalledWith(
+      expect.objectContaining({ timeoutMs: 45_000, voices: ['codex', 'grok'] })
+    );
+  });
+
+  it('an unexpected orchestration throw → exit 3 (not the all-empty 1)', async () => {
+    mockConsult.mockRejectedValue(new Error('boom'));
+    expect(await main(['consult', 'q'])).toBe(3);
+  });
+
+  it('every voice failed (no answers) → exit 1', async () => {
+    mockConsult.mockResolvedValue(
+      consultResult({
+        answers: [{ answer: '', error: 'boom', keyPoints: [], ok: false, raw: null, summary: '', voiceId: 'codex' }],
+      })
+    );
+    expect(await main(['consult', 'q'])).toBe(1);
+  });
+
+  it('printConsult strips control/ANSI escapes from untrusted voice output', async () => {
+    const ESC = '\u001b';
+    mockConsult.mockResolvedValue(
+      consultResult({
+        answers: [
+          { answer: `ans${ESC}[31m`, keyPoints: [`kp${ESC}[5m`], ok: true, raw: '{}', summary: `s${ESC}[1m`, voiceId: 'codex' },
+        ],
+        synthesis: {
+          agreements: [{ point: `agree${ESC}[0m`, voices: [`codex${ESC}[31m`] }],
+          by: 'claude',
+          degraded: false,
+          divergences: [{ point: `split${ESC}[7m`, positions: [`codex: now${ESC}[4m`] }],
+          ok: true,
+          raw: null,
+          recommendation: `rec${ESC}[9m`,
+          summary: `head${ESC}[2m`,
+        },
+      })
+    );
+    expect(await main(['consult', 'q'])).toBe(0);
+    const printed = vi.mocked(console.log).mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(printed).not.toContain(ESC);
+    expect(printed).toContain('agree');
+    expect(printed).toContain('split');
   });
 });

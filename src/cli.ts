@@ -23,7 +23,9 @@ import {
   VOICE_IDS,
   type VoiceId,
 } from './modes/brainstorm/types';
-import { isImplemented, isMode } from './modes';
+import { runConsultMode } from './modes/consult';
+import type { ConsultResult } from './modes/consult/types';
+import { isImplemented, isMode, resolveMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
 import type { DiffMode } from './modes/review/diff';
@@ -52,9 +54,12 @@ Modes:
   brainstorm   Cross-vendor ideation on a TOPIC (implemented) — each voice
                generates ideas independently, critiques the others, then one
                synthesizes a ranked, de-duplicated recommendation.
+  consult      Cross-vendor Q&A on a QUESTION (implemented; alias: ask) — each
+               voice answers independently, then one synthesizes what they AGREE
+               on (confident) vs where they DIVERGE (look closer).
 
-Run \`ensemble-ai review --help\`, \`ensemble-ai security --help\`, or
-\`ensemble-ai brainstorm --help\` for options.`;
+Run \`ensemble-ai review --help\`, \`ensemble-ai security --help\`,
+\`ensemble-ai brainstorm --help\`, or \`ensemble-ai consult --help\` for options.`;
 
 const REVIEW_USAGE = `ensemble-ai review — review a diff with ALL configured AI reviewers.
 
@@ -726,15 +731,251 @@ async function brainstormCommand(args: string[]): Promise<number> {
   return anyIdeas ? 0 : 1;
 }
 
-export async function main(argv: string[]): Promise<number> {
-  const mode = argv[0];
-  if (!mode || mode === '-h' || mode === '--help') {
-    console.log(USAGE);
-    return mode ? 0 : 1;
+const CONSULT_USAGE = `ensemble-ai consult — convene multiple AI voices on a QUESTION.
+
+Usage:
+  ensemble-ai consult "<question>" [options]
+  ensemble-ai ask "<question>" [options]      (alias)
+
+Each voice answers the question INDEPENDENTLY (no anchoring), then one voice
+synthesizes: what the voices AGREE on (the confident core) vs where they DIVERGE
+(flagged "look closer", with who took which position) + a bottom-line
+recommendation. Voices: codex + grok + claude by default. For decisions + research.
+
+Options:
+  --file <path>         include a file's contents as shared context for every voice
+  --critique            run an extra round where each voice reviews the others'
+                        answers before synthesis (default: off — answer→synthesize)
+  --voices <ids>        comma-separated voice ids (default: codex,grok,claude)
+  --synthesizer <id>    which voice runs the synthesis (default: claude if present)
+  --timeout <seconds>   per-voice timeout (default 300)
+  --voices-file <path>  voices config json (default ~/.ensemble-ai/voices.json)
+  --json                print the full result as JSON instead of formatted text
+  --cwd <dir>           working dir for --file resolution (default: cwd)
+  -h, --help            this help
+
+Exit codes: 0 = produced answers (synthesis printed) · 1 = no usable output (every
+voice failed) · 3 = usage or an unexpected operational error.`;
+
+// One consult rendered for the terminal: the independent answers, then the
+// synthesis split into AGREE / DIVERGE. Every line passed through clean() (voice
+// text is untrusted — a crafted reply could carry ANSI escapes).
+function printConsult(r: ConsultResult): void {
+  const out: string[] = [];
+  out.push('');
+  out.push(`ensemble-ai consult — ${clean(r.question).slice(0, 200)}`);
+  out.push(`  voices: ${r.roster.join(', ')}`);
+  out.push('');
+  out.push('Independent answers');
+  for (const a of r.answers) {
+    out.push('');
+    out.push(`  ── ${a.voiceId} ──`);
+    if (!a.ok) {
+      out.push(`     (no answer — ${clean(a.error ?? 'failed').slice(0, 160)})`);
+      continue;
+    }
+    if (a.summary) out.push(`     ${clean(a.summary).slice(0, 240)}`);
+    if (a.answer) out.push(`     ${clean(a.answer).slice(0, 400)}`);
+    for (const kp of a.keyPoints) out.push(`       · ${clean(kp).slice(0, 200)}`);
   }
+  if (r.critique.length > 0) {
+    out.push('');
+    out.push('Cross-critique');
+    for (const c of r.critique) {
+      out.push('');
+      out.push(`  ── ${c.voiceId} ──`);
+      if (!c.ok) {
+        out.push(`     (no notes — ${clean(c.error ?? 'failed').slice(0, 160)})`);
+        continue;
+      }
+      for (const n of c.notes) {
+        out.push(`     [${n.stance}] ${clean(n.target)} — ${clean(n.assessment).slice(0, 260)}`);
+      }
+    }
+  }
+  out.push('');
+  const s = r.synthesis;
+  out.push(
+    `Synthesis${s.by ? ` (by ${s.by})` : ''}${s.degraded ? ' — DEGRADED (deterministic fallback, NOT compared for agreement)' : ''}`
+  );
+  if (s.summary) out.push(`  ${clean(s.summary).slice(0, 400)}`);
+  if (s.agreements.length > 0) {
+    out.push('');
+    out.push('  ✓ AGREE (confident)');
+    for (const a of s.agreements) {
+      out.push(`     • ${clean(a.point).slice(0, 300)}${a.voices.length ? `  [${a.voices.map(clean).join(', ')}]` : ''}`);
+    }
+  }
+  if (s.divergences.length > 0) {
+    out.push('');
+    out.push('  ⚠ DIVERGE (look closer)');
+    for (const d of s.divergences) {
+      out.push(`     • ${clean(d.point).slice(0, 300)}`);
+      for (const p of d.positions) out.push(`         − ${clean(p).slice(0, 240)}`);
+    }
+  }
+  if (s.recommendation) {
+    out.push('');
+    out.push('  → Recommendation');
+    out.push(`     ${clean(s.recommendation).slice(0, 500)}`);
+  }
+  out.push('');
+  console.log(out.join('\n'));
+}
+
+async function consultCommand(args: string[]): Promise<number> {
+  let parsed: ReturnType<typeof parseArgs>;
+  try {
+    parsed = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        critique: { type: 'boolean' },
+        cwd: { type: 'string' },
+        file: { type: 'string' },
+        help: { short: 'h', type: 'boolean' },
+        json: { type: 'boolean' },
+        synthesizer: { type: 'string' },
+        timeout: { type: 'string' },
+        voices: { type: 'string' },
+        'voices-file': { type: 'string' },
+      },
+    });
+  } catch (e) {
+    console.error(`ensemble-ai consult: ${(e as Error).message}`);
+    console.error(CONSULT_USAGE);
+    return 3;
+  }
+  const { positionals, values } = parsed;
+  if (values.help) {
+    console.log(CONSULT_USAGE);
+    return 0;
+  }
+  const question = positionals.join(' ').trim();
+  if (!question) {
+    console.error(
+      'ensemble-ai consult: a question is required, e.g. ensemble-ai consult "should I use Postgres or SQLite for X?"'
+    );
+    console.error(CONSULT_USAGE);
+    return 3;
+  }
+
+  const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
+  let fileContext: string | undefined;
+  if (typeof values.file === 'string') {
+    const filePath = path.resolve(cwd, values.file);
+    try {
+      const bytes = fs.statSync(filePath).size;
+      if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
+        console.error(
+          `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
+        );
+        return 3;
+      }
+      fileContext = fs.readFileSync(filePath, 'utf8');
+    } catch (e) {
+      console.error(
+        `ensemble-ai consult: cannot read --file ${values.file}: ${(e as Error).message}`
+      );
+      return 3;
+    }
+  }
+
+  // --voices: fail CLOSED on an unknown id (a typo must error, never silently run a
+  // narrower roster than asked). Absent → undefined → the default roster.
+  let voices: VoiceId[] | undefined;
+  if (typeof values.voices === 'string') {
+    const requested = values.voices.split(',').map((s) => s.trim()).filter(Boolean);
+    const unknown = requested.filter((id) => !isVoiceId(id));
+    if (unknown.length > 0 || requested.length === 0) {
+      console.error(
+        `ensemble-ai consult: --voices "${values.voices}" ${
+          unknown.length ? `has unknown id(s): ${unknown.join(', ')}` : 'is empty'
+        } (known: ${VOICE_IDS.join(', ')})`
+      );
+      return 3;
+    }
+    voices = parseVoiceIds(requested);
+  }
+
+  let synthesizer: VoiceId | undefined;
+  if (typeof values.synthesizer === 'string') {
+    if (!isVoiceId(values.synthesizer)) {
+      console.error(
+        `ensemble-ai consult: --synthesizer "${values.synthesizer}" is not a known voice (known: ${VOICE_IDS.join(', ')})`
+      );
+      return 3;
+    }
+    synthesizer = values.synthesizer;
+  }
+
+  // --synthesizer must be IN the effective roster: pickSynthesizer only honors an
+  // in-roster request and SILENTLY falls back otherwise, so an out-of-roster id would
+  // be dropped without a word. Fail closed, exactly like --voices.
+  const roster = voices ?? VOICE_IDS;
+  if (synthesizer && !roster.includes(synthesizer)) {
+    console.error(
+      `ensemble-ai consult: --synthesizer "${synthesizer}" is not in the voices roster (${roster.join(', ')})`
+    );
+    return 3;
+  }
+
+  let timeoutMs: number | undefined;
+  if (typeof values.timeout === 'string') {
+    const secs = Number(values.timeout);
+    if (!Number.isFinite(secs) || secs <= 0) {
+      console.error('ensemble-ai consult: --timeout must be a positive number of seconds');
+      return 3;
+    }
+    timeoutMs = Math.round(secs * 1000);
+    if (timeoutMs < 1) {
+      // A sub-millisecond value rounds to 0, and `timeoutMs ?? DEFAULT` does NOT
+      // restore the default for a present-but-falsy 0 — the watchdog would fire at
+      // 0ms and kill every voice instantly. Reject it as out of range.
+      console.error('ensemble-ai consult: --timeout is too small (rounds to 0ms)');
+      return 3;
+    }
+  }
+
+  let result: ConsultResult;
+  try {
+    result = await runConsultMode({
+      critique: Boolean(values.critique),
+      fileContext,
+      onProgress: (m) => console.error(`· ${m}`),
+      question,
+      synthesizer,
+      timeoutMs,
+      voices,
+      voicesFile:
+        typeof values['voices-file'] === 'string' ? values['voices-file'] : undefined,
+    });
+  } catch (e) {
+    // An unexpected orchestration failure is NOT "every voice failed" (exit 1) — it is
+    // an operational error. Exit 3, matching review/brainstorm, so the modes don't drift.
+    console.error(`ensemble-ai consult: ${(e as Error).message}`);
+    return 3;
+  }
+
+  if (values.json) console.log(JSON.stringify(result, null, 2));
+  else printConsult(result);
+
+  // 1 = nothing usable came back (every voice failed to answer).
+  const anyAnswers = result.answers.some((a) => a.ok);
+  return anyAnswers ? 0 : 1;
+}
+
+export async function main(argv: string[]): Promise<number> {
+  const raw = argv[0];
+  if (!raw || raw === '-h' || raw === '--help') {
+    console.log(USAGE);
+    return raw ? 0 : 1;
+  }
+  const mode = resolveMode(raw);
   if (mode === 'review') return reviewCommand(argv.slice(1), 'code');
   if (mode === 'security') return reviewCommand(argv.slice(1), 'security');
   if (mode === 'brainstorm') return brainstormCommand(argv.slice(1));
+  if (mode === 'consult') return consultCommand(argv.slice(1));
   if (isMode(mode) && !isImplemented(mode)) {
     console.error(`ensemble-ai: mode "${mode}" is planned but not implemented yet.`);
     return 3;
