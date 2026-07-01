@@ -21,7 +21,8 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+
+import { isEntrypoint } from '../core/entrypoint';
 
 // The env var that forces the gate OPEN (fail-open) so it can never hard-brick PR
 // creation. Any non-empty, non-"0"/"false" value enables the override.
@@ -46,7 +47,10 @@ export interface GateInput {
 // invocation is guarded — every other tool call passes straight through. Matches
 // `gh` (optionally path-qualified) then `pr` then `create` as whitespace-separated
 // tokens anywhere in the command (so `cd x && gh pr create …` is caught), tolerant
-// of extra spaces; deliberately narrow to avoid guarding unrelated commands.
+// of extra spaces; deliberately narrow to avoid guarding unrelated commands. The
+// trailing class mirrors the leading one — a shell terminator right after `create`
+// (`gh pr create;`, `…&`, `…|cat`, `(gh pr create)`) must still be guarded, else the
+// gate fails OPEN on those natural forms.
 //
 // SCOPE (by design): this is a best-effort heuristic, NOT a tamper-proof boundary.
 // An operator can express `gh pr create` in a form this regex misses (a shell alias,
@@ -58,15 +62,28 @@ export function matchesGuardedCommand(input: GateInput): boolean {
   if (input.toolName && input.toolName !== 'Bash') return false;
   const cmd = input.command;
   if (!cmd) return false;
-  return /(^|[\s;&|(])(?:[^\s;&|]*\/)?gh\s+pr\s+create(\s|$)/.test(cmd);
+  return /(^|[\s;&|(])(?:[^\s;&|]*\/)?gh\s+pr\s+create($|[\s;&|)])/.test(cmd);
+}
+
+// The inline skip marker only counts as an override when it appears in a shell
+// COMMENT (`gh pr create … # ensemble-ai:skip-gate`, as documented), i.e. a `#`
+// precedes it on the same line. A bare mention — e.g. a PR title/body that happens
+// to contain the string (`gh pr create --title "fix ensemble-ai:skip-gate parsing"`)
+// — must NOT silently disable the gate. This is a heuristic (it can't fully parse
+// shell), but requiring the `#` context rules out the common accidental match.
+function hasInlineOverride(command: string): boolean {
+  const i = command.indexOf(INLINE_OVERRIDE_MARKER);
+  if (i < 0) return false;
+  const lineStart = command.lastIndexOf('\n', i) + 1;
+  return command.lastIndexOf('#', i) >= lineStart;
 }
 
 // Is the override active for this call? True if the override env is set to a truthy
-// value OR the guarded command carries the inline skip marker.
+// value OR the guarded command carries the inline skip marker as a comment.
 export function isOverridden(input: GateInput, env: NodeJS.ProcessEnv): boolean {
   const raw = env[OVERRIDE_ENV];
   const envOn = !!raw && raw !== '0' && raw.toLowerCase() !== 'false';
-  const inlineOn = !!input.command && input.command.includes(INLINE_OVERRIDE_MARKER);
+  const inlineOn = !!input.command && hasInlineOverride(input.command);
   return envOn || inlineOn;
 }
 
@@ -197,10 +214,50 @@ export function buildVerifyArgs(trailDir: string | undefined): string[] {
   return args;
 }
 
+// The shape execFileSync throws (a subset). `status` is the numeric exit code when
+// the process ran; `signal`/`code` distinguish a timeout/signal-kill from ENOENT.
+export interface ExecError {
+  code?: number | string;
+  status?: number | null;
+  signal?: string | null;
+  stderr?: Buffer | string;
+  stdout?: Buffer | string;
+  message?: string;
+}
+
+// Classify an execFileSync failure into a VerifyOutcome. Three cases the gate must
+// distinguish:
+//   • a numeric exit status → the CLI RAN and returned non-zero (unreviewed) → block;
+//   • killed by the timeout or a signal (ETIMEDOUT, or any non-null signal) → the CLI
+//     RAN but was terminated before it could confirm review → FAIL CLOSED (block), NOT
+//     the fail-open path below: a wedged/slow verifier must not wave an unreviewed PR
+//     through (the 120s bound exists to stop the hang, not to allow the PR);
+//   • otherwise (no status, no signal — ENOENT, etc.) → the process could not be
+//     spawned (CLI not installed) → fail OPEN so a broken install never hard-bricks PRs.
+export function classifyVerifyError(err: ExecError): VerifyOutcome {
+  const collectOutput = (): string =>
+    `${String(err.stdout ?? '')}${String(err.stderr ?? '')}`;
+  if (typeof err.status === 'number') {
+    return { code: err.status, output: collectOutput(), ran: true };
+  }
+  if (err.signal != null || err.code === 'ETIMEDOUT') {
+    const detail = collectOutput().trim();
+    return {
+      code: 1,
+      output:
+        detail ||
+        `the review verifier was terminated before confirming the diff is reviewed (${err.code ?? err.signal})`,
+      ran: true,
+    };
+  }
+  return { error: err.message || 'could not spawn `ensemble-ai`', ran: false };
+}
+
 // Run the verifier via the `ensemble-ai` CLI on PATH. Exit codes ARE the contract
-// (0 = reviewed; non-zero = not), so a non-zero exit is a normal outcome, not a
-// throw to catch — execFileSync throws on non-zero, so we recover the code. A
-// spawn failure (ENOENT — CLI not installed) is the `ran:false` fail-open path.
+// (0 = reviewed; non-zero = not), so a non-zero exit is a normal outcome, not a throw
+// to catch — execFileSync throws on non-zero, so classifyVerifyError recovers the code
+// (and maps a timeout/signal-kill to a fail-CLOSED block, only a genuine spawn failure
+// to the fail-open path).
 export function runVerifyCli(
   cwd: string | undefined,
   env: NodeJS.ProcessEnv
@@ -212,28 +269,13 @@ export function runVerifyCli(
       cwd: cwd || process.cwd(),
       encoding: 'utf8',
       env,
-      // Bound it so a wedged verify can't hang PR creation forever.
+      // Bound it so a wedged verify can't hang PR creation forever (a timeout is then
+      // classified as fail-CLOSED, not fail-open — see classifyVerifyError).
       timeout: 120_000,
     });
     return { code: 0, output, ran: true };
   } catch (e) {
-    const err = e as {
-      code?: number | string;
-      status?: number | null;
-      stderr?: Buffer | string;
-      stdout?: Buffer | string;
-      message?: string;
-    };
-    // A resolved exit status (number) means the CLI RAN and returned non-zero.
-    if (typeof err.status === 'number') {
-      const out = `${String(err.stdout ?? '')}${String(err.stderr ?? '')}`;
-      return { code: err.status, output: out, ran: true };
-    }
-    // No numeric status → the process could not be spawned (ENOENT, etc.).
-    return {
-      error: err.message || 'could not spawn `ensemble-ai`',
-      ran: false,
-    };
+    return classifyVerifyError(e as ExecError);
   }
 }
 
@@ -278,20 +320,7 @@ export function runHook(raw: string, io: HookIO): number {
 
 // Auto-run ONLY as the actual hook entry (not when imported by a test). Reads the
 // whole stdin payload synchronously, runs the hook, sets the process exit code.
-function isEntrypoint(): boolean {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  try {
-    // fileURLToPath (not `new URL(...).pathname`) so a repo path with spaces or other
-    // %-encoded chars decodes to match process.argv[1] — otherwise the hook would
-    // silently no-op (fail OPEN) for such a path. Mirrors cli.ts's isEntrypoint.
-    return path.resolve(entry) === fileURLToPath(import.meta.url);
-  } catch {
-    return false;
-  }
-}
-
-if (isEntrypoint()) {
+if (isEntrypoint(import.meta.url)) {
   let raw = '';
   try {
     raw = fs.readFileSync(0, 'utf8');

@@ -3,14 +3,26 @@
 // src/cli.ts
 import { execFileSync as execFileSync3 } from "child_process";
 import crypto2 from "crypto";
-import fs8 from "fs";
+import fs9 from "fs";
 import os7 from "os";
 import path7 from "path";
-import { fileURLToPath } from "url";
 import { parseArgs } from "util";
 
-// src/core/reviewers.ts
+// src/core/entrypoint.ts
 import fs from "fs";
+import { fileURLToPath } from "url";
+function isEntrypoint(importMetaUrl) {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return fs.realpathSync(entry) === fs.realpathSync(fileURLToPath(importMetaUrl));
+  } catch {
+    return false;
+  }
+}
+
+// src/core/reviewers.ts
+import fs2 from "fs";
 import os from "os";
 import path from "path";
 
@@ -74,7 +86,7 @@ function parseReviewers(raw) {
 }
 function loadReviewers(file = REVIEWERS_FILE) {
   try {
-    return parseReviewers(JSON.parse(fs.readFileSync(file, "utf8")));
+    return parseReviewers(JSON.parse(fs2.readFileSync(file, "utf8")));
   } catch {
     return { ...REVIEWER_DEFAULTS };
   }
@@ -412,7 +424,7 @@ a tight ranked list of the genuinely strong ideas over a long one.
 }
 
 // src/modes/brainstorm/voices.ts
-import fs5 from "fs";
+import fs6 from "fs";
 import os5 from "os";
 import path4 from "path";
 
@@ -422,12 +434,12 @@ import path2 from "path";
 
 // src/core/spawn.ts
 import { spawn } from "child_process";
-import fs3 from "fs";
+import fs4 from "fs";
 import os2 from "os";
 
 // src/core/bin.ts
 import { execFileSync } from "child_process";
-import fs2 from "fs";
+import fs3 from "fs";
 var binCache = /* @__PURE__ */ new Map();
 function resolveBin(name, opts = {}) {
   const cached = binCache.get(name);
@@ -437,7 +449,7 @@ function resolveBin(name, opts = {}) {
     ...opts.candidates ?? []
   ].filter((c) => Boolean(c));
   for (const c of candidates) {
-    if (fs2.existsSync(c)) {
+    if (fs3.existsSync(c)) {
       binCache.set(name, c);
       return c;
     }
@@ -529,9 +541,9 @@ function runReviewerExec(opts) {
         if (text) raw = text;
       } else {
         try {
-          const text = fs3.readFileSync(outFile ?? "", "utf8").trim();
+          const text = fs4.readFileSync(outFile ?? "", "utf8").trim();
           if (text) raw = text;
-          fs3.unlinkSync(outFile ?? "");
+          fs4.unlinkSync(outFile ?? "");
         } catch {
         }
       }
@@ -591,7 +603,7 @@ function runCodexReview(prompt, config, opts = {}) {
 }
 
 // src/reviewers/grok.ts
-import fs4 from "fs";
+import fs5 from "fs";
 import os4 from "os";
 import path3 from "path";
 var GROK_BIN_CANDIDATES = [path3.join(os4.homedir(), ".grok", "bin", "grok")];
@@ -640,16 +652,16 @@ function replaceReviewSection(content) {
 function ensureSandboxProfile(profile, file = path3.join(os4.homedir(), ".grok", "sandbox.toml")) {
   if (BUILTIN_SANDBOXES.has(profile) || profile !== REVIEW_PROFILE_NAME) return;
   try {
-    const existing = fs4.existsSync(file) ? fs4.readFileSync(file, "utf8") : "";
+    const existing = fs5.existsSync(file) ? fs5.readFileSync(file, "utf8") : "";
     if (existing.includes(REVIEW_PROFILE_BLOCK)) return;
-    fs4.mkdirSync(path3.dirname(file), { recursive: true });
+    fs5.mkdirSync(path3.dirname(file), { recursive: true });
     const updated = existing.includes(REVIEW_PROFILE_HEADER) ? replaceReviewSection(existing) : null;
     const content = updated ?? (existing.trim() ? `${existing.trimEnd()}
 
 ${REVIEW_PROFILE}` : REVIEW_PROFILE);
     const tmp = `${file}.tmp`;
-    fs4.writeFileSync(tmp, content);
-    fs4.renameSync(tmp, file);
+    fs5.writeFileSync(tmp, content);
+    fs5.renameSync(tmp, file);
   } catch {
   }
 }
@@ -686,7 +698,7 @@ function runGrokReview(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const sandbox = resolveReviewSandbox(config.sandbox);
   ensureSandboxProfile(sandbox);
-  const cwd = fs4.mkdtempSync(path3.join(os4.tmpdir(), "grok-review-"));
+  const cwd = fs5.mkdtempSync(path3.join(os4.tmpdir(), "grok-review-"));
   return runReviewerExec({
     args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
     bin: resolveGrokBin(),
@@ -696,7 +708,7 @@ function runGrokReview(prompt, config, opts = {}) {
     timeoutMs
   }).then(({ raw, stderrTail, timedOut }) => {
     try {
-      fs4.rmSync(cwd, { force: true, recursive: true });
+      fs5.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
     const text = raw ? extractGrokText(raw) : null;
@@ -798,7 +810,7 @@ function parseVoices(raw) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs5.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs6.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
@@ -1371,7 +1383,7 @@ function isImplemented(mode) {
 }
 
 // src/core/artifacts.ts
-import fs6 from "fs";
+import fs7 from "fs";
 import path5 from "path";
 function sanitizePathSegment(s) {
   return s.replace(/[^a-zA-Z0-9._-]/g, "_");
@@ -1380,15 +1392,15 @@ function reviewDir(baseDir, runId) {
   return path5.join(baseDir, sanitizePathSegment(runId) || "unknown");
 }
 function writeAtomic(dir, name, content) {
-  fs6.mkdirSync(dir, { recursive: true });
+  fs7.mkdirSync(dir, { recursive: true });
   const target = path5.join(dir, name);
   const tmp = `${target}.tmp`;
-  fs6.writeFileSync(tmp, content);
-  fs6.renameSync(tmp, target);
+  fs7.writeFileSync(tmp, content);
+  fs7.renameSync(tmp, target);
 }
 function readJson(file) {
   try {
-    return JSON.parse(fs6.readFileSync(file, "utf8"));
+    return JSON.parse(fs7.readFileSync(file, "utf8"));
   } catch {
     return null;
   }
@@ -1993,7 +2005,7 @@ function scanDependencySurface(files) {
 }
 
 // src/modes/review/receipt.ts
-import fs7 from "fs";
+import fs8 from "fs";
 import os6 from "os";
 import path6 from "path";
 function computePolicyHash(args) {
@@ -2042,10 +2054,10 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs7.mkdirSync(path6.dirname(file), { recursive: true });
+  fs8.mkdirSync(path6.dirname(file), { recursive: true });
   const tmp = `${file}.tmp`;
-  fs7.writeFileSync(tmp, JSON.stringify(receipt, null, 2));
-  fs7.renameSync(tmp, file);
+  fs8.writeFileSync(tmp, JSON.stringify(receipt, null, 2));
+  fs8.renameSync(tmp, file);
   return file;
 }
 function validateReceiptShape(value) {
@@ -2086,7 +2098,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs7.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs8.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -2637,7 +2649,7 @@ function genRunId() {
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
   try {
-    const s = fs8.readFileSync(0, "utf8");
+    const s = fs9.readFileSync(0, "utf8");
     return s.trim() ? s : void 0;
   } catch {
     return void 0;
@@ -2679,7 +2691,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "diff-file": {
       let text;
       try {
-        text = fs8.readFileSync(String(selection.diffFile), "utf8");
+        text = fs9.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
@@ -3037,14 +3049,14 @@ async function brainstormCommand(args) {
   if (typeof values.file === "string") {
     const filePath = path7.resolve(cwd, values.file);
     try {
-      const bytes = fs8.statSync(filePath).size;
+      const bytes = fs9.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs8.readFileSync(filePath, "utf8");
+      fileContext = fs9.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${e.message}`
@@ -3242,14 +3254,14 @@ async function consultCommand(args) {
   if (typeof values.file === "string") {
     const filePath = path7.resolve(cwd, values.file);
     try {
-      const bytes = fs8.statSync(filePath).size;
+      const bytes = fs9.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs8.readFileSync(filePath, "utf8");
+      fileContext = fs9.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai consult: cannot read --file ${values.file}: ${e.message}`
@@ -3422,7 +3434,7 @@ async function receiptCommand(args) {
   const readReceiptFile = (p) => {
     let raw;
     try {
-      raw = fs8.readFileSync(p, "utf8");
+      raw = fs9.readFileSync(p, "utf8");
     } catch (e) {
       return { error: `cannot read receipt ${p}: ${e.message}` };
     }
@@ -3571,10 +3583,10 @@ async function reviewersCommand(args) {
   const view = {
     reviewers: listReviewers(reviewersFile),
     reviewersFile,
-    reviewersFileExists: fs8.existsSync(reviewersFile),
+    reviewersFileExists: fs9.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
     voicesFile,
-    voicesFileExists: fs8.existsSync(voicesFile)
+    voicesFileExists: fs9.existsSync(voicesFile)
   };
   if (values.json) console.log(JSON.stringify(view, null, 2));
   else console.log(renderRegistry(view));
@@ -3717,16 +3729,7 @@ async function main(argv) {
   console.error(USAGE);
   return 3;
 }
-function isEntrypoint() {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  try {
-    return path7.resolve(entry) === fileURLToPath(import.meta.url);
-  } catch {
-    return false;
-  }
-}
-if (isEntrypoint()) {
+if (isEntrypoint(import.meta.url)) {
   main(process.argv.slice(2)).then(
     (code) => {
       process.exitCode = code;

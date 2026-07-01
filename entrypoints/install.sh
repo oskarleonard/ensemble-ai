@@ -34,6 +34,11 @@ mkdir -p "$TARGET/skills"
 
 # 1) skills
 for dir in "$SKILLS_SRC"/*/; do
+  # Skip anything that isn't a skill dir — a subdir without a SKILL.md, or (when the
+  # glob matches nothing and stays literal) the non-existent "*/". Without this guard
+  # `set -e` + a failing `cp` would abort the install half-applied (skills partly
+  # copied, the gate hook never merged).
+  [ -f "$dir/SKILL.md" ] || continue
   name="$(basename "$dir")"
   mkdir -p "$TARGET/skills/$name"
   cp "$dir/SKILL.md" "$TARGET/skills/$name/SKILL.md"
@@ -44,10 +49,11 @@ done
 SETTINGS="$TARGET/settings.json"
 [ -f "$SETTINGS" ] && cp "$SETTINGS" "$SETTINGS.bak" && echo "  backup: $SETTINGS.bak"
 
-# Single-quote the hook path IN the command string so a repo path with spaces
-# still runs (the command is executed by a shell). HOOK_JS is an absolute fs path
-# with no single-quote in any realistic checkout.
-HOOK_CMD="node '$HOOK_JS'"
+# Single-quote the hook path IN the command string so a repo path with spaces still
+# runs (the command is executed by a shell). Also escape any single quote in the path
+# (e.g. an /Users/o'brien/... home) as the '\'' idiom, so the quoting stays valid
+# instead of producing a broken command that silently never runs (fail-open gate).
+HOOK_CMD="node '${HOOK_JS//\'/\'\\\'\'}'"
 SETTINGS="$SETTINGS" HOOK_CMD="$HOOK_CMD" node <<'NODE'
 const fs = require('fs');
 const file = process.env.SETTINGS;
@@ -69,8 +75,12 @@ if (fs.existsSync(file)) {
 cfg.hooks = cfg.hooks || {};
 const pre = Array.isArray(cfg.hooks.PreToolUse) ? cfg.hooks.PreToolUse : [];
 // Idempotent: drop any prior ensemble-ai gate group, then add a fresh one.
+// Match either install form: the `node .../dist/entrypoints/hook.js` path this
+// script writes, or the `ensemble-ai-pre-pr-gate` bin name the README documents for
+// an npm-linked install — so re-running REPLACES our group instead of duplicating it.
 const isOurs = (g) => Array.isArray(g.hooks) && g.hooks.some(
-  (h) => typeof h.command === 'string' && h.command.includes('entrypoints/hook.js')
+  (h) => typeof h.command === 'string' &&
+    (h.command.includes('entrypoints/hook.js') || h.command.includes('ensemble-ai-pre-pr-gate'))
 );
 const kept = pre.filter((g) => !isOurs(g));
 kept.push({ matcher: 'Bash', hooks: [{ type: 'command', command: cmd }] });

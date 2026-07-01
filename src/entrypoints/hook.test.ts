@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildVerifyArgs,
+  classifyVerifyError,
   decideGate,
   type GateInput,
   isOverridden,
@@ -35,6 +36,18 @@ describe('matchesGuardedCommand', () => {
     expect(
       matchesGuardedCommand({ command: '/opt/homebrew/bin/gh pr create -t x', toolName: 'Bash' })
     ).toBe(true);
+  });
+
+  it('matches `gh pr create` terminated by a shell metachar (no fail-open on ;&|))', () => {
+    for (const command of [
+      'gh pr create;',
+      'gh pr create&',
+      'gh pr create|cat',
+      '(gh pr create)',
+      'gh pr create && echo done',
+    ]) {
+      expect(matchesGuardedCommand({ command, toolName: 'Bash' })).toBe(true);
+    }
   });
 
   it('does NOT match unrelated gh / non-Bash commands', () => {
@@ -91,6 +104,46 @@ describe('decideGate', () => {
     expect(d.action).toBe('allow');
     expect(d.reason).toContain('could not run');
   });
+
+  it('BLOCKS when the verifier is killed by the timeout (ran-but-unconfirmed → fail CLOSED)', () => {
+    const timedOut = () =>
+      classifyVerifyError({ status: null, signal: 'SIGTERM', code: 'ETIMEDOUT' });
+    const d = decideGate(prCreate, { overridden: false, verify: timedOut });
+    expect(d.action).toBe('block');
+  });
+});
+
+describe('classifyVerifyError', () => {
+  it('maps a numeric exit status to a ran block (the CLI ran, diff unreviewed)', () => {
+    expect(classifyVerifyError({ status: 3, stdout: 'NO RECEIPT', stderr: '' })).toEqual({
+      code: 3,
+      output: 'NO RECEIPT',
+      ran: true,
+    });
+  });
+
+  it('maps a timeout (ETIMEDOUT / SIGTERM, null status) to a fail-CLOSED block, not fail-open', () => {
+    const r = classifyVerifyError({ status: null, signal: 'SIGTERM', code: 'ETIMEDOUT' });
+    expect(r.ran).toBe(true);
+    expect((r as { code: number; ran: true }).code).not.toBe(0);
+  });
+
+  it('maps a signal-kill (null status, signal set) to a fail-CLOSED block', () => {
+    const r = classifyVerifyError({ status: null, signal: 'SIGKILL' });
+    expect(r.ran).toBe(true);
+    expect((r as { code: number; ran: true }).code).not.toBe(0);
+  });
+
+  it('maps a spawn failure (ENOENT: no status, no signal) to the fail-OPEN ran:false path', () => {
+    const r = classifyVerifyError({
+      status: null,
+      signal: null,
+      code: 'ENOENT',
+      message: 'spawn ensemble-ai ENOENT',
+    });
+    expect(r.ran).toBe(false);
+    expect((r as { error: string; ran: false }).error).toContain('ENOENT');
+  });
 });
 
 describe('isOverridden', () => {
@@ -105,6 +158,19 @@ describe('isOverridden', () => {
   it('honors the inline skip marker in the command', () => {
     expect(
       isOverridden({ command: 'gh pr create # ensemble-ai:skip-gate', toolName: 'Bash' }, {})
+    ).toBe(true);
+  });
+
+  it('requires the marker to be a comment — a bare mention (PR title/body) does NOT override', () => {
+    expect(
+      isOverridden(
+        { command: 'gh pr create --title "fix ensemble-ai:skip-gate parsing"', toolName: 'Bash' },
+        {}
+      )
+    ).toBe(false);
+    // the documented `#` comment form still works, with or without a space
+    expect(
+      isOverridden({ command: 'gh pr create #ensemble-ai:skip-gate', toolName: 'Bash' }, {})
     ).toBe(true);
   });
 });

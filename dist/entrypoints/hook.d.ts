@@ -35,6 +35,15 @@ interface HookPayload {
 declare function parseHookPayload(raw: string): HookPayload;
 declare function resolveTrailDir(cwd: string | undefined, env: NodeJS.ProcessEnv, exists?: (p: string) => boolean): string | undefined;
 declare function buildVerifyArgs(trailDir: string | undefined): string[];
+interface ExecError {
+    code?: number | string;
+    status?: number | null;
+    signal?: string | null;
+    stderr?: Buffer | string;
+    stdout?: Buffer | string;
+    message?: string;
+}
+declare function classifyVerifyError(err: ExecError): VerifyOutcome;
 declare function runVerifyCli(cwd: string | undefined, env: NodeJS.ProcessEnv): VerifyOutcome;
 interface HookIO {
     env: NodeJS.ProcessEnv;
@@ -43,4 +52,4 @@ interface HookIO {
 }
 declare function runHook(raw: string, io: HookIO): number;
 
-export { type GateDecision, type GateDeps, type GateInput, type HookIO, type HookPayload, INLINE_OVERRIDE_MARKER, OVERRIDE_ENV, TRAIL_ENV, type VerifyOutcome, buildVerifyArgs, decideGate, isOverridden, matchesGuardedCommand, parseHookPayload, resolveTrailDir, runHook, runVerifyCli };
+export { type ExecError, type GateDecision, type GateDeps, type GateInput, type HookIO, type HookPayload, INLINE_OVERRIDE_MARKER, OVERRIDE_ENV, TRAIL_ENV, type VerifyOutcome, buildVerifyArgs, classifyVerifyError, decideGate, isOverridden, matchesGuardedCommand, parseHookPayload, resolveTrailDir, runHook, runVerifyCli };

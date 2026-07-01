@@ -13,8 +13,6 @@ import type { ModeName } from '../modes';
 export const SKILL_ARGS_PLACEHOLDER = '$ARGUMENTS';
 
 export interface SkillSpec {
-  // What the user types the arg as — a diff source, a topic, or a question.
-  argHint: string;
   // The canonical CLI mode (post-alias) this skill runs.
   mode: ModeName;
   // The slash-command name (no leading slash), == the CLI mode/alias the user knows.
@@ -26,26 +24,10 @@ export interface SkillSpec {
 // IMPLEMENTED mode — asserted by the tests, so a skill can never point at a
 // planned-but-unbuilt mode).
 export const SKILL_SPECS: SkillSpec[] = [
-  {
-    argHint: '[diff source — default: current branch · --pr N · --staged · --diff-file <path>]',
-    mode: 'review',
-    name: 'review',
-  },
-  {
-    argHint: '[diff source — default: current branch · --pr N · --staged · --diff-file <path>]',
-    mode: 'security',
-    name: 'security',
-  },
-  {
-    argHint: '"<topic>" [--file <path> for shared context]',
-    mode: 'brainstorm',
-    name: 'brainstorm',
-  },
-  {
-    argHint: '"<question>" [--file <path> for context · --critique]',
-    mode: 'consult',
-    name: 'consult',
-  },
+  { mode: 'review', name: 'review' },
+  { mode: 'security', name: 'security' },
+  { mode: 'brainstorm', name: 'brainstorm' },
+  { mode: 'consult', name: 'consult' },
 ];
 
 export function findSkill(name: string): SkillSpec | undefined {

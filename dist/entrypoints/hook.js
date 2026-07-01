@@ -2,9 +2,23 @@
 
 // src/entrypoints/hook.ts
 import { execFileSync } from "child_process";
-import fs from "fs";
+import fs2 from "fs";
 import path from "path";
+
+// src/core/entrypoint.ts
+import fs from "fs";
 import { fileURLToPath } from "url";
+function isEntrypoint(importMetaUrl) {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return fs.realpathSync(entry) === fs.realpathSync(fileURLToPath(importMetaUrl));
+  } catch {
+    return false;
+  }
+}
+
+// src/entrypoints/hook.ts
 var OVERRIDE_ENV = "ENSEMBLE_AI_GATE_OVERRIDE";
 var INLINE_OVERRIDE_MARKER = "ensemble-ai:skip-gate";
 var TRAIL_ENV = "ENSEMBLE_AI_TRAIL_DIR";
@@ -12,12 +26,18 @@ function matchesGuardedCommand(input) {
   if (input.toolName && input.toolName !== "Bash") return false;
   const cmd = input.command;
   if (!cmd) return false;
-  return /(^|[\s;&|(])(?:[^\s;&|]*\/)?gh\s+pr\s+create(\s|$)/.test(cmd);
+  return /(^|[\s;&|(])(?:[^\s;&|]*\/)?gh\s+pr\s+create($|[\s;&|)])/.test(cmd);
+}
+function hasInlineOverride(command) {
+  const i = command.indexOf(INLINE_OVERRIDE_MARKER);
+  if (i < 0) return false;
+  const lineStart = command.lastIndexOf("\n", i) + 1;
+  return command.lastIndexOf("#", i) >= lineStart;
 }
 function isOverridden(input, env) {
   const raw = env[OVERRIDE_ENV];
   const envOn = !!raw && raw !== "0" && raw.toLowerCase() !== "false";
-  const inlineOn = !!input.command && input.command.includes(INLINE_OVERRIDE_MARKER);
+  const inlineOn = !!input.command && hasInlineOverride(input.command);
   return envOn || inlineOn;
 }
 function decideGate(input, deps) {
@@ -67,7 +87,7 @@ function parseHookPayload(raw) {
     return { input: {} };
   }
 }
-function resolveTrailDir(cwd, env, exists = fs.existsSync) {
+function resolveTrailDir(cwd, env, exists = fs2.existsSync) {
   const fromEnv = env[TRAIL_ENV];
   if (fromEnv) return fromEnv;
   if (cwd) {
@@ -81,6 +101,21 @@ function buildVerifyArgs(trailDir) {
   if (trailDir) args.push("--trail", trailDir);
   return args;
 }
+function classifyVerifyError(err) {
+  const collectOutput = () => `${String(err.stdout ?? "")}${String(err.stderr ?? "")}`;
+  if (typeof err.status === "number") {
+    return { code: err.status, output: collectOutput(), ran: true };
+  }
+  if (err.signal != null || err.code === "ETIMEDOUT") {
+    const detail = collectOutput().trim();
+    return {
+      code: 1,
+      output: detail || `the review verifier was terminated before confirming the diff is reviewed (${err.code ?? err.signal})`,
+      ran: true
+    };
+  }
+  return { error: err.message || "could not spawn `ensemble-ai`", ran: false };
+}
 function runVerifyCli(cwd, env) {
   const trailDir = resolveTrailDir(cwd, env);
   const args = buildVerifyArgs(trailDir);
@@ -89,20 +124,13 @@ function runVerifyCli(cwd, env) {
       cwd: cwd || process.cwd(),
       encoding: "utf8",
       env,
-      // Bound it so a wedged verify can't hang PR creation forever.
+      // Bound it so a wedged verify can't hang PR creation forever (a timeout is then
+      // classified as fail-CLOSED, not fail-open — see classifyVerifyError).
       timeout: 12e4
     });
     return { code: 0, output, ran: true };
   } catch (e) {
-    const err = e;
-    if (typeof err.status === "number") {
-      const out = `${String(err.stdout ?? "")}${String(err.stderr ?? "")}`;
-      return { code: err.status, output: out, ran: true };
-    }
-    return {
-      error: err.message || "could not spawn `ensemble-ai`",
-      ran: false
-    };
+    return classifyVerifyError(e);
   }
 }
 function runHook(raw, io) {
@@ -129,19 +157,10 @@ function runHook(raw, io) {
   }
   return 0;
 }
-function isEntrypoint() {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  try {
-    return path.resolve(entry) === fileURLToPath(import.meta.url);
-  } catch {
-    return false;
-  }
-}
-if (isEntrypoint()) {
+if (isEntrypoint(import.meta.url)) {
   let raw = "";
   try {
-    raw = fs.readFileSync(0, "utf8");
+    raw = fs2.readFileSync(0, "utf8");
   } catch {
     raw = "";
   }
@@ -156,6 +175,7 @@ export {
   OVERRIDE_ENV,
   TRAIL_ENV,
   buildVerifyArgs,
+  classifyVerifyError,
   decideGate,
   isOverridden,
   matchesGuardedCommand,
