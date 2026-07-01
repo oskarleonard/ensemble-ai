@@ -22,17 +22,17 @@ const SKILLS_DIR = path.resolve(
 describe('SKILL_SPECS registry', () => {
   it('has the four entrypoint skills', () => {
     expect(SKILL_SPECS.map((s) => s.name).sort()).toEqual([
-      'brainstorm',
-      'consult',
-      'review',
-      'security',
+      'ensemble-ai-brainstorm',
+      'ensemble-ai-consult',
+      'ensemble-ai-review',
+      'ensemble-ai-security',
     ]);
   });
 
   it('every skill maps ONLY to an IMPLEMENTED mode (no pointing at a planned mode)', () => {
     for (const spec of SKILL_SPECS) {
-      // the skill name is the CLI verb; it must resolve to the spec's mode …
-      expect(resolveMode(spec.name)).toBe(spec.mode);
+      // the skill's mode is the CLI verb; it must resolve to itself (an implemented mode) …
+      expect(resolveMode(spec.mode)).toBe(spec.mode);
       // … and that mode must actually be built
       expect(IMPLEMENTED_MODES).toContain(spec.mode);
     }
@@ -41,7 +41,7 @@ describe('SKILL_SPECS registry', () => {
 
 describe('skillInvocationLine', () => {
   it('is `ensemble-ai <mode> $ARGUMENTS`', () => {
-    const spec = findSkill('consult')!;
+    const spec = findSkill('ensemble-ai-consult')!;
     expect(skillInvocationLine(spec)).toBe(`ensemble-ai consult ${SKILL_ARGS_PLACEHOLDER}`);
   });
 });

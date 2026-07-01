@@ -1,9 +1,9 @@
 ---
-name: consult
-description: Pose a question to the ensemble (Codex + Grok + Claude) — each voice answers independently, then one synthesizes what they AGREE on (confident) vs where they DIVERGE (look closer) + a bottom-line recommendation. Use when the user says "/consult" or "/ask", wants a cross-vendor answer to a decision/research question, or a second and third vendor's take.
+name: ensemble-ai-consult
+description: Pose a question to the ensemble (Codex + Grok + Claude) — each voice answers independently, then one synthesizes what they AGREE on (confident) vs where they DIVERGE (look closer) + a bottom-line recommendation. Use when the user says "/ensemble-ai-consult" or "/ask", wants a cross-vendor answer to a decision/research question, or a second and third vendor's take.
 ---
 
-# /consult — cross-vendor Q&A via ensemble-ai
+# /ensemble-ai-consult — cross-vendor Q&A via ensemble-ai
 
 Thin wrapper over the `ensemble-ai` CLI (the `consult` mode, alias `ask`). It poses
 a question to the cross-vendor AI ensemble and summarizes the result — it does NOT

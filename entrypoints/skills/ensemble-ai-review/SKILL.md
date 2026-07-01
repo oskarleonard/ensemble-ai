@@ -1,9 +1,9 @@
 ---
-name: review
-description: Convene every configured cross-vendor reviewer (Codex + Grok) on a code diff, read-only, and collect typed findings grouped by severity. Use when the user says "/review", asks to review a diff/PR/branch with the ensemble / cross-vendor / multiple models, or wants a second (and third) vendor's take on code.
+name: ensemble-ai-review
+description: Convene every configured cross-vendor reviewer (Codex + Grok) on a code diff, read-only, and collect typed findings grouped by severity. Use when the user says "/ensemble-ai-review", asks to review a diff/PR/branch with the ensemble / cross-vendor / multiple models, or wants a second (and third) vendor's take on code.
 ---
 
-# /review — cross-vendor review via ensemble-ai
+# /ensemble-ai-review — cross-vendor review via ensemble-ai
 
 Thin wrapper over the `ensemble-ai` CLI. It convenes the cross-vendor AI ensemble
 and summarizes the result in this session — it does NOT re-implement the logic.
