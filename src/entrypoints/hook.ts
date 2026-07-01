@@ -21,6 +21,7 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // The env var that forces the gate OPEN (fail-open) so it can never hard-brick PR
 // creation. Any non-empty, non-"0"/"false" value enables the override.
@@ -139,9 +140,22 @@ function indentBlock(s: string): string {
 
 // ── stdin → CLI → hook output wiring (the impure shell around decideGate) ────────
 
-// Parse the Claude Code PreToolUse hook payload. Tolerant of shape drift: missing
-// fields simply mean "not a guarded call" (→ allow), never a crash.
-export function parseHookInput(raw: string): GateInput {
+// Parse the Claude Code PreToolUse payload ONCE into the pieces the hook needs: the
+// gate `input` (command + tool name) for the decision, and the `cwd` for the verifier.
+// Tolerant of shape drift — missing/malformed fields mean "not a guarded call"
+// (→ allow), never a crash. Parsing once keeps the per-Bash-call hot path cheap.
+//
+// The cwd is the SESSION cwd from the payload; a command that `cd`s into a DIFFERENT
+// repo before `gh pr create` would be verified against the session cwd, not that repo
+// (a known limitation — parsing arbitrary shell `cd` targets is fragile and itself
+// bypassable). For the overwhelmingly common case (creating a PR from the repo you're
+// working in) it verifies the right diff.
+export interface HookPayload {
+  input: GateInput;
+  cwd?: string;
+}
+
+export function parseHookPayload(raw: string): HookPayload {
   try {
     const j = JSON.parse(raw) as {
       cwd?: string;
@@ -149,26 +163,11 @@ export function parseHookInput(raw: string): GateInput {
       tool_name?: string;
     };
     return {
-      command: j.tool_input?.command,
-      toolName: j.tool_name,
+      input: { command: j.tool_input?.command, toolName: j.tool_name },
+      cwd: typeof j.cwd === 'string' ? j.cwd : undefined,
     };
   } catch {
-    return {};
-  }
-}
-
-// Extract the cwd the guarded command runs in, so verify checks the RIGHT repo.
-// This is the SESSION cwd from the hook payload; a command that `cd`s into a
-// DIFFERENT repo before `gh pr create` would be verified against the session cwd,
-// not that repo (a known limitation — parsing arbitrary shell `cd` targets is
-// fragile and itself bypassable). For the overwhelmingly common case (creating a
-// PR from the repo you're working in) it verifies the right diff.
-export function parseCwd(raw: string): string | undefined {
-  try {
-    const j = JSON.parse(raw) as { cwd?: string };
-    return typeof j.cwd === 'string' ? j.cwd : undefined;
-  } catch {
-    return undefined;
+    return { input: {} };
   }
 }
 
@@ -249,8 +248,7 @@ export interface HookIO {
 // PreToolUse block contract) AND a permissionDecision JSON on stdout for newer
 // versions; an allow is a silent exit 0 (with any fail-open warning on stderr).
 export function runHook(raw: string, io: HookIO): number {
-  const input = parseHookInput(raw);
-  const cwd = parseCwd(raw);
+  const { input, cwd } = parseHookPayload(raw);
   const decision = decideGate(input, {
     overridden: isOverridden(input, io.env),
     verify: () => runVerifyCli(cwd, io.env),
@@ -284,10 +282,10 @@ function isEntrypoint(): boolean {
   const entry = process.argv[1];
   if (!entry) return false;
   try {
-    return (
-      path.resolve(entry) ===
-      path.resolve(new URL(import.meta.url).pathname)
-    );
+    // fileURLToPath (not `new URL(...).pathname`) so a repo path with spaces or other
+    // %-encoded chars decodes to match process.argv[1] — otherwise the hook would
+    // silently no-op (fail OPEN) for such a path. Mirrors cli.ts's isEntrypoint.
+    return path.resolve(entry) === fileURLToPath(import.meta.url);
   } catch {
     return false;
   }

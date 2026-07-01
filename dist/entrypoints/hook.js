@@ -4,6 +4,7 @@
 import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 var OVERRIDE_ENV = "ENSEMBLE_AI_GATE_OVERRIDE";
 var INLINE_OVERRIDE_MARKER = "ensemble-ai:skip-gate";
 var TRAIL_ENV = "ENSEMBLE_AI_TRAIL_DIR";
@@ -55,23 +56,15 @@ function indentBlock(s) {
   if (!s) return "    (no output)";
   return s.split("\n").map((l) => `    ${l}`).join("\n");
 }
-function parseHookInput(raw) {
+function parseHookPayload(raw) {
   try {
     const j = JSON.parse(raw);
     return {
-      command: j.tool_input?.command,
-      toolName: j.tool_name
+      input: { command: j.tool_input?.command, toolName: j.tool_name },
+      cwd: typeof j.cwd === "string" ? j.cwd : void 0
     };
   } catch {
-    return {};
-  }
-}
-function parseCwd(raw) {
-  try {
-    const j = JSON.parse(raw);
-    return typeof j.cwd === "string" ? j.cwd : void 0;
-  } catch {
-    return void 0;
+    return { input: {} };
   }
 }
 function resolveTrailDir(cwd, env, exists = fs.existsSync) {
@@ -113,8 +106,7 @@ function runVerifyCli(cwd, env) {
   }
 }
 function runHook(raw, io) {
-  const input = parseHookInput(raw);
-  const cwd = parseCwd(raw);
+  const { input, cwd } = parseHookPayload(raw);
   const decision = decideGate(input, {
     overridden: isOverridden(input, io.env),
     verify: () => runVerifyCli(cwd, io.env)
@@ -141,7 +133,7 @@ function isEntrypoint() {
   const entry = process.argv[1];
   if (!entry) return false;
   try {
-    return path.resolve(entry) === path.resolve(new URL(import.meta.url).pathname);
+    return path.resolve(entry) === fileURLToPath(import.meta.url);
   } catch {
     return false;
   }
@@ -167,8 +159,7 @@ export {
   decideGate,
   isOverridden,
   matchesGuardedCommand,
-  parseCwd,
-  parseHookInput,
+  parseHookPayload,
   resolveTrailDir,
   runHook,
   runVerifyCli

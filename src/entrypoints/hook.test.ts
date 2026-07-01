@@ -7,8 +7,7 @@ import {
   isOverridden,
   matchesGuardedCommand,
   OVERRIDE_ENV,
-  parseCwd,
-  parseHookInput,
+  parseHookPayload,
   resolveTrailDir,
   runHook,
   TRAIL_ENV,
@@ -130,20 +129,21 @@ describe('resolveTrailDir + buildVerifyArgs', () => {
   });
 });
 
-describe('parseHookInput / parseCwd', () => {
-  it('extracts the Bash command, tool name, and cwd', () => {
+describe('parseHookPayload', () => {
+  it('extracts the gate input (command + tool name) and cwd in one parse', () => {
     const raw = JSON.stringify({
       cwd: '/repo',
       tool_input: { command: 'gh pr create' },
       tool_name: 'Bash',
     });
-    expect(parseHookInput(raw)).toEqual({ command: 'gh pr create', toolName: 'Bash' });
-    expect(parseCwd(raw)).toBe('/repo');
+    expect(parseHookPayload(raw)).toEqual({
+      input: { command: 'gh pr create', toolName: 'Bash' },
+      cwd: '/repo',
+    });
   });
 
   it('degrades to an empty input on malformed JSON (→ allow, never crash)', () => {
-    expect(parseHookInput('not json')).toEqual({});
-    expect(parseCwd('not json')).toBeUndefined();
+    expect(parseHookPayload('not json')).toEqual({ input: {} });
   });
 });
 

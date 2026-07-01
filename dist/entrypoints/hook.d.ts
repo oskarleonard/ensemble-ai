@@ -28,8 +28,11 @@ interface GateDeps {
     verify: () => VerifyOutcome;
 }
 declare function decideGate(input: GateInput, deps: GateDeps): GateDecision;
-declare function parseHookInput(raw: string): GateInput;
-declare function parseCwd(raw: string): string | undefined;
+interface HookPayload {
+    input: GateInput;
+    cwd?: string;
+}
+declare function parseHookPayload(raw: string): HookPayload;
 declare function resolveTrailDir(cwd: string | undefined, env: NodeJS.ProcessEnv, exists?: (p: string) => boolean): string | undefined;
 declare function buildVerifyArgs(trailDir: string | undefined): string[];
 declare function runVerifyCli(cwd: string | undefined, env: NodeJS.ProcessEnv): VerifyOutcome;
@@ -40,4 +43,4 @@ interface HookIO {
 }
 declare function runHook(raw: string, io: HookIO): number;
 
-export { type GateDecision, type GateDeps, type GateInput, type HookIO, INLINE_OVERRIDE_MARKER, OVERRIDE_ENV, TRAIL_ENV, type VerifyOutcome, buildVerifyArgs, decideGate, isOverridden, matchesGuardedCommand, parseCwd, parseHookInput, resolveTrailDir, runHook, runVerifyCli };
+export { type GateDecision, type GateDeps, type GateInput, type HookIO, type HookPayload, INLINE_OVERRIDE_MARKER, OVERRIDE_ENV, TRAIL_ENV, type VerifyOutcome, buildVerifyArgs, decideGate, isOverridden, matchesGuardedCommand, parseHookPayload, resolveTrailDir, runHook, runVerifyCli };

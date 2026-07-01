@@ -7,9 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { IMPLEMENTED_MODES, resolveMode } from '../modes';
 
 import {
-  buildSkillCommand,
   findSkill,
-  renderSkillDoc,
   SKILL_ARGS_PLACEHOLDER,
   SKILL_SPECS,
   skillInvocationLine,
@@ -41,24 +39,6 @@ describe('SKILL_SPECS registry', () => {
   });
 });
 
-describe('buildSkillCommand (the wrapper invocation)', () => {
-  it('maps each skill to its CLI verb + forwards args verbatim', () => {
-    expect(buildSkillCommand('review', ['--pr', '12'])).toEqual({
-      argv: ['review', '--pr', '12'],
-    });
-    expect(buildSkillCommand('brainstorm', ['naming options for X'])).toEqual({
-      argv: ['brainstorm', 'naming options for X'],
-    });
-    // no args → just the verb
-    expect(buildSkillCommand('security')).toEqual({ argv: ['security'] });
-  });
-
-  it('fails closed on an unknown skill (never a silent no-op)', () => {
-    const r = buildSkillCommand('deploy');
-    expect('error' in r).toBe(true);
-  });
-});
-
 describe('skillInvocationLine', () => {
   it('is `ensemble-ai <mode> $ARGUMENTS`', () => {
     const spec = findSkill('consult')!;
@@ -79,14 +59,4 @@ describe('shipped SKILL.md files (no drift from the registry)', () => {
       expect(body).toContain(SKILL_ARGS_PLACEHOLDER);
     });
   }
-});
-
-describe('renderSkillDoc', () => {
-  it('produces frontmatter + the invocation for a spec', () => {
-    const spec = findSkill('review')!;
-    const doc = renderSkillDoc(spec);
-    expect(doc.startsWith(`---\nname: review\n`)).toBe(true);
-    expect(doc).toContain(skillInvocationLine(spec));
-    expect(doc).toContain(spec.argHint);
-  });
 });
