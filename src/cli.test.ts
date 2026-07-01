@@ -250,6 +250,39 @@ describe('diff-source resolution → engine inputs (all reviewers by default)', 
     expect(await main(['review', '--pr', '5', '--staged'])).toBe(3);
     expect(mockRun).not.toHaveBeenCalled();
   });
+
+  it('--pr with a malformed github PR URL → usage error (exit 3), no review fired', async () => {
+    expect(await main(['review', '--pr', 'https://github.com/o/r/pull/abc'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+
+  it('a bare-number positional (ambiguous with a path) → usage error (exit 3), no review', async () => {
+    expect(await main(['review', '5'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+
+  it('a non-URL positional → usage error (exit 3), no review fired', async () => {
+    expect(await main(['review', 'not-a-url'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+
+  it('a positional PR URL + --pr → conflict usage error (exit 3), no review fired', async () => {
+    expect(
+      await main(['review', 'https://github.com/o/r/pull/5', '--pr', '6'])
+    ).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+
+  it('two positionals → usage error (exit 3), no review fired', async () => {
+    expect(
+      await main([
+        'review',
+        'https://github.com/o/r/pull/5',
+        'https://github.com/o/r/pull/6',
+      ])
+    ).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
 });
 
 describe('brainstorm dispatch + arg parsing', () => {

@@ -958,7 +958,7 @@ function acquireDiff(opts) {
   if (opts.diffText !== void 0) {
     mode = opts.diffMode ?? "raw";
     rawDiff = opts.diffText;
-    headSha = mode === "pr" ? "gh pr diff (no local commit identity)" : "raw diff (no commit identity)";
+    headSha = opts.headShaOverride ?? (mode === "pr" ? "gh pr diff (no local commit identity)" : "raw diff (no commit identity)");
   } else if (opts.staged) {
     mode = "staged";
     rawDiff = git(opts.cwd, ["diff", "--cached"]);
@@ -1390,6 +1390,7 @@ async function runReviewMode(opts) {
     cwd: opts.cwd,
     diffMode: opts.diffMode,
     diffText: opts.diffText,
+    headShaOverride: opts.headShaOverride,
     staged: opts.staged,
     workingTree: opts.workingTree
   });

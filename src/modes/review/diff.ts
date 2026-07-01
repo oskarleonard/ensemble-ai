@@ -281,6 +281,10 @@ export interface AcquireDiffOpts {
   // A pre-supplied raw diff (mode 'raw' unless diffMode overrides): no git
   // resolution, no commit identity.
   diffText?: string;
+  // Override the headSha for a pre-supplied diffText — used for a `gh pr diff` of a
+  // URL PR, where the CLI resolves the PR head SHA (`gh pr view --json headRefOid`)
+  // so the receipt is content-tied to the exact PR head instead of a generic label.
+  headShaOverride?: string;
   // Review staged changes (`git diff --cached`) vs HEAD.
   staged?: boolean;
   // Review uncommitted tracked changes vs HEAD instead of base...HEAD.
@@ -304,9 +308,10 @@ export function acquireDiff(opts: AcquireDiffOpts): AcquiredDiff {
     mode = opts.diffMode ?? 'raw';
     rawDiff = opts.diffText;
     headSha =
-      mode === 'pr'
+      opts.headShaOverride ??
+      (mode === 'pr'
         ? 'gh pr diff (no local commit identity)'
-        : 'raw diff (no commit identity)';
+        : 'raw diff (no commit identity)');
   } else if (opts.staged) {
     mode = 'staged';
     rawDiff = git(opts.cwd, ['diff', '--cached']);

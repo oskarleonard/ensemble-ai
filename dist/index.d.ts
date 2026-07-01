@@ -162,6 +162,7 @@ interface AcquireDiffOpts {
     cwd: string;
     diffMode?: DiffMode;
     diffText?: string;
+    headShaOverride?: string;
     staged?: boolean;
     workingTree?: boolean;
 }
@@ -297,6 +298,7 @@ interface ReviewModeOptions {
     cwd: string;
     diffMode?: DiffMode;
     diffText?: string;
+    headShaOverride?: string;
     objective?: string;
     onProgress?: (msg: string) => void;
     out: string;
