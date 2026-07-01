@@ -44,13 +44,28 @@ done
 SETTINGS="$TARGET/settings.json"
 [ -f "$SETTINGS" ] && cp "$SETTINGS" "$SETTINGS.bak" && echo "  backup: $SETTINGS.bak"
 
-HOOK_CMD="node $HOOK_JS"
+# Single-quote the hook path IN the command string so a repo path with spaces
+# still runs (the command is executed by a shell). HOOK_JS is an absolute fs path
+# with no single-quote in any realistic checkout.
+HOOK_CMD="node '$HOOK_JS'"
 SETTINGS="$SETTINGS" HOOK_CMD="$HOOK_CMD" node <<'NODE'
 const fs = require('fs');
 const file = process.env.SETTINGS;
 const cmd = process.env.HOOK_CMD;
 let cfg = {};
-try { cfg = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { cfg = {}; }
+// If settings.json EXISTS but is unparseable, ABORT — never silently reset it to
+// {} and overwrite the user's config (the .bak was already made, but clobbering a
+// present-but-broken file is data loss). A missing file is fine → start from {}.
+if (fs.existsSync(file)) {
+  try {
+    cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    console.error(
+      `error: ${file} exists but is not valid JSON (${e.message}) — fix it or move it aside; refusing to overwrite`
+    );
+    process.exit(1);
+  }
+}
 cfg.hooks = cfg.hooks || {};
 const pre = Array.isArray(cfg.hooks.PreToolUse) ? cfg.hooks.PreToolUse : [];
 // Idempotent: drop any prior ensemble-ai gate group, then add a fresh one.

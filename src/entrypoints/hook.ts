@@ -46,6 +46,13 @@ export interface GateInput {
 // `gh` (optionally path-qualified) then `pr` then `create` as whitespace-separated
 // tokens anywhere in the command (so `cd x && gh pr create …` is caught), tolerant
 // of extra spaces; deliberately narrow to avoid guarding unrelated commands.
+//
+// SCOPE (by design): this is a best-effort heuristic, NOT a tamper-proof boundary.
+// An operator can express `gh pr create` in a form this regex misses (a shell alias,
+// a variable, unusual quoting) — but the gate protects the operator from FORGETTING
+// to review, not from an actor bent on evading their OWN gate (who could equally
+// uninstall the hook). Same threat model as the receipt: see receipt.ts. The explicit
+// override exists precisely so a bypass is a deliberate, visible choice.
 export function matchesGuardedCommand(input: GateInput): boolean {
   if (input.toolName && input.toolName !== 'Bash') return false;
   const cmd = input.command;
@@ -151,6 +158,11 @@ export function parseHookInput(raw: string): GateInput {
 }
 
 // Extract the cwd the guarded command runs in, so verify checks the RIGHT repo.
+// This is the SESSION cwd from the hook payload; a command that `cd`s into a
+// DIFFERENT repo before `gh pr create` would be verified against the session cwd,
+// not that repo (a known limitation — parsing arbitrary shell `cd` targets is
+// fragile and itself bypassable). For the overwhelmingly common case (creating a
+// PR from the repo you're working in) it verifies the right diff.
 export function parseCwd(raw: string): string | undefined {
   try {
     const j = JSON.parse(raw) as { cwd?: string };
