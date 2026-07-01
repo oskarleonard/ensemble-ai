@@ -35,7 +35,6 @@ import { runConsultMode } from './modes/consult';
 import type { ConsultResult } from './modes/consult/types';
 import { isImplemented, isMode, resolveMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
-import { enforceTrailBoundary } from './modes/review/trail-boundary';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
 import {
   acquireDiff,
@@ -128,8 +127,7 @@ Diff source (give at most ONE; default = current branch):
 
 Options:
   --base <ref>          base ref for the default (commit) mode
-  --reviewers <ids>     comma-separated reviewer ids to subset the roster (default: all
-                        configured — codex, grok)
+  --reviewers <ids>     comma-separated reviewer ids (default: all configured)
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
@@ -726,19 +724,10 @@ async function reviewCommand(
     reviewers = parsed;
   }
   const runId = typeof values['run-id'] === 'string' ? values['run-id'] : genRunId();
-  let out =
+  const out =
     typeof values.out === 'string'
       ? path.resolve(values.out)
       : path.join(os.tmpdir(), 'ensemble-ai', runId);
-  // Brain-separation guard: a `_work` repo's trail is fenced out of the personal brain
-  // (boundaries rule 14) — force it to a local temp dir if `--out` would land in ~/brain.
-  const boundary = enforceTrailBoundary(cwd, out, runId);
-  if (boundary.overridden) {
-    console.error(
-      `· trail: a _work repo's trail is fenced OUT of the personal brain → ${boundary.out}`
-    );
-    out = boundary.out;
-  }
   const ceiling = positiveCeiling(
     typeof values.ceiling === 'string' ? values.ceiling : undefined,
     cmd
@@ -773,17 +762,6 @@ async function reviewCommand(
     return 3;
   }
 
-  // Secret-scan block: fail closed (exit 2) BEFORE anything hits disk. runReviewMode
-  // returns no packet/conventions when it blocks (prompt + manifest are undefined), but
-  // make the "nothing written on a blocked diff" guarantee EXPLICIT rather than incidental
-  // — a secret-carrying diff must never leave a packet.md / conventions.json on disk (a
-  // later refactor could otherwise populate those before the scan). Print the block reason
-  // (no secret content — printSummary shows only paths/labels), then stop.
-  if (result.blocked) {
-    printSummary(result, profile);
-    return 2;
-  }
-
   // The gathered-conventions manifest joins the trail so the receipt's evidence dir
   // records which convention files the reviewers saw (best-effort — never fatal).
   if (result.conventionManifest) {
@@ -798,31 +776,17 @@ async function reviewCommand(
     }
   }
 
-  // Write the EXACT packet the cross-vendor reviewers saw (diff + gathered conventions)
-  // to the trail, so the session-Claude running the /ensemble-ai-review skill can review
-  // from the identical payload — same context as codex/grok, not strictly less. Best-
-  // effort; the `_work` fence already redirected `out` out of the brain if needed.
-  if (result.prompt) {
-    try {
-      fs.mkdirSync(out, { recursive: true });
-      fs.writeFileSync(path.join(out, 'packet.md'), result.prompt);
-    } catch {
-      /* trail write is best-effort */
-    }
-  }
-
   printSummary(result, profile);
   console.error(`trail: ${out}`);
-
+  if (result.blocked) return 2;
   // 1 = a reviewer failed to complete (crash / timeout / no parse) — the review is
   // not trustworthy, so this outranks the findings gate below.
   const allReviewed =
     result.reviews.length > 0 &&
     result.reviews.every((r) => r.terminalState === 'reviewed');
   if (!allReviewed) return 1;
-  // 4 = the findings GATE: a completed review surfaced a HIGH from ANY reviewer (the
-  // full codex+grok roster is scanned). Gate-usable by default (a pre-PR hook can fail
-  // on it); --no-fail-on-high opts out → 0.
+  // 4 = the findings GATE: a completed review surfaced a HIGH. Gate-usable by
+  // default (a pre-PR hook can fail on it); --no-fail-on-high opts out → 0.
   if (!values['no-fail-on-high'] && hasHighFinding(result.reviews)) return 4;
   return 0;
 }

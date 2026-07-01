@@ -22,41 +22,17 @@ export function resolveClaudeBin(): string {
 // passed as an invalid value.
 const CLAUDE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
-// The layered READ-ONLY policy every headless Claude voice (brainstorm + consult
-// ideation/synthesis) runs under. It is report-only — it must never touch the tree.
-// This is REAL enforcement, not a claim:
-//   `--tools ""`          — the hard constraint: DISABLES every built-in tool, so there
-//                           is literally no Edit/Write/Bash/NotebookEdit to invoke even
-//                           if a crafted diff or topic tries to prompt-inject one
-//                           (verified: with `--tools ""` a "write this file" prompt
-//                           produces no file — the tool does not exist to call).
-//   `--disallowed-tools`  — belt-and-suspenders: an explicit deny of the mutating tools,
-//                           so the read-only intent survives even if a future edit widens
-//                           `--tools`.
-//   `--permission-mode default` — never `bypassPermissions`/`--dangerously-skip-…`, so no
-//                           ambient config can silently grant a tool back.
-// This gives Claude the same read-only guarantee codex (`-s read-only`) and grok (OS
-// sandbox) carry. Encoded as DATA so a unit test pins it.
-const CLAUDE_READONLY_ARGS = [
-  '--tools',
-  '',
-  '--disallowed-tools',
-  'Bash',
-  'Edit',
-  'Write',
-  'NotebookEdit',
-  '--permission-mode',
-  'default',
-];
-
-// PURE: the claude CLI args for a headless voice. `-p <prompt>` (headless, single-shot,
-// prints the reply to STDOUT) + `--output-format text` (a plain reply; we parse the
-// embedded ```json block out of it ourselves, exactly like the codex / grok voices —
-// symmetry IS robustness) + the layered read-only policy above. Honors the voice
-// config's model/effort so a CONFIGURED Claude model actually runs (not merely printed
-// in progress). Encoded as DATA so a unit test pins it.
+// PURE: the claude CLI args for a brainstorm voice. `-p <prompt>` (headless,
+// single-shot, prints the reply to STDOUT) + `--output-format text` (a plain reply;
+// we parse the embedded ```json block out of it ourselves, exactly like the codex /
+// grok voices — symmetry IS robustness). `--tools ""` DISABLES every tool: ideation
+// needs none, and a tool-less voice is provably READ-ONLY — it cannot read, write, or
+// execute anything even if the topic or file context tries to prompt-inject it, giving
+// Claude the same read-only guarantee codex (`-s read-only`) and grok (OS sandbox)
+// carry. Honors the voice config's model/effort so a CONFIGURED Claude model actually
+// runs (not merely printed in progress). Encoded as DATA so a unit test pins it.
 export function buildClaudeVoiceArgs(prompt: string, config?: VoiceConfig): string[] {
-  const args = ['-p', prompt, '--output-format', 'text', ...CLAUDE_READONLY_ARGS];
+  const args = ['-p', prompt, '--output-format', 'text', '--tools', ''];
   if (config?.model && config.model !== 'default') args.push('--model', config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort)) args.push('--effort', config.effort);
   return args;

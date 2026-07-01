@@ -1684,10 +1684,10 @@ async function runReviewMode(opts) {
     const store = opts.receiptStore ?? defaultReceiptStore();
     const file = writeReceipt(store, built.receipt);
     log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, conventionManifest, depSurface, prompt, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, receiptError: built.error, reviews, secretScan };
 }
 
 // src/modes/brainstorm/types.ts
@@ -1938,19 +1938,8 @@ function resolveClaudeBin() {
   return resolveBin("claude", { envVar: "CLAUDE_BIN" });
 }
 var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
-var CLAUDE_READONLY_ARGS = [
-  "--tools",
-  "",
-  "--disallowed-tools",
-  "Bash",
-  "Edit",
-  "Write",
-  "NotebookEdit",
-  "--permission-mode",
-  "default"
-];
 function buildClaudeVoiceArgs(prompt, config) {
-  const args = ["-p", prompt, "--output-format", "text", ...CLAUDE_READONLY_ARGS];
+  const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
   if (config?.model && config.model !== "default") args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
   return args;

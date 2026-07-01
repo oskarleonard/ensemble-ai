@@ -3,9 +3,9 @@
 // src/cli.ts
 import { execFileSync as execFileSync3 } from "child_process";
 import crypto2 from "crypto";
-import fs11 from "fs";
-import os8 from "os";
-import path9 from "path";
+import fs10 from "fs";
+import os7 from "os";
+import path8 from "path";
 import { parseArgs } from "util";
 
 // src/core/conventions.ts
@@ -901,19 +901,8 @@ function resolveClaudeBin() {
   return resolveBin("claude", { envVar: "CLAUDE_BIN" });
 }
 var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
-var CLAUDE_READONLY_ARGS = [
-  "--tools",
-  "",
-  "--disallowed-tools",
-  "Bash",
-  "Edit",
-  "Write",
-  "NotebookEdit",
-  "--permission-mode",
-  "default"
-];
 function buildClaudeVoiceArgs(prompt, config) {
-  const args = ["-p", prompt, "--output-format", "text", ...CLAUDE_READONLY_ARGS];
+  const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
   if (config?.model && config.model !== "default") args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
   return args;
@@ -1929,9 +1918,9 @@ var GENERATED_PATTERNS = [
   /\.(js|css)\.map$/,
   /\.snap$/
 ];
-function classifyFileKind(path10, isBinary) {
+function classifyFileKind(path9, isBinary) {
   if (isBinary) return "binary";
-  return GENERATED_PATTERNS.some((re) => re.test(path10)) ? "generated" : "source";
+  return GENERATED_PATTERNS.some((re) => re.test(path9)) ? "generated" : "source";
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -1949,7 +1938,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path10 = pathOfSection(section2);
+    const path9 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -1960,8 +1949,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path10, isBinary),
-      path: path10,
+      kind: classifyFileKind(path9, isBinary),
+      path: path9,
       raw: section2,
       removed
     };
@@ -2589,62 +2578,10 @@ async function runReviewMode(opts) {
     const store = opts.receiptStore ?? defaultReceiptStore();
     const file = writeReceipt(store, built.receipt);
     log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, conventionManifest, depSurface, prompt, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptError: built.error, reviews, secretScan };
-}
-
-// src/modes/review/trail-boundary.ts
-import fs10 from "fs";
-import os7 from "os";
-import path8 from "path";
-function realpathBestEffort(p) {
-  let cur = path8.resolve(p);
-  const tail = [];
-  for (; ; ) {
-    try {
-      const real = fs10.realpathSync(cur);
-      return tail.length ? path8.join(real, ...tail.reverse()) : real;
-    } catch {
-      const parent = path8.dirname(cur);
-      if (parent === cur) return path8.resolve(p);
-      tail.push(path8.basename(cur));
-      cur = parent;
-    }
-  }
-}
-function isUnderWorkPath(p) {
-  return realpathBestEffort(p).split(path8.sep).some((seg) => seg === "_work" || seg.startsWith("_work-"));
-}
-function trailBoundaryViolation(cwd, outDir, brainRoots) {
-  if (!isUnderWorkPath(cwd)) return false;
-  const out = realpathBestEffort(outDir);
-  return brainRoots.some((root) => {
-    const r = realpathBestEffort(root);
-    return out === r || out.startsWith(r + path8.sep);
-  });
-}
-function resolveBrainRoots() {
-  const roots = /* @__PURE__ */ new Set();
-  const candidates = [
-    path8.join(os7.homedir(), "brain"),
-    path8.join(os7.homedir(), "programming", "projects", "_personal", "my-brain")
-  ];
-  for (const c of candidates) {
-    try {
-      roots.add(fs10.realpathSync(c));
-    } catch {
-    }
-    roots.add(path8.resolve(c));
-  }
-  return [...roots];
-}
-function enforceTrailBoundary(cwd, outDir, runId, brainRoots = resolveBrainRoots()) {
-  if (trailBoundaryViolation(cwd, outDir, brainRoots)) {
-    return { out: path8.join(os7.tmpdir(), "ensemble-ai", runId), overridden: true };
-  }
-  return { out: outDir, overridden: false };
+  return { acquired, blocked: false, conventionManifest, depSurface, receiptError: built.error, reviews, secretScan };
 }
 
 // src/modes/review/source.ts
@@ -2913,8 +2850,7 @@ Diff source (give at most ONE; default = current branch):
 
 Options:
   --base <ref>          base ref for the default (commit) mode
-  --reviewers <ids>     comma-separated reviewer ids to subset the roster (default: all
-                        configured \u2014 codex, grok)
+  --reviewers <ids>     comma-separated reviewer ids (default: all configured)
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
@@ -2961,7 +2897,7 @@ function genRunId() {
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
   try {
-    const s = fs11.readFileSync(0, "utf8");
+    const s = fs10.readFileSync(0, "utf8");
     return s.trim() ? s : void 0;
   } catch {
     return void 0;
@@ -3094,7 +3030,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "diff-file": {
       let text;
       try {
-        text = fs11.readFileSync(String(selection.diffFile), "utf8");
+        text = fs10.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
@@ -3322,7 +3258,7 @@ async function reviewCommand(args, profile = "code") {
     console.log(usage);
     return 0;
   }
-  const cwd = values.cwd ? path9.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
   const noConventions = Boolean(values["no-conventions"]);
@@ -3340,14 +3276,7 @@ async function reviewCommand(args, profile = "code") {
     reviewers = parsed;
   }
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-  let out = typeof values.out === "string" ? path9.resolve(values.out) : path9.join(os8.tmpdir(), "ensemble-ai", runId);
-  const boundary = enforceTrailBoundary(cwd, out, runId);
-  if (boundary.overridden) {
-    console.error(
-      `\xB7 trail: a _work repo's trail is fenced OUT of the personal brain \u2192 ${boundary.out}`
-    );
-    out = boundary.out;
-  }
+  const out = typeof values.out === "string" ? path8.resolve(values.out) : path8.join(os7.tmpdir(), "ensemble-ai", runId);
   const ceiling = positiveCeiling(
     typeof values.ceiling === "string" ? values.ceiling : void 0,
     cmd
@@ -3380,29 +3309,19 @@ async function reviewCommand(args, profile = "code") {
     console.error(`ensemble-ai ${cmd}: ${e.message}`);
     return 3;
   }
-  if (result.blocked) {
-    printSummary(result, profile);
-    return 2;
-  }
   if (result.conventionManifest) {
     try {
-      fs11.mkdirSync(out, { recursive: true });
-      fs11.writeFileSync(
-        path9.join(out, "conventions.json"),
+      fs10.mkdirSync(out, { recursive: true });
+      fs10.writeFileSync(
+        path8.join(out, "conventions.json"),
         JSON.stringify(result.conventionManifest, null, 2)
       );
     } catch {
     }
   }
-  if (result.prompt) {
-    try {
-      fs11.mkdirSync(out, { recursive: true });
-      fs11.writeFileSync(path9.join(out, "packet.md"), result.prompt);
-    } catch {
-    }
-  }
   printSummary(result, profile);
   console.error(`trail: ${out}`);
+  if (result.blocked) return 2;
   const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
   if (!allReviewed) return 1;
   if (!values["no-fail-on-high"] && hasHighFinding(result.reviews)) return 4;
@@ -3522,19 +3441,19 @@ async function brainstormCommand(args) {
     console.error(BRAINSTORM_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path9.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path9.resolve(cwd, values.file);
+    const filePath = path8.resolve(cwd, values.file);
     try {
-      const bytes = fs11.statSync(filePath).size;
+      const bytes = fs10.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs11.readFileSync(filePath, "utf8");
+      fileContext = fs10.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${e.message}`
@@ -3727,19 +3646,19 @@ async function consultCommand(args) {
     console.error(CONSULT_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path9.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path9.resolve(cwd, values.file);
+    const filePath = path8.resolve(cwd, values.file);
     try {
-      const bytes = fs11.statSync(filePath).size;
+      const bytes = fs10.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs11.readFileSync(filePath, "utf8");
+      fileContext = fs10.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai consult: cannot read --file ${values.file}: ${e.message}`
@@ -3913,11 +3832,11 @@ async function receiptCommand(args) {
     console.log(RECEIPT_USAGE);
     return 0;
   }
-  const receiptPathArg = typeof positionals[0] === "string" ? path9.resolve(positionals[0]) : void 0;
+  const receiptPathArg = typeof positionals[0] === "string" ? path8.resolve(positionals[0]) : void 0;
   const readReceiptFile = (p) => {
     let raw;
     try {
-      raw = fs11.readFileSync(p, "utf8");
+      raw = fs10.readFileSync(p, "utf8");
     } catch (e) {
       return { error: `cannot read receipt ${p}: ${e.message}` };
     }
@@ -3953,7 +3872,7 @@ async function receiptCommand(args) {
   );
   if (typeof ceiling === "object") return ceiling.code;
   const ceilingBytes = ceiling ?? DEFAULT_COVERAGE_CEILING;
-  const cwd = values.cwd ? path9.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
   if (Boolean(values.staged) && Boolean(values["working-tree"])) {
     console.error(
       `ensemble-ai receipt ${sub}: choose at most one of --staged / --working-tree`
@@ -3984,7 +3903,7 @@ async function receiptCommand(args) {
     }),
     repo: acquired.repoId
   };
-  const store = values.store ? path9.resolve(String(values.store)) : defaultReceiptStore();
+  const store = values.store ? path8.resolve(String(values.store)) : defaultReceiptStore();
   if (sub === "show") {
     const receipt = readReceipt(store, key);
     if (!receipt) {
@@ -4013,7 +3932,7 @@ async function receiptCommand(args) {
     // with isDiffReviewed so a digest-only drift still reports `stale`.
     readReceipt: receiptPathArg ? (k) => explicit && receiptIdentityMatches(explicit, k) ? explicit : null : (k) => readReceipt(store, k),
     strict: Boolean(values.strict || values["require-artifacts"]),
-    trailDir: typeof values.trail === "string" ? path9.resolve(values.trail) : void 0
+    trailDir: typeof values.trail === "string" ? path8.resolve(values.trail) : void 0
   };
   const state = verifyReceipt({ coverage: acquired.coverage, key, required }, verifyDeps);
   console.log(formatVerify(state, key));
@@ -4061,15 +3980,15 @@ async function reviewersCommand(args) {
     console.log(REVIEWERS_USAGE);
     return 0;
   }
-  const reviewersFile = typeof values["reviewers-file"] === "string" ? path9.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
-  const voicesFile = typeof values["voices-file"] === "string" ? path9.resolve(values["voices-file"]) : VOICES_FILE;
+  const reviewersFile = typeof values["reviewers-file"] === "string" ? path8.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
+  const voicesFile = typeof values["voices-file"] === "string" ? path8.resolve(values["voices-file"]) : VOICES_FILE;
   const view = {
     reviewers: listReviewers(reviewersFile),
     reviewersFile,
-    reviewersFileExists: fs11.existsSync(reviewersFile),
+    reviewersFileExists: fs10.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
     voicesFile,
-    voicesFileExists: fs11.existsSync(voicesFile)
+    voicesFileExists: fs10.existsSync(voicesFile)
   };
   if (values.json) console.log(JSON.stringify(view, null, 2));
   else console.log(renderRegistry(view));
@@ -4158,7 +4077,7 @@ async function diffCommand(args) {
     "diff"
   );
   if (typeof ceiling === "object") return ceiling.code;
-  const cwd = values.cwd ? path9.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
   let acquired;

@@ -352,7 +352,6 @@ interface ReviewModeResult {
     blockedReason?: string;
     conventionManifest?: ConventionManifest;
     depSurface?: DepSurfaceResult;
-    prompt?: string;
     receipt?: DiffReviewReceipt;
     receiptError?: string;
     receiptPath?: string;

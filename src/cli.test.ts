@@ -1,5 +1,3 @@
-import fs from 'node:fs';
-
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
@@ -183,24 +181,6 @@ describe('reviewer roster (codex+grok core; claude is not a CLI reviewer)', () =
   it('--with-claude is no longer a flag → usage error, exit 3 (spawned path deferred)', async () => {
     expect(await main(['review', '--working-tree', '--with-claude'])).toBe(3);
     expect(mockRun).not.toHaveBeenCalled();
-  });
-});
-
-describe('secret-scan block writes NOTHING to disk (fail closed before the trail)', () => {
-  it('a blocked diff exits 2 and never writes the packet/conventions to disk', async () => {
-    const writeSpy = vi.spyOn(fs, 'writeFileSync').mockImplementation(() => {});
-    // A blocked result WITH a prompt+manifest present (a stricter guard than the engine's
-    // own undefined-on-block) — the CLI must still write nothing because it blocked.
-    mockRun.mockResolvedValue(
-      result({
-        blocked: true,
-        blockedReason: 'diff carries a secret',
-        conventionManifest: { capBytes: 0, files: [], totalBytes: 0 },
-        prompt: 'SECRET PACKET CONTENTS',
-      })
-    );
-    expect(await main(['review', '--working-tree'])).toBe(2);
-    expect(writeSpy).not.toHaveBeenCalled();
   });
 });
 

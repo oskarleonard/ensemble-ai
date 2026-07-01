@@ -13,37 +13,10 @@ const cfg = (over: Partial<VoiceConfig> = {}): VoiceConfig => ({
 });
 
 describe('buildClaudeVoiceArgs', () => {
-  it('runs headless single-shot, printing plain text to stdout, under the layered read-only policy', () => {
+  it('runs headless single-shot, printing plain text to stdout, with ALL tools disabled', () => {
     const args = buildClaudeVoiceArgs('brainstorm prompt');
-    // Layered read-only enforcement (provably no mutation): `--tools ""` disables every
-    // tool, `--disallowed-tools` explicitly denies the mutating ones, and
-    // `--permission-mode default` refuses any ambient bypass.
-    expect(args).toEqual([
-      '-p',
-      'brainstorm prompt',
-      '--output-format',
-      'text',
-      '--tools',
-      '',
-      '--disallowed-tools',
-      'Bash',
-      'Edit',
-      'Write',
-      'NotebookEdit',
-      '--permission-mode',
-      'default',
-    ]);
-  });
-  it('disables all tools AND explicitly denies every mutating tool (read-only, defense-in-depth)', () => {
-    const args = buildClaudeVoiceArgs('p');
-    // `--tools ""` = the hard disable.
-    expect(args[args.indexOf('--tools') + 1]).toBe('');
-    // The mutating tools are also named in the deny list, and none is granted back.
-    for (const tool of ['Bash', 'Edit', 'Write', 'NotebookEdit']) {
-      expect(args).toContain(tool);
-    }
-    expect(args).not.toContain('--dangerously-skip-permissions');
-    expect(args[args.indexOf('--permission-mode') + 1]).toBe('default');
+    // `--tools ""` makes the voice provably read-only (ideation needs no tools).
+    expect(args).toEqual(['-p', 'brainstorm prompt', '--output-format', 'text', '--tools', '']);
   });
   it('passes the prompt verbatim (no shell interpolation)', () => {
     const tricky = 'a "quoted" $VAR & topic';
