@@ -33,8 +33,10 @@ import type { DepSurfaceResult } from './modes/review/dep-surface';
 import {
   acquireDiff,
   type AcquiredDiff,
+  coverageCounts,
   DEFAULT_COVERAGE_CEILING,
   type DiffMode,
+  omittedLine,
 } from './modes/review/diff';
 import {
   classifySecurityFinding,
@@ -46,6 +48,7 @@ import {
   defaultReceiptStore,
   type DiffReviewReceipt,
   readReceipt,
+  receiptIdentityMatches,
   type ReceiptKey,
   validateReceiptShape,
 } from './modes/review/receipt';
@@ -363,11 +366,9 @@ function printSummary(result: ReviewModeResult, profile: ReviewProfile): void {
   if (a.baseRef) out.push(`  base:    ${a.baseRef} (${a.baseSha ?? '?'})`);
   out.push(`  head:    ${a.headSha}`);
   out.push(`  digest:  ${a.canonicalDigest}`);
-  out.push(
-    `  files:   ${a.coverage.totalFiles} total · ${a.coverage.includedFiles} reviewed · ${a.coverage.omittedFiles} omitted`
-  );
+  out.push(`  files:   ${coverageCounts(a.coverage)}`);
   for (const f of a.coverage.files.filter((x) => !x.included)) {
-    out.push(`             omitted: ${f.path} (${f.omitReason}/${f.kind})`);
+    out.push(`             ${omittedLine({ kind: f.kind, path: f.path, reason: f.omitReason })}`);
   }
   const ss = result.secretScan;
   if (ss.sensitivePaths.length || ss.inlineSecrets.length) {
@@ -457,7 +458,7 @@ async function reviewCommand(
     console.error(`ensemble-ai ${cmd}: ${selection.error}`);
     return 3;
   }
-  const source = resolveSource(selection, cwd, stdinContent);
+  const source = resolveSource(selection, cwd, stdinContent, cmd);
   if ('code' in source) return source.code;
 
   // "no --reviewers" → undefined → run the full default set. But if --reviewers IS
@@ -466,32 +467,21 @@ async function reviewCommand(
   // (which would also mint a receipt under a weaker policy). Fail closed.
   let reviewers: ReviewerId[] | undefined;
   if (typeof values.reviewers === 'string') {
-    const requested = values.reviewers
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const unknown = requested.filter((id) => !isReviewerId(id));
-    if (unknown.length > 0 || requested.length === 0) {
-      console.error(
-        `ensemble-ai ${cmd}: --reviewers "${values.reviewers}" ${
-          unknown.length ? `has unknown id(s): ${unknown.join(', ')}` : 'is empty'
-        } (known: ${REVIEWER_IDS.join(', ')})`
-      );
-      return 3;
-    }
-    reviewers = parseReviewerIds(requested);
+    const parsed = parseReviewerList(values.reviewers, cmd);
+    if ('code' in parsed) return parsed.code;
+    reviewers = parsed;
   }
   const runId = typeof values['run-id'] === 'string' ? values['run-id'] : genRunId();
   const out =
     typeof values.out === 'string'
       ? path.resolve(values.out)
       : path.join(os.tmpdir(), 'ensemble-ai', runId);
-  const ceilingBytes =
-    typeof values.ceiling === 'string' ? Number(values.ceiling) : undefined;
-  if (ceilingBytes !== undefined && (!Number.isFinite(ceilingBytes) || ceilingBytes <= 0)) {
-    console.error(`ensemble-ai ${cmd}: --ceiling must be a positive number`);
-    return 3;
-  }
+  const ceiling = positiveCeiling(
+    typeof values.ceiling === 'string' ? values.ceiling : undefined,
+    cmd
+  );
+  if (typeof ceiling === 'object') return ceiling.code;
+  const ceilingBytes = ceiling;
 
   let result: ReviewModeResult;
   try {
@@ -997,15 +987,14 @@ async function consultCommand(args: string[]): Promise<number> {
 
 // ── Plumbing commands (no reviewer runs) ─────────────────────────────────────
 
-// Parse a fail-closed `--reviewers` list, defaulting to the FULL registry. Unlike
-// review mode (where absent → undefined → "run all"), the gate/preview need a
-// CONCRETE required set, so absent → [...REVIEWER_IDS]. A typo still errors (never
-// silently narrows the policy). Returns the ids or a usage-error code.
-function parseRequiredReviewers(
-  raw: string | undefined,
+// Validate an EXPLICIT `--reviewers` token list (split/trim), failing closed if any
+// token is unknown or the list is empty — a typo must never silently narrow the
+// policy. Shared by review mode and the plumbing gate/preview so the fail-closed
+// rule + the error wording have ONE source of truth. Returns the ids or an error code.
+function parseReviewerList(
+  raw: string,
   cmd: string
 ): ReviewerId[] | { code: number } {
-  if (raw === undefined) return [...REVIEWER_IDS];
   const requested = raw.split(',').map((s) => s.trim()).filter(Boolean);
   const unknown = requested.filter((id) => !isReviewerId(id));
   if (unknown.length > 0 || requested.length === 0) {
@@ -1017,6 +1006,16 @@ function parseRequiredReviewers(
     return { code: 3 };
   }
   return parseReviewerIds(requested) as ReviewerId[];
+}
+
+// Parse a fail-closed `--reviewers` list, defaulting to the FULL registry. Unlike
+// review mode (where absent → undefined → "run all"), the gate/preview need a
+// CONCRETE required set, so absent → [...REVIEWER_IDS].
+function parseRequiredReviewers(
+  raw: string | undefined,
+  cmd: string
+): ReviewerId[] | { code: number } {
+  return raw === undefined ? [...REVIEWER_IDS] : parseReviewerList(raw, cmd);
 }
 
 function positiveCeiling(
@@ -1095,7 +1094,7 @@ async function receiptCommand(args: string[]): Promise<number> {
         staged: { type: 'boolean' },
         store: { type: 'string' },
         strict: { type: 'boolean' },
-        'trail': { type: 'string' },
+        trail: { type: 'string' },
         'working-tree': { type: 'boolean' },
       },
     }));
@@ -1158,7 +1157,21 @@ async function receiptCommand(args: string[]): Promise<number> {
     'receipt'
   );
   if (typeof ceiling === 'object') return ceiling.code;
+  // Resolve the coverage ceiling ONCE so the live diff (acquireDiff) and the receipt
+  // key's policyHash are sized under the SAME value — no second `?? DEFAULT` that could
+  // silently drift and make a genuinely-reviewed diff report no-receipt.
+  const ceilingBytes = ceiling ?? DEFAULT_COVERAGE_CEILING;
   const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
+
+  // At most one explicit source, mirroring selectDiffSource for the review/diff commands
+  // — otherwise acquireDiff silently prefers --staged and drops --working-tree, gating
+  // the wrong diff identity with no error.
+  if (Boolean(values.staged) && Boolean(values['working-tree'])) {
+    console.error(
+      `ensemble-ai receipt ${sub}: choose at most one of --staged / --working-tree`
+    );
+    return 3;
+  }
 
   // Both `verify` and `show`-without-path need the LIVE diff identity to derive the
   // receipt key. Fail closed (exit 3) if the base can't be resolved.
@@ -1166,7 +1179,7 @@ async function receiptCommand(args: string[]): Promise<number> {
   try {
     acquired = acquireDiff({
       base: typeof values.base === 'string' ? values.base : undefined,
-      ceilingBytes: ceiling,
+      ceilingBytes,
       cwd,
       staged: Boolean(values.staged),
       workingTree: Boolean(values['working-tree']),
@@ -1180,7 +1193,7 @@ async function receiptCommand(args: string[]): Promise<number> {
     diffDigest: acquired.canonicalDigest,
     headSha: acquired.headSha,
     policyHash: computePolicyHash({
-      coveragePolicy: { ceilingBytes: ceiling ?? DEFAULT_COVERAGE_CEILING },
+      coveragePolicy: { ceilingBytes },
       diffMode: acquired.mode,
       reviewerPolicy: required,
     }),
@@ -1212,8 +1225,14 @@ async function receiptCommand(args: string[]): Promise<number> {
     explicit = res.receipt;
   }
   const verifyDeps = {
+    // An explicit --path receipt must still match the FULL live identity — repo + both
+    // SHAs + policyHash — exactly as the store lookup binds it (the store file is
+    // addressed by the full-key hash). Without this, `verify <path>` degrades to a
+    // digest-only check, a strictly weaker gate than `verify` (store). The digest stays
+    // with isDiffReviewed so a digest-only drift still reports `stale`.
     readReceipt: receiptPathArg
-      ? () => explicit
+      ? (k: ReceiptKey): DiffReviewReceipt | null =>
+          explicit && receiptIdentityMatches(explicit, k) ? explicit : null
       : (k: ReceiptKey) => readReceipt(store, k),
     strict: Boolean(values.strict || values['require-artifacts']),
     trailDir: typeof values.trail === 'string' ? path.resolve(values.trail) : undefined,

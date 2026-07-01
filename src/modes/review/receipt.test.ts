@@ -11,8 +11,10 @@ import {
   computePolicyHash,
   type DiffReviewReceipt,
   isDiffReviewed,
+  keyOf,
   type ReceiptKey,
   readReceipt,
+  receiptIdentityMatches,
   receiptKeyHash,
   receiptPath,
   validateReceiptShape,
@@ -94,6 +96,29 @@ describe('receiptKeyHash — the full reviewed identity (no collisions)', () => 
   });
   it('two policies on one (head, digest) do NOT collide', () => {
     expect(receiptKeyHash(k)).not.toBe(receiptKeyHash({ ...k, policyHash: 'sha256:p2' }));
+  });
+});
+
+describe('receiptIdentityMatches — bind an explicit --path receipt to the live identity', () => {
+  const receipt: DiffReviewReceipt = {
+    baseRef: 'origin/main', baseSha: 'aaa', completed: ['codex', 'grok'],
+    coverage: { includedFiles: 0, omitted: [], omittedFiles: 0, totalFiles: 0 },
+    diffDigest: 'sha256:deadbeef', diffMode: 'commit', headSha: 'bbb',
+    policyHash: 'sha256:p1', repo: 'https://example/repo',
+    reviewerPolicy: ['codex', 'grok'], runId: 'run-1', vendors: ['openai', 'xai'],
+  };
+  const key: ReceiptKey = keyOf(receipt);
+
+  it('matches when repo + both SHAs + policyHash all equal — digest is EXCLUDED (left to isDiffReviewed → stale)', () => {
+    expect(receiptIdentityMatches(receipt, key)).toBe(true);
+    expect(receiptIdentityMatches(receipt, { ...key, diffDigest: 'sha256:moved' })).toBe(true);
+  });
+
+  it('rejects a receipt whose repo / baseSha / headSha / policyHash differ (closes the digest-only --path gate)', () => {
+    expect(receiptIdentityMatches(receipt, { ...key, repo: 'other/repo' })).toBe(false);
+    expect(receiptIdentityMatches(receipt, { ...key, baseSha: 'zzz' })).toBe(false);
+    expect(receiptIdentityMatches(receipt, { ...key, headSha: 'zzz' })).toBe(false);
+    expect(receiptIdentityMatches(receipt, { ...key, policyHash: 'sha256:p2' })).toBe(false);
   });
 });
 

@@ -121,6 +121,31 @@ export interface Coverage {
   totalFiles: number;
 }
 
+// Coverage PRESENTATION — one wording shared by the review summary (cli
+// printSummary), the `diff` packet preview, and the receipt renderers
+// (plumbing/verify), so the `total · reviewed · omitted` skeleton and the
+// `omitted: <path> (<reason>/<kind>)` line have a single source of truth and can't
+// drift. Pure; take structural args so both a Coverage entry and a ReceiptCoverage
+// entry satisfy them. Callers supply their own left-indent.
+export function coverageCounts(c: {
+  includedFiles: number;
+  omittedFiles: number;
+  totalFiles: number;
+}): string {
+  return `${c.totalFiles} total · ${c.includedFiles} reviewed · ${c.omittedFiles} omitted`;
+}
+
+export function omittedLine(o: {
+  kind: string;
+  path: string;
+  reason: string | undefined;
+}): string {
+  // `reason` is optional on a Coverage entry (only omitted files carry one, and they
+  // always do — computeCoverage sets binary/generated/over-limit); the `?? 'omitted'`
+  // matches summarizeCoverage's fallback so the shared line never renders "undefined".
+  return `omitted: ${o.path} (${o.reason ?? 'omitted'}/${o.kind})`;
+}
+
 // Decide which file diffs the reviewer actually sees, bounded by a byte ceiling,
 // and record EVERY file's disposition. Binary + generated files are omitted by
 // kind; remaining (source) files are included in order until the ceiling, after

@@ -127,6 +127,25 @@ export function keyOf(receipt: DiffReviewReceipt): ReceiptKey {
   };
 }
 
+// Does this receipt's IDENTITY (repo + both SHAs + policy — everything EXCEPT the diff
+// digest) match the live key? The store lookup binds all five key fields implicitly
+// (the receipt file is ADDRESSED by the full-key hash), so a `receipt verify <path>`
+// that reads a file directly must re-bind the same identity or it becomes a strictly
+// weaker gate than the store path. The digest is deliberately excluded here so a
+// digest-only drift (commits since review) still surfaces as `stale` via isDiffReviewed,
+// not a blunt no-receipt.
+export function receiptIdentityMatches(
+  receipt: DiffReviewReceipt,
+  key: ReceiptKey
+): boolean {
+  return (
+    receipt.repo === key.repo &&
+    receipt.baseSha === key.baseSha &&
+    receipt.headSha === key.headSha &&
+    receipt.policyHash === key.policyHash
+  );
+}
+
 export function writeReceipt(
   storeDir: string,
   receipt: DiffReviewReceipt

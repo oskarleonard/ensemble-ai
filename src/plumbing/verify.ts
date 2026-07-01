@@ -7,7 +7,7 @@
 
 import { readReview } from '../core/artifacts';
 import type { ReviewerId, StoredReview } from '../core/types';
-import type { Coverage } from '../modes/review/diff';
+import { type Coverage, coverageCounts, omittedLine } from '../modes/review/diff';
 import {
   type DiffReviewReason,
   type DiffReviewReceipt,
@@ -161,11 +161,9 @@ export function formatReceipt(receipt: DiffReviewReceipt): string {
   out.push(`  completed: ${receipt.completed.join(', ')}`);
   out.push(`  vendors:   ${receipt.vendors.join(', ')}`);
   out.push(`  runId:     ${receipt.runId}`);
-  out.push(
-    `  coverage:  ${c.totalFiles} total · ${c.includedFiles} reviewed · ${c.omittedFiles} omitted`
-  );
+  out.push(`  coverage:  ${coverageCounts(c)}`);
   for (const o of c.omitted) {
-    out.push(`               omitted: ${o.path} (${o.reason}/${o.kind})`);
+    out.push(`               ${omittedLine({ kind: o.kind, path: o.path, reason: o.reason })}`);
   }
   out.push('');
   return out.join('\n');

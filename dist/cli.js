@@ -1764,6 +1764,12 @@ function parseDiffFiles(raw) {
     };
   });
 }
+function coverageCounts(c) {
+  return `${c.totalFiles} total \xB7 ${c.includedFiles} reviewed \xB7 ${c.omittedFiles} omitted`;
+}
+function omittedLine(o) {
+  return `omitted: ${o.path} (${o.reason ?? "omitted"}/${o.kind})`;
+}
 function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
   const entries = [];
   const includedSections = [];
@@ -2030,6 +2036,9 @@ function keyOf(receipt) {
     policyHash: receipt.policyHash,
     repo: receipt.repo
   };
+}
+function receiptIdentityMatches(receipt, key) {
+  return receipt.repo === key.repo && receipt.baseSha === key.baseSha && receipt.headSha === key.headSha && receipt.policyHash === key.policyHash;
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
@@ -2423,10 +2432,10 @@ function renderPacketPreview(acquired, preview, opts) {
   out.push(`  mode:    ${acquired.mode}`);
   out.push(`  digest:  ${acquired.canonicalDigest}`);
   out.push(
-    `  files:   ${c.totalFiles} total \xB7 ${c.includedFiles} reviewed \xB7 ${c.omittedFiles} omitted \xB7 ${c.includedBytes}/${c.totalBytes} bytes covered`
+    `  files:   ${coverageCounts(c)} \xB7 ${c.includedBytes}/${c.totalBytes} bytes covered`
   );
   for (const f of c.files.filter((x) => !x.included)) {
-    out.push(`             omitted: ${f.path} (${f.omitReason}/${f.kind})`);
+    out.push(`             ${omittedLine({ kind: f.kind, path: f.path, reason: f.omitReason })}`);
   }
   out.push("");
   out.push("  packet sections (what the reviewer sees):");
@@ -2540,11 +2549,9 @@ function formatReceipt(receipt) {
   out.push(`  completed: ${receipt.completed.join(", ")}`);
   out.push(`  vendors:   ${receipt.vendors.join(", ")}`);
   out.push(`  runId:     ${receipt.runId}`);
-  out.push(
-    `  coverage:  ${c.totalFiles} total \xB7 ${c.includedFiles} reviewed \xB7 ${c.omittedFiles} omitted`
-  );
+  out.push(`  coverage:  ${coverageCounts(c)}`);
   for (const o of c.omitted) {
-    out.push(`               omitted: ${o.path} (${o.reason}/${o.kind})`);
+    out.push(`               ${omittedLine({ kind: o.kind, path: o.path, reason: o.reason })}`);
   }
   out.push("");
   return out.join("\n");
@@ -2787,11 +2794,9 @@ function printSummary(result, profile) {
   if (a.baseRef) out.push(`  base:    ${a.baseRef} (${a.baseSha ?? "?"})`);
   out.push(`  head:    ${a.headSha}`);
   out.push(`  digest:  ${a.canonicalDigest}`);
-  out.push(
-    `  files:   ${a.coverage.totalFiles} total \xB7 ${a.coverage.includedFiles} reviewed \xB7 ${a.coverage.omittedFiles} omitted`
-  );
+  out.push(`  files:   ${coverageCounts(a.coverage)}`);
   for (const f of a.coverage.files.filter((x) => !x.included)) {
-    out.push(`             omitted: ${f.path} (${f.omitReason}/${f.kind})`);
+    out.push(`             ${omittedLine({ kind: f.kind, path: f.path, reason: f.omitReason })}`);
   }
   const ss = result.secretScan;
   if (ss.sensitivePaths.length || ss.inlineSecrets.length) {
@@ -2867,27 +2872,22 @@ async function reviewCommand(args, profile = "code") {
     console.error(`ensemble-ai ${cmd}: ${selection.error}`);
     return 3;
   }
-  const source = resolveSource(selection, cwd, stdinContent);
+  const source = resolveSource(selection, cwd, stdinContent, cmd);
   if ("code" in source) return source.code;
   let reviewers;
   if (typeof values.reviewers === "string") {
-    const requested = values.reviewers.split(",").map((s) => s.trim()).filter(Boolean);
-    const unknown = requested.filter((id) => !isReviewerId(id));
-    if (unknown.length > 0 || requested.length === 0) {
-      console.error(
-        `ensemble-ai ${cmd}: --reviewers "${values.reviewers}" ${unknown.length ? `has unknown id(s): ${unknown.join(", ")}` : "is empty"} (known: ${REVIEWER_IDS.join(", ")})`
-      );
-      return 3;
-    }
-    reviewers = parseReviewerIds(requested);
+    const parsed = parseReviewerList(values.reviewers, cmd);
+    if ("code" in parsed) return parsed.code;
+    reviewers = parsed;
   }
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
   const out = typeof values.out === "string" ? path7.resolve(values.out) : path7.join(os7.tmpdir(), "ensemble-ai", runId);
-  const ceilingBytes = typeof values.ceiling === "string" ? Number(values.ceiling) : void 0;
-  if (ceilingBytes !== void 0 && (!Number.isFinite(ceilingBytes) || ceilingBytes <= 0)) {
-    console.error(`ensemble-ai ${cmd}: --ceiling must be a positive number`);
-    return 3;
-  }
+  const ceiling = positiveCeiling(
+    typeof values.ceiling === "string" ? values.ceiling : void 0,
+    cmd
+  );
+  if (typeof ceiling === "object") return ceiling.code;
+  const ceilingBytes = ceiling;
   let result;
   try {
     result = await runReviewMode({
@@ -3320,8 +3320,7 @@ async function consultCommand(args) {
   const anyAnswers = result.answers.some((a) => a.ok);
   return anyAnswers ? 0 : 1;
 }
-function parseRequiredReviewers(raw, cmd) {
-  if (raw === void 0) return [...REVIEWER_IDS];
+function parseReviewerList(raw, cmd) {
   const requested = raw.split(",").map((s) => s.trim()).filter(Boolean);
   const unknown = requested.filter((id) => !isReviewerId(id));
   if (unknown.length > 0 || requested.length === 0) {
@@ -3331,6 +3330,9 @@ function parseRequiredReviewers(raw, cmd) {
     return { code: 3 };
   }
   return parseReviewerIds(requested);
+}
+function parseRequiredReviewers(raw, cmd) {
+  return raw === void 0 ? [...REVIEWER_IDS] : parseReviewerList(raw, cmd);
 }
 function positiveCeiling(raw, cmd) {
   if (raw === void 0) return void 0;
@@ -3403,7 +3405,7 @@ async function receiptCommand(args) {
         staged: { type: "boolean" },
         store: { type: "string" },
         strict: { type: "boolean" },
-        "trail": { type: "string" },
+        trail: { type: "string" },
         "working-tree": { type: "boolean" }
       }
     }));
@@ -3455,12 +3457,19 @@ async function receiptCommand(args) {
     "receipt"
   );
   if (typeof ceiling === "object") return ceiling.code;
+  const ceilingBytes = ceiling ?? DEFAULT_COVERAGE_CEILING;
   const cwd = values.cwd ? path7.resolve(String(values.cwd)) : process.cwd();
+  if (Boolean(values.staged) && Boolean(values["working-tree"])) {
+    console.error(
+      `ensemble-ai receipt ${sub}: choose at most one of --staged / --working-tree`
+    );
+    return 3;
+  }
   let acquired;
   try {
     acquired = acquireDiff({
       base: typeof values.base === "string" ? values.base : void 0,
-      ceilingBytes: ceiling,
+      ceilingBytes,
       cwd,
       staged: Boolean(values.staged),
       workingTree: Boolean(values["working-tree"])
@@ -3474,7 +3483,7 @@ async function receiptCommand(args) {
     diffDigest: acquired.canonicalDigest,
     headSha: acquired.headSha,
     policyHash: computePolicyHash({
-      coveragePolicy: { ceilingBytes: ceiling ?? DEFAULT_COVERAGE_CEILING },
+      coveragePolicy: { ceilingBytes },
       diffMode: acquired.mode,
       reviewerPolicy: required
     }),
@@ -3502,7 +3511,12 @@ async function receiptCommand(args) {
     explicit = res.receipt;
   }
   const verifyDeps = {
-    readReceipt: receiptPathArg ? () => explicit : (k) => readReceipt(store, k),
+    // An explicit --path receipt must still match the FULL live identity — repo + both
+    // SHAs + policyHash — exactly as the store lookup binds it (the store file is
+    // addressed by the full-key hash). Without this, `verify <path>` degrades to a
+    // digest-only check, a strictly weaker gate than `verify` (store). The digest stays
+    // with isDiffReviewed so a digest-only drift still reports `stale`.
+    readReceipt: receiptPathArg ? (k) => explicit && receiptIdentityMatches(explicit, k) ? explicit : null : (k) => readReceipt(store, k),
     strict: Boolean(values.strict || values["require-artifacts"]),
     trailDir: typeof values.trail === "string" ? path7.resolve(values.trail) : void 0
   };

@@ -866,6 +866,12 @@ function parseDiffFiles(raw) {
     };
   });
 }
+function coverageCounts(c) {
+  return `${c.totalFiles} total \xB7 ${c.includedFiles} reviewed \xB7 ${c.omittedFiles} omitted`;
+}
+function omittedLine(o) {
+  return `omitted: ${o.path} (${o.reason ?? "omitted"}/${o.kind})`;
+}
 function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
   const entries = [];
   const includedSections = [];
@@ -1135,6 +1141,9 @@ function keyOf(receipt) {
     policyHash: receipt.policyHash,
     repo: receipt.repo
   };
+}
+function receiptIdentityMatches(receipt, key) {
+  return receipt.repo === key.repo && receipt.baseSha === key.baseSha && receipt.headSha === key.headSha && receipt.policyHash === key.policyHash;
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
@@ -2423,6 +2432,7 @@ export {
   computeCoverage,
   computePolicyHash,
   consult_exports as consult,
+  coverageCounts,
   coverageShortfall,
   defaultReceiptStore,
   diffDigest,
@@ -2444,6 +2454,7 @@ export {
   loadReviewers,
   loadVoices,
   makeEscalatingKill,
+  omittedLine,
   oneOf,
   parseCritique,
   parseDiffFiles,
@@ -2459,6 +2470,7 @@ export {
   readReceipt,
   readReview,
   readReviewsForRun,
+  receiptIdentityMatches,
   receiptKeyHash,
   receiptPath,
   renderCritiquePrompt,

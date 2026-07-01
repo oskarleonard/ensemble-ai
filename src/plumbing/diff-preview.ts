@@ -8,7 +8,7 @@
 import { assembleCodePacket } from '../core/packet';
 import { renderReviewPrompt } from '../core/prompt';
 import type { ReviewPacket } from '../core/types';
-import type { AcquiredDiff } from '../modes/review/diff';
+import { type AcquiredDiff, coverageCounts, omittedLine } from '../modes/review/diff';
 import { DEFAULT_OBJECTIVE } from '../modes/review';
 import { type ReviewProfile, SECURITY_OBJECTIVE } from '../modes/review/profile';
 
@@ -53,10 +53,10 @@ export function renderPacketPreview(
   out.push(`  mode:    ${acquired.mode}`);
   out.push(`  digest:  ${acquired.canonicalDigest}`);
   out.push(
-    `  files:   ${c.totalFiles} total · ${c.includedFiles} reviewed · ${c.omittedFiles} omitted · ${c.includedBytes}/${c.totalBytes} bytes covered`
+    `  files:   ${coverageCounts(c)} · ${c.includedBytes}/${c.totalBytes} bytes covered`
   );
   for (const f of c.files.filter((x) => !x.included)) {
-    out.push(`             omitted: ${f.path} (${f.omitReason}/${f.kind})`);
+    out.push(`             ${omittedLine({ kind: f.kind, path: f.path, reason: f.omitReason })}`);
   }
   out.push('');
   out.push('  packet sections (what the reviewer sees):');
@@ -66,6 +66,9 @@ export function renderPacketPreview(
   }
   out.push('');
   out.push(`  packet complete: ${preview.packet.complete ? 'yes' : 'NO — a blind review (diff missing/too small)'}`);
+  // The rendered prompt is reviewer-INDEPENDENT today (renderReviewPrompt keys off
+  // the profile, not the reviewer), so cost scales by count: N chars × R reviewers.
+  // If the prompt ever becomes reviewer-specific, this preview must render per reviewer.
   out.push(
     `  cost preview:    ~${preview.prompt.length} prompt chars × ${opts.reviewers.length} reviewer(s) [${opts.reviewers.join(', ')}]`
   );

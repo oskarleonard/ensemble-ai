@@ -156,4 +156,10 @@ describe('receipt command', () => {
   it('bare receipt (no subcommand) → usage, exit 3', async () => {
     expect(await main(['receipt'])).toBe(3);
   });
+
+  it('receipt verify --staged --working-tree → usage error (exit 3), never a silent staged-wins', async () => {
+    const code = await main(['receipt', 'verify', '--staged', '--working-tree']);
+    expect(code).toBe(3);
+    expect(errored).toContain('at most one of --staged / --working-tree');
+  });
 });
