@@ -59,12 +59,13 @@ export interface PrUrlRef {
 }
 
 // Parse a GitHub PR URL → {owner, repo, pr}, or null if it isn't one. Tolerates
-// http/https, a trailing `/files` or `/commits` sub-tab, a trailing slash, and a
-// `?query`/`#hash`. The PR number is a strict positive integer (same rule as the
-// bare --pr form), so `.../pull/0` or `.../pull/abc` cleanly returns null → error.
+// http/https, a case-insensitive scheme+host (GitHub.com is a valid host), a trailing
+// `/files` or `/commits` sub-tab, a trailing slash, and a `?query`/`#hash`. The PR
+// number is a strict positive integer (same rule as the bare --pr form), so
+// `.../pull/0` or `.../pull/abc` cleanly returns null → error.
 export function parsePrUrl(s: string): PrUrlRef | null {
   const m =
-    /^https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/([1-9][0-9]*)(?:\/(?:files|commits))?\/?(?:[?#].*)?$/.exec(
+    /^https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/([1-9][0-9]*)(?:\/(?:files|commits))?\/?(?:[?#].*)?$/i.exec(
       s.trim()
     );
   if (!m) return null;

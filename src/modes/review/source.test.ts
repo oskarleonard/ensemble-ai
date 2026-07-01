@@ -120,6 +120,14 @@ describe('parsePrUrl — GitHub PR URL → {owner, repo, pr}', () => {
     }
   });
 
+  it('matches the host case-insensitively (GitHub.com is a valid host)', () => {
+    expect(parsePrUrl('https://GitHub.com/o/r/pull/8')).toEqual({
+      owner: 'o',
+      pr: 8,
+      repo: 'r',
+    });
+  });
+
   it('trims surrounding whitespace', () => {
     expect(parsePrUrl('  https://github.com/o/r/pull/9  ')).toEqual({
       owner: 'o',

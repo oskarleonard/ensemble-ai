@@ -227,6 +227,28 @@ function resolveSource(
         repoFlag.length > 0
           ? `gh pr diff ${selection.pr} ${repoFlag.join(' ')}`
           : `gh pr diff ${selection.pr}`;
+      // For a URL PR, content-tie the receipt to the exact PR head via `gh pr view
+      // --json headRefOid`. Read it BEFORE and AFTER the diff and only trust it if it
+      // didn't move across the fetch — otherwise the diff and the head label could
+      // come from DIFFERENT PR heads (a TOCTOU that would mislabel the receipt). A
+      // move, or any gh failure, degrades to the generic label. Best-effort, never
+      // blocks. A bare integer (no repoFlag) resolves no head (unchanged behavior).
+      const readHead = (): string | undefined => {
+        if (repoFlag.length === 0) return undefined;
+        const view = capture(
+          'gh',
+          ['pr', 'view', String(selection.pr), ...repoFlag, '--json', 'headRefOid'],
+          cwd
+        );
+        if (!view.ok) return undefined;
+        try {
+          const oid = (JSON.parse(view.text) as { headRefOid?: unknown }).headRefOid;
+          return typeof oid === 'string' && oid.trim() ? oid.trim() : undefined;
+        } catch {
+          return undefined;
+        }
+      };
+      const headBefore = readHead();
       const cap = capture('gh', ['pr', 'diff', String(selection.pr), ...repoFlag], cwd);
       if (!cap.ok) {
         console.error(`ensemble-ai ${cmd}: \`${label}\` failed: ${cap.error}`);
@@ -236,25 +258,10 @@ function resolveSource(
         console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
         return { code: 3 };
       }
-      // For a URL PR, content-tie the receipt to the exact PR head: resolve the head
-      // SHA via `gh pr view --json headRefOid`. Best-effort — a failure degrades to
-      // the generic 'gh pr diff (no local commit identity)' label, never blocks.
-      let headShaOverride: string | undefined;
-      if (repoFlag.length > 0) {
-        const view = capture(
-          'gh',
-          ['pr', 'view', String(selection.pr), ...repoFlag, '--json', 'headRefOid'],
-          cwd
-        );
-        if (view.ok) {
-          try {
-            const oid = (JSON.parse(view.text) as { headRefOid?: unknown }).headRefOid;
-            if (typeof oid === 'string' && oid.trim()) headShaOverride = oid.trim();
-          } catch {
-            // Malformed JSON → leave undefined (generic label). Not fatal.
-          }
-        }
-      }
+      // Only label the receipt with the head when it was IDENTICAL immediately before
+      // and after the diff fetch — proof the diff belongs to that exact head.
+      const headShaOverride =
+        headBefore && headBefore === readHead() ? headBefore : undefined;
       return { diffMode: 'pr', diffText: cap.text, headShaOverride };
     }
     case 'diff-file': {

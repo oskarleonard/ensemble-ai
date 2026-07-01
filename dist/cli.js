@@ -2387,7 +2387,7 @@ async function runReviewMode(opts) {
 
 // src/modes/review/source.ts
 function parsePrUrl(s) {
-  const m = /^https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/([1-9][0-9]*)(?:\/(?:files|commits))?\/?(?:[?#].*)?$/.exec(
+  const m = /^https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/([1-9][0-9]*)(?:\/(?:files|commits))?\/?(?:[?#].*)?$/i.exec(
     s.trim()
   );
   if (!m) return null;
@@ -2706,6 +2706,22 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "pr": {
       const repoFlag = selection.owner && selection.repo ? ["-R", `${selection.owner}/${selection.repo}`] : [];
       const label = repoFlag.length > 0 ? `gh pr diff ${selection.pr} ${repoFlag.join(" ")}` : `gh pr diff ${selection.pr}`;
+      const readHead = () => {
+        if (repoFlag.length === 0) return void 0;
+        const view = capture(
+          "gh",
+          ["pr", "view", String(selection.pr), ...repoFlag, "--json", "headRefOid"],
+          cwd
+        );
+        if (!view.ok) return void 0;
+        try {
+          const oid = JSON.parse(view.text).headRefOid;
+          return typeof oid === "string" && oid.trim() ? oid.trim() : void 0;
+        } catch {
+          return void 0;
+        }
+      };
+      const headBefore = readHead();
       const cap3 = capture("gh", ["pr", "diff", String(selection.pr), ...repoFlag], cwd);
       if (!cap3.ok) {
         console.error(`ensemble-ai ${cmd}: \`${label}\` failed: ${cap3.error}`);
@@ -2715,21 +2731,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
         console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
         return { code: 3 };
       }
-      let headShaOverride;
-      if (repoFlag.length > 0) {
-        const view = capture(
-          "gh",
-          ["pr", "view", String(selection.pr), ...repoFlag, "--json", "headRefOid"],
-          cwd
-        );
-        if (view.ok) {
-          try {
-            const oid = JSON.parse(view.text).headRefOid;
-            if (typeof oid === "string" && oid.trim()) headShaOverride = oid.trim();
-          } catch {
-          }
-        }
-      }
+      const headShaOverride = headBefore && headBefore === readHead() ? headBefore : void 0;
       return { diffMode: "pr", diffText: cap3.text, headShaOverride };
     }
     case "diff-file": {
