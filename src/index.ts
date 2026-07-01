@@ -36,5 +36,13 @@ export * from './modes/review/receipt';
 export * from './modes/review/profile';
 export * from './modes/review/dep-surface';
 
+// ── The brainstorm MODE: roster · voices · prompts · parse · orchestration ────
+export * from './modes/brainstorm';
+export * from './modes/brainstorm/types';
+export * from './modes/brainstorm/voices';
+export * from './modes/brainstorm/claude';
+export * from './modes/brainstorm/prompt';
+export * from './modes/brainstorm/parse';
+
 // ── Mode registry (mode-first) ───────────────────────────────────────────────
 export * from './modes';

@@ -2,7 +2,7 @@
 
 Cross-vendor AI CLI — convene multiple models (Codex, Grok, …) on a task, **read-only**, and collect their output as typed, machine-readable **facts**.
 
-Modes (architected mode-first): **`review`** — a code diff — is implemented; `brainstorm` and `security` are reserved.
+Modes (architected mode-first): **`review`** (a code diff), **`security`** (a code diff, security lens), and **`brainstorm`** (a topic) are implemented. Every mode is a variation of "fan out across vendors → synthesize" — their **disagreement is the signal**.
 
 It's the portable engine behind a cross-vendor *code review* workflow: give it a `git diff`, it runs each configured reviewer **read-only in an OS-enforced sandbox**, parses their output into typed findings, and writes a self-describing trail plus a content-tied receipt. It emits **facts** (findings + per-reviewer execution status + coverage + a receipt) — **never a gate verdict**. The gate policy belongs to whatever consumes it (a terminal, a pre-PR hook, a dashboard).
 
@@ -41,6 +41,25 @@ ensemble-ai review --reviewers codex,grok --out ./review-trail
 Options: `--base <ref>` · `--reviewers <ids>` · `--out <dir>` · `--sandbox <profile>` · `--allow-sensitive` · `--ceiling <bytes>` · `--cwd <dir>` · `--run-id <id>`.
 
 **Exit codes** (execution status, not a gate verdict): `0` = the review completed (even *with* findings) · `1` = a reviewer failed (crash / timeout / no parse) · `2` = blocked by the diff secret-scan · `3` = usage / no diff.
+
+### Brainstorm
+
+`brainstorm` runs ideation on a **topic** (not a diff) across multiple AI voices and synthesizes the result:
+
+```sh
+# three rounds: independent ideas → cross-critique → ranked synthesis
+ensemble-ai brainstorm "naming options for a cross-vendor AI CLI"
+
+# bring shared context, pick voices, name the synthesizer
+ensemble-ai brainstorm "how should we shard this table?" --file schema.sql
+ensemble-ai brainstorm "feature ideas" --voices codex,grok --synthesizer codex
+```
+
+The three rounds: **(1) generate** — each voice produces ideas *independently* (no anchoring on the others); **(2) critique** — each voice sees the *others'* ideas and critiques + extends them ("they talk to each other"); **(3) synthesize** — one voice de-duplicates, weighs the critiques, and produces a **ranked recommendation** crediting contributors. Default roster: **Codex + Grok + Claude** — Claude joins as a voice here (no independence concern, unlike review). Any voice can fail without taking down the others; if the synthesizer is unavailable it degrades to a deterministic dedupe.
+
+Options: `--file <path>` · `--voices <ids>` · `--synthesizer <id>` · `--timeout <seconds>` · `--voices-file <path>` · `--json` · `--cwd <dir>`.
+
+**Exit codes:** `0` = ideas produced (synthesis printed) · `1` = no usable output (every voice failed) · `3` = usage or an unexpected operational error.
 
 ## Design
 

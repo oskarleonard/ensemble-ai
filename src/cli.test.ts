@@ -11,11 +11,16 @@ import type { ReviewModeResult } from './modes/review';
 // Mock the engine so the CLI's arg-parsing + exit-code CONTRACT is tested without
 // running a real review (no codex/grok). The live end-to-end is a separate smoke.
 vi.mock('./modes/review', () => ({ runReviewMode: vi.fn() }));
+// Same for brainstorm: test the dispatch + arg-parsing contract, never spawn voices.
+vi.mock('./modes/brainstorm', () => ({ runBrainstormMode: vi.fn() }));
 
 import { main } from './cli';
+import { runBrainstormMode } from './modes/brainstorm';
+import type { BrainstormResult } from './modes/brainstorm/types';
 import { runReviewMode } from './modes/review';
 
 const mockRun = vi.mocked(runReviewMode);
+const mockBrainstorm = vi.mocked(runBrainstormMode);
 
 function storedReview(
   reviewerId: ReviewerId,
@@ -64,6 +69,7 @@ function result(over: Partial<ReviewModeResult>): ReviewModeResult {
 
 beforeEach(() => {
   mockRun.mockReset();
+  mockBrainstorm.mockReset();
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
 });
@@ -126,7 +132,9 @@ describe('mode dispatch + usage', () => {
     expect(mockRun).not.toHaveBeenCalled();
   });
 
-  it('a planned-but-unimplemented mode (brainstorm) → exit 3', async () => {
+  it('brainstorm dispatches to its own command, not the review engine', async () => {
+    // brainstorm is implemented now: `brainstorm` with no topic hits its OWN usage
+    // error (exit 3) and the review engine is never invoked.
     expect(await main(['brainstorm'])).toBe(3);
     expect(mockRun).not.toHaveBeenCalled();
   });
@@ -235,5 +243,140 @@ describe('diff-source resolution → engine inputs (all reviewers by default)', 
   it('two explicit sources (--pr + --staged) → usage error (exit 3), no review fired', async () => {
     expect(await main(['review', '--pr', '5', '--staged'])).toBe(3);
     expect(mockRun).not.toHaveBeenCalled();
+  });
+});
+
+describe('brainstorm dispatch + arg parsing', () => {
+  function brainstormResult(over: Partial<BrainstormResult> = {}): BrainstormResult {
+    return {
+      critique: [],
+      generate: [
+        {
+          ideas: [{ body: 'b', id: 'codex-1', title: 't', voiceId: 'codex' }],
+          ok: true,
+          raw: '{}',
+          summary: '',
+          voiceId: 'codex',
+        },
+      ],
+      roster: ['codex', 'grok', 'claude'],
+      synthesis: { by: 'claude', degraded: false, ok: true, ranked: [], raw: null, summary: 's' },
+      topic: 'name it',
+      ...over,
+    };
+  }
+
+  it('a topic → fires brainstorm and exits 0', async () => {
+    mockBrainstorm.mockResolvedValue(brainstormResult());
+    expect(await main(['brainstorm', 'name', 'the', 'CLI'])).toBe(0);
+    expect(mockBrainstorm).toHaveBeenCalledWith(
+      expect.objectContaining({ topic: 'name the CLI' })
+    );
+  });
+
+  it('no topic → usage error (exit 3), nothing fired', async () => {
+    expect(await main(['brainstorm'])).toBe(3);
+    expect(mockBrainstorm).not.toHaveBeenCalled();
+  });
+
+  it('--help → exit 0, nothing fired', async () => {
+    expect(await main(['brainstorm', '--help'])).toBe(0);
+    expect(mockBrainstorm).not.toHaveBeenCalled();
+  });
+
+  it('--voices with an unknown id → usage error (exit 3), fail closed', async () => {
+    expect(await main(['brainstorm', 'x', '--voices', 'codex,gemini'])).toBe(3);
+    expect(mockBrainstorm).not.toHaveBeenCalled();
+  });
+
+  it('--synthesizer with an unknown id → usage error (exit 3)', async () => {
+    expect(await main(['brainstorm', 'x', '--synthesizer', 'nope'])).toBe(3);
+    expect(mockBrainstorm).not.toHaveBeenCalled();
+  });
+
+  it('--timeout seconds → milliseconds threaded to the engine', async () => {
+    mockBrainstorm.mockResolvedValue(brainstormResult());
+    await main(['brainstorm', 'x', '--timeout', '30', '--voices', 'codex,grok']);
+    expect(mockBrainstorm).toHaveBeenCalledWith(
+      expect.objectContaining({ timeoutMs: 30_000, voices: ['codex', 'grok'] })
+    );
+  });
+
+  it('--timeout that rounds to 0ms → usage error (exit 3), nothing fired', async () => {
+    expect(await main(['brainstorm', 'x', '--timeout', '0.0001'])).toBe(3);
+    expect(mockBrainstorm).not.toHaveBeenCalled();
+  });
+
+  it('--synthesizer outside the --voices roster → usage error (exit 3), fail closed', async () => {
+    expect(
+      await main(['brainstorm', 'x', '--voices', 'codex,grok', '--synthesizer', 'claude'])
+    ).toBe(3);
+    expect(mockBrainstorm).not.toHaveBeenCalled();
+  });
+
+  it('--synthesizer inside the roster is threaded to the engine', async () => {
+    mockBrainstorm.mockResolvedValue(brainstormResult());
+    await main(['brainstorm', 'x', '--voices', 'codex,grok', '--synthesizer', 'grok']);
+    expect(mockBrainstorm).toHaveBeenCalledWith(
+      expect.objectContaining({ synthesizer: 'grok', voices: ['codex', 'grok'] })
+    );
+  });
+
+  it('an unexpected orchestration throw → exit 3 (operational error, not the all-empty 1)', async () => {
+    mockBrainstorm.mockRejectedValue(new Error('boom'));
+    expect(await main(['brainstorm', 'x'])).toBe(3);
+  });
+
+  it('every voice failed (no ideas) → exit 1', async () => {
+    mockBrainstorm.mockResolvedValue(
+      brainstormResult({
+        generate: [
+          { error: 'boom', ideas: [], ok: false, raw: null, summary: '', voiceId: 'codex' as const },
+        ],
+      })
+    );
+    expect(await main(['brainstorm', 'x'])).toBe(1);
+  });
+
+  it('printBrainstorm strips control/ANSI escapes from untrusted voice output', async () => {
+    const ESC = '\u001b';
+    mockBrainstorm.mockResolvedValue(
+      brainstormResult({
+        generate: [
+          {
+            ideas: [{ body: `body${ESC}[31m`, id: 'codex-1', title: `t${ESC}[0m`, voiceId: 'codex' }],
+            ok: true,
+            raw: '{}',
+            summary: `sum${ESC}[1m`,
+            voiceId: 'codex',
+          },
+        ],
+        critique: [
+          {
+            critiques: [{ assessment: `weak${ESC}[5m`, stance: 'concern', target: `codex-1${ESC}[7m` }],
+            extensions: [],
+            ok: true,
+            raw: null,
+            summary: '',
+            voiceId: 'grok',
+          },
+        ],
+        synthesis: {
+          by: 'claude',
+          degraded: false,
+          ok: true,
+          raw: null,
+          summary: `final${ESC}[2m`,
+          // contributors + title + why + risks are UNTRUSTED synthesizer output.
+          ranked: [
+            { contributors: [`codex${ESC}[31m`, `grok${ESC}[0m`], rank: 1, title: `Winner${ESC}[0m`, why: `w${ESC}[4m`, risks: `r${ESC}[9m` },
+          ],
+        },
+      })
+    );
+    expect(await main(['brainstorm', 'x'])).toBe(0);
+    const printed = vi.mocked(console.log).mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(printed).not.toContain(ESC); // no escape char reached the terminal
+    expect(printed).toContain('Winner'); // the cleaned content is still rendered
   });
 });
