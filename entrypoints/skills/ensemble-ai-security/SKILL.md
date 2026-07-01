@@ -1,9 +1,9 @@
 ---
-name: security
-description: Run the cross-vendor reviewers over a diff under a security-auditor lens (injection · XSS · authz · secret-leak · supply-chain · SSRF · path-traversal · crypto) plus a local dependency-surface flag. Use when the user says "/security", asks for a security audit/review of a diff/PR with the ensemble / cross-vendor / multiple models.
+name: ensemble-ai-security
+description: Run the cross-vendor reviewers over a diff under a security-auditor lens (injection · XSS · authz · secret-leak · supply-chain · SSRF · path-traversal · crypto) plus a local dependency-surface flag. Use when the user says "/ensemble-ai-security", asks for a security audit/review of a diff/PR with the ensemble / cross-vendor / multiple models.
 ---
 
-# /security — cross-vendor security audit via ensemble-ai
+# /ensemble-ai-security — cross-vendor security audit via ensemble-ai
 
 Thin wrapper over the `ensemble-ai` CLI. It convenes the cross-vendor AI ensemble
 under a security-auditor lens and summarizes the result — it does NOT re-implement

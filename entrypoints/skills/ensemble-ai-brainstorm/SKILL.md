@@ -1,9 +1,9 @@
 ---
-name: brainstorm
-description: Convene multiple AI voices (Codex + Grok + Claude) on a topic — each generates ideas independently, critiques the others, then one synthesizes a ranked, de-duplicated recommendation. Use when the user says "/brainstorm", wants cross-vendor ideation on a feature/name/architecture, or asks "what am I missing" with the ensemble.
+name: ensemble-ai-brainstorm
+description: Convene multiple AI voices (Codex + Grok + Claude) on a topic — each generates ideas independently, critiques the others, then one synthesizes a ranked, de-duplicated recommendation. Use when the user says "/ensemble-ai-brainstorm", wants cross-vendor ideation on a feature/name/architecture, or asks "what am I missing" with the ensemble.
 ---
 
-# /brainstorm — cross-vendor ideation via ensemble-ai
+# /ensemble-ai-brainstorm — cross-vendor ideation via ensemble-ai
 
 Thin wrapper over the `ensemble-ai` CLI. It convenes the cross-vendor AI ensemble
 on a topic and summarizes the result — it does NOT re-implement the logic. Three

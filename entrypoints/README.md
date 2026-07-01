@@ -4,7 +4,7 @@ Two developer entrypoints that WRAP the `ensemble-ai` CLI — thin layers, one
 engine. Nothing here re-implements review/brainstorm/consult logic; it all shells
 out to `ensemble-ai <mode>`.
 
-1. **Claude skills** — `/review`, `/security`, `/brainstorm`, `/consult`: run the
+1. **Claude skills** — `/ensemble-ai-review`, `/ensemble-ai-security`, `/ensemble-ai-brainstorm`, `/ensemble-ai-consult`: run the
    matching CLI mode and summarize the result in-session.
 2. **A pre-PR review GATE** — a Claude Code `PreToolUse` hook on `gh pr create`
    that runs `ensemble-ai receipt verify --strict` and BLOCKS the PR unless the
@@ -30,13 +30,13 @@ Each `skills/<name>/SKILL.md` is a minimal wrapper: it tells Claude to run
 
 | Skill        | Runs                        | For                                            |
 |--------------|-----------------------------|------------------------------------------------|
-| `/review`    | `ensemble-ai review …`      | cross-vendor code review of a diff/PR/branch   |
-| `/security`  | `ensemble-ai security …`    | the same, under a security-auditor lens        |
-| `/brainstorm`| `ensemble-ai brainstorm "…"`| divergent ideation → cross-critique → converge |
-| `/consult`   | `ensemble-ai consult "…"`   | cross-vendor Q&A: AGREE vs DIVERGE + a rec      |
+| `/ensemble-ai-review`    | `ensemble-ai review …`      | cross-vendor code review of a diff/PR/branch   |
+| `/ensemble-ai-security`  | `ensemble-ai security …`    | the same, under a security-auditor lens        |
+| `/ensemble-ai-brainstorm`| `ensemble-ai brainstorm "…"`| divergent ideation → cross-critique → converge |
+| `/ensemble-ai-consult`   | `ensemble-ai consult "…"`   | cross-vendor Q&A: AGREE vs DIVERGE + a rec      |
 
 Install: `install.sh` copies them into `<config-dir>/skills/`, or copy a folder by
-hand. Invoke in Claude Code with `/review`, `/security`, etc.
+hand. Invoke in Claude Code with `/ensemble-ai-review`, `/ensemble-ai-security`, etc.
 
 ## 2 · The pre-PR review gate (hook)
 

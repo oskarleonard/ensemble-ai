@@ -13,21 +13,25 @@ import type { ModeName } from '../modes';
 export const SKILL_ARGS_PLACEHOLDER = '$ARGUMENTS';
 
 export interface SkillSpec {
-  // The canonical CLI mode (post-alias) this skill runs.
+  // The canonical CLI mode (post-alias) this skill runs — the `ensemble-ai <mode>`
+  // verb the wrapper invokes.
   mode: ModeName;
-  // The slash-command name (no leading slash), == the CLI mode/alias the user knows.
+  // The Claude slash-command name (no leading slash). PREFIXED with `ensemble-ai-`
+  // so the skills never collide with a user's other `/review`-style skills; it is
+  // DECOUPLED from the CLI verb (`mode`) — the wrapper runs `ensemble-ai <mode>`,
+  // not `ensemble-ai <name>`.
   name: string;
 }
 
-// The four entrypoint skills. `name` is what the user types (and the CLI verb the
-// wrapper runs); `mode` is the canonical mode it resolves to (only ever an
-// IMPLEMENTED mode — asserted by the tests, so a skill can never point at a
-// planned-but-unbuilt mode).
+// The four entrypoint skills. `name` is the slash command the user types
+// (`ensemble-ai-`-prefixed to avoid collisions); `mode` is the canonical CLI verb
+// the wrapper runs (only ever an IMPLEMENTED mode — asserted by the tests, so a
+// skill can never point at a planned-but-unbuilt mode).
 export const SKILL_SPECS: SkillSpec[] = [
-  { mode: 'review', name: 'review' },
-  { mode: 'security', name: 'security' },
-  { mode: 'brainstorm', name: 'brainstorm' },
-  { mode: 'consult', name: 'consult' },
+  { mode: 'review', name: 'ensemble-ai-review' },
+  { mode: 'security', name: 'ensemble-ai-security' },
+  { mode: 'brainstorm', name: 'ensemble-ai-brainstorm' },
+  { mode: 'consult', name: 'ensemble-ai-consult' },
 ];
 
 export function findSkill(name: string): SkillSpec | undefined {
@@ -39,5 +43,5 @@ export function findSkill(name: string): SkillSpec | undefined {
 // invocation line (a test asserts each SKILL.md contains exactly this line), so the
 // skill wrapper and the CLI can never drift.
 export function skillInvocationLine(spec: SkillSpec): string {
-  return `ensemble-ai ${spec.name} ${SKILL_ARGS_PLACEHOLDER}`;
+  return `ensemble-ai ${spec.mode} ${SKILL_ARGS_PLACEHOLDER}`;
 }
