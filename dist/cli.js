@@ -79,7 +79,7 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   const queue = [];
   const enqueue = (rel) => {
     if (!rel || !rel.endsWith(".md")) return;
-    if (seen.has(rel) || seen.size >= maxFiles) return;
+    if (seen.has(rel)) return;
     seen.add(rel);
     queue.push(rel);
   };
@@ -98,31 +98,43 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   const files = [];
   const chunks = [];
   let used = 0;
+  let visited = 0;
   while (queue.length > 0) {
     const rel = queue.shift();
     const content = await reader.read(rel);
     if (content === null) continue;
+    if (visited >= maxFiles) break;
+    visited++;
     const bytes = Buffer.byteLength(content, "utf8");
     const dir = dirOf(rel);
     for (const ref of extractRefs(content)) enqueue(resolveInRepo(dir, ref));
     const remaining = capBytes - used;
-    if (remaining <= 0) {
+    const header = fileHeader(rel);
+    const headerBytes = Buffer.byteLength(header, "utf8");
+    if (remaining <= headerBytes) {
       files.push({ path: rel, bytes, included: false, truncated: false, reason: "over-cap" });
       continue;
     }
-    if (bytes <= remaining) {
-      chunks.push(fileHeader(rel) + content);
-      used += bytes;
+    if (headerBytes + bytes <= remaining) {
+      chunks.push(header + content);
+      used += headerBytes + bytes;
       files.push({ path: rel, bytes, included: true, truncated: false });
     } else {
-      const head = sliceBytes(content, remaining);
-      chunks.push(
-        `${fileHeader(rel)}${head}
+      const noticeFor = (n) => `
 
-\u2026[${bytes - Buffer.byteLength(head, "utf8")} bytes truncated \u2014 over the ${capBytes}-byte conventions cap]\u2026
-`
-      );
-      used += Buffer.byteLength(head, "utf8");
+\u2026[${n} bytes truncated \u2014 over the ${capBytes}-byte conventions cap]\u2026
+`;
+      const noticeReserve = Buffer.byteLength(noticeFor(bytes), "utf8");
+      const contentBudget = remaining - headerBytes - noticeReserve;
+      if (contentBudget <= 0) {
+        files.push({ path: rel, bytes, included: false, truncated: false, reason: "over-cap" });
+        continue;
+      }
+      const head = sliceBytes(content, contentBudget);
+      const headBytes = Buffer.byteLength(head, "utf8");
+      const notice = noticeFor(bytes - headBytes);
+      chunks.push(`${header}${head}${notice}`);
+      used += headerBytes + headBytes + Buffer.byteLength(notice, "utf8");
       files.push({ path: rel, bytes, included: true, truncated: true, reason: "over-cap" });
     }
   }
@@ -133,11 +145,25 @@ async function gatherConventions(reader, changedPaths, config = {}) {
 }
 function fsConventionReader(repoRoot) {
   const root = path.resolve(repoRoot);
+  let realRoot;
+  try {
+    realRoot = fs.realpathSync(root);
+  } catch {
+    realRoot = root;
+  }
   const within = (rel) => {
     const abs = path.resolve(root, rel);
     const back = path.relative(root, abs);
     if (back.startsWith("..") || path.isAbsolute(back)) return null;
-    return abs;
+    let real;
+    try {
+      real = fs.realpathSync(abs);
+    } catch {
+      return null;
+    }
+    const realBack = path.relative(realRoot, real);
+    if (realBack.startsWith("..") || path.isAbsolute(realBack)) return null;
+    return real;
   };
   return {
     async read(rel) {
@@ -2985,8 +3011,8 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
             ],
             cwd
           );
-          const r = prResult(cmp, label3, headSha);
-          return "code" in r ? r : { ...r, conventionsCtx: { ref: headSha, repoSlug } };
+          const r2 = prResult(cmp, label3, headSha);
+          return "code" in r2 ? r2 : { ...r2, conventionsCtx: { ref: headSha, repoSlug } };
         }
         const label2 = `gh pr diff ${selection.pr} -R ${repoSlug}`;
         const cap4 = capture(
@@ -2994,7 +3020,8 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
           ["pr", "diff", String(selection.pr), "-R", repoSlug],
           cwd
         );
-        return prResult(cap4, label2);
+        const r = prResult(cap4, label2);
+        return "code" in r ? r : { ...r, noLocalConventions: true };
       }
       const label = `gh pr diff ${selection.pr}`;
       const cap3 = capture("gh", ["pr", "diff", String(selection.pr)], cwd);
@@ -3236,7 +3263,12 @@ async function reviewCommand(args, profile = "code") {
   if ("code" in source) return source.code;
   const noConventions = Boolean(values["no-conventions"]);
   const conventionPaths = parseConventionPaths(values.conventions);
-  const conventionReader = noConventions ? null : buildConventionReader(cwd, source.conventionsCtx);
+  if (source.noLocalConventions && !noConventions) {
+    console.error(
+      "\xB7 conventions: skipped \u2014 a URL PR's head SHA was unresolvable, so its conventions can't be fetched and the local repo's belong to a DIFFERENT repo"
+    );
+  }
+  const conventionReader = noConventions || source.noLocalConventions ? null : buildConventionReader(cwd, source.conventionsCtx);
   let reviewers;
   if (typeof values.reviewers === "string") {
     const parsed = parseReviewerList(values.reviewers, cmd);
@@ -4066,7 +4098,7 @@ async function diffCommand(args) {
   }
   let agentsMd;
   let conventions;
-  if (!values["no-conventions"]) {
+  if (!values["no-conventions"] && !source.noLocalConventions) {
     const reader = buildConventionReader(cwd, source.conventionsCtx);
     if (reader) {
       const changed = acquired.files.map((f) => f.path).filter((p) => p && p !== "unknown");

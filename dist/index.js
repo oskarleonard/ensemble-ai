@@ -436,7 +436,7 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   const queue = [];
   const enqueue = (rel) => {
     if (!rel || !rel.endsWith(".md")) return;
-    if (seen.has(rel) || seen.size >= maxFiles) return;
+    if (seen.has(rel)) return;
     seen.add(rel);
     queue.push(rel);
   };
@@ -455,31 +455,43 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   const files = [];
   const chunks = [];
   let used = 0;
+  let visited = 0;
   while (queue.length > 0) {
     const rel = queue.shift();
     const content = await reader.read(rel);
     if (content === null) continue;
+    if (visited >= maxFiles) break;
+    visited++;
     const bytes = Buffer.byteLength(content, "utf8");
     const dir = dirOf(rel);
     for (const ref of extractRefs(content)) enqueue(resolveInRepo(dir, ref));
     const remaining = capBytes - used;
-    if (remaining <= 0) {
+    const header = fileHeader(rel);
+    const headerBytes = Buffer.byteLength(header, "utf8");
+    if (remaining <= headerBytes) {
       files.push({ path: rel, bytes, included: false, truncated: false, reason: "over-cap" });
       continue;
     }
-    if (bytes <= remaining) {
-      chunks.push(fileHeader(rel) + content);
-      used += bytes;
+    if (headerBytes + bytes <= remaining) {
+      chunks.push(header + content);
+      used += headerBytes + bytes;
       files.push({ path: rel, bytes, included: true, truncated: false });
     } else {
-      const head = sliceBytes(content, remaining);
-      chunks.push(
-        `${fileHeader(rel)}${head}
+      const noticeFor = (n) => `
 
-\u2026[${bytes - Buffer.byteLength(head, "utf8")} bytes truncated \u2014 over the ${capBytes}-byte conventions cap]\u2026
-`
-      );
-      used += Buffer.byteLength(head, "utf8");
+\u2026[${n} bytes truncated \u2014 over the ${capBytes}-byte conventions cap]\u2026
+`;
+      const noticeReserve = Buffer.byteLength(noticeFor(bytes), "utf8");
+      const contentBudget = remaining - headerBytes - noticeReserve;
+      if (contentBudget <= 0) {
+        files.push({ path: rel, bytes, included: false, truncated: false, reason: "over-cap" });
+        continue;
+      }
+      const head = sliceBytes(content, contentBudget);
+      const headBytes = Buffer.byteLength(head, "utf8");
+      const notice = noticeFor(bytes - headBytes);
+      chunks.push(`${header}${head}${notice}`);
+      used += headerBytes + headBytes + Buffer.byteLength(notice, "utf8");
       files.push({ path: rel, bytes, included: true, truncated: true, reason: "over-cap" });
     }
   }
@@ -490,11 +502,25 @@ async function gatherConventions(reader, changedPaths, config = {}) {
 }
 function fsConventionReader(repoRoot) {
   const root = path.resolve(repoRoot);
+  let realRoot;
+  try {
+    realRoot = fs.realpathSync(root);
+  } catch {
+    realRoot = root;
+  }
   const within = (rel) => {
     const abs = path.resolve(root, rel);
     const back = path.relative(root, abs);
     if (back.startsWith("..") || path.isAbsolute(back)) return null;
-    return abs;
+    let real;
+    try {
+      real = fs.realpathSync(abs);
+    } catch {
+      return null;
+    }
+    const realBack = path.relative(realRoot, real);
+    if (realBack.startsWith("..") || path.isAbsolute(realBack)) return null;
+    return real;
   };
   return {
     async read(rel) {
