@@ -22,9 +22,9 @@ export function resolveClaudeBin(): string {
 // passed as an invalid value.
 const CLAUDE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
-// The layered READ-ONLY policy every headless Claude voice (brainstorm ideation AND
-// the review reviewer/synthesizer) runs under. Both are report-only — they must never
-// touch the tree. This is REAL enforcement, not a claim:
+// The layered READ-ONLY policy every headless Claude voice (brainstorm + consult
+// ideation/synthesis) runs under. It is report-only — it must never touch the tree.
+// This is REAL enforcement, not a claim:
 //   `--tools ""`          — the hard constraint: DISABLES every built-in tool, so there
 //                           is literally no Edit/Write/Bash/NotebookEdit to invoke even
 //                           if a crafted diff or topic tries to prompt-inject one

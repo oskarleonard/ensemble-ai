@@ -89,8 +89,9 @@ export interface ReviewModeResult {
   // The local dependency-surface scan — present ONLY for the 'security' profile
   // (manifest changes + risky imports drawn from the diff; no network).
   depSurface?: DepSurfaceResult;
-  // The exact packet prompt the reviewers saw — reused by the `--with-claude` layer
-  // so the cold claude reviewer reviews the SAME payload. Absent when blocked.
+  // The exact packet prompt the reviewers saw — written to `<trail>/packet.md` so the
+  // session-Claude running the /ensemble-ai-review skill reviews the SAME payload codex+
+  // grok did (not a strictly-thinner view). Absent when blocked.
   prompt?: string;
   receipt?: DiffReviewReceipt;
   receiptError?: string;

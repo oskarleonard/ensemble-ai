@@ -23,7 +23,7 @@ import {
   type StoredReview,
 } from './core/types';
 import { runBrainstormMode } from './modes/brainstorm';
-import { listVoices, loadVoices, VOICES_FILE } from './modes/brainstorm/voices';
+import { listVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
   type BrainstormResult,
   isVoiceId,
@@ -35,13 +35,7 @@ import { runConsultMode } from './modes/consult';
 import type { ConsultResult } from './modes/consult/types';
 import { isImplemented, isMode, resolveMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
-import {
-  type ClaudeLayerResult,
-  enforceTrailBoundary,
-  renderClaudeLayer,
-  resolveReviewRoster,
-  runClaudeReviewLayer,
-} from './modes/review/with-claude';
+import { enforceTrailBoundary } from './modes/review/trail-boundary';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
 import {
   acquireDiff,
@@ -134,14 +128,8 @@ Diff source (give at most ONE; default = current branch):
 
 Options:
   --base <ref>          base ref for the default (commit) mode
-  --reviewers <ids>     comma-separated reviewer ids (default: all configured; with
-                        --with-claude, "claude" is a valid id to subset the roster)
-  --with-claude         ALSO run a cold headless \`claude -p\` reviewer + a separate
-                        \`claude -p\` SYNTHESIS pass (dedupe · agree/disagree · per-finding
-                        sanity-check · bottom line). Off by default — inside a Claude
-                        session prefer the /ensemble-ai-review skill (that session IS the
-                        ensemble's Claude, and bills the right account). Inherits the
-                        ambient CLAUDE_CONFIG_DIR. REVIEW-ONLY — never edits code.
+  --reviewers <ids>     comma-separated reviewer ids to subset the roster (default: all
+                        configured — codex, grok)
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
@@ -448,14 +436,6 @@ function hasHighFinding(reviews: StoredReview[]): boolean {
   );
 }
 
-// The Claude voice (the cold `--with-claude` reviewer) is a full reviewer, so its HIGH
-// findings count toward the SAME exit-code gate as codex/grok — a Claude-only HIGH must
-// not slip through as exit 0. Only a COMPLETED (ok) claude review counts.
-function claudeLayerHasHigh(layer: ClaudeLayerResult | null): boolean {
-  const cr = layer?.claudeReview;
-  return Boolean(cr?.ok && cr.findings.some((f) => f.severity === 'high'));
-}
-
 // The per-reviewer one-line tally for the gate-friendly summary, e.g. `codex 1H/2M`,
 // `grok 2H`, `codex clean`, `grok failed`.
 function reviewerTally(r: StoredReview): string {
@@ -700,7 +680,6 @@ async function reviewCommand(
         'run-id': { type: 'string' },
         sandbox: { type: 'string' },
         staged: { type: 'boolean' },
-        'with-claude': { type: 'boolean' },
         'working-tree': { type: 'boolean' },
       },
     }));
@@ -736,24 +715,16 @@ async function reviewCommand(
       ? null
       : buildConventionReader(cwd, source.conventionsCtx);
 
-  // Resolve the roster: the cross-vendor CORE (codex/grok — subset with `--reviewers`,
-  // fail-closed on a typo) + whether the CLAUDE voice runs (only under --with-claude).
-  // "no --reviewers" → the full default core; `--with-claude` widens the accepted ids
-  // to include `claude`. Fail closed so a typo can never silently narrow the policy.
-  const withClaude = Boolean(values['with-claude']);
-  const requestedReviewers =
-    typeof values.reviewers === 'string'
-      ? values.reviewers.split(',').map((s) => s.trim()).filter(Boolean)
-      : undefined;
-  const roster = resolveReviewRoster(requestedReviewers, withClaude);
-  if ('error' in roster) {
-    console.error(`ensemble-ai ${cmd}: --reviewers "${values.reviewers}" — ${roster.error}`);
-    return 3;
+  // "no --reviewers" → undefined → run the full default set. But if --reviewers IS
+  // given, EVERY token must be a known id: a typo like `codex,grokk` must error,
+  // never silently drop the unknown and run a narrower set than the user asked for
+  // (which would also mint a receipt under a weaker policy). Fail closed.
+  let reviewers: ReviewerId[] | undefined;
+  if (typeof values.reviewers === 'string') {
+    const parsed = parseReviewerList(values.reviewers, cmd);
+    if ('code' in parsed) return parsed.code;
+    reviewers = parsed;
   }
-  // Preserve the "no --reviewers → undefined → engine runs ALL configured" contract;
-  // an explicit list threads the resolved core subset.
-  const reviewers: ReviewerId[] | undefined =
-    requestedReviewers === undefined ? undefined : roster.core;
   const runId = typeof values['run-id'] === 'string' ? values['run-id'] : genRunId();
   let out =
     typeof values.out === 'string'
@@ -802,6 +773,17 @@ async function reviewCommand(
     return 3;
   }
 
+  // Secret-scan block: fail closed (exit 2) BEFORE anything hits disk. runReviewMode
+  // returns no packet/conventions when it blocks (prompt + manifest are undefined), but
+  // make the "nothing written on a blocked diff" guarantee EXPLICIT rather than incidental
+  // — a secret-carrying diff must never leave a packet.md / conventions.json on disk (a
+  // later refactor could otherwise populate those before the scan). Print the block reason
+  // (no secret content — printSummary shows only paths/labels), then stop.
+  if (result.blocked) {
+    printSummary(result, profile);
+    return 2;
+  }
+
   // The gathered-conventions manifest joins the trail so the receipt's evidence dir
   // records which convention files the reviewers saw (best-effort — never fatal).
   if (result.conventionManifest) {
@@ -832,53 +814,16 @@ async function reviewCommand(
   printSummary(result, profile);
   console.error(`trail: ${out}`);
 
-  // The `--with-claude` layer: a cold headless claude reviewer + a claude SYNTHESIS pass
-  // over every voice. Additive INSIGHT only — it never edits code. Run it ONLY when
-  // claude is actually in the roster (`roster.claude`): an explicit `--reviewers`
-  // WITHOUT claude opts the voice out, so we must not inject a (paid) claude call the
-  // user excluded. The claude voice + synthesizer inherit the ambient CLAUDE_CONFIG_DIR
-  // (bills the right account). Best-effort: a failure degrades, never taking down the
-  // review. NOTE: the claude reviewer IS a reviewer, so its HIGH findings feed the same
-  // exit-code gate below — a Claude-only HIGH does not slip through as exit 0.
-  let claudeLayer: ClaudeLayerResult | null = null;
-  if (withClaude && roster.claude && !result.blocked && result.prompt) {
-    const voiceConfigs = loadVoices();
-    claudeLayer = await runClaudeReviewLayer({
-      claudeConfig: voiceConfigs.claude,
-      coreReviews: result.reviews,
-      includeClaudeReviewer: roster.claude,
-      log: (m) => console.error(`· ${m}`),
-      reviewPrompt: result.prompt,
-      synthConfig: voiceConfigs.claude,
-    });
-    console.log(renderClaudeLayer(claudeLayer).join('\n'));
-    try {
-      fs.mkdirSync(out, { recursive: true });
-      fs.writeFileSync(
-        path.join(out, 'claude-synthesis.json'),
-        JSON.stringify(claudeLayer, null, 2)
-      );
-    } catch {
-      /* trail write is best-effort */
-    }
-  }
-
-  if (result.blocked) return 2;
   // 1 = a reviewer failed to complete (crash / timeout / no parse) — the review is
   // not trustworthy, so this outranks the findings gate below.
   const allReviewed =
     result.reviews.length > 0 &&
     result.reviews.every((r) => r.terminalState === 'reviewed');
   if (!allReviewed) return 1;
-  // 4 = the findings GATE: a completed review surfaced a HIGH — from ANY reviewer,
-  // including the Claude voice (--with-claude). Gate-usable by default (a pre-PR hook can
-  // fail on it); --no-fail-on-high opts out → 0.
-  if (
-    !values['no-fail-on-high'] &&
-    (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))
-  ) {
-    return 4;
-  }
+  // 4 = the findings GATE: a completed review surfaced a HIGH from ANY reviewer (the
+  // full codex+grok roster is scanned). Gate-usable by default (a pre-PR hook can fail
+  // on it); --no-fail-on-high opts out → 0.
+  if (!values['no-fail-on-high'] && hasHighFinding(result.reviews)) return 4;
   return 0;
 }
 

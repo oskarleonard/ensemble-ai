@@ -2595,316 +2595,10 @@ async function runReviewMode(opts) {
   return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptError: built.error, reviews, secretScan };
 }
 
-// src/modes/review/with-claude.ts
+// src/modes/review/trail-boundary.ts
 import fs10 from "fs";
 import os7 from "os";
 import path8 from "path";
-
-// src/modes/review/synthesis.ts
-var SANITY_VERDICTS = ["likely-real", "look-closer", "likely-false"];
-function str5(v) {
-  return typeof v === "string" ? v.trim() : "";
-}
-function strList2(v) {
-  if (!Array.isArray(v)) return [];
-  return [...new Set(v.map(str5).filter(Boolean))];
-}
-var FIELD_BUDGET = 2e3;
-function cap3(s) {
-  return s.length > FIELD_BUDGET ? `${s.slice(0, FIELD_BUDGET)}\u2026[truncated]` : s;
-}
-function voiceReviewsBlock(reviews) {
-  return reviews.filter((r) => r.ok).map((r) => {
-    const head = `[${r.voiceId}] ${cap3(r.summary) || "(no summary)"}`;
-    if (r.findings.length === 0) return `${head}
-  (no findings \u2014 looks correct)`;
-    const lines = r.findings.map((f) => {
-      const where = f.evidence.file ? `${f.evidence.file}${f.evidence.line ? `:${f.evidence.line}` : ""}` : "(uncited)";
-      return `  - [${f.severity}/${f.confidence}] ${where} \u2014 ${cap3(f.title)}: ${cap3(f.body)}`;
-    });
-    return `${head}
-${lines.join("\n")}`;
-  }).join("\n\n");
-}
-function renderReviewSynthesisPrompt(reviews) {
-  return `You are the SYNTHESIZER for a multi-model CODE REVIEW. Several AI reviewers
-each reviewed the SAME diff INDEPENDENTLY (they did not see each other's findings).
-Review-only: do NOT propose editing the code here \u2014 your job is to make sense of the
-findings. Separate the signal:
-- DEDUPE: collapse the SAME underlying issue reported by multiple reviewers into one.
-- AGREEMENTS: findings \u22652 reviewers independently raised \u2014 the confident core.
-- DISAGREEMENTS: a finding only ONE reviewer raised, or where reviewers conflict \u2014 flag
-  these "look closer" and record who took which position.
-- SANITY-CHECK each distinct finding: is it likely-real, look-closer, or likely-false
-  (a probable hallucination / false positive)? Reviewers do hallucinate \u2014 catch it.
-- BOTTOM LINE: the headline \u2014 is this diff safe to merge, and what must change first.
-
-## The reviewers' independent findings
-${voiceReviewsBlock(reviews)}
-
-## Output format \u2014 STRICT
-Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
-{
-  "summary": "<2-3 sentence overall read of the change>",
-  "agreements": [
-    { "point": "<a finding \u22652 reviewers concur on>", "voices": ["codex", "grok"] }
-  ],
-  "disagreements": [
-    { "point": "<a finding one reviewer raised or they split on>", "positions": ["codex: real", "claude: false positive"] }
-  ],
-  "sanityChecks": [
-    { "finding": "<the distinct finding>", "verdict": "likely-real" | "look-closer" | "likely-false", "note": "<why>" }
-  ],
-  "bottomLine": "<merge-safe? what must change first, and how confident given agree vs a judgment call>"
-}
-Only list a REAL agreement (genuine concurrence) and a REAL disagreement (a substantive
-split). Empty arrays are fine. Do not invent findings.`;
-}
-function parseAgreements2(v) {
-  if (!Array.isArray(v)) return [];
-  const out = [];
-  for (const ra of v) {
-    if (!ra || typeof ra !== "object") continue;
-    const a = ra;
-    const point = str5(a.point);
-    if (!point) continue;
-    out.push({ point, voices: strList2(a.voices) });
-  }
-  return out;
-}
-function parseDisagreements(v) {
-  if (!Array.isArray(v)) return [];
-  const out = [];
-  for (const rd of v) {
-    if (!rd || typeof rd !== "object") continue;
-    const d = rd;
-    const point = str5(d.point);
-    if (!point) continue;
-    out.push({ point, positions: strList2(d.positions) });
-  }
-  return out;
-}
-function parseSanityChecks(v) {
-  if (!Array.isArray(v)) return [];
-  const out = [];
-  for (const rs of v) {
-    if (!rs || typeof rs !== "object") continue;
-    const s = rs;
-    const finding = str5(s.finding);
-    if (!finding) continue;
-    out.push({
-      finding,
-      note: str5(s.note),
-      verdict: oneOf(SANITY_VERDICTS, s.verdict, "look-closer")
-    });
-  }
-  return out;
-}
-function parseReviewSynthesis(raw) {
-  const obj = extractJsonBlock(raw);
-  if (!obj || typeof obj !== "object") {
-    return {
-      agreements: [],
-      bottomLine: "",
-      disagreements: [],
-      parseError: "no parseable JSON block in the synthesis output",
-      sanityChecks: [],
-      summary: ""
-    };
-  }
-  const o = obj;
-  const summary = str5(o.summary);
-  const bottomLine = str5(o.bottomLine);
-  const agreements = parseAgreements2(o.agreements);
-  const disagreements = parseDisagreements(o.disagreements);
-  const sanityChecks = parseSanityChecks(o.sanityChecks);
-  if (!bottomLine && !summary) {
-    return {
-      agreements,
-      bottomLine: "",
-      disagreements,
-      parseError: 'synthesis output has no "bottomLine" or "summary"',
-      sanityChecks,
-      summary: ""
-    };
-  }
-  return { agreements, bottomLine, disagreements, sanityChecks, summary };
-}
-function reconcileSynthesis(synth, reviews) {
-  if (synth.degraded) return { synthesis: synth, demoted: 0 };
-  const realVoices = new Set(
-    reviews.filter((r) => r.ok).map((r) => r.voiceId.trim().toLowerCase())
-  );
-  const isReal = (v) => realVoices.has(v.trim().toLowerCase());
-  const agreements = [];
-  const demoted = [];
-  for (const a of synth.agreements) {
-    const credited = [...new Set(a.voices)].filter(isReal);
-    if (credited.length >= 2) {
-      agreements.push({ point: a.point, voices: credited });
-    } else {
-      demoted.push({
-        point: a.point,
-        positions: credited.length > 0 ? credited.map((v) => `${v}: raised`) : ["unverified \u2014 no reviewing voice corroborates this as a shared finding"]
-      });
-    }
-  }
-  return {
-    synthesis: {
-      ...synth,
-      agreements,
-      disagreements: demoted.length ? [...synth.disagreements, ...demoted] : synth.disagreements
-    },
-    demoted: demoted.length
-  };
-}
-function fallbackReviewSynthesis(reviews) {
-  const ok = reviews.filter((r) => r.ok);
-  const disagreements = [];
-  for (const r of ok) {
-    for (const f of r.findings) {
-      disagreements.push({
-        point: f.title,
-        positions: [`${r.voiceId}: [${f.severity}] ${f.evidence.file ?? "(uncited)"}`]
-      });
-    }
-  }
-  return {
-    agreements: [],
-    bottomLine: ok.length > 0 ? "Synthesizer unavailable \u2014 each reviewer's findings shown as-is, NOT deduped or cross-confirmed. Read each voice directly." : "No reviewer produced a usable review.",
-    by: null,
-    degraded: true,
-    disagreements,
-    ok: false,
-    raw: null,
-    sanityChecks: [],
-    summary: ok.length > 0 ? `${ok.length} reviewer(s) produced findings; synthesizer unavailable, so they are NOT compared for agreement.` : "No reviews to synthesize."
-  };
-}
-
-// src/modes/review/with-claude.ts
-function resolveReviewRoster(requested, withClaude) {
-  const known = withClaude ? [...REVIEWER_IDS, "claude"] : [...REVIEWER_IDS];
-  if (requested === void 0) {
-    return { claude: withClaude, core: [...REVIEWER_IDS] };
-  }
-  const ids = [...new Set(requested.map((s) => s.trim()).filter(Boolean))];
-  const unknown = ids.filter((id) => !known.includes(id));
-  if (unknown.length > 0) {
-    const hint = !withClaude && unknown.includes("claude") ? " (claude is only available with --with-claude)" : "";
-    return {
-      error: `unknown reviewer id(s): ${unknown.join(", ")} (known: ${known.join(", ")})${hint}`
-    };
-  }
-  const core = ids.filter(
-    (id) => REVIEWER_IDS.includes(id)
-  );
-  const claude = ids.includes("claude");
-  if (core.length === 0) {
-    return {
-      error: "select at least one cross-vendor reviewer (codex/grok) \u2014 claude is additive (--with-claude), not standalone"
-    };
-  }
-  return { claude, core };
-}
-function storedToVoiceReview(r) {
-  return {
-    findings: r.findings,
-    ok: r.terminalState === "reviewed",
-    summary: r.summary,
-    voiceId: r.reviewerId ?? r.reviewer.vendor
-  };
-}
-async function synthesizeReviews(reviews, run, config, opts = {}) {
-  const log = opts.log ?? (() => {
-  });
-  const healthy = reviews.filter((r) => r.ok);
-  if (healthy.length === 0) return fallbackReviewSynthesis(reviews);
-  const prompt = renderReviewSynthesisPrompt(reviews);
-  log("Synthesizing with claude \u2014 dedupe \xB7 agree/disagree \xB7 sanity-check\u2026");
-  let res;
-  try {
-    res = await run(prompt, config, { timeoutMs: opts.timeoutMs });
-  } catch (e) {
-    log(`  \xB7 synthesis failed (${e.message}) \u2014 deterministic fallback`);
-    return { ...fallbackReviewSynthesis(reviews), error: e.message };
-  }
-  if (!res.raw || res.timedOut) {
-    log("  \xB7 synthesis produced no usable output \u2014 deterministic fallback");
-    return {
-      ...fallbackReviewSynthesis(reviews),
-      error: res.timedOut ? "synthesis timed out" : "synthesis produced no output"
-    };
-  }
-  const parsed = parseReviewSynthesis(res.raw);
-  if (parsed.parseError) {
-    log(`  \xB7 synthesis not parseable (${parsed.parseError}) \u2014 deterministic fallback`);
-    return { ...fallbackReviewSynthesis(reviews), error: parsed.parseError, raw: res.raw };
-  }
-  const { synthesis, demoted } = reconcileSynthesis(
-    {
-      agreements: parsed.agreements,
-      bottomLine: parsed.bottomLine,
-      by: "claude",
-      degraded: false,
-      disagreements: parsed.disagreements,
-      ok: true,
-      raw: res.raw,
-      sanityChecks: parsed.sanityChecks,
-      summary: parsed.summary
-    },
-    reviews
-  );
-  if (demoted > 0) {
-    log(
-      `  \xB7 synthesis: ${demoted} unverifiable "agreement(s)" demoted to look-closer (not corroborated by \u22652 real voices)`
-    );
-  }
-  log(
-    `  \xB7 synthesis: ${synthesis.agreements.length} agreement(s), ${synthesis.disagreements.length} disagreement(s), ${synthesis.sanityChecks.length} sanity-check(s)`
-  );
-  return synthesis;
-}
-async function runClaudeReviewLayer(opts) {
-  const log = opts.log ?? (() => {
-  });
-  const run = opts.run ?? runClaudeVoice;
-  const voiceReviews = opts.coreReviews.map(storedToVoiceReview);
-  let claudeReview = null;
-  if (opts.includeClaudeReviewer) {
-    log("  \xB7 claude (anthropic) reviewing the diff (cold)\u2026");
-    claudeReview = await runClaudeReviewer(opts.reviewPrompt, opts.claudeConfig, run, opts.timeoutMs, log);
-    voiceReviews.push(claudeReview);
-  }
-  const synthesis = await synthesizeReviews(
-    voiceReviews,
-    run,
-    opts.synthConfig ?? opts.claudeConfig,
-    { log, timeoutMs: opts.timeoutMs }
-  );
-  return { claudeReview, synthesis };
-}
-async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log) {
-  let res;
-  try {
-    res = await run(reviewPrompt, config, { timeoutMs });
-  } catch (e) {
-    log(`  \xB7 claude: failed to run \u2014 ${e.message}`);
-    return { findings: [], ok: false, summary: `claude did not run: ${e.message}`, voiceId: "claude" };
-  }
-  if (!res.raw || res.timedOut) {
-    const why = res.timedOut ? "timed out" : "produced no output";
-    log(`  \xB7 claude: ${why}`);
-    return { findings: [], ok: false, summary: `claude ${why}`, voiceId: "claude" };
-  }
-  const parsed = parseFindings(res.raw);
-  if (parsed.parseError) {
-    log(`  \xB7 claude: ${parsed.parseError}`);
-    return { findings: [], ok: false, summary: parsed.summary || parsed.parseError, voiceId: "claude" };
-  }
-  log(`  \xB7 claude: reviewed \u2014 ${parsed.findings.length} finding(s)`);
-  return { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: "claude" };
-}
 function realpathBestEffort(p) {
   let cur = path8.resolve(p);
   const tail = [];
@@ -2951,57 +2645,6 @@ function enforceTrailBoundary(cwd, outDir, runId, brainRoots = resolveBrainRoots
     return { out: path8.join(os7.tmpdir(), "ensemble-ai", runId), overridden: true };
   }
   return { out: outDir, overridden: false };
-}
-function scrub(s) {
-  return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
-}
-function renderClaudeLayer(result) {
-  const out = [];
-  const cr = result.claudeReview;
-  if (cr) {
-    out.push("");
-    out.push(`  \u2500\u2500 claude [anthropic] \u2014 ${cr.ok ? "reviewed" : "failed"} (cold, --with-claude) \u2500\u2500`);
-    if (!cr.ok) {
-      out.push(`     ${scrub(cr.summary).slice(0, 200)}`);
-    } else if (cr.findings.length === 0) {
-      out.push("     no findings");
-    } else {
-      for (const f of cr.findings) {
-        const where = f.evidence.file ? `${f.evidence.file}${f.evidence.line ? `:${f.evidence.line}` : ""}` : "(uncited)";
-        out.push(`     [${f.severity}] ${scrub(where)}  ${scrub(f.title)}`);
-      }
-    }
-  }
-  const s = result.synthesis;
-  out.push("");
-  out.push(
-    `  Claude synthesis${s.by ? ` (by ${s.by})` : ""}${s.degraded ? " \u2014 DEGRADED (deterministic fallback, NOT cross-confirmed)" : ""}`
-  );
-  if (s.summary) out.push(`     ${scrub(s.summary).slice(0, 400)}`);
-  if (s.agreements.length > 0) {
-    out.push("     \u2713 AGREE (confident)");
-    for (const a of s.agreements) {
-      out.push(`        \u2022 ${scrub(a.point).slice(0, 300)}${a.voices.length ? `  [${a.voices.map(scrub).join(", ")}]` : ""}`);
-    }
-  }
-  if (s.disagreements.length > 0) {
-    out.push("     \u26A0 DISAGREE (look closer)");
-    for (const d of s.disagreements) {
-      out.push(`        \u2022 ${scrub(d.point).slice(0, 300)}`);
-      for (const p of d.positions) out.push(`            \u2212 ${scrub(p).slice(0, 240)}`);
-    }
-  }
-  if (s.sanityChecks.length > 0) {
-    out.push("     sanity-checks");
-    for (const c of s.sanityChecks) {
-      out.push(`        [${c.verdict}] ${scrub(c.finding).slice(0, 200)}${c.note ? ` \u2014 ${scrub(c.note).slice(0, 200)}` : ""}`);
-    }
-  }
-  if (s.bottomLine) {
-    out.push("     \u2192 bottom line");
-    out.push(`        ${scrub(s.bottomLine).slice(0, 500)}`);
-  }
-  return out;
 }
 
 // src/modes/review/source.ts
@@ -3270,14 +2913,8 @@ Diff source (give at most ONE; default = current branch):
 
 Options:
   --base <ref>          base ref for the default (commit) mode
-  --reviewers <ids>     comma-separated reviewer ids (default: all configured; with
-                        --with-claude, "claude" is a valid id to subset the roster)
-  --with-claude         ALSO run a cold headless \`claude -p\` reviewer + a separate
-                        \`claude -p\` SYNTHESIS pass (dedupe \xB7 agree/disagree \xB7 per-finding
-                        sanity-check \xB7 bottom line). Off by default \u2014 inside a Claude
-                        session prefer the /ensemble-ai-review skill (that session IS the
-                        ensemble's Claude, and bills the right account). Inherits the
-                        ambient CLAUDE_CONFIG_DIR. REVIEW-ONLY \u2014 never edits code.
+  --reviewers <ids>     comma-separated reviewer ids to subset the roster (default: all
+                        configured \u2014 codex, grok)
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
@@ -3362,26 +2999,26 @@ function gitToplevel(cwd) {
 function ghConventionReader(repoSlug, ref, cwd) {
   return {
     async read(rel) {
-      const cap4 = capture(
+      const cap3 = capture(
         "gh",
         ["api", `repos/${repoSlug}/contents/${rel}?ref=${ref}`, "--jq", ".content"],
         cwd
       );
-      if (!cap4.ok || !cap4.text.trim()) return null;
+      if (!cap3.ok || !cap3.text.trim()) return null;
       try {
-        return Buffer.from(cap4.text.replace(/\s/g, ""), "base64").toString("utf8");
+        return Buffer.from(cap3.text.replace(/\s/g, ""), "base64").toString("utf8");
       } catch {
         return null;
       }
     },
     async list(dirRel) {
-      const cap4 = capture(
+      const cap3 = capture(
         "gh",
         ["api", `repos/${repoSlug}/contents/${dirRel}?ref=${ref}`, "--jq", ".[].path"],
         cwd
       );
-      if (!cap4.ok) return [];
-      return cap4.text.split("\n").map((s) => s.trim()).filter((s) => s.endsWith(".md"));
+      if (!cap3.ok) return [];
+      return cap3.text.split("\n").map((s) => s.trim()).filter((s) => s.endsWith(".md"));
     }
   };
 }
@@ -3393,16 +3030,16 @@ function buildConventionReader(cwd, ctx) {
 function resolveSource(selection, cwd, stdinContent, cmd = "review") {
   switch (selection.kind) {
     case "pr": {
-      const prResult = (cap5, label2, headShaOverride) => {
-        if (!cap5.ok) {
-          console.error(`ensemble-ai ${cmd}: \`${label2}\` failed: ${cap5.error}`);
+      const prResult = (cap4, label2, headShaOverride) => {
+        if (!cap4.ok) {
+          console.error(`ensemble-ai ${cmd}: \`${label2}\` failed: ${cap4.error}`);
           return { code: 3 };
         }
-        if (!cap5.text.trim()) {
+        if (!cap4.text.trim()) {
           console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
           return { code: 3 };
         }
-        return { diffMode: "pr", diffText: cap5.text, headShaOverride };
+        return { diffMode: "pr", diffText: cap4.text, headShaOverride };
       };
       if (selection.owner && selection.repo) {
         const repoSlug = `${selection.owner}/${selection.repo}`;
@@ -3442,17 +3079,17 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
           return "code" in r2 ? r2 : { ...r2, conventionsCtx: { ref: headSha, repoSlug } };
         }
         const label2 = `gh pr diff ${selection.pr} -R ${repoSlug}`;
-        const cap5 = capture(
+        const cap4 = capture(
           "gh",
           ["pr", "diff", String(selection.pr), "-R", repoSlug],
           cwd
         );
-        const r = prResult(cap5, label2);
+        const r = prResult(cap4, label2);
         return "code" in r ? r : { ...r, noLocalConventions: true };
       }
       const label = `gh pr diff ${selection.pr}`;
-      const cap4 = capture("gh", ["pr", "diff", String(selection.pr)], cwd);
-      return prResult(cap4, label);
+      const cap3 = capture("gh", ["pr", "diff", String(selection.pr)], cwd);
+      return prResult(cap3, label);
     }
     case "diff-file": {
       let text;
@@ -3492,10 +3129,6 @@ function hasHighFinding(reviews) {
   return reviews.some(
     (r) => r.terminalState === "reviewed" && r.findings.some((f) => f.severity === "high")
   );
-}
-function claudeLayerHasHigh(layer) {
-  const cr = layer?.claudeReview;
-  return Boolean(cr?.ok && cr.findings.some((f) => f.severity === "high"));
 }
 function reviewerTally(r) {
   const id = r.reviewerId ?? r.reviewer.vendor;
@@ -3677,7 +3310,6 @@ async function reviewCommand(args, profile = "code") {
         "run-id": { type: "string" },
         sandbox: { type: "string" },
         staged: { type: "boolean" },
-        "with-claude": { type: "boolean" },
         "working-tree": { type: "boolean" }
       }
     }));
@@ -3701,14 +3333,12 @@ async function reviewCommand(args, profile = "code") {
     );
   }
   const conventionReader = noConventions || source.noLocalConventions ? null : buildConventionReader(cwd, source.conventionsCtx);
-  const withClaude = Boolean(values["with-claude"]);
-  const requestedReviewers = typeof values.reviewers === "string" ? values.reviewers.split(",").map((s) => s.trim()).filter(Boolean) : void 0;
-  const roster = resolveReviewRoster(requestedReviewers, withClaude);
-  if ("error" in roster) {
-    console.error(`ensemble-ai ${cmd}: --reviewers "${values.reviewers}" \u2014 ${roster.error}`);
-    return 3;
+  let reviewers;
+  if (typeof values.reviewers === "string") {
+    const parsed = parseReviewerList(values.reviewers, cmd);
+    if ("code" in parsed) return parsed.code;
+    reviewers = parsed;
   }
-  const reviewers = requestedReviewers === void 0 ? void 0 : roster.core;
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
   let out = typeof values.out === "string" ? path9.resolve(values.out) : path9.join(os8.tmpdir(), "ensemble-ai", runId);
   const boundary = enforceTrailBoundary(cwd, out, runId);
@@ -3750,6 +3380,10 @@ async function reviewCommand(args, profile = "code") {
     console.error(`ensemble-ai ${cmd}: ${e.message}`);
     return 3;
   }
+  if (result.blocked) {
+    printSummary(result, profile);
+    return 2;
+  }
   if (result.conventionManifest) {
     try {
       fs11.mkdirSync(out, { recursive: true });
@@ -3769,33 +3403,9 @@ async function reviewCommand(args, profile = "code") {
   }
   printSummary(result, profile);
   console.error(`trail: ${out}`);
-  let claudeLayer = null;
-  if (withClaude && roster.claude && !result.blocked && result.prompt) {
-    const voiceConfigs = loadVoices();
-    claudeLayer = await runClaudeReviewLayer({
-      claudeConfig: voiceConfigs.claude,
-      coreReviews: result.reviews,
-      includeClaudeReviewer: roster.claude,
-      log: (m) => console.error(`\xB7 ${m}`),
-      reviewPrompt: result.prompt,
-      synthConfig: voiceConfigs.claude
-    });
-    console.log(renderClaudeLayer(claudeLayer).join("\n"));
-    try {
-      fs11.mkdirSync(out, { recursive: true });
-      fs11.writeFileSync(
-        path9.join(out, "claude-synthesis.json"),
-        JSON.stringify(claudeLayer, null, 2)
-      );
-    } catch {
-    }
-  }
-  if (result.blocked) return 2;
   const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
   if (!allReviewed) return 1;
-  if (!values["no-fail-on-high"] && (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))) {
-    return 4;
-  }
+  if (!values["no-fail-on-high"] && hasHighFinding(result.reviews)) return 4;
   return 0;
 }
 var BRAINSTORM_USAGE = `ensemble-ai brainstorm \u2014 convene multiple AI voices on a TOPIC.

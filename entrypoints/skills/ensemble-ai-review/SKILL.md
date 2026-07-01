@@ -13,9 +13,10 @@ voice. You do NOT re-implement the CLI's logic, and you do NOT edit the code.
 **Why the session-Claude, not a spawned one:** whichever Claude you already are
 (work-claude or personal) IS the ensemble's Claude, so the review bills the RIGHT
 account — fire this from work-claude and the work code review draws on the WORK Claude
-quota, never personal usage. (For a bare terminal with no Claude session, the CLI's
-`--with-claude` flag spawns a headless `claude -p` reviewer + synthesizer instead —
-see below. From here, inside a session, you are the cheaper, better path.)
+quota, never personal usage. You are the cheaper, better path: no extra process, no
+sandbox to prove, and the synthesis is done by the model already in the loop. (A
+bare-terminal spawned-`claude -p` reviewer for use OUTSIDE a session is a deferred
+follow-up — this skill is the session path.)
 
 ## 1 · Run the cross-vendor reviewers (Codex + Grok)
 
