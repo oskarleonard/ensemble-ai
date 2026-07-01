@@ -10,7 +10,8 @@
   },
   "type": "module",
   "bin": {
-    "ensemble-ai": "dist/cli.js"
+    "ensemble-ai": "dist/cli.js",
+    "ensemble-ai-pre-pr-gate": "dist/entrypoints/hook.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
