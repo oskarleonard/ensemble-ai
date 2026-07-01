@@ -216,13 +216,16 @@ function resolveSource(
     } {
   switch (selection.kind) {
     case 'pr': {
-      // A gh capture → the diff text, or an error code for a failed/empty fetch — the
-      // same clear exit for every PR fetch path below. Returns the text (not a
-      // narrowed cap) so callers stay type-clean without re-narrowing the union.
-      const prDiffText = (
+      // A gh capture → the case's engine inputs (the PR diff, optionally SHA-bound via
+      // `headShaOverride`), or a usage-error code for a failed/empty fetch. Centralizes
+      // the ok/empty checks so every PR fetch path below is a single `return`.
+      const prResult = (
         cap: ReturnType<typeof capture>,
-        label: string
-      ): string | { code: number } => {
+        label: string,
+        headShaOverride?: string
+      ):
+        | { code: number }
+        | { diffMode: DiffMode; diffText: string; headShaOverride?: string } => {
         if (!cap.ok) {
           console.error(`ensemble-ai ${cmd}: \`${label}\` failed: ${cap.error}`);
           return { code: 3 };
@@ -231,7 +234,7 @@ function resolveSource(
           console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
           return { code: 3 };
         }
-        return cap.text;
+        return { diffMode: 'pr', diffText: cap.text, headShaOverride };
       };
 
       // A URL PR carries owner/repo → fetch the diff BOUND to the exact head SHA via
@@ -277,9 +280,7 @@ function resolveSource(
             ],
             cwd
           );
-          const d = prDiffText(cmp, label);
-          if (typeof d !== 'string') return d;
-          return { diffMode: 'pr', diffText: d, headShaOverride: headSha };
+          return prResult(cmp, label, headSha);
         }
         // SHAs unresolved → unbound `gh pr diff -R` (no SHA binding, generic label).
         const label = `gh pr diff ${selection.pr} -R ${repoSlug}`;
@@ -288,17 +289,13 @@ function resolveSource(
           ['pr', 'diff', String(selection.pr), '-R', repoSlug],
           cwd
         );
-        const d = prDiffText(cap, label);
-        if (typeof d !== 'string') return d;
-        return { diffMode: 'pr', diffText: d };
+        return prResult(cap, label);
       }
 
       // Bare integer PR: the cwd's repo, current head — unchanged (no SHA binding).
       const label = `gh pr diff ${selection.pr}`;
       const cap = capture('gh', ['pr', 'diff', String(selection.pr)], cwd);
-      const d = prDiffText(cap, label);
-      if (typeof d !== 'string') return d;
-      return { diffMode: 'pr', diffText: d };
+      return prResult(cap, label);
     }
     case 'diff-file': {
       let text: string;

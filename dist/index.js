@@ -916,16 +916,16 @@ function canonicalizeDiff(raw) {
 function diffDigest(raw) {
   return `sha256:${sha256Hex(canonicalizeDiff(raw))}`;
 }
-function git(cwd, args) {
-  return execFileSync2("git", args, { cwd, encoding: "utf8" });
+function git(cwd, args, opts) {
+  return execFileSync2("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: opts?.quiet ? ["ignore", "pipe", "ignore"] : ["pipe", "pipe", "inherit"]
+  });
 }
 function gitOrNull(cwd, args) {
   try {
-    return execFileSync2("git", args, {
-      cwd,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    }).trim();
+    return git(cwd, args, { quiet: true }).trim();
   } catch {
     return null;
   }

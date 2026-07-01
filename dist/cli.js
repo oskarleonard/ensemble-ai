@@ -1826,16 +1826,16 @@ function canonicalizeDiff(raw) {
 function diffDigest(raw) {
   return `sha256:${sha256Hex(canonicalizeDiff(raw))}`;
 }
-function git(cwd, args) {
-  return execFileSync2("git", args, { cwd, encoding: "utf8" });
+function git(cwd, args, opts) {
+  return execFileSync2("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: opts?.quiet ? ["ignore", "pipe", "ignore"] : ["pipe", "pipe", "inherit"]
+  });
 }
 function gitOrNull(cwd, args) {
   try {
-    return execFileSync2("git", args, {
-      cwd,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    }).trim();
+    return git(cwd, args, { quiet: true }).trim();
   } catch {
     return null;
   }
@@ -2708,7 +2708,7 @@ function capture(cmd, cmdArgs, cwd) {
 function resolveSource(selection, cwd, stdinContent, cmd = "review") {
   switch (selection.kind) {
     case "pr": {
-      const prDiffText = (cap4, label2) => {
+      const prResult = (cap4, label2, headShaOverride) => {
         if (!cap4.ok) {
           console.error(`ensemble-ai ${cmd}: \`${label2}\` failed: ${cap4.error}`);
           return { code: 3 };
@@ -2717,7 +2717,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
           console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
           return { code: 3 };
         }
-        return cap4.text;
+        return { diffMode: "pr", diffText: cap4.text, headShaOverride };
       };
       if (selection.owner && selection.repo) {
         const repoSlug = `${selection.owner}/${selection.repo}`;
@@ -2753,9 +2753,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
             ],
             cwd
           );
-          const d3 = prDiffText(cmp, label3);
-          if (typeof d3 !== "string") return d3;
-          return { diffMode: "pr", diffText: d3, headShaOverride: headSha };
+          return prResult(cmp, label3, headSha);
         }
         const label2 = `gh pr diff ${selection.pr} -R ${repoSlug}`;
         const cap4 = capture(
@@ -2763,15 +2761,11 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
           ["pr", "diff", String(selection.pr), "-R", repoSlug],
           cwd
         );
-        const d2 = prDiffText(cap4, label2);
-        if (typeof d2 !== "string") return d2;
-        return { diffMode: "pr", diffText: d2 };
+        return prResult(cap4, label2);
       }
       const label = `gh pr diff ${selection.pr}`;
       const cap3 = capture("gh", ["pr", "diff", String(selection.pr)], cwd);
-      const d = prDiffText(cap3, label);
-      if (typeof d !== "string") return d;
-      return { diffMode: "pr", diffText: d };
+      return prResult(cap3, label);
     }
     case "diff-file": {
       let text;
