@@ -214,7 +214,15 @@ function git(cwd: string, args: string[]): string {
 
 function gitOrNull(cwd: string, args: string[]): string | null {
   try {
-    return git(cwd, args).trim();
+    // The OPTIONAL-probe path (base resolution, repoId, rev-parse): a failure means
+    // "not available" → null. Silence stderr so git's own noise ("fatal: not a git
+    // repository" when reviewing a PR URL from a non-repo cwd like /tmp) never leaks
+    // to the user; the load-bearing `git()` above keeps stderr for real diff errors.
+    return execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
   } catch {
     return null;
   }

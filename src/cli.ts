@@ -216,55 +216,89 @@ function resolveSource(
     } {
   switch (selection.kind) {
     case 'pr': {
-      // A URL PR carries owner/repo → `-R <owner>/<repo>` makes `gh` fetch the diff
-      // from ANY cwd (even outside the repo, no branch checkout). A bare integer has
-      // no repo → `gh pr diff <N>` resolves against the cwd's repo (unchanged).
-      const repoFlag =
-        selection.owner && selection.repo
-          ? ['-R', `${selection.owner}/${selection.repo}`]
-          : [];
-      const label =
-        repoFlag.length > 0
-          ? `gh pr diff ${selection.pr} ${repoFlag.join(' ')}`
-          : `gh pr diff ${selection.pr}`;
-      // For a URL PR, content-tie the receipt to the exact PR head via `gh pr view
-      // --json headRefOid`. Read it BEFORE and AFTER the diff and only trust it if it
-      // didn't move across the fetch — otherwise the diff and the head label could
-      // come from DIFFERENT PR heads (a TOCTOU that would mislabel the receipt). A
-      // move, or any gh failure, degrades to the generic label. Best-effort, never
-      // blocks. A bare integer (no repoFlag) resolves no head (unchanged behavior).
-      const fetchHeadRefOid = (): string | undefined => {
-        if (repoFlag.length === 0) return undefined;
-        const view = capture(
+      // A gh capture → the diff text, or an error code for a failed/empty fetch — the
+      // same clear exit for every PR fetch path below. Returns the text (not a
+      // narrowed cap) so callers stay type-clean without re-narrowing the union.
+      const prDiffText = (
+        cap: ReturnType<typeof capture>,
+        label: string
+      ): string | { code: number } => {
+        if (!cap.ok) {
+          console.error(`ensemble-ai ${cmd}: \`${label}\` failed: ${cap.error}`);
+          return { code: 3 };
+        }
+        if (!cap.text.trim()) {
+          console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
+          return { code: 3 };
+        }
+        return cap.text;
+      };
+
+      // A URL PR carries owner/repo → fetch the diff BOUND to the exact head SHA via
+      // the compare API: one `gh api pulls/<N>` reads the PR's base+head SHAs, then
+      // `gh api compare/<base>...<head>` returns EXACTLY that range's diff. So the
+      // receipt's headSha provably matches the reviewed bytes — no TOCTOU between a
+      // `gh pr diff` and a separate head read (the compare diff is byte-identical to
+      // `gh pr diff`). Works from ANY cwd. Any gh failure degrades to an unbound
+      // `gh pr diff -R` (generic head label). A bare integer keeps `gh pr diff <N>`
+      // against the cwd's repo, unchanged (no SHA binding).
+      if (selection.owner && selection.repo) {
+        const repoSlug = `${selection.owner}/${selection.repo}`;
+        const meta = capture(
           'gh',
-          ['pr', 'view', String(selection.pr), ...repoFlag, '--json', 'headRefOid'],
+          [
+            'api',
+            `repos/${repoSlug}/pulls/${selection.pr}`,
+            '--jq',
+            '{base: .base.sha, head: .head.sha}',
+          ],
           cwd
         );
-        if (!view.ok) return undefined;
-        try {
-          const oid = (JSON.parse(view.text) as { headRefOid?: unknown }).headRefOid;
-          return typeof oid === 'string' && oid.trim() ? oid.trim() : undefined;
-        } catch {
-          return undefined;
+        let baseSha: string | undefined;
+        let headSha: string | undefined;
+        if (meta.ok) {
+          try {
+            const o = JSON.parse(meta.text) as { base?: unknown; head?: unknown };
+            if (typeof o.base === 'string' && o.base.trim()) baseSha = o.base.trim();
+            if (typeof o.head === 'string' && o.head.trim()) headSha = o.head.trim();
+          } catch {
+            /* unresolved → fall through to the unbound gh pr diff below */
+          }
         }
-      };
-      const headBefore = fetchHeadRefOid();
-      const cap = capture('gh', ['pr', 'diff', String(selection.pr), ...repoFlag], cwd);
-      if (!cap.ok) {
-        console.error(`ensemble-ai ${cmd}: \`${label}\` failed: ${cap.error}`);
-        return { code: 3 };
+        if (baseSha && headSha) {
+          const label = `gh api repos/${repoSlug}/compare/${baseSha.slice(0, 7)}...${headSha.slice(0, 7)}`;
+          const cmp = capture(
+            'gh',
+            [
+              'api',
+              `repos/${repoSlug}/compare/${baseSha}...${headSha}`,
+              '-H',
+              'Accept: application/vnd.github.diff',
+            ],
+            cwd
+          );
+          const d = prDiffText(cmp, label);
+          if (typeof d !== 'string') return d;
+          return { diffMode: 'pr', diffText: d, headShaOverride: headSha };
+        }
+        // SHAs unresolved → unbound `gh pr diff -R` (no SHA binding, generic label).
+        const label = `gh pr diff ${selection.pr} -R ${repoSlug}`;
+        const cap = capture(
+          'gh',
+          ['pr', 'diff', String(selection.pr), '-R', repoSlug],
+          cwd
+        );
+        const d = prDiffText(cap, label);
+        if (typeof d !== 'string') return d;
+        return { diffMode: 'pr', diffText: d };
       }
-      if (!cap.text.trim()) {
-        console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
-        return { code: 3 };
-      }
-      // Only label the receipt with the head when it read IDENTICAL immediately before
-      // AND after the diff fetch — proof the diff belongs to that exact head. Each call
-      // is a separate `gh pr view`, so this equality is the actual TOCTOU guard.
-      const headAfter = fetchHeadRefOid();
-      const headShaOverride =
-        headBefore && headBefore === headAfter ? headBefore : undefined;
-      return { diffMode: 'pr', diffText: cap.text, headShaOverride };
+
+      // Bare integer PR: the cwd's repo, current head — unchanged (no SHA binding).
+      const label = `gh pr diff ${selection.pr}`;
+      const cap = capture('gh', ['pr', 'diff', String(selection.pr)], cwd);
+      const d = prDiffText(cap, label);
+      if (typeof d !== 'string') return d;
+      return { diffMode: 'pr', diffText: d };
     }
     case 'diff-file': {
       let text: string;

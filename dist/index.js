@@ -921,7 +921,11 @@ function git(cwd, args) {
 }
 function gitOrNull(cwd, args) {
   try {
-    return git(cwd, args).trim();
+    return execFileSync2("git", args, {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
   } catch {
     return null;
   }
