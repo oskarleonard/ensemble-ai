@@ -102,4 +102,40 @@ describe('A5 · `diff` populates packet conventions (local mode)', () => {
     expect(code).toBe(0);
     expect(logs.join('\n')).not.toContain('conventions:');
   });
+
+  // The load-bearing boundary: an in-tree symlink pointing OUTSIDE the repo passes the
+  // lexical under-root check but MUST NOT be followed (realpath exposes the escape).
+  it('does NOT follow an in-repo symlink that escapes the repo root', async () => {
+    // A secret file OUTSIDE the repo, and an in-repo symlink + @-import pointing at it.
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'ea-outside-'));
+    fs.writeFileSync(path.join(outside, 'secret.md'), 'TOP-SECRET-LEAK-CONTENT');
+    fs.symlinkSync(path.join(outside, 'secret.md'), path.join(tmp, 'leak.md'));
+    fs.writeFileSync(
+      path.join(tmp, 'CLAUDE.md'),
+      '# root rules\n@AGENTS.md\n@leak.md\nsee CONTRIBUTING.md\n'
+    );
+    try {
+      const code = await main([
+        'diff',
+        '--cwd',
+        tmp,
+        '--working-tree',
+        '--json',
+      ]);
+      expect(code).toBe(0);
+      const out = logs.join('\n');
+      // The escaping symlink's target content never enters the packet…
+      expect(out).not.toContain('TOP-SECRET-LEAK-CONTENT');
+      // …and leak.md is not gathered as a convention file (its read resolves outside root).
+      const parsed = JSON.parse(out) as {
+        conventions?: { files: { path: string; included: boolean }[] };
+      };
+      const paths = (parsed.conventions?.files ?? []).map((f) => f.path);
+      expect(paths).not.toContain('leak.md');
+      // in-repo conventions still gather normally (the guard rejects ONLY the escape).
+      expect(paths).toContain('AGENTS.md');
+    } finally {
+      fs.rmSync(outside, { force: true, recursive: true });
+    }
+  });
 });

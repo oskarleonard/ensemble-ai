@@ -149,7 +149,7 @@ export async function gatherConventions(
   const queue: string[] = [];
   const enqueue = (rel: string | null): void => {
     if (!rel || !rel.endsWith('.md')) return; // only markdown docs are conventions prose
-    if (seen.has(rel) || seen.size >= maxFiles) return;
+    if (seen.has(rel)) return; // dedupe — also terminates any import cycle
     seen.add(rel);
     queue.push(rel);
   };
@@ -172,32 +172,56 @@ export async function gatherConventions(
   const files: ConventionFileEntry[] = [];
   const chunks: string[] = [];
   let used = 0;
+  // maxFiles bounds distinct REAL (existing) files visited — NOT speculative seed
+  // candidates. Entry-file / common-doc seeds are enqueued for every touched dir before
+  // we know they exist; counting those misses against the ceiling would let a deep tree
+  // of absent candidates starve the real linked docs. So the cap counts reads that hit.
+  let visited = 0;
   while (queue.length > 0) {
     const rel = queue.shift() as string;
     const content = await reader.read(rel);
-    if (content === null) continue; // missing/unreadable → not part of the set
+    if (content === null) continue; // missing/unreadable → not part of the set (no budget)
+    if (visited >= maxFiles) break; // ceiling on real files reached (cycle/runaway backstop)
+    visited++;
     const bytes = Buffer.byteLength(content, 'utf8');
     // Discover transitive refs BEFORE cap decisions (an over-cap file can still link
-    // to a small important one; enqueue's maxFiles guard bounds any cycle).
+    // to a small important one; the `seen` dedupe bounds any cycle).
     const dir = dirOf(rel);
     for (const ref of extractRefs(content)) enqueue(resolveInRepo(dir, ref));
 
+    // The emitted `text` carries the per-file framing (a header, and for a truncated
+    // file a notice) — count THAT toward the cap too, so the flattened text actually
+    // honors capBytes rather than overshooting by the sum of every header.
     const remaining = capBytes - used;
-    if (remaining <= 0) {
-      // Nothing left in the budget → NAMED as omitted, never silently dropped.
+    const header = fileHeader(rel);
+    const headerBytes = Buffer.byteLength(header, 'utf8');
+    if (remaining <= headerBytes) {
+      // Not even room for the header → NAMED as omitted, never silently dropped.
       files.push({ path: rel, bytes, included: false, truncated: false, reason: 'over-cap' });
       continue;
     }
-    if (bytes <= remaining) {
-      chunks.push(fileHeader(rel) + content);
-      used += bytes;
+    if (headerBytes + bytes <= remaining) {
+      chunks.push(header + content);
+      used += headerBytes + bytes;
       files.push({ path: rel, bytes, included: true, truncated: false });
     } else {
-      const head = sliceBytes(content, remaining);
-      chunks.push(
-        `${fileHeader(rel)}${head}\n\n…[${bytes - Buffer.byteLength(head, 'utf8')} bytes truncated — over the ${capBytes}-byte conventions cap]…\n`
-      );
-      used += Buffer.byteLength(head, 'utf8');
+      // Reserve room for the header + the truncation notice within `remaining` so the
+      // total never exceeds the cap. noticeFor(bytes) upper-bounds the notice's digit
+      // count (the real notice has ≤ as many digits) → `used` stays ≤ capBytes.
+      const noticeFor = (n: number): string =>
+        `\n\n…[${n} bytes truncated — over the ${capBytes}-byte conventions cap]…\n`;
+      const noticeReserve = Buffer.byteLength(noticeFor(bytes), 'utf8');
+      const contentBudget = remaining - headerBytes - noticeReserve;
+      if (contentBudget <= 0) {
+        // No room for header + notice (+ content) → NAMED as omitted, never silent.
+        files.push({ path: rel, bytes, included: false, truncated: false, reason: 'over-cap' });
+        continue;
+      }
+      const head = sliceBytes(content, contentBudget);
+      const headBytes = Buffer.byteLength(head, 'utf8');
+      const notice = noticeFor(bytes - headBytes);
+      chunks.push(`${header}${head}${notice}`);
+      used += headerBytes + headBytes + Buffer.byteLength(notice, 'utf8');
       files.push({ path: rel, bytes, included: true, truncated: true, reason: 'over-cap' });
     }
   }
@@ -212,11 +236,31 @@ export async function gatherConventions(
 // root (defense in depth beside resolveInRepo).
 export function fsConventionReader(repoRoot: string): ConventionReader {
   const root = path.resolve(repoRoot);
+  // Resolve symlinks in the root ONCE so containment is compared on real paths (the
+  // repo itself may live under a symlinked path, e.g. /var → /private/var on macOS).
+  let realRoot: string;
+  try {
+    realRoot = fs.realpathSync(root);
+  } catch {
+    realRoot = root;
+  }
+  // Resolve rel under root, then REALPATH it and re-check containment: a symlink INSIDE
+  // the repo pointing OUTSIDE passes the lexical check (its path string is under root)
+  // but must NOT be followed — realpath exposes the escape. THE load-bearing boundary
+  // (defense beside resolveInRepo). Missing / broken links → null (not part of the set).
   const within = (rel: string): string | null => {
     const abs = path.resolve(root, rel);
     const back = path.relative(root, abs);
-    if (back.startsWith('..') || path.isAbsolute(back)) return null;
-    return abs;
+    if (back.startsWith('..') || path.isAbsolute(back)) return null; // lexical escape
+    let real: string;
+    try {
+      real = fs.realpathSync(abs);
+    } catch {
+      return null; // missing / unreadable / broken symlink
+    }
+    const realBack = path.relative(realRoot, real);
+    if (realBack.startsWith('..') || path.isAbsolute(realBack)) return null; // symlink escape
+    return real;
   };
   return {
     async read(rel) {

@@ -291,6 +291,10 @@ function resolveSource(
       diffMode?: DiffMode;
       diffText?: string;
       headShaOverride?: string;
+      // A URL PR reviews a DIFFERENT repo than the cwd. When its head SHA can't be
+      // resolved (no gh ref to read conventions at), suppress the LOCAL-repo fallback:
+      // gather NOTHING rather than the wrong repo's conventions.
+      noLocalConventions?: boolean;
       staged?: boolean;
       workingTree?: boolean;
     } {
@@ -366,14 +370,18 @@ function resolveSource(
           // even when fired from a bare terminal / non-repo cwd.
           return 'code' in r ? r : { ...r, conventionsCtx: { ref: headSha, repoSlug } };
         }
-        // SHAs unresolved → unbound `gh pr diff -R` (no SHA binding, generic label).
+        // SHAs unresolved → unbound `gh pr diff -R` (no SHA binding, generic label). A
+        // URL PR reviews a DIFFERENT repo than the cwd, so its conventions must come ONLY
+        // from the PR repo — but with no resolved head SHA there is no ref to read them
+        // at. Suppress the local-repo fallback: EMPTY conventions, never the wrong repo's.
         const label = `gh pr diff ${selection.pr} -R ${repoSlug}`;
         const cap = capture(
           'gh',
           ['pr', 'diff', String(selection.pr), '-R', repoSlug],
           cwd
         );
-        return prResult(cap, label);
+        const r = prResult(cap, label);
+        return 'code' in r ? r : { ...r, noLocalConventions: true };
       }
 
       // Bare integer PR: the cwd's repo, current head — unchanged (no SHA binding).
@@ -693,9 +701,17 @@ async function reviewCommand(
   // sources, a gh reader (PR head) for a `--pr <url>`.
   const noConventions = Boolean(values['no-conventions']);
   const conventionPaths = parseConventionPaths(values.conventions);
-  const conventionReader = noConventions
-    ? null
-    : buildConventionReader(cwd, source.conventionsCtx);
+  // A URL PR whose head SHA couldn't be resolved must NOT borrow the LOCAL cwd's
+  // conventions — that's a different repo. Gather NOTHING (with a note) instead.
+  if (source.noLocalConventions && !noConventions) {
+    console.error(
+      "· conventions: skipped — a URL PR's head SHA was unresolvable, so its conventions can't be fetched and the local repo's belong to a DIFFERENT repo"
+    );
+  }
+  const conventionReader =
+    noConventions || source.noLocalConventions
+      ? null
+      : buildConventionReader(cwd, source.conventionsCtx);
 
   // "no --reviewers" → undefined → run the full default set. But if --reviewers IS
   // given, EVERY token must be a known id: a typo like `codex,grokk` must error,
@@ -1685,7 +1701,10 @@ async function diffCommand(args: string[]): Promise<number> {
   // --no-conventions; fs reader for local sources, gh reader for a `--pr <url>`.
   let agentsMd: string | undefined;
   let conventions: ConventionManifest | undefined;
-  if (!values['no-conventions']) {
+  // Same rule as the review path: an unresolvable URL PR gathers NOTHING rather than
+  // the local (different) repo's conventions — a resolved URL PR still gathers from the
+  // PR repo via source.conventionsCtx (the gh reader), so the preview matches the review.
+  if (!values['no-conventions'] && !source.noLocalConventions) {
     const reader = buildConventionReader(cwd, source.conventionsCtx);
     if (reader) {
       const changed = acquired.files
