@@ -11,9 +11,13 @@ import {
   computePolicyHash,
   type DiffReviewReceipt,
   isDiffReviewed,
+  keyOf,
   type ReceiptKey,
   readReceipt,
+  receiptIdentityMatches,
   receiptKeyHash,
+  receiptPath,
+  validateReceiptShape,
   writeReceipt,
 } from './receipt';
 
@@ -95,6 +99,29 @@ describe('receiptKeyHash — the full reviewed identity (no collisions)', () => 
   });
 });
 
+describe('receiptIdentityMatches — bind an explicit --path receipt to the live identity', () => {
+  const receipt: DiffReviewReceipt = {
+    baseRef: 'origin/main', baseSha: 'aaa', completed: ['codex', 'grok'],
+    coverage: { includedFiles: 0, omitted: [], omittedFiles: 0, totalFiles: 0 },
+    diffDigest: 'sha256:deadbeef', diffMode: 'commit', headSha: 'bbb',
+    policyHash: 'sha256:p1', repo: 'https://example/repo',
+    reviewerPolicy: ['codex', 'grok'], runId: 'run-1', vendors: ['openai', 'xai'],
+  };
+  const key: ReceiptKey = keyOf(receipt);
+
+  it('matches when repo + both SHAs + policyHash all equal — digest is EXCLUDED (left to isDiffReviewed → stale)', () => {
+    expect(receiptIdentityMatches(receipt, key)).toBe(true);
+    expect(receiptIdentityMatches(receipt, { ...key, diffDigest: 'sha256:moved' })).toBe(true);
+  });
+
+  it('rejects a receipt whose repo / baseSha / headSha / policyHash differ (closes the digest-only --path gate)', () => {
+    expect(receiptIdentityMatches(receipt, { ...key, repo: 'other/repo' })).toBe(false);
+    expect(receiptIdentityMatches(receipt, { ...key, baseSha: 'zzz' })).toBe(false);
+    expect(receiptIdentityMatches(receipt, { ...key, headSha: 'zzz' })).toBe(false);
+    expect(receiptIdentityMatches(receipt, { ...key, policyHash: 'sha256:p2' })).toBe(false);
+  });
+});
+
 describe('buildDiffReceipt', () => {
   it('qualifies when every required reviewer completed + coverage has no omitted source', () => {
     const r = buildDiffReceipt({
@@ -161,6 +188,54 @@ describe('writeReceipt / readReceipt', () => {
     const key: ReceiptKey = { baseSha: receipt.baseSha, diffDigest: receipt.diffDigest, headSha: receipt.headSha, policyHash: receipt.policyHash, repo: receipt.repo };
     expect(readReceipt(store, key)?.runId).toBe('run-1');
     expect(readReceipt(store, { ...key, diffDigest: 'sha256:other' })).toBeNull();
+  });
+});
+
+describe('validateReceiptShape — reject malformed/partial receipts (no blind cast)', () => {
+  const good: DiffReviewReceipt = {
+    baseRef: 'origin/main', baseSha: 'aaa', completed: ['codex', 'grok'],
+    coverage: { includedFiles: 1, omitted: [], omittedFiles: 0, totalFiles: 1 },
+    diffDigest: 'sha256:deadbeef', diffMode: 'commit', headSha: 'bbb',
+    policyHash: 'sha256:p', repo: 'r', reviewerPolicy: ['codex', 'grok'],
+    runId: 'run-1', vendors: ['openai', 'xai'],
+  };
+
+  it('accepts a well-formed receipt (repo/base may be null)', () => {
+    expect(validateReceiptShape(good)).toBe(good);
+    expect(() => validateReceiptShape({ ...good, repo: null, baseRef: null, baseSha: null })).not.toThrow();
+  });
+
+  it('rejects a non-object', () => {
+    expect(() => validateReceiptShape(null)).toThrow(/not a JSON object/);
+    expect(() => validateReceiptShape([good])).toThrow(/not a JSON object/);
+    expect(() => validateReceiptShape('nope')).toThrow(/not a JSON object/);
+  });
+
+  it('rejects a partial receipt, naming the missing/invalid fields', () => {
+    const { diffDigest: _d, completed: _c, ...partial } = good;
+    expect(() => validateReceiptShape(partial)).toThrow(/malformed receipt/);
+    expect(() => validateReceiptShape(partial)).toThrow(/diffDigest/);
+    expect(() => validateReceiptShape(partial)).toThrow(/completed/);
+  });
+
+  it('rejects wrong-typed fields (completed not a string[], coverage counts not numbers)', () => {
+    expect(() => validateReceiptShape({ ...good, completed: [1, 2] })).toThrow(/completed/);
+    expect(() =>
+      validateReceiptShape({ ...good, coverage: { ...good.coverage, totalFiles: 'x' } })
+    ).toThrow(/coverage.totalFiles/);
+  });
+
+  it('readReceipt returns null (not a garbage object) for a malformed stored file', () => {
+    const store = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-bad-'));
+    try {
+      const key: ReceiptKey = { baseSha: 'aaa', diffDigest: 'sha256:deadbeef', headSha: 'bbb', policyHash: 'sha256:p', repo: 'r' };
+      const file = receiptPath(store, key);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({ runId: 'run-1' })); // partial → invalid
+      expect(readReceipt(store, key)).toBeNull();
+    } finally {
+      fs.rmSync(store, { force: true, recursive: true });
+    }
   });
 });
 
