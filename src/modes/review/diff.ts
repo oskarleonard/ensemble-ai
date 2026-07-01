@@ -208,13 +208,22 @@ export function diffDigest(raw: string): string {
 
 // ── git I/O ────────────────────────────────────────────────────────────────
 
-function git(cwd: string, args: string[]): string {
-  return execFileSync('git', args, { cwd, encoding: 'utf8' });
+function git(cwd: string, args: string[], opts?: { quiet?: boolean }): string {
+  // `opts.quiet` silences stderr for the OPTIONAL-probe path (base resolution,
+  // repoId, rev-parse) so git's own noise ("fatal: not a git repository" when
+  // reviewing a PR URL from a non-repo cwd like /tmp) never leaks to the user. The
+  // default keeps stderr on the parent so real diff errors stay visible.
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: opts?.quiet ? ['ignore', 'pipe', 'ignore'] : ['pipe', 'pipe', 'inherit'],
+  });
 }
 
 function gitOrNull(cwd: string, args: string[]): string | null {
+  // An optional probe that fails means "not available" → null (stderr silenced).
   try {
-    return git(cwd, args).trim();
+    return git(cwd, args, { quiet: true }).trim();
   } catch {
     return null;
   }

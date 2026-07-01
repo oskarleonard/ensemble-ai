@@ -1826,12 +1826,16 @@ function canonicalizeDiff(raw) {
 function diffDigest(raw) {
   return `sha256:${sha256Hex(canonicalizeDiff(raw))}`;
 }
-function git(cwd, args) {
-  return execFileSync2("git", args, { cwd, encoding: "utf8" });
+function git(cwd, args, opts) {
+  return execFileSync2("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: opts?.quiet ? ["ignore", "pipe", "ignore"] : ["pipe", "pipe", "inherit"]
+  });
 }
 function gitOrNull(cwd, args) {
   try {
-    return git(cwd, args).trim();
+    return git(cwd, args, { quiet: true }).trim();
   } catch {
     return null;
   }
@@ -2704,36 +2708,64 @@ function capture(cmd, cmdArgs, cwd) {
 function resolveSource(selection, cwd, stdinContent, cmd = "review") {
   switch (selection.kind) {
     case "pr": {
-      const repoFlag = selection.owner && selection.repo ? ["-R", `${selection.owner}/${selection.repo}`] : [];
-      const label = repoFlag.length > 0 ? `gh pr diff ${selection.pr} ${repoFlag.join(" ")}` : `gh pr diff ${selection.pr}`;
-      const fetchHeadRefOid = () => {
-        if (repoFlag.length === 0) return void 0;
-        const view = capture(
+      const prResult = (cap4, label2, headShaOverride) => {
+        if (!cap4.ok) {
+          console.error(`ensemble-ai ${cmd}: \`${label2}\` failed: ${cap4.error}`);
+          return { code: 3 };
+        }
+        if (!cap4.text.trim()) {
+          console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
+          return { code: 3 };
+        }
+        return { diffMode: "pr", diffText: cap4.text, headShaOverride };
+      };
+      if (selection.owner && selection.repo) {
+        const repoSlug = `${selection.owner}/${selection.repo}`;
+        const meta = capture(
           "gh",
-          ["pr", "view", String(selection.pr), ...repoFlag, "--json", "headRefOid"],
+          [
+            "api",
+            `repos/${repoSlug}/pulls/${selection.pr}`,
+            "--jq",
+            "{base: .base.sha, head: .head.sha}"
+          ],
           cwd
         );
-        if (!view.ok) return void 0;
-        try {
-          const oid = JSON.parse(view.text).headRefOid;
-          return typeof oid === "string" && oid.trim() ? oid.trim() : void 0;
-        } catch {
-          return void 0;
+        let baseSha;
+        let headSha;
+        if (meta.ok) {
+          try {
+            const o = JSON.parse(meta.text);
+            if (typeof o.base === "string" && o.base.trim()) baseSha = o.base.trim();
+            if (typeof o.head === "string" && o.head.trim()) headSha = o.head.trim();
+          } catch {
+          }
         }
-      };
-      const headBefore = fetchHeadRefOid();
-      const cap3 = capture("gh", ["pr", "diff", String(selection.pr), ...repoFlag], cwd);
-      if (!cap3.ok) {
-        console.error(`ensemble-ai ${cmd}: \`${label}\` failed: ${cap3.error}`);
-        return { code: 3 };
+        if (baseSha && headSha) {
+          const label3 = `gh api repos/${repoSlug}/compare/${baseSha.slice(0, 7)}...${headSha.slice(0, 7)}`;
+          const cmp = capture(
+            "gh",
+            [
+              "api",
+              `repos/${repoSlug}/compare/${baseSha}...${headSha}`,
+              "-H",
+              "Accept: application/vnd.github.diff"
+            ],
+            cwd
+          );
+          return prResult(cmp, label3, headSha);
+        }
+        const label2 = `gh pr diff ${selection.pr} -R ${repoSlug}`;
+        const cap4 = capture(
+          "gh",
+          ["pr", "diff", String(selection.pr), "-R", repoSlug],
+          cwd
+        );
+        return prResult(cap4, label2);
       }
-      if (!cap3.text.trim()) {
-        console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
-        return { code: 3 };
-      }
-      const headAfter = fetchHeadRefOid();
-      const headShaOverride = headBefore && headBefore === headAfter ? headBefore : void 0;
-      return { diffMode: "pr", diffText: cap3.text, headShaOverride };
+      const label = `gh pr diff ${selection.pr}`;
+      const cap3 = capture("gh", ["pr", "diff", String(selection.pr)], cwd);
+      return prResult(cap3, label);
     }
     case "diff-file": {
       let text;
