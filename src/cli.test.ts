@@ -18,6 +18,12 @@ vi.mock('./modes/review', () => ({ runReviewMode: vi.fn() }));
 vi.mock('./modes/brainstorm', () => ({ runBrainstormMode: vi.fn() }));
 // Same for consult: test the dispatch + arg-parsing + alias contract, never spawn.
 vi.mock('./modes/consult', () => ({ runConsultMode: vi.fn() }));
+// Mock ONLY the spawned Opus layer (keep the real roster/gate/render helpers) so the
+// CLI's self-contained wiring is tested without spawning a real `claude -p`.
+vi.mock('./modes/review/self-contained', async (importActual) => ({
+  ...(await importActual<typeof import('./modes/review/self-contained')>()),
+  runClaudeReviewLayer: vi.fn(),
+}));
 
 import { main, resolveTrailBase } from './cli';
 import { runBrainstormMode } from './modes/brainstorm';
@@ -25,10 +31,12 @@ import type { BrainstormResult } from './modes/brainstorm/types';
 import { runConsultMode } from './modes/consult';
 import type { ConsultResult } from './modes/consult/types';
 import { runReviewMode } from './modes/review';
+import { runClaudeReviewLayer } from './modes/review/self-contained';
 
 const mockRun = vi.mocked(runReviewMode);
 const mockBrainstorm = vi.mocked(runBrainstormMode);
 const mockConsult = vi.mocked(runConsultMode);
+const mockLayer = vi.mocked(runClaudeReviewLayer);
 
 function storedReview(
   reviewerId: ReviewerId,
@@ -79,6 +87,7 @@ beforeEach(() => {
   mockRun.mockReset();
   mockBrainstorm.mockReset();
   mockConsult.mockReset();
+  mockLayer.mockReset();
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
 });
@@ -174,16 +183,60 @@ describe('flag threading', () => {
   });
 });
 
-describe('reviewer roster (codex+grok core; claude is not a CLI reviewer)', () => {
-  it('"claude" as a --reviewers id fails closed (unknown id → exit 3, no engine run)', async () => {
+describe('reviewer roster (codex+grok core; Opus/claude default-on, --no-claude opts out)', () => {
+  it('"claude" ALONE fails closed — needs ≥1 cross-vendor core (exit 3, no engine run)', async () => {
     expect(await main(['review', '--working-tree', '--reviewers', 'claude'])).toBe(3);
-    expect(await main(['review', '--working-tree', '--reviewers', 'codex,claude'])).toBe(3);
     expect(mockRun).not.toHaveBeenCalled();
   });
 
-  it('--with-claude is no longer a flag → usage error, exit 3 (spawned path deferred)', async () => {
+  it('"codex,claude" is a VALID roster now (claude is additive) — engine runs core=[codex]', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
+    expect(await main(['review', '--working-tree', '--reviewers', 'codex,claude'])).toBe(0);
+    expect(mockRun).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ['codex'] }));
+  });
+
+  it('a typo still fails closed (exit 3, no engine run)', async () => {
+    expect(await main(['review', '--working-tree', '--reviewers', 'codex,grokk'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+
+  it('--with-claude is not a flag → usage error, exit 3 (the opt-out is --no-claude)', async () => {
     expect(await main(['review', '--working-tree', '--with-claude'])).toBe(3);
     expect(mockRun).not.toHaveBeenCalled();
+  });
+});
+
+describe('self-contained Opus layer wiring (default-on; --no-claude opts out; feeds the gate)', () => {
+  const synthesis = {
+    agreements: [], bottomLine: 'ok', by: 'claude', degraded: false,
+    disagreements: [], ok: true, raw: null, sanityChecks: [], summary: 's',
+  };
+
+  it('runs the Opus layer by default over the pinned packet prompt', async () => {
+    mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed')] }));
+    mockLayer.mockResolvedValue({ claudeReview: null, synthesis });
+    await main(['review', '--working-tree']);
+    expect(mockLayer).toHaveBeenCalledWith(
+      expect.objectContaining({ includeClaudeReviewer: true, reviewPrompt: 'PINNED' })
+    );
+  });
+
+  it('--no-claude skips the Opus layer entirely', async () => {
+    mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed')] }));
+    await main(['review', '--working-tree', '--no-claude']);
+    expect(mockLayer).not.toHaveBeenCalled();
+  });
+
+  it('a claude-only HIGH drives the exit-4 gate (the Opus voice counts)', async () => {
+    mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed')] }));
+    mockLayer.mockResolvedValue({
+      claudeReview: {
+        findings: [{ body: '', confidence: 'high', evidence: {}, id: 'f1', severity: 'high', title: 't' }],
+        ok: true, summary: '', voiceId: 'claude',
+      },
+      synthesis,
+    });
+    expect(await main(['review', '--working-tree'])).toBe(4);
   });
 });
 

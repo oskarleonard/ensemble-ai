@@ -89,6 +89,10 @@ export interface ReviewModeResult {
   // The local dependency-surface scan — present ONLY for the 'security' profile
   // (manifest changes + risky imports drawn from the diff; no network).
   depSurface?: DepSurfaceResult;
+  // The exact rendered prompt every core reviewer saw (byte-identical across reviewers) —
+  // returned so the self-contained layer's cold Opus reviewer reviews the SAME pinned
+  // packet, never a re-derived diff. Absent only on a secret-scan block (no packet built).
+  prompt?: string;
   receipt?: DiffReviewReceipt;
   receiptError?: string;
   receiptPath?: string;
@@ -325,8 +329,8 @@ export async function runReviewMode(
     const store = opts.receiptStore ?? defaultReceiptStore();
     const file = writeReceipt(store, built.receipt);
     log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, conventionManifest, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, depSurface, prompt, receipt: built.receipt, receiptPath: file, reviews, secretScan };
   }
   log(`No receipt — ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptError: built.error, reviews, secretScan };
 }

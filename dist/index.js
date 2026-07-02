@@ -369,6 +369,7 @@ ${ask}
 import fs from "fs";
 import path from "path";
 var DEFAULT_CAP_BYTES = 8e4;
+var CAP_PROBE_MARGIN = 8;
 var DEFAULT_MAX_FILES = 60;
 var ENTRY_FILES = ["CLAUDE.md", "AGENTS.md"];
 var COMMON_DOCS = ["CONTRIBUTING.md", "ARCHITECTURE.md", "TECH_DESIGN.md"];
@@ -458,8 +459,10 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   let visited = 0;
   while (queue.length > 0) {
     const rel = queue.shift();
-    const content = await reader.read(rel, capBytes);
-    if (content === null) continue;
+    const probe = await reader.read(rel, capBytes + CAP_PROBE_MARGIN);
+    if (probe === null) continue;
+    const readTruncated = Buffer.byteLength(probe, "utf8") > capBytes;
+    const content = readTruncated ? sliceBytes(probe, capBytes) : probe;
     const bytes = Buffer.byteLength(content, "utf8");
     if (visited >= maxFiles) {
       files.push({ path: rel, bytes, included: false, truncated: false, reason: "max-files" });
@@ -478,7 +481,9 @@ async function gatherConventions(reader, changedPaths, config = {}) {
     if (headerBytes + bytes <= remaining) {
       chunks.push(header + content);
       used += headerBytes + bytes;
-      files.push({ path: rel, bytes, included: true, truncated: false });
+      files.push(
+        readTruncated ? { path: rel, bytes, included: true, truncated: true, reason: "over-cap" } : { path: rel, bytes, included: true, truncated: false }
+      );
     } else {
       const noticeFor = (n) => `
 
@@ -645,11 +650,31 @@ function reviewDir(baseDir, runId) {
 }
 function writeAtomic(dir, name, content) {
   fs3.mkdirSync(dir, { recursive: true, mode: 448 });
-  const target = path3.join(dir, name);
+  let realDir = dir;
+  try {
+    realDir = fs3.realpathSync(dir);
+  } catch {
+  }
+  const target = path3.join(realDir, name);
   const tmp = `${target}.tmp`;
-  fs3.writeFileSync(tmp, content, { mode: 384 });
-  fs3.chmodSync(tmp, 384);
+  try {
+    fs3.unlinkSync(tmp);
+  } catch {
+  }
+  const flags = fs3.constants.O_WRONLY | fs3.constants.O_CREAT | fs3.constants.O_EXCL | fs3.constants.O_NOFOLLOW;
+  const fd = fs3.openSync(tmp, flags, 384);
+  try {
+    fs3.writeFileSync(fd, content);
+    fs3.fchmodSync(fd, 384);
+  } finally {
+    fs3.closeSync(fd);
+  }
   fs3.renameSync(tmp, target);
+}
+function writeTrailFile(baseDir, runId, name, content) {
+  const dir = reviewDir(baseDir, runId);
+  writeAtomic(dir, name, content);
+  return path3.join(dir, name);
 }
 function readJson(file) {
   try {
@@ -1699,10 +1724,10 @@ async function runReviewMode(opts) {
     const store = opts.receiptStore ?? defaultReceiptStore();
     const file = writeReceipt(store, built.receipt);
     log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, conventionManifest, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, depSurface, prompt, receipt: built.receipt, receiptPath: file, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptError: built.error, reviews, secretScan };
 }
 
 // src/modes/brainstorm/types.ts
@@ -2736,5 +2761,6 @@ export {
   summarizeCoverage,
   titleCase,
   validateReceiptShape,
-  writeReceipt
+  writeReceipt,
+  writeTrailFile
 };

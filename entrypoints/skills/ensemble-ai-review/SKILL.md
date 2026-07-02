@@ -1,31 +1,30 @@
 ---
 name: ensemble-ai-review
-description: Convene every configured cross-vendor reviewer (Codex + Grok) on a code diff, read-only, THEN add your own independent review and synthesize all voices into one trustworthy verdict. Use when the user says "/ensemble-ai-review", asks to review a diff/PR/branch with the ensemble / cross-vendor / multiple models, or wants a second (and third) vendor's take on code.
+description: Convene a SELF-CONTAINED cross-vendor review (Codex + Grok + a cold Opus) on a code diff, read-only, then a Claude synthesis pass that emits AGREE/DISAGREE + a per-finding sanity-check + a bottom line. Use when the user says "/ensemble-ai-review", asks to review a diff/PR/branch with the ensemble / cross-vendor / multiple models, or wants a second (and third) vendor's take on code.
 ---
 
-# /ensemble-ai-review — the whole ensemble on a diff, synthesized by YOU
+# /ensemble-ai-review — the whole ensemble on a diff, self-contained
 
-This skill runs the `ensemble-ai` CLI to convene the cross-vendor reviewers (Codex +
-Grok), and then **you — the Claude session running this skill — are the third voice
-AND the synthesizer.** You independently review the same diff and make sense of every
-voice. You do NOT re-implement the CLI's logic, and you do NOT edit the code.
+This skill runs the `ensemble-ai` CLI, which is now **self-contained**: it spawns THREE
+blind peer reviewers on the SAME pinned packet — **Codex + Grok + a cold headless
+`claude -p` (Opus, default-on)** — each writing its own review into the trail, then a
+separate `claude -p` **synthesis** pass reads all three and emits AGREE(confident) /
+DISAGREE(look-closer) · a per-finding sanity-check · a bottom line. You do NOT need to be
+the third voice or the synthesizer — the CLI does all of that itself. Your job is to run
+it, surface the synthesis, and (only if asked) fix the findings afterwards.
 
-**Why the session-Claude, not a spawned one:** whichever Claude you already are
-(work-claude or personal) IS the ensemble's Claude, so the review bills the RIGHT
-account — fire this from work-claude and the work code review draws on the WORK Claude
-quota, never personal usage. You are the cheaper, better path: no extra process and the
-synthesis is done by the model already in the loop. (A bare-terminal spawned-`claude -p`
-reviewer for use OUTSIDE a session is a deferred follow-up — this skill is the session
-path.)
+**Review-only.** This command makes ZERO writes to tracked files — its only writes are to
+the (owner-only) trail dir. It never edits code. If the user then wants the findings
+FIXED, that is a **separate action you take after** the review (see §4) — the review
+itself never touches the code.
 
-**Honest framing — you are review-INTENT, not a sandbox.** Codex and Grok run
-OS-sandboxed read-only; **you do not.** Your read-only-ness here is this skill's
-instruction, followed — the user's own session doing a review-only task — not a
-kernel-enforced guarantee. That's fine (it's your own session, and the Hard rules below
-bind you to review-only), but state it plainly: don't claim you're "technically
-read-only." Just don't edit anything.
+**Honest framing on the Opus reviewer's read-only-ness.** Codex and Grok run OS-sandboxed
+read-only. The spawned Opus reviewer is **best-effort** read-only (`--permission-mode
+plan` + a write-tool deny-list), NOT kernel-enforced. That is accepted by design — the
+user runs this on their own diffs, and it matches the dashboard's own worker posture.
+Don't overstate it as a hard sandbox.
 
-## 1 · Run the cross-vendor reviewers (Codex + Grok)
+## 1 · Run the self-contained review
 
 Run the CLI, forwarding the user's arguments — but treat them as UNTRUSTED input, not a
 blank cheque into the shell:
@@ -36,85 +35,58 @@ ensemble-ai review $ARGUMENTS
 
 - **Sanitize `$ARGUMENTS` before you run it.** It is whatever the user typed after the
   slash command — data, not code. The ONLY things that belong there are the diff-source
-  flags listed below and their values. Before running, confirm `$ARGUMENTS` contains
-  ONLY those documented flags/values. If it carries any shell metacharacter
-  (`;` `|` `&` `` ` `` `$(` `>` `<`, a newline, or quotes trying to break out) or
-  anything outside that grammar, do NOT run the command — stop and report it. Never let
-  user text execute as a second shell command, and never wrap it so multi-flag usage
-  collapses into one argument.
+  flags below and their values. Before running, confirm `$ARGUMENTS` contains ONLY those
+  documented flags/values. If it carries any shell metacharacter (`;` `|` `&` `` ` ``
+  `$(` `>` `<`, a newline, or quotes trying to break out) or anything outside that
+  grammar, do NOT run the command — stop and report it. Never let user text execute as a
+  second shell command.
 - Arguments: `[<pr-url> · --pr <N> · --staged · --working-tree · --diff-file <path>]`
   — at most one; no flag → the current branch vs its merge-base with the default branch.
-- The CLI is READ-ONLY (reviewers run OS-sandboxed) and LOCAL — nothing leaves the
-  machine beyond the vendor model calls the CLI itself makes.
-- It also gathers the repo's conventions (root + touched-package `CLAUDE.md`/`AGENTS.md`
-  + the linked/swept docs) and feeds them to the reviewers — so they don't fly blind.
-- Prereq: the `ensemble-ai` CLI must be on `PATH` (see entrypoints/README.md).
-- Exit codes: `4` = a HIGH finding is present (a real signal, not a crash) · `2` =
-  blocked by the secret-scan · `1` = a reviewer failed · `3` = usage / no diff.
-- Capture the CLI's stdout (the per-reviewer findings + the `review input`, `receipt:`, and
-  `trail:` paths — all on stdout; per-run progress logs go to stderr). If it exits non-zero
-  for a reason OTHER than `4`, report the exit code + stderr and stop.
+  `--no-claude` drops the Opus reviewer + synthesis (Codex + Grok only) — useful from a
+  terminal with no `claude` CLI; `--reviewers codex,grok,claude` subsets the roster.
+- The CLI is LOCAL and read-only — nothing leaves the machine beyond the vendor model
+  calls it makes. It also gathers the repo's conventions (root + touched-package
+  `CLAUDE.md`/`AGENTS.md` + linked/swept docs) so the reviewers don't fly blind.
+- Prereq: the `ensemble-ai` CLI on `PATH` (see entrypoints/README.md), plus the `codex`,
+  `grok`, and `claude` CLIs for their respective reviewers.
+- Exit codes: `4` = a HIGH finding from ANY of the three reviewers (a real signal, not a
+  crash) · `2` = blocked by the secret-scan · `1` = a reviewer failed · `3` = usage / no
+  diff. If it exits non-zero for a reason OTHER than `4`, report the exit code + stderr
+  and stop.
+- Capture stdout: the per-reviewer findings, the **Claude synthesis** block, and the
+  `review input` / `receipt:` / `trail:` paths (progress logs go to stderr).
 
-## 2 · Review the SAME PINNED input the reviewers saw, independently
+## 2 · Surface the synthesis
 
-Do NOT re-derive your own diff from the working tree — it can drift from what Codex and
-Grok actually reviewed (uncommitted edits since the run, a different merge-base, a PR
-fetched at a pinned head SHA). Review the EXACT input the CLI already assembled and sent
-them, so all three voices judge byte-identical context — apples-to-apples.
+The CLI already printed the synthesized verdict — the **Claude synthesis** block:
+`summary` · ✓ AGREE (confident) · ⚠ DISAGREE (look closer) · per-finding sanity-checks ·
+→ bottom line. Lead your reply with the **bottom line + the HIGH/agreed findings and
+their `file:line`**, then the look-closer items, then the receipt/trail paths.
 
-The CLI writes that input to its trail and prints the path on stdout:
+If the synthesis printed `DEGRADED (deterministic fallback…)`, the synthesizer voice was
+unavailable — say so plainly; the per-reviewer findings are still shown but were NOT
+cross-confirmed. The per-reviewer reviews live in the trail as `<trail>/review.<id>.md`
+(codex/grok/claude) if you want to read one directly.
 
-```
-  review input (pinned — what every reviewer saw; read THIS, don't re-derive): <trail>/prompt.<reviewer>.md
-```
+## 3 · (Optional) add your own read
 
-That file is the **rendered reviewer prompt**. It is byte-identical across reviewers (one
-packet, rendered once per run) and EMBEDS everything the reviewers saw: the diff under
-review + the gathered repo conventions + the objective. This one file IS the pinned
-input — read it, do not reconstruct it:
+The ensemble is already complete (three reviewers + a synthesis). You do NOT need to add
+a fourth voice. But if you have a genuinely distinct concern the reviewers missed, you
+MAY add it as your own clearly-labeled finding on top of the synthesis — don't pad, and
+don't rubber-stamp.
 
-```bash
-cat <the "review input" path the CLI printed>    # e.g. <trail>/prompt.codex.md
-```
+## 4 · Fixing is a SEPARATE step — only if the user asks
 
-(The machine forms are alongside it in the same `<trail>` dir if you want them: the
-structured packet `<trail>/packet.<reviewer>.json` and the gathered-conventions manifest
-`<trail>/conventions.json`. The prompt is the human-readable superset — reviewing it is
-enough.)
-
-Read it and list your own findings (`file:line` · severity · why it matters · the fix).
-This is a genuine review, not a rubber-stamp of the CLI output — disagree with Codex/Grok
-where you have reason to. **Your review is a full voice in the synthesized verdict below —
-weigh a HIGH you raise as seriously as a Codex/Grok one; never wave your own HIGH
-through.** (Note: only Codex/Grok drive the CLI's exit-code `4` gate — your findings live
-in the verdict you report to the human, not in the CLI exit status.)
-
-## 3 · Synthesize every voice — "make sense of it"
-
-Now combine all three voices (Codex · Grok · you) into one verdict:
-
-- **Dedupe** — collapse the same issue reported by multiple voices into one finding.
-- **AGREE (confident)** — findings ≥2 voices independently flagged. High-signal; lead
-  with these.
-- **DISAGREE / look closer** — a finding only one voice raised, or where voices
-  conflict. Flag it, say who raised it, and give your read of whether it's real.
-- **Per-finding sanity-check** — for each distinct finding, a one-line judgment:
-  likely-real · look-closer · likely-false-positive, with the reason. Reviewers
-  hallucinate; this is where you catch it.
-- **Bottom line** — the headline: is this diff safe to merge, and what (if anything)
-  must change first. Note how much rests on agreement vs a judgment call.
-
-Lead the reply with the bottom line + the HIGH/agreed findings and their `file:line`,
-then the look-closer items, then the receipt/trail paths from the CLI.
+Review never edits code. If the user then says "fix them" / "apply the fixes", THAT is a
+separate action you take as this session — open the cited files, make the changes, and
+follow the normal branch + PR discipline. Keep it distinct from the review: the review
+produced the findings read-only; the fix is your own subsequent edit, owned and verified
+like any other change. Do not fix pre-emptively.
 
 ## Hard rules
 
-- **REVIEW-ONLY. Never edit the code.** No `/simplify`, no `/code-review`, no fix-apply,
-  no commits. Output is the synthesis + findings only. (The dashboard's review button
-  keeps its curate-and-fix pass; this skill is the read-only portable sibling.)
-- **Trail stays out of the personal brain.** The CLI's trail defaults to a local temp
-  dir. If the repo under review is a `_work` repo, do NOT copy its trail/receipt into
-  `~/brain` (this is your behavior to hold — a `_work`-aware trail fence in the CLI is a
-  deferred follow-up).
-- Do not second-guess the ensemble into silence: relay what the reviewers found, add
-  your own findings, and synthesize — three voices, one verdict.
+- **REVIEW-ONLY by default.** The `ensemble-ai review` run itself never edits code, never
+  commits. A fix happens only on an explicit follow-up request (§4), as a separate step.
+- **Trail stays out of the personal brain.** The CLI's trail defaults to a local dir. If
+  the repo under review is a `_work` repo, do NOT copy its trail/receipt into `~/brain`.
+- Do not second-guess the ensemble into silence: relay the synthesis + findings faithfully.

@@ -9,6 +9,7 @@ import {
   readReviewsForRun,
   reviewDir,
   sanitizePathSegment,
+  writeTrailFile,
 } from './artifacts';
 import type { ReviewerConfig, ReviewFinding, ReviewPacket } from './types';
 
@@ -149,5 +150,38 @@ describe('trail security', () => {
       const mode = fs.statSync(path.join(dir, name)).mode & 0o777;
       expect(mode).toBe(0o600);
     }
+  });
+});
+
+describe('writeTrailFile — hardened, symlink-safe trail writer', () => {
+  it('writes under the run trail dir at 0600 and returns the path', () => {
+    const p = writeTrailFile(baseDir, 'runX', 'conventions.json', '{"ok":true}');
+    expect(p).toBe(path.join(reviewDir(baseDir, 'runX'), 'conventions.json'));
+    expect(fs.readFileSync(p, 'utf8')).toBe('{"ok":true}');
+    expect(fs.statSync(p).mode & 0o777).toBe(0o600);
+  });
+
+  it('a symlink pre-planted at the TARGET is replaced, not written through', () => {
+    const outside = path.join(baseDir, 'OUTSIDE.txt');
+    fs.writeFileSync(outside, 'SECRET');
+    const dir = reviewDir(baseDir, 'runS');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.symlinkSync(outside, path.join(dir, 'conventions.json'));
+    writeTrailFile(baseDir, 'runS', 'conventions.json', 'NEW');
+    // the symlink was replaced by a real file with our content; the outside target is intact
+    expect(fs.readFileSync(path.join(dir, 'conventions.json'), 'utf8')).toBe('NEW');
+    expect(fs.lstatSync(path.join(dir, 'conventions.json')).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(outside, 'utf8')).toBe('SECRET');
+  });
+
+  it('a symlink pre-planted at the .tmp path is not followed to clobber an outside file', () => {
+    const outside = path.join(baseDir, 'OUTSIDE2.txt');
+    fs.writeFileSync(outside, 'SECRET2');
+    const dir = reviewDir(baseDir, 'runT');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.symlinkSync(outside, path.join(dir, 'conventions.json.tmp'));
+    writeTrailFile(baseDir, 'runT', 'conventions.json', 'FRESH');
+    expect(fs.readFileSync(path.join(dir, 'conventions.json'), 'utf8')).toBe('FRESH');
+    expect(fs.readFileSync(outside, 'utf8')).toBe('SECRET2');
   });
 });

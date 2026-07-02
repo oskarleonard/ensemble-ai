@@ -55,6 +55,11 @@ export interface GatheredConventions {
 }
 
 const DEFAULT_CAP_BYTES = 80_000;
+
+// How far past capBytes the per-file read probes so a read-truncated file is DETECTABLE
+// (see the gather loop). Must exceed the 4-byte max UTF-8 char so a trailing-partial trim
+// can't mask an over-cap read; tiny vs capBytes, so no meaningful over-read.
+const CAP_PROBE_MARGIN = 8;
 const DEFAULT_MAX_FILES = 60;
 // Per-dir convention entry files (root + every touched package dir).
 const ENTRY_FILES = ['CLAUDE.md', 'AGENTS.md'];
@@ -185,9 +190,16 @@ export async function gatherConventions(
     const rel = queue.shift() as string;
     // Bound the READ to the cap — the gatherer never emits more than capBytes of any one
     // file, so a cap-bounded read is always sufficient AND a multi-GB doc in the tree is
-    // never slurped whole just to be trimmed. `bytes` is this (bounded) read length.
-    const content = await reader.read(rel, capBytes);
-    if (content === null) continue; // missing/unreadable → not part of the set (no budget)
+    // never slurped whole just to be trimmed. Probe a small MARGIN past the cap so we can
+    // DETECT a read-truncated file: if the bounded read comes back longer than capBytes, the
+    // file exceeds the cap and what we hold is a HEAD, not the whole file — so it must NEVER
+    // be reported as complete (truncated:false). The margin (> a 4-byte max UTF-8 char)
+    // means a trailing-partial-multibyte TRIM at the boundary can't drag an over-cap read
+    // back down to ≤ capBytes and hide the truncation. `bytes` is the (capped) length.
+    const probe = await reader.read(rel, capBytes + CAP_PROBE_MARGIN);
+    if (probe === null) continue; // missing/unreadable → not part of the set (no budget)
+    const readTruncated = Buffer.byteLength(probe, 'utf8') > capBytes;
+    const content = readTruncated ? sliceBytes(probe, capBytes) : probe;
     const bytes = Buffer.byteLength(content, 'utf8');
     // Ceiling reached: a REAL (existing) file we won't process. NAME it omitted rather
     // than SILENTLY dropping the boundary file (the honesty rule — same as over-cap), then
@@ -216,7 +228,13 @@ export async function gatherConventions(
     if (headerBytes + bytes <= remaining) {
       chunks.push(header + content);
       used += headerBytes + bytes;
-      files.push({ path: rel, bytes, included: true, truncated: false });
+      // A read-truncated file that still fit `remaining` is a HEAD, not the whole file —
+      // record it truncated (never silently "complete"), same honesty rule as over-cap.
+      files.push(
+        readTruncated
+          ? { path: rel, bytes, included: true, truncated: true, reason: 'over-cap' }
+          : { path: rel, bytes, included: true, truncated: false }
+      );
     } else {
       // Reserve room for the header + the truncation notice within `remaining` so the
       // total never exceeds the cap. noticeFor(bytes) upper-bounds the notice's digit

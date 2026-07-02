@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { reviewDir } from './core/artifacts';
+import { reviewDir, writeTrailFile } from './core/artifacts';
 import {
   type ConventionManifest,
   type ConventionReader,
@@ -24,7 +24,7 @@ import {
   type StoredReview,
 } from './core/types';
 import { runBrainstormMode } from './modes/brainstorm';
-import { listVoices, VOICES_FILE } from './modes/brainstorm/voices';
+import { listVoices, loadVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
   type BrainstormResult,
   isVoiceId,
@@ -36,6 +36,13 @@ import { runConsultMode } from './modes/consult';
 import type { ConsultResult } from './modes/consult/types';
 import { isImplemented, isMode, resolveMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
+import {
+  claudeLayerHasHigh,
+  type ClaudeLayerResult,
+  renderClaudeLayer,
+  resolveReviewRoster,
+  runClaudeReviewLayer,
+} from './modes/review/self-contained';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
 import {
   acquireDiff,
@@ -104,10 +111,14 @@ Plumbing (no reviewer runs — inspect the engine):
 
 Run \`ensemble-ai <mode|command> --help\` for options.`;
 
-const REVIEW_USAGE = `ensemble-ai review — review a diff with ALL configured AI reviewers.
+const REVIEW_USAGE = `ensemble-ai review — self-contained cross-vendor review of a diff.
 
-Runs every reviewer in the registry (codex + grok) by default and prints their
-findings grouped by severity. With NO source flag it reviews the current branch.
+Spawns THREE blind peer reviewers on the SAME pinned packet — codex + grok + a cold
+headless \`claude -p\` (Opus, default-on) — each writing its own review into the trail,
+then a \`claude -p\` SYNTHESIS pass reads all three and emits AGREE(confident)/DISAGREE
+(look-closer) · a per-finding sanity-check · a bottom line. Runs from ANY terminal with
+no Claude session. REVIEW-ONLY — it never edits code. With NO source flag it reviews the
+current branch. \`--no-claude\` drops the Opus reviewer + synthesis (codex + grok only).
 
 Usage:
   ensemble-ai review [<pr-url>] [options]
@@ -128,7 +139,10 @@ Diff source (give at most ONE; default = current branch):
 
 Options:
   --base <ref>          base ref for the default (commit) mode
-  --reviewers <ids>     comma-separated reviewer ids (default: all configured)
+  --reviewers <ids>     comma-separated reviewer ids to subset the roster
+                        (default: codex,grok,claude — claude is a valid id)
+  --no-claude           drop the cold Opus reviewer + the synthesis pass (codex + grok
+                        only) — e.g. from a terminal with no Claude CLI
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
@@ -719,6 +733,7 @@ async function reviewCommand(
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
+        'no-claude': { type: 'boolean' },
         'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
         out: { type: 'string' },
@@ -762,16 +777,25 @@ async function reviewCommand(
       ? null
       : buildConventionReader(cwd, source.conventionsCtx);
 
-  // "no --reviewers" → undefined → run the full default set. But if --reviewers IS
-  // given, EVERY token must be a known id: a typo like `codex,grokk` must error,
-  // never silently drop the unknown and run a narrower set than the user asked for
+  // Resolve the roster: the cross-vendor CORE (codex/grok — subset with `--reviewers`,
+  // fail-closed on a typo) + whether the cold Opus (claude) reviewer + synthesis run
+  // (DEFAULT-ON; `--no-claude` opts out). `claude` is a valid `--reviewers` id. "no
+  // --reviewers" → the full default core; a typo can never silently narrow the policy
   // (which would also mint a receipt under a weaker policy). Fail closed.
-  let reviewers: ReviewerId[] | undefined;
-  if (typeof values.reviewers === 'string') {
-    const parsed = parseReviewerList(values.reviewers, cmd);
-    if ('code' in parsed) return parsed.code;
-    reviewers = parsed;
+  const noClaude = Boolean(values['no-claude']);
+  const requestedReviewers =
+    typeof values.reviewers === 'string'
+      ? values.reviewers.split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined;
+  const roster = resolveReviewRoster(requestedReviewers, noClaude);
+  if ('error' in roster) {
+    console.error(`ensemble-ai ${cmd}: --reviewers "${values.reviewers}" — ${roster.error}`);
+    return 3;
   }
+  // Preserve the "no --reviewers → undefined → engine runs ALL configured core" contract;
+  // an explicit list threads the resolved core subset.
+  const reviewers: ReviewerId[] | undefined =
+    requestedReviewers === undefined ? undefined : roster.core;
   const runId = typeof values['run-id'] === 'string' ? values['run-id'] : genRunId();
   // The trail BASE dir. `--out` overrides; otherwise repo-local when reviewing the cwd
   // repo's OWN diff, else a temp dir (resolveTrailBase — the diff-source-keyed fence).
@@ -819,15 +843,18 @@ async function reviewCommand(
   }
 
   // The gathered-conventions manifest joins the trail so the receipt's evidence dir
-  // records which convention files the reviewers saw (best-effort — never fatal).
+  // records which convention files the reviewers saw (best-effort — never fatal). Written
+  // through the hardened trail writer (realpath'd dir + O_NOFOLLOW tmp + atomic rename) so
+  // a symlinked trail path can't redirect the write out of the trail dir — never a raw
+  // writeFileSync that would follow a pre-planted symlink at the target.
   if (result.conventionManifest) {
     try {
-      fs.mkdirSync(trailDir, { mode: 0o700, recursive: true });
-      const cfile = path.join(trailDir, 'conventions.json');
-      fs.writeFileSync(cfile, JSON.stringify(result.conventionManifest, null, 2), {
-        mode: 0o600,
-      });
-      fs.chmodSync(cfile, 0o600);
+      writeTrailFile(
+        out,
+        runId,
+        'conventions.json',
+        JSON.stringify(result.conventionManifest, null, 2)
+      );
     } catch {
       /* trail write is best-effort */
     }
@@ -851,6 +878,33 @@ async function reviewCommand(
       `  review input (pinned — what every reviewer saw; read THIS, don't re-derive): ${path.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
   }
+  // The SELF-CONTAINED layer: a cold Opus (claude) peer reviewer over the SAME pinned
+  // packet + a claude SYNTHESIS pass that reads all three reviewers' trail files. DEFAULT-ON
+  // (roster.claude; `--no-claude` opts out). Skipped when the diff was blocked or no packet
+  // built (result.prompt absent). REVIEW-ONLY — writes only to the trail. Best-effort: any
+  // failure degrades (deterministic fallback), never taking down the review. The Opus
+  // reviewer IS a reviewer, so its HIGH findings feed the SAME exit gate below.
+  let claudeLayer: ClaudeLayerResult | null = null;
+  if (roster.claude && !result.blocked && result.prompt) {
+    const voiceConfigs = loadVoices();
+    claudeLayer = await runClaudeReviewLayer({
+      baseDir: out,
+      claudeConfig: voiceConfigs.claude,
+      coreReviews: result.reviews,
+      includeClaudeReviewer: true,
+      log: (m) => console.error(`· ${m}`),
+      reviewPrompt: result.prompt,
+      runId,
+      synthConfig: voiceConfigs.claude,
+    });
+    console.log(renderClaudeLayer(claudeLayer).join('\n'));
+    try {
+      writeTrailFile(out, runId, 'claude-synthesis.json', JSON.stringify(claudeLayer, null, 2));
+    } catch {
+      /* trail write is best-effort */
+    }
+  }
+
   // On stdout (with the receipt + pinned-input paths) — the machine-readable trail
   // location, so the doc's "paths on stdout" is accurate.
   console.log(`trail: ${trailDir}`);
@@ -861,9 +915,15 @@ async function reviewCommand(
     result.reviews.length > 0 &&
     result.reviews.every((r) => r.terminalState === 'reviewed');
   if (!allReviewed) return 1;
-  // 4 = the findings GATE: a completed review surfaced a HIGH. Gate-usable by
-  // default (a pre-PR hook can fail on it); --no-fail-on-high opts out → 0.
-  if (!values['no-fail-on-high'] && hasHighFinding(result.reviews)) return 4;
+  // 4 = the findings GATE: a completed review surfaced a HIGH — from ANY of the three
+  // reviewers (codex + grok + the cold Opus voice). Gate-usable by default (a pre-PR hook
+  // can fail on it); --no-fail-on-high opts out → 0.
+  if (
+    !values['no-fail-on-high'] &&
+    (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))
+  ) {
+    return 4;
+  }
   return 0;
 }
 

@@ -40,13 +40,61 @@ export function reviewDir(baseDir: string, runId: string): string {
 // an owner-only dir (0700). writeFileSync's `mode` is masked by the process umask, so
 // chmod after the write to GUARANTEE 0600 regardless of the caller's umask, then
 // rename into place (an atomic swap that carries the tmp file's mode).
+//
+// Symlink-safe: REALPATH the (created) dir so a symlinked path component can't redirect
+// the write out of the intended tree, and open the tmp with O_NOFOLLOW | O_EXCL so a
+// pre-planted symlink at the tmp path is REFUSED (never followed to clobber an outside
+// target). The final rename replaces `target` atomically — replacing a symlink AT the
+// target with the real file rather than writing through it.
 function writeAtomic(dir: string, name: string, content: string): void {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const target = path.join(dir, name);
+  // Realpath the dir now that it exists so the write target is the resolved real dir,
+  // not a string that a symlinked component could point elsewhere.
+  let realDir = dir;
+  try {
+    realDir = fs.realpathSync(dir);
+  } catch {
+    /* brand-new dir race — fall back to the lexical path */
+  }
+  const target = path.join(realDir, name);
   const tmp = `${target}.tmp`;
-  fs.writeFileSync(tmp, content, { mode: 0o600 });
-  fs.chmodSync(tmp, 0o600);
+  // O_NOFOLLOW: refuse if `tmp` is a symlink. O_EXCL: refuse a pre-existing tmp (a
+  // planted symlink or a stale file) rather than truncating through it. Clear a stale
+  // tmp from an earlier crashed write, then create fresh.
+  try {
+    fs.unlinkSync(tmp);
+  } catch {
+    /* no stale tmp — fine */
+  }
+  const flags =
+    fs.constants.O_WRONLY |
+    fs.constants.O_CREAT |
+    fs.constants.O_EXCL |
+    fs.constants.O_NOFOLLOW;
+  const fd = fs.openSync(tmp, flags, 0o600);
+  try {
+    fs.writeFileSync(fd, content);
+    fs.fchmodSync(fd, 0o600);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(tmp, target);
+}
+
+// Public, hardened trail writer: the SAME symlink-safe atomic write persistReview uses,
+// exposed so other trail writers (the CLI's convention-manifest, the per-reviewer
+// review.<id>.md, the Claude reviewer's artifacts) route through ONE hardened path
+// instead of a raw fs.writeFileSync that would follow a symlinked target. Keyed by the
+// (sanitized) runId trail dir so every trail file lands together.
+export function writeTrailFile(
+  baseDir: string,
+  runId: string,
+  name: string,
+  content: string
+): string {
+  const dir = reviewDir(baseDir, runId);
+  writeAtomic(dir, name, content);
+  return path.join(dir, name);
 }
 
 function readJson<T>(file: string): T | null {
