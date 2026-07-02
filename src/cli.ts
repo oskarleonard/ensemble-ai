@@ -777,6 +777,18 @@ async function reviewCommand(
   }
 
   printSummary(result, profile);
+  // The PINNED review input every reviewer saw — the rendered prompt, written to the
+  // trail. It EMBEDS the exact diff under review + the gathered conventions + objective,
+  // and is byte-identical across reviewers (one packet, rendered once per run — so the
+  // first reviewer's copy is representative). Printed so a synthesizing session-Claude
+  // (the /ensemble-ai-review skill) reviews THIS exact input, never a re-derived
+  // working-tree diff that could drift from what Codex/Grok reviewed.
+  const pinnedReviewerId = result.reviews[0]?.reviewerId;
+  if (pinnedReviewerId) {
+    console.log(
+      `  review input (pinned — what every reviewer saw; read THIS, don't re-derive): ${path.join(out, `prompt.${pinnedReviewerId}.md`)}`
+    );
+  }
   console.error(`trail: ${out}`);
   if (result.blocked) return 2;
   // 1 = a reviewer failed to complete (crash / timeout / no parse) — the review is

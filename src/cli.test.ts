@@ -171,6 +171,19 @@ describe('flag threading', () => {
   });
 });
 
+describe('reviewer roster (codex+grok core; claude is not a CLI reviewer)', () => {
+  it('"claude" as a --reviewers id fails closed (unknown id → exit 3, no engine run)', async () => {
+    expect(await main(['review', '--working-tree', '--reviewers', 'claude'])).toBe(3);
+    expect(await main(['review', '--working-tree', '--reviewers', 'codex,claude'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+
+  it('--with-claude is no longer a flag → usage error, exit 3 (spawned path deferred)', async () => {
+    expect(await main(['review', '--working-tree', '--with-claude'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+});
+
 describe('profile selection (review vs security — same engine)', () => {
   it('review threads profile: "code" to the engine', async () => {
     mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
