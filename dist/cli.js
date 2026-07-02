@@ -3320,6 +3320,12 @@ async function reviewCommand(args, profile = "code") {
     }
   }
   printSummary(result, profile);
+  const pinnedReviewerId = result.reviews[0]?.reviewerId;
+  if (pinnedReviewerId) {
+    console.log(
+      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path8.join(out, `prompt.${pinnedReviewerId}.md`)}`
+    );
+  }
   console.error(`trail: ${out}`);
   if (result.blocked) return 2;
   const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
