@@ -62,10 +62,12 @@ import {
   computePolicyHash,
   defaultReceiptStore,
   type DiffReviewReceipt,
+  type PeerReviewerRecord,
   readReceipt,
   receiptIdentityMatches,
   type ReceiptKey,
   validateReceiptShape,
+  writeReceipt,
 } from './modes/review/receipt';
 import {
   type DiffSourceSelection,
@@ -655,8 +657,12 @@ function printSummary(result: ReviewModeResult, profile: ReviewProfile): void {
   out.push('');
   if (result.receipt) {
     out.push(`  receipt: ${result.receiptPath}`);
+    const peers = result.receipt.peerReviewers ?? [];
+    const peerNote = peers.length
+      ? ` · peers: ${peers.map((p) => `${p.id} ${p.state}`).join(', ')}`
+      : '';
     out.push(
-      `           completed: ${result.receipt.completed.join(', ')} · vendors: ${result.receipt.vendors.join(', ')}`
+      `           completed: ${result.receipt.completed.join(', ')} · vendors: ${result.receipt.vendors.join(', ')}${peerNote}`
     );
   } else {
     out.push(`  receipt: none — ${result.receiptError ?? 'not qualified'}`);
@@ -897,6 +903,88 @@ async function reviewCommand(
     }
   }
 
+  // The SELF-CONTAINED layer: a cold Opus (claude) peer reviewer over the SAME pinned
+  // packet + a claude SYNTHESIS pass that reads all three reviewers' trail files. DEFAULT-ON
+  // (roster.claude; `--no-claude` opts out). Skipped when the diff was blocked or no packet
+  // built (result.prompt absent). REVIEW-ONLY — writes only to the trail. Best-effort: any
+  // failure degrades (deterministic fallback), never taking down the review. The Opus
+  // reviewer IS a reviewer, so its HIGH findings feed the SAME exit gate below.
+  //
+  // It is COMPUTED here (before printSummary) but RENDERED after, so the receipt below can
+  // reflect the FULL expected roster: the receipt is written only once the Opus reviewer
+  // is known to have completed — an incomplete 3-reviewer run must never leave a clean
+  // receipt (the codex-review fail-open).
+  let claudeLayer: ClaudeLayerResult | null = null;
+  let claudeLayerCrashed = false;
+  // The Opus layer runs iff claude is in the roster, the diff wasn't blocked, and a packet
+  // was built. The exit gate below reuses this EXACT condition — a claude that was expected
+  // to review but didn't must fail-loud; a claude legitimately not-run (blocked / no packet)
+  // has nothing to gate.
+  const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
+  if (claudeLayerExpected && result.prompt) {
+    const voiceConfigs = loadVoices();
+    // The layer's own writes/spawn are best-effort internally, but a residual throw (an
+    // unexpected FS/spawn error) must DEGRADE the Opus layer, not crash the whole review
+    // after the codex/grok core already completed. Catch it here as a backstop; the
+    // incompleteness is then reflected in the receipt gate + exit gate below (fail-loud).
+    try {
+      claudeLayer = await runClaudeReviewLayer({
+        baseDir: out,
+        claudeConfig: voiceConfigs.claude,
+        coreReviews: result.reviews,
+        includeClaudeReviewer: true,
+        log: (m) => console.error(`· ${m}`),
+        reviewPrompt: result.prompt,
+        runId,
+      });
+      try {
+        writeTrailFile(out, runId, 'claude-synthesis.json', JSON.stringify(claudeLayer, null, 2));
+      } catch {
+        /* trail write is best-effort */
+      }
+    } catch (e) {
+      claudeLayerCrashed = true;
+      console.error(
+        `ensemble-ai ${cmd}: the Opus (claude) review layer crashed — ${(e as Error).message}`
+      );
+    }
+  }
+
+  // Persist the receipt ONLY after the full expected roster ran (fail-loud parity with the
+  // exit gate): the codex/grok core qualified a candidate, but when the default-on Opus
+  // reviewer was EXPECTED it must ALSO have completed — else NO clean receipt is written
+  // (a stale 'reviewed' receipt for an incomplete run is the fail-open). When it did
+  // complete, the peer reviewer is STAMPED into the receipt so downstream can tell a full
+  // N-reviewer pass from a codex/grok-only one.
+  if (result.receiptCandidate && result.receiptStore) {
+    const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
+    const rosterComplete = !claudeLayerExpected || claudeReviewed;
+    if (rosterComplete) {
+      const peerReviewers: PeerReviewerRecord[] = claudeLayer?.claudeReview
+        ? [
+            {
+              id: 'claude',
+              state: claudeLayer.claudeReview.ok ? 'reviewed' : 'failed-reviewer',
+              vendor: `anthropic/${claudeLayer.modelLabel}`,
+            },
+          ]
+        : [];
+      const receipt =
+        peerReviewers.length > 0
+          ? { ...result.receiptCandidate, peerReviewers }
+          : result.receiptCandidate;
+      try {
+        result.receiptPath = writeReceipt(result.receiptStore, receipt);
+        result.receipt = receipt;
+      } catch (e) {
+        result.receiptError = `receipt write failed — ${(e as Error).message}`;
+      }
+    } else {
+      result.receiptError =
+        'review INCOMPLETE — the default-on Opus (claude) reviewer was expected but did not complete, so no fully-reviewed receipt was minted';
+    }
+  }
+
   printSummary(result, profile);
   // The PINNED review input every reviewer saw — the rendered prompt, written to the
   // trail. It EMBEDS the exact diff under review + the gathered conventions + objective,
@@ -915,47 +1003,9 @@ async function reviewCommand(
       `  review input (pinned — what every reviewer saw; read THIS, don't re-derive): ${path.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
   }
-  // The SELF-CONTAINED layer: a cold Opus (claude) peer reviewer over the SAME pinned
-  // packet + a claude SYNTHESIS pass that reads all three reviewers' trail files. DEFAULT-ON
-  // (roster.claude; `--no-claude` opts out). Skipped when the diff was blocked or no packet
-  // built (result.prompt absent). REVIEW-ONLY — writes only to the trail. Best-effort: any
-  // failure degrades (deterministic fallback), never taking down the review. The Opus
-  // reviewer IS a reviewer, so its HIGH findings feed the SAME exit gate below.
-  let claudeLayer: ClaudeLayerResult | null = null;
-  let claudeLayerCrashed = false;
-  // The Opus layer runs iff claude is in the roster, the diff wasn't blocked, and a packet
-  // was built. The exit gate below reuses this EXACT condition — a claude that was expected
-  // to review but didn't must fail-loud; a claude legitimately not-run (blocked / no packet)
-  // has nothing to gate.
-  const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
-  if (claudeLayerExpected && result.prompt) {
-    const voiceConfigs = loadVoices();
-    // The layer's own writes/spawn are best-effort internally, but a residual throw (an
-    // unexpected FS/spawn error) must DEGRADE the Opus layer, not crash the whole review
-    // after the codex/grok core already completed + printed. Catch it here as a backstop;
-    // the incompleteness is then reflected in the exit gate below (fail-loud, not exit 0).
-    try {
-      claudeLayer = await runClaudeReviewLayer({
-        baseDir: out,
-        claudeConfig: voiceConfigs.claude,
-        coreReviews: result.reviews,
-        includeClaudeReviewer: true,
-        log: (m) => console.error(`· ${m}`),
-        reviewPrompt: result.prompt,
-        runId,
-      });
-      console.log(renderClaudeLayer(claudeLayer).join('\n'));
-      try {
-        writeTrailFile(out, runId, 'claude-synthesis.json', JSON.stringify(claudeLayer, null, 2));
-      } catch {
-        /* trail write is best-effort */
-      }
-    } catch (e) {
-      claudeLayerCrashed = true;
-      console.error(
-        `ensemble-ai ${cmd}: the Opus (claude) review layer crashed — ${(e as Error).message}`
-      );
-    }
+  // Render the self-contained Opus layer (computed above) after the core summary.
+  if (claudeLayer) {
+    console.log(renderClaudeLayer(claudeLayer).join('\n'));
   }
 
   // On stdout (with the receipt + pinned-input paths) — the machine-readable trail

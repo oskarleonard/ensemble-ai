@@ -2352,6 +2352,12 @@ function validateReceiptShape(value) {
   if (!isStrArr(o.completed)) errs.push("completed (string[])");
   if (!isStrArr(o.reviewerPolicy)) errs.push("reviewerPolicy (string[])");
   if (!isStrArr(o.vendors)) errs.push("vendors (string[])");
+  if (o.peerReviewers !== void 0) {
+    const okArr = Array.isArray(o.peerReviewers) && o.peerReviewers.every(
+      (p) => p !== null && typeof p === "object" && !Array.isArray(p) && isStr(p.id) && isStr(p.state) && isStr(p.vendor)
+    );
+    if (!okArr) errs.push("peerReviewers (PeerReviewerRecord[])");
+  }
   const c = o.coverage;
   if (c === null || typeof c !== "object" || Array.isArray(c)) {
     errs.push("coverage (object)");
@@ -2664,9 +2670,8 @@ async function runReviewMode(opts) {
   });
   if (built.ok && built.receipt) {
     const store = opts.receiptStore ?? defaultReceiptStore();
-    const file = writeReceipt(store, built.receipt);
-    log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, conventionManifest, depSurface, prompt, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    log("Receipt qualified by the core \u2014 deferred to the full-roster gate.");
+    return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
   return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptError: built.error, reviews, secretScan };
@@ -3424,6 +3429,11 @@ function formatReceipt(receipt) {
   out.push(`  reviewers: ${receipt.reviewerPolicy.join(", ")} (policy)`);
   out.push(`  completed: ${receipt.completed.join(", ")}`);
   out.push(`  vendors:   ${receipt.vendors.join(", ")}`);
+  if (receipt.peerReviewers && receipt.peerReviewers.length > 0) {
+    out.push(
+      `  peers:     ${receipt.peerReviewers.map((p) => `${p.id} (${p.vendor}) ${p.state}`).join(", ")}`
+    );
+  }
   out.push(`  runId:     ${receipt.runId}`);
   out.push(`  coverage:  ${coverageCounts(c)}`);
   for (const o of c.omitted) {
@@ -3843,8 +3853,10 @@ function printSummary(result, profile) {
   out.push("");
   if (result.receipt) {
     out.push(`  receipt: ${result.receiptPath}`);
+    const peers = result.receipt.peerReviewers ?? [];
+    const peerNote = peers.length ? ` \xB7 peers: ${peers.map((p) => `${p.id} ${p.state}`).join(", ")}` : "";
     out.push(
-      `           completed: ${result.receipt.completed.join(", ")} \xB7 vendors: ${result.receipt.vendors.join(", ")}`
+      `           completed: ${result.receipt.completed.join(", ")} \xB7 vendors: ${result.receipt.vendors.join(", ")}${peerNote}`
     );
   } else {
     out.push(`  receipt: none \u2014 ${result.receiptError ?? "not qualified"}`);
@@ -4000,14 +4012,6 @@ async function reviewCommand(args, profile = "code") {
     } catch {
     }
   }
-  printSummary(result, profile);
-  if (result.reviews.length > 0) {
-    const first = result.reviews[0];
-    const pinnedReviewerId = first.reviewerId ?? first.reviewer.vendor;
-    console.log(
-      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path9.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
-    );
-  }
   let claudeLayer = null;
   let claudeLayerCrashed = false;
   const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
@@ -4023,7 +4027,6 @@ async function reviewCommand(args, profile = "code") {
         reviewPrompt: result.prompt,
         runId
       });
-      console.log(renderClaudeLayer(claudeLayer).join("\n"));
       try {
         writeTrailFile(out, runId, "claude-synthesis.json", JSON.stringify(claudeLayer, null, 2));
       } catch {
@@ -4034,6 +4037,39 @@ async function reviewCommand(args, profile = "code") {
         `ensemble-ai ${cmd}: the Opus (claude) review layer crashed \u2014 ${e.message}`
       );
     }
+  }
+  if (result.receiptCandidate && result.receiptStore) {
+    const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
+    const rosterComplete = !claudeLayerExpected || claudeReviewed;
+    if (rosterComplete) {
+      const peerReviewers = claudeLayer?.claudeReview ? [
+        {
+          id: "claude",
+          state: claudeLayer.claudeReview.ok ? "reviewed" : "failed-reviewer",
+          vendor: `anthropic/${claudeLayer.modelLabel}`
+        }
+      ] : [];
+      const receipt = peerReviewers.length > 0 ? { ...result.receiptCandidate, peerReviewers } : result.receiptCandidate;
+      try {
+        result.receiptPath = writeReceipt(result.receiptStore, receipt);
+        result.receipt = receipt;
+      } catch (e) {
+        result.receiptError = `receipt write failed \u2014 ${e.message}`;
+      }
+    } else {
+      result.receiptError = "review INCOMPLETE \u2014 the default-on Opus (claude) reviewer was expected but did not complete, so no fully-reviewed receipt was minted";
+    }
+  }
+  printSummary(result, profile);
+  if (result.reviews.length > 0) {
+    const first = result.reviews[0];
+    const pinnedReviewerId = first.reviewerId ?? first.reviewer.vendor;
+    console.log(
+      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path9.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
+    );
+  }
+  if (claudeLayer) {
+    console.log(renderClaudeLayer(claudeLayer).join("\n"));
   }
   console.log(`trail: ${trailDir}`);
   if (result.blocked) return 2;

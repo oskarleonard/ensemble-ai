@@ -31,6 +31,11 @@ import type { BrainstormResult } from './modes/brainstorm/types';
 import { runConsultMode } from './modes/consult';
 import type { ConsultResult } from './modes/consult/types';
 import { runReviewMode } from './modes/review';
+import {
+  type DiffReviewReceipt,
+  keyOf,
+  readReceipt,
+} from './modes/review/receipt';
 import { runClaudeReviewLayer } from './modes/review/self-contained';
 
 const mockRun = vi.mocked(runReviewMode);
@@ -257,6 +262,81 @@ describe('self-contained Opus layer wiring (default-on; --no-claude opts out; fe
     mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed')] }));
     mockLayer.mockRejectedValue(new Error('unexpected FS error'));
     expect(await main(['review', '--working-tree'])).toBe(1);
+  });
+});
+
+describe('receipt reflects the FULL expected roster (not just the codex/grok core)', () => {
+  const synthesis = {
+    agreements: [], bottomLine: 'ok', by: 'claude', degraded: false,
+    disagreements: [], ok: true, raw: null, sanityChecks: [], summary: 's',
+  };
+
+  // A codex/grok-qualified candidate the core hands off (deferred, unwritten): the CLI
+  // decides whether to persist it AFTER the default-on Opus reviewer runs.
+  function candidate(): DiffReviewReceipt {
+    return {
+      baseRef: null, baseSha: null,
+      completed: ['codex', 'grok'],
+      coverage: { includedFiles: 1, omitted: [], omittedFiles: 0, totalFiles: 1 },
+      diffDigest: 'sha256:x', diffMode: 'working-tree', headSha: 'h',
+      policyHash: 'sha256:p', repo: null,
+      reviewerPolicy: ['codex', 'grok'], runId: 'r', vendors: ['openai', 'xai'],
+    };
+  }
+  function store(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'ea-receipt-'));
+  }
+  function coreReviewed(): StoredReview[] {
+    return [storedReview('codex', 'reviewed'), storedReview('grok', 'reviewed')];
+  }
+
+  it('a FAILED/skipped default-on Opus reviewer → NO clean receipt is written', async () => {
+    // codex/grok qualified a receipt candidate, but the default-on Opus reviewer did NOT
+    // complete → an INCOMPLETE 3-reviewer run must not leave a valid "reviewed" receipt
+    // (the codex-review fail-open). Fail-loud (exit 1) AND no receipt on disk.
+    const s = store();
+    const cand = candidate();
+    mockRun.mockResolvedValue(result({
+      prompt: 'PINNED', reviews: coreReviewed(), receiptCandidate: cand, receiptStore: s,
+    }));
+    mockLayer.mockResolvedValue({
+      claudeReview: { findings: [], ok: false, summary: 'claude produced no output', voiceId: 'claude' },
+      modelLabel: 'opus', synthesis,
+    });
+    expect(await main(['review', '--working-tree'])).toBe(1);
+    expect(readReceipt(s, keyOf(cand))).toBeNull();
+  });
+
+  it('a COMPLETED default-on Opus reviewer → receipt written stamping the peer reviewer', async () => {
+    const s = store();
+    const cand = candidate();
+    mockRun.mockResolvedValue(result({
+      prompt: 'PINNED', reviews: coreReviewed(), receiptCandidate: cand, receiptStore: s,
+    }));
+    mockLayer.mockResolvedValue({
+      claudeReview: { findings: [], ok: true, summary: '', voiceId: 'claude' },
+      modelLabel: 'opus', synthesis,
+    });
+    expect(await main(['review', '--working-tree'])).toBe(0);
+    const written = readReceipt(s, keyOf(cand));
+    expect(written).not.toBeNull();
+    expect(written?.completed).toEqual(['codex', 'grok']);
+    expect(written?.peerReviewers).toEqual([
+      { id: 'claude', state: 'reviewed', vendor: 'anthropic/opus' },
+    ]);
+  });
+
+  it('--no-claude → the codex/grok-only receipt is written with no peer reviewers', async () => {
+    const s = store();
+    const cand = candidate();
+    mockRun.mockResolvedValue(result({
+      prompt: 'PINNED', reviews: coreReviewed(), receiptCandidate: cand, receiptStore: s,
+    }));
+    expect(await main(['review', '--working-tree', '--no-claude'])).toBe(0);
+    expect(mockLayer).not.toHaveBeenCalled();
+    const written = readReceipt(s, keyOf(cand));
+    expect(written).not.toBeNull();
+    expect(written?.peerReviewers).toBeUndefined();
   });
 });
 

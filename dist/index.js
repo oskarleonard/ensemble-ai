@@ -1447,6 +1447,12 @@ function validateReceiptShape(value) {
   if (!isStrArr(o.completed)) errs.push("completed (string[])");
   if (!isStrArr(o.reviewerPolicy)) errs.push("reviewerPolicy (string[])");
   if (!isStrArr(o.vendors)) errs.push("vendors (string[])");
+  if (o.peerReviewers !== void 0) {
+    const okArr = Array.isArray(o.peerReviewers) && o.peerReviewers.every(
+      (p) => p !== null && typeof p === "object" && !Array.isArray(p) && isStr(p.id) && isStr(p.state) && isStr(p.vendor)
+    );
+    if (!okArr) errs.push("peerReviewers (PeerReviewerRecord[])");
+  }
   const c = o.coverage;
   if (c === null || typeof c !== "object" || Array.isArray(c)) {
     errs.push("coverage (object)");
@@ -1759,9 +1765,8 @@ async function runReviewMode(opts) {
   });
   if (built.ok && built.receipt) {
     const store = opts.receiptStore ?? defaultReceiptStore();
-    const file = writeReceipt(store, built.receipt);
-    log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, conventionManifest, depSurface, prompt, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    log("Receipt qualified by the core \u2014 deferred to the full-roster gate.");
+    return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
   return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptError: built.error, reviews, secretScan };
