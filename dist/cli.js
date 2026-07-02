@@ -8,9 +8,100 @@ import os7 from "os";
 import path8 from "path";
 import { parseArgs } from "util";
 
-// src/core/conventions.ts
+// src/core/artifacts.ts
 import fs from "fs";
 import path from "path";
+
+// src/core/types.ts
+var REVIEWER_IDS = ["codex", "grok"];
+function isReviewerId(v) {
+  return REVIEWER_IDS.includes(v);
+}
+function parseReviewerIds(raw) {
+  if (!Array.isArray(raw)) return void 0;
+  const ids = [...new Set(raw.filter(isReviewerId))];
+  return ids.length > 0 ? ids : void 0;
+}
+var SEVERITIES = ["high", "medium", "low"];
+var CONFIDENCES = ["high", "medium", "low"];
+
+// src/core/artifacts.ts
+function sanitizePathSegment(s) {
+  return s.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+function reviewDir(baseDir, runId) {
+  return path.join(baseDir, sanitizePathSegment(runId) || "unknown");
+}
+function writeAtomic(dir, name, content) {
+  fs.mkdirSync(dir, { recursive: true, mode: 448 });
+  const target = path.join(dir, name);
+  const tmp = `${target}.tmp`;
+  fs.writeFileSync(tmp, content, { mode: 384 });
+  fs.chmodSync(tmp, 384);
+  fs.renameSync(tmp, target);
+}
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+function manifestOf(packet) {
+  return packet.sections.map((s) => ({
+    included: s.included,
+    note: s.note,
+    title: s.title,
+    truncated: s.truncated
+  }));
+}
+function reviewJson(reviewerId) {
+  return `review.${reviewerId}.json`;
+}
+function persistReview(baseDir, input) {
+  const dir = reviewDir(baseDir, input.runId);
+  const id = input.reviewer.id;
+  writeAtomic(dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
+  writeAtomic(dir, `prompt.${id}.md`, input.prompt);
+  if (input.raw !== null) writeAtomic(dir, `${id}-review.raw.md`, input.raw);
+  writeAtomic(
+    dir,
+    `findings.${id}.json`,
+    JSON.stringify(input.findings, null, 2)
+  );
+  const stored = {
+    findings: input.findings,
+    packet: {
+      complete: input.packet.complete,
+      manifest: manifestOf(input.packet)
+    },
+    reviewer: {
+      effort: input.reviewer.effort,
+      model: input.reviewer.model,
+      vendor: input.reviewer.vendor
+    },
+    reviewerId: id,
+    runId: input.runId,
+    summary: input.summary,
+    terminalState: input.terminalState
+  };
+  writeAtomic(dir, reviewJson(id), JSON.stringify(stored, null, 2));
+  return stored;
+}
+function readReview(baseDir, runId, reviewerId = "codex") {
+  const dir = reviewDir(baseDir, runId);
+  const perId = readJson(path.join(dir, reviewJson(reviewerId)));
+  if (perId) return perId.reviewerId ? perId : { ...perId, reviewerId };
+  if (reviewerId === "codex") {
+    const legacy = readJson(path.join(dir, "review.json"));
+    if (legacy) return { ...legacy, reviewerId: "codex" };
+  }
+  return null;
+}
+
+// src/core/conventions.ts
+import fs2 from "fs";
+import path2 from "path";
 var DEFAULT_CAP_BYTES = 8e4;
 var DEFAULT_MAX_FILES = 60;
 var ENTRY_FILES = ["CLAUDE.md", "AGENTS.md"];
@@ -21,13 +112,13 @@ function resolveInRepo(fromDir, ref) {
   if (!first) return null;
   if (first.startsWith("/") || first.startsWith("~")) return null;
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(first)) return null;
-  const joined = path.posix.normalize(path.posix.join(fromDir || ".", first));
+  const joined = path2.posix.normalize(path2.posix.join(fromDir || ".", first));
   if (joined === ".." || joined.startsWith("../")) return null;
   if (joined.startsWith("/")) return null;
   return joined === "." ? "" : joined.replace(/^\.\//, "");
 }
 function dirOf(relPath) {
-  const d = path.posix.dirname(relPath);
+  const d = path2.posix.dirname(relPath);
   return d === "." ? "" : d;
 }
 function joinDir(dir, file) {
@@ -101,11 +192,14 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   let visited = 0;
   while (queue.length > 0) {
     const rel = queue.shift();
-    const content = await reader.read(rel);
+    const content = await reader.read(rel, capBytes);
     if (content === null) continue;
-    if (visited >= maxFiles) break;
-    visited++;
     const bytes = Buffer.byteLength(content, "utf8");
+    if (visited >= maxFiles) {
+      files.push({ path: rel, bytes, included: false, truncated: false, reason: "max-files" });
+      break;
+    }
+    visited++;
     const dir = dirOf(rel);
     for (const ref of extractRefs(content)) enqueue(resolveInRepo(dir, ref));
     const remaining = capBytes - used;
@@ -144,34 +238,42 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   };
 }
 function fsConventionReader(repoRoot) {
-  const root = path.resolve(repoRoot);
+  const root = path2.resolve(repoRoot);
   let realRoot;
   try {
-    realRoot = fs.realpathSync(root);
+    realRoot = fs2.realpathSync(root);
   } catch {
     realRoot = root;
   }
   const within = (rel) => {
-    const abs = path.resolve(root, rel);
-    const back = path.relative(root, abs);
-    if (back.startsWith("..") || path.isAbsolute(back)) return null;
+    const abs = path2.resolve(root, rel);
+    const back = path2.relative(root, abs);
+    if (back.startsWith("..") || path2.isAbsolute(back)) return null;
     let real;
     try {
-      real = fs.realpathSync(abs);
+      real = fs2.realpathSync(abs);
     } catch {
       return null;
     }
-    const realBack = path.relative(realRoot, real);
-    if (realBack.startsWith("..") || path.isAbsolute(realBack)) return null;
+    const realBack = path2.relative(realRoot, real);
+    if (realBack.startsWith("..") || path2.isAbsolute(realBack)) return null;
     return real;
   };
   return {
-    async read(rel) {
+    async read(rel, maxBytes) {
       const abs = within(rel);
       if (!abs) return null;
       try {
-        if (!fs.statSync(abs).isFile()) return null;
-        return fs.readFileSync(abs, "utf8");
+        if (!fs2.statSync(abs).isFile()) return null;
+        if (maxBytes === void 0) return fs2.readFileSync(abs, "utf8");
+        const fd = fs2.openSync(abs, "r");
+        try {
+          const buf = Buffer.alloc(maxBytes);
+          const n = fs2.readSync(fd, buf, 0, maxBytes, 0);
+          return buf.subarray(0, n).toString("utf8").replace(/�$/, "");
+        } finally {
+          fs2.closeSync(fd);
+        }
       } catch {
         return null;
       }
@@ -180,7 +282,7 @@ function fsConventionReader(repoRoot) {
       const abs = within(dirRel);
       if (!abs) return [];
       try {
-        return fs.readdirSync(abs).filter((n) => n.endsWith(".md")).map((n) => joinDir(dirRel, n));
+        return fs2.readdirSync(abs).filter((n) => n.endsWith(".md")).map((n) => joinDir(dirRel, n));
       } catch {
         return [];
       }
@@ -189,38 +291,23 @@ function fsConventionReader(repoRoot) {
 }
 
 // src/core/entrypoint.ts
-import fs2 from "fs";
+import fs3 from "fs";
 import { fileURLToPath } from "url";
 function isEntrypoint(importMetaUrl) {
   const entry = process.argv[1];
   if (!entry) return false;
   try {
-    return fs2.realpathSync(entry) === fs2.realpathSync(fileURLToPath(importMetaUrl));
+    return fs3.realpathSync(entry) === fs3.realpathSync(fileURLToPath(importMetaUrl));
   } catch {
     return false;
   }
 }
 
 // src/core/reviewers.ts
-import fs3 from "fs";
+import fs4 from "fs";
 import os from "os";
-import path2 from "path";
-
-// src/core/types.ts
-var REVIEWER_IDS = ["codex", "grok"];
-function isReviewerId(v) {
-  return REVIEWER_IDS.includes(v);
-}
-function parseReviewerIds(raw) {
-  if (!Array.isArray(raw)) return void 0;
-  const ids = [...new Set(raw.filter(isReviewerId))];
-  return ids.length > 0 ? ids : void 0;
-}
-var SEVERITIES = ["high", "medium", "low"];
-var CONFIDENCES = ["high", "medium", "low"];
-
-// src/core/reviewers.ts
-var REVIEWERS_FILE = process.env.ENSEMBLE_REVIEWERS_FILE || path2.join(os.homedir(), ".ensemble-ai", "reviewers.json");
+import path3 from "path";
+var REVIEWERS_FILE = process.env.ENSEMBLE_REVIEWERS_FILE || path3.join(os.homedir(), ".ensemble-ai", "reviewers.json");
 var REVIEWER_DEFAULTS = {
   codex: {
     cmd: "codex",
@@ -266,7 +353,7 @@ function parseReviewers(raw) {
 }
 function loadReviewers(file = REVIEWERS_FILE) {
   try {
-    return parseReviewers(JSON.parse(fs3.readFileSync(file, "utf8")));
+    return parseReviewers(JSON.parse(fs4.readFileSync(file, "utf8")));
   } catch {
     return { ...REVIEWER_DEFAULTS };
   }
@@ -604,22 +691,22 @@ a tight ranked list of the genuinely strong ideas over a long one.
 }
 
 // src/modes/brainstorm/voices.ts
-import fs7 from "fs";
+import fs8 from "fs";
 import os5 from "os";
-import path5 from "path";
+import path6 from "path";
 
 // src/reviewers/codex.ts
 import os3 from "os";
-import path3 from "path";
+import path4 from "path";
 
 // src/core/spawn.ts
 import { spawn } from "child_process";
-import fs5 from "fs";
+import fs6 from "fs";
 import os2 from "os";
 
 // src/core/bin.ts
 import { execFileSync } from "child_process";
-import fs4 from "fs";
+import fs5 from "fs";
 var binCache = /* @__PURE__ */ new Map();
 function resolveBin(name, opts = {}) {
   const cached = binCache.get(name);
@@ -629,7 +716,7 @@ function resolveBin(name, opts = {}) {
     ...opts.candidates ?? []
   ].filter((c) => Boolean(c));
   for (const c of candidates) {
-    if (fs4.existsSync(c)) {
+    if (fs5.existsSync(c)) {
       binCache.set(name, c);
       return c;
     }
@@ -721,9 +808,9 @@ function runReviewerExec(opts) {
         if (text) raw = text;
       } else {
         try {
-          const text = fs5.readFileSync(outFile ?? "", "utf8").trim();
+          const text = fs6.readFileSync(outFile ?? "", "utf8").trim();
           if (text) raw = text;
-          fs5.unlinkSync(outFile ?? "");
+          fs6.unlinkSync(outFile ?? "");
         } catch {
         }
       }
@@ -763,7 +850,7 @@ function buildCodexReviewArgs(config, outFile, prompt) {
 }
 function runCodexReview(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  const outFile = path3.join(
+  const outFile = path4.join(
     os3.tmpdir(),
     `codex-review-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
   );
@@ -783,10 +870,10 @@ function runCodexReview(prompt, config, opts = {}) {
 }
 
 // src/reviewers/grok.ts
-import fs6 from "fs";
+import fs7 from "fs";
 import os4 from "os";
-import path4 from "path";
-var GROK_BIN_CANDIDATES = [path4.join(os4.homedir(), ".grok", "bin", "grok")];
+import path5 from "path";
+var GROK_BIN_CANDIDATES = [path5.join(os4.homedir(), ".grok", "bin", "grok")];
 function resolveGrokBin() {
   return resolveBin("grok", {
     candidates: GROK_BIN_CANDIDATES,
@@ -829,19 +916,19 @@ function replaceReviewSection(content) {
   const after = lines.slice(to).join("\n").replace(/^\n+/, "");
   return [before, REVIEW_PROFILE.trimEnd(), after].filter((s) => s.length > 0).join("\n\n") + "\n";
 }
-function ensureSandboxProfile(profile, file = path4.join(os4.homedir(), ".grok", "sandbox.toml")) {
+function ensureSandboxProfile(profile, file = path5.join(os4.homedir(), ".grok", "sandbox.toml")) {
   if (BUILTIN_SANDBOXES.has(profile) || profile !== REVIEW_PROFILE_NAME) return;
   try {
-    const existing = fs6.existsSync(file) ? fs6.readFileSync(file, "utf8") : "";
+    const existing = fs7.existsSync(file) ? fs7.readFileSync(file, "utf8") : "";
     if (existing.includes(REVIEW_PROFILE_BLOCK)) return;
-    fs6.mkdirSync(path4.dirname(file), { recursive: true });
+    fs7.mkdirSync(path5.dirname(file), { recursive: true });
     const updated = existing.includes(REVIEW_PROFILE_HEADER) ? replaceReviewSection(existing) : null;
     const content = updated ?? (existing.trim() ? `${existing.trimEnd()}
 
 ${REVIEW_PROFILE}` : REVIEW_PROFILE);
     const tmp = `${file}.tmp`;
-    fs6.writeFileSync(tmp, content);
-    fs6.renameSync(tmp, file);
+    fs7.writeFileSync(tmp, content);
+    fs7.renameSync(tmp, file);
   } catch {
   }
 }
@@ -878,7 +965,7 @@ function runGrokReview(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const sandbox = resolveReviewSandbox(config.sandbox);
   ensureSandboxProfile(sandbox);
-  const cwd = fs6.mkdtempSync(path4.join(os4.tmpdir(), "grok-review-"));
+  const cwd = fs7.mkdtempSync(path5.join(os4.tmpdir(), "grok-review-"));
   return runReviewerExec({
     args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
     bin: resolveGrokBin(),
@@ -888,7 +975,7 @@ function runGrokReview(prompt, config, opts = {}) {
     timeoutMs
   }).then(({ raw, stderrTail, timedOut }) => {
     try {
-      fs6.rmSync(cwd, { force: true, recursive: true });
+      fs7.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
     const text = raw ? extractGrokText(raw) : null;
@@ -964,7 +1051,7 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), o),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), o)
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path5.join(os5.homedir(), ".ensemble-ai", "voices.json");
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path6.join(os5.homedir(), ".ensemble-ai", "voices.json");
 function str3(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
@@ -990,7 +1077,7 @@ function parseVoices(raw) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs7.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs8.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
@@ -1560,81 +1647,6 @@ function isMode(v) {
 }
 function isImplemented(mode) {
   return IMPLEMENTED_MODES.includes(mode);
-}
-
-// src/core/artifacts.ts
-import fs8 from "fs";
-import path6 from "path";
-function sanitizePathSegment(s) {
-  return s.replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-function reviewDir(baseDir, runId) {
-  return path6.join(baseDir, sanitizePathSegment(runId) || "unknown");
-}
-function writeAtomic(dir, name, content) {
-  fs8.mkdirSync(dir, { recursive: true });
-  const target = path6.join(dir, name);
-  const tmp = `${target}.tmp`;
-  fs8.writeFileSync(tmp, content);
-  fs8.renameSync(tmp, target);
-}
-function readJson(file) {
-  try {
-    return JSON.parse(fs8.readFileSync(file, "utf8"));
-  } catch {
-    return null;
-  }
-}
-function manifestOf(packet) {
-  return packet.sections.map((s) => ({
-    included: s.included,
-    note: s.note,
-    title: s.title,
-    truncated: s.truncated
-  }));
-}
-function reviewJson(reviewerId) {
-  return `review.${reviewerId}.json`;
-}
-function persistReview(baseDir, input) {
-  const dir = reviewDir(baseDir, input.runId);
-  const id = input.reviewer.id;
-  writeAtomic(dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
-  writeAtomic(dir, `prompt.${id}.md`, input.prompt);
-  if (input.raw !== null) writeAtomic(dir, `${id}-review.raw.md`, input.raw);
-  writeAtomic(
-    dir,
-    `findings.${id}.json`,
-    JSON.stringify(input.findings, null, 2)
-  );
-  const stored = {
-    findings: input.findings,
-    packet: {
-      complete: input.packet.complete,
-      manifest: manifestOf(input.packet)
-    },
-    reviewer: {
-      effort: input.reviewer.effort,
-      model: input.reviewer.model,
-      vendor: input.reviewer.vendor
-    },
-    reviewerId: id,
-    runId: input.runId,
-    summary: input.summary,
-    terminalState: input.terminalState
-  };
-  writeAtomic(dir, reviewJson(id), JSON.stringify(stored, null, 2));
-  return stored;
-}
-function readReview(baseDir, runId, reviewerId = "codex") {
-  const dir = reviewDir(baseDir, runId);
-  const perId = readJson(path6.join(dir, reviewJson(reviewerId)));
-  if (perId) return perId.reviewerId ? perId : { ...perId, reviewerId };
-  if (reviewerId === "codex") {
-    const legacy = readJson(path6.join(dir, "review.json"));
-    if (legacy) return { ...legacy, reviewerId: "codex" };
-  }
-  return null;
 }
 
 // src/core/packet.ts
@@ -2238,9 +2250,10 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs9.mkdirSync(path7.dirname(file), { recursive: true });
+  fs9.mkdirSync(path7.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs9.writeFileSync(tmp, JSON.stringify(receipt, null, 2));
+  fs9.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs9.chmodSync(tmp, 384);
   fs9.renameSync(tmp, file);
   return file;
 }
@@ -2854,7 +2867,9 @@ Options:
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
-  --out <dir>           trail output dir (default: a temp dir, printed)
+  --out <dir>           trail BASE dir; a per-run <run-id>/ subdir is created under it
+                        (default: repo-local .ensemble-ai/reviews when reviewing this
+                        repo's own diff, else an OS temp dir \u2014 the path is printed)
   --sandbox <profile>   reviewer sandbox profile override (deny-by-default only)
   --allow-sensitive     review even if the diff carries secrets/sensitive paths
   --ceiling <bytes>     coverage byte ceiling (default 200000)
@@ -2932,17 +2947,34 @@ function gitToplevel(cwd) {
     return null;
   }
 }
+function resolveTrailBase(gitRoot, localRepoTrail) {
+  if (gitRoot && localRepoTrail) {
+    return path8.join(gitRoot, ".ensemble-ai", "reviews");
+  }
+  return path8.join(os7.tmpdir(), "ensemble-ai", "reviews");
+}
 function ghConventionReader(repoSlug, ref, cwd) {
+  const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
+  const encRef = encodeURIComponent(ref);
   return {
-    async read(rel) {
+    async read(rel, maxBytes) {
       const cap3 = capture(
         "gh",
-        ["api", `repos/${repoSlug}/contents/${rel}?ref=${ref}`, "--jq", ".content"],
+        [
+          "api",
+          `repos/${repoSlug}/contents/${encPath(rel)}?ref=${encRef}`,
+          "--jq",
+          'if type=="object" and .type=="file" then .content else empty end'
+        ],
         cwd
       );
       if (!cap3.ok || !cap3.text.trim()) return null;
       try {
-        return Buffer.from(cap3.text.replace(/\s/g, ""), "base64").toString("utf8");
+        const decoded = Buffer.from(cap3.text.replace(/\s/g, ""), "base64").toString("utf8");
+        if (maxBytes !== void 0 && Buffer.byteLength(decoded, "utf8") > maxBytes) {
+          return Buffer.from(decoded, "utf8").subarray(0, maxBytes).toString("utf8").replace(/�$/, "");
+        }
+        return decoded;
       } catch {
         return null;
       }
@@ -2950,7 +2982,7 @@ function ghConventionReader(repoSlug, ref, cwd) {
     async list(dirRel) {
       const cap3 = capture(
         "gh",
-        ["api", `repos/${repoSlug}/contents/${dirRel}?ref=${ref}`, "--jq", ".[].path"],
+        ["api", `repos/${repoSlug}/contents/${encPath(dirRel)}?ref=${encRef}`, "--jq", ".[].path"],
         cwd
       );
       if (!cap3.ok) return [];
@@ -3048,11 +3080,11 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "stdin":
       return { diffText: stdinContent };
     case "staged":
-      return { staged: true };
+      return { localRepoTrail: true, staged: true };
     case "working-tree":
-      return { workingTree: true };
+      return { localRepoTrail: true, workingTree: true };
     case "commit":
-      return {};
+      return { localRepoTrail: true };
   }
 }
 var SEVERITY_LABEL = {
@@ -3276,7 +3308,8 @@ async function reviewCommand(args, profile = "code") {
     reviewers = parsed;
   }
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-  const out = typeof values.out === "string" ? path8.resolve(values.out) : path8.join(os7.tmpdir(), "ensemble-ai", runId);
+  const out = typeof values.out === "string" ? path8.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+  const trailDir = reviewDir(out, runId);
   const ceiling = positiveCeiling(
     typeof values.ceiling === "string" ? values.ceiling : void 0,
     cmd
@@ -3311,22 +3344,24 @@ async function reviewCommand(args, profile = "code") {
   }
   if (result.conventionManifest) {
     try {
-      fs10.mkdirSync(out, { recursive: true });
-      fs10.writeFileSync(
-        path8.join(out, "conventions.json"),
-        JSON.stringify(result.conventionManifest, null, 2)
-      );
+      fs10.mkdirSync(trailDir, { mode: 448, recursive: true });
+      const cfile = path8.join(trailDir, "conventions.json");
+      fs10.writeFileSync(cfile, JSON.stringify(result.conventionManifest, null, 2), {
+        mode: 384
+      });
+      fs10.chmodSync(cfile, 384);
     } catch {
     }
   }
   printSummary(result, profile);
-  const pinnedReviewerId = result.reviews[0]?.reviewerId;
-  if (pinnedReviewerId) {
+  if (result.reviews.length > 0) {
+    const first = result.reviews[0];
+    const pinnedReviewerId = first.reviewerId ?? first.reviewer.vendor;
     console.log(
-      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path8.join(out, `prompt.${pinnedReviewerId}.md`)}`
+      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path8.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
   }
-  console.error(`trail: ${out}`);
+  console.log(`trail: ${trailDir}`);
   if (result.blocked) return 2;
   const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
   if (!allReviewed) return 1;
@@ -4171,5 +4206,6 @@ if (isEntrypoint(import.meta.url)) {
   );
 }
 export {
-  main
+  main,
+  resolveTrailBase
 };

@@ -151,9 +151,12 @@ export function writeReceipt(
   receipt: DiffReviewReceipt
 ): string {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(receipt, null, 2));
+  // Owner-only (0600): a receipt records what/where was reviewed. writeFileSync's mode
+  // is umask-masked, so chmod after to GUARANTEE 0600, then atomically rename in.
+  fs.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);
   fs.renameSync(tmp, file);
   return file;
 }

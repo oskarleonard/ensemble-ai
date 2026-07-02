@@ -35,11 +35,17 @@ export function reviewDir(baseDir: string, runId: string): string {
   return path.join(baseDir, sanitizePathSegment(runId) || 'unknown');
 }
 
+// A trail file can EMBED the reviewed diff (and, in a security review, whatever
+// secret-adjacent lines survived the scan) — so it is written OWNER-ONLY (0600) in
+// an owner-only dir (0700). writeFileSync's `mode` is masked by the process umask, so
+// chmod after the write to GUARANTEE 0600 regardless of the caller's umask, then
+// rename into place (an atomic swap that carries the tmp file's mode).
 function writeAtomic(dir: string, name: string, content: string): void {
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const target = path.join(dir, name);
   const tmp = `${target}.tmp`;
-  fs.writeFileSync(tmp, content);
+  fs.writeFileSync(tmp, content, { mode: 0o600 });
+  fs.chmodSync(tmp, 0o600);
   fs.renameSync(tmp, target);
 }
 

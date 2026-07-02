@@ -458,11 +458,14 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   let visited = 0;
   while (queue.length > 0) {
     const rel = queue.shift();
-    const content = await reader.read(rel);
+    const content = await reader.read(rel, capBytes);
     if (content === null) continue;
-    if (visited >= maxFiles) break;
-    visited++;
     const bytes = Buffer.byteLength(content, "utf8");
+    if (visited >= maxFiles) {
+      files.push({ path: rel, bytes, included: false, truncated: false, reason: "max-files" });
+      break;
+    }
+    visited++;
     const dir = dirOf(rel);
     for (const ref of extractRefs(content)) enqueue(resolveInRepo(dir, ref));
     const remaining = capBytes - used;
@@ -523,12 +526,20 @@ function fsConventionReader(repoRoot) {
     return real;
   };
   return {
-    async read(rel) {
+    async read(rel, maxBytes) {
       const abs = within(rel);
       if (!abs) return null;
       try {
         if (!fs.statSync(abs).isFile()) return null;
-        return fs.readFileSync(abs, "utf8");
+        if (maxBytes === void 0) return fs.readFileSync(abs, "utf8");
+        const fd = fs.openSync(abs, "r");
+        try {
+          const buf = Buffer.alloc(maxBytes);
+          const n = fs.readSync(fd, buf, 0, maxBytes, 0);
+          return buf.subarray(0, n).toString("utf8").replace(/�$/, "");
+        } finally {
+          fs.closeSync(fd);
+        }
       } catch {
         return null;
       }
@@ -546,8 +557,10 @@ function fsConventionReader(repoRoot) {
 }
 function memoryConventionReader(fileMap) {
   return {
-    async read(rel) {
-      return Object.prototype.hasOwnProperty.call(fileMap, rel) ? fileMap[rel] : null;
+    async read(rel, maxBytes) {
+      if (!Object.prototype.hasOwnProperty.call(fileMap, rel)) return null;
+      const c = fileMap[rel];
+      return maxBytes === void 0 ? c : sliceBytes(c, maxBytes);
     },
     async list(dirRel) {
       const prefix = dirRel === "" ? "" : `${dirRel}/`;
@@ -631,10 +644,11 @@ function reviewDir(baseDir, runId) {
   return path3.join(baseDir, sanitizePathSegment(runId) || "unknown");
 }
 function writeAtomic(dir, name, content) {
-  fs3.mkdirSync(dir, { recursive: true });
+  fs3.mkdirSync(dir, { recursive: true, mode: 448 });
   const target = path3.join(dir, name);
   const tmp = `${target}.tmp`;
-  fs3.writeFileSync(tmp, content);
+  fs3.writeFileSync(tmp, content, { mode: 384 });
+  fs3.chmodSync(tmp, 384);
   fs3.renameSync(tmp, target);
 }
 function readJson(file) {
@@ -1344,9 +1358,10 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs7.mkdirSync(path6.dirname(file), { recursive: true });
+  fs7.mkdirSync(path6.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs7.writeFileSync(tmp, JSON.stringify(receipt, null, 2));
+  fs7.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs7.chmodSync(tmp, 384);
   fs7.renameSync(tmp, file);
   return file;
 }

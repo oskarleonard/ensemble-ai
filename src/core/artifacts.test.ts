@@ -3,7 +3,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { persistReview, readReview, readReviewsForRun } from './artifacts';
+import {
+  persistReview,
+  readReview,
+  readReviewsForRun,
+  reviewDir,
+  sanitizePathSegment,
+} from './artifacts';
 import type { ReviewerConfig, ReviewFinding, ReviewPacket } from './types';
 
 // baseDir is now an explicit first arg (no env-driven path) — give every test a
@@ -96,5 +102,52 @@ describe('per-reviewer artifacts', () => {
     expect(readReviewsForRun(baseDir, runId).map((r) => r.reviewerId)).toEqual(
       ['codex']
     );
+  });
+});
+
+describe('trail security', () => {
+  it('sanitizes a traversal-laden runId so a trail can never escape its base', () => {
+    // A crafted --run-id must not climb out of baseDir. sanitize collapses every path
+    // SEPARATOR (and any other non-[A-Za-z0-9._-] char) to `_`, so the result is always a
+    // SINGLE child segment — a leftover `..` substring is harmless without a separator.
+    // reviewDir routes EVERY key through it.
+    for (const evil of ['../../etc', '..\\..\\win', 'a/b/../../c', '/abs/path']) {
+      const dir = reviewDir(baseDir, evil);
+      const rel = path.relative(baseDir, dir);
+      // A real traversal would make `rel` climb (`..` as its own component) or go absolute.
+      // A leftover `..` INSIDE a single segment name (e.g. `.._.._etc`) is not a traversal.
+      expect(rel === '..' || rel.startsWith(`..${path.sep}`)).toBe(false);
+      expect(path.isAbsolute(rel)).toBe(false);
+      expect(path.dirname(dir)).toBe(baseDir); // exactly one level under the base
+      expect(path.basename(dir)).not.toMatch(/[/\\]/); // no separator survived
+    }
+    // The sanitizer itself leaves no path SEPARATORS (dots are allowed → no traversal
+    // without a separator to act on).
+    expect(sanitizePathSegment('../../etc/passwd')).not.toMatch(/[/\\]/);
+    expect(sanitizePathSegment('../../etc')).toBe('.._.._etc');
+  });
+
+  it('writes every persisted trail file owner-only (0600)', () => {
+    persistReview(baseDir, {
+      findings: [finding('f1')],
+      packet: packet(),
+      prompt: 'the rendered prompt',
+      raw: 'raw reply',
+      reviewer: cfg('codex'),
+      runId: 'perm-run',
+      summary: 's',
+      terminalState: 'reviewed',
+    });
+    const dir = reviewDir(baseDir, 'perm-run');
+    for (const name of [
+      'packet.codex.json',
+      'prompt.codex.md',
+      'codex-review.raw.md',
+      'findings.codex.json',
+      'review.codex.json',
+    ]) {
+      const mode = fs.statSync(path.join(dir, name)).mode & 0o777;
+      expect(mode).toBe(0o600);
+    }
   });
 });
