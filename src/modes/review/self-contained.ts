@@ -282,16 +282,34 @@ export async function runClaudeReviewLayer(
       log
     );
     claudeReview = review;
-    persistClaudeReview(opts.baseDir, opts.runId, review, raw);
+    // The trail persist is best-effort: an FS error (bad perms, symlink refusal, full
+    // disk) must DEGRADE the Opus reviewer — the in-memory review still feeds the HIGH
+    // gate + rendering — never crash the whole review. It just drops out of the
+    // disk-read synthesis input below (synthesis then runs over codex+grok).
+    try {
+      persistClaudeReview(opts.baseDir, opts.runId, review, raw);
+    } catch (e) {
+      log(`  · claude: trail persist failed (${(e as Error).message}) — continuing without it`);
+    }
   }
 
   // Write each reviewer's rendered review.<id>.md (durable, human-readable trail artifact).
+  // Each write is best-effort — one reviewer's FS error must not take down the others or
+  // the synthesis.
   const coreVoices = opts.coreReviews.map(storedToVoiceReview);
   for (const v of coreVoices) {
-    writeTrailFile(opts.baseDir, opts.runId, `review.${v.voiceId}.md`, renderReviewMarkdown(v));
+    try {
+      writeTrailFile(opts.baseDir, opts.runId, `review.${v.voiceId}.md`, renderReviewMarkdown(v));
+    } catch (e) {
+      log(`  · trail write review.${v.voiceId}.md failed (${(e as Error).message}) — continuing`);
+    }
   }
   if (claudeReview) {
-    writeTrailFile(opts.baseDir, opts.runId, 'review.claude.md', renderReviewMarkdown(claudeReview));
+    try {
+      writeTrailFile(opts.baseDir, opts.runId, 'review.claude.md', renderReviewMarkdown(claudeReview));
+    } catch (e) {
+      log(`  · trail write review.claude.md failed (${(e as Error).message}) — continuing`);
+    }
   }
 
   // Synthesize over the reviews READ BACK from the trail files (the literal "reads the three

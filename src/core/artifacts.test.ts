@@ -184,4 +184,16 @@ describe('writeTrailFile — hardened, symlink-safe trail writer', () => {
     expect(fs.readFileSync(path.join(dir, 'conventions.json'), 'utf8')).toBe('FRESH');
     expect(fs.readFileSync(outside, 'utf8')).toBe('SECRET2');
   });
+
+  it('REFUSES to write through a symlinked trail DIR (never follows it out of the tree)', () => {
+    const outsideDir = path.join(baseDir, 'outside-dir');
+    fs.mkdirSync(outsideDir, { recursive: true });
+    // Pre-plant the run dir itself as a symlink to an outside directory. Recursive mkdir
+    // treats it as "already exists"; the writer must lstat + refuse, not follow it.
+    const runDirPath = reviewDir(baseDir, 'runSymDir');
+    fs.symlinkSync(outsideDir, runDirPath);
+    expect(() => writeTrailFile(baseDir, 'runSymDir', 'conventions.json', 'X')).toThrow(/symlinked trail dir/);
+    // nothing was written into the outside target
+    expect(fs.existsSync(path.join(outsideDir, 'conventions.json'))).toBe(false);
+  });
 });

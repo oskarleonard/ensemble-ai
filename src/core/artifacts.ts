@@ -48,8 +48,16 @@ export function reviewDir(baseDir: string, runId: string): string {
 // target with the real file rather than writing through it.
 function writeAtomic(dir: string, name: string, content: string): void {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  // Realpath the dir now that it exists so the write target is the resolved real dir,
-  // not a string that a symlinked component could point elsewhere.
+  // Refuse to write through a SYMLINKED trail dir: recursive mkdir treats a pre-planted
+  // symlink-to-dir as "already exists" and does NOT error, and realpathSync would then
+  // FOLLOW it — redirecting the write out of the intended tree (the O_NOFOLLOW below only
+  // guards the final FILE component, never a symlinked DIRECTORY). lstat the leaf and
+  // reject a symlink outright rather than following it.
+  if (fs.lstatSync(dir).isSymbolicLink()) {
+    throw new Error(`ensemble-ai: refusing to write into a symlinked trail dir: ${dir}`);
+  }
+  // Now realpath the (real) dir so the write target is the resolved real dir, not a string
+  // whose interior components a symlink could point elsewhere.
   let realDir = dir;
   try {
     realDir = fs.realpathSync(dir);
@@ -71,14 +79,33 @@ function writeAtomic(dir: string, name: string, content: string): void {
     fs.constants.O_CREAT |
     fs.constants.O_EXCL |
     fs.constants.O_NOFOLLOW;
-  const fd = fs.openSync(tmp, flags, 0o600);
+  // openSync can THROW (ELOOP when O_NOFOLLOW refuses a planted symlink, EEXIST on an
+  // O_EXCL race, EACCES). Surface a clear, contextualized error rather than a raw errno so
+  // a caller (trail writes are best-effort) can catch + degrade — and don't leak a fd.
+  let fd: number;
+  try {
+    fd = fs.openSync(tmp, flags, 0o600);
+  } catch (e) {
+    throw new Error(`ensemble-ai: cannot open trail temp file ${tmp}: ${(e as Error).message}`);
+  }
   try {
     fs.writeFileSync(fd, content);
     fs.fchmodSync(fd, 0o600);
   } finally {
     fs.closeSync(fd);
   }
-  fs.renameSync(tmp, target);
+  // On a rename failure, clean up the dangling tmp so a retry isn't blocked by O_EXCL and
+  // no half-written temp is left behind (recoverable, not an un-recoverable primitive).
+  try {
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* best-effort cleanup */
+    }
+    throw new Error(`ensemble-ai: cannot finalize trail file ${target}: ${(e as Error).message}`);
+  }
 }
 
 // Public, hardened trail writer: the SAME symlink-safe atomic write persistReview uses,

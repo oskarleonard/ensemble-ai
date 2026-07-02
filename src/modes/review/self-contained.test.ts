@@ -134,10 +134,17 @@ describe('storedToVoiceReview', () => {
 });
 
 describe('synthesizeReviews — injected runner, deterministic degrade', () => {
+  // Each voice actually RAISED a finding — so a claimed agreement crediting ≥2 of them is
+  // corroborated by real per-voice findings (reconcileSynthesis validates against the
+  // findings, not merely "the voice reviewed"; a no-findings voice can't corroborate).
+  const f = (voiceId: string) => ({
+    body: 'b', confidence: 'high' as const, evidence: { file: 'src/x.ts', line: 3 },
+    id: 'f1', severity: 'high' as const, title: `${voiceId} bug`,
+  });
   const reviews: VoiceReview[] = [
-    { findings: [], ok: true, summary: 'codex', voiceId: 'codex' },
-    { findings: [], ok: true, summary: 'grok', voiceId: 'grok' },
-    { findings: [], ok: true, summary: 'claude', voiceId: 'claude' },
+    { findings: [f('codex')], ok: true, summary: 'codex', voiceId: 'codex' },
+    { findings: [f('grok')], ok: true, summary: 'grok', voiceId: 'grok' },
+    { findings: [f('claude')], ok: true, summary: 'claude', voiceId: 'claude' },
   ];
 
   it('parses a conforming synthesis into the agree/disagree/sanity/bottom-line structure', async () => {
@@ -268,9 +275,14 @@ describe('loadVoiceReviewsFromTrail — synthesis input is read from the injecte
     const base = tmpTrail();
     const runId = 'runL2';
     seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    // claude raised a finding too, so it can legitimately corroborate the codex+claude
+    // agreement (reconcileSynthesis validates a credited voice against its real findings).
     fs.writeFileSync(
       path.join(reviewDir(base, runId), 'review.claude.json'),
-      JSON.stringify({ findings: [], ok: true, summary: 'claude read', voiceId: 'claude' })
+      JSON.stringify({
+        findings: [{ body: 'b', confidence: 'high', evidence: { file: 'src/x.ts', line: 3 }, id: 'f1', severity: 'high', title: 'claude bug' }],
+        ok: true, summary: 'claude read', voiceId: 'claude',
+      })
     );
     const { run } = makeRunner();
     const s = await synthesizeReviews(loadVoiceReviewsFromTrail(base, runId), run, CFG);

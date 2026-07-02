@@ -650,6 +650,9 @@ function reviewDir(baseDir, runId) {
 }
 function writeAtomic(dir, name, content) {
   fs3.mkdirSync(dir, { recursive: true, mode: 448 });
+  if (fs3.lstatSync(dir).isSymbolicLink()) {
+    throw new Error(`ensemble-ai: refusing to write into a symlinked trail dir: ${dir}`);
+  }
   let realDir = dir;
   try {
     realDir = fs3.realpathSync(dir);
@@ -662,14 +665,27 @@ function writeAtomic(dir, name, content) {
   } catch {
   }
   const flags = fs3.constants.O_WRONLY | fs3.constants.O_CREAT | fs3.constants.O_EXCL | fs3.constants.O_NOFOLLOW;
-  const fd = fs3.openSync(tmp, flags, 384);
+  let fd;
+  try {
+    fd = fs3.openSync(tmp, flags, 384);
+  } catch (e) {
+    throw new Error(`ensemble-ai: cannot open trail temp file ${tmp}: ${e.message}`);
+  }
   try {
     fs3.writeFileSync(fd, content);
     fs3.fchmodSync(fd, 384);
   } finally {
     fs3.closeSync(fd);
   }
-  fs3.renameSync(tmp, target);
+  try {
+    fs3.renameSync(tmp, target);
+  } catch (e) {
+    try {
+      fs3.unlinkSync(tmp);
+    } catch {
+    }
+    throw new Error(`ensemble-ai: cannot finalize trail file ${target}: ${e.message}`);
+  }
 }
 function writeTrailFile(baseDir, runId, name, content) {
   const dir = reviewDir(baseDir, runId);

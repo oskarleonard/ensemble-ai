@@ -34,6 +34,9 @@ function reviewDir(baseDir, runId) {
 }
 function writeAtomic(dir, name, content) {
   fs.mkdirSync(dir, { recursive: true, mode: 448 });
+  if (fs.lstatSync(dir).isSymbolicLink()) {
+    throw new Error(`ensemble-ai: refusing to write into a symlinked trail dir: ${dir}`);
+  }
   let realDir = dir;
   try {
     realDir = fs.realpathSync(dir);
@@ -46,14 +49,27 @@ function writeAtomic(dir, name, content) {
   } catch {
   }
   const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW;
-  const fd = fs.openSync(tmp, flags, 384);
+  let fd;
+  try {
+    fd = fs.openSync(tmp, flags, 384);
+  } catch (e) {
+    throw new Error(`ensemble-ai: cannot open trail temp file ${tmp}: ${e.message}`);
+  }
   try {
     fs.writeFileSync(fd, content);
     fs.fchmodSync(fd, 384);
   } finally {
     fs.closeSync(fd);
   }
-  fs.renameSync(tmp, target);
+  try {
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+    }
+    throw new Error(`ensemble-ai: cannot finalize trail file ${target}: ${e.message}`);
+  }
 }
 function writeTrailFile(baseDir, runId, name, content) {
   const dir = reviewDir(baseDir, runId);
@@ -2804,10 +2820,10 @@ function parseReviewSynthesis(raw) {
 }
 function reconcileSynthesis(synth, reviews) {
   if (synth.degraded) return { synthesis: synth, demoted: 0 };
-  const realVoices = new Set(
-    reviews.filter((r) => r.ok).map((r) => r.voiceId.trim().toLowerCase())
+  const findingVoices = new Set(
+    reviews.filter((r) => r.ok && r.findings.length > 0).map((r) => r.voiceId.trim().toLowerCase())
   );
-  const isReal = (v) => realVoices.has(v.trim().toLowerCase());
+  const isReal = (v) => findingVoices.has(v.trim().toLowerCase());
   const agreements = [];
   const demoted = [];
   for (const a of synth.agreements) {
@@ -2878,7 +2894,7 @@ function reviewJsonFromTrail(baseDir, runId, name) {
 function isFinding(v) {
   if (!v || typeof v !== "object") return false;
   const f = v;
-  return typeof f.title === "string" && typeof f.body === "string" && typeof f.severity === "string" && typeof f.evidence === "object" && f.evidence !== null;
+  return typeof f.id === "string" && f.id.trim() !== "" && typeof f.title === "string" && typeof f.body === "string" && typeof f.severity === "string" && SEVERITIES.includes(f.severity) && typeof f.confidence === "string" && CONFIDENCES.includes(f.confidence) && typeof f.evidence === "object" && f.evidence !== null;
 }
 
 // src/modes/review/self-contained.ts
@@ -3030,14 +3046,26 @@ async function runClaudeReviewLayer(opts) {
       log
     );
     claudeReview = review;
-    persistClaudeReview(opts.baseDir, opts.runId, review, raw);
+    try {
+      persistClaudeReview(opts.baseDir, opts.runId, review, raw);
+    } catch (e) {
+      log(`  \xB7 claude: trail persist failed (${e.message}) \u2014 continuing without it`);
+    }
   }
   const coreVoices = opts.coreReviews.map(storedToVoiceReview);
   for (const v of coreVoices) {
-    writeTrailFile(opts.baseDir, opts.runId, `review.${v.voiceId}.md`, renderReviewMarkdown(v));
+    try {
+      writeTrailFile(opts.baseDir, opts.runId, `review.${v.voiceId}.md`, renderReviewMarkdown(v));
+    } catch (e) {
+      log(`  \xB7 trail write review.${v.voiceId}.md failed (${e.message}) \u2014 continuing`);
+    }
   }
   if (claudeReview) {
-    writeTrailFile(opts.baseDir, opts.runId, "review.claude.md", renderReviewMarkdown(claudeReview));
+    try {
+      writeTrailFile(opts.baseDir, opts.runId, "review.claude.md", renderReviewMarkdown(claudeReview));
+    } catch (e) {
+      log(`  \xB7 trail write review.claude.md failed (${e.message}) \u2014 continuing`);
+    }
   }
   const voiceReviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
   const synthesis = await synthesizeReviews(
@@ -3827,6 +3855,10 @@ async function reviewCommand(args, profile = "code") {
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
   const out = typeof values.out === "string" ? path9.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
+  try {
+    fs11.rmSync(trailDir, { force: true, recursive: true });
+  } catch {
+  }
   const ceiling = positiveCeiling(
     typeof values.ceiling === "string" ? values.ceiling : void 0,
     cmd
@@ -3879,28 +3911,47 @@ async function reviewCommand(args, profile = "code") {
     );
   }
   let claudeLayer = null;
-  if (roster.claude && !result.blocked && result.prompt) {
+  let claudeLayerCrashed = false;
+  const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
+  if (claudeLayerExpected && result.prompt) {
     const voiceConfigs = loadVoices();
-    claudeLayer = await runClaudeReviewLayer({
-      baseDir: out,
-      claudeConfig: voiceConfigs.claude,
-      coreReviews: result.reviews,
-      includeClaudeReviewer: true,
-      log: (m) => console.error(`\xB7 ${m}`),
-      reviewPrompt: result.prompt,
-      runId,
-      synthConfig: voiceConfigs.claude
-    });
-    console.log(renderClaudeLayer(claudeLayer).join("\n"));
     try {
-      writeTrailFile(out, runId, "claude-synthesis.json", JSON.stringify(claudeLayer, null, 2));
-    } catch {
+      claudeLayer = await runClaudeReviewLayer({
+        baseDir: out,
+        claudeConfig: voiceConfigs.claude,
+        coreReviews: result.reviews,
+        includeClaudeReviewer: true,
+        log: (m) => console.error(`\xB7 ${m}`),
+        reviewPrompt: result.prompt,
+        runId,
+        synthConfig: voiceConfigs.claude
+      });
+      console.log(renderClaudeLayer(claudeLayer).join("\n"));
+      try {
+        writeTrailFile(out, runId, "claude-synthesis.json", JSON.stringify(claudeLayer, null, 2));
+      } catch {
+      }
+    } catch (e) {
+      claudeLayerCrashed = true;
+      console.error(
+        `ensemble-ai ${cmd}: the Opus (claude) review layer crashed \u2014 ${e.message}`
+      );
     }
   }
   console.log(`trail: ${trailDir}`);
   if (result.blocked) return 2;
   const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
   if (!allReviewed) return 1;
+  if (claudeLayerExpected) {
+    const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
+    if (!claudeReviewed) {
+      const why = claudeLayer?.claudeReview ? clean(claudeLayer.claudeReview.summary).slice(0, 200) : claudeLayerCrashed ? "the Opus review layer crashed" : "the Opus review layer did not run to completion";
+      console.error(
+        `ensemble-ai ${cmd}: reviewer claude failed (${why}) \u2014 review INCOMPLETE: the codex/grok core completed, the Opus reviewer did not, so this is NOT a full 3-reviewer pass`
+      );
+      return 1;
+    }
+  }
   if (!values["no-fail-on-high"] && (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))) {
     return 4;
   }

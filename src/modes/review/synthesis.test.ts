@@ -148,6 +148,18 @@ describe('reconcileSynthesis — no invented consensus (validate vs real voices)
     expect(synthesis.disagreements[0].positions).toEqual(['codex: raised']);
   });
 
+  it('demotes an agreement crediting a voice that reviewed but raised NO findings', () => {
+    // grok reviewed cleanly (no findings) — it cannot corroborate a finding-agreement, so
+    // an agreement crediting codex+grok collapses to a single real corroborator → demoted.
+    const { synthesis, demoted } = reconcileSynthesis(
+      synth({ agreements: [{ point: 'only codex found this', voices: ['codex', 'grok'] }] }),
+      [review('codex'), review('grok', { findings: [] })]
+    );
+    expect(demoted).toBe(1);
+    expect(synthesis.agreements).toEqual([]);
+    expect(synthesis.disagreements[0].positions).toEqual(['codex: raised']);
+  });
+
   it('demotes an agreement with no corroborating voice at all', () => {
     const { synthesis } = reconcileSynthesis(
       synth({ agreements: [{ point: 'unsupported', voices: [] }] }),

@@ -238,6 +238,24 @@ describe('self-contained Opus layer wiring (default-on; --no-claude opts out; fe
     });
     expect(await main(['review', '--working-tree'])).toBe(4);
   });
+
+  it('a FAILED Opus reviewer (default-on, no HIGH from core) → exit 1, NOT a silent 0', async () => {
+    // codex/grok reviewed cleanly, but the DEFAULT claude reviewer failed to complete.
+    // The user asked for 3 reviewers and got 2 — must fail-loud (exit 1), never exit 0 as
+    // if fully reviewed.
+    mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed')] }));
+    mockLayer.mockResolvedValue({
+      claudeReview: { findings: [], ok: false, summary: 'claude produced no output', voiceId: 'claude' },
+      synthesis,
+    });
+    expect(await main(['review', '--working-tree'])).toBe(1);
+  });
+
+  it('a claude-layer CRASH (mockLayer throws) degrades → exit 1, review not falsely clean', async () => {
+    mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed')] }));
+    mockLayer.mockRejectedValue(new Error('unexpected FS error'));
+    expect(await main(['review', '--working-tree'])).toBe(1);
+  });
 });
 
 describe('profile selection (review vs security — same engine)', () => {

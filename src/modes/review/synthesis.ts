@@ -222,25 +222,30 @@ export function parseReviewSynthesis(raw: string): ParsedReviewSynthesis {
   return { agreements, bottomLine, disagreements, sanityChecks, summary };
 }
 
-// Guard against a synthesizer that fabricates CONFIDENT CONSENSUS. An AGREEMENT is only
-// legitimate if ≥2 DISTINCT voices that ACTUALLY produced a review concur — so we
-// validate the synthesizer's claims against the real per-voice reviews, never trusting
-// the model's self-report. For each agreement: drop any credited voice id that did not
-// review (a hallucinated/phantom voice — e.g. crediting "claude" when it never ran), and
-// if fewer than 2 real voices remain, DEMOTE it to a disagreement ("look closer") rather
-// than silently presenting invented agreement as high-signal. Voice ids match
-// case-insensitively (the model may echo a different case). Returns the corrected
-// synthesis + the demotion count (for logging). The deterministic fallback already makes
-// no agreement claim, so it passes through untouched.
+// Guard against a synthesizer that fabricates CONFIDENT CONSENSUS. An AGREEMENT is a
+// concurrence on a FINDING, so it is only legitimate if ≥2 DISTINCT voices that ACTUALLY
+// RAISED A FINDING concur — we validate the synthesizer's claims against the real
+// per-voice findings, never trusting the model's self-report. For each agreement: drop any
+// credited voice id that did not raise a finding (a hallucinated/phantom voice — e.g.
+// crediting "claude" when it never ran, OR crediting a voice that reviewed but reported
+// NOTHING, which cannot corroborate a finding), and if fewer than 2 corroborating voices
+// remain, DEMOTE it to a disagreement ("look closer") rather than presenting invented
+// agreement as high-signal. Voice ids match case-insensitively (the model may echo a
+// different case). Returns the corrected synthesis + the demotion count (for logging). The
+// deterministic fallback already makes no agreement claim, so it passes through untouched.
 export function reconcileSynthesis(
   synth: ReviewSynthesis,
   reviews: VoiceReview[]
 ): { synthesis: ReviewSynthesis; demoted: number } {
   if (synth.degraded) return { synthesis: synth, demoted: 0 };
-  const realVoices = new Set(
-    reviews.filter((r) => r.ok).map((r) => r.voiceId.trim().toLowerCase())
+  // A voice can corroborate a finding-agreement ONLY if it both reviewed (ok) AND actually
+  // produced at least one finding — a clean/no-findings review raised nothing to agree on.
+  const findingVoices = new Set(
+    reviews
+      .filter((r) => r.ok && r.findings.length > 0)
+      .map((r) => r.voiceId.trim().toLowerCase())
   );
-  const isReal = (v: string): boolean => realVoices.has(v.trim().toLowerCase());
+  const isReal = (v: string): boolean => findingVoices.has(v.trim().toLowerCase());
 
   const agreements: ReviewAgreement[] = [];
   const demoted: ReviewDisagreement[] = [];

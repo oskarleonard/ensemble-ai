@@ -808,6 +808,17 @@ async function reviewCommand(
       ? path.resolve(values.out)
       : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
+  // Scope this run's trail to THIS run. If the run dir already exists — an explicitly
+  // REUSED `--run-id` — clear it first, so STALE review files from a prior run with the
+  // same id can't be read back into the synthesis (loadVoiceReviewsFromTrail reads
+  // whatever `review.<id>.json` is on disk, blind to which run wrote it). A fresh /
+  // auto-generated run id has no dir to clear (force → no throw). reviewDir appends the
+  // sanitized runId as a dedicated subdir, so this only ever removes THIS run's own dir.
+  try {
+    fs.rmSync(trailDir, { force: true, recursive: true });
+  } catch {
+    /* best-effort — nothing to clear (fresh run id) */
+  }
   const ceiling = positiveCeiling(
     typeof values.ceiling === 'string' ? values.ceiling : undefined,
     cmd
@@ -885,23 +896,40 @@ async function reviewCommand(
   // failure degrades (deterministic fallback), never taking down the review. The Opus
   // reviewer IS a reviewer, so its HIGH findings feed the SAME exit gate below.
   let claudeLayer: ClaudeLayerResult | null = null;
-  if (roster.claude && !result.blocked && result.prompt) {
+  let claudeLayerCrashed = false;
+  // The Opus layer runs iff claude is in the roster, the diff wasn't blocked, and a packet
+  // was built. The exit gate below reuses this EXACT condition — a claude that was expected
+  // to review but didn't must fail-loud; a claude legitimately not-run (blocked / no packet)
+  // has nothing to gate.
+  const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
+  if (claudeLayerExpected && result.prompt) {
     const voiceConfigs = loadVoices();
-    claudeLayer = await runClaudeReviewLayer({
-      baseDir: out,
-      claudeConfig: voiceConfigs.claude,
-      coreReviews: result.reviews,
-      includeClaudeReviewer: true,
-      log: (m) => console.error(`· ${m}`),
-      reviewPrompt: result.prompt,
-      runId,
-      synthConfig: voiceConfigs.claude,
-    });
-    console.log(renderClaudeLayer(claudeLayer).join('\n'));
+    // The layer's own writes/spawn are best-effort internally, but a residual throw (an
+    // unexpected FS/spawn error) must DEGRADE the Opus layer, not crash the whole review
+    // after the codex/grok core already completed + printed. Catch it here as a backstop;
+    // the incompleteness is then reflected in the exit gate below (fail-loud, not exit 0).
     try {
-      writeTrailFile(out, runId, 'claude-synthesis.json', JSON.stringify(claudeLayer, null, 2));
-    } catch {
-      /* trail write is best-effort */
+      claudeLayer = await runClaudeReviewLayer({
+        baseDir: out,
+        claudeConfig: voiceConfigs.claude,
+        coreReviews: result.reviews,
+        includeClaudeReviewer: true,
+        log: (m) => console.error(`· ${m}`),
+        reviewPrompt: result.prompt,
+        runId,
+        synthConfig: voiceConfigs.claude,
+      });
+      console.log(renderClaudeLayer(claudeLayer).join('\n'));
+      try {
+        writeTrailFile(out, runId, 'claude-synthesis.json', JSON.stringify(claudeLayer, null, 2));
+      } catch {
+        /* trail write is best-effort */
+      }
+    } catch (e) {
+      claudeLayerCrashed = true;
+      console.error(
+        `ensemble-ai ${cmd}: the Opus (claude) review layer crashed — ${(e as Error).message}`
+      );
     }
   }
 
@@ -915,6 +943,26 @@ async function reviewCommand(
     result.reviews.length > 0 &&
     result.reviews.every((r) => r.terminalState === 'reviewed');
   if (!allReviewed) return 1;
+  // The cold Opus (claude) reviewer is DEFAULT-ON — a THIRD reviewer, not an optional
+  // extra. If it was in the roster but did NOT complete (spawn/parse failure → an ok:false
+  // review, or the layer crashed above), the review is INCOMPLETE: the user asked for 3
+  // reviewers and got 2. Fail-loud like a failed core reviewer (exit 1) rather than exit 0
+  // as if fully reviewed. `--no-fail-on-high` does NOT suppress this — it only gates HIGH
+  // findings, never a missing reviewer.
+  if (claudeLayerExpected) {
+    const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
+    if (!claudeReviewed) {
+      const why = claudeLayer?.claudeReview
+        ? clean(claudeLayer.claudeReview.summary).slice(0, 200)
+        : claudeLayerCrashed
+          ? 'the Opus review layer crashed'
+          : 'the Opus review layer did not run to completion';
+      console.error(
+        `ensemble-ai ${cmd}: reviewer claude failed (${why}) — review INCOMPLETE: the codex/grok core completed, the Opus reviewer did not, so this is NOT a full 3-reviewer pass`
+      );
+      return 1;
+    }
+  }
   // 4 = the findings GATE: a completed review surfaced a HIGH — from ANY of the three
   // reviewers (codex + grok + the cold Opus voice). Gate-usable by default (a pre-PR hook
   // can fail on it); --no-fail-on-high opts out → 0.
