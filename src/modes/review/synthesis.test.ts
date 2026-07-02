@@ -191,6 +191,18 @@ describe('reconcileSynthesis — no invented consensus (validate vs real voices)
     expect(demoted).toBe(0);
   });
 
+  it('counts case/whitespace variants of ONE voice as a single voice (no self-corroboration)', () => {
+    // A synthesizer listing the same reviewer twice under different casing must NOT satisfy
+    // the ≥2-DISTINCT-voices bar — "codex" and "Codex" are one voice, not a concurrence.
+    const { synthesis, demoted } = reconcileSynthesis(
+      synth({ agreements: [{ point: 'null deref in foo', voices: ['codex', 'Codex'] }] }),
+      reviews
+    );
+    expect(demoted).toBe(1);
+    expect(synthesis.agreements).toEqual([]);
+    expect(synthesis.disagreements[0].positions).toEqual(['codex: raised']);
+  });
+
   it('leaves a degraded (deterministic) synthesis untouched', () => {
     const d = synth({ agreements: [{ point: 'p', voices: ['x'] }], degraded: true });
     expect(reconcileSynthesis(d, reviews)).toEqual({ synthesis: d, demoted: 0 });

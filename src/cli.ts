@@ -202,6 +202,17 @@ function genRunId(): string {
 // dir to clear (realpath throws → we simply return). So the recursive rm can only ever remove
 // this run's own subdir under the trail base.
 function clearReusedRunTrail(baseDir: string, trailDir: string): void {
+  // Refuse to clear THROUGH a symlinked run dir. writeAtomic won't WRITE into a symlinked
+  // trail dir, so the cleaner must not DELETE through one either: a planted `base/<run-id>`
+  // symlink would otherwise resolve (below) to another run's REAL dir inside the base and the
+  // recursive rm would nuke it — exactly the "only this run's own subdir" guarantee this
+  // fence exists to keep. lstat the pre-realpath path; a symlink here → refuse. (Absent /
+  // fresh run id → lstat throws → nothing to clear.)
+  try {
+    if (fs.lstatSync(trailDir).isSymbolicLink()) return;
+  } catch {
+    return;
+  }
   let realBase: string;
   let realTarget: string;
   try {

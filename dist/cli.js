@@ -2894,10 +2894,13 @@ function reconcileSynthesis(synth, reviews) {
   const demoted = [];
   for (const a of synth.agreements) {
     const pointTokens = significantTokens(a.point);
-    const credited = [...new Set(a.voices)].filter((v) => {
-      const review = findingVoices.get(v.trim().toLowerCase());
-      return review ? voiceCorroboratesPoint(review, pointTokens) : false;
-    });
+    const credited = [
+      ...new Set(
+        a.voices.map((v) => findingVoices.get(v.trim().toLowerCase())).filter(
+          (review) => review !== void 0 && voiceCorroboratesPoint(review, pointTokens)
+        ).map((review) => review.voiceId)
+      )
+    ];
     if (credited.length >= 2) {
       agreements.push({ point: a.point, voices: credited });
     } else {
@@ -3533,6 +3536,11 @@ function genRunId() {
   return `${stamp}-${crypto2.randomBytes(4).toString("hex")}`;
 }
 function clearReusedRunTrail(baseDir, trailDir) {
+  try {
+    if (fs11.lstatSync(trailDir).isSymbolicLink()) return;
+  } catch {
+    return;
+  }
   let realBase;
   let realTarget;
   try {

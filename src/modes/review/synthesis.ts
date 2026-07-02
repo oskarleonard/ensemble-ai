@@ -284,10 +284,20 @@ export function reconcileSynthesis(
   const demoted: ReviewDisagreement[] = [];
   for (const a of synth.agreements) {
     const pointTokens = significantTokens(a.point);
-    const credited = [...new Set(a.voices)].filter((v) => {
-      const review = findingVoices.get(v.trim().toLowerCase());
-      return review ? voiceCorroboratesPoint(review, pointTokens) : false;
-    });
+    // Credit by the CANONICAL voiceId of the corroborating review, deduped — so case /
+    // whitespace variants of ONE voice ("codex" + "Codex") resolve to the same reviewer and
+    // can't be counted as two, which would slip a single-voice claim past the ≥2-DISTINCT bar.
+    const credited = [
+      ...new Set(
+        a.voices
+          .map((v) => findingVoices.get(v.trim().toLowerCase()))
+          .filter(
+            (review): review is VoiceReview =>
+              review !== undefined && voiceCorroboratesPoint(review, pointTokens)
+          )
+          .map((review) => review.voiceId)
+      ),
+    ];
     if (credited.length >= 2) {
       agreements.push({ point: a.point, voices: credited });
     } else {
