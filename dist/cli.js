@@ -33,6 +33,9 @@ function sanitizePathSegment(s) {
 function reviewDir(baseDir, runId) {
   return path.join(baseDir, sanitizePathSegment(runId) || "unknown");
 }
+function escapesRoot(rel) {
+  return rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
+}
 function writeAtomic(root, dir, name, content) {
   fs.mkdirSync(dir, { recursive: true, mode: 448 });
   for (const p of [root, dir]) {
@@ -54,7 +57,7 @@ function writeAtomic(root, dir, name, content) {
   } catch {
   }
   const rel = path.relative(realRoot, realDir);
-  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+  if (escapesRoot(rel)) {
     throw new Error(
       `ensemble-ai: refusing to write outside the trail root: ${realDir} is not under ${realRoot}`
     );
@@ -428,6 +431,11 @@ function loadReviewers(file = REVIEWERS_FILE) {
 function listReviewers(file = REVIEWERS_FILE) {
   const all = loadReviewers(file);
   return REVIEWER_IDS.map((id) => all[id]);
+}
+
+// src/core/sanitize.ts
+function scrubControl(s) {
+  return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 // src/core/findings.ts
@@ -3147,7 +3155,7 @@ async function runClaudeReviewLayer(opts) {
   const synthesis = await synthesizeReviews(
     voiceReviews,
     run,
-    opts.synthConfig ?? opts.claudeConfig,
+    opts.claudeConfig,
     { log, timeoutMs: opts.timeoutMs }
   );
   return { claudeReview, modelLabel, synthesis };
@@ -3156,9 +3164,6 @@ function claudeLayerHasHigh(layer) {
   const cr = layer?.claudeReview;
   return Boolean(cr?.ok && cr.findings.some((f) => f.severity === "high"));
 }
-function scrub(s) {
-  return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
-}
 function renderClaudeLayer(result) {
   const out = [];
   const cr = result.claudeReview;
@@ -3166,13 +3171,13 @@ function renderClaudeLayer(result) {
     out.push("");
     out.push(`  \u2500\u2500 claude [anthropic/${result.modelLabel}] \u2014 ${cr.ok ? "reviewed" : "failed"} (cold peer reviewer) \u2500\u2500`);
     if (!cr.ok) {
-      out.push(`     ${scrub(cr.summary).slice(0, 200)}`);
+      out.push(`     ${scrubControl(cr.summary).slice(0, 200)}`);
     } else if (cr.findings.length === 0) {
       out.push("     no findings");
     } else {
       for (const f of cr.findings) {
         const where = f.evidence.file ? `${f.evidence.file}${f.evidence.line ? `:${f.evidence.line}` : ""}` : "(uncited)";
-        out.push(`     [${f.severity}] ${scrub(where)}  ${scrub(f.title)}`);
+        out.push(`     [${f.severity}] ${scrubControl(where)}  ${scrubControl(f.title)}`);
       }
     }
   }
@@ -3181,29 +3186,29 @@ function renderClaudeLayer(result) {
   out.push(
     `  Claude synthesis${s.by ? ` (by ${s.by})` : ""}${s.degraded ? " \u2014 DEGRADED (deterministic fallback, NOT cross-confirmed)" : ""}`
   );
-  if (s.summary) out.push(`     ${scrub(s.summary).slice(0, 400)}`);
+  if (s.summary) out.push(`     ${scrubControl(s.summary).slice(0, 400)}`);
   if (s.agreements.length > 0) {
     out.push("     \u2713 AGREE (confident)");
     for (const a of s.agreements) {
-      out.push(`        \u2022 ${scrub(a.point).slice(0, 300)}${a.voices.length ? `  [${a.voices.map(scrub).join(", ")}]` : ""}`);
+      out.push(`        \u2022 ${scrubControl(a.point).slice(0, 300)}${a.voices.length ? `  [${a.voices.map(scrubControl).join(", ")}]` : ""}`);
     }
   }
   if (s.disagreements.length > 0) {
     out.push("     \u26A0 DISAGREE (look closer)");
     for (const d of s.disagreements) {
-      out.push(`        \u2022 ${scrub(d.point).slice(0, 300)}`);
-      for (const p of d.positions) out.push(`            \u2212 ${scrub(p).slice(0, 240)}`);
+      out.push(`        \u2022 ${scrubControl(d.point).slice(0, 300)}`);
+      for (const p of d.positions) out.push(`            \u2212 ${scrubControl(p).slice(0, 240)}`);
     }
   }
   if (s.sanityChecks.length > 0) {
     out.push("     sanity-checks");
     for (const c of s.sanityChecks) {
-      out.push(`        [${c.verdict}] ${scrub(c.finding).slice(0, 200)}${c.note ? ` \u2014 ${scrub(c.note).slice(0, 200)}` : ""}`);
+      out.push(`        [${c.verdict}] ${scrubControl(c.finding).slice(0, 200)}${c.note ? ` \u2014 ${scrubControl(c.note).slice(0, 200)}` : ""}`);
     }
   }
   if (s.bottomLine) {
     out.push("     \u2192 bottom line");
-    out.push(`        ${scrub(s.bottomLine).slice(0, 500)}`);
+    out.push(`        ${scrubControl(s.bottomLine).slice(0, 500)}`);
   }
   return out;
 }
@@ -3537,7 +3542,7 @@ function clearReusedRunTrail(baseDir, trailDir) {
     return;
   }
   const rel = path9.relative(realBase, realTarget);
-  if (!rel || rel === ".." || rel.startsWith(`..${path9.sep}`) || path9.isAbsolute(rel)) {
+  if (!rel || escapesRoot(rel)) {
     return;
   }
   fs11.rmSync(realTarget, { force: true, recursive: true });
@@ -3746,21 +3751,18 @@ function oneLineSummary(result) {
   const receipt = result.receipt ? `receipt ${result.receipt.diffDigest.slice(0, 19)}\u2026` : "receipt none";
   return `${tallies} \xB7 ${receipt}`;
 }
-function clean(s) {
-  return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
-}
 function evidenceRef(file, line) {
   if (!file) return "(uncited)";
-  const f = clean(file);
+  const f = scrubControl(file);
   return line ? `${f}:${line}` : f;
 }
 function findingLine(f, profile) {
   const ref = evidenceRef(f.evidence.file, f.evidence.line);
   if (profile === "security") {
     const cls = classifySecurityFinding(f);
-    return `       [${cls}] ${ref}  ${clean(stripSecurityTag(f.title))}`;
+    return `       [${cls}] ${ref}  ${scrubControl(stripSecurityTag(f.title))}`;
   }
-  return `       ${ref}  ${clean(f.title)}`;
+  return `       ${ref}  ${scrubControl(f.title)}`;
 }
 function reviewerBlock(r, profile) {
   const id = r.reviewerId ?? r.reviewer.vendor;
@@ -3770,7 +3772,7 @@ function reviewerBlock(r, profile) {
     `  \u2500\u2500 ${id} [${r.reviewer.vendor} \xB7 ${r.reviewer.model}] \u2014 ${r.terminalState} \u2500\u2500`
   );
   if (r.terminalState !== "reviewed") {
-    out.push(`     ${clean(r.summary).slice(0, 200)}`);
+    out.push(`     ${scrubControl(r.summary).slice(0, 200)}`);
     return out;
   }
   if (r.findings.length === 0) {
@@ -3793,8 +3795,8 @@ function depSurfaceBlock(d) {
   }
   for (const m of d.manifests) {
     const kind = m.isLockfile ? "lockfile" : "manifest";
-    out.push(`     ${kind} ${m.label}: ${clean(m.path)} (+${m.added} line(s))`);
-    for (const s of m.samples) out.push(`         + ${clean(s).slice(0, 100)}`);
+    out.push(`     ${kind} ${m.label}: ${scrubControl(m.path)} (+${m.added} line(s))`);
+    for (const s of m.samples) out.push(`         + ${scrubControl(s).slice(0, 100)}`);
   }
   for (const r of d.riskyImports) {
     out.push(`     risky [${r.cls}] ${r.label} \u2014 ${evidenceRef(r.path, r.line)}`);
@@ -3936,7 +3938,7 @@ async function reviewCommand(args, profile = "code") {
   }
   const conventionReader = noConventions || source.noLocalConventions ? null : buildConventionReader(cwd, source.conventionsCtx);
   const noClaude = Boolean(values["no-claude"]);
-  const requestedReviewers = typeof values.reviewers === "string" ? values.reviewers.split(",").map((s) => s.trim()).filter(Boolean) : void 0;
+  const requestedReviewers = typeof values.reviewers === "string" ? values.reviewers.split(",") : void 0;
   const roster = resolveReviewRoster(requestedReviewers, noClaude);
   if ("error" in roster) {
     console.error(`ensemble-ai ${cmd}: --reviewers "${values.reviewers}" \u2014 ${roster.error}`);
@@ -4011,8 +4013,7 @@ async function reviewCommand(args, profile = "code") {
         includeClaudeReviewer: true,
         log: (m) => console.error(`\xB7 ${m}`),
         reviewPrompt: result.prompt,
-        runId,
-        synthConfig: voiceConfigs.claude
+        runId
       });
       console.log(renderClaudeLayer(claudeLayer).join("\n"));
       try {
@@ -4033,7 +4034,7 @@ async function reviewCommand(args, profile = "code") {
   if (claudeLayerExpected) {
     const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
     if (!claudeReviewed) {
-      const why = claudeLayer?.claudeReview ? clean(claudeLayer.claudeReview.summary).slice(0, 200) : claudeLayerCrashed ? "the Opus review layer crashed" : "the Opus review layer did not run to completion";
+      const why = claudeLayer?.claudeReview ? scrubControl(claudeLayer.claudeReview.summary).slice(0, 200) : claudeLayerCrashed ? "the Opus review layer crashed" : "the Opus review layer did not run to completion";
       console.error(
         `ensemble-ai ${cmd}: reviewer claude failed (${why}) \u2014 review INCOMPLETE: the codex/grok core completed, the Opus reviewer did not, so this is NOT a full 3-reviewer pass`
       );
@@ -4070,7 +4071,7 @@ voice failed) \xB7 3 = usage or an unexpected operational error.`;
 function printBrainstorm(r) {
   const out = [];
   out.push("");
-  out.push(`ensemble-ai brainstorm \u2014 ${clean(r.topic).slice(0, 200)}`);
+  out.push(`ensemble-ai brainstorm \u2014 ${scrubControl(r.topic).slice(0, 200)}`);
   out.push(`  voices: ${r.roster.join(", ")}`);
   out.push("");
   out.push("Round 1 \xB7 independent ideas");
@@ -4078,13 +4079,13 @@ function printBrainstorm(r) {
     out.push("");
     out.push(`  \u2500\u2500 ${g.voiceId} \u2500\u2500`);
     if (!g.ok) {
-      out.push(`     (no ideas \u2014 ${clean(g.error ?? "failed").slice(0, 160)})`);
+      out.push(`     (no ideas \u2014 ${scrubControl(g.error ?? "failed").slice(0, 160)})`);
       continue;
     }
-    if (g.summary) out.push(`     ${clean(g.summary).slice(0, 240)}`);
+    if (g.summary) out.push(`     ${scrubControl(g.summary).slice(0, 240)}`);
     for (const idea of g.ideas) {
-      out.push(`     \u2022 [${idea.id}] ${clean(idea.title)}`);
-      if (idea.body) out.push(`         ${clean(idea.body).slice(0, 300)}`);
+      out.push(`     \u2022 [${idea.id}] ${scrubControl(idea.title)}`);
+      if (idea.body) out.push(`         ${scrubControl(idea.body).slice(0, 300)}`);
     }
   }
   if (r.critique.length > 0) {
@@ -4094,15 +4095,15 @@ function printBrainstorm(r) {
       out.push("");
       out.push(`  \u2500\u2500 ${c.voiceId} \u2500\u2500`);
       if (!c.ok) {
-        out.push(`     (no critique \u2014 ${clean(c.error ?? "failed").slice(0, 160)})`);
+        out.push(`     (no critique \u2014 ${scrubControl(c.error ?? "failed").slice(0, 160)})`);
         continue;
       }
       for (const cr of c.critiques) {
-        out.push(`     [${cr.stance}] ${clean(cr.target)} \u2014 ${clean(cr.assessment).slice(0, 260)}`);
+        out.push(`     [${cr.stance}] ${scrubControl(cr.target)} \u2014 ${scrubControl(cr.assessment).slice(0, 260)}`);
       }
       for (const ex of c.extensions) {
-        out.push(`     + ${clean(ex.title)}`);
-        if (ex.body) out.push(`         ${clean(ex.body).slice(0, 260)}`);
+        out.push(`     + ${scrubControl(ex.title)}`);
+        if (ex.body) out.push(`         ${scrubControl(ex.body).slice(0, 260)}`);
       }
     }
   }
@@ -4111,14 +4112,14 @@ function printBrainstorm(r) {
   out.push(
     `Round 3 \xB7 synthesis${s.by ? ` (by ${s.by})` : ""}${s.degraded ? " \u2014 DEGRADED (deterministic fallback)" : ""}`
   );
-  if (s.summary) out.push(`  ${clean(s.summary).slice(0, 400)}`);
+  if (s.summary) out.push(`  ${scrubControl(s.summary).slice(0, 400)}`);
   for (const ri of s.ranked) {
     out.push("");
     out.push(
-      `  ${ri.rank}. ${clean(ri.title)}${ri.contributors.length ? `  [${ri.contributors.map(clean).join(", ")}]` : ""}`
+      `  ${ri.rank}. ${scrubControl(ri.title)}${ri.contributors.length ? `  [${ri.contributors.map(scrubControl).join(", ")}]` : ""}`
     );
-    if (ri.why) out.push(`     why:  ${clean(ri.why).slice(0, 300)}`);
-    if (ri.risks) out.push(`     risk: ${clean(ri.risks).slice(0, 240)}`);
+    if (ri.why) out.push(`     why:  ${scrubControl(ri.why).slice(0, 300)}`);
+    if (ri.risks) out.push(`     risk: ${scrubControl(ri.risks).slice(0, 240)}`);
   }
   out.push("");
   console.log(out.join("\n"));
@@ -4269,7 +4270,7 @@ voice failed) \xB7 3 = usage or an unexpected operational error.`;
 function printConsult(r) {
   const out = [];
   out.push("");
-  out.push(`ensemble-ai consult \u2014 ${clean(r.question).slice(0, 200)}`);
+  out.push(`ensemble-ai consult \u2014 ${scrubControl(r.question).slice(0, 200)}`);
   out.push(`  voices: ${r.roster.join(", ")}`);
   out.push("");
   out.push("Independent answers");
@@ -4277,12 +4278,12 @@ function printConsult(r) {
     out.push("");
     out.push(`  \u2500\u2500 ${a.voiceId} \u2500\u2500`);
     if (!a.ok) {
-      out.push(`     (no answer \u2014 ${clean(a.error ?? "failed").slice(0, 160)})`);
+      out.push(`     (no answer \u2014 ${scrubControl(a.error ?? "failed").slice(0, 160)})`);
       continue;
     }
-    if (a.summary) out.push(`     ${clean(a.summary).slice(0, 240)}`);
-    if (a.answer) out.push(`     ${clean(a.answer).slice(0, 400)}`);
-    for (const kp of a.keyPoints) out.push(`       \xB7 ${clean(kp).slice(0, 200)}`);
+    if (a.summary) out.push(`     ${scrubControl(a.summary).slice(0, 240)}`);
+    if (a.answer) out.push(`     ${scrubControl(a.answer).slice(0, 400)}`);
+    for (const kp of a.keyPoints) out.push(`       \xB7 ${scrubControl(kp).slice(0, 200)}`);
   }
   if (r.critique.length > 0) {
     out.push("");
@@ -4291,11 +4292,11 @@ function printConsult(r) {
       out.push("");
       out.push(`  \u2500\u2500 ${c.voiceId} \u2500\u2500`);
       if (!c.ok) {
-        out.push(`     (no notes \u2014 ${clean(c.error ?? "failed").slice(0, 160)})`);
+        out.push(`     (no notes \u2014 ${scrubControl(c.error ?? "failed").slice(0, 160)})`);
         continue;
       }
       for (const n of c.notes) {
-        out.push(`     [${n.stance}] ${clean(n.target)} \u2014 ${clean(n.assessment).slice(0, 260)}`);
+        out.push(`     [${n.stance}] ${scrubControl(n.target)} \u2014 ${scrubControl(n.assessment).slice(0, 260)}`);
       }
     }
   }
@@ -4304,26 +4305,26 @@ function printConsult(r) {
   out.push(
     `Synthesis${s.by ? ` (by ${s.by})` : ""}${s.degraded ? " \u2014 DEGRADED (deterministic fallback, NOT compared for agreement)" : ""}`
   );
-  if (s.summary) out.push(`  ${clean(s.summary).slice(0, 400)}`);
+  if (s.summary) out.push(`  ${scrubControl(s.summary).slice(0, 400)}`);
   if (s.agreements.length > 0) {
     out.push("");
     out.push("  \u2713 AGREE (confident)");
     for (const a of s.agreements) {
-      out.push(`     \u2022 ${clean(a.point).slice(0, 300)}${a.voices.length ? `  [${a.voices.map(clean).join(", ")}]` : ""}`);
+      out.push(`     \u2022 ${scrubControl(a.point).slice(0, 300)}${a.voices.length ? `  [${a.voices.map(scrubControl).join(", ")}]` : ""}`);
     }
   }
   if (s.divergences.length > 0) {
     out.push("");
     out.push("  \u26A0 DIVERGE (look closer)");
     for (const d of s.divergences) {
-      out.push(`     \u2022 ${clean(d.point).slice(0, 300)}`);
-      for (const p of d.positions) out.push(`         \u2212 ${clean(p).slice(0, 240)}`);
+      out.push(`     \u2022 ${scrubControl(d.point).slice(0, 300)}`);
+      for (const p of d.positions) out.push(`         \u2212 ${scrubControl(p).slice(0, 240)}`);
     }
   }
   if (s.recommendation) {
     out.push("");
     out.push("  \u2192 Recommendation");
-    out.push(`     ${clean(s.recommendation).slice(0, 500)}`);
+    out.push(`     ${scrubControl(s.recommendation).slice(0, 500)}`);
   }
   out.push("");
   console.log(out.join("\n"));

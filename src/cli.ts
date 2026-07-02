@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { reviewDir, writeTrailFile } from './core/artifacts';
+import { escapesRoot, reviewDir, writeTrailFile } from './core/artifacts';
 import {
   type ConventionManifest,
   type ConventionReader,
@@ -15,6 +15,7 @@ import {
 } from './core/conventions';
 import { isEntrypoint } from './core/entrypoint';
 import { listReviewers, REVIEWERS_FILE } from './core/reviewers';
+import { scrubControl as clean } from './core/sanitize';
 import {
   isReviewerId,
   parseReviewerIds,
@@ -210,7 +211,7 @@ function clearReusedRunTrail(baseDir: string, trailDir: string): void {
     return; // base or per-run dir doesn't exist yet → nothing to clear (fresh run id)
   }
   const rel = path.relative(realBase, realTarget);
-  if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+  if (!rel || escapesRoot(rel)) {
     return; // not strictly inside the base (would be the base itself or an escape) → refuse
   }
   fs.rmSync(realTarget, { force: true, recursive: true });
@@ -544,15 +545,6 @@ function oneLineSummary(result: ReviewModeResult): string {
   return `${tallies} · ${receipt}`;
 }
 
-// Strip C0/DEL control characters from reviewer-controlled text before it hits the
-// terminal — a crafted diff could induce a reviewer to emit ANSI escapes in a
-// finding title/path; printed raw they could rewrite the terminal. Whitespace is
-// collapsed so a finding stays one tidy line.
-function clean(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
 function evidenceRef(file?: string, line?: number): string {
   if (!file) return '(uncited)';
   const f = clean(file);
@@ -808,9 +800,11 @@ async function reviewCommand(
   // --reviewers" → the full default core; a typo can never silently narrow the policy
   // (which would also mint a receipt under a weaker policy). Fail closed.
   const noClaude = Boolean(values['no-claude']);
+  // resolveReviewRoster owns the single trim/filter/dedup of these tokens (and the
+  // fail-closed unknown-id check), so pass the raw split — don't normalize twice.
   const requestedReviewers =
     typeof values.reviewers === 'string'
-      ? values.reviewers.split(',').map((s) => s.trim()).filter(Boolean)
+      ? values.reviewers.split(',')
       : undefined;
   const roster = resolveReviewRoster(requestedReviewers, noClaude);
   if ('error' in roster) {
@@ -938,7 +932,6 @@ async function reviewCommand(
         log: (m) => console.error(`· ${m}`),
         reviewPrompt: result.prompt,
         runId,
-        synthConfig: voiceConfigs.claude,
       });
       console.log(renderClaudeLayer(claudeLayer).join('\n'));
       try {
@@ -1464,8 +1457,9 @@ async function consultCommand(args: string[]): Promise<number> {
 
 // Validate an EXPLICIT `--reviewers` token list (split/trim), failing closed if any
 // token is unknown or the list is empty — a typo must never silently narrow the
-// policy. Shared by review mode and the plumbing gate/preview so the fail-closed
-// rule + the error wording have ONE source of truth. Returns the ids or an error code.
+// policy. The fail-closed source of truth for the PLUMBING gate/preview
+// (parseRequiredReviewers). Review mode resolves its own roster via resolveReviewRoster
+// (which additionally knows the default-on `claude` id). Returns the ids or an error code.
 function parseReviewerList(
   raw: string,
   cmd: string

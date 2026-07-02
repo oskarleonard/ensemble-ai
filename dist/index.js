@@ -649,6 +649,9 @@ function sanitizePathSegment(s) {
 function reviewDir(baseDir, runId) {
   return path3.join(baseDir, sanitizePathSegment(runId) || "unknown");
 }
+function escapesRoot(rel) {
+  return rel === ".." || rel.startsWith(`..${path3.sep}`) || path3.isAbsolute(rel);
+}
 function writeAtomic(root, dir, name, content) {
   fs3.mkdirSync(dir, { recursive: true, mode: 448 });
   for (const p of [root, dir]) {
@@ -670,7 +673,7 @@ function writeAtomic(root, dir, name, content) {
   } catch {
   }
   const rel = path3.relative(realRoot, realDir);
-  if (rel === ".." || rel.startsWith(`..${path3.sep}`) || path3.isAbsolute(rel)) {
+  if (escapesRoot(rel)) {
     throw new Error(
       `ensemble-ai: refusing to write outside the trail root: ${realDir} is not under ${realRoot}`
     );
@@ -2724,6 +2727,7 @@ export {
   defaultReceiptStore,
   diffDigest,
   ensureSandboxProfile,
+  escapesRoot,
   extractGrokText,
   extractJsonBlock,
   extractRefs,

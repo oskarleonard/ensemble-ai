@@ -60,6 +60,16 @@ export function reviewDir(baseDir: string, runId: string): string {
 // itself is the caller's own trusted path, outside this function's frame.) The tmp is then
 // opened O_NOFOLLOW | O_EXCL so a planted symlink at the FILE component is refused too, and
 // the final rename replaces `target` atomically rather than writing through a symlink.
+// TRUE if a `path.relative(base, target)` result points OUTSIDE base — the shared
+// containment predicate for the trail's write/delete trust boundary (writeAtomic here + the
+// CLI's clearReusedRunTrail). `..` or `../…` = an ancestor/sibling escape; an absolute result
+// = a different root (e.g. a symlink hop off the volume). ONE definition so the path-escape
+// rule can't drift between the writer and the cleaner. An EMPTY rel (target === base) is NOT
+// an escape here — a caller that must also reject the base itself adds a `!rel` guard.
+export function escapesRoot(rel: string): boolean {
+  return rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
+}
+
 function writeAtomic(root: string, dir: string, name: string, content: string): void {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   // Recursive mkdir treats a pre-planted symlink-to-dir as "already exists" and does NOT
@@ -87,7 +97,7 @@ function writeAtomic(root: string, dir: string, name: string, content: string): 
     /* brand-new dir race — fall back to the lexical paths */
   }
   const rel = path.relative(realRoot, realDir);
-  if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+  if (escapesRoot(rel)) {
     throw new Error(
       `ensemble-ai: refusing to write outside the trail root: ${realDir} is not under ${realRoot}`
     );

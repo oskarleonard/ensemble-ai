@@ -12,6 +12,7 @@
 
 import { readReviewsForRun, writeTrailFile } from '../../core/artifacts';
 import { parseFindings } from '../../core/findings';
+import { scrubControl as scrub } from '../../core/sanitize';
 import type { ReviewFinding, StoredReview } from '../../core/types';
 import { REVIEWER_IDS, type ReviewerId } from '../../core/types';
 import type { RunReviewOpts } from '../../reviewers/codex';
@@ -259,7 +260,6 @@ export interface ClaudeLayerOptions {
   runId: string;
   // Injectable claude runner (default: the real headless `claude -p` voice).
   run?: ClaudeRunner;
-  synthConfig?: VoiceConfig;
   timeoutMs?: number;
 }
 
@@ -346,7 +346,7 @@ export async function runClaudeReviewLayer(
   const synthesis = await synthesizeReviews(
     voiceReviews,
     run,
-    opts.synthConfig ?? opts.claudeConfig,
+    opts.claudeConfig,
     { log, timeoutMs: opts.timeoutMs }
   );
   return { claudeReview, modelLabel, synthesis };
@@ -363,13 +363,6 @@ export function claudeLayerHasHigh(layer: ClaudeLayerResult | null): boolean {
 }
 
 // ── Rendering (for the CLI summary) ───────────────────────────────────────────────────
-
-// Strip control chars + collapse whitespace — voice output is untrusted (a crafted diff
-// could induce ANSI escapes). Local copy so the module is self-contained.
-function scrub(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim();
-}
 
 // The claude-layer block for stdout: the cold Opus review's findings, then the synthesis
 // (AGREE / DISAGREE / sanity-checks / bottom line). Grouped + scannable.
