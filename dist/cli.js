@@ -3,9 +3,9 @@
 // src/cli.ts
 import { execFileSync as execFileSync3 } from "child_process";
 import crypto2 from "crypto";
-import fs10 from "fs";
+import fs11 from "fs";
 import os7 from "os";
-import path8 from "path";
+import path9 from "path";
 import { parseArgs } from "util";
 
 // src/core/artifacts.ts
@@ -27,18 +27,74 @@ var CONFIDENCES = ["high", "medium", "low"];
 
 // src/core/artifacts.ts
 function sanitizePathSegment(s) {
-  return s.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const cleaned = s.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return /^\.+$/.test(cleaned) ? `_${cleaned}` : cleaned;
 }
 function reviewDir(baseDir, runId) {
   return path.join(baseDir, sanitizePathSegment(runId) || "unknown");
 }
-function writeAtomic(dir, name, content) {
+function escapesRoot(rel) {
+  return rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
+}
+function writeAtomic(root, dir, name, content) {
   fs.mkdirSync(dir, { recursive: true, mode: 448 });
-  const target = path.join(dir, name);
+  for (const p of [root, dir]) {
+    let st;
+    try {
+      st = fs.lstatSync(p);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`ensemble-ai: refusing to write into a symlinked trail dir: ${p}`);
+    }
+  }
+  let realDir = dir;
+  let realRoot = root;
+  try {
+    realDir = fs.realpathSync(dir);
+    realRoot = fs.realpathSync(root);
+  } catch {
+  }
+  const rel = path.relative(realRoot, realDir);
+  if (escapesRoot(rel)) {
+    throw new Error(
+      `ensemble-ai: refusing to write outside the trail root: ${realDir} is not under ${realRoot}`
+    );
+  }
+  const target = path.join(realDir, name);
   const tmp = `${target}.tmp`;
-  fs.writeFileSync(tmp, content, { mode: 384 });
-  fs.chmodSync(tmp, 384);
-  fs.renameSync(tmp, target);
+  try {
+    fs.unlinkSync(tmp);
+  } catch {
+  }
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW;
+  let fd;
+  try {
+    fd = fs.openSync(tmp, flags, 384);
+  } catch (e) {
+    throw new Error(`ensemble-ai: cannot open trail temp file ${tmp}: ${e.message}`);
+  }
+  try {
+    fs.writeFileSync(fd, content);
+    fs.fchmodSync(fd, 384);
+  } finally {
+    fs.closeSync(fd);
+  }
+  try {
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+    }
+    throw new Error(`ensemble-ai: cannot finalize trail file ${target}: ${e.message}`);
+  }
+}
+function writeTrailFile(baseDir, runId, name, content) {
+  const dir = reviewDir(baseDir, runId);
+  writeAtomic(baseDir, dir, name, content);
+  return path.join(dir, name);
 }
 function readJson(file) {
   try {
@@ -61,10 +117,11 @@ function reviewJson(reviewerId) {
 function persistReview(baseDir, input) {
   const dir = reviewDir(baseDir, input.runId);
   const id = input.reviewer.id;
-  writeAtomic(dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
-  writeAtomic(dir, `prompt.${id}.md`, input.prompt);
-  if (input.raw !== null) writeAtomic(dir, `${id}-review.raw.md`, input.raw);
+  writeAtomic(baseDir, dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
+  writeAtomic(baseDir, dir, `prompt.${id}.md`, input.prompt);
+  if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review.raw.md`, input.raw);
   writeAtomic(
+    baseDir,
     dir,
     `findings.${id}.json`,
     JSON.stringify(input.findings, null, 2)
@@ -85,7 +142,7 @@ function persistReview(baseDir, input) {
     summary: input.summary,
     terminalState: input.terminalState
   };
-  writeAtomic(dir, reviewJson(id), JSON.stringify(stored, null, 2));
+  writeAtomic(baseDir, dir, reviewJson(id), JSON.stringify(stored, null, 2));
   return stored;
 }
 function readReview(baseDir, runId, reviewerId = "codex") {
@@ -98,11 +155,20 @@ function readReview(baseDir, runId, reviewerId = "codex") {
   }
   return null;
 }
+function readReviewsForRun(baseDir, runId) {
+  const out = [];
+  for (const id of REVIEWER_IDS) {
+    const r = readReview(baseDir, runId, id);
+    if (r) out.push(r);
+  }
+  return out;
+}
 
 // src/core/conventions.ts
 import fs2 from "fs";
 import path2 from "path";
 var DEFAULT_CAP_BYTES = 8e4;
+var CAP_PROBE_MARGIN = 8;
 var DEFAULT_MAX_FILES = 60;
 var ENTRY_FILES = ["CLAUDE.md", "AGENTS.md"];
 var COMMON_DOCS = ["CONTRIBUTING.md", "ARCHITECTURE.md", "TECH_DESIGN.md"];
@@ -192,8 +258,10 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   let visited = 0;
   while (queue.length > 0) {
     const rel = queue.shift();
-    const content = await reader.read(rel, capBytes);
-    if (content === null) continue;
+    const probe = await reader.read(rel, capBytes + CAP_PROBE_MARGIN);
+    if (probe === null) continue;
+    const readTruncated = Buffer.byteLength(probe, "utf8") > capBytes;
+    const content = readTruncated ? sliceBytes(probe, capBytes) : probe;
     const bytes = Buffer.byteLength(content, "utf8");
     if (visited >= maxFiles) {
       files.push({ path: rel, bytes, included: false, truncated: false, reason: "max-files" });
@@ -212,7 +280,9 @@ async function gatherConventions(reader, changedPaths, config = {}) {
     if (headerBytes + bytes <= remaining) {
       chunks.push(header + content);
       used += headerBytes + bytes;
-      files.push({ path: rel, bytes, included: true, truncated: false });
+      files.push(
+        readTruncated ? { path: rel, bytes, included: true, truncated: true, reason: "over-cap" } : { path: rel, bytes, included: true, truncated: false }
+      );
     } else {
       const noticeFor = (n) => `
 
@@ -361,6 +431,11 @@ function loadReviewers(file = REVIEWERS_FILE) {
 function listReviewers(file = REVIEWERS_FILE) {
   const all = loadReviewers(file);
   return REVIEWER_IDS.map((id) => all[id]);
+}
+
+// src/core/sanitize.ts
+function scrubControl(s) {
+  return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 // src/core/findings.ts
@@ -1930,9 +2005,9 @@ var GENERATED_PATTERNS = [
   /\.(js|css)\.map$/,
   /\.snap$/
 ];
-function classifyFileKind(path9, isBinary) {
+function classifyFileKind(path10, isBinary) {
   if (isBinary) return "binary";
-  return GENERATED_PATTERNS.some((re) => re.test(path9)) ? "generated" : "source";
+  return GENERATED_PATTERNS.some((re) => re.test(path10)) ? "generated" : "source";
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -1950,7 +2025,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path9 = pathOfSection(section2);
+    const path10 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -1961,8 +2036,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path9, isBinary),
-      path: path9,
+      kind: classifyFileKind(path10, isBinary),
+      path: path10,
       raw: section2,
       removed
     };
@@ -2277,6 +2352,12 @@ function validateReceiptShape(value) {
   if (!isStrArr(o.completed)) errs.push("completed (string[])");
   if (!isStrArr(o.reviewerPolicy)) errs.push("reviewerPolicy (string[])");
   if (!isStrArr(o.vendors)) errs.push("vendors (string[])");
+  if (o.peerReviewers !== void 0) {
+    const okArr = Array.isArray(o.peerReviewers) && o.peerReviewers.every(
+      (p) => p !== null && typeof p === "object" && !Array.isArray(p) && isStr(p.id) && isStr(p.state) && isStr(p.vendor)
+    );
+    if (!okArr) errs.push("peerReviewers (PeerReviewerRecord[])");
+  }
   const c = o.coverage;
   if (c === null || typeof c !== "object" || Array.isArray(c)) {
     errs.push("coverage (object)");
@@ -2589,12 +2670,555 @@ async function runReviewMode(opts) {
   });
   if (built.ok && built.receipt) {
     const store = opts.receiptStore ?? defaultReceiptStore();
-    const file = writeReceipt(store, built.receipt);
-    log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, conventionManifest, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    log("Receipt qualified by the core \u2014 deferred to the full-roster gate.");
+    return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptError: built.error, reviews, secretScan };
+}
+
+// src/modes/review/claude.ts
+var CLAUDE_EFFORTS2 = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
+var CLAUDE_REVIEW_DENIED_TOOLS = [
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit"
+];
+function buildClaudeReviewArgs(prompt, config) {
+  const args = [
+    "-p",
+    prompt,
+    "--output-format",
+    "text",
+    "--permission-mode",
+    "plan",
+    "--disallowedTools",
+    ...CLAUDE_REVIEW_DENIED_TOOLS
+  ];
+  if (config?.model && config.model !== "default")
+    args.push("--model", config.model);
+  if (config && CLAUDE_EFFORTS2.has(config.effort))
+    args.push("--effort", config.effort);
+  return args;
+}
+function runClaudeReviewVoice(prompt, config, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
+  return runReviewerExec({
+    args: buildClaudeReviewArgs(prompt, config),
+    bin: resolveClaudeBin(),
+    capture: "stdout",
+    onSpawn: opts.onSpawn,
+    stderrLimit: 2e3,
+    timeoutMs
+  }).then(({ raw, stderrTail, timedOut }) => ({
+    ok: raw !== null && !timedOut,
+    raw,
+    stderrTail,
+    timedOut
+  }));
+}
+
+// src/modes/review/synthesis.ts
+var SANITY_VERDICTS = ["likely-real", "look-closer", "likely-false"];
+function str5(v) {
+  return typeof v === "string" ? v.trim() : "";
+}
+function strList2(v) {
+  if (!Array.isArray(v)) return [];
+  return [...new Set(v.map(str5).filter(Boolean))];
+}
+var FIELD_BUDGET = 2e3;
+function cap3(s) {
+  return s.length > FIELD_BUDGET ? `${s.slice(0, FIELD_BUDGET)}\u2026[truncated]` : s;
+}
+function voiceReviewsBlock(reviews) {
+  return reviews.filter((r) => r.ok).map((r) => {
+    const head = `[${r.voiceId}] ${cap3(r.summary) || "(no summary)"}`;
+    if (r.findings.length === 0) return `${head}
+  (no findings \u2014 looks correct)`;
+    const lines = r.findings.map((f) => {
+      const where = f.evidence.file ? `${f.evidence.file}${f.evidence.line ? `:${f.evidence.line}` : ""}` : "(uncited)";
+      return `  - [${f.severity}/${f.confidence}] ${where} \u2014 ${cap3(f.title)}: ${cap3(f.body)}`;
+    });
+    return `${head}
+${lines.join("\n")}`;
+  }).join("\n\n");
+}
+function renderReviewSynthesisPrompt(reviews) {
+  return `You are the SYNTHESIZER for a multi-model CODE REVIEW. Several AI reviewers
+each reviewed the SAME diff INDEPENDENTLY (they did not see each other's findings).
+Review-only: do NOT propose editing the code here \u2014 your job is to make sense of the
+findings. Separate the signal:
+- DEDUPE: collapse the SAME underlying issue reported by multiple reviewers into one.
+- AGREEMENTS: findings \u22652 reviewers independently raised \u2014 the confident core.
+- DISAGREEMENTS: a finding only ONE reviewer raised, or where reviewers conflict \u2014 flag
+  these "look closer" and record who took which position.
+- SANITY-CHECK each distinct finding: is it likely-real, look-closer, or likely-false
+  (a probable hallucination / false positive)? Reviewers do hallucinate \u2014 catch it.
+- BOTTOM LINE: the headline \u2014 is this diff safe to merge, and what must change first.
+
+## The reviewers' independent findings
+${voiceReviewsBlock(reviews)}
+
+## Output format \u2014 STRICT
+Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
+{
+  "summary": "<2-3 sentence overall read of the change>",
+  "agreements": [
+    { "point": "<a finding \u22652 reviewers concur on>", "voices": ["codex", "grok"] }
+  ],
+  "disagreements": [
+    { "point": "<a finding one reviewer raised or they split on>", "positions": ["codex: real", "claude: false positive"] }
+  ],
+  "sanityChecks": [
+    { "finding": "<the distinct finding>", "verdict": "likely-real" | "look-closer" | "likely-false", "note": "<why>" }
+  ],
+  "bottomLine": "<merge-safe? what must change first, and how confident given agree vs a judgment call>"
+}
+Only list a REAL agreement (genuine concurrence) and a REAL disagreement (a substantive
+split). Empty arrays are fine. Do not invent findings.`;
+}
+function parseAgreements2(v) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const ra of v) {
+    if (!ra || typeof ra !== "object") continue;
+    const a = ra;
+    const point = str5(a.point);
+    if (!point) continue;
+    out.push({ point, voices: strList2(a.voices) });
+  }
+  return out;
+}
+function parseDisagreements(v) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const rd of v) {
+    if (!rd || typeof rd !== "object") continue;
+    const d = rd;
+    const point = str5(d.point);
+    if (!point) continue;
+    out.push({ point, positions: strList2(d.positions) });
+  }
+  return out;
+}
+function parseSanityChecks(v) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const rs of v) {
+    if (!rs || typeof rs !== "object") continue;
+    const s = rs;
+    const finding = str5(s.finding);
+    if (!finding) continue;
+    out.push({
+      finding,
+      note: str5(s.note),
+      verdict: oneOf(SANITY_VERDICTS, s.verdict, "look-closer")
+    });
+  }
+  return out;
+}
+function parseReviewSynthesis(raw) {
+  const obj = extractJsonBlock(raw);
+  if (!obj || typeof obj !== "object") {
+    return {
+      agreements: [],
+      bottomLine: "",
+      disagreements: [],
+      parseError: "no parseable JSON block in the synthesis output",
+      sanityChecks: [],
+      summary: ""
+    };
+  }
+  const o = obj;
+  const summary = str5(o.summary);
+  const bottomLine = str5(o.bottomLine);
+  const agreements = parseAgreements2(o.agreements);
+  const disagreements = parseDisagreements(o.disagreements);
+  const sanityChecks = parseSanityChecks(o.sanityChecks);
+  if (!bottomLine && !summary) {
+    return {
+      agreements,
+      bottomLine: "",
+      disagreements,
+      parseError: 'synthesis output has no "bottomLine" or "summary"',
+      sanityChecks,
+      summary: ""
+    };
+  }
+  return { agreements, bottomLine, disagreements, sanityChecks, summary };
+}
+var STOPWORDS = /* @__PURE__ */ new Set([
+  "the",
+  "and",
+  "for",
+  "that",
+  "this",
+  "with",
+  "are",
+  "was",
+  "not",
+  "but",
+  "its",
+  "into",
+  "from",
+  "when",
+  "then",
+  "than",
+  "has",
+  "have",
+  "you",
+  "your",
+  "can",
+  "will"
+]);
+function significantTokens(s) {
+  const out = /* @__PURE__ */ new Set();
+  for (const t of s.toLowerCase().match(/[a-z0-9_]+/g) ?? []) {
+    if (t.length >= 3 && !STOPWORDS.has(t)) out.add(t);
+  }
+  return out;
+}
+function voiceCorroboratesPoint(review, pointTokens) {
+  if (pointTokens.size === 0) return false;
+  for (const f of review.findings) {
+    const hay = significantTokens(
+      `${f.title} ${f.body} ${f.evidence.file ?? ""} ${f.evidence.detail ?? ""}`
+    );
+    for (const t of pointTokens) if (hay.has(t)) return true;
+  }
+  return false;
+}
+function reconcileSynthesis(synth, reviews) {
+  if (synth.degraded) return { synthesis: synth, demoted: 0 };
+  const findingVoices = new Map(
+    reviews.filter((r) => r.ok && r.findings.length > 0).map((r) => [r.voiceId.trim().toLowerCase(), r])
+  );
+  const agreements = [];
+  const demoted = [];
+  for (const a of synth.agreements) {
+    const pointTokens = significantTokens(a.point);
+    const credited = [
+      ...new Set(
+        a.voices.map((v) => findingVoices.get(v.trim().toLowerCase())).filter(
+          (review) => review !== void 0 && voiceCorroboratesPoint(review, pointTokens)
+        ).map((review) => review.voiceId)
+      )
+    ];
+    if (credited.length >= 2) {
+      agreements.push({ point: a.point, voices: credited });
+    } else {
+      demoted.push({
+        point: a.point,
+        positions: credited.length > 0 ? credited.map((v) => `${v}: raised`) : ["unverified \u2014 no reviewing voice corroborates this as a shared finding"]
+      });
+    }
+  }
+  return {
+    synthesis: {
+      ...synth,
+      agreements,
+      disagreements: demoted.length ? [...synth.disagreements, ...demoted] : synth.disagreements
+    },
+    demoted: demoted.length
+  };
+}
+function fallbackReviewSynthesis(reviews) {
+  const ok = reviews.filter((r) => r.ok);
+  const disagreements = [];
+  for (const r of ok) {
+    for (const f of r.findings) {
+      disagreements.push({
+        point: f.title,
+        positions: [`${r.voiceId}: [${f.severity}] ${f.evidence.file ?? "(uncited)"}`]
+      });
+    }
+  }
+  return {
+    agreements: [],
+    bottomLine: ok.length > 0 ? "Synthesizer unavailable \u2014 each reviewer's findings shown as-is, NOT deduped or cross-confirmed. Read each voice directly." : "No reviewer produced a usable review.",
+    by: null,
+    degraded: true,
+    disagreements,
+    ok: false,
+    raw: null,
+    sanityChecks: [],
+    summary: ok.length > 0 ? `${ok.length} reviewer(s) produced findings; synthesizer unavailable, so they are NOT compared for agreement.` : "No reviews to synthesize."
+  };
+}
+
+// src/modes/review/trail-io.ts
+import fs10 from "fs";
+import path8 from "path";
+function reviewJsonFromTrail(baseDir, runId, name) {
+  let obj;
+  try {
+    obj = JSON.parse(fs10.readFileSync(path8.join(reviewDir(baseDir, runId), name), "utf8"));
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== "object") return null;
+  const o = obj;
+  const voiceId = typeof o.voiceId === "string" && o.voiceId.trim() ? o.voiceId.trim() : null;
+  if (!voiceId) return null;
+  return {
+    findings: Array.isArray(o.findings) ? o.findings.filter(isFinding) : [],
+    ok: o.ok === true,
+    summary: typeof o.summary === "string" ? o.summary : "",
+    voiceId
+  };
+}
+function isFinding(v) {
+  if (!v || typeof v !== "object") return false;
+  const f = v;
+  return typeof f.id === "string" && f.id.trim() !== "" && typeof f.title === "string" && typeof f.body === "string" && typeof f.severity === "string" && SEVERITIES.includes(f.severity) && typeof f.confidence === "string" && CONFIDENCES.includes(f.confidence) && typeof f.evidence === "object" && f.evidence !== null;
+}
+
+// src/modes/review/self-contained.ts
+function resolveReviewRoster(requested, noClaude) {
+  const known = [...REVIEWER_IDS, "claude"];
+  if (requested === void 0) {
+    return { claude: !noClaude, core: [...REVIEWER_IDS] };
+  }
+  const ids = [...new Set(requested.map((s) => s.trim()).filter(Boolean))];
+  const unknown = ids.filter((id) => !known.includes(id));
+  if (unknown.length > 0) {
+    return {
+      error: `unknown reviewer id(s): ${unknown.join(", ")} (known: ${known.join(", ")})`
+    };
+  }
+  const core = ids.filter(
+    (id) => REVIEWER_IDS.includes(id)
+  );
+  if (core.length === 0) {
+    return {
+      error: "select at least one cross-vendor reviewer (codex/grok) \u2014 claude is additive, not standalone"
+    };
+  }
+  return { claude: ids.includes("claude") && !noClaude, core };
+}
+function storedToVoiceReview(r) {
+  return {
+    findings: r.findings,
+    ok: r.terminalState === "reviewed",
+    summary: r.summary,
+    voiceId: r.reviewerId ?? r.reviewer.vendor
+  };
+}
+function renderReviewMarkdown(v) {
+  const lines = [`# review \u2014 ${v.voiceId}`, ""];
+  lines.push(v.ok ? "_status: reviewed_" : "_status: failed_", "");
+  lines.push("## summary", "", v.summary || "(none)", "");
+  lines.push("## findings", "");
+  if (v.findings.length === 0) {
+    lines.push("(no findings)");
+  } else {
+    for (const f of v.findings) {
+      const where = f.evidence.file ? `${f.evidence.file}${f.evidence.line ? `:${f.evidence.line}` : ""}` : "(uncited)";
+      lines.push(`### [${f.severity}/${f.confidence}] ${f.title}`);
+      lines.push(`- where: ${where}`);
+      lines.push(`- ${f.body}`, "");
+    }
+  }
+  return `${lines.join("\n")}
+`;
+}
+function persistClaudeReview(baseDir, runId, review, raw) {
+  writeTrailFile(baseDir, runId, "findings.claude.json", JSON.stringify(review.findings, null, 2));
+  if (raw !== null) writeTrailFile(baseDir, runId, "claude-review.raw.md", raw);
+  writeTrailFile(baseDir, runId, "review.claude.json", JSON.stringify(review, null, 2));
+}
+function loadVoiceReviewsFromTrail(baseDir, runId) {
+  const out = readReviewsForRun(baseDir, runId).map(storedToVoiceReview);
+  const claude = reviewJsonFromTrail(baseDir, runId, "review.claude.json");
+  if (claude) out.push(claude);
+  return out;
+}
+async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log) {
+  let res;
+  try {
+    res = await run(reviewPrompt, config, { timeoutMs });
+  } catch (e) {
+    log(`  \xB7 claude: failed to run \u2014 ${e.message}`);
+    return {
+      raw: null,
+      review: { findings: [], ok: false, summary: `claude did not run: ${e.message}`, voiceId: "claude" }
+    };
+  }
+  if (!res.raw || res.timedOut) {
+    const why = res.timedOut ? "timed out" : "produced no output";
+    log(`  \xB7 claude: ${why}`);
+    return { raw: res.raw ?? null, review: { findings: [], ok: false, summary: `claude ${why}`, voiceId: "claude" } };
+  }
+  const parsed = parseFindings(res.raw);
+  if (parsed.parseError) {
+    log(`  \xB7 claude: ${parsed.parseError}`);
+    const detail = parsed.summary ? `; model said: ${parsed.summary}` : "";
+    return {
+      raw: res.raw,
+      review: { findings: [], ok: false, summary: `output not parseable (${parsed.parseError})${detail}`, voiceId: "claude" }
+    };
+  }
+  log(`  \xB7 claude: reviewed \u2014 ${parsed.findings.length} finding(s)`);
+  return { raw: res.raw, review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: "claude" } };
+}
+async function synthesizeReviews(reviews, run, config, opts = {}) {
+  const log = opts.log ?? (() => {
+  });
+  const healthy = reviews.filter((r) => r.ok);
+  if (healthy.length === 0) return fallbackReviewSynthesis(reviews);
+  const prompt = renderReviewSynthesisPrompt(reviews);
+  log("Synthesizing with claude \u2014 dedupe \xB7 agree/disagree \xB7 sanity-check\u2026");
+  let res;
+  try {
+    res = await run(prompt, config, { timeoutMs: opts.timeoutMs });
+  } catch (e) {
+    log(`  \xB7 synthesis failed (${e.message}) \u2014 deterministic fallback`);
+    return { ...fallbackReviewSynthesis(reviews), error: e.message };
+  }
+  if (!res.raw || res.timedOut) {
+    log("  \xB7 synthesis produced no usable output \u2014 deterministic fallback");
+    return {
+      ...fallbackReviewSynthesis(reviews),
+      error: res.timedOut ? "synthesis timed out" : "synthesis produced no output"
+    };
+  }
+  const parsed = parseReviewSynthesis(res.raw);
+  if (parsed.parseError) {
+    log(`  \xB7 synthesis not parseable (${parsed.parseError}) \u2014 deterministic fallback`);
+    return { ...fallbackReviewSynthesis(reviews), error: parsed.parseError, raw: res.raw };
+  }
+  const { synthesis, demoted } = reconcileSynthesis(
+    {
+      agreements: parsed.agreements,
+      bottomLine: parsed.bottomLine,
+      by: "claude",
+      degraded: false,
+      disagreements: parsed.disagreements,
+      ok: true,
+      raw: res.raw,
+      sanityChecks: parsed.sanityChecks,
+      summary: parsed.summary
+    },
+    reviews
+  );
+  if (demoted > 0) {
+    log(
+      `  \xB7 synthesis: ${demoted} unverifiable "agreement(s)" demoted to look-closer (not corroborated by \u22652 real voices)`
+    );
+  }
+  log(
+    `  \xB7 synthesis: ${synthesis.agreements.length} agreement(s), ${synthesis.disagreements.length} disagreement(s), ${synthesis.sanityChecks.length} sanity-check(s)`
+  );
+  return synthesis;
+}
+function claudeModelLabel(config) {
+  return config.model && config.model !== "default" ? config.model : "opus";
+}
+async function runClaudeReviewLayer(opts) {
+  const log = opts.log ?? (() => {
+  });
+  const run = opts.run ?? runClaudeReviewVoice;
+  const modelLabel = claudeModelLabel(opts.claudeConfig);
+  let claudeReview = null;
+  if (opts.includeClaudeReviewer) {
+    log(`  \xB7 claude (anthropic/${modelLabel}) reviewing the diff (cold)\u2026`);
+    const { review, raw } = await runClaudeReviewer(
+      opts.reviewPrompt,
+      opts.claudeConfig,
+      run,
+      opts.timeoutMs,
+      log
+    );
+    claudeReview = review;
+    try {
+      persistClaudeReview(opts.baseDir, opts.runId, review, raw);
+    } catch (e) {
+      const why = e.message;
+      log(`  \xB7 claude: trail persist FAILED (${why}) \u2014 reviewer counted INCOMPLETE`);
+      claudeReview = {
+        ...review,
+        ok: false,
+        summary: `claude reviewed but FAILED to persist to the trail (${why}) \u2014 not a complete reviewer`
+      };
+    }
+  }
+  const coreVoices = opts.coreReviews.map(storedToVoiceReview);
+  for (const v of coreVoices) {
+    try {
+      writeTrailFile(opts.baseDir, opts.runId, `review.${v.voiceId}.md`, renderReviewMarkdown(v));
+    } catch (e) {
+      log(`  \xB7 trail write review.${v.voiceId}.md failed (${e.message}) \u2014 continuing`);
+    }
+  }
+  if (claudeReview) {
+    try {
+      writeTrailFile(opts.baseDir, opts.runId, "review.claude.md", renderReviewMarkdown(claudeReview));
+    } catch (e) {
+      log(`  \xB7 trail write review.claude.md failed (${e.message}) \u2014 continuing`);
+    }
+  }
+  const voiceReviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
+  const synthesis = await synthesizeReviews(
+    voiceReviews,
+    run,
+    opts.claudeConfig,
+    { log, timeoutMs: opts.timeoutMs }
+  );
+  return { claudeReview, modelLabel, synthesis };
+}
+function claudeLayerHasHigh(layer) {
+  const cr = layer?.claudeReview;
+  return Boolean(cr?.ok && cr.findings.some((f) => f.severity === "high"));
+}
+function renderClaudeLayer(result) {
+  const out = [];
+  const cr = result.claudeReview;
+  if (cr) {
+    out.push("");
+    out.push(`  \u2500\u2500 claude [anthropic/${result.modelLabel}] \u2014 ${cr.ok ? "reviewed" : "failed"} (cold peer reviewer) \u2500\u2500`);
+    if (!cr.ok) {
+      out.push(`     ${scrubControl(cr.summary).slice(0, 200)}`);
+    } else if (cr.findings.length === 0) {
+      out.push("     no findings");
+    } else {
+      for (const f of cr.findings) {
+        const where = f.evidence.file ? `${f.evidence.file}${f.evidence.line ? `:${f.evidence.line}` : ""}` : "(uncited)";
+        out.push(`     [${f.severity}] ${scrubControl(where)}  ${scrubControl(f.title)}`);
+      }
+    }
+  }
+  const s = result.synthesis;
+  out.push("");
+  out.push(
+    `  Claude synthesis${s.by ? ` (by ${s.by})` : ""}${s.degraded ? " \u2014 DEGRADED (deterministic fallback, NOT cross-confirmed)" : ""}`
+  );
+  if (s.summary) out.push(`     ${scrubControl(s.summary).slice(0, 400)}`);
+  if (s.agreements.length > 0) {
+    out.push("     \u2713 AGREE (confident)");
+    for (const a of s.agreements) {
+      out.push(`        \u2022 ${scrubControl(a.point).slice(0, 300)}${a.voices.length ? `  [${a.voices.map(scrubControl).join(", ")}]` : ""}`);
+    }
+  }
+  if (s.disagreements.length > 0) {
+    out.push("     \u26A0 DISAGREE (look closer)");
+    for (const d of s.disagreements) {
+      out.push(`        \u2022 ${scrubControl(d.point).slice(0, 300)}`);
+      for (const p of d.positions) out.push(`            \u2212 ${scrubControl(p).slice(0, 240)}`);
+    }
+  }
+  if (s.sanityChecks.length > 0) {
+    out.push("     sanity-checks");
+    for (const c of s.sanityChecks) {
+      out.push(`        [${c.verdict}] ${scrubControl(c.finding).slice(0, 200)}${c.note ? ` \u2014 ${scrubControl(c.note).slice(0, 200)}` : ""}`);
+    }
+  }
+  if (s.bottomLine) {
+    out.push("     \u2192 bottom line");
+    out.push(`        ${scrubControl(s.bottomLine).slice(0, 500)}`);
+  }
+  return out;
 }
 
 // src/modes/review/source.ts
@@ -2805,6 +3429,11 @@ function formatReceipt(receipt) {
   out.push(`  reviewers: ${receipt.reviewerPolicy.join(", ")} (policy)`);
   out.push(`  completed: ${receipt.completed.join(", ")}`);
   out.push(`  vendors:   ${receipt.vendors.join(", ")}`);
+  if (receipt.peerReviewers && receipt.peerReviewers.length > 0) {
+    out.push(
+      `  peers:     ${receipt.peerReviewers.map((p) => `${p.id} (${p.vendor}) ${p.state}`).join(", ")}`
+    );
+  }
   out.push(`  runId:     ${receipt.runId}`);
   out.push(`  coverage:  ${coverageCounts(c)}`);
   for (const o of c.omitted) {
@@ -2839,10 +3468,14 @@ Plumbing (no reviewer runs \u2014 inspect the engine):
   diff         show the assembled review packet that WOULD be sent \u2014 cost-preview/debug.
 
 Run \`ensemble-ai <mode|command> --help\` for options.`;
-var REVIEW_USAGE = `ensemble-ai review \u2014 review a diff with ALL configured AI reviewers.
+var REVIEW_USAGE = `ensemble-ai review \u2014 self-contained cross-vendor review of a diff.
 
-Runs every reviewer in the registry (codex + grok) by default and prints their
-findings grouped by severity. With NO source flag it reviews the current branch.
+Spawns THREE blind peer reviewers on the SAME pinned packet \u2014 codex + grok + a cold
+headless \`claude -p\` (Opus, default-on) \u2014 each writing its own review into the trail,
+then a \`claude -p\` SYNTHESIS pass reads all three and emits AGREE(confident)/DISAGREE
+(look-closer) \xB7 a per-finding sanity-check \xB7 a bottom line. Runs from ANY terminal with
+no Claude session. REVIEW-ONLY \u2014 it never edits code. With NO source flag it reviews the
+current branch. \`--no-claude\` drops the Opus reviewer + synthesis (codex + grok only).
 
 Usage:
   ensemble-ai review [<pr-url>] [options]
@@ -2863,7 +3496,10 @@ Diff source (give at most ONE; default = current branch):
 
 Options:
   --base <ref>          base ref for the default (commit) mode
-  --reviewers <ids>     comma-separated reviewer ids (default: all configured)
+  --reviewers <ids>     comma-separated reviewer ids to subset the roster
+                        (default: codex,grok,claude \u2014 claude is a valid id)
+  --no-claude           drop the cold Opus reviewer + the synthesis pass (codex + grok
+                        only) \u2014 e.g. from a terminal with no Claude CLI
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
@@ -2909,10 +3545,30 @@ function genRunId() {
   const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
   return `${stamp}-${crypto2.randomBytes(4).toString("hex")}`;
 }
+function clearReusedRunTrail(baseDir, trailDir) {
+  try {
+    if (fs11.lstatSync(trailDir).isSymbolicLink()) return;
+  } catch {
+    return;
+  }
+  let realBase;
+  let realTarget;
+  try {
+    realBase = fs11.realpathSync(baseDir);
+    realTarget = fs11.realpathSync(trailDir);
+  } catch {
+    return;
+  }
+  const rel = path9.relative(realBase, realTarget);
+  if (!rel || escapesRoot(rel)) {
+    return;
+  }
+  fs11.rmSync(realTarget, { force: true, recursive: true });
+}
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
   try {
-    const s = fs10.readFileSync(0, "utf8");
+    const s = fs11.readFileSync(0, "utf8");
     return s.trim() ? s : void 0;
   } catch {
     return void 0;
@@ -2949,16 +3605,16 @@ function gitToplevel(cwd) {
 }
 function resolveTrailBase(gitRoot, localRepoTrail) {
   if (gitRoot && localRepoTrail) {
-    return path8.join(gitRoot, ".ensemble-ai", "reviews");
+    return path9.join(gitRoot, ".ensemble-ai", "reviews");
   }
-  return path8.join(os7.tmpdir(), "ensemble-ai", "reviews");
+  return path9.join(os7.tmpdir(), "ensemble-ai", "reviews");
 }
 function ghConventionReader(repoSlug, ref, cwd) {
   const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
   const encRef = encodeURIComponent(ref);
   return {
     async read(rel, maxBytes) {
-      const cap3 = capture(
+      const cap4 = capture(
         "gh",
         [
           "api",
@@ -2968,9 +3624,9 @@ function ghConventionReader(repoSlug, ref, cwd) {
         ],
         cwd
       );
-      if (!cap3.ok || !cap3.text.trim()) return null;
+      if (!cap4.ok || !cap4.text.trim()) return null;
       try {
-        const decoded = Buffer.from(cap3.text.replace(/\s/g, ""), "base64").toString("utf8");
+        const decoded = Buffer.from(cap4.text.replace(/\s/g, ""), "base64").toString("utf8");
         if (maxBytes !== void 0 && Buffer.byteLength(decoded, "utf8") > maxBytes) {
           return Buffer.from(decoded, "utf8").subarray(0, maxBytes).toString("utf8").replace(/�$/, "");
         }
@@ -2980,13 +3636,13 @@ function ghConventionReader(repoSlug, ref, cwd) {
       }
     },
     async list(dirRel) {
-      const cap3 = capture(
+      const cap4 = capture(
         "gh",
         ["api", `repos/${repoSlug}/contents/${encPath(dirRel)}?ref=${encRef}`, "--jq", ".[].path"],
         cwd
       );
-      if (!cap3.ok) return [];
-      return cap3.text.split("\n").map((s) => s.trim()).filter((s) => s.endsWith(".md"));
+      if (!cap4.ok) return [];
+      return cap4.text.split("\n").map((s) => s.trim()).filter((s) => s.endsWith(".md"));
     }
   };
 }
@@ -2998,16 +3654,16 @@ function buildConventionReader(cwd, ctx) {
 function resolveSource(selection, cwd, stdinContent, cmd = "review") {
   switch (selection.kind) {
     case "pr": {
-      const prResult = (cap4, label2, headShaOverride) => {
-        if (!cap4.ok) {
-          console.error(`ensemble-ai ${cmd}: \`${label2}\` failed: ${cap4.error}`);
+      const prResult = (cap5, label2, headShaOverride) => {
+        if (!cap5.ok) {
+          console.error(`ensemble-ai ${cmd}: \`${label2}\` failed: ${cap5.error}`);
           return { code: 3 };
         }
-        if (!cap4.text.trim()) {
+        if (!cap5.text.trim()) {
           console.error(`ensemble-ai ${cmd}: PR #${selection.pr} has an empty diff`);
           return { code: 3 };
         }
-        return { diffMode: "pr", diffText: cap4.text, headShaOverride };
+        return { diffMode: "pr", diffText: cap5.text, headShaOverride };
       };
       if (selection.owner && selection.repo) {
         const repoSlug = `${selection.owner}/${selection.repo}`;
@@ -3047,22 +3703,22 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
           return "code" in r2 ? r2 : { ...r2, conventionsCtx: { ref: headSha, repoSlug } };
         }
         const label2 = `gh pr diff ${selection.pr} -R ${repoSlug}`;
-        const cap4 = capture(
+        const cap5 = capture(
           "gh",
           ["pr", "diff", String(selection.pr), "-R", repoSlug],
           cwd
         );
-        const r = prResult(cap4, label2);
+        const r = prResult(cap5, label2);
         return "code" in r ? r : { ...r, noLocalConventions: true };
       }
       const label = `gh pr diff ${selection.pr}`;
-      const cap3 = capture("gh", ["pr", "diff", String(selection.pr)], cwd);
-      return prResult(cap3, label);
+      const cap4 = capture("gh", ["pr", "diff", String(selection.pr)], cwd);
+      return prResult(cap4, label);
     }
     case "diff-file": {
       let text;
       try {
-        text = fs10.readFileSync(String(selection.diffFile), "utf8");
+        text = fs11.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
@@ -3113,21 +3769,18 @@ function oneLineSummary(result) {
   const receipt = result.receipt ? `receipt ${result.receipt.diffDigest.slice(0, 19)}\u2026` : "receipt none";
   return `${tallies} \xB7 ${receipt}`;
 }
-function clean(s) {
-  return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
-}
 function evidenceRef(file, line) {
   if (!file) return "(uncited)";
-  const f = clean(file);
+  const f = scrubControl(file);
   return line ? `${f}:${line}` : f;
 }
 function findingLine(f, profile) {
   const ref = evidenceRef(f.evidence.file, f.evidence.line);
   if (profile === "security") {
     const cls = classifySecurityFinding(f);
-    return `       [${cls}] ${ref}  ${clean(stripSecurityTag(f.title))}`;
+    return `       [${cls}] ${ref}  ${scrubControl(stripSecurityTag(f.title))}`;
   }
-  return `       ${ref}  ${clean(f.title)}`;
+  return `       ${ref}  ${scrubControl(f.title)}`;
 }
 function reviewerBlock(r, profile) {
   const id = r.reviewerId ?? r.reviewer.vendor;
@@ -3137,7 +3790,7 @@ function reviewerBlock(r, profile) {
     `  \u2500\u2500 ${id} [${r.reviewer.vendor} \xB7 ${r.reviewer.model}] \u2014 ${r.terminalState} \u2500\u2500`
   );
   if (r.terminalState !== "reviewed") {
-    out.push(`     ${clean(r.summary).slice(0, 200)}`);
+    out.push(`     ${scrubControl(r.summary).slice(0, 200)}`);
     return out;
   }
   if (r.findings.length === 0) {
@@ -3160,8 +3813,8 @@ function depSurfaceBlock(d) {
   }
   for (const m of d.manifests) {
     const kind = m.isLockfile ? "lockfile" : "manifest";
-    out.push(`     ${kind} ${m.label}: ${clean(m.path)} (+${m.added} line(s))`);
-    for (const s of m.samples) out.push(`         + ${clean(s).slice(0, 100)}`);
+    out.push(`     ${kind} ${m.label}: ${scrubControl(m.path)} (+${m.added} line(s))`);
+    for (const s of m.samples) out.push(`         + ${scrubControl(s).slice(0, 100)}`);
   }
   for (const r of d.riskyImports) {
     out.push(`     risky [${r.cls}] ${r.label} \u2014 ${evidenceRef(r.path, r.line)}`);
@@ -3200,8 +3853,10 @@ function printSummary(result, profile) {
   out.push("");
   if (result.receipt) {
     out.push(`  receipt: ${result.receiptPath}`);
+    const peers = result.receipt.peerReviewers ?? [];
+    const peerNote = peers.length ? ` \xB7 peers: ${peers.map((p) => `${p.id} ${p.state}`).join(", ")}` : "";
     out.push(
-      `           completed: ${result.receipt.completed.join(", ")} \xB7 vendors: ${result.receipt.vendors.join(", ")}`
+      `           completed: ${result.receipt.completed.join(", ")} \xB7 vendors: ${result.receipt.vendors.join(", ")}${peerNote}`
     );
   } else {
     out.push(`  receipt: none \u2014 ${result.receiptError ?? "not qualified"}`);
@@ -3270,6 +3925,7 @@ async function reviewCommand(args, profile = "code") {
         cwd: { type: "string" },
         "diff-file": { type: "string" },
         help: { short: "h", type: "boolean" },
+        "no-claude": { type: "boolean" },
         "no-conventions": { type: "boolean" },
         "no-fail-on-high": { type: "boolean" },
         out: { type: "string" },
@@ -3290,7 +3946,7 @@ async function reviewCommand(args, profile = "code") {
     console.log(usage);
     return 0;
   }
-  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path9.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
   const noConventions = Boolean(values["no-conventions"]);
@@ -3301,15 +3957,18 @@ async function reviewCommand(args, profile = "code") {
     );
   }
   const conventionReader = noConventions || source.noLocalConventions ? null : buildConventionReader(cwd, source.conventionsCtx);
-  let reviewers;
-  if (typeof values.reviewers === "string") {
-    const parsed = parseReviewerList(values.reviewers, cmd);
-    if ("code" in parsed) return parsed.code;
-    reviewers = parsed;
+  const noClaude = Boolean(values["no-claude"]);
+  const requestedReviewers = typeof values.reviewers === "string" ? values.reviewers.split(",") : void 0;
+  const roster = resolveReviewRoster(requestedReviewers, noClaude);
+  if ("error" in roster) {
+    console.error(`ensemble-ai ${cmd}: --reviewers "${values.reviewers}" \u2014 ${roster.error}`);
+    return 3;
   }
+  const reviewers = requestedReviewers === void 0 ? void 0 : roster.core;
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-  const out = typeof values.out === "string" ? path8.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+  const out = typeof values.out === "string" ? path9.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
+  clearReusedRunTrail(out, trailDir);
   const ceiling = positiveCeiling(
     typeof values.ceiling === "string" ? values.ceiling : void 0,
     cmd
@@ -3344,13 +4003,61 @@ async function reviewCommand(args, profile = "code") {
   }
   if (result.conventionManifest) {
     try {
-      fs10.mkdirSync(trailDir, { mode: 448, recursive: true });
-      const cfile = path8.join(trailDir, "conventions.json");
-      fs10.writeFileSync(cfile, JSON.stringify(result.conventionManifest, null, 2), {
-        mode: 384
-      });
-      fs10.chmodSync(cfile, 384);
+      writeTrailFile(
+        out,
+        runId,
+        "conventions.json",
+        JSON.stringify(result.conventionManifest, null, 2)
+      );
     } catch {
+    }
+  }
+  let claudeLayer = null;
+  let claudeLayerCrashed = false;
+  const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
+  if (claudeLayerExpected && result.prompt) {
+    const voiceConfigs = loadVoices();
+    try {
+      claudeLayer = await runClaudeReviewLayer({
+        baseDir: out,
+        claudeConfig: voiceConfigs.claude,
+        coreReviews: result.reviews,
+        includeClaudeReviewer: true,
+        log: (m) => console.error(`\xB7 ${m}`),
+        reviewPrompt: result.prompt,
+        runId
+      });
+      try {
+        writeTrailFile(out, runId, "claude-synthesis.json", JSON.stringify(claudeLayer, null, 2));
+      } catch {
+      }
+    } catch (e) {
+      claudeLayerCrashed = true;
+      console.error(
+        `ensemble-ai ${cmd}: the Opus (claude) review layer crashed \u2014 ${e.message}`
+      );
+    }
+  }
+  if (result.receiptCandidate && result.receiptStore) {
+    const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
+    const rosterComplete = !claudeLayerExpected || claudeReviewed;
+    if (rosterComplete) {
+      const peerReviewers = claudeLayer?.claudeReview ? [
+        {
+          id: "claude",
+          state: claudeLayer.claudeReview.ok ? "reviewed" : "failed-reviewer",
+          vendor: `anthropic/${claudeLayer.modelLabel}`
+        }
+      ] : [];
+      const receipt = peerReviewers.length > 0 ? { ...result.receiptCandidate, peerReviewers } : result.receiptCandidate;
+      try {
+        result.receiptPath = writeReceipt(result.receiptStore, receipt);
+        result.receipt = receipt;
+      } catch (e) {
+        result.receiptError = `receipt write failed \u2014 ${e.message}`;
+      }
+    } else {
+      result.receiptError = "review INCOMPLETE \u2014 the default-on Opus (claude) reviewer was expected but did not complete, so no fully-reviewed receipt was minted";
     }
   }
   printSummary(result, profile);
@@ -3358,14 +4065,29 @@ async function reviewCommand(args, profile = "code") {
     const first = result.reviews[0];
     const pinnedReviewerId = first.reviewerId ?? first.reviewer.vendor;
     console.log(
-      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path8.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
+      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path9.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
+  }
+  if (claudeLayer) {
+    console.log(renderClaudeLayer(claudeLayer).join("\n"));
   }
   console.log(`trail: ${trailDir}`);
   if (result.blocked) return 2;
   const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
   if (!allReviewed) return 1;
-  if (!values["no-fail-on-high"] && hasHighFinding(result.reviews)) return 4;
+  if (claudeLayerExpected) {
+    const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
+    if (!claudeReviewed) {
+      const why = claudeLayer?.claudeReview ? scrubControl(claudeLayer.claudeReview.summary).slice(0, 200) : claudeLayerCrashed ? "the Opus review layer crashed" : "the Opus review layer did not run to completion";
+      console.error(
+        `ensemble-ai ${cmd}: reviewer claude failed (${why}) \u2014 review INCOMPLETE: the codex/grok core completed, the Opus reviewer did not, so this is NOT a full 3-reviewer pass`
+      );
+      return 1;
+    }
+  }
+  if (!values["no-fail-on-high"] && (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))) {
+    return 4;
+  }
   return 0;
 }
 var BRAINSTORM_USAGE = `ensemble-ai brainstorm \u2014 convene multiple AI voices on a TOPIC.
@@ -3393,7 +4115,7 @@ voice failed) \xB7 3 = usage or an unexpected operational error.`;
 function printBrainstorm(r) {
   const out = [];
   out.push("");
-  out.push(`ensemble-ai brainstorm \u2014 ${clean(r.topic).slice(0, 200)}`);
+  out.push(`ensemble-ai brainstorm \u2014 ${scrubControl(r.topic).slice(0, 200)}`);
   out.push(`  voices: ${r.roster.join(", ")}`);
   out.push("");
   out.push("Round 1 \xB7 independent ideas");
@@ -3401,13 +4123,13 @@ function printBrainstorm(r) {
     out.push("");
     out.push(`  \u2500\u2500 ${g.voiceId} \u2500\u2500`);
     if (!g.ok) {
-      out.push(`     (no ideas \u2014 ${clean(g.error ?? "failed").slice(0, 160)})`);
+      out.push(`     (no ideas \u2014 ${scrubControl(g.error ?? "failed").slice(0, 160)})`);
       continue;
     }
-    if (g.summary) out.push(`     ${clean(g.summary).slice(0, 240)}`);
+    if (g.summary) out.push(`     ${scrubControl(g.summary).slice(0, 240)}`);
     for (const idea of g.ideas) {
-      out.push(`     \u2022 [${idea.id}] ${clean(idea.title)}`);
-      if (idea.body) out.push(`         ${clean(idea.body).slice(0, 300)}`);
+      out.push(`     \u2022 [${idea.id}] ${scrubControl(idea.title)}`);
+      if (idea.body) out.push(`         ${scrubControl(idea.body).slice(0, 300)}`);
     }
   }
   if (r.critique.length > 0) {
@@ -3417,15 +4139,15 @@ function printBrainstorm(r) {
       out.push("");
       out.push(`  \u2500\u2500 ${c.voiceId} \u2500\u2500`);
       if (!c.ok) {
-        out.push(`     (no critique \u2014 ${clean(c.error ?? "failed").slice(0, 160)})`);
+        out.push(`     (no critique \u2014 ${scrubControl(c.error ?? "failed").slice(0, 160)})`);
         continue;
       }
       for (const cr of c.critiques) {
-        out.push(`     [${cr.stance}] ${clean(cr.target)} \u2014 ${clean(cr.assessment).slice(0, 260)}`);
+        out.push(`     [${cr.stance}] ${scrubControl(cr.target)} \u2014 ${scrubControl(cr.assessment).slice(0, 260)}`);
       }
       for (const ex of c.extensions) {
-        out.push(`     + ${clean(ex.title)}`);
-        if (ex.body) out.push(`         ${clean(ex.body).slice(0, 260)}`);
+        out.push(`     + ${scrubControl(ex.title)}`);
+        if (ex.body) out.push(`         ${scrubControl(ex.body).slice(0, 260)}`);
       }
     }
   }
@@ -3434,14 +4156,14 @@ function printBrainstorm(r) {
   out.push(
     `Round 3 \xB7 synthesis${s.by ? ` (by ${s.by})` : ""}${s.degraded ? " \u2014 DEGRADED (deterministic fallback)" : ""}`
   );
-  if (s.summary) out.push(`  ${clean(s.summary).slice(0, 400)}`);
+  if (s.summary) out.push(`  ${scrubControl(s.summary).slice(0, 400)}`);
   for (const ri of s.ranked) {
     out.push("");
     out.push(
-      `  ${ri.rank}. ${clean(ri.title)}${ri.contributors.length ? `  [${ri.contributors.map(clean).join(", ")}]` : ""}`
+      `  ${ri.rank}. ${scrubControl(ri.title)}${ri.contributors.length ? `  [${ri.contributors.map(scrubControl).join(", ")}]` : ""}`
     );
-    if (ri.why) out.push(`     why:  ${clean(ri.why).slice(0, 300)}`);
-    if (ri.risks) out.push(`     risk: ${clean(ri.risks).slice(0, 240)}`);
+    if (ri.why) out.push(`     why:  ${scrubControl(ri.why).slice(0, 300)}`);
+    if (ri.risks) out.push(`     risk: ${scrubControl(ri.risks).slice(0, 240)}`);
   }
   out.push("");
   console.log(out.join("\n"));
@@ -3482,19 +4204,19 @@ async function brainstormCommand(args) {
     console.error(BRAINSTORM_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path9.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path8.resolve(cwd, values.file);
+    const filePath = path9.resolve(cwd, values.file);
     try {
-      const bytes = fs10.statSync(filePath).size;
+      const bytes = fs11.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs10.readFileSync(filePath, "utf8");
+      fileContext = fs11.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${e.message}`
@@ -3592,7 +4314,7 @@ voice failed) \xB7 3 = usage or an unexpected operational error.`;
 function printConsult(r) {
   const out = [];
   out.push("");
-  out.push(`ensemble-ai consult \u2014 ${clean(r.question).slice(0, 200)}`);
+  out.push(`ensemble-ai consult \u2014 ${scrubControl(r.question).slice(0, 200)}`);
   out.push(`  voices: ${r.roster.join(", ")}`);
   out.push("");
   out.push("Independent answers");
@@ -3600,12 +4322,12 @@ function printConsult(r) {
     out.push("");
     out.push(`  \u2500\u2500 ${a.voiceId} \u2500\u2500`);
     if (!a.ok) {
-      out.push(`     (no answer \u2014 ${clean(a.error ?? "failed").slice(0, 160)})`);
+      out.push(`     (no answer \u2014 ${scrubControl(a.error ?? "failed").slice(0, 160)})`);
       continue;
     }
-    if (a.summary) out.push(`     ${clean(a.summary).slice(0, 240)}`);
-    if (a.answer) out.push(`     ${clean(a.answer).slice(0, 400)}`);
-    for (const kp of a.keyPoints) out.push(`       \xB7 ${clean(kp).slice(0, 200)}`);
+    if (a.summary) out.push(`     ${scrubControl(a.summary).slice(0, 240)}`);
+    if (a.answer) out.push(`     ${scrubControl(a.answer).slice(0, 400)}`);
+    for (const kp of a.keyPoints) out.push(`       \xB7 ${scrubControl(kp).slice(0, 200)}`);
   }
   if (r.critique.length > 0) {
     out.push("");
@@ -3614,11 +4336,11 @@ function printConsult(r) {
       out.push("");
       out.push(`  \u2500\u2500 ${c.voiceId} \u2500\u2500`);
       if (!c.ok) {
-        out.push(`     (no notes \u2014 ${clean(c.error ?? "failed").slice(0, 160)})`);
+        out.push(`     (no notes \u2014 ${scrubControl(c.error ?? "failed").slice(0, 160)})`);
         continue;
       }
       for (const n of c.notes) {
-        out.push(`     [${n.stance}] ${clean(n.target)} \u2014 ${clean(n.assessment).slice(0, 260)}`);
+        out.push(`     [${n.stance}] ${scrubControl(n.target)} \u2014 ${scrubControl(n.assessment).slice(0, 260)}`);
       }
     }
   }
@@ -3627,26 +4349,26 @@ function printConsult(r) {
   out.push(
     `Synthesis${s.by ? ` (by ${s.by})` : ""}${s.degraded ? " \u2014 DEGRADED (deterministic fallback, NOT compared for agreement)" : ""}`
   );
-  if (s.summary) out.push(`  ${clean(s.summary).slice(0, 400)}`);
+  if (s.summary) out.push(`  ${scrubControl(s.summary).slice(0, 400)}`);
   if (s.agreements.length > 0) {
     out.push("");
     out.push("  \u2713 AGREE (confident)");
     for (const a of s.agreements) {
-      out.push(`     \u2022 ${clean(a.point).slice(0, 300)}${a.voices.length ? `  [${a.voices.map(clean).join(", ")}]` : ""}`);
+      out.push(`     \u2022 ${scrubControl(a.point).slice(0, 300)}${a.voices.length ? `  [${a.voices.map(scrubControl).join(", ")}]` : ""}`);
     }
   }
   if (s.divergences.length > 0) {
     out.push("");
     out.push("  \u26A0 DIVERGE (look closer)");
     for (const d of s.divergences) {
-      out.push(`     \u2022 ${clean(d.point).slice(0, 300)}`);
-      for (const p of d.positions) out.push(`         \u2212 ${clean(p).slice(0, 240)}`);
+      out.push(`     \u2022 ${scrubControl(d.point).slice(0, 300)}`);
+      for (const p of d.positions) out.push(`         \u2212 ${scrubControl(p).slice(0, 240)}`);
     }
   }
   if (s.recommendation) {
     out.push("");
     out.push("  \u2192 Recommendation");
-    out.push(`     ${clean(s.recommendation).slice(0, 500)}`);
+    out.push(`     ${scrubControl(s.recommendation).slice(0, 500)}`);
   }
   out.push("");
   console.log(out.join("\n"));
@@ -3687,19 +4409,19 @@ async function consultCommand(args) {
     console.error(CONSULT_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path9.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path8.resolve(cwd, values.file);
+    const filePath = path9.resolve(cwd, values.file);
     try {
-      const bytes = fs10.statSync(filePath).size;
+      const bytes = fs11.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs10.readFileSync(filePath, "utf8");
+      fileContext = fs11.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai consult: cannot read --file ${values.file}: ${e.message}`
@@ -3873,11 +4595,11 @@ async function receiptCommand(args) {
     console.log(RECEIPT_USAGE);
     return 0;
   }
-  const receiptPathArg = typeof positionals[0] === "string" ? path8.resolve(positionals[0]) : void 0;
+  const receiptPathArg = typeof positionals[0] === "string" ? path9.resolve(positionals[0]) : void 0;
   const readReceiptFile = (p) => {
     let raw;
     try {
-      raw = fs10.readFileSync(p, "utf8");
+      raw = fs11.readFileSync(p, "utf8");
     } catch (e) {
       return { error: `cannot read receipt ${p}: ${e.message}` };
     }
@@ -3913,7 +4635,7 @@ async function receiptCommand(args) {
   );
   if (typeof ceiling === "object") return ceiling.code;
   const ceilingBytes = ceiling ?? DEFAULT_COVERAGE_CEILING;
-  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path9.resolve(String(values.cwd)) : process.cwd();
   if (Boolean(values.staged) && Boolean(values["working-tree"])) {
     console.error(
       `ensemble-ai receipt ${sub}: choose at most one of --staged / --working-tree`
@@ -3944,7 +4666,7 @@ async function receiptCommand(args) {
     }),
     repo: acquired.repoId
   };
-  const store = values.store ? path8.resolve(String(values.store)) : defaultReceiptStore();
+  const store = values.store ? path9.resolve(String(values.store)) : defaultReceiptStore();
   if (sub === "show") {
     const receipt = readReceipt(store, key);
     if (!receipt) {
@@ -3973,7 +4695,7 @@ async function receiptCommand(args) {
     // with isDiffReviewed so a digest-only drift still reports `stale`.
     readReceipt: receiptPathArg ? (k) => explicit && receiptIdentityMatches(explicit, k) ? explicit : null : (k) => readReceipt(store, k),
     strict: Boolean(values.strict || values["require-artifacts"]),
-    trailDir: typeof values.trail === "string" ? path8.resolve(values.trail) : void 0
+    trailDir: typeof values.trail === "string" ? path9.resolve(values.trail) : void 0
   };
   const state = verifyReceipt({ coverage: acquired.coverage, key, required }, verifyDeps);
   console.log(formatVerify(state, key));
@@ -4021,15 +4743,15 @@ async function reviewersCommand(args) {
     console.log(REVIEWERS_USAGE);
     return 0;
   }
-  const reviewersFile = typeof values["reviewers-file"] === "string" ? path8.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
-  const voicesFile = typeof values["voices-file"] === "string" ? path8.resolve(values["voices-file"]) : VOICES_FILE;
+  const reviewersFile = typeof values["reviewers-file"] === "string" ? path9.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
+  const voicesFile = typeof values["voices-file"] === "string" ? path9.resolve(values["voices-file"]) : VOICES_FILE;
   const view = {
     reviewers: listReviewers(reviewersFile),
     reviewersFile,
-    reviewersFileExists: fs10.existsSync(reviewersFile),
+    reviewersFileExists: fs11.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
     voicesFile,
-    voicesFileExists: fs10.existsSync(voicesFile)
+    voicesFileExists: fs11.existsSync(voicesFile)
   };
   if (values.json) console.log(JSON.stringify(view, null, 2));
   else console.log(renderRegistry(view));
@@ -4118,7 +4840,7 @@ async function diffCommand(args) {
     "diff"
   );
   if (typeof ceiling === "object") return ceiling.code;
-  const cwd = values.cwd ? path8.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path9.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
   let acquired;

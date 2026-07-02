@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { sanitizePathSegment } from '../../core/artifacts';
 import { sha256Hex } from '../../core/hash';
-import type { ReviewerId, StoredReview } from '../../core/types';
+import type { ReviewerId, StoredReview, TerminalState } from '../../core/types';
 
 import type { Coverage, DiffMode } from './diff';
 
@@ -37,11 +37,29 @@ export interface ReceiptCoverage {
   totalFiles: number;
 }
 
+// An ADDITIVE peer reviewer beyond the core codex/grok policy — the default-on cold
+// Opus ('claude') reviewer. `claude` is not a core ReviewerId (it mints no receipt),
+// but it IS a full peer reviewer whose completion the run depends on, so the receipt
+// RECORDS it for completeness. `vendor` carries the model label (e.g. `anthropic/opus`).
+export interface PeerReviewerRecord {
+  id: string;
+  state: TerminalState;
+  vendor: string;
+}
+
 export interface DiffReviewReceipt {
   baseRef: string | null;
   baseSha: string | null;
   completed: ReviewerId[];
   coverage: ReceiptCoverage;
+  // Additive peer reviewers beyond the core codex/grok policy (the default-on Opus
+  // 'claude' reviewer). RECORDED for completeness + legibility — the core policy
+  // (reviewerPolicy/completed) still mints + keys the receipt, so `receipt verify`
+  // is unchanged; a run WITH a peer reviewer is only ever persisted when that peer
+  // ALSO completed (see cli.ts). So a present, `reviewed` peer here means a full
+  // N-reviewer pass; its absence, a core-only (`--no-claude`) one — the two are no
+  // longer indistinguishable. Omitted on a codex/grok-only receipt.
+  peerReviewers?: PeerReviewerRecord[];
   // The canonical-diff content digest (NOT a commit SHA — a raw diff has no
   // intrinsic commit identity; the base+head SHAs carry that, separately).
   diffDigest: string;
@@ -187,6 +205,22 @@ export function validateReceiptShape(value: unknown): DiffReviewReceipt {
   if (!isStrArr(o.completed)) errs.push('completed (string[])');
   if (!isStrArr(o.reviewerPolicy)) errs.push('reviewerPolicy (string[])');
   if (!isStrArr(o.vendors)) errs.push('vendors (string[])');
+  // peerReviewers is OPTIONAL (absent on codex/grok-only receipts) — validate only when
+  // present, and reject a malformed one (each entry: id + state + vendor strings).
+  if (o.peerReviewers !== undefined) {
+    const okArr =
+      Array.isArray(o.peerReviewers) &&
+      o.peerReviewers.every(
+        (p) =>
+          p !== null &&
+          typeof p === 'object' &&
+          !Array.isArray(p) &&
+          isStr((p as Record<string, unknown>).id) &&
+          isStr((p as Record<string, unknown>).state) &&
+          isStr((p as Record<string, unknown>).vendor)
+      );
+    if (!okArr) errs.push('peerReviewers (PeerReviewerRecord[])');
+  }
   const c = o.coverage;
   if (c === null || typeof c !== 'object' || Array.isArray(c)) {
     errs.push('coverage (object)');

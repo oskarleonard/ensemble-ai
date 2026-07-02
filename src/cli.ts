@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { reviewDir } from './core/artifacts';
+import { escapesRoot, reviewDir, writeTrailFile } from './core/artifacts';
 import {
   type ConventionManifest,
   type ConventionReader,
@@ -15,6 +15,7 @@ import {
 } from './core/conventions';
 import { isEntrypoint } from './core/entrypoint';
 import { listReviewers, REVIEWERS_FILE } from './core/reviewers';
+import { scrubControl as clean } from './core/sanitize';
 import {
   isReviewerId,
   parseReviewerIds,
@@ -24,7 +25,7 @@ import {
   type StoredReview,
 } from './core/types';
 import { runBrainstormMode } from './modes/brainstorm';
-import { listVoices, VOICES_FILE } from './modes/brainstorm/voices';
+import { listVoices, loadVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
   type BrainstormResult,
   isVoiceId,
@@ -36,6 +37,13 @@ import { runConsultMode } from './modes/consult';
 import type { ConsultResult } from './modes/consult/types';
 import { isImplemented, isMode, resolveMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
+import {
+  claudeLayerHasHigh,
+  type ClaudeLayerResult,
+  renderClaudeLayer,
+  resolveReviewRoster,
+  runClaudeReviewLayer,
+} from './modes/review/self-contained';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
 import {
   acquireDiff,
@@ -54,10 +62,12 @@ import {
   computePolicyHash,
   defaultReceiptStore,
   type DiffReviewReceipt,
+  type PeerReviewerRecord,
   readReceipt,
   receiptIdentityMatches,
   type ReceiptKey,
   validateReceiptShape,
+  writeReceipt,
 } from './modes/review/receipt';
 import {
   type DiffSourceSelection,
@@ -104,10 +114,14 @@ Plumbing (no reviewer runs — inspect the engine):
 
 Run \`ensemble-ai <mode|command> --help\` for options.`;
 
-const REVIEW_USAGE = `ensemble-ai review — review a diff with ALL configured AI reviewers.
+const REVIEW_USAGE = `ensemble-ai review — self-contained cross-vendor review of a diff.
 
-Runs every reviewer in the registry (codex + grok) by default and prints their
-findings grouped by severity. With NO source flag it reviews the current branch.
+Spawns THREE blind peer reviewers on the SAME pinned packet — codex + grok + a cold
+headless \`claude -p\` (Opus, default-on) — each writing its own review into the trail,
+then a \`claude -p\` SYNTHESIS pass reads all three and emits AGREE(confident)/DISAGREE
+(look-closer) · a per-finding sanity-check · a bottom line. Runs from ANY terminal with
+no Claude session. REVIEW-ONLY — it never edits code. With NO source flag it reviews the
+current branch. \`--no-claude\` drops the Opus reviewer + synthesis (codex + grok only).
 
 Usage:
   ensemble-ai review [<pr-url>] [options]
@@ -128,7 +142,10 @@ Diff source (give at most ONE; default = current branch):
 
 Options:
   --base <ref>          base ref for the default (commit) mode
-  --reviewers <ids>     comma-separated reviewer ids (default: all configured)
+  --reviewers <ids>     comma-separated reviewer ids to subset the roster
+                        (default: codex,grok,claude — claude is a valid id)
+  --no-claude           drop the cold Opus reviewer + the synthesis pass (codex + grok
+                        only) — e.g. from a terminal with no Claude CLI
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
@@ -175,6 +192,42 @@ Options + exit codes are identical to \`ensemble-ai review\` (run \`review --hel
 function genRunId(): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   return `${stamp}-${crypto.randomBytes(4).toString('hex')}`;
+}
+
+// Clear a REUSED run-id's stale trail dir so a prior run's `review.<id>.json` can't be read
+// back into THIS run's synthesis. A recursive delete of a path derived from user input
+// (`--run-id`) is a footgun, so it is fenced with defense-in-depth: the runId is already
+// path-sanitized by reviewDir/sanitizePathSegment (which now also neutralizes bare `.`/`..`),
+// and HERE we independently realpath BOTH the base and the target and delete ONLY when the
+// target resolves to a path STRICTLY INSIDE the realpath'd base — never the base itself, an
+// ancestor, or (via a symlink hop) anywhere outside. A fresh / auto-generated run id has no
+// dir to clear (realpath throws → we simply return). So the recursive rm can only ever remove
+// this run's own subdir under the trail base.
+function clearReusedRunTrail(baseDir: string, trailDir: string): void {
+  // Refuse to clear THROUGH a symlinked run dir. writeAtomic won't WRITE into a symlinked
+  // trail dir, so the cleaner must not DELETE through one either: a planted `base/<run-id>`
+  // symlink would otherwise resolve (below) to another run's REAL dir inside the base and the
+  // recursive rm would nuke it — exactly the "only this run's own subdir" guarantee this
+  // fence exists to keep. lstat the pre-realpath path; a symlink here → refuse. (Absent /
+  // fresh run id → lstat throws → nothing to clear.)
+  try {
+    if (fs.lstatSync(trailDir).isSymbolicLink()) return;
+  } catch {
+    return;
+  }
+  let realBase: string;
+  let realTarget: string;
+  try {
+    realBase = fs.realpathSync(baseDir);
+    realTarget = fs.realpathSync(trailDir);
+  } catch {
+    return; // base or per-run dir doesn't exist yet → nothing to clear (fresh run id)
+  }
+  const rel = path.relative(realBase, realTarget);
+  if (!rel || escapesRoot(rel)) {
+    return; // not strictly inside the base (would be the base itself or an escape) → refuse
+  }
+  fs.rmSync(realTarget, { force: true, recursive: true });
 }
 
 function readStdinIfPiped(): string | undefined {
@@ -505,15 +558,6 @@ function oneLineSummary(result: ReviewModeResult): string {
   return `${tallies} · ${receipt}`;
 }
 
-// Strip C0/DEL control characters from reviewer-controlled text before it hits the
-// terminal — a crafted diff could induce a reviewer to emit ANSI escapes in a
-// finding title/path; printed raw they could rewrite the terminal. Whitespace is
-// collapsed so a finding stays one tidy line.
-function clean(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
 function evidenceRef(file?: string, line?: number): string {
   if (!file) return '(uncited)';
   const f = clean(file);
@@ -613,8 +657,12 @@ function printSummary(result: ReviewModeResult, profile: ReviewProfile): void {
   out.push('');
   if (result.receipt) {
     out.push(`  receipt: ${result.receiptPath}`);
+    const peers = result.receipt.peerReviewers ?? [];
+    const peerNote = peers.length
+      ? ` · peers: ${peers.map((p) => `${p.id} ${p.state}`).join(', ')}`
+      : '';
     out.push(
-      `           completed: ${result.receipt.completed.join(', ')} · vendors: ${result.receipt.vendors.join(', ')}`
+      `           completed: ${result.receipt.completed.join(', ')} · vendors: ${result.receipt.vendors.join(', ')}${peerNote}`
     );
   } else {
     out.push(`  receipt: none — ${result.receiptError ?? 'not qualified'}`);
@@ -719,6 +767,7 @@ async function reviewCommand(
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
+        'no-claude': { type: 'boolean' },
         'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
         out: { type: 'string' },
@@ -762,16 +811,27 @@ async function reviewCommand(
       ? null
       : buildConventionReader(cwd, source.conventionsCtx);
 
-  // "no --reviewers" → undefined → run the full default set. But if --reviewers IS
-  // given, EVERY token must be a known id: a typo like `codex,grokk` must error,
-  // never silently drop the unknown and run a narrower set than the user asked for
+  // Resolve the roster: the cross-vendor CORE (codex/grok — subset with `--reviewers`,
+  // fail-closed on a typo) + whether the cold Opus (claude) reviewer + synthesis run
+  // (DEFAULT-ON; `--no-claude` opts out). `claude` is a valid `--reviewers` id. "no
+  // --reviewers" → the full default core; a typo can never silently narrow the policy
   // (which would also mint a receipt under a weaker policy). Fail closed.
-  let reviewers: ReviewerId[] | undefined;
-  if (typeof values.reviewers === 'string') {
-    const parsed = parseReviewerList(values.reviewers, cmd);
-    if ('code' in parsed) return parsed.code;
-    reviewers = parsed;
+  const noClaude = Boolean(values['no-claude']);
+  // resolveReviewRoster owns the single trim/filter/dedup of these tokens (and the
+  // fail-closed unknown-id check), so pass the raw split — don't normalize twice.
+  const requestedReviewers =
+    typeof values.reviewers === 'string'
+      ? values.reviewers.split(',')
+      : undefined;
+  const roster = resolveReviewRoster(requestedReviewers, noClaude);
+  if ('error' in roster) {
+    console.error(`ensemble-ai ${cmd}: --reviewers "${values.reviewers}" — ${roster.error}`);
+    return 3;
   }
+  // Preserve the "no --reviewers → undefined → engine runs ALL configured core" contract;
+  // an explicit list threads the resolved core subset.
+  const reviewers: ReviewerId[] | undefined =
+    requestedReviewers === undefined ? undefined : roster.core;
   const runId = typeof values['run-id'] === 'string' ? values['run-id'] : genRunId();
   // The trail BASE dir. `--out` overrides; otherwise repo-local when reviewing the cwd
   // repo's OWN diff, else a temp dir (resolveTrailBase — the diff-source-keyed fence).
@@ -784,6 +844,13 @@ async function reviewCommand(
       ? path.resolve(values.out)
       : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
+  // Scope this run's trail to THIS run. If the run dir already exists — an explicitly
+  // REUSED `--run-id` — clear it first, so STALE review files from a prior run with the
+  // same id can't be read back into the synthesis (loadVoiceReviewsFromTrail reads
+  // whatever `review.<id>.json` is on disk, blind to which run wrote it). A fresh /
+  // auto-generated run id has no dir to clear. This is a RECURSIVE delete of a path that
+  // carries user-influenced input (`--run-id`), so it is fenced hard — see clearReusedRunTrail.
+  clearReusedRunTrail(out, trailDir);
   const ceiling = positiveCeiling(
     typeof values.ceiling === 'string' ? values.ceiling : undefined,
     cmd
@@ -819,17 +886,102 @@ async function reviewCommand(
   }
 
   // The gathered-conventions manifest joins the trail so the receipt's evidence dir
-  // records which convention files the reviewers saw (best-effort — never fatal).
+  // records which convention files the reviewers saw (best-effort — never fatal). Written
+  // through the hardened trail writer (realpath'd dir + O_NOFOLLOW tmp + atomic rename) so
+  // a symlinked trail path can't redirect the write out of the trail dir — never a raw
+  // writeFileSync that would follow a pre-planted symlink at the target.
   if (result.conventionManifest) {
     try {
-      fs.mkdirSync(trailDir, { mode: 0o700, recursive: true });
-      const cfile = path.join(trailDir, 'conventions.json');
-      fs.writeFileSync(cfile, JSON.stringify(result.conventionManifest, null, 2), {
-        mode: 0o600,
-      });
-      fs.chmodSync(cfile, 0o600);
+      writeTrailFile(
+        out,
+        runId,
+        'conventions.json',
+        JSON.stringify(result.conventionManifest, null, 2)
+      );
     } catch {
       /* trail write is best-effort */
+    }
+  }
+
+  // The SELF-CONTAINED layer: a cold Opus (claude) peer reviewer over the SAME pinned
+  // packet + a claude SYNTHESIS pass that reads all three reviewers' trail files. DEFAULT-ON
+  // (roster.claude; `--no-claude` opts out). Skipped when the diff was blocked or no packet
+  // built (result.prompt absent). REVIEW-ONLY — writes only to the trail. Best-effort: any
+  // failure degrades (deterministic fallback), never taking down the review. The Opus
+  // reviewer IS a reviewer, so its HIGH findings feed the SAME exit gate below.
+  //
+  // It is COMPUTED here (before printSummary) but RENDERED after, so the receipt below can
+  // reflect the FULL expected roster: the receipt is written only once the Opus reviewer
+  // is known to have completed — an incomplete 3-reviewer run must never leave a clean
+  // receipt (the codex-review fail-open).
+  let claudeLayer: ClaudeLayerResult | null = null;
+  let claudeLayerCrashed = false;
+  // The Opus layer runs iff claude is in the roster, the diff wasn't blocked, and a packet
+  // was built. The exit gate below reuses this EXACT condition — a claude that was expected
+  // to review but didn't must fail-loud; a claude legitimately not-run (blocked / no packet)
+  // has nothing to gate.
+  const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
+  if (claudeLayerExpected && result.prompt) {
+    const voiceConfigs = loadVoices();
+    // The layer's own writes/spawn are best-effort internally, but a residual throw (an
+    // unexpected FS/spawn error) must DEGRADE the Opus layer, not crash the whole review
+    // after the codex/grok core already completed. Catch it here as a backstop; the
+    // incompleteness is then reflected in the receipt gate + exit gate below (fail-loud).
+    try {
+      claudeLayer = await runClaudeReviewLayer({
+        baseDir: out,
+        claudeConfig: voiceConfigs.claude,
+        coreReviews: result.reviews,
+        includeClaudeReviewer: true,
+        log: (m) => console.error(`· ${m}`),
+        reviewPrompt: result.prompt,
+        runId,
+      });
+      try {
+        writeTrailFile(out, runId, 'claude-synthesis.json', JSON.stringify(claudeLayer, null, 2));
+      } catch {
+        /* trail write is best-effort */
+      }
+    } catch (e) {
+      claudeLayerCrashed = true;
+      console.error(
+        `ensemble-ai ${cmd}: the Opus (claude) review layer crashed — ${(e as Error).message}`
+      );
+    }
+  }
+
+  // Persist the receipt ONLY after the full expected roster ran (fail-loud parity with the
+  // exit gate): the codex/grok core qualified a candidate, but when the default-on Opus
+  // reviewer was EXPECTED it must ALSO have completed — else NO clean receipt is written
+  // (a stale 'reviewed' receipt for an incomplete run is the fail-open). When it did
+  // complete, the peer reviewer is STAMPED into the receipt so downstream can tell a full
+  // N-reviewer pass from a codex/grok-only one.
+  if (result.receiptCandidate && result.receiptStore) {
+    const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
+    const rosterComplete = !claudeLayerExpected || claudeReviewed;
+    if (rosterComplete) {
+      const peerReviewers: PeerReviewerRecord[] = claudeLayer?.claudeReview
+        ? [
+            {
+              id: 'claude',
+              state: claudeLayer.claudeReview.ok ? 'reviewed' : 'failed-reviewer',
+              vendor: `anthropic/${claudeLayer.modelLabel}`,
+            },
+          ]
+        : [];
+      const receipt =
+        peerReviewers.length > 0
+          ? { ...result.receiptCandidate, peerReviewers }
+          : result.receiptCandidate;
+      try {
+        result.receiptPath = writeReceipt(result.receiptStore, receipt);
+        result.receipt = receipt;
+      } catch (e) {
+        result.receiptError = `receipt write failed — ${(e as Error).message}`;
+      }
+    } else {
+      result.receiptError =
+        'review INCOMPLETE — the default-on Opus (claude) reviewer was expected but did not complete, so no fully-reviewed receipt was minted';
     }
   }
 
@@ -851,6 +1003,11 @@ async function reviewCommand(
       `  review input (pinned — what every reviewer saw; read THIS, don't re-derive): ${path.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
   }
+  // Render the self-contained Opus layer (computed above) after the core summary.
+  if (claudeLayer) {
+    console.log(renderClaudeLayer(claudeLayer).join('\n'));
+  }
+
   // On stdout (with the receipt + pinned-input paths) — the machine-readable trail
   // location, so the doc's "paths on stdout" is accurate.
   console.log(`trail: ${trailDir}`);
@@ -861,9 +1018,35 @@ async function reviewCommand(
     result.reviews.length > 0 &&
     result.reviews.every((r) => r.terminalState === 'reviewed');
   if (!allReviewed) return 1;
-  // 4 = the findings GATE: a completed review surfaced a HIGH. Gate-usable by
-  // default (a pre-PR hook can fail on it); --no-fail-on-high opts out → 0.
-  if (!values['no-fail-on-high'] && hasHighFinding(result.reviews)) return 4;
+  // The cold Opus (claude) reviewer is DEFAULT-ON — a THIRD reviewer, not an optional
+  // extra. If it was in the roster but did NOT complete (spawn/parse failure → an ok:false
+  // review, or the layer crashed above), the review is INCOMPLETE: the user asked for 3
+  // reviewers and got 2. Fail-loud like a failed core reviewer (exit 1) rather than exit 0
+  // as if fully reviewed. `--no-fail-on-high` does NOT suppress this — it only gates HIGH
+  // findings, never a missing reviewer.
+  if (claudeLayerExpected) {
+    const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
+    if (!claudeReviewed) {
+      const why = claudeLayer?.claudeReview
+        ? clean(claudeLayer.claudeReview.summary).slice(0, 200)
+        : claudeLayerCrashed
+          ? 'the Opus review layer crashed'
+          : 'the Opus review layer did not run to completion';
+      console.error(
+        `ensemble-ai ${cmd}: reviewer claude failed (${why}) — review INCOMPLETE: the codex/grok core completed, the Opus reviewer did not, so this is NOT a full 3-reviewer pass`
+      );
+      return 1;
+    }
+  }
+  // 4 = the findings GATE: a completed review surfaced a HIGH — from ANY of the three
+  // reviewers (codex + grok + the cold Opus voice). Gate-usable by default (a pre-PR hook
+  // can fail on it); --no-fail-on-high opts out → 0.
+  if (
+    !values['no-fail-on-high'] &&
+    (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))
+  ) {
+    return 4;
+  }
   return 0;
 }
 
@@ -1335,8 +1518,9 @@ async function consultCommand(args: string[]): Promise<number> {
 
 // Validate an EXPLICIT `--reviewers` token list (split/trim), failing closed if any
 // token is unknown or the list is empty — a typo must never silently narrow the
-// policy. Shared by review mode and the plumbing gate/preview so the fail-closed
-// rule + the error wording have ONE source of truth. Returns the ids or an error code.
+// policy. The fail-closed source of truth for the PLUMBING gate/preview
+// (parseRequiredReviewers). Review mode resolves its own roster via resolveReviewRoster
+// (which additionally knows the default-on `claude` id). Returns the ids or an error code.
 function parseReviewerList(
   raw: string,
   cmd: string

@@ -369,6 +369,7 @@ ${ask}
 import fs from "fs";
 import path from "path";
 var DEFAULT_CAP_BYTES = 8e4;
+var CAP_PROBE_MARGIN = 8;
 var DEFAULT_MAX_FILES = 60;
 var ENTRY_FILES = ["CLAUDE.md", "AGENTS.md"];
 var COMMON_DOCS = ["CONTRIBUTING.md", "ARCHITECTURE.md", "TECH_DESIGN.md"];
@@ -458,8 +459,10 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   let visited = 0;
   while (queue.length > 0) {
     const rel = queue.shift();
-    const content = await reader.read(rel, capBytes);
-    if (content === null) continue;
+    const probe = await reader.read(rel, capBytes + CAP_PROBE_MARGIN);
+    if (probe === null) continue;
+    const readTruncated = Buffer.byteLength(probe, "utf8") > capBytes;
+    const content = readTruncated ? sliceBytes(probe, capBytes) : probe;
     const bytes = Buffer.byteLength(content, "utf8");
     if (visited >= maxFiles) {
       files.push({ path: rel, bytes, included: false, truncated: false, reason: "max-files" });
@@ -478,7 +481,9 @@ async function gatherConventions(reader, changedPaths, config = {}) {
     if (headerBytes + bytes <= remaining) {
       chunks.push(header + content);
       used += headerBytes + bytes;
-      files.push({ path: rel, bytes, included: true, truncated: false });
+      files.push(
+        readTruncated ? { path: rel, bytes, included: true, truncated: true, reason: "over-cap" } : { path: rel, bytes, included: true, truncated: false }
+      );
     } else {
       const noticeFor = (n) => `
 
@@ -638,18 +643,74 @@ function listReviewers(file = REVIEWERS_FILE) {
 import fs3 from "fs";
 import path3 from "path";
 function sanitizePathSegment(s) {
-  return s.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const cleaned = s.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return /^\.+$/.test(cleaned) ? `_${cleaned}` : cleaned;
 }
 function reviewDir(baseDir, runId) {
   return path3.join(baseDir, sanitizePathSegment(runId) || "unknown");
 }
-function writeAtomic(dir, name, content) {
+function escapesRoot(rel) {
+  return rel === ".." || rel.startsWith(`..${path3.sep}`) || path3.isAbsolute(rel);
+}
+function writeAtomic(root, dir, name, content) {
   fs3.mkdirSync(dir, { recursive: true, mode: 448 });
-  const target = path3.join(dir, name);
+  for (const p of [root, dir]) {
+    let st;
+    try {
+      st = fs3.lstatSync(p);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`ensemble-ai: refusing to write into a symlinked trail dir: ${p}`);
+    }
+  }
+  let realDir = dir;
+  let realRoot = root;
+  try {
+    realDir = fs3.realpathSync(dir);
+    realRoot = fs3.realpathSync(root);
+  } catch {
+  }
+  const rel = path3.relative(realRoot, realDir);
+  if (escapesRoot(rel)) {
+    throw new Error(
+      `ensemble-ai: refusing to write outside the trail root: ${realDir} is not under ${realRoot}`
+    );
+  }
+  const target = path3.join(realDir, name);
   const tmp = `${target}.tmp`;
-  fs3.writeFileSync(tmp, content, { mode: 384 });
-  fs3.chmodSync(tmp, 384);
-  fs3.renameSync(tmp, target);
+  try {
+    fs3.unlinkSync(tmp);
+  } catch {
+  }
+  const flags = fs3.constants.O_WRONLY | fs3.constants.O_CREAT | fs3.constants.O_EXCL | fs3.constants.O_NOFOLLOW;
+  let fd;
+  try {
+    fd = fs3.openSync(tmp, flags, 384);
+  } catch (e) {
+    throw new Error(`ensemble-ai: cannot open trail temp file ${tmp}: ${e.message}`);
+  }
+  try {
+    fs3.writeFileSync(fd, content);
+    fs3.fchmodSync(fd, 384);
+  } finally {
+    fs3.closeSync(fd);
+  }
+  try {
+    fs3.renameSync(tmp, target);
+  } catch (e) {
+    try {
+      fs3.unlinkSync(tmp);
+    } catch {
+    }
+    throw new Error(`ensemble-ai: cannot finalize trail file ${target}: ${e.message}`);
+  }
+}
+function writeTrailFile(baseDir, runId, name, content) {
+  const dir = reviewDir(baseDir, runId);
+  writeAtomic(baseDir, dir, name, content);
+  return path3.join(dir, name);
 }
 function readJson(file) {
   try {
@@ -672,10 +733,11 @@ function reviewJson(reviewerId) {
 function persistReview(baseDir, input) {
   const dir = reviewDir(baseDir, input.runId);
   const id = input.reviewer.id;
-  writeAtomic(dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
-  writeAtomic(dir, `prompt.${id}.md`, input.prompt);
-  if (input.raw !== null) writeAtomic(dir, `${id}-review.raw.md`, input.raw);
+  writeAtomic(baseDir, dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
+  writeAtomic(baseDir, dir, `prompt.${id}.md`, input.prompt);
+  if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review.raw.md`, input.raw);
   writeAtomic(
+    baseDir,
     dir,
     `findings.${id}.json`,
     JSON.stringify(input.findings, null, 2)
@@ -696,7 +758,7 @@ function persistReview(baseDir, input) {
     summary: input.summary,
     terminalState: input.terminalState
   };
-  writeAtomic(dir, reviewJson(id), JSON.stringify(stored, null, 2));
+  writeAtomic(baseDir, dir, reviewJson(id), JSON.stringify(stored, null, 2));
   return stored;
 }
 function readReview(baseDir, runId, reviewerId = "codex") {
@@ -1385,6 +1447,12 @@ function validateReceiptShape(value) {
   if (!isStrArr(o.completed)) errs.push("completed (string[])");
   if (!isStrArr(o.reviewerPolicy)) errs.push("reviewerPolicy (string[])");
   if (!isStrArr(o.vendors)) errs.push("vendors (string[])");
+  if (o.peerReviewers !== void 0) {
+    const okArr = Array.isArray(o.peerReviewers) && o.peerReviewers.every(
+      (p) => p !== null && typeof p === "object" && !Array.isArray(p) && isStr(p.id) && isStr(p.state) && isStr(p.vendor)
+    );
+    if (!okArr) errs.push("peerReviewers (PeerReviewerRecord[])");
+  }
   const c = o.coverage;
   if (c === null || typeof c !== "object" || Array.isArray(c)) {
     errs.push("coverage (object)");
@@ -1697,12 +1765,11 @@ async function runReviewMode(opts) {
   });
   if (built.ok && built.receipt) {
     const store = opts.receiptStore ?? defaultReceiptStore();
-    const file = writeReceipt(store, built.receipt);
-    log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, conventionManifest, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    log("Receipt qualified by the core \u2014 deferred to the full-roster gate.");
+    return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptError: built.error, reviews, secretScan };
 }
 
 // src/modes/brainstorm/types.ts
@@ -2665,6 +2732,7 @@ export {
   defaultReceiptStore,
   diffDigest,
   ensureSandboxProfile,
+  escapesRoot,
   extractGrokText,
   extractJsonBlock,
   extractRefs,
@@ -2736,5 +2804,6 @@ export {
   summarizeCoverage,
   titleCase,
   validateReceiptShape,
-  writeReceipt
+  writeReceipt,
+  writeTrailFile
 };

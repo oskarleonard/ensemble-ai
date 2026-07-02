@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  type ConventionReader,
   extractRefs,
   fsConventionReader,
   gatherConventions,
@@ -218,10 +219,11 @@ describe('C · byte-cap bounds the READ (never slurp a huge file to trim it)', (
       list: reader.list,
     };
     await gatherConventions(spy, ['a.ts'], { capBytes: 6_000 });
-    // Every real read was bounded (never undefined) and never above the cap.
+    // Every real read was bounded (never undefined) and only a tiny margin past the cap
+    // (the read-truncation detection probe = capBytes + a few bytes), never the whole file.
     const reads = seen.filter((n) => n !== undefined) as number[];
     expect(reads.length).toBeGreaterThan(0);
-    expect(reads.every((n) => n <= 6_000)).toBe(true);
+    expect(reads.every((n) => n <= 6_100)).toBe(true);
   });
 });
 
@@ -240,5 +242,48 @@ describe('C · maxFiles boundary file is NAMED, not silently dropped', () => {
     expect(boundary?.included).toBe(false);
     // The one real file under the ceiling IS included — the ceiling didn't drop everything.
     expect(manifest.files.some((f) => f.path === 'CLAUDE.md' && f.included)).toBe(true);
+  });
+});
+
+describe('read-truncation honesty (MED conventions.ts:189)', () => {
+  it('an over-cap file is bounded-read, marked truncated, and never reported complete', async () => {
+    const cap = 200;
+    // A file far larger than the cap. A read must be BOUNDED (not slurp the whole file),
+    // and its manifest entry must be head-only (truncated:true), never truncated:false.
+    const big = 'A'.repeat(5000);
+    const asks: Array<number | undefined> = [];
+    const reader: ConventionReader = {
+      async read(rel, maxBytes) {
+        asks.push(maxBytes);
+        if (rel !== 'AGENTS.md') return null;
+        // Honor the bound like a real reader (return at most maxBytes bytes).
+        return maxBytes === undefined ? big : big.slice(0, maxBytes);
+      },
+      async list() {
+        return [];
+      },
+    };
+    const { manifest } = await gatherConventions(reader, ['src/x.ts'], { capBytes: cap });
+    const entry = manifest.files.find((f) => f.path === 'AGENTS.md');
+    expect(entry).toBeDefined();
+    expect(entry?.truncated).toBe(true); // a head, not a complete file
+    expect(entry?.included).toBe(true); // its head IS in the flattened text
+    expect(entry?.bytes).toBeLessThanOrEqual(cap); // never over the cap
+    // The read was BOUNDED to a small probe of the cap — never an unbounded slurp.
+    expect(asks.every((a) => typeof a === 'number' && a <= cap + 64)).toBe(true);
+  });
+
+  it('a small under-cap file is reported complete (truncated:false)', async () => {
+    const reader: ConventionReader = {
+      async read(rel) {
+        return rel === 'AGENTS.md' ? '# short doc\n' : null;
+      },
+      async list() {
+        return [];
+      },
+    };
+    const { manifest } = await gatherConventions(reader, ['src/x.ts'], { capBytes: 4000 });
+    const entry = manifest.files.find((f) => f.path === 'AGENTS.md');
+    expect(entry).toMatchObject({ included: true, truncated: false });
   });
 });

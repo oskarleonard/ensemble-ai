@@ -32,7 +32,6 @@ import {
   buildDiffReceipt,
   type DiffReviewReceipt,
   defaultReceiptStore,
-  writeReceipt,
 } from './receipt';
 import { scanDiffForSecrets, type SecretScanResult } from './secret-scan';
 
@@ -89,9 +88,20 @@ export interface ReviewModeResult {
   // The local dependency-surface scan — present ONLY for the 'security' profile
   // (manifest changes + risky imports drawn from the diff; no network).
   depSurface?: DepSurfaceResult;
+  // The exact rendered prompt every core reviewer saw (byte-identical across reviewers) —
+  // returned so the self-contained layer's cold Opus reviewer reviews the SAME pinned
+  // packet, never a re-derived diff. Absent only on a secret-scan block (no packet built).
+  prompt?: string;
   receipt?: DiffReviewReceipt;
+  // The receipt the core (codex/grok) QUALIFIED but that is deliberately NOT yet written:
+  // when the default-on Opus reviewer is expected, the caller writes the receipt only
+  // AFTER that reviewer also completes (fail-loud parity with the exit gate), stamping the
+  // peer reviewer in — so an incomplete 3-reviewer run can never leave a clean receipt.
+  receiptCandidate?: DiffReviewReceipt;
   receiptError?: string;
   receiptPath?: string;
+  // The resolved receipt store dir (where the caller writes receiptCandidate).
+  receiptStore?: string;
   reviews: StoredReview[];
   secretScan: SecretScanResult;
 }
@@ -322,11 +332,15 @@ export async function runReviewMode(
     runId: opts.runId,
   });
   if (built.ok && built.receipt) {
+    // The core (codex/grok) QUALIFIES the receipt here, but writing is DEFERRED to the
+    // caller: the default-on Opus reviewer + synthesis run AFTER this, and a receipt must
+    // never be persisted before the full expected roster completed (else a failed/skipped
+    // Opus leaves a clean 'reviewed' receipt for an incomplete run — the fail-open). The
+    // caller writes receiptCandidate once the roster is verified complete.
     const store = opts.receiptStore ?? defaultReceiptStore();
-    const file = writeReceipt(store, built.receipt);
-    log(`Receipt written: ${file}`);
-    return { acquired, blocked: false, conventionManifest, depSurface, receipt: built.receipt, receiptPath: file, reviews, secretScan };
+    log('Receipt qualified by the core — deferred to the full-roster gate.');
+    return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
   }
   log(`No receipt — ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptError: built.error, reviews, secretScan };
 }

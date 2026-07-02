@@ -160,6 +160,11 @@ export function formatReceipt(receipt: DiffReviewReceipt): string {
   out.push(`  reviewers: ${receipt.reviewerPolicy.join(', ')} (policy)`);
   out.push(`  completed: ${receipt.completed.join(', ')}`);
   out.push(`  vendors:   ${receipt.vendors.join(', ')}`);
+  if (receipt.peerReviewers && receipt.peerReviewers.length > 0) {
+    out.push(
+      `  peers:     ${receipt.peerReviewers.map((p) => `${p.id} (${p.vendor}) ${p.state}`).join(', ')}`
+    );
+  }
   out.push(`  runId:     ${receipt.runId}`);
   out.push(`  coverage:  ${coverageCounts(c)}`);
   for (const o of c.omitted) {

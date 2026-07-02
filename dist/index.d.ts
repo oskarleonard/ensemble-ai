@@ -41,6 +41,8 @@ declare function listReviewers(file?: string): ReviewerConfig[];
 
 declare function sanitizePathSegment(s: string): string;
 declare function reviewDir(baseDir: string, runId: string): string;
+declare function escapesRoot(rel: string): boolean;
+declare function writeTrailFile(baseDir: string, runId: string, name: string, content: string): string;
 interface PersistReviewInput {
     findings: ReviewFinding[];
     packet: ReviewPacket;
@@ -229,11 +231,17 @@ interface ReceiptCoverage {
     omittedFiles: number;
     totalFiles: number;
 }
+interface PeerReviewerRecord {
+    id: string;
+    state: TerminalState;
+    vendor: string;
+}
 interface DiffReviewReceipt {
     baseRef: string | null;
     baseSha: string | null;
     completed: ReviewerId[];
     coverage: ReceiptCoverage;
+    peerReviewers?: PeerReviewerRecord[];
     diffDigest: string;
     diffMode: DiffMode;
     headSha: string;
@@ -352,9 +360,12 @@ interface ReviewModeResult {
     blockedReason?: string;
     conventionManifest?: ConventionManifest;
     depSurface?: DepSurfaceResult;
+    prompt?: string;
     receipt?: DiffReviewReceipt;
+    receiptCandidate?: DiffReviewReceipt;
     receiptError?: string;
     receiptPath?: string;
+    receiptStore?: string;
     reviews: StoredReview[];
     secretScan: SecretScanResult;
 }
@@ -578,4 +589,4 @@ declare function resolveMode(v: string): string;
 declare function isMode(v: string): v is ModeName;
 declare function isImplemented(mode: ModeName): boolean;
 
-export { type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormOptions, type BrainstormResult, type BuildReceiptResult, CRITIQUE_STANCES, type CodexReviewResult, type ConsultResult, type ConsultSynthesis, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type Coverage, type CoverageFileEntry, type CoveragePolicy, type Critique, type CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, type FileDiff, type FileKind, type GatherConfig, type GatheredConventions, IMPLEMENTED_MODES, type Idea, type InlineSecretHit, MODES, MODE_ALIASES, type ModeName, type OmitReason, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PersistReviewInput, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type RankedIdea, type RawIdea, type ReceiptCoverage, type ReceiptKey, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunReviewOpts, type SecretScanResult, type SensitivePathHit, StoredReview, type SynthesisResult, TerminalState, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, VOICE_IDS, type VoiceAnswerResult, type VoiceConfig, type VoiceCritiqueResult$1 as VoiceCritiqueResult, type VoiceGenerateResult, type VoiceId, type VoiceRunResult, acquireDiff, buildClaudeVoiceArgs, buildCodexReviewArgs, buildDiffReceipt, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, computeCoverage, computePolicyHash, index as consult, coverageCounts, coverageShortfall, defaultReceiptStore, diffDigest, ensureSandboxProfile, extractGrokText, extractRefs, fallbackSynthesis$1 as fallbackSynthesis, fsConventionReader, gatherConventions, hasDepSurface, isDiffReviewed, isImplemented, isMode, isVoiceId, keyOf, killTree, listReviewers, listVoices, loadReviewers, loadVoices, makeEscalatingKill, memoryConventionReader, omittedLine, parseCritique, parseDiffFiles, parseIdeas, parseReviewers, parseSynthesis, parseVoiceIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, readReceipt, readReview, readReviewsForRun, receiptIdentityMatches, receiptKeyHash, receiptPath, renderCritiquePrompt, renderGeneratePrompt, renderSynthesisPrompt, resolveBase, resolveBin, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveInRepo, resolveMode, resolveRepoId, resolveReviewSandbox, resolveReviewer, reviewDir, runBrainstormMode, runClaudeVoice, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, sha256Hex, summarizeCoverage, validateReceiptShape, writeReceipt };
+export { type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormOptions, type BrainstormResult, type BuildReceiptResult, CRITIQUE_STANCES, type CodexReviewResult, type ConsultResult, type ConsultSynthesis, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type Coverage, type CoverageFileEntry, type CoveragePolicy, type Critique, type CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, type FileDiff, type FileKind, type GatherConfig, type GatheredConventions, IMPLEMENTED_MODES, type Idea, type InlineSecretHit, MODES, MODE_ALIASES, type ModeName, type OmitReason, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PersistReviewInput, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type RankedIdea, type RawIdea, type ReceiptCoverage, type ReceiptKey, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunReviewOpts, type SecretScanResult, type SensitivePathHit, StoredReview, type SynthesisResult, TerminalState, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, VOICE_IDS, type VoiceAnswerResult, type VoiceConfig, type VoiceCritiqueResult$1 as VoiceCritiqueResult, type VoiceGenerateResult, type VoiceId, type VoiceRunResult, acquireDiff, buildClaudeVoiceArgs, buildCodexReviewArgs, buildDiffReceipt, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, computeCoverage, computePolicyHash, index as consult, coverageCounts, coverageShortfall, defaultReceiptStore, diffDigest, ensureSandboxProfile, escapesRoot, extractGrokText, extractRefs, fallbackSynthesis$1 as fallbackSynthesis, fsConventionReader, gatherConventions, hasDepSurface, isDiffReviewed, isImplemented, isMode, isVoiceId, keyOf, killTree, listReviewers, listVoices, loadReviewers, loadVoices, makeEscalatingKill, memoryConventionReader, omittedLine, parseCritique, parseDiffFiles, parseIdeas, parseReviewers, parseSynthesis, parseVoiceIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, readReceipt, readReview, readReviewsForRun, receiptIdentityMatches, receiptKeyHash, receiptPath, renderCritiquePrompt, renderGeneratePrompt, renderSynthesisPrompt, resolveBase, resolveBin, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveInRepo, resolveMode, resolveRepoId, resolveReviewSandbox, resolveReviewer, reviewDir, runBrainstormMode, runClaudeVoice, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, sha256Hex, summarizeCoverage, validateReceiptShape, writeReceipt, writeTrailFile };
