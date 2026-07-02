@@ -27,8 +27,15 @@ import {
 // outside [A-Za-z0-9._-] to '_', so a crafted id (path separators, `..`) can't
 // escape its base dir. ONE copy of this traversal defense — every on-disk key
 // (the run trail, the receipt store) routes through it so they can't drift.
+//
+// Dots ARE legal filename chars, so a segment of ONLY dots survives the char
+// filter — but `.` resolves to the base dir itself and `..` to its PARENT, so
+// `path.join(base, sanitize(id))` would escape (and a recursive rm of it would
+// delete the base or its parent). Neutralize any all-dots result by prefixing
+// `_` so it becomes an ordinary child segment (`.` → `_.`, `..` → `_..`).
 export function sanitizePathSegment(s: string): string {
-  return s.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const cleaned = s.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return /^\.+$/.test(cleaned) ? `_${cleaned}` : cleaned;
 }
 
 export function reviewDir(baseDir: string, runId: string): string {
@@ -41,28 +48,49 @@ export function reviewDir(baseDir: string, runId: string): string {
 // chmod after the write to GUARANTEE 0600 regardless of the caller's umask, then
 // rename into place (an atomic swap that carries the tmp file's mode).
 //
-// Symlink-safe: REALPATH the (created) dir so a symlinked path component can't redirect
-// the write out of the intended tree, and open the tmp with O_NOFOLLOW | O_EXCL so a
-// pre-planted symlink at the tmp path is REFUSED (never followed to clobber an outside
-// target). The final rename replaces `target` atomically — replacing a symlink AT the
-// target with the real file rather than writing through it.
-function writeAtomic(dir: string, name: string, content: string): void {
+// Symlink-safe: the write must land STRICTLY INSIDE the caller-supplied trail `root`
+// (the base dir). The earlier hardening lstat'd ONLY the leaf dir, so a symlink at an
+// ANCESTOR component below the root (e.g. a pre-planted `reviews/` symlink, or the run-id
+// dir reached through one) could still redirect the realpath'd write out of the tree. So
+// now: lstat BOTH the root and the leaf dir and refuse a symlink at either, then realpath
+// BOTH and REQUIRE the resolved dir to be contained under the resolved root — a symlink
+// hop anywhere between root and leaf makes the resolved dir escape the root and is refused.
+// (Legitimate ancestor symlinks in the caller's own base path — /tmp, ~/brain — resolve
+// consistently for root and dir, so containment still holds. A symlink AT/ABOVE the root
+// itself is the caller's own trusted path, outside this function's frame.) The tmp is then
+// opened O_NOFOLLOW | O_EXCL so a planted symlink at the FILE component is refused too, and
+// the final rename replaces `target` atomically rather than writing through a symlink.
+function writeAtomic(root: string, dir: string, name: string, content: string): void {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  // Refuse to write through a SYMLINKED trail dir: recursive mkdir treats a pre-planted
-  // symlink-to-dir as "already exists" and does NOT error, and realpathSync would then
-  // FOLLOW it — redirecting the write out of the intended tree (the O_NOFOLLOW below only
-  // guards the final FILE component, never a symlinked DIRECTORY). lstat the leaf and
-  // reject a symlink outright rather than following it.
-  if (fs.lstatSync(dir).isSymbolicLink()) {
-    throw new Error(`ensemble-ai: refusing to write into a symlinked trail dir: ${dir}`);
+  // Recursive mkdir treats a pre-planted symlink-to-dir as "already exists" and does NOT
+  // error, and realpathSync would then FOLLOW it. lstat the trail root leaf AND the run
+  // dir leaf and reject a symlink at either outright rather than following it.
+  for (const p of [root, dir]) {
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(p);
+    } catch {
+      continue; // not yet present (e.g. a multi-level root just made) — nothing to reject
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`ensemble-ai: refusing to write into a symlinked trail dir: ${p}`);
+    }
   }
-  // Now realpath the (real) dir so the write target is the resolved real dir, not a string
-  // whose interior components a symlink could point elsewhere.
+  // Realpath BOTH so an interior symlink between root and leaf is caught by the containment
+  // check below (not silently followed like the old leaf-only realpath did).
   let realDir = dir;
+  let realRoot = root;
   try {
     realDir = fs.realpathSync(dir);
+    realRoot = fs.realpathSync(root);
   } catch {
-    /* brand-new dir race — fall back to the lexical path */
+    /* brand-new dir race — fall back to the lexical paths */
+  }
+  const rel = path.relative(realRoot, realDir);
+  if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    throw new Error(
+      `ensemble-ai: refusing to write outside the trail root: ${realDir} is not under ${realRoot}`
+    );
   }
   const target = path.join(realDir, name);
   const tmp = `${target}.tmp`;
@@ -120,7 +148,7 @@ export function writeTrailFile(
   content: string
 ): string {
   const dir = reviewDir(baseDir, runId);
-  writeAtomic(dir, name, content);
+  writeAtomic(baseDir, dir, name, content);
   return path.join(dir, name);
 }
 
@@ -168,10 +196,11 @@ export function persistReview(
 ): StoredReview {
   const dir = reviewDir(baseDir, input.runId);
   const id = input.reviewer.id;
-  writeAtomic(dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
-  writeAtomic(dir, `prompt.${id}.md`, input.prompt);
-  if (input.raw !== null) writeAtomic(dir, `${id}-review.raw.md`, input.raw);
+  writeAtomic(baseDir, dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
+  writeAtomic(baseDir, dir, `prompt.${id}.md`, input.prompt);
+  if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review.raw.md`, input.raw);
   writeAtomic(
+    baseDir,
     dir,
     `findings.${id}.json`,
     JSON.stringify(input.findings, null, 2)
@@ -192,7 +221,7 @@ export function persistReview(
     summary: input.summary,
     terminalState: input.terminalState,
   };
-  writeAtomic(dir, reviewJson(id), JSON.stringify(stored, null, 2));
+  writeAtomic(baseDir, dir, reviewJson(id), JSON.stringify(stored, null, 2));
   return stored;
 }
 

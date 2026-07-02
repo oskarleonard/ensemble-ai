@@ -128,6 +128,21 @@ describe('trail security', () => {
     expect(sanitizePathSegment('../../etc')).toBe('.._.._etc');
   });
 
+  it('neutralizes a BARE dot / dot-dot runId (would resolve to the base or its PARENT)', () => {
+    // Dots are legal filename chars, so `.`/`..` survive the char filter — but they resolve
+    // to the base dir itself / its parent, which a recursive trail clear would then delete.
+    // The sanitizer prefixes `_` so they become ordinary child segments.
+    expect(sanitizePathSegment('.')).toBe('_.');
+    expect(sanitizePathSegment('..')).toBe('_..');
+    expect(sanitizePathSegment('...')).toBe('_...');
+    for (const evil of ['.', '..', '...']) {
+      const dir = reviewDir(baseDir, evil);
+      expect(path.dirname(dir)).toBe(baseDir); // strictly ONE level under the base
+      const rel = path.relative(baseDir, dir);
+      expect(rel === '.' || rel === '..' || rel.startsWith(`..${path.sep}`)).toBe(false);
+    }
+  });
+
   it('writes every persisted trail file owner-only (0600)', () => {
     persistReview(baseDir, {
       findings: [finding('f1')],

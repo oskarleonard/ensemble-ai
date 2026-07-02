@@ -27,20 +27,37 @@ var CONFIDENCES = ["high", "medium", "low"];
 
 // src/core/artifacts.ts
 function sanitizePathSegment(s) {
-  return s.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const cleaned = s.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return /^\.+$/.test(cleaned) ? `_${cleaned}` : cleaned;
 }
 function reviewDir(baseDir, runId) {
   return path.join(baseDir, sanitizePathSegment(runId) || "unknown");
 }
-function writeAtomic(dir, name, content) {
+function writeAtomic(root, dir, name, content) {
   fs.mkdirSync(dir, { recursive: true, mode: 448 });
-  if (fs.lstatSync(dir).isSymbolicLink()) {
-    throw new Error(`ensemble-ai: refusing to write into a symlinked trail dir: ${dir}`);
+  for (const p of [root, dir]) {
+    let st;
+    try {
+      st = fs.lstatSync(p);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`ensemble-ai: refusing to write into a symlinked trail dir: ${p}`);
+    }
   }
   let realDir = dir;
+  let realRoot = root;
   try {
     realDir = fs.realpathSync(dir);
+    realRoot = fs.realpathSync(root);
   } catch {
+  }
+  const rel = path.relative(realRoot, realDir);
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    throw new Error(
+      `ensemble-ai: refusing to write outside the trail root: ${realDir} is not under ${realRoot}`
+    );
   }
   const target = path.join(realDir, name);
   const tmp = `${target}.tmp`;
@@ -73,7 +90,7 @@ function writeAtomic(dir, name, content) {
 }
 function writeTrailFile(baseDir, runId, name, content) {
   const dir = reviewDir(baseDir, runId);
-  writeAtomic(dir, name, content);
+  writeAtomic(baseDir, dir, name, content);
   return path.join(dir, name);
 }
 function readJson(file) {
@@ -97,10 +114,11 @@ function reviewJson(reviewerId) {
 function persistReview(baseDir, input) {
   const dir = reviewDir(baseDir, input.runId);
   const id = input.reviewer.id;
-  writeAtomic(dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
-  writeAtomic(dir, `prompt.${id}.md`, input.prompt);
-  if (input.raw !== null) writeAtomic(dir, `${id}-review.raw.md`, input.raw);
+  writeAtomic(baseDir, dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
+  writeAtomic(baseDir, dir, `prompt.${id}.md`, input.prompt);
+  if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review.raw.md`, input.raw);
   writeAtomic(
+    baseDir,
     dir,
     `findings.${id}.json`,
     JSON.stringify(input.findings, null, 2)
@@ -121,7 +139,7 @@ function persistReview(baseDir, input) {
     summary: input.summary,
     terminalState: input.terminalState
   };
-  writeAtomic(dir, reviewJson(id), JSON.stringify(stored, null, 2));
+  writeAtomic(baseDir, dir, reviewJson(id), JSON.stringify(stored, null, 2));
   return stored;
 }
 function readReview(baseDir, runId, reviewerId = "codex") {
@@ -2818,16 +2836,60 @@ function parseReviewSynthesis(raw) {
   }
   return { agreements, bottomLine, disagreements, sanityChecks, summary };
 }
+var STOPWORDS = /* @__PURE__ */ new Set([
+  "the",
+  "and",
+  "for",
+  "that",
+  "this",
+  "with",
+  "are",
+  "was",
+  "not",
+  "but",
+  "its",
+  "into",
+  "from",
+  "when",
+  "then",
+  "than",
+  "has",
+  "have",
+  "you",
+  "your",
+  "can",
+  "will"
+]);
+function significantTokens(s) {
+  const out = /* @__PURE__ */ new Set();
+  for (const t of s.toLowerCase().match(/[a-z0-9_]+/g) ?? []) {
+    if (t.length >= 3 && !STOPWORDS.has(t)) out.add(t);
+  }
+  return out;
+}
+function voiceCorroboratesPoint(review, pointTokens) {
+  if (pointTokens.size === 0) return false;
+  for (const f of review.findings) {
+    const hay = significantTokens(
+      `${f.title} ${f.body} ${f.evidence.file ?? ""} ${f.evidence.detail ?? ""}`
+    );
+    for (const t of pointTokens) if (hay.has(t)) return true;
+  }
+  return false;
+}
 function reconcileSynthesis(synth, reviews) {
   if (synth.degraded) return { synthesis: synth, demoted: 0 };
-  const findingVoices = new Set(
-    reviews.filter((r) => r.ok && r.findings.length > 0).map((r) => r.voiceId.trim().toLowerCase())
+  const findingVoices = new Map(
+    reviews.filter((r) => r.ok && r.findings.length > 0).map((r) => [r.voiceId.trim().toLowerCase(), r])
   );
-  const isReal = (v) => findingVoices.has(v.trim().toLowerCase());
   const agreements = [];
   const demoted = [];
   for (const a of synth.agreements) {
-    const credited = [...new Set(a.voices)].filter(isReal);
+    const pointTokens = significantTokens(a.point);
+    const credited = [...new Set(a.voices)].filter((v) => {
+      const review = findingVoices.get(v.trim().toLowerCase());
+      return review ? voiceCorroboratesPoint(review, pointTokens) : false;
+    });
     if (credited.length >= 2) {
       agreements.push({ point: a.point, voices: credited });
     } else {
@@ -2976,7 +3038,11 @@ async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log) {
   const parsed = parseFindings(res.raw);
   if (parsed.parseError) {
     log(`  \xB7 claude: ${parsed.parseError}`);
-    return { raw: res.raw, review: { findings: [], ok: false, summary: parsed.summary || parsed.parseError, voiceId: "claude" } };
+    const detail = parsed.summary ? `; model said: ${parsed.summary}` : "";
+    return {
+      raw: res.raw,
+      review: { findings: [], ok: false, summary: `output not parseable (${parsed.parseError})${detail}`, voiceId: "claude" }
+    };
   }
   log(`  \xB7 claude: reviewed \u2014 ${parsed.findings.length} finding(s)`);
   return { raw: res.raw, review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: "claude" } };
@@ -3031,13 +3097,17 @@ async function synthesizeReviews(reviews, run, config, opts = {}) {
   );
   return synthesis;
 }
+function claudeModelLabel(config) {
+  return config.model && config.model !== "default" ? config.model : "opus";
+}
 async function runClaudeReviewLayer(opts) {
   const log = opts.log ?? (() => {
   });
   const run = opts.run ?? runClaudeReviewVoice;
+  const modelLabel = claudeModelLabel(opts.claudeConfig);
   let claudeReview = null;
   if (opts.includeClaudeReviewer) {
-    log("  \xB7 claude (anthropic/opus) reviewing the diff (cold)\u2026");
+    log(`  \xB7 claude (anthropic/${modelLabel}) reviewing the diff (cold)\u2026`);
     const { review, raw } = await runClaudeReviewer(
       opts.reviewPrompt,
       opts.claudeConfig,
@@ -3049,7 +3119,13 @@ async function runClaudeReviewLayer(opts) {
     try {
       persistClaudeReview(opts.baseDir, opts.runId, review, raw);
     } catch (e) {
-      log(`  \xB7 claude: trail persist failed (${e.message}) \u2014 continuing without it`);
+      const why = e.message;
+      log(`  \xB7 claude: trail persist FAILED (${why}) \u2014 reviewer counted INCOMPLETE`);
+      claudeReview = {
+        ...review,
+        ok: false,
+        summary: `claude reviewed but FAILED to persist to the trail (${why}) \u2014 not a complete reviewer`
+      };
     }
   }
   const coreVoices = opts.coreReviews.map(storedToVoiceReview);
@@ -3074,7 +3150,7 @@ async function runClaudeReviewLayer(opts) {
     opts.synthConfig ?? opts.claudeConfig,
     { log, timeoutMs: opts.timeoutMs }
   );
-  return { claudeReview, synthesis };
+  return { claudeReview, modelLabel, synthesis };
 }
 function claudeLayerHasHigh(layer) {
   const cr = layer?.claudeReview;
@@ -3088,7 +3164,7 @@ function renderClaudeLayer(result) {
   const cr = result.claudeReview;
   if (cr) {
     out.push("");
-    out.push(`  \u2500\u2500 claude [anthropic/opus] \u2014 ${cr.ok ? "reviewed" : "failed"} (cold peer reviewer) \u2500\u2500`);
+    out.push(`  \u2500\u2500 claude [anthropic/${result.modelLabel}] \u2014 ${cr.ok ? "reviewed" : "failed"} (cold peer reviewer) \u2500\u2500`);
     if (!cr.ok) {
       out.push(`     ${scrub(cr.summary).slice(0, 200)}`);
     } else if (cr.findings.length === 0) {
@@ -3450,6 +3526,21 @@ Options + exit codes are identical to \`ensemble-ai review\` (run \`review --hel
 function genRunId() {
   const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
   return `${stamp}-${crypto2.randomBytes(4).toString("hex")}`;
+}
+function clearReusedRunTrail(baseDir, trailDir) {
+  let realBase;
+  let realTarget;
+  try {
+    realBase = fs11.realpathSync(baseDir);
+    realTarget = fs11.realpathSync(trailDir);
+  } catch {
+    return;
+  }
+  const rel = path9.relative(realBase, realTarget);
+  if (!rel || rel === ".." || rel.startsWith(`..${path9.sep}`) || path9.isAbsolute(rel)) {
+    return;
+  }
+  fs11.rmSync(realTarget, { force: true, recursive: true });
 }
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
@@ -3855,10 +3946,7 @@ async function reviewCommand(args, profile = "code") {
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
   const out = typeof values.out === "string" ? path9.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
-  try {
-    fs11.rmSync(trailDir, { force: true, recursive: true });
-  } catch {
-  }
+  clearReusedRunTrail(out, trailDir);
   const ceiling = positiveCeiling(
     typeof values.ceiling === "string" ? values.ceiling : void 0,
     cmd

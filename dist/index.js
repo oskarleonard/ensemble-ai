@@ -643,20 +643,37 @@ function listReviewers(file = REVIEWERS_FILE) {
 import fs3 from "fs";
 import path3 from "path";
 function sanitizePathSegment(s) {
-  return s.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const cleaned = s.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return /^\.+$/.test(cleaned) ? `_${cleaned}` : cleaned;
 }
 function reviewDir(baseDir, runId) {
   return path3.join(baseDir, sanitizePathSegment(runId) || "unknown");
 }
-function writeAtomic(dir, name, content) {
+function writeAtomic(root, dir, name, content) {
   fs3.mkdirSync(dir, { recursive: true, mode: 448 });
-  if (fs3.lstatSync(dir).isSymbolicLink()) {
-    throw new Error(`ensemble-ai: refusing to write into a symlinked trail dir: ${dir}`);
+  for (const p of [root, dir]) {
+    let st;
+    try {
+      st = fs3.lstatSync(p);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`ensemble-ai: refusing to write into a symlinked trail dir: ${p}`);
+    }
   }
   let realDir = dir;
+  let realRoot = root;
   try {
     realDir = fs3.realpathSync(dir);
+    realRoot = fs3.realpathSync(root);
   } catch {
+  }
+  const rel = path3.relative(realRoot, realDir);
+  if (rel === ".." || rel.startsWith(`..${path3.sep}`) || path3.isAbsolute(rel)) {
+    throw new Error(
+      `ensemble-ai: refusing to write outside the trail root: ${realDir} is not under ${realRoot}`
+    );
   }
   const target = path3.join(realDir, name);
   const tmp = `${target}.tmp`;
@@ -689,7 +706,7 @@ function writeAtomic(dir, name, content) {
 }
 function writeTrailFile(baseDir, runId, name, content) {
   const dir = reviewDir(baseDir, runId);
-  writeAtomic(dir, name, content);
+  writeAtomic(baseDir, dir, name, content);
   return path3.join(dir, name);
 }
 function readJson(file) {
@@ -713,10 +730,11 @@ function reviewJson(reviewerId) {
 function persistReview(baseDir, input) {
   const dir = reviewDir(baseDir, input.runId);
   const id = input.reviewer.id;
-  writeAtomic(dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
-  writeAtomic(dir, `prompt.${id}.md`, input.prompt);
-  if (input.raw !== null) writeAtomic(dir, `${id}-review.raw.md`, input.raw);
+  writeAtomic(baseDir, dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
+  writeAtomic(baseDir, dir, `prompt.${id}.md`, input.prompt);
+  if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review.raw.md`, input.raw);
   writeAtomic(
+    baseDir,
     dir,
     `findings.${id}.json`,
     JSON.stringify(input.findings, null, 2)
@@ -737,7 +755,7 @@ function persistReview(baseDir, input) {
     summary: input.summary,
     terminalState: input.terminalState
   };
-  writeAtomic(dir, reviewJson(id), JSON.stringify(stored, null, 2));
+  writeAtomic(baseDir, dir, reviewJson(id), JSON.stringify(stored, null, 2));
   return stored;
 }
 function readReview(baseDir, runId, reviewerId = "codex") {

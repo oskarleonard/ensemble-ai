@@ -191,6 +191,31 @@ function genRunId(): string {
   return `${stamp}-${crypto.randomBytes(4).toString('hex')}`;
 }
 
+// Clear a REUSED run-id's stale trail dir so a prior run's `review.<id>.json` can't be read
+// back into THIS run's synthesis. A recursive delete of a path derived from user input
+// (`--run-id`) is a footgun, so it is fenced with defense-in-depth: the runId is already
+// path-sanitized by reviewDir/sanitizePathSegment (which now also neutralizes bare `.`/`..`),
+// and HERE we independently realpath BOTH the base and the target and delete ONLY when the
+// target resolves to a path STRICTLY INSIDE the realpath'd base — never the base itself, an
+// ancestor, or (via a symlink hop) anywhere outside. A fresh / auto-generated run id has no
+// dir to clear (realpath throws → we simply return). So the recursive rm can only ever remove
+// this run's own subdir under the trail base.
+function clearReusedRunTrail(baseDir: string, trailDir: string): void {
+  let realBase: string;
+  let realTarget: string;
+  try {
+    realBase = fs.realpathSync(baseDir);
+    realTarget = fs.realpathSync(trailDir);
+  } catch {
+    return; // base or per-run dir doesn't exist yet → nothing to clear (fresh run id)
+  }
+  const rel = path.relative(realBase, realTarget);
+  if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    return; // not strictly inside the base (would be the base itself or an escape) → refuse
+  }
+  fs.rmSync(realTarget, { force: true, recursive: true });
+}
+
 function readStdinIfPiped(): string | undefined {
   if (process.stdin.isTTY) return undefined;
   try {
@@ -812,13 +837,9 @@ async function reviewCommand(
   // REUSED `--run-id` — clear it first, so STALE review files from a prior run with the
   // same id can't be read back into the synthesis (loadVoiceReviewsFromTrail reads
   // whatever `review.<id>.json` is on disk, blind to which run wrote it). A fresh /
-  // auto-generated run id has no dir to clear (force → no throw). reviewDir appends the
-  // sanitized runId as a dedicated subdir, so this only ever removes THIS run's own dir.
-  try {
-    fs.rmSync(trailDir, { force: true, recursive: true });
-  } catch {
-    /* best-effort — nothing to clear (fresh run id) */
-  }
+  // auto-generated run id has no dir to clear. This is a RECURSIVE delete of a path that
+  // carries user-influenced input (`--run-id`), so it is fenced hard — see clearReusedRunTrail.
+  clearReusedRunTrail(out, trailDir);
   const ceiling = positiveCeiling(
     typeof values.ceiling === 'string' ? values.ceiling : undefined,
     cmd

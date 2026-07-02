@@ -214,7 +214,7 @@ describe('self-contained Opus layer wiring (default-on; --no-claude opts out; fe
 
   it('runs the Opus layer by default over the pinned packet prompt', async () => {
     mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed')] }));
-    mockLayer.mockResolvedValue({ claudeReview: null, synthesis });
+    mockLayer.mockResolvedValue({ claudeReview: null, modelLabel: 'opus', synthesis });
     await main(['review', '--working-tree']);
     expect(mockLayer).toHaveBeenCalledWith(
       expect.objectContaining({ includeClaudeReviewer: true, reviewPrompt: 'PINNED' })
@@ -234,6 +234,7 @@ describe('self-contained Opus layer wiring (default-on; --no-claude opts out; fe
         findings: [{ body: '', confidence: 'high', evidence: {}, id: 'f1', severity: 'high', title: 't' }],
         ok: true, summary: '', voiceId: 'claude',
       },
+      modelLabel: 'opus',
       synthesis,
     });
     expect(await main(['review', '--working-tree'])).toBe(4);
@@ -246,6 +247,7 @@ describe('self-contained Opus layer wiring (default-on; --no-claude opts out; fe
     mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed')] }));
     mockLayer.mockResolvedValue({
       claudeReview: { findings: [], ok: false, summary: 'claude produced no output', voiceId: 'claude' },
+      modelLabel: 'opus',
       synthesis,
     });
     expect(await main(['review', '--working-tree'])).toBe(1);

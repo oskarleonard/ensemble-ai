@@ -166,8 +166,16 @@ async function runClaudeReviewer(
   }
   const parsed = parseFindings(res.raw);
   if (parsed.parseError) {
+    // A parse failure is the reviewer FAILING, never a clean review — surface it as such.
+    // Lead the summary with the parse error so a voice that emitted an unparseable reply
+    // (or a bare prose reply that yielded a summary but no findings array) is reported
+    // failed, not dressed up with the model's own summary text that would mask the failure.
     log(`  · claude: ${parsed.parseError}`);
-    return { raw: res.raw, review: { findings: [], ok: false, summary: parsed.summary || parsed.parseError, voiceId: 'claude' } };
+    const detail = parsed.summary ? `; model said: ${parsed.summary}` : '';
+    return {
+      raw: res.raw,
+      review: { findings: [], ok: false, summary: `output not parseable (${parsed.parseError})${detail}`, voiceId: 'claude' },
+    };
   }
   log(`  · claude: reviewed — ${parsed.findings.length} finding(s)`);
   return { raw: res.raw, review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: 'claude' } };
@@ -258,7 +266,18 @@ export interface ClaudeLayerOptions {
 export interface ClaudeLayerResult {
   // The cold Opus review (null when claude is not in the roster).
   claudeReview: VoiceReview | null;
+  // The model that ACTUALLY ran the claude voice (e.g. `opus`, `sonnet`) — rendered in the
+  // stdout block so the output never hardcodes "opus" when a different Claude model is
+  // configured. `opus` is the design default (when the voice config leaves the model unset).
+  modelLabel: string;
   synthesis: ReviewSynthesis;
+}
+
+// The Claude model label for output: the configured model when one is explicitly set, else
+// `opus` (the CLI's default for this voice, by design). So a `--model sonnet` run prints
+// `sonnet`, never a hardcoded `opus`.
+function claudeModelLabel(config: VoiceConfig): string {
+  return config.model && config.model !== 'default' ? config.model : 'opus';
 }
 
 // Run the cold Opus reviewer (when in the roster) over the SAME prompt + persist it, write
@@ -270,10 +289,11 @@ export async function runClaudeReviewLayer(
 ): Promise<ClaudeLayerResult> {
   const log = opts.log ?? (() => {});
   const run: ClaudeRunner = opts.run ?? runClaudeReviewVoice;
+  const modelLabel = claudeModelLabel(opts.claudeConfig);
 
   let claudeReview: VoiceReview | null = null;
   if (opts.includeClaudeReviewer) {
-    log('  · claude (anthropic/opus) reviewing the diff (cold)…');
+    log(`  · claude (anthropic/${modelLabel}) reviewing the diff (cold)…`);
     const { review, raw } = await runClaudeReviewer(
       opts.reviewPrompt,
       opts.claudeConfig,
@@ -282,14 +302,22 @@ export async function runClaudeReviewLayer(
       log
     );
     claudeReview = review;
-    // The trail persist is best-effort: an FS error (bad perms, symlink refusal, full
-    // disk) must DEGRADE the Opus reviewer — the in-memory review still feeds the HIGH
-    // gate + rendering — never crash the whole review. It just drops out of the
-    // disk-read synthesis input below (synthesis then runs over codex+grok).
+    // The trail persist must SUCCEED for the claude voice to count as a complete reviewer:
+    // if it fails, the review never reaches the trail (so the disk-read synthesis below
+    // silently drops it) and its findings are unverifiable after the run. A completed-but-
+    // unpersisted review must NOT be reported as a full pass — mark it ok:false so the exit
+    // gate treats claude as an INCOMPLETE reviewer (fail-loud), matching a failed core
+    // reviewer, instead of exit 0 as if 3 reviewers reviewed. It never crashes the review.
     try {
       persistClaudeReview(opts.baseDir, opts.runId, review, raw);
     } catch (e) {
-      log(`  · claude: trail persist failed (${(e as Error).message}) — continuing without it`);
+      const why = (e as Error).message;
+      log(`  · claude: trail persist FAILED (${why}) — reviewer counted INCOMPLETE`);
+      claudeReview = {
+        ...review,
+        ok: false,
+        summary: `claude reviewed but FAILED to persist to the trail (${why}) — not a complete reviewer`,
+      };
     }
   }
 
@@ -321,7 +349,7 @@ export async function runClaudeReviewLayer(
     opts.synthConfig ?? opts.claudeConfig,
     { log, timeoutMs: opts.timeoutMs }
   );
-  return { claudeReview, synthesis };
+  return { claudeReview, modelLabel, synthesis };
 }
 
 // ── HIGH-gate contribution ────────────────────────────────────────────────────────────
@@ -350,7 +378,7 @@ export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
   const cr = result.claudeReview;
   if (cr) {
     out.push('');
-    out.push(`  ── claude [anthropic/opus] — ${cr.ok ? 'reviewed' : 'failed'} (cold peer reviewer) ──`);
+    out.push(`  ── claude [anthropic/${result.modelLabel}] — ${cr.ok ? 'reviewed' : 'failed'} (cold peer reviewer) ──`);
     if (!cr.ok) {
       out.push(`     ${scrub(cr.summary).slice(0, 200)}`);
     } else if (cr.findings.length === 0) {

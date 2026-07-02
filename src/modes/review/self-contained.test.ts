@@ -255,6 +255,58 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, grace
     expect(calls.map((c) => c.round)).toEqual(['synth']);
     expect(fs.existsSync(path.join(reviewDir(base, runId), 'review.claude.md'))).toBe(false);
   });
+
+  it('surfaces a claude reviewer PARSE failure as failed, not a masked model summary', async () => {
+    const base = tmpTrail();
+    const runId = 'runPF';
+    seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    // A reply with a summary but NO findings array is not a conforming review → parseError.
+    // It must read as FAILED, never dressed up with the model's own summary text.
+    const { run } = makeRunner({ onReview: () => okRun(JSON.stringify({ summary: 'looks fine to me' })) });
+    const res = await runClaudeReviewLayer({
+      baseDir: base, claudeConfig: CFG, coreReviews: [stored('codex'), stored('grok')],
+      includeClaudeReviewer: true, reviewPrompt: 'P', run, runId,
+    });
+    expect(res.claudeReview?.ok).toBe(false);
+    expect(res.claudeReview?.summary).toMatch(/not parseable/i);
+  });
+
+  it('reports the Opus reviewer INCOMPLETE (ok:false) when its findings FAIL to persist', async () => {
+    const base = tmpTrail();
+    const runId = 'runP';
+    seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    // Make the run dir read-only so the claude trail writes raise (the core reviews are
+    // already written + stay readable for the synthesis). A completed-but-unpersisted review
+    // must not count as a full pass — it drops from the disk-read synthesis, so counting it
+    // complete would report a 3-reviewer pass that isn't on the trail.
+    const dir = reviewDir(base, runId);
+    fs.chmodSync(dir, 0o500);
+    try {
+      const { run } = makeRunner();
+      const res = await runClaudeReviewLayer({
+        baseDir: base, claudeConfig: CFG, coreReviews: [stored('codex'), stored('grok')],
+        includeClaudeReviewer: true, reviewPrompt: 'P', run, runId,
+      });
+      expect(res.claudeReview?.ok).toBe(false);
+      expect(res.claudeReview?.summary).toMatch(/failed to persist/i);
+    } finally {
+      fs.chmodSync(dir, 0o700); // restore for tmp cleanup
+    }
+  });
+
+  it('carries the ACTUAL configured claude model (not a hardcoded opus) into the output', async () => {
+    const base = tmpTrail();
+    const runId = 'runM';
+    seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    const { run } = makeRunner();
+    const res = await runClaudeReviewLayer({
+      baseDir: base, claudeConfig: { ...CFG, model: 'sonnet' },
+      coreReviews: [stored('codex'), stored('grok')],
+      includeClaudeReviewer: true, reviewPrompt: 'P', run, runId,
+    });
+    expect(res.modelLabel).toBe('sonnet');
+    expect(renderClaudeLayer(res).join('\n')).toContain('claude [anthropic/sonnet]');
+  });
 });
 
 describe('loadVoiceReviewsFromTrail — synthesis input is read from the injected review files', () => {
@@ -294,10 +346,10 @@ describe('loadVoiceReviewsFromTrail — synthesis input is read from the injecte
 describe('claudeLayerHasHigh — the Opus voice feeds the SAME exit gate', () => {
   it('true only for a completed Opus review carrying a HIGH', () => {
     const high: VoiceReview = { findings: [{ body: 'b', confidence: 'high', evidence: {}, id: 'f1', severity: 'high', title: 't' }], ok: true, summary: '', voiceId: 'claude' };
-    expect(claudeLayerHasHigh({ claudeReview: high, synthesis: {} as never })).toBe(true);
-    expect(claudeLayerHasHigh({ claudeReview: { ...high, ok: false }, synthesis: {} as never })).toBe(false);
+    expect(claudeLayerHasHigh({ claudeReview: high, modelLabel: 'opus', synthesis: {} as never })).toBe(true);
+    expect(claudeLayerHasHigh({ claudeReview: { ...high, ok: false }, modelLabel: 'opus', synthesis: {} as never })).toBe(false);
     expect(claudeLayerHasHigh(null)).toBe(false);
-    expect(claudeLayerHasHigh({ claudeReview: null, synthesis: {} as never })).toBe(false);
+    expect(claudeLayerHasHigh({ claudeReview: null, modelLabel: 'opus', synthesis: {} as never })).toBe(false);
   });
 });
 

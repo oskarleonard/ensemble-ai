@@ -222,17 +222,51 @@ export function parseReviewSynthesis(raw: string): ParsedReviewSynthesis {
   return { agreements, bottomLine, disagreements, sanityChecks, summary };
 }
 
+// Significant tokens of a string, for corroboration matching: lowercased word tokens of
+// length ≥3, minus a small structural stopword set (articles/conjunctions/prepositions),
+// deduped. Kept lexical + deliberately lenient (a legitimate paraphrase shares content
+// words like the symbol/file/keyword) — this is a fabrication guard, not a semantic match.
+const STOPWORDS = new Set([
+  'the', 'and', 'for', 'that', 'this', 'with', 'are', 'was', 'not', 'but', 'its',
+  'into', 'from', 'when', 'then', 'than', 'has', 'have', 'you', 'your', 'can', 'will',
+]);
+function significantTokens(s: string): Set<string> {
+  const out = new Set<string>();
+  for (const t of s.toLowerCase().match(/[a-z0-9_]+/g) ?? []) {
+    if (t.length >= 3 && !STOPWORDS.has(t)) out.add(t);
+  }
+  return out;
+}
+
+// Does a voice ACTUALLY corroborate a claimed agreement point? True only when the voice has
+// at least one finding whose text (title + body + cited file + detail) shares a significant
+// token with the point — i.e. it plausibly raised THE SAME issue, not merely "some" finding.
+// This is what makes an agreement DERIVED from the real findings rather than asserted: a
+// point about an issue no voice's findings mention corroborates nobody, so it can't survive
+// as confident consensus.
+function voiceCorroboratesPoint(review: VoiceReview, pointTokens: Set<string>): boolean {
+  if (pointTokens.size === 0) return false;
+  for (const f of review.findings) {
+    const hay = significantTokens(
+      `${f.title} ${f.body} ${f.evidence.file ?? ''} ${f.evidence.detail ?? ''}`
+    );
+    for (const t of pointTokens) if (hay.has(t)) return true;
+  }
+  return false;
+}
+
 // Guard against a synthesizer that fabricates CONFIDENT CONSENSUS. An AGREEMENT is a
 // concurrence on a FINDING, so it is only legitimate if ≥2 DISTINCT voices that ACTUALLY
-// RAISED A FINDING concur — we validate the synthesizer's claims against the real
-// per-voice findings, never trusting the model's self-report. For each agreement: drop any
-// credited voice id that did not raise a finding (a hallucinated/phantom voice — e.g.
-// crediting "claude" when it never ran, OR crediting a voice that reviewed but reported
-// NOTHING, which cannot corroborate a finding), and if fewer than 2 corroborating voices
-// remain, DEMOTE it to a disagreement ("look closer") rather than presenting invented
-// agreement as high-signal. Voice ids match case-insensitively (the model may echo a
-// different case). Returns the corrected synthesis + the demotion count (for logging). The
-// deterministic fallback already makes no agreement claim, so it passes through untouched.
+// RAISED THE SAME finding concur — we validate the synthesizer's claims against the real
+// per-voice findings, never trusting the model's self-report. For each agreement a voice is
+// credited ONLY if it (a) reviewed (ok) with ≥1 finding AND (b) has a finding that actually
+// corroborates the agreement POINT (lexical overlap — see voiceCorroboratesPoint), so a
+// phantom voice (never ran), a clean/no-findings voice (raised nothing), OR a voice whose
+// findings are about something ELSE cannot prop up an invented agreement. If fewer than 2
+// corroborating voices remain, DEMOTE it to a disagreement ("look closer") rather than
+// presenting invented agreement as high-signal. Voice ids match case-insensitively (the
+// model may echo a different case). Returns the corrected synthesis + the demotion count
+// (for logging). The deterministic fallback makes no agreement claim → passes through.
 export function reconcileSynthesis(
   synth: ReviewSynthesis,
   reviews: VoiceReview[]
@@ -240,17 +274,20 @@ export function reconcileSynthesis(
   if (synth.degraded) return { synthesis: synth, demoted: 0 };
   // A voice can corroborate a finding-agreement ONLY if it both reviewed (ok) AND actually
   // produced at least one finding — a clean/no-findings review raised nothing to agree on.
-  const findingVoices = new Set(
+  const findingVoices = new Map(
     reviews
       .filter((r) => r.ok && r.findings.length > 0)
-      .map((r) => r.voiceId.trim().toLowerCase())
+      .map((r) => [r.voiceId.trim().toLowerCase(), r] as const)
   );
-  const isReal = (v: string): boolean => findingVoices.has(v.trim().toLowerCase());
 
   const agreements: ReviewAgreement[] = [];
   const demoted: ReviewDisagreement[] = [];
   for (const a of synth.agreements) {
-    const credited = [...new Set(a.voices)].filter(isReal);
+    const pointTokens = significantTokens(a.point);
+    const credited = [...new Set(a.voices)].filter((v) => {
+      const review = findingVoices.get(v.trim().toLowerCase());
+      return review ? voiceCorroboratesPoint(review, pointTokens) : false;
+    });
     if (credited.length >= 2) {
       agreements.push({ point: a.point, voices: credited });
     } else {

@@ -129,30 +129,44 @@ describe('reconcileSynthesis — no invented consensus (validate vs real voices)
   const reviews = [review('codex'), review('grok')];
 
   it('keeps a genuine agreement (≥2 real concurring voices), stripping only phantom ids', () => {
+    // The point corroborates both voices' real finding ('null deref in foo') → survives.
     const { synthesis, demoted } = reconcileSynthesis(
-      synth({ agreements: [{ point: 'real bug', voices: ['codex', 'grok', 'phantom'] }] }),
+      synth({ agreements: [{ point: 'null deref in foo', voices: ['codex', 'grok', 'phantom'] }] }),
       reviews
     );
     expect(demoted).toBe(0);
-    expect(synthesis.agreements).toEqual([{ point: 'real bug', voices: ['codex', 'grok'] }]);
+    expect(synthesis.agreements).toEqual([{ point: 'null deref in foo', voices: ['codex', 'grok'] }]);
   });
 
   it('demotes an agreement crediting a voice that never reviewed (phantom consensus)', () => {
     const { synthesis, demoted } = reconcileSynthesis(
-      synth({ agreements: [{ point: 'fabricated', voices: ['codex', 'claude'] }] }),
-      reviews // claude never reviewed
+      synth({ agreements: [{ point: 'null deref in foo', voices: ['codex', 'claude'] }] }),
+      reviews // claude never reviewed → only codex corroborates → <2
     );
     expect(demoted).toBe(1);
     expect(synthesis.agreements).toEqual([]);
-    expect(synthesis.disagreements[0].point).toBe('fabricated');
+    expect(synthesis.disagreements[0].point).toBe('null deref in foo');
     expect(synthesis.disagreements[0].positions).toEqual(['codex: raised']);
+  });
+
+  it('demotes an agreement whose point matches NO real finding (concurrence not proven)', () => {
+    // Both voices reviewed WITH findings, but the claimed agreement is about an issue NEITHER
+    // raised — fabricated consensus derived from nothing, must not survive as confident.
+    const { synthesis, demoted } = reconcileSynthesis(
+      synth({ agreements: [{ point: 'SQL injection in the login handler', voices: ['codex', 'grok'] }] }),
+      reviews // both raised 'null deref in foo' — nothing about SQL injection
+    );
+    expect(demoted).toBe(1);
+    expect(synthesis.agreements).toEqual([]);
+    expect(synthesis.disagreements[0].point).toBe('SQL injection in the login handler');
+    expect(synthesis.disagreements[0].positions[0]).toMatch(/unverified/i);
   });
 
   it('demotes an agreement crediting a voice that reviewed but raised NO findings', () => {
     // grok reviewed cleanly (no findings) — it cannot corroborate a finding-agreement, so
     // an agreement crediting codex+grok collapses to a single real corroborator → demoted.
     const { synthesis, demoted } = reconcileSynthesis(
-      synth({ agreements: [{ point: 'only codex found this', voices: ['codex', 'grok'] }] }),
+      synth({ agreements: [{ point: 'null deref in foo', voices: ['codex', 'grok'] }] }),
       [review('codex'), review('grok', { findings: [] })]
     );
     expect(demoted).toBe(1);
@@ -171,7 +185,7 @@ describe('reconcileSynthesis — no invented consensus (validate vs real voices)
 
   it('matches voice ids case-insensitively', () => {
     const { demoted } = reconcileSynthesis(
-      synth({ agreements: [{ point: 'p', voices: ['CODEX', 'Grok'] }] }),
+      synth({ agreements: [{ point: 'null deref in foo', voices: ['CODEX', 'Grok'] }] }),
       reviews
     );
     expect(demoted).toBe(0);

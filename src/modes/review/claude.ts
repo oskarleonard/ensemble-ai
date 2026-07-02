@@ -18,6 +18,9 @@ import { type RunReviewOpts, REVIEW_TIMEOUT_MS } from '../../reviewers/codex';
 // runs ensemble-ai on their OWN diffs, and this matches the dashboard's own full-tool worker
 // posture. (The spawn's cwd is a throwaway tmpdir — see runReviewerExec — so even a read
 // tool has nothing of the repo to reach; the diff under review is embedded in the prompt.)
+// RATIFIED by Oskar (2026-07-02): the claude voice's read-only being weaker than codex's
+// `-s read-only` / grok's kernel sandbox is accepted, NOT a bug to fix — own-diffs threat
+// model + parity with the dashboard's full-tool review worker.
 
 // Claude's `--effort` accepts these levels; anything else ('default' sentinel included)
 // means "leave it to the CLI default", so the flag is omitted rather than passed invalid.
