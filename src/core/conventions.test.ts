@@ -1,7 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   extractRefs,
+  fsConventionReader,
   gatherConventions,
   memoryConventionReader,
   resolveInRepo,
@@ -179,5 +183,62 @@ describe('config lever · explicit conventions paths', () => {
     const paths = included(manifest);
     expect(paths).toContain('docs/house-style.md');
     expect(paths.some((p) => p.includes('brain'))).toBe(false); // escape rejected
+  });
+});
+
+describe('C · byte-cap bounds the READ (never slurp a huge file to trim it)', () => {
+  let root: string;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-conv-'));
+  });
+  afterEach(() => {
+    fs.rmSync(root, { force: true, recursive: true });
+  });
+
+  it('fs reader reads AT MOST maxBytes off disk, and the full file when unbounded', async () => {
+    const full = 'y'.repeat(200_000);
+    fs.writeFileSync(path.join(root, 'big.md'), full);
+    const reader = fsConventionReader(root);
+    const bounded = await reader.read('big.md', 1_000);
+    expect(bounded).not.toBeNull();
+    expect(Buffer.byteLength(bounded as string, 'utf8')).toBeLessThanOrEqual(1_000);
+    expect((bounded as string).length).toBeLessThan(full.length); // truly bounded, not trimmed-after
+    const whole = await reader.read('big.md');
+    expect(Buffer.byteLength(whole as string, 'utf8')).toBe(200_000);
+  });
+
+  it('gatherConventions passes the cap as the read bound (memory reader honors it)', async () => {
+    const reader = memoryConventionReader({ 'CLAUDE.md': 'z'.repeat(50_000) });
+    const seen: (number | undefined)[] = [];
+    const spy = {
+      read: (rel: string, maxBytes?: number) => {
+        seen.push(maxBytes);
+        return reader.read(rel, maxBytes);
+      },
+      list: reader.list,
+    };
+    await gatherConventions(spy, ['a.ts'], { capBytes: 6_000 });
+    // Every real read was bounded (never undefined) and never above the cap.
+    const reads = seen.filter((n) => n !== undefined) as number[];
+    expect(reads.length).toBeGreaterThan(0);
+    expect(reads.every((n) => n <= 6_000)).toBe(true);
+  });
+});
+
+describe('C · maxFiles boundary file is NAMED, not silently dropped', () => {
+  it('names the file that trips the ceiling with reason max-files', async () => {
+    // Only CLAUDE.md (which links a.md) + a.md exist. With maxFiles=1, CLAUDE.md is the one
+    // processed file; a.md is the boundary — it must be NAMED omitted, never silently gone.
+    const reader = memoryConventionReader({
+      'CLAUDE.md': '@a.md',
+      'a.md': 'the linked doc',
+    });
+    const { manifest } = await gatherConventions(reader, ['x.ts'], { maxFiles: 1 });
+    const boundary = manifest.files.find((f) => f.reason === 'max-files');
+    expect(boundary).toBeDefined();
+    expect(boundary?.path).toBe('a.md');
+    expect(boundary?.included).toBe(false);
+    // The one real file under the ceiling IS included — the ceiling didn't drop everything.
+    expect(manifest.files.some((f) => f.path === 'CLAUDE.md' && f.included)).toBe(true);
   });
 });

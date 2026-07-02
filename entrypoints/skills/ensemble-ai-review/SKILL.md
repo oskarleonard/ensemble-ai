@@ -51,9 +51,9 @@ ensemble-ai review $ARGUMENTS
 - Prereq: the `ensemble-ai` CLI must be on `PATH` (see entrypoints/README.md).
 - Exit codes: `4` = a HIGH finding is present (a real signal, not a crash) · `2` =
   blocked by the secret-scan · `1` = a reviewer failed · `3` = usage / no diff.
-- Capture the CLI's stdout (the per-reviewer findings + the `review input` + receipt/trail
-  paths). If it exits non-zero for a reason OTHER than `4`, report the exit code + stderr
-  and stop.
+- Capture the CLI's stdout (the per-reviewer findings + the `review input`, `receipt:`, and
+  `trail:` paths — all on stdout; per-run progress logs go to stderr). If it exits non-zero
+  for a reason OTHER than `4`, report the exit code + stderr and stop.
 
 ## 2 · Review the SAME PINNED input the reviewers saw, independently
 

@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
@@ -16,7 +19,7 @@ vi.mock('./modes/brainstorm', () => ({ runBrainstormMode: vi.fn() }));
 // Same for consult: test the dispatch + arg-parsing + alias contract, never spawn.
 vi.mock('./modes/consult', () => ({ runConsultMode: vi.fn() }));
 
-import { main } from './cli';
+import { main, resolveTrailBase } from './cli';
 import { runBrainstormMode } from './modes/brainstorm';
 import type { BrainstormResult } from './modes/brainstorm/types';
 import { runConsultMode } from './modes/consult';
@@ -544,5 +547,72 @@ describe('consult dispatch + arg parsing (+ ask alias)', () => {
     expect(printed).not.toContain(ESC);
     expect(printed).toContain('agree');
     expect(printed).toContain('split');
+  });
+});
+
+// Helper: all console.log (stdout) lines the run emitted, joined.
+const stdout = (): string =>
+  vi.mocked(console.log).mock.calls.map((c) => c.join(' ')).join('\n');
+
+describe('trail base (repo-local default + diff-source fence)', () => {
+  it('repo-local .ensemble-ai/reviews when in a git repo reviewing its own diff', () => {
+    expect(resolveTrailBase('/repo/root', true)).toBe(
+      path.join('/repo/root', '.ensemble-ai', 'reviews')
+    );
+  });
+  it('falls back to an OS temp dir when not in a git repo', () => {
+    expect(resolveTrailBase(null, true)).toBe(
+      path.join(os.tmpdir(), 'ensemble-ai', 'reviews')
+    );
+  });
+  it('FENCE: an external diff source (URL PR / raw / stdin) never trails into the cwd repo', () => {
+    // localRepoTrail=false models a --pr URL / --diff-file / stdin: a work/brain PR reviewed
+    // from a personal cwd repo must be fenced to a temp dir, not written into that cwd repo.
+    expect(resolveTrailBase('/repo/root', false)).toBe(
+      path.join(os.tmpdir(), 'ensemble-ai', 'reviews')
+    );
+  });
+});
+
+describe('trail + pinned-input output', () => {
+  it('emits the pinned review-input AND trail paths on stdout, single-nested under --out', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
+    await main(['review', '--working-tree', '--out', '/tmp/eai-out', '--run-id', 'myrun']);
+    const out = stdout();
+    // single <runId> segment — the double-<runId>/<runId> nesting bug is gone
+    expect(out).toContain(path.join('/tmp/eai-out', 'myrun', 'prompt.codex.md'));
+    expect(out).not.toContain(path.join('/tmp/eai-out', 'myrun', 'myrun'));
+    // the trail path is on STDOUT (matches the doc), pointing at the per-run dir
+    expect(out).toContain(`trail: ${path.join('/tmp/eai-out', 'myrun')}`);
+  });
+
+  it('always emits the pinned path when a trail exists (grok-only run, no codex)', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('grok', 'reviewed')] }));
+    await main(['review', '--working-tree', '--out', '/tmp/eai-out2', '--run-id', 'g']);
+    expect(stdout()).toContain(path.join('/tmp/eai-out2', 'g', 'prompt.grok.md'));
+  });
+
+  it('sanitizes a traversal --run-id so the printed trail path stays under the base', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
+    await main(['review', '--working-tree', '--out', '/tmp/eai-out', '--run-id', '../evil']);
+    const out = stdout();
+    expect(out).toContain(path.join('/tmp/eai-out', '.._evil')); // separator collapsed
+    expect(out).not.toContain(path.join('/tmp/eai-out', '..', 'evil')); // never climbs out
+  });
+
+  it('FENCE end-to-end: a --diff-file review defaults its trail to a temp dir, not the cwd repo', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
+    const df = path.join(os.tmpdir(), `eai-fence-${process.pid}.diff`);
+    fs.writeFileSync(df, 'diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -0,0 +1 @@\n+x\n');
+    try {
+      // NO --out: the test cwd IS a git repo, but a --diff-file's provenance is external →
+      // the trail must fence to the OS temp dir, never repo-local `.ensemble-ai`.
+      await main(['review', '--diff-file', df]);
+      const out = stdout();
+      expect(out).toContain(path.join(os.tmpdir(), 'ensemble-ai', 'reviews'));
+      expect(out).not.toContain(`${path.sep}.ensemble-ai${path.sep}reviews`);
+    } finally {
+      fs.rmSync(df, { force: true });
+    }
   });
 });

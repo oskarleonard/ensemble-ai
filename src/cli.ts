@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 
+import { reviewDir } from './core/artifacts';
 import {
   type ConventionManifest,
   type ConventionReader,
@@ -131,7 +132,9 @@ Options:
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
-  --out <dir>           trail output dir (default: a temp dir, printed)
+  --out <dir>           trail BASE dir; a per-run <run-id>/ subdir is created under it
+                        (default: repo-local .ensemble-ai/reviews when reviewing this
+                        repo's own diff, else an OS temp dir — the path is printed)
   --sandbox <profile>   reviewer sandbox profile override (deny-by-default only)
   --allow-sensitive     review even if the diff carries secrets/sensitive paths
   --ceiling <bytes>     coverage byte ceiling (default 200000)
@@ -224,6 +227,23 @@ function gitToplevel(cwd: string): string | null {
   }
 }
 
+// The DEFAULT trail BASE dir (a per-run `<runId>/` subdir is created under it by
+// reviewDir). Repo-local `<gitRoot>/.ensemble-ai/reviews` ONLY when we're in a git repo
+// AND the diff is that repo's own local state (localRepoTrail) — discoverable beside the
+// code, and `.ensemble-ai/` is gitignored so it never lands in a commit. Otherwise (not a
+// repo, OR a URL PR / raw diff / stdin whose provenance is a DIFFERENT or unknown repo)
+// fall back to the OS temp dir — the fence that keeps a work/brain diff's trail from ever
+// being written into an unrelated cwd repo. Keyed on the DIFF SOURCE, not just cwd.
+export function resolveTrailBase(
+  gitRoot: string | null,
+  localRepoTrail: boolean
+): string {
+  if (gitRoot && localRepoTrail) {
+    return path.join(gitRoot, '.ensemble-ai', 'reviews');
+  }
+  return path.join(os.tmpdir(), 'ensemble-ai', 'reviews');
+}
+
 // A gh-backed convention reader (the `--pr <url>` path) — reads repo-relative files
 // + lists dirs from the PR repo at a fixed ref via `gh api …/contents`. Mirrors the
 // dashboard's own gh reader, so both feed the SAME pure gatherConventions. Any gh
@@ -233,24 +253,46 @@ function ghConventionReader(
   ref: string,
   cwd: string
 ): ConventionReader {
+  // A repo-relative path / dir + the ref go into a URL — encode each so a path with a
+  // space or a special char (`docs/a b.md`, `feature/x`) can't corrupt the request or
+  // smuggle extra query params. Segments are encoded individually so `/` separators live.
+  const encPath = (p: string): string =>
+    p.split('/').map(encodeURIComponent).join('/');
+  const encRef = encodeURIComponent(ref);
   return {
-    async read(rel) {
+    async read(rel, maxBytes) {
+      // `.type=="file"` guard: the contents API returns an ARRAY for a directory (and an
+      // object for a file). Only a FILE object carries `.content` — for anything else emit
+      // nothing (→ null) rather than base64-decoding a directory listing into garbage.
       const cap = capture(
         'gh',
-        ['api', `repos/${repoSlug}/contents/${rel}?ref=${ref}`, '--jq', '.content'],
+        [
+          'api',
+          `repos/${repoSlug}/contents/${encPath(rel)}?ref=${encRef}`,
+          '--jq',
+          'if type=="object" and .type=="file" then .content else empty end',
+        ],
         cwd
       );
       if (!cap.ok || !cap.text.trim()) return null;
       try {
-        return Buffer.from(cap.text.replace(/\s/g, ''), 'base64').toString('utf8');
+        const decoded = Buffer.from(cap.text.replace(/\s/g, ''), 'base64').toString('utf8');
+        if (maxBytes !== undefined && Buffer.byteLength(decoded, 'utf8') > maxBytes) {
+          // Bound the returned content (drop a trailing partial multibyte char) so a huge
+          // remote doc never sits whole in the heap past what the gatherer can emit.
+          return Buffer.from(decoded, 'utf8').subarray(0, maxBytes).toString('utf8').replace(/�$/, '');
+        }
+        return decoded;
       } catch {
         return null;
       }
     },
     async list(dirRel) {
+      // A directory listing is an array; `.[].path` on a FILE (object) errors → non-zero
+      // exit → [] (handled by !cap.ok), so listing a non-dir yields nothing, not garbage.
       const cap = capture(
         'gh',
-        ['api', `repos/${repoSlug}/contents/${dirRel}?ref=${ref}`, '--jq', '.[].path'],
+        ['api', `repos/${repoSlug}/contents/${encPath(dirRel)}?ref=${encRef}`, '--jq', '.[].path'],
         cwd
       );
       if (!cap.ok) return [];
@@ -291,6 +333,13 @@ function resolveSource(
       diffMode?: DiffMode;
       diffText?: string;
       headShaOverride?: string;
+      // True ONLY when the diff is the cwd repo's OWN local state (commit/staged/
+      // working-tree) — so a repo-local `.ensemble-ai/reviews` trail is safe to drop.
+      // A URL PR (a DIFFERENT, possibly work/brain repo), a raw --diff-file, or piped
+      // stdin has unknown provenance → left false → the trail defaults to a temp dir,
+      // never written INTO the cwd repo. This is the trail fence keyed on the DIFF
+      // SOURCE, not just cwd (a work PR reviewed from ~/brain must not trail into it).
+      localRepoTrail?: boolean;
       // A URL PR reviews a DIFFERENT repo than the cwd. When its head SHA can't be
       // resolved (no gh ref to read conventions at), suppress the LOCAL-repo fallback:
       // gather NOTHING rather than the wrong repo's conventions.
@@ -410,11 +459,11 @@ function resolveSource(
     case 'stdin':
       return { diffText: stdinContent };
     case 'staged':
-      return { staged: true };
+      return { localRepoTrail: true, staged: true };
     case 'working-tree':
-      return { workingTree: true };
+      return { localRepoTrail: true, workingTree: true };
     case 'commit':
-      return {};
+      return { localRepoTrail: true };
   }
 }
 
@@ -724,10 +773,17 @@ async function reviewCommand(
     reviewers = parsed;
   }
   const runId = typeof values['run-id'] === 'string' ? values['run-id'] : genRunId();
+  // The trail BASE dir. `--out` overrides; otherwise repo-local when reviewing the cwd
+  // repo's OWN diff, else a temp dir (resolveTrailBase — the diff-source-keyed fence).
+  // reviewDir appends the PATH-SANITIZED runId to get the actual per-run trail dir; it is
+  // computed ONCE here so the packet writes (persistReview), the conventions manifest, the
+  // pinned-input path, and the printed trail path all agree — and so `out` never itself
+  // carries the runId, which is what double-nested `<runId>/<runId>` before.
   const out =
     typeof values.out === 'string'
       ? path.resolve(values.out)
-      : path.join(os.tmpdir(), 'ensemble-ai', runId);
+      : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+  const trailDir = reviewDir(out, runId);
   const ceiling = positiveCeiling(
     typeof values.ceiling === 'string' ? values.ceiling : undefined,
     cmd
@@ -766,11 +822,12 @@ async function reviewCommand(
   // records which convention files the reviewers saw (best-effort — never fatal).
   if (result.conventionManifest) {
     try {
-      fs.mkdirSync(out, { recursive: true });
-      fs.writeFileSync(
-        path.join(out, 'conventions.json'),
-        JSON.stringify(result.conventionManifest, null, 2)
-      );
+      fs.mkdirSync(trailDir, { mode: 0o700, recursive: true });
+      const cfile = path.join(trailDir, 'conventions.json');
+      fs.writeFileSync(cfile, JSON.stringify(result.conventionManifest, null, 2), {
+        mode: 0o600,
+      });
+      fs.chmodSync(cfile, 0o600);
     } catch {
       /* trail write is best-effort */
     }
@@ -783,13 +840,20 @@ async function reviewCommand(
   // first reviewer's copy is representative). Printed so a synthesizing session-Claude
   // (the /ensemble-ai-review skill) reviews THIS exact input, never a re-derived
   // working-tree diff that could drift from what Codex/Grok reviewed.
-  const pinnedReviewerId = result.reviews[0]?.reviewerId;
-  if (pinnedReviewerId) {
+  // Emit the pinned path whenever a TRAIL exists (any reviewer persisted its prompt) —
+  // not gated on a specific reviews[0] shape. The rendered prompt is byte-identical across
+  // reviewers, so the first persisted reviewer's copy is representative. reviewerId is
+  // always set by persistReview; the vendor is a defensive fallback.
+  if (result.reviews.length > 0) {
+    const first = result.reviews[0];
+    const pinnedReviewerId = first.reviewerId ?? first.reviewer.vendor;
     console.log(
-      `  review input (pinned — what every reviewer saw; read THIS, don't re-derive): ${path.join(out, `prompt.${pinnedReviewerId}.md`)}`
+      `  review input (pinned — what every reviewer saw; read THIS, don't re-derive): ${path.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
   }
-  console.error(`trail: ${out}`);
+  // On stdout (with the receipt + pinned-input paths) — the machine-readable trail
+  // location, so the doc's "paths on stdout" is accurate.
+  console.log(`trail: ${trailDir}`);
   if (result.blocked) return 2;
   // 1 = a reviewer failed to complete (crash / timeout / no parse) — the review is
   // not trustworthy, so this outranks the findings gate below.

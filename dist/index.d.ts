@@ -2,7 +2,7 @@ import { R as ReviewerId, a as ReviewerConfig, b as ReviewFinding, c as ReviewPa
 export { C as CONFIDENCES, e as Confidence, D as DIFF_USEFUL_FLOOR, E as Evidence, F as FINDINGS_INSTRUCTIONS, M as ManifestEntry, P as PACKET_BUDGETS, f as PacketInput, g as PacketSection, h as ParsedReview, i as REVIEWER_IDS, j as REVIEW_PROFILES, k as SECURITY_CLASSES, l as SECURITY_OBJECTIVE, m as SEVERITIES, n as SecurityClass, o as Severity, p as TERMINAL_STATES, q as assembleCodePacket, r as classifySecurityFinding, s as extractJsonBlock, t as isReviewProfile, u as isReviewerId, v as oneOf, w as parseFindings, x as parseReviewerIds, y as renderReviewPrompt, z as section, A as securityClassLabel, B as stripSecurityTag, G as titleCase } from './contracts-DOjPsC5x.js';
 
 interface ConventionReader {
-    read(relPath: string): Promise<string | null>;
+    read(relPath: string, maxBytes?: number): Promise<string | null>;
     list(dirRelPath: string): Promise<string[]>;
 }
 interface GatherConfig {
@@ -15,7 +15,7 @@ interface ConventionFileEntry {
     bytes: number;
     included: boolean;
     truncated: boolean;
-    reason?: 'over-cap';
+    reason?: 'over-cap' | 'max-files';
 }
 interface ConventionManifest {
     capBytes: number;

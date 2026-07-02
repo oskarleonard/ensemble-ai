@@ -14,7 +14,11 @@ import path from 'node:path';
 // Repo-relative, async so the same core serves a sync fs reader and an async gh reader.
 export interface ConventionReader {
   // Read a repo-relative file's UTF-8 content; null if missing/unreadable/not a file.
-  read(relPath: string): Promise<string | null>;
+  // `maxBytes` (when given) BOUNDS THE READ itself — a reader must not pull more than
+  // maxBytes bytes into memory (a multi-GB doc in the tree must never be slurped whole
+  // just to be trimmed afterwards). The gatherer only ever emits ≤ capBytes of any one
+  // file, so a maxBytes-bounded content is always enough to fill the budget.
+  read(relPath: string, maxBytes?: number): Promise<string | null>;
   // Repo-relative *.md paths directly under a repo-relative dir (one level), for the
   // docs/ + ai-spec/ sweeps. [] when the dir is absent.
   list(dirRelPath: string): Promise<string[]>;
@@ -33,10 +37,10 @@ export interface GatherConfig {
 
 export interface ConventionFileEntry {
   path: string; // repo-relative
-  bytes: number; // full file size
+  bytes: number; // file size as read (bounded by the read cap — see ConventionReader.read)
   included: boolean; // its content is in `text` (fully or head-truncated)
   truncated: boolean; // head-only, because it crossed the cap
-  reason?: 'over-cap'; // why it was truncated/omitted
+  reason?: 'over-cap' | 'max-files'; // why it was truncated/omitted (cap · file-count ceiling)
 }
 
 export interface ConventionManifest {
@@ -179,11 +183,20 @@ export async function gatherConventions(
   let visited = 0;
   while (queue.length > 0) {
     const rel = queue.shift() as string;
-    const content = await reader.read(rel);
+    // Bound the READ to the cap — the gatherer never emits more than capBytes of any one
+    // file, so a cap-bounded read is always sufficient AND a multi-GB doc in the tree is
+    // never slurped whole just to be trimmed. `bytes` is this (bounded) read length.
+    const content = await reader.read(rel, capBytes);
     if (content === null) continue; // missing/unreadable → not part of the set (no budget)
-    if (visited >= maxFiles) break; // ceiling on real files reached (cycle/runaway backstop)
-    visited++;
     const bytes = Buffer.byteLength(content, 'utf8');
+    // Ceiling reached: a REAL (existing) file we won't process. NAME it omitted rather
+    // than SILENTLY dropping the boundary file (the honesty rule — same as over-cap), then
+    // stop. Checked after the existence read so `visited` only ever counts real files.
+    if (visited >= maxFiles) {
+      files.push({ path: rel, bytes, included: false, truncated: false, reason: 'max-files' });
+      break;
+    }
+    visited++;
     // Discover transitive refs BEFORE cap decisions (an over-cap file can still link
     // to a small important one; the `seen` dedupe bounds any cycle).
     const dir = dirOf(rel);
@@ -263,12 +276,22 @@ export function fsConventionReader(repoRoot: string): ConventionReader {
     return real;
   };
   return {
-    async read(rel) {
+    async read(rel, maxBytes) {
       const abs = within(rel);
       if (!abs) return null;
       try {
         if (!fs.statSync(abs).isFile()) return null;
-        return fs.readFileSync(abs, 'utf8');
+        if (maxBytes === undefined) return fs.readFileSync(abs, 'utf8');
+        // Bounded read: pull at most maxBytes bytes off disk so a multi-GB file is never
+        // read whole just to be trimmed. Decode + drop a trailing partial multibyte char.
+        const fd = fs.openSync(abs, 'r');
+        try {
+          const buf = Buffer.alloc(maxBytes);
+          const n = fs.readSync(fd, buf, 0, maxBytes, 0);
+          return buf.subarray(0, n).toString('utf8').replace(/�$/, '');
+        } finally {
+          fs.closeSync(fd);
+        }
       } catch {
         return null;
       }
@@ -294,8 +317,10 @@ export function memoryConventionReader(
   fileMap: Record<string, string>
 ): ConventionReader {
   return {
-    async read(rel) {
-      return Object.prototype.hasOwnProperty.call(fileMap, rel) ? fileMap[rel] : null;
+    async read(rel, maxBytes) {
+      if (!Object.prototype.hasOwnProperty.call(fileMap, rel)) return null;
+      const c = fileMap[rel];
+      return maxBytes === undefined ? c : sliceBytes(c, maxBytes);
     },
     async list(dirRel) {
       const prefix = dirRel === '' ? '' : `${dirRel}/`;
