@@ -127,8 +127,9 @@ const REVIEW_USAGE = `ensemble-ai review — self-contained cross-vendor review 
 
 Spawns THREE blind peer reviewers on the SAME pinned packet — codex + grok + a cold
 headless \`claude -p\` (Opus, default-on) — each writing its own review into the trail,
-then a \`claude -p\` SYNTHESIS pass reads all three and emits AGREE(confident)/DISAGREE
-(look-closer) · a per-finding sanity-check · a bottom line. Runs from ANY terminal with
+then a \`claude -p\` GATE pass reads all three and emits AGREE(confident)/DISAGREE
+(look-closer) · a grounded per-finding verdict (agree/partial/false/unverified) · a bottom
+line. Runs from ANY terminal with
 no Claude session. REVIEW-ONLY — it never edits code. With NO source flag it reviews the
 current branch. \`--no-claude\` drops the Opus reviewer + synthesis (codex + grok only).
 
@@ -1109,11 +1110,33 @@ async function reviewCommand(
     !values['no-fail-on-high'] &&
     (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))
   ) {
-    // Exit 4 UNLESS the gate honored-dismissed EVERY HIGH: authority active AND at least one HIGH
-    // dismissed AND none remaining. Fail-closed — a remaining HIGH, a STRICT run (nothing
-    // dismissed), a gate failure, or any records/raw mismatch all gate.
+    // Exit 4 UNLESS the gate honored-dismissed EVERY HIGH. `highGate.dismissedHighIds` comes from
+    // the gate RECORDS, reconciled from the reviews RE-READ from the trail (loadVoiceReviewsFromTrail
+    // → readReviewsForRun / reviewJsonFromTrail, both of which SILENTLY DROP a review that fails to
+    // read back). The "is there a HIGH" trigger above, by contrast, reads the IN-MEMORY reviews. So
+    // trusting "all gate-HIGHs dismissed" alone is FAIL-OPEN: a HIGH present in-memory but absent from
+    // the gate's record set (a trail read-back gap · a stale reused run-id · a concurrent same-run-id
+    // run) would leave `gatingHighIds` empty and slip to exit 0. Fail-closed: require the honored
+    // dismissals to account for EVERY in-memory HIGH — counted from the SAME authoritative source the
+    // trigger keys off (core reviews that reached `terminalState === 'reviewed'` + an ok Opus voice,
+    // the exact predicate `hasHighFinding`/`claudeLayerHasHigh`/the gate's `healthy` filter use) — with
+    // none left gating. A divergence (detected > recorded) then gates, never dismisses.
+    const detectedHighCount =
+      result.reviews.reduce(
+        (n, r) =>
+          n +
+          (r.terminalState === 'reviewed'
+            ? r.findings.filter((f) => f.severity === 'high').length
+            : 0),
+        0
+      ) +
+      (claudeLayer?.claudeReview?.ok
+        ? claudeLayer.claudeReview.findings.filter((f) => f.severity === 'high').length
+        : 0);
     const allHighsDismissed =
-      highGate.dismissedHighIds.length > 0 && highGate.gatingHighIds.length === 0;
+      detectedHighCount > 0 &&
+      highGate.dismissedHighIds.length === detectedHighCount &&
+      highGate.gatingHighIds.length === 0;
     if (!allHighsDismissed) return 4;
   }
   return 0;

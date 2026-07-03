@@ -1,8 +1,9 @@
 // The SELF-CONTAINED review layer: after the cross-vendor CORE (codex+grok) reviews the
 // pinned packet, add a THIRD blind peer reviewer — a COLD headless `claude -p` (Opus) —
-// on the SAME packet, then a separate `claude -p` SYNTHESIS pass that reads all three
-// reviewers' persisted trail files and emits AGREE(confident)/DISAGREE(look-closer) ·
-// per-finding sanity-check · bottom-line. DEFAULT-ON (opt out with `--no-claude`), so the
+// on the SAME packet, then a separate `claude -p` GATE pass that reads all three
+// reviewers' persisted trail files and emits AGREE(confident)/DISAGREE(look-closer) · a
+// grounded per-finding verdict (agree/partial/false/unverified) · bottom-line. DEFAULT-ON
+// (opt out with `--no-claude`), so the
 // bare `ensemble-ai review <pr|branch|url>` runs from ANY terminal with no Claude session.
 //
 // REVIEW-ONLY: this layer never edits code. Its ONLY writes are to the (fenced, 0600)
@@ -319,7 +320,7 @@ export function claudeLayerHasHigh(layer: ClaudeLayerResult | null): boolean {
 // ── Rendering (for the CLI summary) ───────────────────────────────────────────────────
 
 // The claude-layer block for stdout: the cold Opus review's findings, then the synthesis
-// (AGREE / DISAGREE / sanity-checks / bottom line). Grouped + scannable.
+// (AGREE / DISAGREE / bottom line) and the grounded per-finding verdict tags. Grouped + scannable.
 export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
   const out: string[] = [];
   const cr = result.claudeReview;

@@ -1,4 +1,5 @@
 import { evidenceRef } from '../../core/findings';
+import { scrubControl } from '../../core/sanitize';
 
 import {
   GATE_ENVELOPE_SCHEMA_VERSION,
@@ -33,7 +34,12 @@ function findingsBlock(findings: GateFinding[]): string {
   if (findings.length === 0) return '(no findings raised by any reviewer)';
   return findings
     .map((f) => {
-      const where = evidenceRef(f.file, f.line);
+      // The location goes on the host-owned metadata line the prompt declares TRUSTWORTHY, but
+      // `f.file` is reviewer-controlled (a crafted diff can influence a finding's evidence.file, and
+      // asEvidence only `.trim()`s it — internal newlines / ANSI / a fake directive survive). Scrub
+      // it so nothing reviewer-controlled reaches the "trusted" line unfenced (a verdict-spoof /
+      // prompt-injection surface, sharper now the gate has exit authority).
+      const where = evidenceRef(f.file, f.line, scrubControl);
       // Host-owned, TRUSTWORTHY metadata (id · reviewer · severity · location · hunk pointer)
       // stays OUTSIDE the fence. The reviewer's OWN title + body are UNTRUSTED free text — a
       // crafted diff can influence what a reviewer wrote — so they go INSIDE an explicit data

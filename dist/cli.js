@@ -2308,12 +2308,7 @@ function readTrailJson(baseDir, runId, name) {
   }
 }
 function reviewJsonFromTrail(baseDir, runId, name) {
-  let obj;
-  try {
-    obj = JSON.parse(fs9.readFileSync(path7.join(reviewDir(baseDir, runId), name), "utf8"));
-  } catch {
-    return null;
-  }
+  const obj = readTrailJson(baseDir, runId, name);
   if (!obj || typeof obj !== "object") return null;
   const o = obj;
   const voiceId = typeof o.voiceId === "string" && o.voiceId.trim() ? o.voiceId.trim() : null;
@@ -2906,7 +2901,7 @@ function hunkNote(f) {
 function findingsBlock(findings) {
   if (findings.length === 0) return "(no findings raised by any reviewer)";
   return findings.map((f) => {
-    const where = evidenceRef(f.file, f.line);
+    const where = evidenceRef(f.file, f.line, scrubControl);
     return [
       `- ${f.findingId} \xB7 ${f.reviewer} \xB7 [${f.severity}] ${where}  ${hunkNote(f)}`,
       `  <<<CLAIM ${f.findingId} \u2014 UNTRUSTED reviewer text>>>`,
@@ -3962,8 +3957,9 @@ var REVIEW_USAGE = `ensemble-ai review \u2014 self-contained cross-vendor review
 
 Spawns THREE blind peer reviewers on the SAME pinned packet \u2014 codex + grok + a cold
 headless \`claude -p\` (Opus, default-on) \u2014 each writing its own review into the trail,
-then a \`claude -p\` SYNTHESIS pass reads all three and emits AGREE(confident)/DISAGREE
-(look-closer) \xB7 a per-finding sanity-check \xB7 a bottom line. Runs from ANY terminal with
+then a \`claude -p\` GATE pass reads all three and emits AGREE(confident)/DISAGREE
+(look-closer) \xB7 a grounded per-finding verdict (agree/partial/false/unverified) \xB7 a bottom
+line. Runs from ANY terminal with
 no Claude session. REVIEW-ONLY \u2014 it never edits code. With NO source flag it reviews the
 current branch. \`--no-claude\` drops the Opus reviewer + synthesis (codex + grok only).
 
@@ -4614,7 +4610,11 @@ async function reviewCommand(args, profile = "code") {
     }
   }
   if (!values["no-fail-on-high"] && (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))) {
-    const allHighsDismissed = highGate.dismissedHighIds.length > 0 && highGate.gatingHighIds.length === 0;
+    const detectedHighCount = result.reviews.reduce(
+      (n, r) => n + (r.terminalState === "reviewed" ? r.findings.filter((f) => f.severity === "high").length : 0),
+      0
+    ) + (claudeLayer?.claudeReview?.ok ? claudeLayer.claudeReview.findings.filter((f) => f.severity === "high").length : 0);
+    const allHighsDismissed = detectedHighCount > 0 && highGate.dismissedHighIds.length === detectedHighCount && highGate.gatingHighIds.length === 0;
     if (!allHighsDismissed) return 4;
   }
   return 0;

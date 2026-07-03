@@ -30,12 +30,9 @@ export function reviewJsonFromTrail(
   runId: string,
   name: string
 ): VoiceReview | null {
-  let obj: unknown;
-  try {
-    obj = JSON.parse(fs.readFileSync(path.join(reviewDir(baseDir, runId), name), 'utf8'));
-  } catch {
-    return null;
-  }
+  // Route through the ONE generic trail reader (above) rather than re-deriving the path + parse —
+  // a missing/unreadable/unparseable file → null, exactly as before (a JSON `null` fails the guard).
+  const obj = readTrailJson<unknown>(baseDir, runId, name);
   if (!obj || typeof obj !== 'object') return null;
   const o = obj as Record<string, unknown>;
   const voiceId = typeof o.voiceId === 'string' && o.voiceId.trim() ? o.voiceId.trim() : null;

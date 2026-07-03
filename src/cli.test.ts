@@ -339,6 +339,16 @@ describe('exit-4 gate authority — provenance-scoped dismiss-only (DC4)', () =>
     coreHigh();
     expect(await main(['review', '--working-tree', '--no-claude'])).toBe(4);
   });
+
+  it('a HIGH present in-memory but MISSING from the gate record set still gates (no fail-open on a trail read-back drop) ⇒ exit 4', async () => {
+    // Two in-memory HIGHs (codex#1, codex#2); the gate only recorded + dismissed codex#1 — codex#2
+    // dropped from the trail-loaded set (readReviewsForRun/reviewJsonFromTrail silently drop an
+    // unreadable review). "All GATE-highs dismissed" (gatingHighIds empty) must NOT read as "all
+    // highs dismissed": the un-adjudicated codex#2 gates. Fail-closed against the two-source divergence.
+    mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed', 2, 'high')] }));
+    layerWith([record({ findingId: 'codex#1' })]);
+    expect(await main(['review', '--working-tree'])).toBe(4);
+  });
 });
 
 describe('receipt reflects the FULL expected roster (not just the codex/grok core)', () => {

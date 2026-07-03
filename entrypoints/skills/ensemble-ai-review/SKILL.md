@@ -1,6 +1,6 @@
 ---
 name: ensemble-ai-review
-description: Convene a SELF-CONTAINED cross-vendor review (Codex + Grok + a cold Opus) on a code diff, read-only, then a Claude synthesis pass that emits AGREE/DISAGREE + a per-finding sanity-check + a bottom line. Use when the user says "/ensemble-ai-review", asks to review a diff/PR/branch with the ensemble / cross-vendor / multiple models, or wants a second (and third) vendor's take on code.
+description: Convene a SELF-CONTAINED cross-vendor review (Codex + Grok + a cold Opus) on a code diff, read-only, then a Claude gate pass that emits AGREE/DISAGREE + a grounded per-finding verdict (agree/partial/false/unverified) + a bottom line. Use when the user says "/ensemble-ai-review", asks to review a diff/PR/branch with the ensemble / cross-vendor / multiple models, or wants a second (and third) vendor's take on code.
 ---
 
 # /ensemble-ai-review — the whole ensemble on a diff, self-contained
@@ -8,10 +8,11 @@ description: Convene a SELF-CONTAINED cross-vendor review (Codex + Grok + a cold
 This skill runs the `ensemble-ai` CLI, which is now **self-contained**: it spawns THREE
 blind peer reviewers on the SAME pinned packet — **Codex + Grok + a cold headless
 `claude -p` (Opus, default-on)** — each writing its own review into the trail, then a
-separate `claude -p` **synthesis** pass reads all three and emits AGREE(confident) /
-DISAGREE(look-closer) · a per-finding sanity-check · a bottom line. You do NOT need to be
-the third voice or the synthesizer — the CLI does all of that itself. Your job is to run
-it, surface the synthesis, and (only if asked) fix the findings afterwards.
+separate `claude -p` **gate** pass reads all three and emits AGREE(confident) /
+DISAGREE(look-closer) · a grounded per-finding verdict (agree/partial/false/unverified) · a
+bottom line. You do NOT need to be the third voice or the gate — the CLI does all of that
+itself. Your job is to run it, surface the synthesis + verdicts, and (only if asked) fix the
+findings afterwards.
 
 **Review-only.** This command makes ZERO writes to tracked files — its only writes are to
 the (owner-only) trail dir. It never edits code. If the user then wants the findings
@@ -62,7 +63,7 @@ ensemble-ai review $ARGUMENTS
 
 The CLI already printed two things — surface BOTH:
 
-- The **Claude synthesis** prose (`summary` · ✓ AGREE (confident) · ⚠ DISAGREE (look closer) ·
+- The **Claude synthesis** prose (✓ AGREE (confident) · ⚠ DISAGREE (look closer) ·
   → bottom line). Lead your reply with the **bottom line + the HIGH/agreed findings and their
   `file:line`**, then the look-closer items.
 - The **gate — grounded verdicts** block: each finding tagged `agree` / `partial` / `false` /

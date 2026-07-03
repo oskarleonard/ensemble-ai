@@ -29,8 +29,10 @@ import {
 // It is fed each finding's CITED diff hunk from the pinned packet, tags EVERY finding
 // agree/partial/false/unverified (never removes one), records a durable schema-versioned
 // `gate-verdicts.json` trail (raw model verdict + host EFFECTIVE verdict + a machine-readable
-// downgrade reason), and renders the tags to stdout. Phase 1 is ADDITIVE: it builds the trail
-// + rendering + validation plumbing; it does NOT change exit codes (authority is Phase 2).
+// downgrade reason), and renders the tags to stdout. Phase 2 adds the DISMISS-ONLY exit authority
+// below (`gateAuthorityActive` · `resolveHighGate`, consumed by cli.ts): under active authority a
+// citation-validated `false` on a HIGH may drop it from the exit-4 gate — dismiss-only, never a
+// promotion, and every host-forced downgrade still gates.
 // Everything here is a pure function of its inputs except runGate's spawn + the trail write.
 
 // The verdict taxonomy that replaces likely-real/look-closer/likely-false. `agree` = real;
