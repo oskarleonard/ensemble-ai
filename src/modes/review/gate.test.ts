@@ -363,6 +363,34 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
     const res = await runGate({ baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews: [review('codex', [f()])], run: async () => okRun(env), runId });
     expect(res.verdicts[0]).toMatchObject({ downgradeReason: 'invalid-citation', effectiveVerdict: 'unverified' });
   });
+
+  it('EXCLUDES a failed (ok:false) reviewer\'s findings from the verdict set — untrusted, like the exit gate', async () => {
+    const { base, runId } = seed();
+    // grok TIMED OUT but partly parsed → ok:false yet still carries a finding; the gate must
+    // not tag it (parity with cli.ts hasHighFinding, which counts only terminalState reviewed).
+    const mixed: VoiceReview[] = [
+      review('codex', [f({ title: 'codex a' })]),
+      { findings: [f({ title: 'grok cut-off HIGH', severity: 'high' })], ok: false, summary: 'grok timed out', voiceId: 'grok' },
+    ];
+    const env = envelope([{ findingId: 'codex#1', reason: 'real', verdict: 'agree' }]);
+    const res = await runGate({ baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews: mixed, run: async () => okRun(env), runId });
+    expect(res.verdicts.map((v) => v.findingId)).toEqual(['codex#1']);
+    expect(res.verdicts.some((v) => v.reviewer === 'grok')).toBe(false);
+  });
+
+  it('does NOT spawn the gate model when no reviewer is healthy (fallback + empty verdicts)', async () => {
+    const { base, runId } = seed();
+    let spawned = false;
+    const res = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD,
+      reviews: [{ findings: [f()], ok: false, summary: 'failed', voiceId: 'codex' }],
+      run: async () => { spawned = true; return okRun(goodEnvelope); },
+      runId,
+    });
+    expect(spawned).toBe(false);
+    expect(res.synthesis.degraded).toBe(true); // deterministic fallback, no model call
+    expect(res.verdicts).toEqual([]); // no healthy findings to verdict
+  });
 });
 
 // A file diff whose single hunk is ~45KB after ±25 windowing (long lines) — used to exercise

@@ -1,6 +1,6 @@
 import { writeTrailFile } from '../../core/artifacts';
 import { extractJsonBlock } from '../../core/findings';
-import type { Severity } from '../../core/types';
+import { SEVERITIES, type Severity } from '../../core/types';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 import { type RunReviewOpts } from '../../reviewers/codex';
@@ -8,6 +8,7 @@ import { type RunReviewOpts } from '../../reviewers/codex';
 import { renderGatePrompt } from './gate-prompt';
 import {
   type Hunk,
+  type ResolvedHunk,
   hunkCodeLines,
   hunkRangeKey,
   parsePacketHunks,
@@ -99,8 +100,6 @@ export interface GateInjection {
   truncated: boolean;
 }
 
-const SEVERITY_RANK: Record<Severity, number> = { high: 0, low: 2, medium: 1 };
-
 // The total UTF-8 byte budget for injected hunk text in ONE gate prompt. Bounds token cost;
 // over-budget hunks are NAMED as truncated (never silently dropped) and their findings are
 // dismissal-ineligible — a known, safe, host-enforced degradation at high finding counts.
@@ -150,10 +149,7 @@ export function prepareGateFindings(
   packetHunks: Map<string, Hunk[]>
 ): { findings: GateFinding[]; injections: GateInjection[] } {
   const raw = flattenFindings(reviews);
-  const resolved = new Map<
-    string,
-    { bodyIndex: number; hunk: Hunk } | null
-  >();
+  const resolved = new Map<string, ResolvedHunk | null>();
   for (const rf of raw) {
     const fileHunks = rf.file && rf.line !== null ? packetHunks.get(rf.file) : undefined;
     resolved.set(
@@ -165,7 +161,7 @@ export function prepareGateFindings(
   // Budget order: severity → reviewer rank → finding index (stable).
   const order = [...raw].sort(
     (a, b) =>
-      SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] ||
+      SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity) ||
       a.reviewerRank - b.reviewerRank ||
       a.index - b.index
   );
@@ -194,17 +190,11 @@ export function prepareGateFindings(
     // lone over-budget hunk is still shown; subsequent over-budget hunks are truncated out.
     const admitted = injections.length === 0 || usedBytes + bytes <= GATE_HUNK_BYTE_BUDGET;
     const label = admitted ? `H${injections.length + 1}` : '';
-    const entry: GateInjection & { admitted: boolean } = {
-      admitted,
-      label,
-      rangeKey: key,
-      text: win.text,
-      truncated: win.truncated,
-    };
-    byKey.set(key, entry);
+    const injection: GateInjection = { label, rangeKey: key, text: win.text, truncated: win.truncated };
+    byKey.set(key, { ...injection, admitted });
     if (admitted) {
       usedBytes += bytes;
-      injections.push({ label, rangeKey: key, text: win.text, truncated: win.truncated });
+      injections.push(injection);
       labelById.set(rf.findingId, label);
       if (win.truncated) truncatedById.add(rf.findingId);
     } else {
@@ -280,6 +270,12 @@ export interface ParsedGateEnvelope {
 
 export type EnvelopeFailure = { failure: 'gate-failed' | 'unknown-schema' };
 
+// Every way the WHOLE envelope fails closed — the parse-time EnvelopeFailure plus the
+// runtime-only `packet-fail`. Each member is a DowngradeReason stamped on every finding.
+export type WholeEnvelopeFailure = {
+  failure: Extract<DowngradeReason, 'gate-failed' | 'unknown-schema' | 'packet-fail'>;
+};
+
 function parseVerdicts(v: unknown): RawVerdictEntry[] {
   if (!Array.isArray(v)) return [];
   const out: RawVerdictEntry[] = [];
@@ -347,7 +343,7 @@ function recordBase(f: GateFinding): Omit<
   };
 }
 
-const FAILURE_REASON: Record<'gate-failed' | 'unknown-schema' | 'packet-fail', string> = {
+const FAILURE_REASON: Record<WholeEnvelopeFailure['failure'], string> = {
   'gate-failed': 'gate produced no usable verdicts — fail-closed to unverified',
   'packet-fail': 'pinned packet unavailable at gate time — verdicts cannot be grounded',
   'unknown-schema': 'gate envelope had a missing/unsupported schemaVersion — fail-closed',
@@ -362,7 +358,7 @@ const FAILURE_REASON: Record<'gate-failed' | 'unknown-schema' | 'packet-fail', s
 // failure ⇒ every finding unverified with that machine-readable reason.
 export function reconcileGateVerdicts(
   findings: GateFinding[],
-  parsed: EnvelopeFailure | ParsedGateEnvelope | { failure: 'packet-fail' }
+  parsed: ParsedGateEnvelope | WholeEnvelopeFailure
 ): { records: GateVerdictRecord[]; warnings: string[] } {
   if ('failure' in parsed) {
     const reason = FAILURE_REASON[parsed.failure];
@@ -553,11 +549,15 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     log(`  · gate: pinned packet unusable (${packet.reason}) — verdicts cannot be grounded`);
   }
   const packetHunks = packet.ok ? parsePacketHunks(packet.diff) : new Map<string, Hunk[]>();
-  const { findings, injections } = prepareGateFindings(opts.reviews, packetHunks);
+  // Tag only COMPLETED (ok) reviewers' findings. A cut-off / failed reviewer's findings are
+  // untrusted — they are excluded from the exit gate (cli.ts `hasHighFinding` requires
+  // terminalState === 'reviewed') and were never synthesized, so the gate must not launder
+  // them into the verdict set either.
+  const { findings, injections } = prepareGateFindings(healthy, packetHunks);
 
   const finalize = (
     synthesis: ReviewSynthesis,
-    parsed: EnvelopeFailure | ParsedGateEnvelope | { failure: 'packet-fail' }
+    parsed: ParsedGateEnvelope | WholeEnvelopeFailure
   ): GateRunResult => {
     const { records, warnings } = reconcileGateVerdicts(findings, parsed);
     for (const w of warnings) log(`  · ${w}`);
@@ -574,7 +574,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     return finalize(fallbackReviewSynthesis(opts.reviews), { failure: 'gate-failed' });
   }
 
-  const prompt = renderGatePrompt(findings, injections, opts.reviews);
+  const prompt = renderGatePrompt(findings, injections);
   log('Gate: grounding findings against the pinned diff hunks — verdict tags…');
   let res: VoiceRunResult;
   try {
@@ -606,7 +606,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // Prose synthesis (agreements/disagreements/bottomLine) survives even a packet-fail — only
   // the grounded VERDICTS are killed there. Reconcile the prose against the real reviews (the
   // unchanged corroboration guard) so the gate can't fabricate confident consensus.
-  const { synthesis } = reconcileSynthesis(
+  const { synthesis, demoted } = reconcileSynthesis(
     {
       agreements: parsed.agreements,
       bottomLine: parsed.bottomLine,
@@ -619,5 +619,10 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     },
     opts.reviews
   );
+  // Surface the anti-fabrication guard firing: an "agreement" no ≥2 real voices corroborate is
+  // demoted to look-closer. Silent demotion would hide a caught fabricated-consensus attempt.
+  if (demoted > 0) {
+    log(`  · synthesis: ${demoted} unverifiable "agreement(s)" demoted to look-closer (not corroborated by ≥2 real voices)`);
+  }
   return finalize(synthesis, packetFail ? { failure: 'packet-fail' } : parsed);
 }

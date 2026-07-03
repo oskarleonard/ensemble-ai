@@ -2875,7 +2875,7 @@ var cap3 = (s, n) => s.length > n ? `${s.slice(0, n)}\u2026` : s;
 function hunkNote(f) {
   if (!f.resolved) return "\u2192 hunk unavailable (cite is out-of-diff) \u2014 cannot dismiss (use unverified)";
   if (f.hunkLabel === null) return "\u2192 hunk omitted (gate byte budget exceeded) \u2014 cannot dismiss (use unverified)";
-  if (f.truncated) return `\u2192 see hunk ${f.hunkLabel} (windowed \xB125 lines \u2014 TRUNCATED, cannot dismiss)`;
+  if (f.truncated) return `\u2192 see hunk ${f.hunkLabel} (windowed \xB1${HUNK_WINDOW_LINES} lines \u2014 TRUNCATED, cannot dismiss)`;
   return `\u2192 see hunk ${f.hunkLabel}`;
 }
 function findingsBlock(findings) {
@@ -2912,7 +2912,7 @@ Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
 Tag EVERY finding exactly once by its findingId. verdict \u2208 agree | partial | false | unverified.
 A "false" REQUIRES a "citation" that quotes a real line from THAT finding's own hunk \u2014 no valid
 quote means use "unverified", never "false". Do not invent findingIds; do not restate severities.`;
-function renderGatePrompt(findings, injections, _reviews) {
+function renderGatePrompt(findings, injections) {
   return `You are the VERIFIED GATE for a multi-model CODE REVIEW. Several AI reviewers each
 reviewed the SAME diff INDEPENDENTLY. You are given, per finding, the reviewer's claim AND the
 EXACT cited diff hunk from the pinned packet the reviewers saw. Review-only: do NOT propose
@@ -3084,7 +3084,6 @@ function capStr(s, n) {
   const t = typeof s === "string" ? s.trim() : "";
   return t.length > n ? t.slice(0, n) : t;
 }
-var SEVERITY_RANK = { high: 0, low: 2, medium: 1 };
 var GATE_HUNK_BYTE_BUDGET = 40960;
 function flattenFindings(reviews) {
   const out = [];
@@ -3116,7 +3115,7 @@ function prepareGateFindings(reviews, packetHunks) {
     );
   }
   const order = [...raw].sort(
-    (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] || a.reviewerRank - b.reviewerRank || a.index - b.index
+    (a, b) => SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity) || a.reviewerRank - b.reviewerRank || a.index - b.index
   );
   const injections = [];
   const byKey = /* @__PURE__ */ new Map();
@@ -3140,17 +3139,11 @@ function prepareGateFindings(reviews, packetHunks) {
     const bytes = Buffer.byteLength(win.text, "utf8");
     const admitted = injections.length === 0 || usedBytes + bytes <= GATE_HUNK_BYTE_BUDGET;
     const label = admitted ? `H${injections.length + 1}` : "";
-    const entry = {
-      admitted,
-      label,
-      rangeKey: key,
-      text: win.text,
-      truncated: win.truncated
-    };
-    byKey.set(key, entry);
+    const injection = { label, rangeKey: key, text: win.text, truncated: win.truncated };
+    byKey.set(key, { ...injection, admitted });
     if (admitted) {
       usedBytes += bytes;
-      injections.push({ label, rangeKey: key, text: win.text, truncated: win.truncated });
+      injections.push(injection);
       labelById.set(rf.findingId, label);
       if (win.truncated) truncatedById.add(rf.findingId);
     } else {
@@ -3347,7 +3340,7 @@ async function runGate(opts) {
     log(`  \xB7 gate: pinned packet unusable (${packet.reason}) \u2014 verdicts cannot be grounded`);
   }
   const packetHunks = packet.ok ? parsePacketHunks(packet.diff) : /* @__PURE__ */ new Map();
-  const { findings, injections } = prepareGateFindings(opts.reviews, packetHunks);
+  const { findings, injections } = prepareGateFindings(healthy, packetHunks);
   const finalize = (synthesis2, parsed2) => {
     const { records, warnings } = reconcileGateVerdicts(findings, parsed2);
     for (const w of warnings) log(`  \xB7 ${w}`);
@@ -3360,7 +3353,7 @@ async function runGate(opts) {
   if (healthy.length === 0) {
     return finalize(fallbackReviewSynthesis(opts.reviews), { failure: "gate-failed" });
   }
-  const prompt = renderGatePrompt(findings, injections, opts.reviews);
+  const prompt = renderGatePrompt(findings, injections);
   log("Gate: grounding findings against the pinned diff hunks \u2014 verdict tags\u2026");
   let res;
   try {
@@ -3387,7 +3380,7 @@ async function runGate(opts) {
       { failure: parsed.failure }
     );
   }
-  const { synthesis } = reconcileSynthesis(
+  const { synthesis, demoted } = reconcileSynthesis(
     {
       agreements: parsed.agreements,
       bottomLine: parsed.bottomLine,
@@ -3400,6 +3393,9 @@ async function runGate(opts) {
     },
     opts.reviews
   );
+  if (demoted > 0) {
+    log(`  \xB7 synthesis: ${demoted} unverifiable "agreement(s)" demoted to look-closer (not corroborated by \u22652 real voices)`);
+  }
   return finalize(synthesis, packetFail ? { failure: "packet-fail" } : parsed);
 }
 

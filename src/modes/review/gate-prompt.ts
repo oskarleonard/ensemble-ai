@@ -3,7 +3,7 @@ import {
   type GateFinding,
   type GateInjection,
 } from './gate';
-import type { VoiceReview } from './synthesis';
+import { HUNK_WINDOW_LINES } from './gate-hunks';
 
 // The hunk-fed GATE prompt. Unlike the old text-only synthesis prompt, the gate sees each
 // finding's CITED diff hunk (resolved from the pinned packet), so it can catch a
@@ -23,7 +23,7 @@ const cap = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n)}�
 function hunkNote(f: GateFinding): string {
   if (!f.resolved) return '→ hunk unavailable (cite is out-of-diff) — cannot dismiss (use unverified)';
   if (f.hunkLabel === null) return '→ hunk omitted (gate byte budget exceeded) — cannot dismiss (use unverified)';
-  if (f.truncated) return `→ see hunk ${f.hunkLabel} (windowed ±25 lines — TRUNCATED, cannot dismiss)`;
+  if (f.truncated) return `→ see hunk ${f.hunkLabel} (windowed ±${HUNK_WINDOW_LINES} lines — TRUNCATED, cannot dismiss)`;
   return `→ see hunk ${f.hunkLabel}`;
 }
 
@@ -73,8 +73,7 @@ quote means use "unverified", never "false". Do not invent findingIds; do not re
 // Render the whole gate prompt from the prepared, host-owned findings + the deduped injections.
 export function renderGatePrompt(
   findings: GateFinding[],
-  injections: GateInjection[],
-  _reviews: VoiceReview[]
+  injections: GateInjection[]
 ): string {
   return `You are the VERIFIED GATE for a multi-model CODE REVIEW. Several AI reviewers each
 reviewed the SAME diff INDEPENDENTLY. You are given, per finding, the reviewer's claim AND the

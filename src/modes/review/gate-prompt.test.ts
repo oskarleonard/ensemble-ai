@@ -33,7 +33,7 @@ describe('renderGatePrompt — hunk-fed, data-fenced, composite-envelope-pinned 
     ]),
   ];
   const { findings, injections } = prepareGateFindings(reviews, parsePacketHunks(DIFF));
-  const prompt = renderGatePrompt(findings, injections, reviews);
+  const prompt = renderGatePrompt(findings, injections);
 
   it('injects the cited hunk (labeled) for an in-diff finding', () => {
     expect(prompt).toContain('const veryUniqueGroundingLineHere = a.value.length;');
