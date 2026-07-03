@@ -184,6 +184,10 @@ async function runClaudeReviewer(
 export interface ClaudeLayerOptions {
   baseDir: string;
   claudeConfig: VoiceConfig;
+  // The GATE (synthesis) seat — its own model/effort, independent of the `claude` REVIEWER above
+  // ("reviewer = Opus @ high, gate = Fable @ max"). Always a `claude -p` spawn (only model/effort
+  // differ). Omitted ⇒ inherits `claudeConfig` (the pre-Phase-3 behavior — one seat for both).
+  gateConfig?: VoiceConfig;
   // The codex+grok reviews already produced + persisted by runReviewMode (the core).
   coreReviews: StoredReview[];
   // The head SHA the reviewers saw — the gate reads the pinned packet keyed by it, and a
@@ -290,7 +294,9 @@ export async function runClaudeReviewLayer(
   const voiceReviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
   const gate = await runGate({
     baseDir: opts.baseDir,
-    config: opts.claudeConfig,
+    // The GATE spawns its OWN configured seat (model/effort), NOT necessarily the reviewer's —
+    // defaulting to claudeConfig keeps the one-seat behavior when no `gate` entry is configured.
+    config: opts.gateConfig ?? opts.claudeConfig,
     expectedHeadSha: opts.expectedHeadSha,
     log,
     reviews: voiceReviews,

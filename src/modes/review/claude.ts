@@ -24,7 +24,9 @@ import { type RunReviewOpts, REVIEW_TIMEOUT_MS } from '../../reviewers/codex';
 
 // Claude's `--effort` accepts these levels; anything else ('default' sentinel included)
 // means "leave it to the CLI default", so the flag is omitted rather than passed invalid.
-const CLAUDE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+// Exported so the gate-seat resolver whitelist-checks a `--gate-effort` value against the
+// SAME set (one source of truth for the review-side effort whitelist).
+export const CLAUDE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
 // The write tools denied for a review/synthesis voice. Encoded as data so a unit test
 // pins the exact deny-list (a silent drop here is the difference between best-effort and

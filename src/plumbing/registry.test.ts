@@ -17,6 +17,7 @@ const voices: VoiceConfig[] = [
 
 function view(over: Partial<RegistryView> = {}): RegistryView {
   return {
+    gate: { effort: 'default', effortSource: 'default', model: 'default', modelSource: 'default' },
     reviewers,
     reviewersFile: '/home/x/.ensemble-ai/reviewers.json',
     reviewersFileExists: true,
@@ -52,5 +53,23 @@ describe('renderRegistry', () => {
     // the present voices file shows its path with no "not present" note
     expect(out).toContain('config: /home/x/.ensemble-ai/voices.json');
     expect(out).not.toContain('voices.json — not present');
+  });
+
+  it('renders the review-synthesis GATE seat with model · effort · per-field source', () => {
+    const out = renderRegistry(
+      view({ gate: { effort: 'max', effortSource: 'file', model: 'fable', modelSource: 'file' } })
+    );
+    expect(out).toContain('review synthesis');
+    const gateLine = out.split('\n').find((l) => l.trimStart().startsWith('gate'))!;
+    expect(gateLine).toContain('anthropic · fable @ max');
+    expect(gateLine).toContain('source model:file · effort:file');
+  });
+
+  it('shows the built-in default gate seat (Opus) with default sources when unconfigured', () => {
+    const gateLine = renderRegistry(view())
+      .split('\n')
+      .find((l) => l.trimStart().startsWith('gate'))!;
+    expect(gateLine).toContain('anthropic · default @ default');
+    expect(gateLine).toContain('model:default · effort:default');
   });
 });
