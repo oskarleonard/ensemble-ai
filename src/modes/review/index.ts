@@ -5,7 +5,11 @@ import {
   gatherConventions,
 } from '../../core/conventions';
 import { parseFindings } from '../../core/findings';
-import { assembleCodePacket, PACKET_BUDGETS } from '../../core/packet';
+import {
+  assembleCodePacket,
+  PACKET_BUDGETS,
+  reviewerVisibleDiff,
+} from '../../core/packet';
 import { renderReviewPrompt } from '../../core/prompt';
 import { loadReviewers } from '../../core/reviewers';
 import {
@@ -287,14 +291,18 @@ export async function runReviewMode(
     log('Packet incomplete (no usable diff) — persisting an empty review.');
   }
 
-  // Materialize the PINNED gate packet ONCE per run: the exact covered diff + the head SHA it
-  // was resolved at. The verified gate's hunk-resolver + citation-validator read ONLY this
-  // artifact (never the working tree), so a tree that mutates between the run and the gate can
-  // change no authority outcome. Best-effort — a failure just means the gate later reads no
-  // packet and degrades all-`unverified` (fail-closed).
+  // Materialize the PINNED gate packet ONCE per run: the exact REVIEWER-VISIBLE diff (the
+  // packet's diff-section body — head+tail-truncated over PACKET_BUDGETS.diff, exactly what every
+  // reviewer saw in the prompt) + the head SHA it was resolved at. Pinning the reviewer-visible
+  // bytes (NOT the full pre-truncation acquired.diff) is the binding fix (grok-f1/codex-f3): a
+  // citation into bytes the reviewers did NOT see can never validate a dismissal. The verified
+  // gate's hunk-resolver + citation-validator read ONLY this artifact (never the working tree),
+  // so a tree that mutates between the run and the gate can change no authority outcome.
+  // Best-effort — a failure just means the gate later reads no packet and degrades
+  // all-`unverified` (fail-closed).
   try {
     persistGatePacket(opts.out, opts.runId, {
-      diff: acquired.diff,
+      diff: reviewerVisibleDiff(packet).text,
       headSha: acquired.headSha,
     });
   } catch {

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { reviewDir, writeTrailFile } from '../../core/artifacts';
+import { segmentsWithoutTruncationSplices } from '../../core/packet';
 import { readTrailJson } from './trail-io';
 
 import { parseDiffFiles } from './diff';
@@ -18,10 +19,13 @@ import { parseDiffFiles } from './diff';
 // PURE except the two thin fs helpers (persist/read) — everything else is a pure function of
 // its inputs so the resolver/validator are exhaustively unit-testable over fixtures.
 
-// The pinned-packet artifact schema. Bumped if the shape changes; a reader that does not
-// recognize the version treats the packet as unusable → the gate degrades all-`unverified`
-// (fail-closed), never guesses under semantics it doesn't understand.
-export const GATE_PACKET_SCHEMA_VERSION = 1;
+// The pinned-packet artifact schema. Bumped if the shape OR semantics change; a reader that does
+// not recognize the version treats the packet as unusable → the gate degrades all-`unverified`
+// (fail-closed), never guesses under semantics it doesn't understand. v2 (Phase 2) pins the
+// reviewer-VISIBLE diff bytes (the head+tail-truncated packet section the reviewers saw), so a
+// citation can only validate against bytes a reviewer actually saw — a stale v1 packet (which
+// pinned the FULL pre-truncation diff) is therefore treated as corrupt → packet-fail (safe).
+export const GATE_PACKET_SCHEMA_VERSION = 2;
 
 export interface GatePacket {
   diff: string;
@@ -124,13 +128,23 @@ export function parseFileHunks(fileSection: string): Hunk[] {
   return hunks;
 }
 
-// Parse the pinned covered diff into per-file hunks, keyed by the file path parseDiffFiles
-// resolves. Deterministic: the same diff bytes always yield the same map.
+// Parse the pinned (reviewer-visible) diff into per-file hunks, keyed by the file path
+// parseDiffFiles resolves. Deterministic: the same diff bytes always yield the same map.
+// TRUNCATION-AWARE: the pinned diff may carry head+tail truncation splices, so hunks are parsed
+// WITHIN each splice-free segment independently — a hunk never spans a cut (no fabricated spliced
+// line), and neither the marker nor a partial boundary fragment can ever become a citable line. A
+// file that straddles a cut merges its per-segment hunks (disjoint ranges); a tail orphan whose
+// header was truncated away resolves to 'unknown' and drops out → out-of-packet → unverified (the
+// SAFE direction). A NON-truncated diff is a single segment — identical to parsing it whole.
 export function parsePacketHunks(diff: string): Map<string, Hunk[]> {
   const out = new Map<string, Hunk[]>();
-  for (const f of parseDiffFiles(diff)) {
-    if (f.path === 'unknown') continue;
-    out.set(f.path, parseFileHunks(f.raw));
+  for (const segment of segmentsWithoutTruncationSplices(diff)) {
+    for (const f of parseDiffFiles(segment)) {
+      if (f.path === 'unknown') continue;
+      const existing = out.get(f.path);
+      if (existing) existing.push(...parseFileHunks(f.raw));
+      else out.set(f.path, parseFileHunks(f.raw));
+    }
   }
   return out;
 }

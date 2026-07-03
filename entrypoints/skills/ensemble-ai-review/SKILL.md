@@ -1,6 +1,6 @@
 ---
 name: ensemble-ai-review
-description: Convene a SELF-CONTAINED cross-vendor review (Codex + Grok + a cold Opus) on a code diff, read-only, then a Claude synthesis pass that emits AGREE/DISAGREE + a per-finding sanity-check + a bottom line. Use when the user says "/ensemble-ai-review", asks to review a diff/PR/branch with the ensemble / cross-vendor / multiple models, or wants a second (and third) vendor's take on code.
+description: Convene a SELF-CONTAINED cross-vendor review (Codex + Grok + a cold Opus) on a code diff, read-only, then a Claude gate pass that emits AGREE/DISAGREE + a grounded per-finding verdict (agree/partial/false/unverified) + a bottom line. Use when the user says "/ensemble-ai-review", asks to review a diff/PR/branch with the ensemble / cross-vendor / multiple models, or wants a second (and third) vendor's take on code.
 ---
 
 # /ensemble-ai-review — the whole ensemble on a diff, self-contained
@@ -8,10 +8,11 @@ description: Convene a SELF-CONTAINED cross-vendor review (Codex + Grok + a cold
 This skill runs the `ensemble-ai` CLI, which is now **self-contained**: it spawns THREE
 blind peer reviewers on the SAME pinned packet — **Codex + Grok + a cold headless
 `claude -p` (Opus, default-on)** — each writing its own review into the trail, then a
-separate `claude -p` **synthesis** pass reads all three and emits AGREE(confident) /
-DISAGREE(look-closer) · a per-finding sanity-check · a bottom line. You do NOT need to be
-the third voice or the synthesizer — the CLI does all of that itself. Your job is to run
-it, surface the synthesis, and (only if asked) fix the findings afterwards.
+separate `claude -p` **gate** pass reads all three and emits AGREE(confident) /
+DISAGREE(look-closer) · a grounded per-finding verdict (agree/partial/false/unverified) · a
+bottom line. You do NOT need to be the third voice or the gate — the CLI does all of that
+itself. Your job is to run it, surface the synthesis + verdicts, and (only if asked) fix the
+findings afterwards.
 
 **Review-only.** This command makes ZERO writes to tracked files — its only writes are to
 the (owner-only) trail dir. It never edits code. If the user then wants the findings
@@ -49,24 +50,34 @@ ensemble-ai review $ARGUMENTS
   `CLAUDE.md`/`AGENTS.md` + linked/swept docs) so the reviewers don't fly blind.
 - Prereq: the `ensemble-ai` CLI on `PATH` (see entrypoints/README.md), plus the `codex`,
   `grok`, and `claude` CLIs for their respective reviewers.
-- Exit codes: `4` = a HIGH finding from ANY of the three reviewers (a real signal, not a
-  crash) · `2` = blocked by the secret-scan · `1` = a reviewer failed · `3` = usage / no
-  diff. If it exits non-zero for a reason OTHER than `4`, report the exit code + stderr
-  and stop.
+- Exit codes: `4` = a HIGH the GATE did not dismiss (a real signal, not a crash — the cold-Opus
+  gate grounds each finding against its cited hunk and may dismiss ONLY a citation-validated
+  `false`; dismissal is dismiss-only, ON by default for LOCAL diffs and STRICT for foreign ones
+  — `--strict-high` forces strict, `--gate-dismissals` opts a foreign diff in; see the README) ·
+  `2` = blocked by the secret-scan · `1` = a reviewer failed · `3` = usage / no diff. If it exits
+  non-zero for a reason OTHER than `4`, report the exit code + stderr and stop.
 - Capture stdout: the per-reviewer findings, the **Claude synthesis** block, and the
   `review input` / `receipt:` / `trail:` paths (progress logs go to stderr).
 
-## 2 · Surface the synthesis
+## 2 · Surface the synthesis + the grounded verdicts
 
-The CLI already printed the synthesized verdict — the **Claude synthesis** block:
-`summary` · ✓ AGREE (confident) · ⚠ DISAGREE (look closer) · per-finding sanity-checks ·
-→ bottom line. Lead your reply with the **bottom line + the HIGH/agreed findings and
-their `file:line`**, then the look-closer items, then the receipt/trail paths.
+The CLI already printed two things — surface BOTH:
 
-If the synthesis printed `DEGRADED (deterministic fallback…)`, the synthesizer voice was
-unavailable — say so plainly; the per-reviewer findings are still shown but were NOT
-cross-confirmed. The per-reviewer reviews live in the trail as `<trail>/review.<id>.md`
-(codex/grok/claude) if you want to read one directly.
+- The **Claude synthesis** prose (✓ AGREE (confident) · ⚠ DISAGREE (look closer) ·
+  → bottom line). Lead your reply with the **bottom line + the HIGH/agreed findings and their
+  `file:line`**, then the look-closer items.
+- The **gate — grounded verdicts** block: each finding tagged `agree` / `partial` / `false` /
+  `unverified`, a summary counts line (`gate — N agree · N partial · N false (dismissed) · N
+  unverified`), and a **gate authority** block. Relay the verdict counts, and call out any
+  `HIGH (dismissed by gate — …)` line — a HIGH the gate refuted against the cited code. Then the
+  receipt / trail paths.
+
+**The structured verdicts are authoritative, not the prose.** If the prose calls a real HIGH
+"minor", trust the verdict tag + severity, not the sentence. If the synthesis printed `DEGRADED
+(deterministic fallback…)` OR the gate line says "gate teeth did not engage", say so plainly — the
+findings are shown but the gate could not ground them (all `unverified`), so nothing was
+cross-confirmed / dismissed. The per-reviewer reviews live in the trail as `<trail>/review.<id>.md`
+(codex/grok/claude); the grounded verdicts live in `<trail>/gate-verdicts.json`.
 
 ## 3 · (Optional) add your own read
 
@@ -82,6 +93,13 @@ separate action you take as this session — open the cited files, make the chan
 follow the normal branch + PR discipline. Keep it distinct from the review: the review
 produced the findings read-only; the fix is your own subsequent edit, owned and verified
 like any other change. Do not fix pre-emptively.
+
+**Drive the fix from `<trail>/gate-verdicts.json`, not the prose.** Fix the findings the gate
+tagged `agree` or `partial` (a `partial` is real but overstated — fix the real part). Treat every
+`unverified` — ESPECIALLY an unverified HIGH, which still blocks the exit — as an explicit
+investigate / triage item, never a silent drop: the gate could not ground it, not that it is false.
+A finding the gate marked `false (dismissed)` was refuted against its own cited hunk — leave it, but
+sanity-check the dismissal yourself if it was a HIGH.
 
 ## Hard rules
 

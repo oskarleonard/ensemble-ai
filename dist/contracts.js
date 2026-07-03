@@ -37,6 +37,11 @@ array with a "summary" that says so. Do not invent issues to fill the list.`;
 function oneOf(set, v, fallback) {
   return set.includes(v) ? v : fallback;
 }
+function evidenceRef(file, line, scrub = (s) => s) {
+  if (!file) return "(uncited)";
+  const f = scrub(file);
+  return line ? `${f}:${line}` : f;
+}
 var asSeverity = (v) => oneOf(SEVERITIES, v, "medium");
 var asConfidence = (v) => oneOf(CONFIDENCES, v, "low");
 function asEvidence(v) {
@@ -116,6 +121,12 @@ var PACKET_BUDGETS = {
   tests: 8e3
 };
 var DIFF_USEFUL_FLOOR = 200;
+var MARKER_RE_SRC = String.raw`…\[\d+ chars truncated\]…`;
+var truncationMarker = (droppedChars) => `\u2026[${droppedChars} chars truncated]\u2026`;
+var TRUNCATION_MARKER_RE = new RegExp(MARKER_RE_SRC);
+function segmentsWithoutTruncationSplices(body) {
+  return body.split(new RegExp(String.raw`[^\n]*\n\n${MARKER_RE_SRC}\n\n[^\n]*`));
+}
 function truncate(text, budget) {
   if (text.length <= budget) return { text, truncated: false };
   const head = Math.floor(budget * 0.7);
@@ -123,7 +134,7 @@ function truncate(text, budget) {
   return {
     text: `${text.slice(0, head)}
 
-\u2026[${text.length - budget} chars truncated]\u2026
+${truncationMarker(text.length - budget)}
 
 ${text.slice(-tail)}`,
     truncated: true
@@ -140,6 +151,11 @@ function section(title, why, body, budget) {
     title,
     truncated: cut.truncated
   };
+}
+var DIFF_SECTION_TITLE = "The diff under review";
+function reviewerVisibleDiff(packet) {
+  const s = packet.sections.find((sec) => sec.title === DIFF_SECTION_TITLE);
+  return { text: s?.body ?? "", truncated: s?.truncated ?? false };
 }
 function assembleCodePacket(input) {
   const sections = [
@@ -171,7 +187,7 @@ function assembleCodePacket(input) {
     );
   }
   const diff = section(
-    "The diff under review",
+    DIFF_SECTION_TITLE,
     "the change itself \u2014 review THIS, not the whole repo",
     input.diff,
     PACKET_BUDGETS.diff
@@ -338,19 +354,24 @@ ${ask}
 }
 export {
   CONFIDENCES,
+  DIFF_SECTION_TITLE,
   DIFF_USEFUL_FLOOR,
   FINDINGS_INSTRUCTIONS,
   PACKET_BUDGETS,
   REVIEWER_IDS,
   SEVERITIES,
   TERMINAL_STATES,
+  TRUNCATION_MARKER_RE,
   assembleCodePacket,
+  evidenceRef,
   extractJsonBlock,
   isReviewerId,
   oneOf,
   parseFindings,
   parseReviewerIds,
   renderReviewPrompt,
+  reviewerVisibleDiff,
   section,
+  segmentsWithoutTruncationSplices,
   titleCase
 };

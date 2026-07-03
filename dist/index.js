@@ -43,6 +43,11 @@ array with a "summary" that says so. Do not invent issues to fill the list.`;
 function oneOf(set, v, fallback) {
   return set.includes(v) ? v : fallback;
 }
+function evidenceRef(file, line, scrub = (s) => s) {
+  if (!file) return "(uncited)";
+  const f = scrub(file);
+  return line ? `${f}:${line}` : f;
+}
 var asSeverity = (v) => oneOf(SEVERITIES, v, "medium");
 var asConfidence = (v) => oneOf(CONFIDENCES, v, "low");
 function asEvidence(v) {
@@ -122,6 +127,12 @@ var PACKET_BUDGETS = {
   tests: 8e3
 };
 var DIFF_USEFUL_FLOOR = 200;
+var MARKER_RE_SRC = String.raw`…\[\d+ chars truncated\]…`;
+var truncationMarker = (droppedChars) => `\u2026[${droppedChars} chars truncated]\u2026`;
+var TRUNCATION_MARKER_RE = new RegExp(MARKER_RE_SRC);
+function segmentsWithoutTruncationSplices(body) {
+  return body.split(new RegExp(String.raw`[^\n]*\n\n${MARKER_RE_SRC}\n\n[^\n]*`));
+}
 function truncate(text, budget) {
   if (text.length <= budget) return { text, truncated: false };
   const head = Math.floor(budget * 0.7);
@@ -129,7 +140,7 @@ function truncate(text, budget) {
   return {
     text: `${text.slice(0, head)}
 
-\u2026[${text.length - budget} chars truncated]\u2026
+${truncationMarker(text.length - budget)}
 
 ${text.slice(-tail)}`,
     truncated: true
@@ -146,6 +157,11 @@ function section(title, why, body, budget) {
     title,
     truncated: cut.truncated
   };
+}
+var DIFF_SECTION_TITLE = "The diff under review";
+function reviewerVisibleDiff(packet) {
+  const s = packet.sections.find((sec) => sec.title === DIFF_SECTION_TITLE);
+  return { text: s?.body ?? "", truncated: s?.truncated ?? false };
 }
 function assembleCodePacket(input) {
   const sections = [
@@ -177,7 +193,7 @@ function assembleCodePacket(input) {
     );
   }
   const diff = section(
-    "The diff under review",
+    DIFF_SECTION_TITLE,
     "the change itself \u2014 review THIS, not the whole repo",
     input.diff,
     PACKET_BUDGETS.diff
@@ -1379,7 +1395,7 @@ import fs7 from "fs";
 import path6 from "path";
 
 // src/modes/review/gate-hunks.ts
-var GATE_PACKET_SCHEMA_VERSION = 1;
+var GATE_PACKET_SCHEMA_VERSION = 2;
 function persistGatePacket(baseDir, runId, input) {
   const packet = {
     diff: input.diff,
@@ -1393,6 +1409,11 @@ function persistGatePacket(baseDir, runId, input) {
 import fs9 from "fs";
 import os5 from "os";
 import path8 from "path";
+
+// src/modes/review/gate.ts
+var GATE_VERDICTS = ["agree", "partial", "false", "unverified"];
+
+// src/modes/review/receipt.ts
 function computePolicyHash(args) {
   const canonical = JSON.stringify({
     coveragePolicy: args.coveragePolicy,
@@ -1446,6 +1467,14 @@ function writeReceipt(storeDir, receipt) {
   fs9.renameSync(tmp, file);
   return file;
 }
+function isVerdictCounts(v) {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+  const rec = v;
+  return Object.keys(rec).length === GATE_VERDICTS.length && GATE_VERDICTS.every((k) => {
+    const n = rec[k];
+    return typeof n === "number" && Number.isInteger(n) && n >= 0;
+  });
+}
 function validateReceiptShape(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("receipt is not a JSON object");
@@ -1471,6 +1500,11 @@ function validateReceiptShape(value) {
       (p) => p !== null && typeof p === "object" && !Array.isArray(p) && isStr(p.id) && isStr(p.state) && isStr(p.vendor)
     );
     if (!okArr) errs.push("peerReviewers (PeerReviewerRecord[])");
+  }
+  if (o.gateDisposition !== void 0) {
+    const g = o.gateDisposition;
+    const okDisp = g !== null && typeof g === "object" && !Array.isArray(g) && Array.isArray(g.dismissedHighIds) && g.dismissedHighIds.every((x) => isStr(x)) && typeof g.trailWritten === "boolean" && isVerdictCounts(g.verdictCounts);
+    if (!okDisp) errs.push("gateDisposition (GateDispositionSummary)");
   }
   const c = o.coverage;
   if (c === null || typeof c !== "object" || Array.isArray(c)) {
@@ -1745,7 +1779,7 @@ async function runReviewMode(opts) {
   }
   try {
     persistGatePacket(opts.out, opts.runId, {
-      diff: acquired.diff,
+      diff: reviewerVisibleDiff(packet).text,
       headSha: acquired.headSha
     });
   } catch {
@@ -2367,7 +2401,7 @@ function parseCritique2(raw) {
   }
   return { notes, summary };
 }
-function parseAgreements(v) {
+function parseAgreements2(v) {
   if (!Array.isArray(v)) return [];
   const out = [];
   for (const ra of v) {
@@ -2405,7 +2439,7 @@ function parseConsultSynthesis(raw) {
   const o = obj;
   const summary = str4(o.summary);
   const recommendation = str4(o.recommendation);
-  const agreements = parseAgreements(o.agreements);
+  const agreements = parseAgreements2(o.agreements);
   const divergences = parseDivergences(o.divergences);
   if (!recommendation && !summary) {
     return {
@@ -2721,6 +2755,7 @@ export {
   DEFAULT_COVERAGE_CEILING,
   DEFAULT_OBJECTIVE,
   DEFAULT_VOICE_TIMEOUT_MS,
+  DIFF_SECTION_TITLE,
   DIFF_USEFUL_FLOOR,
   FINDINGS_INSTRUCTIONS,
   IMPLEMENTED_MODES,
@@ -2737,6 +2772,7 @@ export {
   SECURITY_OBJECTIVE,
   SEVERITIES,
   TERMINAL_STATES,
+  TRUNCATION_MARKER_RE,
   VOICES_FILE,
   VOICE_ADAPTERS,
   VOICE_DEFAULTS,
@@ -2759,6 +2795,7 @@ export {
   diffDigest,
   ensureSandboxProfile,
   escapesRoot,
+  evidenceRef,
   extractGrokText,
   extractJsonBlock,
   extractRefs,
@@ -2814,6 +2851,7 @@ export {
   resolveReviewSandbox,
   resolveReviewer,
   reviewDir,
+  reviewerVisibleDiff,
   runBrainstormMode,
   runClaudeVoice,
   runCodexReview,
@@ -2825,6 +2863,7 @@ export {
   scanDiffForSecrets,
   section,
   securityClassLabel,
+  segmentsWithoutTruncationSplices,
   sha256Hex,
   stripSecurityTag,
   summarizeCoverage,

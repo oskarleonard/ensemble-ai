@@ -1,5 +1,5 @@
 import { writeTrailFile } from '../../core/artifacts';
-import { extractJsonBlock } from '../../core/findings';
+import { evidenceRef, extractJsonBlock } from '../../core/findings';
 import { SEVERITIES, type Severity } from '../../core/types';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
@@ -29,8 +29,10 @@ import {
 // It is fed each finding's CITED diff hunk from the pinned packet, tags EVERY finding
 // agree/partial/false/unverified (never removes one), records a durable schema-versioned
 // `gate-verdicts.json` trail (raw model verdict + host EFFECTIVE verdict + a machine-readable
-// downgrade reason), and renders the tags to stdout. Phase 1 is ADDITIVE: it builds the trail
-// + rendering + validation plumbing; it does NOT change exit codes (authority is Phase 2).
+// downgrade reason), and renders the tags to stdout. Phase 2 adds the DISMISS-ONLY exit authority
+// below (`gateAuthorityActive` · `resolveHighGate`, consumed by cli.ts): under active authority a
+// citation-validated `false` on a HIGH may drop it from the exit-4 gate — dismiss-only, never a
+// promotion, and every host-forced downgrade still gates.
 // Everything here is a pure function of its inputs except runGate's spawn + the trail write.
 
 // The verdict taxonomy that replaces likely-real/look-closer/likely-false. `agree` = real;
@@ -434,6 +436,136 @@ export function honoredHighDismissals(
     .map((r) => r.findingId);
 }
 
+// ── Exit authority (Phase 2 — dismiss-only) ────────────────────────────────────────────
+
+// Whether the gate's DISMISS-ONLY exit authority is IN EFFECT for this run. ON by default for
+// LOCAL provenance (the diff is the cwd repo's own working-tree/--staged/branch state — the
+// trusted self-review case this feature was ratified for); STRICT for FOREIGN provenance
+// (--pr / URL / stdin / --diff-file) unless `--gate-dismissals` explicitly opts in; `--strict-high`
+// forces STRICT everywhere. STRICT = the gate's verdicts stay advisory and EVERY HIGH gates
+// (exactly today's behavior). Pure — the CLI resolves `localProvenance` from the diff source.
+export interface GateAuthorityInputs {
+  gateDismissals: boolean; // --gate-dismissals: opt FOREIGN provenance INTO authority
+  localProvenance: boolean; // the diff is the cwd repo's own local state (trusted)
+  strictHigh: boolean; // --strict-high: force STRICT anywhere
+}
+
+// The ONE precedence ladder both the boolean and the label derive from — strict-high wins, then
+// local provenance is trusted-on, then foreign is on ONLY if explicitly opted in, else foreign is
+// strict. Resolving it once means the exit decision and the user-facing "why" can never disagree
+// (the label is the stdout explanation of that exact decision).
+type GateAuthorityMode = 'strict-forced' | 'local-on' | 'foreign-opted-in' | 'foreign-strict';
+
+function gateAuthorityMode(i: GateAuthorityInputs): GateAuthorityMode {
+  if (i.strictHigh) return 'strict-forced'; // strict everywhere — no dismissals honored
+  if (i.localProvenance) return 'local-on'; // trusted self-review — authority ON
+  if (i.gateDismissals) return 'foreign-opted-in'; // foreign, explicitly opted in — authority ON
+  return 'foreign-strict'; // foreign, not opted in — strict
+}
+
+export function gateAuthorityActive(i: GateAuthorityInputs): boolean {
+  const mode = gateAuthorityMode(i);
+  return mode === 'local-on' || mode === 'foreign-opted-in';
+}
+
+// A one-line human label for the resolved authority mode (stdout legibility).
+export function gateAuthorityLabel(i: GateAuthorityInputs): string {
+  switch (gateAuthorityMode(i)) {
+    case 'strict-forced':
+      return 'STRICT (--strict-high — every HIGH gates)';
+    case 'local-on':
+      return 'ON (local provenance — dismiss-only)';
+    case 'foreign-opted-in':
+      return 'ON (--gate-dismissals — foreign provenance opted in)';
+    case 'foreign-strict':
+      return 'STRICT (foreign provenance — every HIGH gates; pass --gate-dismissals to enable)';
+  }
+}
+
+// The exit decision over HIGH findings: which HIGHs still GATE (force exit 4) vs which the gate
+// HONORED-dismissed. Under STRICT authority EVERY HIGH gates (dismissed set empty). Under active
+// authority a HIGH is dismissed ONLY when it is a citation-validated `false` AND the trail durably
+// wrote (honoredHighDismissals). The Phase-1 host-forced downgrades — truncation-ineligible,
+// invalid citation, packet/parse/schema failure, trail-write failure — never yield an
+// effectiveVerdict `false`, so they can never enter the dismissed set: a downgraded HIGH always
+// gates. Pure — the CLI keeps exit precedence (2 > 1 > 4 > 0) and never lets this trip exit 1.
+export interface HighGateDecision {
+  dismissedHighIds: string[]; // HONORED dismissals — rendered loudly, dropped from the gate
+  gatingHighIds: string[]; // HIGHs that still gate → exit 4
+}
+
+export function resolveHighGate(
+  records: GateVerdictRecord[],
+  trailWritten: boolean,
+  authorityActive: boolean
+): HighGateDecision {
+  const highIds = records.filter((r) => r.severity === 'high').map((r) => r.findingId);
+  if (!authorityActive) return { dismissedHighIds: [], gatingHighIds: highIds };
+  const dismissed = new Set(honoredHighDismissals(records, trailWritten));
+  return {
+    dismissedHighIds: highIds.filter((id) => dismissed.has(id)),
+    gatingHighIds: highIds.filter((id) => !dismissed.has(id)),
+  };
+}
+
+// The exit-authority block for stdout: the resolved mode, each HONORED-dismissed HIGH rendered
+// LOUDLY as `HIGH (dismissed by gate — reason)`, any advisory-only gate-`false` HIGHs that STRICT
+// did NOT honor (surfaced, never silently gated), and the HIGHs that still gate. Returns [] when
+// there are no HIGH findings at all (nothing authority-relevant to say). Pure.
+export function renderHighGate(
+  records: GateVerdictRecord[],
+  decision: HighGateDecision,
+  opts: { authorityActive: boolean; authorityLabel: string; scrub: (s: string) => string }
+): string[] {
+  const s = opts.scrub;
+  const highs = records.filter((r) => r.severity === 'high');
+  if (highs.length === 0) return [];
+  const byId = new Map(records.map((r) => [r.findingId, r]));
+  const out: string[] = ['', `  ── gate authority — ${opts.authorityLabel} ──`];
+  for (const id of decision.dismissedHighIds) {
+    const r = byId.get(id);
+    const reason = r?.reason ? s(r.reason).slice(0, 200) : 'grounded false verdict';
+    const where = r?.file ? ` · ${s(r.file)}${r.line ? `:${r.line}` : ''}` : '';
+    out.push(`     HIGH (dismissed by gate — ${reason}) · ${id}${where}`);
+  }
+  // A gate `false` on a HIGH that authority did NOT honor (a STRICT run) — advisory only, surfaced
+  // so the user sees the dismiss path exists (and how to enable it) rather than silently gating.
+  if (!opts.authorityActive) {
+    const advisory = highs.filter((r) => r.effectiveVerdict === 'false').map((r) => r.findingId);
+    if (advisory.length > 0) {
+      out.push(
+        `     gate marked ${advisory.length} HIGH(s) \`false\` (advisory — authority STRICT, NOT dismissed): ${advisory.join(', ')}`
+      );
+    }
+  }
+  if (decision.gatingHighIds.length > 0) {
+    out.push(
+      `     ${decision.gatingHighIds.length} HIGH(s) gate → exit 4: ${decision.gatingHighIds.join(', ')}`
+    );
+  } else if (decision.dismissedHighIds.length > 0) {
+    out.push('     every HIGH dismissed by the gate — no HIGH gates this run');
+  }
+  return out;
+}
+
+// The gate-disposition summary the receipt carries (spec §Design 2). Verdict counts + the HONORED
+// dismissed HIGH ids + the trail-failed marker (trailWritten=false means dismissals were NOT
+// honored). Additive on the receipt — `receipt verify` never reads it, so its semantics are
+// unchanged. `verdictCounts` keys are the GateVerdict enum, JSON-serialized as strings.
+export interface GateDispositionSummary {
+  dismissedHighIds: string[];
+  trailWritten: boolean;
+  verdictCounts: Record<string, number>;
+}
+
+export function gateDispositionSummary(
+  records: GateVerdictRecord[],
+  dismissedHighIds: string[],
+  trailWritten: boolean
+): GateDispositionSummary {
+  return { dismissedHighIds, trailWritten, verdictCounts: verdictCounts(records) };
+}
+
 // ── Durable trail ──────────────────────────────────────────────────────────────────────
 
 export interface GateVerdictsTrail {
@@ -483,7 +615,7 @@ export function renderGateVerdicts(
     out.push('     no findings to verdict');
   } else {
     for (const r of records) {
-      const where = r.file ? `${s(r.file)}${r.line ? `:${r.line}` : ''}` : '(uncited)';
+      const where = evidenceRef(r.file, r.line, s);
       const dg = r.downgradeReason ? `  (host: ${r.downgradeReason})` : '';
       const reason = r.reason ? ` — ${s(r.reason).slice(0, 200)}` : '';
       out.push(
@@ -568,6 +700,22 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     return { gateTrailWritten, synthesis, verdicts: records };
   };
 
+  // Every FAIL-CLOSED spawn/parse exit shares one shape: log, then finalize the deterministic
+  // fallback synthesis (carrying the error string, and the raw gate output when we have it) as a
+  // whole-envelope failure. One closure so the three failure branches can't drift on that shape.
+  const bail = (
+    logMsg: string,
+    error: string,
+    failure: WholeEnvelopeFailure['failure'],
+    raw?: string
+  ): GateRunResult => {
+    log(logMsg);
+    return finalize(
+      { ...fallbackReviewSynthesis(opts.reviews), error, ...(raw !== undefined ? { raw } : {}) },
+      { failure }
+    );
+  };
+
   // No healthy reviewer ⇒ nothing to verdict; still emit the deterministic fallback synthesis
   // and a (probably empty) trail so the artifact always exists.
   if (healthy.length === 0) {
@@ -580,26 +728,27 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   try {
     res = await opts.run(prompt, opts.config, { timeoutMs: opts.timeoutMs });
   } catch (e) {
-    log(`  · gate failed (${(e as Error).message}) — deterministic fallback + all unverified`);
-    return finalize(
-      { ...fallbackReviewSynthesis(opts.reviews), error: (e as Error).message },
-      { failure: 'gate-failed' }
+    return bail(
+      `  · gate failed (${(e as Error).message}) — deterministic fallback + all unverified`,
+      (e as Error).message,
+      'gate-failed'
     );
   }
   if (!res.raw || res.timedOut) {
-    log('  · gate produced no usable output — deterministic fallback + all unverified');
-    return finalize(
-      { ...fallbackReviewSynthesis(opts.reviews), error: res.timedOut ? 'gate timed out' : 'gate produced no output' },
-      { failure: 'gate-failed' }
+    return bail(
+      '  · gate produced no usable output — deterministic fallback + all unverified',
+      res.timedOut ? 'gate timed out' : 'gate produced no output',
+      'gate-failed'
     );
   }
 
   const parsed = parseGateEnvelope(res.raw);
   if ('failure' in parsed) {
-    log(`  · gate envelope not usable (${parsed.failure}) — deterministic fallback + all unverified`);
-    return finalize(
-      { ...fallbackReviewSynthesis(opts.reviews), error: parsed.failure, raw: res.raw },
-      { failure: parsed.failure }
+    return bail(
+      `  · gate envelope not usable (${parsed.failure}) — deterministic fallback + all unverified`,
+      parsed.failure,
+      parsed.failure,
+      res.raw
     );
   }
 

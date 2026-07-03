@@ -14,6 +14,7 @@ import {
   gatherConventions,
 } from './core/conventions';
 import { isEntrypoint } from './core/entrypoint';
+import { evidenceRef } from './core/findings';
 import { listReviewers, REVIEWERS_FILE } from './core/reviewers';
 import { scrubControl as clean } from './core/sanitize';
 import {
@@ -45,6 +46,14 @@ import {
   runClaudeReviewLayer,
 } from './modes/review/self-contained';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
+import {
+  gateAuthorityActive,
+  type GateAuthorityInputs,
+  gateAuthorityLabel,
+  gateDispositionSummary,
+  renderHighGate,
+  resolveHighGate,
+} from './modes/review/gate';
 import {
   acquireDiff,
   type AcquiredDiff,
@@ -118,8 +127,9 @@ const REVIEW_USAGE = `ensemble-ai review — self-contained cross-vendor review 
 
 Spawns THREE blind peer reviewers on the SAME pinned packet — codex + grok + a cold
 headless \`claude -p\` (Opus, default-on) — each writing its own review into the trail,
-then a \`claude -p\` SYNTHESIS pass reads all three and emits AGREE(confident)/DISAGREE
-(look-closer) · a per-finding sanity-check · a bottom line. Runs from ANY terminal with
+then a \`claude -p\` GATE pass reads all three and emits AGREE(confident)/DISAGREE
+(look-closer) · a grounded per-finding verdict (agree/partial/false/unverified) · a bottom
+line. Runs from ANY terminal with
 no Claude session. REVIEW-ONLY — it never edits code. With NO source flag it reviews the
 current branch. \`--no-claude\` drops the Opus reviewer + synthesis (codex + grok only).
 
@@ -149,6 +159,10 @@ Options:
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
+  --strict-high         force STRICT: EVERY HIGH gates (exit 4), even one the gate dismissed —
+                        overrides the provenance default (use for untrusted diffs / CI)
+  --gate-dismissals     opt a FOREIGN diff (--pr/URL/stdin/--diff-file) INTO the gate's
+                        dismiss-only authority (LOCAL diffs already have it on by default)
   --out <dir>           trail BASE dir; a per-run <run-id>/ subdir is created under it
                         (default: repo-local .ensemble-ai/reviews when reviewing this
                         repo's own diff, else an OS temp dir — the path is printed)
@@ -159,9 +173,17 @@ Options:
   --run-id <id>         trail/receipt run id (default: generated)
   -h, --help            this help
 
-Exit codes: 0 = completed, no HIGH (or gate disabled) · 1 = a reviewer failed
+Gate authority (exit 4): a HIGH stops the gate ONLY when the cold-Opus GATE returns a
+citation-validated \`false\` grounded in the reviewed code — dismiss-only: it can never bless,
+promote, or soften anything else. The grounding proves the gate READ the disputed code; it does
+NOT prove the finding is false (the verdict is the gate model's judgment). Authority is ON by
+default ONLY for LOCAL diffs (--working-tree/--staged/branch — the trusted self-review case) and
+STRICT for FOREIGN provenance (--pr/URL/stdin/--diff-file), where every HIGH gates. --strict-high
+forces STRICT anywhere; --gate-dismissals opts foreign provenance in. Dismissed HIGHs print loudly.
+
+Exit codes: 0 = completed, no gating HIGH (or gate disabled) · 1 = a reviewer failed
 (crash/timeout/no-parse) · 2 = blocked by the secret-scan · 3 = usage / no diff ·
-4 = completed WITH a HIGH finding (the gate; disable with --no-fail-on-high).`;
+4 = completed with a HIGH the gate did NOT dismiss (disable with --no-fail-on-high).`;
 
 const SECURITY_USAGE = `ensemble-ai security — adversarial SECURITY audit of a diff with ALL reviewers.
 
@@ -558,12 +580,6 @@ function oneLineSummary(result: ReviewModeResult): string {
   return `${tallies} · ${receipt}`;
 }
 
-function evidenceRef(file?: string, line?: number): string {
-  if (!file) return '(uncited)';
-  const f = clean(file);
-  return line ? `${f}:${line}` : f;
-}
-
 // One finding line: `file:line  title`, with a `[class]` security-class tag prepended
 // in the security profile (the reviewer's own leading [tag] is stripped to avoid
 // duplication, then re-rendered from the canonical class).
@@ -571,7 +587,7 @@ function findingLine(
   f: StoredReview['findings'][number],
   profile: ReviewProfile
 ): string {
-  const ref = evidenceRef(f.evidence.file, f.evidence.line);
+  const ref = evidenceRef(f.evidence.file, f.evidence.line, clean);
   if (profile === 'security') {
     const cls = classifySecurityFinding(f);
     return `       [${cls}] ${ref}  ${clean(stripSecurityTag(f.title))}`;
@@ -620,7 +636,7 @@ function depSurfaceBlock(d: DepSurfaceResult): string[] {
     for (const s of m.samples) out.push(`         + ${clean(s).slice(0, 100)}`);
   }
   for (const r of d.riskyImports) {
-    out.push(`     risky [${r.cls}] ${r.label} — ${evidenceRef(r.path, r.line)}`);
+    out.push(`     risky [${r.cls}] ${r.label} — ${evidenceRef(r.path, r.line, clean)}`);
   }
   return out;
 }
@@ -766,6 +782,7 @@ async function reviewCommand(
         conventions: { type: 'string' },
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
+        'gate-dismissals': { type: 'boolean' },
         help: { short: 'h', type: 'boolean' },
         'no-claude': { type: 'boolean' },
         'no-conventions': { type: 'boolean' },
@@ -776,6 +793,7 @@ async function reviewCommand(
         'run-id': { type: 'string' },
         sandbox: { type: 'string' },
         staged: { type: 'boolean' },
+        'strict-high': { type: 'boolean' },
         'working-tree': { type: 'boolean' },
       },
     }));
@@ -951,6 +969,25 @@ async function reviewCommand(
     }
   }
 
+  // Resolve the gate's DISMISS-ONLY exit authority for this run (Phase 2). ON by default for a
+  // LOCAL diff (working-tree/--staged/branch — the trusted self-review case), STRICT for FOREIGN
+  // provenance (--pr/URL/stdin/--diff-file) unless --gate-dismissals opts in; --strict-high forces
+  // STRICT everywhere. `source.localRepoTrail` is the SAME provenance signal the trail-fence keys
+  // off (#13). Computed here — before the receipt, the render, and the exit — so all three agree.
+  // Pure + safe even when the gate did not run (--no-claude → no records → nothing to dismiss).
+  const gateAuthorityInputs: GateAuthorityInputs = {
+    gateDismissals: Boolean(values['gate-dismissals']),
+    localProvenance: source.localRepoTrail === true,
+    strictHigh: Boolean(values['strict-high']),
+  };
+  const authorityActive = gateAuthorityActive(gateAuthorityInputs);
+  const gateRecords = claudeLayer?.gateVerdicts ?? [];
+  const highGate = resolveHighGate(
+    gateRecords,
+    claudeLayer?.gateTrailWritten ?? false,
+    authorityActive
+  );
+
   // Persist the receipt ONLY after the full expected roster ran (fail-loud parity with the
   // exit gate): the codex/grok core qualified a candidate, but when the default-on Opus
   // reviewer was EXPECTED it must ALSO have completed — else NO clean receipt is written
@@ -970,10 +1007,22 @@ async function reviewCommand(
             },
           ]
         : [];
-      const receipt =
-        peerReviewers.length > 0
-          ? { ...result.receiptCandidate, peerReviewers }
-          : result.receiptCandidate;
+      // Attach the gate-disposition summary whenever the gate ran (claudeLayer present) — verdict
+      // counts + honored dismissed HIGH ids + the trail-written marker. Additive: `receipt verify`
+      // never reads it (verify semantics unchanged), it is recorded for legibility + retro-scoring.
+      const receipt: DiffReviewReceipt = {
+        ...result.receiptCandidate,
+        ...(peerReviewers.length > 0 ? { peerReviewers } : {}),
+        ...(claudeLayer
+          ? {
+              gateDisposition: gateDispositionSummary(
+                gateRecords,
+                highGate.dismissedHighIds,
+                claudeLayer.gateTrailWritten
+              ),
+            }
+          : {}),
+      };
       try {
         result.receiptPath = writeReceipt(result.receiptStore, receipt);
         result.receipt = receipt;
@@ -1007,6 +1056,15 @@ async function reviewCommand(
   // Render the self-contained Opus layer (computed above) after the core summary.
   if (claudeLayer) {
     console.log(renderClaudeLayer(claudeLayer).join('\n'));
+    // The exit-AUTHORITY block: the resolved mode + any HONORED-dismissed HIGHs rendered LOUDLY
+    // (`HIGH (dismissed by gate — reason)`) + the HIGHs that still gate. Empty (unprinted) when
+    // there are no HIGH findings at all.
+    const highGateLines = renderHighGate(gateRecords, highGate, {
+      authorityActive,
+      authorityLabel: gateAuthorityLabel(gateAuthorityInputs),
+      scrub: clean,
+    });
+    if (highGateLines.length > 0) console.log(highGateLines.join('\n'));
   }
 
   // On stdout (with the receipt + pinned-input paths) — the machine-readable trail
@@ -1039,14 +1097,54 @@ async function reviewCommand(
       return 1;
     }
   }
-  // 4 = the findings GATE: a completed review surfaced a HIGH — from ANY of the three
-  // reviewers (codex + grok + the cold Opus voice). Gate-usable by default (a pre-PR hook
-  // can fail on it); --no-fail-on-high opts out → 0.
+  // 4 = the findings GATE: a completed review surfaced a HIGH — from ANY of the three reviewers
+  // (codex + grok + the cold Opus voice). Phase 2 — the gate's DISMISS-ONLY authority may drop a
+  // HIGH from the gate, but ONLY when it is a citation-validated `false` under ACTIVE authority
+  // (local provenance, or --gate-dismissals) AND the trail durably wrote. Under STRICT (foreign
+  // provenance / --strict-high) EVERY HIGH gates (today's behavior). Every Phase-1 host-forced
+  // downgrade (truncation-ineligible · invalid-citation · packet/parse/schema fail · trail-write
+  // fail) leaves its HIGH gating. A gate FAILURE yields all-`unverified` (nothing dismissed) → the
+  // HIGH still gates — and a gate failure NEVER trips exit 1 (that is reviewer-failure only,
+  // handled above). --no-fail-on-high opts out of 4 entirely. Precedence 2 > 1 > 4 > 0 intact.
   if (
     !values['no-fail-on-high'] &&
     (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))
   ) {
-    return 4;
+    // Exit 4 UNLESS the gate honored-dismissed EVERY HIGH. `highGate.dismissedHighIds`/`gatingHighIds`
+    // come from the gate RECORDS, reconciled from the reviews RE-READ from the trail
+    // (loadVoiceReviewsFromTrail → readReviewsForRun / reviewJsonFromTrail, both of which SILENTLY DROP
+    // a review that fails to read back). The "is there a HIGH" trigger above, by contrast, reads the
+    // IN-MEMORY reviews. Trusting "all gate-HIGHs dismissed" alone is FAIL-OPEN — and so is an equal
+    // COUNT check (dismissed.length === detected.length): a two-source divergence (a trail read-back
+    // gap · a stale reused run-id · a concurrent same-run-id run) can leave the tallies EQUAL while the
+    // record set adjudicated a DIFFERENT HIGH than the in-memory one, dismissing the wrong finding and
+    // slipping a real HIGH to exit 0 (codex-f1 · grok-f3). Fail-closed by IDENTITY, not count:
+    // reconstruct the id of EVERY in-memory HIGH in the gate's own `${voiceId}#${n}` namespace
+    // (flattenFindings), from the SAME authoritative source the trigger keys off (core reviews that
+    // reached `terminalState === 'reviewed'` + an ok Opus voice), and require the honored-dismissed set
+    // to COVER every one — with none left gating. A HIGH the records never adjudicated is absent from
+    // the dismissed set, so it gates; it can never slip through on a coincidental count match. (voiceId
+    // mirrors storedToVoiceReview — `reviewerId ?? reviewer.vendor`; the index is the finding's
+    // position in its reviewer's full findings array, the exact key flattenFindings assigns.)
+    const detectedHighIds: string[] = [];
+    for (const r of result.reviews) {
+      if (r.terminalState !== 'reviewed') continue;
+      const voiceId = r.reviewerId ?? r.reviewer.vendor;
+      r.findings.forEach((f, i) => {
+        if (f.severity === 'high') detectedHighIds.push(`${voiceId}#${i + 1}`);
+      });
+    }
+    if (claudeLayer?.claudeReview?.ok) {
+      claudeLayer.claudeReview.findings.forEach((f, i) => {
+        if (f.severity === 'high') detectedHighIds.push(`claude#${i + 1}`);
+      });
+    }
+    const honoredDismissed = new Set(highGate.dismissedHighIds);
+    const allHighsDismissed =
+      detectedHighIds.length > 0 &&
+      highGate.gatingHighIds.length === 0 &&
+      detectedHighIds.every((id) => honoredDismissed.has(id));
+    if (!allHighsDismissed) return 4;
   }
   return 0;
 }

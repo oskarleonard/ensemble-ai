@@ -1,8 +1,9 @@
 // The SELF-CONTAINED review layer: after the cross-vendor CORE (codex+grok) reviews the
 // pinned packet, add a THIRD blind peer reviewer — a COLD headless `claude -p` (Opus) —
-// on the SAME packet, then a separate `claude -p` SYNTHESIS pass that reads all three
-// reviewers' persisted trail files and emits AGREE(confident)/DISAGREE(look-closer) ·
-// per-finding sanity-check · bottom-line. DEFAULT-ON (opt out with `--no-claude`), so the
+// on the SAME packet, then a separate `claude -p` GATE pass that reads all three
+// reviewers' persisted trail files and emits AGREE(confident)/DISAGREE(look-closer) · a
+// grounded per-finding verdict (agree/partial/false/unverified) · bottom-line. DEFAULT-ON
+// (opt out with `--no-claude`), so the
 // bare `ensemble-ai review <pr|branch|url>` runs from ANY terminal with no Claude session.
 //
 // REVIEW-ONLY: this layer never edits code. Its ONLY writes are to the (fenced, 0600)
@@ -11,7 +12,7 @@
 // ./claude), accepted by design (the user runs it on their own diffs).
 
 import { readReviewsForRun, writeTrailFile } from '../../core/artifacts';
-import { parseFindings } from '../../core/findings';
+import { evidenceRef, parseFindings } from '../../core/findings';
 import { scrubControl as scrub } from '../../core/sanitize';
 import type { ReviewFinding, StoredReview } from '../../core/types';
 import { REVIEWER_IDS, type ReviewerId } from '../../core/types';
@@ -92,9 +93,7 @@ export function renderReviewMarkdown(v: VoiceReview): string {
     lines.push('(no findings)');
   } else {
     for (const f of v.findings) {
-      const where = f.evidence.file
-        ? `${f.evidence.file}${f.evidence.line ? `:${f.evidence.line}` : ''}`
-        : '(uncited)';
+      const where = evidenceRef(f.evidence.file, f.evidence.line);
       lines.push(`### [${f.severity}/${f.confidence}] ${f.title}`);
       lines.push(`- where: ${where}`);
       lines.push(`- ${f.body}`, '');
@@ -321,7 +320,7 @@ export function claudeLayerHasHigh(layer: ClaudeLayerResult | null): boolean {
 // ── Rendering (for the CLI summary) ───────────────────────────────────────────────────
 
 // The claude-layer block for stdout: the cold Opus review's findings, then the synthesis
-// (AGREE / DISAGREE / sanity-checks / bottom line). Grouped + scannable.
+// (AGREE / DISAGREE / bottom line) and the grounded per-finding verdict tags. Grouped + scannable.
 export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
   const out: string[] = [];
   const cr = result.claudeReview;
@@ -334,9 +333,7 @@ export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
       out.push('     no findings');
     } else {
       for (const f of cr.findings) {
-        const where = f.evidence.file
-          ? `${f.evidence.file}${f.evidence.line ? `:${f.evidence.line}` : ''}`
-          : '(uncited)';
+        const where = evidenceRef(f.evidence.file, f.evidence.line);
         out.push(`     [${f.severity}] ${scrub(where)}  ${scrub(f.title)}`);
       }
     }

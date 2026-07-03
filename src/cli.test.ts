@@ -31,6 +31,7 @@ import type { BrainstormResult } from './modes/brainstorm/types';
 import { runConsultMode } from './modes/consult';
 import type { ConsultResult } from './modes/consult/types';
 import { runReviewMode } from './modes/review';
+import type { GateVerdictRecord } from './modes/review/gate';
 import {
   type DiffReviewReceipt,
   keyOf,
@@ -269,6 +270,107 @@ describe('self-contained Opus layer wiring (default-on; --no-claude opts out; fe
   });
 });
 
+// ── DC4 — the verdict-aware exit-4 gate: provenance-scoped, dismiss-only ────────────────
+describe('exit-4 gate authority — provenance-scoped dismiss-only (DC4)', () => {
+  const synthesis = {
+    agreements: [], bottomLine: 'ok', by: 'claude', degraded: false,
+    disagreements: [], ok: true, raw: null, summary: 's',
+  };
+  function record(over: Partial<GateVerdictRecord> & { findingId: string }): GateVerdictRecord {
+    return {
+      downgradeReason: null, effectiveVerdict: 'false', file: 'a.ts', line: 1,
+      rawVerdict: 'false', reason: 'refuted', reviewer: over.findingId.split('#')[0],
+      severity: 'high', title: 't', ...over,
+    };
+  }
+  function layerWith(gateVerdicts: GateVerdictRecord[], gateTrailWritten = true): void {
+    mockLayer.mockResolvedValue({
+      claudeReview: { findings: [], ok: true, summary: '', voiceId: 'claude' },
+      gateTrailWritten, gateVerdicts, modelLabel: 'opus', synthesis,
+    });
+  }
+  // codex raises a HIGH (so anyHigh is true); the gate returns a verdict for it.
+  function coreHigh(): void {
+    mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed', 1, 'high')] }));
+  }
+  function diffFile(): string {
+    const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ea-df-')), 'c.diff');
+    fs.writeFileSync(p, 'diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n');
+    return p;
+  }
+
+  it('LOCAL diff + validated-false HIGH ⇒ authority ON ⇒ dismissed ⇒ exit 0', async () => {
+    coreHigh(); layerWith([record({ findingId: 'codex#1' })]);
+    expect(await main(['review', '--working-tree'])).toBe(0);
+  });
+
+  it('LOCAL diff + --strict-high ⇒ STRICT ⇒ the HIGH still gates ⇒ exit 4', async () => {
+    coreHigh(); layerWith([record({ findingId: 'codex#1' })]);
+    expect(await main(['review', '--working-tree', '--strict-high'])).toBe(4);
+  });
+
+  it('FOREIGN diff (--diff-file) + validated-false HIGH ⇒ STRICT by default ⇒ exit 4', async () => {
+    coreHigh(); layerWith([record({ findingId: 'codex#1' })]);
+    expect(await main(['review', '--diff-file', diffFile()])).toBe(4);
+  });
+
+  it('FOREIGN diff + --gate-dismissals ⇒ authority opted IN ⇒ dismissed ⇒ exit 0', async () => {
+    coreHigh(); layerWith([record({ findingId: 'codex#1' })]);
+    expect(await main(['review', '--diff-file', diffFile(), '--gate-dismissals'])).toBe(0);
+  });
+
+  it('a host-forced downgrade (truncated ⇒ unverified) HIGH always gates, even LOCAL ⇒ exit 4', async () => {
+    coreHigh();
+    layerWith([record({ downgradeReason: 'truncated', effectiveVerdict: 'unverified', findingId: 'codex#1' })]);
+    expect(await main(['review', '--working-tree'])).toBe(4);
+  });
+
+  it('a trail-write failure ⇒ dismissal NOT honored ⇒ exit 4 even LOCAL', async () => {
+    coreHigh(); layerWith([record({ findingId: 'codex#1' })], false);
+    expect(await main(['review', '--working-tree'])).toBe(4);
+  });
+
+  it('--no-fail-on-high suppresses exit 4 regardless of authority', async () => {
+    coreHigh(); layerWith([record({ downgradeReason: 'missing', effectiveVerdict: 'unverified', findingId: 'codex#1', rawVerdict: null })]);
+    expect(await main(['review', '--working-tree', '--no-fail-on-high'])).toBe(0);
+  });
+
+  it('--no-claude ⇒ no gate ⇒ a HIGH always gates (no dismiss path) ⇒ exit 4', async () => {
+    coreHigh();
+    expect(await main(['review', '--working-tree', '--no-claude'])).toBe(4);
+  });
+
+  it('a HIGH present in-memory but MISSING from the gate record set still gates (no fail-open on a trail read-back drop) ⇒ exit 4', async () => {
+    // Two in-memory HIGHs (codex#1, codex#2); the gate only recorded + dismissed codex#1 — codex#2
+    // dropped from the trail-loaded set (readReviewsForRun/reviewJsonFromTrail silently drop an
+    // unreadable review). "All GATE-highs dismissed" (gatingHighIds empty) must NOT read as "all
+    // highs dismissed": the un-adjudicated codex#2 gates. Fail-closed against the two-source divergence.
+    mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed', 2, 'high')] }));
+    layerWith([record({ findingId: 'codex#1' })]);
+    expect(await main(['review', '--working-tree'])).toBe(4);
+  });
+
+  it('count MATCHES but the dismissed ids are a DIFFERENT HIGH ⇒ identity coverage still gates ⇒ exit 4', async () => {
+    // Two in-memory HIGHs (codex#1, codex#2). The gate recorded + dismissed codex#1 AND a phantom
+    // grok#1 (a stale/concurrent record, or a trail read-back that SWAPPED membership) — so the
+    // dismissed COUNT (2) equals the detected count (2), yet the real codex#2 was never adjudicated.
+    // The old equal-count check failed OPEN here; identity coverage requires EVERY in-memory HIGH id
+    // to be in the honored-dismissed set, so the uncovered codex#2 gates (codex-f1 · grok-f3).
+    mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed', 2, 'high')] }));
+    layerWith([record({ findingId: 'codex#1' }), record({ findingId: 'grok#1' })]);
+    expect(await main(['review', '--working-tree'])).toBe(4);
+  });
+
+  it('every in-memory HIGH covered BY IDENTITY in the dismissed set ⇒ the legit all-dismissed path ⇒ exit 0', async () => {
+    // Both in-memory HIGHs (codex#1, codex#2) are the exact ids the gate honored-dismissed — full
+    // identity coverage, nothing gating. Guards the fix against being over-strict: the real
+    // all-dismissed path must still reach exit 0.
+    mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed', 2, 'high')] }));
+    layerWith([record({ findingId: 'codex#1' }), record({ findingId: 'codex#2' })]);
+    expect(await main(['review', '--working-tree'])).toBe(0);
+  });
+});
+
 describe('receipt reflects the FULL expected roster (not just the codex/grok core)', () => {
   const synthesis = {
     agreements: [], bottomLine: 'ok', by: 'claude', degraded: false,
@@ -328,6 +430,33 @@ describe('receipt reflects the FULL expected roster (not just the codex/grok cor
     expect(written?.peerReviewers).toEqual([
       { id: 'claude', state: 'reviewed', vendor: 'anthropic/opus' },
     ]);
+  });
+
+  it('the written receipt carries the gate-disposition summary (DC7)', async () => {
+    const s = store();
+    const cand = candidate();
+    mockRun.mockResolvedValue(result({
+      prompt: 'PINNED',
+      reviews: [storedReview('codex', 'reviewed', 1, 'high'), storedReview('grok', 'reviewed')],
+      receiptCandidate: cand, receiptStore: s,
+    }));
+    mockLayer.mockResolvedValue({
+      claudeReview: { findings: [], ok: true, summary: '', voiceId: 'claude' },
+      gateTrailWritten: true,
+      gateVerdicts: [{
+        downgradeReason: null, effectiveVerdict: 'false', file: 'a.ts', findingId: 'codex#1',
+        line: 1, rawVerdict: 'false', reason: 'r', reviewer: 'codex', severity: 'high', title: 't',
+      }],
+      modelLabel: 'opus', synthesis,
+    });
+    // LOCAL provenance ⇒ authority ON ⇒ the validated-false HIGH is dismissed ⇒ exit 0.
+    expect(await main(['review', '--working-tree'])).toBe(0);
+    const written = readReceipt(s, keyOf(cand));
+    expect(written?.gateDisposition).toEqual({
+      dismissedHighIds: ['codex#1'],
+      trailWritten: true,
+      verdictCounts: { agree: 0, false: 1, partial: 0, unverified: 0 },
+    });
   });
 
   it('--no-claude → the codex/grok-only receipt is written with no peer reviewers', async () => {

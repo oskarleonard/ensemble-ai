@@ -11,12 +11,16 @@ import type { VoiceRunResult } from '../brainstorm/voices';
 
 import {
   GATE_TRAIL_SCHEMA_VERSION,
+  gateAuthorityActive,
+  gateDispositionSummary,
   type GateFinding,
   honoredHighDismissals,
   parseGateEnvelope,
   prepareGateFindings,
   reconcileGateVerdicts,
   renderGateVerdicts,
+  renderHighGate,
+  resolveHighGate,
   runGate,
   validateCitation,
   verdictCounts,
@@ -390,6 +394,105 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
     expect(spawned).toBe(false);
     expect(res.synthesis.degraded).toBe(true); // deterministic fallback, no model call
     expect(res.verdicts).toEqual([]); // no healthy findings to verdict
+  });
+});
+
+// ── DC4 — provenance-scoped authority + dismiss-only exit gate ─────────────────────────
+describe('gateAuthorityActive — provenance-scoped default + flag overrides (DC4)', () => {
+  it('LOCAL provenance ⇒ authority ON by default', () => {
+    expect(gateAuthorityActive({ gateDismissals: false, localProvenance: true, strictHigh: false })).toBe(true);
+  });
+  it('FOREIGN provenance ⇒ STRICT by default; --gate-dismissals opts it IN', () => {
+    expect(gateAuthorityActive({ gateDismissals: false, localProvenance: false, strictHigh: false })).toBe(false);
+    expect(gateAuthorityActive({ gateDismissals: true, localProvenance: false, strictHigh: false })).toBe(true);
+  });
+  it('--strict-high forces STRICT anywhere — beats local provenance AND --gate-dismissals', () => {
+    expect(gateAuthorityActive({ gateDismissals: true, localProvenance: true, strictHigh: true })).toBe(false);
+  });
+});
+
+describe('resolveHighGate — dismiss-only; host-forced downgrades always gate (DC4 · DC11 · DC12)', () => {
+  const validatedFalse = (id: string, over: Partial<GateFinding> = {}) =>
+    reconcileGateVerdicts(
+      [gf({ findingId: id, ...over })],
+      parseGateEnvelope(envelope([{ citation: ANCHOR, findingId: id, reason: 'refuted', verdict: 'false' }]))
+    ).records;
+
+  it('active authority + validated-false HIGH + trail written ⇒ dismissed, none gates', () => {
+    expect(resolveHighGate(validatedFalse('codex#1'), true, true)).toEqual({ dismissedHighIds: ['codex#1'], gatingHighIds: [] });
+  });
+  it('STRICT authority ⇒ EVERY HIGH gates, even a validated-false one', () => {
+    expect(resolveHighGate(validatedFalse('codex#1'), true, false)).toEqual({ dismissedHighIds: [], gatingHighIds: ['codex#1'] });
+  });
+  it('a trail-write failure ⇒ NOT dismissed even under active authority (DC11)', () => {
+    expect(resolveHighGate(validatedFalse('codex#1'), false, true)).toEqual({ dismissedHighIds: [], gatingHighIds: ['codex#1'] });
+  });
+  it('a TRUNCATED HIGH (host-forced unverified) gates even with a valid citation (DC12)', () => {
+    expect(resolveHighGate(validatedFalse('codex#1', { truncated: true }), true, true)).toEqual({ dismissedHighIds: [], gatingHighIds: ['codex#1'] });
+  });
+  it('invalid-citation + packet-fail HIGHs gate under active authority (host-forced downgrade honored)', () => {
+    const badCite = reconcileGateVerdicts([gf()], parseGateEnvelope(envelope([{ citation: 'nowhere near the hunk', findingId: 'codex#1', reason: 'r', verdict: 'false' }]))).records;
+    expect(resolveHighGate(badCite, true, true).gatingHighIds).toEqual(['codex#1']);
+    const packetFail = reconcileGateVerdicts([gf()], { failure: 'packet-fail' }).records;
+    expect(resolveHighGate(packetFail, true, true).gatingHighIds).toEqual(['codex#1']);
+  });
+  it('MED/LOW findings are NEVER in the HIGH gate', () => {
+    const recs = reconcileGateVerdicts([gf({ findingId: 'grok#1', severity: 'medium' })], parseGateEnvelope(envelope([{ findingId: 'grok#1', reason: 'r', verdict: 'agree' }]))).records;
+    expect(resolveHighGate(recs, true, false)).toEqual({ dismissedHighIds: [], gatingHighIds: [] });
+  });
+  it('mixed — a dismissed HIGH alongside an agree HIGH ⇒ the agree HIGH still gates', () => {
+    const recs = reconcileGateVerdicts(
+      [gf({ findingId: 'codex#1' }), gf({ findingId: 'grok#1' })],
+      parseGateEnvelope(envelope([
+        { citation: ANCHOR, findingId: 'codex#1', reason: 'refuted', verdict: 'false' },
+        { findingId: 'grok#1', reason: 'real', verdict: 'agree' },
+      ]))
+    ).records;
+    expect(resolveHighGate(recs, true, true)).toEqual({ dismissedHighIds: ['codex#1'], gatingHighIds: ['grok#1'] });
+  });
+});
+
+describe('renderHighGate — loud dismissed HIGH + advisory-strict surfacing (DC4)', () => {
+  const validatedFalse = reconcileGateVerdicts(
+    [gf({ findingId: 'codex#1' })],
+    parseGateEnvelope(envelope([{ citation: ANCHOR, findingId: 'codex#1', reason: 'refuted by the cited line', verdict: 'false' }]))
+  ).records;
+
+  it('renders a dismissed HIGH LOUDLY as `HIGH (dismissed by gate — reason)`', () => {
+    const d = resolveHighGate(validatedFalse, true, true);
+    const text = renderHighGate(validatedFalse, d, { authorityActive: true, authorityLabel: 'ON (local provenance — dismiss-only)', scrub }).join('\n');
+    expect(text).toMatch(/HIGH \(dismissed by gate — refuted by the cited line\) · codex#1/);
+    expect(text).toContain('every HIGH dismissed by the gate');
+  });
+  it('under STRICT, an advisory gate-false HIGH is surfaced (not dismissed) and still gates', () => {
+    const d = resolveHighGate(validatedFalse, true, false);
+    const text = renderHighGate(validatedFalse, d, { authorityActive: false, authorityLabel: 'STRICT (--strict-high — every HIGH gates)', scrub }).join('\n');
+    expect(text).toMatch(/advisory — authority STRICT/);
+    expect(text).toMatch(/1 HIGH\(s\) gate → exit 4: codex#1/);
+    expect(text).not.toMatch(/dismissed by gate/);
+  });
+  it('returns [] when there are no HIGH findings (nothing authority-relevant to say)', () => {
+    const med = reconcileGateVerdicts([gf({ findingId: 'grok#1', severity: 'medium' })], parseGateEnvelope(envelope([{ findingId: 'grok#1', reason: 'r', verdict: 'agree' }]))).records;
+    expect(renderHighGate(med, resolveHighGate(med, true, true), { authorityActive: true, authorityLabel: 'x', scrub })).toEqual([]);
+  });
+});
+
+// ── DC7 — the receipt disposition summary payload ──────────────────────────────────────
+describe('gateDispositionSummary — receipt disposition payload (DC7)', () => {
+  it('carries verdict counts + honored dismissed HIGH ids + the trail-written marker', () => {
+    const recs = reconcileGateVerdicts(
+      [gf({ findingId: 'codex#1' }), gf({ findingId: 'grok#1', severity: 'medium' })],
+      parseGateEnvelope(envelope([
+        { citation: ANCHOR, findingId: 'codex#1', reason: 'r', verdict: 'false' },
+        { findingId: 'grok#1', reason: 'r', verdict: 'agree' },
+      ]))
+    ).records;
+    const summary = gateDispositionSummary(recs, resolveHighGate(recs, true, true).dismissedHighIds, true);
+    expect(summary).toEqual({
+      dismissedHighIds: ['codex#1'],
+      trailWritten: true,
+      verdictCounts: { agree: 1, false: 1, partial: 0, unverified: 0 },
+    });
   });
 });
 

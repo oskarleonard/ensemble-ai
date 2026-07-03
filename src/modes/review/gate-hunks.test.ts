@@ -134,6 +134,67 @@ describe('hunkCodeLines + hunkRangeKey', () => {
   });
 });
 
+// ── Binding fix #1 (grok-f1/codex-f3) — truncation-marker-aware hunk parsing ────────────
+// A pinned diff can carry the packet truncator's head+tail splice: `…[N chars truncated]…` between
+// blank lines, with a PARTIAL line on each side of the cut. Neither the marker nor a partial
+// fragment may become a citable line, and a hunk must never span the cut.
+describe('parsePacketHunks — truncation-marker-aware (binding fix #1)', () => {
+  // HEAD ends with a PARTIAL line (cut mid-token, no trailing newline).
+  const HEAD_PART = `diff --git a/src/head.ts b/src/head.ts
+--- a/src/head.ts
++++ b/src/head.ts
+@@ -1,3 +1,4 @@
+ export function head() {
++  const uniqueHeadGroundingLineHere = computeHeadValue(x);
+   return h;
+ }
++  const partialHeadLineCutMidTokenHere = veryLongExpr`;
+  // TAIL resumes with a PARTIAL fragment, THEN a complete file section with its own header.
+  const TAIL_PART = `partialTailFragmentBeforeItsFirstNewline
+diff --git a/src/tail.ts b/src/tail.ts
+--- a/src/tail.ts
++++ b/src/tail.ts
+@@ -1,3 +1,4 @@
+ export function tail() {
++  const uniqueTailGroundingLineHere = computeTailValue(y);
+   return t;
+ }
+`;
+  const TRUNCATED = `${HEAD_PART}\n\n…[9999 chars truncated]…\n\n${TAIL_PART}`;
+
+  it('parses BOTH the head file and the post-marker tail file (with its own header)', () => {
+    const map = parsePacketHunks(TRUNCATED);
+    expect([...map.keys()].sort()).toEqual(['src/head.ts', 'src/tail.ts']);
+    // the real, complete reviewer-visible lines resolve + are citable
+    const headCode = hunkCodeLines(map.get('src/head.ts')![0]);
+    const tailCode = hunkCodeLines(map.get('src/tail.ts')![0]);
+    expect(headCode).toContain('const uniqueHeadGroundingLineHere = computeHeadValue(x);');
+    expect(tailCode).toContain('const uniqueTailGroundingLineHere = computeTailValue(y);');
+  });
+
+  it('NEVER makes the marker or a partial boundary line citable (no bytes the reviewer did not see as code)', () => {
+    const map = parsePacketHunks(TRUNCATED);
+    const allCode = [...map.values()].flat().flatMap((h) => hunkCodeLines(h));
+    // the truncation marker itself is not a code line
+    expect(allCode.some((l) => /chars truncated/.test(l))).toBe(false);
+    // the partial head line (cut mid-token) is dropped — not a complete line the reviewer saw
+    expect(allCode.some((l) => l.includes('partialHeadLineCutMidTokenHere'))).toBe(false);
+    // the partial tail fragment is dropped too
+    expect(allCode.some((l) => l.includes('partialTailFragmentBeforeItsFirstNewline'))).toBe(false);
+  });
+
+  it('a NON-truncated (marker-free) diff parses normally — the common path is unchanged', () => {
+    const clean = `diff --git a/src/x.ts b/src/x.ts
+--- a/src/x.ts
++++ b/src/x.ts
+@@ -1,2 +1,3 @@
+ const ctx = header();
++const soleUniqueGroundingLine = compute(v);
+`;
+    expect(hunkCodeLines(parsePacketHunks(clean).get('src/x.ts')![0])).toContain('const soleUniqueGroundingLine = compute(v);');
+  });
+});
+
 describe('readGatePacket — pinned-packet identity is PROVEN (fail-closed)', () => {
   function tmp(): string {
     return fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-gp-'));
@@ -165,5 +226,16 @@ describe('readGatePacket — pinned-packet identity is PROVEN (fail-closed)', ()
       JSON.stringify({ diff: MIXED, headSha: 'x', schemaVersion: GATE_PACKET_SCHEMA_VERSION + 99 })
     );
     expect(readGatePacket(base, 'r5', 'x')).toEqual({ ok: false, reason: 'corrupt' });
+
+    // A stale v1 packet (which pinned the FULL pre-truncation diff) is now unrecognized → corrupt
+    // (Phase 2 pins reviewer-visible bytes under v2), so a citation can't validate against bytes
+    // the reviewer never saw. The schema version is bumped to 2 exactly for this semantic change.
+    expect(GATE_PACKET_SCHEMA_VERSION).toBe(2);
+    fs.mkdirSync(reviewDir(base, 'r6'), { recursive: true });
+    fs.writeFileSync(
+      path.join(reviewDir(base, 'r6'), 'packet.gate.json'),
+      JSON.stringify({ diff: MIXED, headSha: 'x', schemaVersion: 1 })
+    );
+    expect(readGatePacket(base, 'r6', 'x')).toEqual({ ok: false, reason: 'corrupt' });
   });
 });

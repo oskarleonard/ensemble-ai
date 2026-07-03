@@ -225,6 +225,33 @@ describe('validateReceiptShape — reject malformed/partial receipts (no blind c
     ).toThrow(/coverage.totalFiles/);
   });
 
+  it('accepts an ADDITIVE gateDisposition (Phase 2) + round-trips it; rejects a malformed one (DC7)', () => {
+    const withDisp = {
+      ...good,
+      gateDisposition: {
+        dismissedHighIds: ['codex#1'],
+        trailWritten: true,
+        verdictCounts: { agree: 1, false: 1, partial: 0, unverified: 2 },
+      },
+    };
+    expect(validateReceiptShape(withDisp)).toBe(withDisp);
+    // a receipt WITHOUT it still validates — existing fixtures + --no-claude runs unchanged
+    expect(() => validateReceiptShape(good)).not.toThrow();
+    // a corrupt one is caught (never a trust boundary, but corruption is rejected)
+    expect(() => validateReceiptShape({ ...good, gateDisposition: { trailWritten: 'yes' } })).toThrow(/gateDisposition/);
+    expect(() => validateReceiptShape({ ...good, gateDisposition: [] })).toThrow(/gateDisposition/);
+    // codex-f3: verdictCounts must be the 4 taxonomy keys as non-negative INTEGERS — a non-array
+    // object is no longer enough. Non-numeric, negative, non-integer, missing, or extra keys are corruption.
+    const disp = (verdictCounts: unknown) => ({ ...good, gateDisposition: { dismissedHighIds: ['codex#1'], trailWritten: true, verdictCounts } });
+    expect(() => validateReceiptShape(disp({ agree: 'many', false: 0, partial: 0, unverified: 0 }))).toThrow(/gateDisposition/);
+    expect(() => validateReceiptShape(disp({ agree: -1, false: 0, partial: 0, unverified: 0 }))).toThrow(/gateDisposition/);
+    expect(() => validateReceiptShape(disp({ agree: 1.5, false: 0, partial: 0, unverified: 0 }))).toThrow(/gateDisposition/);
+    expect(() => validateReceiptShape(disp({ agree: 0, false: 0, partial: 0 }))).toThrow(/gateDisposition/); // missing 'unverified'
+    expect(() => validateReceiptShape(disp({ agree: 0, false: 0, partial: 0, unverified: 0, bogus: 1 }))).toThrow(/gateDisposition/); // extra key
+    // the exact valid taxonomy still passes
+    expect(() => validateReceiptShape(disp({ agree: 0, false: 0, partial: 0, unverified: 0 }))).not.toThrow();
+  });
+
   it('readReceipt returns null (not a garbage object) for a malformed stored file', () => {
     const store = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-bad-'));
     try {
@@ -256,6 +283,22 @@ describe('isDiffReviewed — LIVE validation', () => {
     const s = isDiffReviewed(
       { coverage: cleanCoverage, key, required },
       { readReceipt: () => goodReceipt, readReview: (_r, id) => reviewed(id) }
+    );
+    expect(s).toMatchObject({ reason: 'reviewed', reviewed: true });
+  });
+
+  it('IGNORES an additive gateDisposition — verify semantics UNCHANGED (DC7)', () => {
+    const withDisp: DiffReviewReceipt = {
+      ...goodReceipt,
+      gateDisposition: {
+        dismissedHighIds: ['codex#1'],
+        trailWritten: true,
+        verdictCounts: { agree: 0, false: 1, partial: 0, unverified: 0 },
+      },
+    };
+    const s = isDiffReviewed(
+      { coverage: cleanCoverage, key, required },
+      { readReceipt: () => withDisp, readReview: (_r, id) => reviewed(id) }
     );
     expect(s).toMatchObject({ reason: 'reviewed', reviewed: true });
   });

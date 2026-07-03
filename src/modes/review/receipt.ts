@@ -7,6 +7,8 @@ import { sha256Hex } from '../../core/hash';
 import type { ReviewerId, StoredReview, TerminalState } from '../../core/types';
 
 import type { Coverage, DiffMode } from './diff';
+import { GATE_VERDICTS } from './gate';
+import type { GateDispositionSummary } from './gate';
 
 // The content-tied DIFF receipt — the diff analog of the spec-review receipt
 // doctrine. A diff earns a receipt only after a qualifying cross-vendor review;
@@ -60,6 +62,12 @@ export interface DiffReviewReceipt {
   // N-reviewer pass; its absence, a core-only (`--no-claude`) one — the two are no
   // longer indistinguishable. Omitted on a codex/grok-only receipt.
   peerReviewers?: PeerReviewerRecord[];
+  // The gate-disposition summary (Phase 2) — additive, host-owned POLICY metadata: the gate's
+  // verdict counts + the HONORED dismissed HIGH ids + whether the trail durably wrote (false ⇒
+  // dismissals were NOT honored). RECORDED for legibility + retro-scoring; `receipt verify` NEVER
+  // reads it (isDiffReviewed keys off the diff digest + completed[] + coverage + artifacts only),
+  // so a receipt with or without it verifies IDENTICALLY. Omitted on a `--no-claude` run (no gate).
+  gateDisposition?: GateDispositionSummary;
   // The canonical-diff content digest (NOT a commit SHA — a raw diff has no
   // intrinsic commit identity; the base+head SHAs carry that, separately).
   diffDigest: string;
@@ -179,6 +187,24 @@ export function writeReceipt(
   return file;
 }
 
+// verdictCounts must be an object with EXACTLY the GateVerdict taxonomy keys, each a finite
+// non-negative integer — not merely "a non-array object" (the prior check). A malformed count
+// ({ agree: "many" }, negatives, non-integers, unknown or missing keys) would otherwise pass and
+// mislead an analytics / fix-loop reader (codex-f3). Never a trust boundary; it just fails a corrupt
+// receipt closed, like the sibling field checks. Keyed off GATE_VERDICTS so it can never drift.
+function isVerdictCounts(v: unknown): boolean {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return false;
+  const rec = v as Record<string, unknown>;
+  // length === taxonomy AND every taxonomy key valid ⇒ no missing and no extra keys.
+  return (
+    Object.keys(rec).length === GATE_VERDICTS.length &&
+    GATE_VERDICTS.every((k) => {
+      const n = rec[k];
+      return typeof n === 'number' && Number.isInteger(n) && n >= 0;
+    })
+  );
+}
+
 // Lightweight structural validation of a receipt read from untrusted JSON — reject a
 // malformed / partial file with a CLEAR error instead of blind-casting it (Codex LOW).
 // This is a shape check, NOT a trust boundary: a well-formed but FORGED receipt still
@@ -220,6 +246,21 @@ export function validateReceiptShape(value: unknown): DiffReviewReceipt {
           isStr((p as Record<string, unknown>).vendor)
       );
     if (!okArr) errs.push('peerReviewers (PeerReviewerRecord[])');
+  }
+  // gateDisposition is OPTIONAL (absent on --no-claude receipts + every pre-Phase-2 receipt, so
+  // existing verify fixtures pass unchanged). Validate only when present — catch a corrupt one
+  // before a reader (analytics / the fix-loop) trusts it; it is never a trust boundary.
+  if (o.gateDisposition !== undefined) {
+    const g = o.gateDisposition;
+    const okDisp =
+      g !== null &&
+      typeof g === 'object' &&
+      !Array.isArray(g) &&
+      Array.isArray((g as Record<string, unknown>).dismissedHighIds) &&
+      ((g as Record<string, unknown>).dismissedHighIds as unknown[]).every((x) => isStr(x)) &&
+      typeof (g as Record<string, unknown>).trailWritten === 'boolean' &&
+      isVerdictCounts((g as Record<string, unknown>).verdictCounts);
+    if (!okDisp) errs.push('gateDisposition (GateDispositionSummary)');
   }
   const c = o.coverage;
   if (c === null || typeof c !== 'object' || Array.isArray(c)) {
