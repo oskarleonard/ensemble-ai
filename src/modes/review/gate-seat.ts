@@ -43,17 +43,21 @@ function plainObject(v: unknown): Record<string, unknown> | null {
     : null;
 }
 
-// Resolve one field (model or effort) — identical bar the key: a valid FLAG wins outright; else a
-// present-but-junk file field warns, then the value inherits gate → claude → 'default', each with
-// its source. The one field-specific bit — model accepts any flag string, effort's flag is
-// whitelist-checked — is applied by the caller, which passes `null` for a rejected flag; this owns
-// every source so the two fields can't drift.
+// Resolve one field (model or effort) — identical bar the key: a valid FLAG wins outright; else the
+// value inherits gate → claude → 'default', each with its source. Two field-specific rules are
+// applied by the caller: the flag is pre-validated (it passes `null` for a rejected flag), and
+// `accept` filters the FILE links (model takes anything; effort must be a known level). A file
+// value that is present but junk, or present but rejected by `accept`, warns and falls through to
+// the next link — so a bogus effort can never resolve to `source:'file'` and be advertised by
+// `ensemble-ai config` while buildClaudeReviewArgs silently drops it at spawn (the flag/file
+// symmetry codex+grok flagged). This owns every source so the two fields can't drift.
 function resolveField(
   key: 'effort' | 'model',
   flag: string | null,
   gate: Record<string, unknown> | null,
   claude: Record<string, unknown> | null,
-  warn: (m: string) => void
+  warn: (m: string) => void,
+  accept: (v: string) => boolean = () => true
 ): { source: SeatSource; value: string } {
   if (flag) return { source: 'flag', value: flag };
   const fromGate = gate ? nonEmptyStr(gate[key]) : null;
@@ -61,10 +65,17 @@ function resolveField(
     warn(
       `gate seat: \`${key}\` must be a non-empty string — falling back to the claude voice / built-in default`,
     );
-  const inherited = fromGate || (claude && nonEmptyStr(claude[key]));
-  return inherited
-    ? { source: 'file', value: inherited }
-    : { source: 'default', value: 'default' };
+  // gate value first, then the inherited claude value; a non-empty value the field rejects (an
+  // effort outside CLAUDE_EFFORTS — the `accept` branch is only reachable for effort) warns and
+  // falls through rather than resolving to a value the spawn would drop.
+  for (const v of [fromGate, claude ? nonEmptyStr(claude[key]) : null]) {
+    if (v === null) continue;
+    if (accept(v)) return { source: 'file', value: v };
+    warn(
+      `gate seat: \`${key}\` "${v}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — falling back to the claude voice / built-in default`,
+    );
+  }
+  return { source: 'default', value: 'default' };
 }
 
 // PURE: resolve the gate seat from the raw voices.json object + flag overrides. Emits warnings
@@ -104,12 +115,14 @@ export function resolveGateSeat(
     warn
   );
 
-  // EFFORT — flag → gate.effort → claude.effort (inherit) → 'default'. A flag effort outside the
-  // CLAUDE_EFFORTS whitelist is IGNORED (today's behavior) + warned, then treated as no flag. A
-  // FILE effort is stored as-is (buildClaudeReviewArgs whitelist-filters it at argv time — parity
-  // with the claude voice, so a bogus file value degrades exactly as today, not specially).
+  // EFFORT — flag → gate.effort → claude.effort (inherit) → 'default', validated against the
+  // CLAUDE_EFFORTS whitelist at EVERY link. A flag outside it is IGNORED + warned; a FILE value
+  // outside it likewise warns + falls through (so `config` never advertises an effort the gate
+  // would silently drop at spawn — the flag/file symmetry codex+grok flagged). buildClaudeReviewArgs
+  // still argv-filters at spawn, so the resolved seat and the spawn now agree.
+  const isKnownEffort = (v: string): boolean => CLAUDE_EFFORTS.has(v);
   const flagEffort = nonEmptyStr(flags.effort);
-  const effortFlagOk = flagEffort !== null && CLAUDE_EFFORTS.has(flagEffort);
+  const effortFlagOk = flagEffort !== null && isKnownEffort(flagEffort);
   if (flagEffort && !effortFlagOk)
     warn(
       `gate seat: --gate-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — ignored`,
@@ -119,7 +132,8 @@ export function resolveGateSeat(
     effortFlagOk ? flagEffort : null,
     gate,
     claude,
-    warn
+    warn,
+    isKnownEffort
   );
 
   return {

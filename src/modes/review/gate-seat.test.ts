@@ -132,4 +132,27 @@ describe('resolveGateSeat — per-seat gate model/effort (done-criterion 6)', ()
     expect(seat.effortSource).toBe('file');
     expect(warnings.some((w) => w.includes('not a known effort'))).toBe(true);
   });
+
+  // codex-f1 / grok-f1: a FILE effort outside the whitelist must NOT resolve to source:'file' and
+  // be advertised by `config` while buildClaudeReviewArgs silently drops it — the file path is now
+  // validated with the same whitelist as the flag path.
+  it('a FILE gate.effort outside the whitelist warns + falls back (never advertised as file)', () => {
+    const raw = { gate: { effort: 'ludicrous', model: 'fable' } };
+    const { seat, warnings } = resolve(raw);
+    expect(seat.config.effort).toBe('default'); // dropped, not the bogus value
+    expect(seat.effortSource).toBe('default');
+    expect(warnings.some((w) => w.includes('not a known effort'))).toBe(true);
+    // the model still resolves; the argv carries no --effort (matches the spawn), not a bad one
+    const args = gateArgv(raw);
+    expect(args[args.indexOf('--model') + 1]).toBe('fable');
+    expect(args).not.toContain('--effort');
+  });
+
+  it('an invalid FILE gate.effort falls through to a valid claude.effort (per-link validation)', () => {
+    const raw = { claude: { effort: 'high' }, gate: { effort: 'ludicrous', model: 'fable' } };
+    const { seat, warnings } = resolve(raw);
+    expect(seat.config.effort).toBe('high'); // inherited the valid claude link, not 'default'
+    expect(seat.effortSource).toBe('file');
+    expect(warnings.some((w) => w.includes('not a known effort'))).toBe(true);
+  });
 });

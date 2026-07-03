@@ -3728,15 +3728,21 @@ function nonEmptyStr(v) {
 function plainObject(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : null;
 }
-function resolveField(key, flag, gate, claude, warn) {
+function resolveField(key, flag, gate, claude, warn, accept = () => true) {
   if (flag) return { source: "flag", value: flag };
   const fromGate = gate ? nonEmptyStr(gate[key]) : null;
   if (gate && key in gate && fromGate === null)
     warn(
       `gate seat: \`${key}\` must be a non-empty string \u2014 falling back to the claude voice / built-in default`
     );
-  const inherited = fromGate || claude && nonEmptyStr(claude[key]);
-  return inherited ? { source: "file", value: inherited } : { source: "default", value: "default" };
+  for (const v of [fromGate, claude ? nonEmptyStr(claude[key]) : null]) {
+    if (v === null) continue;
+    if (accept(v)) return { source: "file", value: v };
+    warn(
+      `gate seat: \`${key}\` "${v}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 falling back to the claude voice / built-in default`
+    );
+  }
+  return { source: "default", value: "default" };
 }
 function resolveGateSeat(raw, flags, warn) {
   const root = plainObject(raw) ?? {};
@@ -3760,8 +3766,9 @@ function resolveGateSeat(raw, flags, warn) {
     claude,
     warn
   );
+  const isKnownEffort = (v) => CLAUDE_EFFORTS2.has(v);
   const flagEffort = nonEmptyStr(flags.effort);
-  const effortFlagOk = flagEffort !== null && CLAUDE_EFFORTS2.has(flagEffort);
+  const effortFlagOk = flagEffort !== null && isKnownEffort(flagEffort);
   if (flagEffort && !effortFlagOk)
     warn(
       `gate seat: --gate-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 ignored`
@@ -3771,7 +3778,8 @@ function resolveGateSeat(raw, flags, warn) {
     effortFlagOk ? flagEffort : null,
     gate,
     claude,
-    warn
+    warn,
+    isKnownEffort
   );
   return {
     // The gate IS the claude binary with a swapped model/effort — source its identity (cmd/id/
