@@ -65,6 +65,32 @@ A **gate failure never opens the gate and never trips exit 1** — a spawn error
 
 **Feeding a fix-loop:** the **structured verdicts** in `<trail>/gate-verdicts.json` (the `<trail>` path the run prints already includes the per-run id) — *not* the synthesis prose — are authoritative. Point a coding agent at the trail and fix the `agree` / `partial` findings; treat every `unverified` (especially an **unverified HIGH**, which still blocks the gate) as an explicit investigate-or-triage set, never a silent drop. Keep the gate seat at least as capable as your strongest reviewer — a weak gate mostly returns `unverified` (the safe-but-toothless mode), which stdout flags as "gate teeth did not engage".
 
+### Configuring the seats — `reviewers.json` and `voices.json`
+
+Every seat is **config, not a hardcode** — two JSON files under `~/.ensemble-ai/` (each env-overridable: `ENSEMBLE_REVIEWERS_FILE` / `ENSEMBLE_VOICES_FILE`). Run `ensemble-ai config` (alias of `ensemble-ai reviewers`) to print the **resolved** seats — id · vendor · model · effort · sandbox, plus which file each came from — so what you see is exactly what the modes run. Neither file needs to exist; a missing or junk entry falls back to the baked default (a bad config can never silently disable a seat).
+
+**`~/.ensemble-ai/reviewers.json`** — the cross-vendor **reviewers** (Codex + Grok), the diff-facing lenses:
+
+```json
+{
+  "codex": { "model": "gpt-5.5", "effort": "xhigh" },
+  "grok":  { "model": "grok-build", "effort": "high" }
+}
+```
+
+**`~/.ensemble-ai/voices.json`** — the Claude **voices** (`claude` = the brainstorm/consult voice **and** the cold-Opus review reviewer) plus the **`gate`** seat (the verified-gate synthesizer). The gate takes **`model` and `effort` only** — it is always a `claude -p` spawn under the read-only plan-mode + write-tool deny-list, so a `cmd` key on the `gate` seat is **ignored + warned** (the read-only posture can't be configured away). This makes "reviewer = Opus @ high, **gate = Fable @ max**" expressible:
+
+```json
+{
+  "claude": { "model": "opus", "effort": "high" },
+  "gate":   { "model": "fable", "effort": "max" }
+}
+```
+
+- **Gate resolution chain:** the `gate` entry → the `claude` entry (model/effort only) → the built-in default (**Opus**). A `gate` seat with no `voices.json` at all is byte-for-byte today's default gate.
+- **Per-run override:** `--gate-model <m>` / `--gate-effort <e>` beat the file for one run (an effort outside `low|medium|high|xhigh|max` is ignored — today's whitelist, kept). Codex/Grok stay per-reviewer-configurable via `reviewers.json`.
+- **Capability floor:** keep the gate at least as capable as your strongest reviewer. A weak gate mostly returns `unverified` — *safe but toothless* (it can't dismiss what it can't ground), which the gate summary line flags with **`gate teeth did not engage — consider a stronger gate model`**. That notice is the runtime signal that the seat is under-powered for the diff.
+
 ### Brainstorm
 
 `brainstorm` runs ideation on a **topic** (not a diff) across multiple AI voices and synthesizes the result:

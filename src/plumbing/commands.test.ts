@@ -48,6 +48,39 @@ describe('reviewers / config command', () => {
     expect(parsed.reviewers.map((r: { id: string }) => r.id)).toEqual(['codex', 'grok']);
     expect(parsed.reviewersFileExists).toBe(false);
   });
+
+  it('surfaces the resolved GATE seat (model · effort · source) from a voices.json fixture', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-gate-'));
+    const voicesFile = path.join(dir, 'voices.json');
+    fs.writeFileSync(
+      voicesFile,
+      JSON.stringify({ claude: { effort: 'high', model: 'opus' }, gate: { effort: 'max', model: 'fable' } })
+    );
+    const code = await main(['config', '--voices-file', voicesFile, '--reviewers-file', '/nope.json']);
+    expect(code).toBe(0);
+    expect(logged).toContain('review synthesis');
+    const gateLine = logged.split('\n').find((l) => l.trimStart().startsWith('gate'))!;
+    expect(gateLine).toContain('anthropic · fable @ max');
+    expect(gateLine).toContain('source model:file · effort:file');
+    // --json carries the gate seat too
+    logged = '';
+    await main(['config', '--json', '--voices-file', voicesFile, '--reviewers-file', '/nope.json']);
+    expect(JSON.parse(logged).gate).toEqual({
+      effort: 'max', effortSource: 'file', model: 'fable', modelSource: 'file',
+    });
+    fs.rmSync(dir, { force: true, recursive: true });
+  });
+
+  it('a `cmd` key on the gate seat warns loudly (stderr) but still renders the seat', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-gate-'));
+    const voicesFile = path.join(dir, 'voices.json');
+    fs.writeFileSync(voicesFile, JSON.stringify({ gate: { cmd: 'grok', model: 'fable' } }));
+    const code = await main(['config', '--voices-file', voicesFile, '--reviewers-file', '/nope.json']);
+    expect(code).toBe(0);
+    expect(errored).toContain('`cmd` is ignored');
+    expect(logged).toContain('anthropic · fable @'); // model still applied, spawn stays claude -p
+    fs.rmSync(dir, { force: true, recursive: true });
+  });
 });
 
 describe('diff command — assembles the packet WITHOUT spawning a reviewer', () => {

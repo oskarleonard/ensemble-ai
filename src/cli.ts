@@ -54,6 +54,7 @@ import {
   renderHighGate,
   resolveHighGate,
 } from './modes/review/gate';
+import { type GateSeat, loadGateSeat } from './modes/review/gate-seat';
 import {
   acquireDiff,
   type AcquiredDiff,
@@ -163,6 +164,11 @@ Options:
                         overrides the provenance default (use for untrusted diffs / CI)
   --gate-dismissals     opt a FOREIGN diff (--pr/URL/stdin/--diff-file) INTO the gate's
                         dismiss-only authority (LOCAL diffs already have it on by default)
+  --gate-model <m>      model for the GATE (synthesis) seat — overrides the voices.json
+                        \`gate\` entry; the gate is always claude -p (keep it ≥ your strongest
+                        reviewer, else it mostly returns unverified — the toothless mode)
+  --gate-effort <e>     effort for the GATE seat (low|medium|high|xhigh|max) — overrides the
+                        file; an unknown value is ignored (\`ensemble-ai config\` shows the seat)
   --out <dir>           trail BASE dir; a per-run <run-id>/ subdir is created under it
                         (default: repo-local .ensemble-ai/reviews when reviewing this
                         repo's own diff, else an OS temp dir — the path is printed)
@@ -783,6 +789,8 @@ async function reviewCommand(
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
         'gate-dismissals': { type: 'boolean' },
+        'gate-effort': { type: 'string' },
+        'gate-model': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
         'no-claude': { type: 'boolean' },
         'no-conventions': { type: 'boolean' },
@@ -941,6 +949,19 @@ async function reviewCommand(
   const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
   if (claudeLayerExpected && result.prompt) {
     const voiceConfigs = loadVoices();
+    // The GATE (synthesis) seat resolves INDEPENDENTLY of the `claude` reviewer voice: the
+    // voices.json `gate` entry → the `claude` entry (model/effort only) → the built-in Opus
+    // default, with `--gate-model`/`--gate-effort` overriding the file. A `cmd` on the gate seat
+    // is ignored (the gate is always a read-only `claude -p` spawn); a junk entry warns + falls
+    // back. Warnings surface on stderr so a mis-config is loud, never silent.
+    const gateSeat: GateSeat = loadGateSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+        model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+      },
+      (m) => console.error(`· ${m}`)
+    );
     // The layer's own writes/spawn are best-effort internally, but a residual throw (an
     // unexpected FS/spawn error) must DEGRADE the Opus layer, not crash the whole review
     // after the codex/grok core already completed. Catch it here as a backstop; the
@@ -949,6 +970,7 @@ async function reviewCommand(
       claudeLayer = await runClaudeReviewLayer({
         baseDir: out,
         claudeConfig: voiceConfigs.claude,
+        gateConfig: gateSeat.config,
         coreReviews: result.reviews,
         expectedHeadSha: result.acquired.headSha,
         includeClaudeReviewer: true,
@@ -1935,7 +1957,16 @@ async function reviewersCommand(args: string[]): Promise<number> {
     typeof values['voices-file'] === 'string'
       ? path.resolve(values['voices-file'])
       : VOICES_FILE;
+  // The gate seat resolves from the SAME voices.json (no run flags here — `config` is a read-only
+  // view, so source ∈ {file, default}); a junk/`cmd`-bearing entry warns loudly on stderr.
+  const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`· ${m}`));
   const view: RegistryView = {
+    gate: {
+      effort: gateSeat.config.effort,
+      effortSource: gateSeat.effortSource,
+      model: gateSeat.config.model,
+      modelSource: gateSeat.modelSource,
+    },
     reviewers: listReviewers(reviewersFile),
     reviewersFile,
     reviewersFileExists: fs.existsSync(reviewersFile),

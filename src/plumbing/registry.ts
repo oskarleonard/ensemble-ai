@@ -7,8 +7,20 @@
 
 import type { ReviewerConfig } from '../core/types';
 import type { VoiceConfig } from '../modes/brainstorm/types';
+import type { SeatSource } from '../modes/review/gate-seat';
+
+// The review-synthesis GATE seat, resolved for display: model/effort + where each came from
+// (flag/file/default). Always a `claude -p` spawn, so no cmd/sandbox/vendor variance to show.
+export interface GateSeatView {
+  effort: string;
+  effortSource: SeatSource;
+  model: string;
+  modelSource: SeatSource;
+}
 
 export interface RegistryView {
+  // The review-synthesis GATE (resolved from the voices.json `gate` seat → claude voice → Opus).
+  gate: GateSeatView;
   // The review/security reviewer roster (from reviewers.json or baked defaults).
   reviewers: ReviewerConfig[];
   reviewersFile: string;
@@ -45,6 +57,14 @@ export function renderRegistry(view: RegistryView): string {
   out.push('  brainstorm · consult  (voices — Claude joins; no independence concern)');
   out.push(`    config: ${sourceNote(view.voicesFile, view.voicesFileExists)}`);
   for (const v of view.voices) out.push(agentLine(v));
+  out.push('');
+  // The GATE (synthesis) seat — always claude -p; {model, effort} from the voices.json `gate`
+  // entry → the claude voice → the built-in Opus default. Sources shown so it's clear WHERE the
+  // resolved model/effort came from (flag/file/default) — the standing "which config" legibility.
+  out.push('  review synthesis  (the verified GATE — always claude -p; {model,effort} only)');
+  out.push(
+    `    ${'gate'.padEnd(7)} anthropic · ${view.gate.model} @ ${view.gate.effort}  · source model:${view.gate.modelSource} · effort:${view.gate.effortSource}`
+  );
   out.push('');
   return out.join('\n');
 }

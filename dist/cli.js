@@ -3,7 +3,7 @@
 // src/cli.ts
 import { execFileSync as execFileSync3 } from "child_process";
 import crypto2 from "crypto";
-import fs12 from "fs";
+import fs13 from "fs";
 import os7 from "os";
 import path10 from "path";
 import { parseArgs } from "util";
@@ -3654,7 +3654,9 @@ async function runClaudeReviewLayer(opts) {
   const voiceReviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
   const gate = await runGate({
     baseDir: opts.baseDir,
-    config: opts.claudeConfig,
+    // The GATE spawns its OWN configured seat (model/effort), NOT necessarily the reviewer's —
+    // defaulting to claudeConfig keeps the one-seat behavior when no `gate` entry is configured.
+    config: opts.gateConfig ?? opts.claudeConfig,
     expectedHeadSha: opts.expectedHeadSha,
     log,
     reviews: voiceReviews,
@@ -3716,6 +3718,84 @@ function renderClaudeLayer(result) {
   }
   out.push(...renderGateVerdicts(result.gateVerdicts, { scrub: scrubControl, trailWritten: result.gateTrailWritten }));
   return out;
+}
+
+// src/modes/review/gate-seat.ts
+import fs12 from "fs";
+function nonEmptyStr(v) {
+  return typeof v === "string" && v.trim() ? v.trim() : null;
+}
+function plainObject(v) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+}
+function resolveGateSeat(raw, flags, warn) {
+  const root = plainObject(raw) ?? {};
+  let gate = null;
+  if (root.gate !== void 0) {
+    gate = plainObject(root.gate);
+    if (!gate)
+      warn(
+        'gate seat: expected an object like {"model":"\u2026","effort":"\u2026"} \u2014 ignoring the `gate` entry and inheriting the claude voice / built-in default'
+      );
+  }
+  const claude = plainObject(root.claude);
+  if (gate && "cmd" in gate)
+    warn(
+      "gate seat: `cmd` is ignored \u2014 the gate is always a `claude -p` spawn (read-only plan mode + write-tool deny-list); remove it"
+    );
+  let model = "default";
+  let modelSource = "default";
+  const flagModel = nonEmptyStr(flags.model);
+  if (flagModel) {
+    model = flagModel;
+    modelSource = "flag";
+  } else {
+    if (gate && "model" in gate && nonEmptyStr(gate.model) === null)
+      warn(
+        "gate seat: `model` must be a non-empty string \u2014 falling back to the claude voice / built-in default"
+      );
+    const inherited = gate && nonEmptyStr(gate.model) || claude && nonEmptyStr(claude.model);
+    if (inherited) {
+      model = inherited;
+      modelSource = "file";
+    }
+  }
+  let effort = "default";
+  let effortSource = "default";
+  const flagEffort = nonEmptyStr(flags.effort);
+  if (flagEffort && CLAUDE_EFFORTS2.has(flagEffort)) {
+    effort = flagEffort;
+    effortSource = "flag";
+  } else {
+    if (flagEffort && !CLAUDE_EFFORTS2.has(flagEffort))
+      warn(
+        `gate seat: --gate-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 ignored`
+      );
+    if (gate && "effort" in gate && nonEmptyStr(gate.effort) === null)
+      warn(
+        "gate seat: `effort` must be a non-empty string \u2014 falling back to the claude voice / built-in default"
+      );
+    const inherited = gate && nonEmptyStr(gate.effort) || claude && nonEmptyStr(claude.effort);
+    if (inherited) {
+      effort = inherited;
+      effortSource = "file";
+    }
+  }
+  return {
+    config: { cmd: "claude", effort, id: "claude", model, vendor: "anthropic" },
+    effortSource,
+    modelSource
+  };
+}
+function loadGateSeat(file = VOICES_FILE, flags = {}, warn = () => {
+}) {
+  let raw = {};
+  try {
+    raw = JSON.parse(fs12.readFileSync(file, "utf8"));
+  } catch {
+    raw = {};
+  }
+  return resolveGateSeat(raw, flags, warn);
 }
 
 // src/modes/review/source.ts
@@ -3857,6 +3937,11 @@ function renderRegistry(view) {
   out.push("  brainstorm \xB7 consult  (voices \u2014 Claude joins; no independence concern)");
   out.push(`    config: ${sourceNote(view.voicesFile, view.voicesFileExists)}`);
   for (const v of view.voices) out.push(agentLine(v));
+  out.push("");
+  out.push("  review synthesis  (the verified GATE \u2014 always claude -p; {model,effort} only)");
+  out.push(
+    `    ${"gate".padEnd(7)} anthropic \xB7 ${view.gate.model} @ ${view.gate.effort}  \xB7 source model:${view.gate.modelSource} \xB7 effort:${view.gate.effortSource}`
+  );
   out.push("");
   return out.join("\n");
 }
@@ -4005,6 +4090,11 @@ Options:
                         overrides the provenance default (use for untrusted diffs / CI)
   --gate-dismissals     opt a FOREIGN diff (--pr/URL/stdin/--diff-file) INTO the gate's
                         dismiss-only authority (LOCAL diffs already have it on by default)
+  --gate-model <m>      model for the GATE (synthesis) seat \u2014 overrides the voices.json
+                        \`gate\` entry; the gate is always claude -p (keep it \u2265 your strongest
+                        reviewer, else it mostly returns unverified \u2014 the toothless mode)
+  --gate-effort <e>     effort for the GATE seat (low|medium|high|xhigh|max) \u2014 overrides the
+                        file; an unknown value is ignored (\`ensemble-ai config\` shows the seat)
   --out <dir>           trail BASE dir; a per-run <run-id>/ subdir is created under it
                         (default: repo-local .ensemble-ai/reviews when reviewing this
                         repo's own diff, else an OS temp dir \u2014 the path is printed)
@@ -4057,15 +4147,15 @@ function genRunId() {
 }
 function clearReusedRunTrail(baseDir, trailDir) {
   try {
-    if (fs12.lstatSync(trailDir).isSymbolicLink()) return;
+    if (fs13.lstatSync(trailDir).isSymbolicLink()) return;
   } catch {
     return;
   }
   let realBase;
   let realTarget;
   try {
-    realBase = fs12.realpathSync(baseDir);
-    realTarget = fs12.realpathSync(trailDir);
+    realBase = fs13.realpathSync(baseDir);
+    realTarget = fs13.realpathSync(trailDir);
   } catch {
     return;
   }
@@ -4073,12 +4163,12 @@ function clearReusedRunTrail(baseDir, trailDir) {
   if (!rel || escapesRoot(rel)) {
     return;
   }
-  fs12.rmSync(realTarget, { force: true, recursive: true });
+  fs13.rmSync(realTarget, { force: true, recursive: true });
 }
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
   try {
-    const s = fs12.readFileSync(0, "utf8");
+    const s = fs13.readFileSync(0, "utf8");
     return s.trim() ? s : void 0;
   } catch {
     return void 0;
@@ -4228,7 +4318,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "diff-file": {
       let text;
       try {
-        text = fs12.readFileSync(String(selection.diffFile), "utf8");
+        text = fs13.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
@@ -4430,6 +4520,8 @@ async function reviewCommand(args, profile = "code") {
         cwd: { type: "string" },
         "diff-file": { type: "string" },
         "gate-dismissals": { type: "boolean" },
+        "gate-effort": { type: "string" },
+        "gate-model": { type: "string" },
         help: { short: "h", type: "boolean" },
         "no-claude": { type: "boolean" },
         "no-conventions": { type: "boolean" },
@@ -4524,10 +4616,19 @@ async function reviewCommand(args, profile = "code") {
   const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
   if (claudeLayerExpected && result.prompt) {
     const voiceConfigs = loadVoices();
+    const gateSeat = loadGateSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values["gate-effort"] === "string" ? values["gate-effort"] : void 0,
+        model: typeof values["gate-model"] === "string" ? values["gate-model"] : void 0
+      },
+      (m) => console.error(`\xB7 ${m}`)
+    );
     try {
       claudeLayer = await runClaudeReviewLayer({
         baseDir: out,
         claudeConfig: voiceConfigs.claude,
+        gateConfig: gateSeat.config,
         coreReviews: result.reviews,
         expectedHeadSha: result.acquired.headSha,
         includeClaudeReviewer: true,
@@ -4760,14 +4861,14 @@ async function brainstormCommand(args) {
   if (typeof values.file === "string") {
     const filePath = path10.resolve(cwd, values.file);
     try {
-      const bytes = fs12.statSync(filePath).size;
+      const bytes = fs13.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs12.readFileSync(filePath, "utf8");
+      fileContext = fs13.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${e.message}`
@@ -4965,14 +5066,14 @@ async function consultCommand(args) {
   if (typeof values.file === "string") {
     const filePath = path10.resolve(cwd, values.file);
     try {
-      const bytes = fs12.statSync(filePath).size;
+      const bytes = fs13.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs12.readFileSync(filePath, "utf8");
+      fileContext = fs13.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai consult: cannot read --file ${values.file}: ${e.message}`
@@ -5150,7 +5251,7 @@ async function receiptCommand(args) {
   const readReceiptFile = (p) => {
     let raw;
     try {
-      raw = fs12.readFileSync(p, "utf8");
+      raw = fs13.readFileSync(p, "utf8");
     } catch (e) {
       return { error: `cannot read receipt ${p}: ${e.message}` };
     }
@@ -5296,13 +5397,20 @@ async function reviewersCommand(args) {
   }
   const reviewersFile = typeof values["reviewers-file"] === "string" ? path10.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
   const voicesFile = typeof values["voices-file"] === "string" ? path10.resolve(values["voices-file"]) : VOICES_FILE;
+  const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`\xB7 ${m}`));
   const view = {
+    gate: {
+      effort: gateSeat.config.effort,
+      effortSource: gateSeat.effortSource,
+      model: gateSeat.config.model,
+      modelSource: gateSeat.modelSource
+    },
     reviewers: listReviewers(reviewersFile),
     reviewersFile,
-    reviewersFileExists: fs12.existsSync(reviewersFile),
+    reviewersFileExists: fs13.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
     voicesFile,
-    voicesFileExists: fs12.existsSync(voicesFile)
+    voicesFileExists: fs13.existsSync(voicesFile)
   };
   if (values.json) console.log(JSON.stringify(view, null, 2));
   else console.log(renderRegistry(view));
