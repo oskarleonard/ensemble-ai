@@ -7,6 +7,7 @@ import { sha256Hex } from '../../core/hash';
 import type { ReviewerId, StoredReview, TerminalState } from '../../core/types';
 
 import type { Coverage, DiffMode } from './diff';
+import { GATE_VERDICTS } from './gate';
 import type { GateDispositionSummary } from './gate';
 
 // The content-tied DIFF receipt — the diff analog of the spec-review receipt
@@ -186,6 +187,24 @@ export function writeReceipt(
   return file;
 }
 
+// verdictCounts must be an object with EXACTLY the GateVerdict taxonomy keys, each a finite
+// non-negative integer — not merely "a non-array object" (the prior check). A malformed count
+// ({ agree: "many" }, negatives, non-integers, unknown or missing keys) would otherwise pass and
+// mislead an analytics / fix-loop reader (codex-f3). Never a trust boundary; it just fails a corrupt
+// receipt closed, like the sibling field checks. Keyed off GATE_VERDICTS so it can never drift.
+function isVerdictCounts(v: unknown): boolean {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return false;
+  const rec = v as Record<string, unknown>;
+  // length === taxonomy AND every taxonomy key valid ⇒ no missing and no extra keys.
+  return (
+    Object.keys(rec).length === GATE_VERDICTS.length &&
+    GATE_VERDICTS.every((k) => {
+      const n = rec[k];
+      return typeof n === 'number' && Number.isInteger(n) && n >= 0;
+    })
+  );
+}
+
 // Lightweight structural validation of a receipt read from untrusted JSON — reject a
 // malformed / partial file with a CLEAR error instead of blind-casting it (Codex LOW).
 // This is a shape check, NOT a trust boundary: a well-formed but FORGED receipt still
@@ -240,9 +259,7 @@ export function validateReceiptShape(value: unknown): DiffReviewReceipt {
       Array.isArray((g as Record<string, unknown>).dismissedHighIds) &&
       ((g as Record<string, unknown>).dismissedHighIds as unknown[]).every((x) => isStr(x)) &&
       typeof (g as Record<string, unknown>).trailWritten === 'boolean' &&
-      (g as Record<string, unknown>).verdictCounts !== null &&
-      typeof (g as Record<string, unknown>).verdictCounts === 'object' &&
-      !Array.isArray((g as Record<string, unknown>).verdictCounts);
+      isVerdictCounts((g as Record<string, unknown>).verdictCounts);
     if (!okDisp) errs.push('gateDisposition (GateDispositionSummary)');
   }
   const c = o.coverage;

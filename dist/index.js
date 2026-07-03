@@ -1409,6 +1409,11 @@ function persistGatePacket(baseDir, runId, input) {
 import fs9 from "fs";
 import os5 from "os";
 import path8 from "path";
+
+// src/modes/review/gate.ts
+var GATE_VERDICTS = ["agree", "partial", "false", "unverified"];
+
+// src/modes/review/receipt.ts
 function computePolicyHash(args) {
   const canonical = JSON.stringify({
     coveragePolicy: args.coveragePolicy,
@@ -1462,6 +1467,14 @@ function writeReceipt(storeDir, receipt) {
   fs9.renameSync(tmp, file);
   return file;
 }
+function isVerdictCounts(v) {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+  const rec = v;
+  return Object.keys(rec).length === GATE_VERDICTS.length && GATE_VERDICTS.every((k) => {
+    const n = rec[k];
+    return typeof n === "number" && Number.isInteger(n) && n >= 0;
+  });
+}
 function validateReceiptShape(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("receipt is not a JSON object");
@@ -1490,7 +1503,7 @@ function validateReceiptShape(value) {
   }
   if (o.gateDisposition !== void 0) {
     const g = o.gateDisposition;
-    const okDisp = g !== null && typeof g === "object" && !Array.isArray(g) && Array.isArray(g.dismissedHighIds) && g.dismissedHighIds.every((x) => isStr(x)) && typeof g.trailWritten === "boolean" && g.verdictCounts !== null && typeof g.verdictCounts === "object" && !Array.isArray(g.verdictCounts);
+    const okDisp = g !== null && typeof g === "object" && !Array.isArray(g) && Array.isArray(g.dismissedHighIds) && g.dismissedHighIds.every((x) => isStr(x)) && typeof g.trailWritten === "boolean" && isVerdictCounts(g.verdictCounts);
     if (!okDisp) errs.push("gateDisposition (GateDispositionSummary)");
   }
   const c = o.coverage;
@@ -2388,7 +2401,7 @@ function parseCritique2(raw) {
   }
   return { notes, summary };
 }
-function parseAgreements(v) {
+function parseAgreements2(v) {
   if (!Array.isArray(v)) return [];
   const out = [];
   for (const ra of v) {
@@ -2426,7 +2439,7 @@ function parseConsultSynthesis(raw) {
   const o = obj;
   const summary = str4(o.summary);
   const recommendation = str4(o.recommendation);
-  const agreements = parseAgreements(o.agreements);
+  const agreements = parseAgreements2(o.agreements);
   const divergences = parseDivergences(o.divergences);
   if (!recommendation && !summary) {
     return {

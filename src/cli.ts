@@ -1110,33 +1110,40 @@ async function reviewCommand(
     !values['no-fail-on-high'] &&
     (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))
   ) {
-    // Exit 4 UNLESS the gate honored-dismissed EVERY HIGH. `highGate.dismissedHighIds` comes from
-    // the gate RECORDS, reconciled from the reviews RE-READ from the trail (loadVoiceReviewsFromTrail
-    // → readReviewsForRun / reviewJsonFromTrail, both of which SILENTLY DROP a review that fails to
-    // read back). The "is there a HIGH" trigger above, by contrast, reads the IN-MEMORY reviews. So
-    // trusting "all gate-HIGHs dismissed" alone is FAIL-OPEN: a HIGH present in-memory but absent from
-    // the gate's record set (a trail read-back gap · a stale reused run-id · a concurrent same-run-id
-    // run) would leave `gatingHighIds` empty and slip to exit 0. Fail-closed: require the honored
-    // dismissals to account for EVERY in-memory HIGH — counted from the SAME authoritative source the
-    // trigger keys off (core reviews that reached `terminalState === 'reviewed'` + an ok Opus voice,
-    // the exact predicate `hasHighFinding`/`claudeLayerHasHigh`/the gate's `healthy` filter use) — with
-    // none left gating. A divergence (detected > recorded) then gates, never dismisses.
-    const detectedHighCount =
-      result.reviews.reduce(
-        (n, r) =>
-          n +
-          (r.terminalState === 'reviewed'
-            ? r.findings.filter((f) => f.severity === 'high').length
-            : 0),
-        0
-      ) +
-      (claudeLayer?.claudeReview?.ok
-        ? claudeLayer.claudeReview.findings.filter((f) => f.severity === 'high').length
-        : 0);
+    // Exit 4 UNLESS the gate honored-dismissed EVERY HIGH. `highGate.dismissedHighIds`/`gatingHighIds`
+    // come from the gate RECORDS, reconciled from the reviews RE-READ from the trail
+    // (loadVoiceReviewsFromTrail → readReviewsForRun / reviewJsonFromTrail, both of which SILENTLY DROP
+    // a review that fails to read back). The "is there a HIGH" trigger above, by contrast, reads the
+    // IN-MEMORY reviews. Trusting "all gate-HIGHs dismissed" alone is FAIL-OPEN — and so is an equal
+    // COUNT check (dismissed.length === detected.length): a two-source divergence (a trail read-back
+    // gap · a stale reused run-id · a concurrent same-run-id run) can leave the tallies EQUAL while the
+    // record set adjudicated a DIFFERENT HIGH than the in-memory one, dismissing the wrong finding and
+    // slipping a real HIGH to exit 0 (codex-f1 · grok-f3). Fail-closed by IDENTITY, not count:
+    // reconstruct the id of EVERY in-memory HIGH in the gate's own `${voiceId}#${n}` namespace
+    // (flattenFindings), from the SAME authoritative source the trigger keys off (core reviews that
+    // reached `terminalState === 'reviewed'` + an ok Opus voice), and require the honored-dismissed set
+    // to COVER every one — with none left gating. A HIGH the records never adjudicated is absent from
+    // the dismissed set, so it gates; it can never slip through on a coincidental count match. (voiceId
+    // mirrors storedToVoiceReview — `reviewerId ?? reviewer.vendor`; the index is the finding's
+    // position in its reviewer's full findings array, the exact key flattenFindings assigns.)
+    const detectedHighIds: string[] = [];
+    for (const r of result.reviews) {
+      if (r.terminalState !== 'reviewed') continue;
+      const voiceId = r.reviewerId ?? r.reviewer.vendor;
+      r.findings.forEach((f, i) => {
+        if (f.severity === 'high') detectedHighIds.push(`${voiceId}#${i + 1}`);
+      });
+    }
+    if (claudeLayer?.claudeReview?.ok) {
+      claudeLayer.claudeReview.findings.forEach((f, i) => {
+        if (f.severity === 'high') detectedHighIds.push(`claude#${i + 1}`);
+      });
+    }
+    const honoredDismissed = new Set(highGate.dismissedHighIds);
     const allHighsDismissed =
-      detectedHighCount > 0 &&
-      highGate.dismissedHighIds.length === detectedHighCount &&
-      highGate.gatingHighIds.length === 0;
+      detectedHighIds.length > 0 &&
+      highGate.gatingHighIds.length === 0 &&
+      detectedHighIds.every((id) => honoredDismissed.has(id));
     if (!allHighsDismissed) return 4;
   }
   return 0;

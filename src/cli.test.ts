@@ -349,6 +349,26 @@ describe('exit-4 gate authority — provenance-scoped dismiss-only (DC4)', () =>
     layerWith([record({ findingId: 'codex#1' })]);
     expect(await main(['review', '--working-tree'])).toBe(4);
   });
+
+  it('count MATCHES but the dismissed ids are a DIFFERENT HIGH ⇒ identity coverage still gates ⇒ exit 4', async () => {
+    // Two in-memory HIGHs (codex#1, codex#2). The gate recorded + dismissed codex#1 AND a phantom
+    // grok#1 (a stale/concurrent record, or a trail read-back that SWAPPED membership) — so the
+    // dismissed COUNT (2) equals the detected count (2), yet the real codex#2 was never adjudicated.
+    // The old equal-count check failed OPEN here; identity coverage requires EVERY in-memory HIGH id
+    // to be in the honored-dismissed set, so the uncovered codex#2 gates (codex-f1 · grok-f3).
+    mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed', 2, 'high')] }));
+    layerWith([record({ findingId: 'codex#1' }), record({ findingId: 'grok#1' })]);
+    expect(await main(['review', '--working-tree'])).toBe(4);
+  });
+
+  it('every in-memory HIGH covered BY IDENTITY in the dismissed set ⇒ the legit all-dismissed path ⇒ exit 0', async () => {
+    // Both in-memory HIGHs (codex#1, codex#2) are the exact ids the gate honored-dismissed — full
+    // identity coverage, nothing gating. Guards the fix against being over-strict: the real
+    // all-dismissed path must still reach exit 0.
+    mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed', 2, 'high')] }));
+    layerWith([record({ findingId: 'codex#1' }), record({ findingId: 'codex#2' })]);
+    expect(await main(['review', '--working-tree'])).toBe(0);
+  });
 });
 
 describe('receipt reflects the FULL expected roster (not just the codex/grok core)', () => {
