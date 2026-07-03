@@ -1,5 +1,5 @@
-import { R as ReviewerId, a as ReviewerConfig, b as ReviewFinding, c as ReviewPacket, T as TerminalState, S as StoredReview, d as ReviewProfile } from './contracts-DOjPsC5x.js';
-export { C as CONFIDENCES, e as Confidence, D as DIFF_USEFUL_FLOOR, E as Evidence, F as FINDINGS_INSTRUCTIONS, M as ManifestEntry, P as PACKET_BUDGETS, f as PacketInput, g as PacketSection, h as ParsedReview, i as REVIEWER_IDS, j as REVIEW_PROFILES, k as SECURITY_CLASSES, l as SECURITY_OBJECTIVE, m as SEVERITIES, n as SecurityClass, o as Severity, p as TERMINAL_STATES, q as assembleCodePacket, r as classifySecurityFinding, s as extractJsonBlock, t as isReviewProfile, u as isReviewerId, v as oneOf, w as parseFindings, x as parseReviewerIds, y as renderReviewPrompt, z as section, A as securityClassLabel, B as stripSecurityTag, G as titleCase } from './contracts-DOjPsC5x.js';
+import { R as ReviewerId, a as ReviewerConfig, b as ReviewFinding, c as ReviewPacket, T as TerminalState, S as StoredReview, d as ReviewProfile } from './contracts-COrIaqYY.js';
+export { C as CONFIDENCES, e as Confidence, D as DIFF_SECTION_TITLE, f as DIFF_USEFUL_FLOOR, E as Evidence, F as FINDINGS_INSTRUCTIONS, M as ManifestEntry, P as PACKET_BUDGETS, g as PacketInput, h as PacketSection, i as ParsedReview, j as REVIEWER_IDS, k as REVIEW_PROFILES, l as SECURITY_CLASSES, m as SECURITY_OBJECTIVE, n as SEVERITIES, o as SecurityClass, p as Severity, q as TERMINAL_STATES, r as TRUNCATION_MARKER_RE, s as assembleCodePacket, t as classifySecurityFinding, u as extractJsonBlock, v as isReviewProfile, w as isReviewerId, x as oneOf, y as parseFindings, z as parseReviewerIds, A as renderReviewPrompt, B as reviewerVisibleDiff, G as section, H as securityClassLabel, I as segmentsWithoutTruncationSplices, J as stripSecurityTag, K as titleCase } from './contracts-COrIaqYY.js';
 
 interface ConventionReader {
     read(relPath: string, maxBytes?: number): Promise<string | null>;
@@ -221,6 +221,92 @@ interface DepSurfaceResult {
 declare function scanDependencySurface(files: FileDiff[]): DepSurfaceResult;
 declare function hasDepSurface(r: DepSurfaceResult): boolean;
 
+declare const VOICE_IDS: readonly ["codex", "grok", "claude"];
+type VoiceId = (typeof VOICE_IDS)[number];
+declare function isVoiceId(v: unknown): v is VoiceId;
+declare function parseVoiceIds(raw: unknown): VoiceId[] | undefined;
+interface VoiceConfig {
+    cmd: string;
+    effort: string;
+    id: VoiceId;
+    model: string;
+    sandbox?: string;
+    vendor: string;
+}
+interface Idea {
+    body: string;
+    id: string;
+    title: string;
+    voiceId?: VoiceId;
+}
+interface RawIdea {
+    body: string;
+    title: string;
+}
+declare const CRITIQUE_STANCES: readonly ["support", "concern", "extend"];
+type CritiqueStance = (typeof CRITIQUE_STANCES)[number];
+interface Critique {
+    assessment: string;
+    stance: CritiqueStance;
+    target: string;
+}
+interface RankedIdea {
+    contributors: string[];
+    rank: number;
+    risks?: string;
+    title: string;
+    why: string;
+}
+interface VoiceGenerateResult {
+    error?: string;
+    ideas: Idea[];
+    ok: boolean;
+    raw: string | null;
+    summary: string;
+    timedOut?: boolean;
+    voiceId: VoiceId;
+}
+interface VoiceCritiqueResult$1 {
+    critiques: Critique[];
+    error?: string;
+    extensions: RawIdea[];
+    ok: boolean;
+    raw: string | null;
+    summary: string;
+    timedOut?: boolean;
+    voiceId: VoiceId;
+}
+interface SynthesisResult {
+    by: VoiceId | null;
+    degraded: boolean;
+    error?: string;
+    ok: boolean;
+    ranked: RankedIdea[];
+    raw: string | null;
+    summary: string;
+}
+interface BrainstormResult {
+    critique: VoiceCritiqueResult$1[];
+    generate: VoiceGenerateResult[];
+    roster: VoiceId[];
+    synthesis: SynthesisResult;
+    topic: string;
+}
+
+type VoiceRunResult = CodexReviewResult;
+declare const VOICE_DEFAULTS: Record<VoiceId, VoiceConfig>;
+declare const VOICE_ADAPTERS: Record<VoiceId, (prompt: string, config: VoiceConfig, opts?: RunReviewOpts) => Promise<VoiceRunResult>>;
+declare const VOICES_FILE: string;
+declare function parseVoices(raw: unknown): Record<VoiceId, VoiceConfig>;
+declare function loadVoices(file?: string): Record<VoiceId, VoiceConfig>;
+declare function listVoices(file?: string): VoiceConfig[];
+
+interface GateDispositionSummary {
+    dismissedHighIds: string[];
+    trailWritten: boolean;
+    verdictCounts: Record<string, number>;
+}
+
 interface ReceiptCoverage {
     includedFiles: number;
     omitted: {
@@ -242,6 +328,7 @@ interface DiffReviewReceipt {
     completed: ReviewerId[];
     coverage: ReceiptCoverage;
     peerReviewers?: PeerReviewerRecord[];
+    gateDisposition?: GateDispositionSummary;
     diffDigest: string;
     diffMode: DiffMode;
     headSha: string;
@@ -371,86 +458,6 @@ interface ReviewModeResult {
 }
 declare const DEFAULT_OBJECTIVE = "Adversarial cross-vendor review of a code diff \u2014 find correctness, security, and convention issues a same-vendor author might miss.";
 declare function runReviewMode(opts: ReviewModeOptions): Promise<ReviewModeResult>;
-
-declare const VOICE_IDS: readonly ["codex", "grok", "claude"];
-type VoiceId = (typeof VOICE_IDS)[number];
-declare function isVoiceId(v: unknown): v is VoiceId;
-declare function parseVoiceIds(raw: unknown): VoiceId[] | undefined;
-interface VoiceConfig {
-    cmd: string;
-    effort: string;
-    id: VoiceId;
-    model: string;
-    sandbox?: string;
-    vendor: string;
-}
-interface Idea {
-    body: string;
-    id: string;
-    title: string;
-    voiceId?: VoiceId;
-}
-interface RawIdea {
-    body: string;
-    title: string;
-}
-declare const CRITIQUE_STANCES: readonly ["support", "concern", "extend"];
-type CritiqueStance = (typeof CRITIQUE_STANCES)[number];
-interface Critique {
-    assessment: string;
-    stance: CritiqueStance;
-    target: string;
-}
-interface RankedIdea {
-    contributors: string[];
-    rank: number;
-    risks?: string;
-    title: string;
-    why: string;
-}
-interface VoiceGenerateResult {
-    error?: string;
-    ideas: Idea[];
-    ok: boolean;
-    raw: string | null;
-    summary: string;
-    timedOut?: boolean;
-    voiceId: VoiceId;
-}
-interface VoiceCritiqueResult$1 {
-    critiques: Critique[];
-    error?: string;
-    extensions: RawIdea[];
-    ok: boolean;
-    raw: string | null;
-    summary: string;
-    timedOut?: boolean;
-    voiceId: VoiceId;
-}
-interface SynthesisResult {
-    by: VoiceId | null;
-    degraded: boolean;
-    error?: string;
-    ok: boolean;
-    ranked: RankedIdea[];
-    raw: string | null;
-    summary: string;
-}
-interface BrainstormResult {
-    critique: VoiceCritiqueResult$1[];
-    generate: VoiceGenerateResult[];
-    roster: VoiceId[];
-    synthesis: SynthesisResult;
-    topic: string;
-}
-
-type VoiceRunResult = CodexReviewResult;
-declare const VOICE_DEFAULTS: Record<VoiceId, VoiceConfig>;
-declare const VOICE_ADAPTERS: Record<VoiceId, (prompt: string, config: VoiceConfig, opts?: RunReviewOpts) => Promise<VoiceRunResult>>;
-declare const VOICES_FILE: string;
-declare function parseVoices(raw: unknown): Record<VoiceId, VoiceConfig>;
-declare function loadVoices(file?: string): Record<VoiceId, VoiceConfig>;
-declare function listVoices(file?: string): VoiceConfig[];
 
 declare const DEFAULT_VOICE_TIMEOUT_MS$1 = 300000;
 type Adapters$1 = Record<VoiceId, (prompt: string, config: VoiceConfig, opts?: {

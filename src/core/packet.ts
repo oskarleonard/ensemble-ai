@@ -37,6 +37,26 @@ export interface PacketInput {
   testOutput?: string; // the author's test run output / result
 }
 
+// The head+tail truncation splice marker `…[N chars truncated]…` that section() inserts when a
+// body exceeds its budget. core/packet OWNS this format; the verified gate's hunk parser
+// (modes/review/gate-hunks) consumes the matcher + splitter below to stay truncation-aware, so
+// the two can never drift on what a truncated diff looks like.
+const truncationMarker = (droppedChars: number): string =>
+  `…[${droppedChars} chars truncated]…`;
+
+// Detects the marker LINE (non-global — safe for .test()).
+export const TRUNCATION_MARKER_RE = /…\[\d+ chars truncated\]…/;
+
+// Split a (possibly truncated) body at each splice, DROPPING the marker AND the partial line on
+// either side of the cut — neither is a complete line the reviewer saw as coherent code (the
+// head's last line was cut mid-content; the tail resumes mid-line). A body with NO splice is
+// returned as a single segment, byte-identical to not splitting (the common, non-truncated path).
+// The gate parses hunks WITHIN each segment independently, so no hunk ever spans a cut and neither
+// the marker nor a partial fragment can become a citable anchor.
+export function segmentsWithoutTruncationSplices(body: string): string[] {
+  return body.split(/[^\n]*\n\n…\[\d+ chars truncated\]…\n\n[^\n]*/);
+}
+
 // Keep the head + a tail so a budget cut never hides the end of a file/diff.
 // Internal to section().
 function truncate(
@@ -47,7 +67,7 @@ function truncate(
   const head = Math.floor(budget * 0.7);
   const tail = budget - head;
   return {
-    text: `${text.slice(0, head)}\n\n…[${text.length - budget} chars truncated]…\n\n${text.slice(-tail)}`,
+    text: `${text.slice(0, head)}\n\n${truncationMarker(text.length - budget)}\n\n${text.slice(-tail)}`,
     truncated: true,
   };
 }
@@ -75,6 +95,19 @@ export function section(
     title,
     truncated: cut.truncated,
   };
+}
+
+// The title of the diff section in the assembled packet — the reviewer-visible diff bytes live
+// in its body (head+tail-truncated over PACKET_BUDGETS.diff). The verified gate pins THIS (not the
+// full pre-truncation diff) so a citation can only ever validate against bytes a reviewer saw.
+export const DIFF_SECTION_TITLE = 'The diff under review';
+
+export function reviewerVisibleDiff(packet: ReviewPacket): {
+  text: string;
+  truncated: boolean;
+} {
+  const s = packet.sections.find((sec) => sec.title === DIFF_SECTION_TITLE);
+  return { text: s?.body ?? '', truncated: s?.truncated ?? false };
 }
 
 // PURE: assemble a bounded, manifested code-review packet from gathered inputs.
@@ -117,7 +150,7 @@ export function assembleCodePacket(input: PacketInput): ReviewPacket {
     );
   }
   const diff = section(
-    'The diff under review',
+    DIFF_SECTION_TITLE,
     'the change itself — review THIS, not the whole repo',
     input.diff,
     PACKET_BUDGETS.diff

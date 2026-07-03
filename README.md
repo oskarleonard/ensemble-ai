@@ -44,6 +44,27 @@ The **trail** defaults to a repo-local `.ensemble-ai/reviews/<run-id>/` when you
 
 **Exit codes** (execution status, not a gate verdict): `0` = the review completed (even *with* findings) · `1` = a reviewer failed (crash / timeout / no parse) · `2` = blocked by the diff secret-scan · `3` = usage / no diff.
 
+### The verified gate — dismiss-only exit authority (exit 4)
+
+The `review` / `security` **CLI** adds one gate on top of the facts above: **exit `4`** when a completed review surfaced a **HIGH** finding. Its cold-Opus **gate reviewer** grounds each finding against the exact diff hunk the reviewers saw and tags it `agree` / `partial` / `false` / `unverified`; a HIGH stops the gate **only** on a citation-validated **`false`** — *dismiss-only*: the gate can drop a hallucinated HIGH from a weak reviewer, but can **never** bless, promote, or soften anything else. Everything else (`agree` / `partial` / `unverified` / missing) still gates, uniformly across Codex, Grok, and the Opus reviewer.
+
+**Grounding is not proof.** The citation only proves the gate *read* the disputed code (a whitespace-normalized, minimum-anchor quote of the finding's own hunk in the pinned packet). The `false` verdict itself is the gate model's **judgment**, not a proof of falsity.
+
+**Provenance-scoped by default** — dismissal authority is trusted for your own local diffs, strict for anything foreign:
+
+| Diff source | Authority | Effect |
+| --- | --- | --- |
+| `--working-tree` · `--staged` · branch-vs-merge-base (the default) | **ON** | a validated-`false` HIGH is dismissed |
+| `--pr <N\|url>` · a PR URL · piped stdin · `--diff-file` | **STRICT** | every HIGH gates (verdicts advisory) |
+
+- **`--strict-high`** forces STRICT **anywhere** — every HIGH gates even one the gate dismissed (use for untrusted diffs / CI, or any run where raw HIGH severity should gate).
+- **`--gate-dismissals`** opts a **foreign** diff into the dismiss-only authority (local diffs already have it). Its reader-of-record for a non-git input (stdin / `--diff-file` / a PR) is the run's **pinned packet** (`packet.gate.json` — the reviewer-visible diff at the resolved head SHA), the SAME immutable artifact the local path reads; nothing is re-derived from the working tree.
+- **`--no-fail-on-high`** suppresses exit 4 entirely (unchanged).
+
+A **gate failure never opens the gate and never trips exit 1** — a spawn error, a timeout, an unparseable / unknown-schema envelope, a missing / corrupt / SHA-mismatched packet, or a trail-write failure all force every verdict to `unverified`, so a HIGH still gates. Dismissed HIGHs print **loudly** (`HIGH (dismissed by gate — <reason>)`), and the run writes a durable `gate-verdicts.json` trail (raw + effective verdict + a machine-readable downgrade reason per finding). Exit precedence: `2` (secret-scan) > `1` (reviewer failed) > `4` (HIGH) > `0`.
+
+**Feeding a fix-loop:** the **structured verdicts** in `<trail>/<run-id>/gate-verdicts.json` — *not* the synthesis prose — are authoritative. Point a coding agent at the trail and fix the `agree` / `partial` findings; treat every `unverified` (especially an **unverified HIGH**, which still blocks the gate) as an explicit investigate-or-triage set, never a silent drop. Keep the gate seat at least as capable as your strongest reviewer — a weak gate mostly returns `unverified` (the safe-but-toothless mode), which stdout flags as "gate teeth did not engage".
+
 ### Brainstorm
 
 `brainstorm` runs ideation on a **topic** (not a diff) across multiple AI voices and synthesizes the result:

@@ -434,6 +434,118 @@ export function honoredHighDismissals(
     .map((r) => r.findingId);
 }
 
+// ── Exit authority (Phase 2 — dismiss-only) ────────────────────────────────────────────
+
+// Whether the gate's DISMISS-ONLY exit authority is IN EFFECT for this run. ON by default for
+// LOCAL provenance (the diff is the cwd repo's own working-tree/--staged/branch state — the
+// trusted self-review case this feature was ratified for); STRICT for FOREIGN provenance
+// (--pr / URL / stdin / --diff-file) unless `--gate-dismissals` explicitly opts in; `--strict-high`
+// forces STRICT everywhere. STRICT = the gate's verdicts stay advisory and EVERY HIGH gates
+// (exactly today's behavior). Pure — the CLI resolves `localProvenance` from the diff source.
+export interface GateAuthorityInputs {
+  gateDismissals: boolean; // --gate-dismissals: opt FOREIGN provenance INTO authority
+  localProvenance: boolean; // the diff is the cwd repo's own local state (trusted)
+  strictHigh: boolean; // --strict-high: force STRICT anywhere
+}
+
+export function gateAuthorityActive(i: GateAuthorityInputs): boolean {
+  if (i.strictHigh) return false; // strict everywhere — no dismissals honored
+  if (i.localProvenance) return true; // trusted self-review — authority ON
+  return i.gateDismissals; // foreign — ON only if explicitly opted in
+}
+
+// A one-line human label for the resolved authority mode (stdout legibility).
+export function gateAuthorityLabel(i: GateAuthorityInputs): string {
+  if (i.strictHigh) return 'STRICT (--strict-high — every HIGH gates)';
+  if (i.localProvenance) return 'ON (local provenance — dismiss-only)';
+  if (i.gateDismissals) return 'ON (--gate-dismissals — foreign provenance opted in)';
+  return 'STRICT (foreign provenance — every HIGH gates; pass --gate-dismissals to enable)';
+}
+
+// The exit decision over HIGH findings: which HIGHs still GATE (force exit 4) vs which the gate
+// HONORED-dismissed. Under STRICT authority EVERY HIGH gates (dismissed set empty). Under active
+// authority a HIGH is dismissed ONLY when it is a citation-validated `false` AND the trail durably
+// wrote (honoredHighDismissals). The Phase-1 host-forced downgrades — truncation-ineligible,
+// invalid citation, packet/parse/schema failure, trail-write failure — never yield an
+// effectiveVerdict `false`, so they can never enter the dismissed set: a downgraded HIGH always
+// gates. Pure — the CLI keeps exit precedence (2 > 1 > 4 > 0) and never lets this trip exit 1.
+export interface HighGateDecision {
+  dismissedHighIds: string[]; // HONORED dismissals — rendered loudly, dropped from the gate
+  gatingHighIds: string[]; // HIGHs that still gate → exit 4
+}
+
+export function resolveHighGate(
+  records: GateVerdictRecord[],
+  trailWritten: boolean,
+  authorityActive: boolean
+): HighGateDecision {
+  const highIds = records.filter((r) => r.severity === 'high').map((r) => r.findingId);
+  if (!authorityActive) return { dismissedHighIds: [], gatingHighIds: highIds };
+  const dismissed = new Set(honoredHighDismissals(records, trailWritten));
+  return {
+    dismissedHighIds: highIds.filter((id) => dismissed.has(id)),
+    gatingHighIds: highIds.filter((id) => !dismissed.has(id)),
+  };
+}
+
+// The exit-authority block for stdout: the resolved mode, each HONORED-dismissed HIGH rendered
+// LOUDLY as `HIGH (dismissed by gate — reason)`, any advisory-only gate-`false` HIGHs that STRICT
+// did NOT honor (surfaced, never silently gated), and the HIGHs that still gate. Returns [] when
+// there are no HIGH findings at all (nothing authority-relevant to say). Pure.
+export function renderHighGate(
+  records: GateVerdictRecord[],
+  decision: HighGateDecision,
+  opts: { authorityActive: boolean; authorityLabel: string; scrub: (s: string) => string }
+): string[] {
+  const s = opts.scrub;
+  const highs = records.filter((r) => r.severity === 'high');
+  if (highs.length === 0) return [];
+  const byId = new Map(records.map((r) => [r.findingId, r]));
+  const out: string[] = ['', `  ── gate authority — ${opts.authorityLabel} ──`];
+  for (const id of decision.dismissedHighIds) {
+    const r = byId.get(id);
+    const reason = r?.reason ? s(r.reason).slice(0, 200) : 'grounded false verdict';
+    const where = r?.file ? ` · ${s(r.file)}${r.line ? `:${r.line}` : ''}` : '';
+    out.push(`     HIGH (dismissed by gate — ${reason}) · ${id}${where}`);
+  }
+  // A gate `false` on a HIGH that authority did NOT honor (a STRICT run) — advisory only, surfaced
+  // so the user sees the dismiss path exists (and how to enable it) rather than silently gating.
+  if (!opts.authorityActive) {
+    const advisory = highs.filter((r) => r.effectiveVerdict === 'false').map((r) => r.findingId);
+    if (advisory.length > 0) {
+      out.push(
+        `     gate marked ${advisory.length} HIGH(s) \`false\` (advisory — authority STRICT, NOT dismissed): ${advisory.join(', ')}`
+      );
+    }
+  }
+  if (decision.gatingHighIds.length > 0) {
+    out.push(
+      `     ${decision.gatingHighIds.length} HIGH(s) gate → exit 4: ${decision.gatingHighIds.join(', ')}`
+    );
+  } else if (decision.dismissedHighIds.length > 0) {
+    out.push('     every HIGH dismissed by the gate — no HIGH gates this run');
+  }
+  return out;
+}
+
+// The gate-disposition summary the receipt carries (spec §Design 2). Verdict counts + the HONORED
+// dismissed HIGH ids + the trail-failed marker (trailWritten=false means dismissals were NOT
+// honored). Additive on the receipt — `receipt verify` never reads it, so its semantics are
+// unchanged. `verdictCounts` keys are the GateVerdict enum, JSON-serialized as strings.
+export interface GateDispositionSummary {
+  dismissedHighIds: string[];
+  trailWritten: boolean;
+  verdictCounts: Record<string, number>;
+}
+
+export function gateDispositionSummary(
+  records: GateVerdictRecord[],
+  dismissedHighIds: string[],
+  trailWritten: boolean
+): GateDispositionSummary {
+  return { dismissedHighIds, trailWritten, verdictCounts: verdictCounts(records) };
+}
+
 // ── Durable trail ──────────────────────────────────────────────────────────────────────
 
 export interface GateVerdictsTrail {

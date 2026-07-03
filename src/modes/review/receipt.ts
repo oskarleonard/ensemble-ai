@@ -7,6 +7,7 @@ import { sha256Hex } from '../../core/hash';
 import type { ReviewerId, StoredReview, TerminalState } from '../../core/types';
 
 import type { Coverage, DiffMode } from './diff';
+import type { GateDispositionSummary } from './gate';
 
 // The content-tied DIFF receipt — the diff analog of the spec-review receipt
 // doctrine. A diff earns a receipt only after a qualifying cross-vendor review;
@@ -60,6 +61,12 @@ export interface DiffReviewReceipt {
   // N-reviewer pass; its absence, a core-only (`--no-claude`) one — the two are no
   // longer indistinguishable. Omitted on a codex/grok-only receipt.
   peerReviewers?: PeerReviewerRecord[];
+  // The gate-disposition summary (Phase 2) — additive, host-owned POLICY metadata: the gate's
+  // verdict counts + the HONORED dismissed HIGH ids + whether the trail durably wrote (false ⇒
+  // dismissals were NOT honored). RECORDED for legibility + retro-scoring; `receipt verify` NEVER
+  // reads it (isDiffReviewed keys off the diff digest + completed[] + coverage + artifacts only),
+  // so a receipt with or without it verifies IDENTICALLY. Omitted on a `--no-claude` run (no gate).
+  gateDisposition?: GateDispositionSummary;
   // The canonical-diff content digest (NOT a commit SHA — a raw diff has no
   // intrinsic commit identity; the base+head SHAs carry that, separately).
   diffDigest: string;
@@ -220,6 +227,23 @@ export function validateReceiptShape(value: unknown): DiffReviewReceipt {
           isStr((p as Record<string, unknown>).vendor)
       );
     if (!okArr) errs.push('peerReviewers (PeerReviewerRecord[])');
+  }
+  // gateDisposition is OPTIONAL (absent on --no-claude receipts + every pre-Phase-2 receipt, so
+  // existing verify fixtures pass unchanged). Validate only when present — catch a corrupt one
+  // before a reader (analytics / the fix-loop) trusts it; it is never a trust boundary.
+  if (o.gateDisposition !== undefined) {
+    const g = o.gateDisposition;
+    const okDisp =
+      g !== null &&
+      typeof g === 'object' &&
+      !Array.isArray(g) &&
+      Array.isArray((g as Record<string, unknown>).dismissedHighIds) &&
+      ((g as Record<string, unknown>).dismissedHighIds as unknown[]).every((x) => isStr(x)) &&
+      typeof (g as Record<string, unknown>).trailWritten === 'boolean' &&
+      (g as Record<string, unknown>).verdictCounts !== null &&
+      typeof (g as Record<string, unknown>).verdictCounts === 'object' &&
+      !Array.isArray((g as Record<string, unknown>).verdictCounts);
+    if (!okDisp) errs.push('gateDisposition (GateDispositionSummary)');
   }
   const c = o.coverage;
   if (c === null || typeof c !== 'object' || Array.isArray(c)) {

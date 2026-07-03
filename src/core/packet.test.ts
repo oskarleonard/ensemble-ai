@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { assembleCodePacket, PACKET_BUDGETS, type PacketInput } from './packet';
+import {
+  assembleCodePacket,
+  DIFF_SECTION_TITLE,
+  PACKET_BUDGETS,
+  type PacketInput,
+  reviewerVisibleDiff,
+  segmentsWithoutTruncationSplices,
+  TRUNCATION_MARKER_RE,
+} from './packet';
 
 const base: PacketInput = {
   diff: 'diff --git a/x b/x\n'.repeat(20),
@@ -87,5 +95,40 @@ describe('assembleCodePacket', () => {
     expect(assembleCodePacket({ ...base, testOutput: 'x' }).complete).toBe(
       true
     );
+  });
+});
+
+// ── Binding fix #1 — the reviewer-visible diff + truncation-splice splitter ─────────────
+describe('reviewerVisibleDiff + segmentsWithoutTruncationSplices (binding fix #1)', () => {
+  it('reviewerVisibleDiff returns the diff-SECTION body — exactly what the reviewer saw', () => {
+    const p = assembleCodePacket(base);
+    const section = p.sections.find((s) => s.title === DIFF_SECTION_TITLE)!;
+    const v = reviewerVisibleDiff(p);
+    expect(v.text).toBe(section.body);
+    expect(v.truncated).toBe(false);
+  });
+
+  it('a diff over the budget ⇒ truncated bytes that carry a splice marker', () => {
+    const huge = 'diff --git a/big b/big\n' + 'x'.repeat(PACKET_BUDGETS.diff + 5_000);
+    const v = reviewerVisibleDiff(assembleCodePacket({ ...base, diff: huge }));
+    expect(v.truncated).toBe(true);
+    expect(v.text.length).toBeLessThan(huge.length);
+    expect(TRUNCATION_MARKER_RE.test(v.text)).toBe(true);
+  });
+
+  it('no marker ⇒ ONE segment (byte-identical to the input — the common path)', () => {
+    const d = 'diff --git a/x b/x\n@@ -1,1 +1,1 @@\n-a\n+b\n';
+    expect(segmentsWithoutTruncationSplices(d)).toEqual([d]);
+  });
+
+  it('splits at a splice, DROPPING the marker AND the partial line on each side of the cut', () => {
+    const spliced =
+      'headContentLine\npartialHeadCut\n\n…[42 chars truncated]…\n\npartialTailResume\ntailContentLine';
+    const segs = segmentsWithoutTruncationSplices(spliced);
+    expect(segs).toEqual(['headContentLine\n', '\ntailContentLine']);
+    const joined = segs.join('|');
+    expect(joined).not.toContain('truncated');
+    expect(joined).not.toContain('partialHeadCut');
+    expect(joined).not.toContain('partialTailResume');
   });
 });

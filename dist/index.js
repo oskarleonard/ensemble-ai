@@ -122,6 +122,11 @@ var PACKET_BUDGETS = {
   tests: 8e3
 };
 var DIFF_USEFUL_FLOOR = 200;
+var truncationMarker = (droppedChars) => `\u2026[${droppedChars} chars truncated]\u2026`;
+var TRUNCATION_MARKER_RE = /…\[\d+ chars truncated\]…/;
+function segmentsWithoutTruncationSplices(body) {
+  return body.split(/[^\n]*\n\n…\[\d+ chars truncated\]…\n\n[^\n]*/);
+}
 function truncate(text, budget) {
   if (text.length <= budget) return { text, truncated: false };
   const head = Math.floor(budget * 0.7);
@@ -129,7 +134,7 @@ function truncate(text, budget) {
   return {
     text: `${text.slice(0, head)}
 
-\u2026[${text.length - budget} chars truncated]\u2026
+${truncationMarker(text.length - budget)}
 
 ${text.slice(-tail)}`,
     truncated: true
@@ -146,6 +151,11 @@ function section(title, why, body, budget) {
     title,
     truncated: cut.truncated
   };
+}
+var DIFF_SECTION_TITLE = "The diff under review";
+function reviewerVisibleDiff(packet) {
+  const s = packet.sections.find((sec) => sec.title === DIFF_SECTION_TITLE);
+  return { text: s?.body ?? "", truncated: s?.truncated ?? false };
 }
 function assembleCodePacket(input) {
   const sections = [
@@ -177,7 +187,7 @@ function assembleCodePacket(input) {
     );
   }
   const diff = section(
-    "The diff under review",
+    DIFF_SECTION_TITLE,
     "the change itself \u2014 review THIS, not the whole repo",
     input.diff,
     PACKET_BUDGETS.diff
@@ -1379,7 +1389,7 @@ import fs7 from "fs";
 import path6 from "path";
 
 // src/modes/review/gate-hunks.ts
-var GATE_PACKET_SCHEMA_VERSION = 1;
+var GATE_PACKET_SCHEMA_VERSION = 2;
 function persistGatePacket(baseDir, runId, input) {
   const packet = {
     diff: input.diff,
@@ -1471,6 +1481,11 @@ function validateReceiptShape(value) {
       (p) => p !== null && typeof p === "object" && !Array.isArray(p) && isStr(p.id) && isStr(p.state) && isStr(p.vendor)
     );
     if (!okArr) errs.push("peerReviewers (PeerReviewerRecord[])");
+  }
+  if (o.gateDisposition !== void 0) {
+    const g = o.gateDisposition;
+    const okDisp = g !== null && typeof g === "object" && !Array.isArray(g) && Array.isArray(g.dismissedHighIds) && g.dismissedHighIds.every((x) => isStr(x)) && typeof g.trailWritten === "boolean" && g.verdictCounts !== null && typeof g.verdictCounts === "object" && !Array.isArray(g.verdictCounts);
+    if (!okDisp) errs.push("gateDisposition (GateDispositionSummary)");
   }
   const c = o.coverage;
   if (c === null || typeof c !== "object" || Array.isArray(c)) {
@@ -1745,7 +1760,7 @@ async function runReviewMode(opts) {
   }
   try {
     persistGatePacket(opts.out, opts.runId, {
-      diff: acquired.diff,
+      diff: reviewerVisibleDiff(packet).text,
       headSha: acquired.headSha
     });
   } catch {
@@ -2721,6 +2736,7 @@ export {
   DEFAULT_COVERAGE_CEILING,
   DEFAULT_OBJECTIVE,
   DEFAULT_VOICE_TIMEOUT_MS,
+  DIFF_SECTION_TITLE,
   DIFF_USEFUL_FLOOR,
   FINDINGS_INSTRUCTIONS,
   IMPLEMENTED_MODES,
@@ -2737,6 +2753,7 @@ export {
   SECURITY_OBJECTIVE,
   SEVERITIES,
   TERMINAL_STATES,
+  TRUNCATION_MARKER_RE,
   VOICES_FILE,
   VOICE_ADAPTERS,
   VOICE_DEFAULTS,
@@ -2814,6 +2831,7 @@ export {
   resolveReviewSandbox,
   resolveReviewer,
   reviewDir,
+  reviewerVisibleDiff,
   runBrainstormMode,
   runClaudeVoice,
   runCodexReview,
@@ -2825,6 +2843,7 @@ export {
   scanDiffForSecrets,
   section,
   securityClassLabel,
+  segmentsWithoutTruncationSplices,
   sha256Hex,
   stripSecurityTag,
   summarizeCoverage,

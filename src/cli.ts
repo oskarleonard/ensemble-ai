@@ -46,6 +46,14 @@ import {
 } from './modes/review/self-contained';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
 import {
+  gateAuthorityActive,
+  type GateAuthorityInputs,
+  gateAuthorityLabel,
+  gateDispositionSummary,
+  renderHighGate,
+  resolveHighGate,
+} from './modes/review/gate';
+import {
   acquireDiff,
   type AcquiredDiff,
   coverageCounts,
@@ -149,6 +157,10 @@ Options:
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
+  --strict-high         force STRICT: EVERY HIGH gates (exit 4), even one the gate dismissed —
+                        overrides the provenance default (use for untrusted diffs / CI)
+  --gate-dismissals     opt a FOREIGN diff (--pr/URL/stdin/--diff-file) INTO the gate's
+                        dismiss-only authority (LOCAL diffs already have it on by default)
   --out <dir>           trail BASE dir; a per-run <run-id>/ subdir is created under it
                         (default: repo-local .ensemble-ai/reviews when reviewing this
                         repo's own diff, else an OS temp dir — the path is printed)
@@ -159,9 +171,17 @@ Options:
   --run-id <id>         trail/receipt run id (default: generated)
   -h, --help            this help
 
-Exit codes: 0 = completed, no HIGH (or gate disabled) · 1 = a reviewer failed
+Gate authority (exit 4): a HIGH stops the gate ONLY when the cold-Opus GATE returns a
+citation-validated \`false\` grounded in the reviewed code — dismiss-only: it can never bless,
+promote, or soften anything else. The grounding proves the gate READ the disputed code; it does
+NOT prove the finding is false (the verdict is the gate model's judgment). Authority is ON by
+default ONLY for LOCAL diffs (--working-tree/--staged/branch — the trusted self-review case) and
+STRICT for FOREIGN provenance (--pr/URL/stdin/--diff-file), where every HIGH gates. --strict-high
+forces STRICT anywhere; --gate-dismissals opts foreign provenance in. Dismissed HIGHs print loudly.
+
+Exit codes: 0 = completed, no gating HIGH (or gate disabled) · 1 = a reviewer failed
 (crash/timeout/no-parse) · 2 = blocked by the secret-scan · 3 = usage / no diff ·
-4 = completed WITH a HIGH finding (the gate; disable with --no-fail-on-high).`;
+4 = completed with a HIGH the gate did NOT dismiss (disable with --no-fail-on-high).`;
 
 const SECURITY_USAGE = `ensemble-ai security — adversarial SECURITY audit of a diff with ALL reviewers.
 
@@ -766,6 +786,7 @@ async function reviewCommand(
         conventions: { type: 'string' },
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
+        'gate-dismissals': { type: 'boolean' },
         help: { short: 'h', type: 'boolean' },
         'no-claude': { type: 'boolean' },
         'no-conventions': { type: 'boolean' },
@@ -776,6 +797,7 @@ async function reviewCommand(
         'run-id': { type: 'string' },
         sandbox: { type: 'string' },
         staged: { type: 'boolean' },
+        'strict-high': { type: 'boolean' },
         'working-tree': { type: 'boolean' },
       },
     }));
@@ -951,6 +973,25 @@ async function reviewCommand(
     }
   }
 
+  // Resolve the gate's DISMISS-ONLY exit authority for this run (Phase 2). ON by default for a
+  // LOCAL diff (working-tree/--staged/branch — the trusted self-review case), STRICT for FOREIGN
+  // provenance (--pr/URL/stdin/--diff-file) unless --gate-dismissals opts in; --strict-high forces
+  // STRICT everywhere. `source.localRepoTrail` is the SAME provenance signal the trail-fence keys
+  // off (#13). Computed here — before the receipt, the render, and the exit — so all three agree.
+  // Pure + safe even when the gate did not run (--no-claude → no records → nothing to dismiss).
+  const gateAuthorityInputs: GateAuthorityInputs = {
+    gateDismissals: Boolean(values['gate-dismissals']),
+    localProvenance: source.localRepoTrail === true,
+    strictHigh: Boolean(values['strict-high']),
+  };
+  const authorityActive = gateAuthorityActive(gateAuthorityInputs);
+  const gateRecords = claudeLayer?.gateVerdicts ?? [];
+  const highGate = resolveHighGate(
+    gateRecords,
+    claudeLayer?.gateTrailWritten ?? false,
+    authorityActive
+  );
+
   // Persist the receipt ONLY after the full expected roster ran (fail-loud parity with the
   // exit gate): the codex/grok core qualified a candidate, but when the default-on Opus
   // reviewer was EXPECTED it must ALSO have completed — else NO clean receipt is written
@@ -970,10 +1011,22 @@ async function reviewCommand(
             },
           ]
         : [];
-      const receipt =
-        peerReviewers.length > 0
-          ? { ...result.receiptCandidate, peerReviewers }
-          : result.receiptCandidate;
+      // Attach the gate-disposition summary whenever the gate ran (claudeLayer present) — verdict
+      // counts + honored dismissed HIGH ids + the trail-written marker. Additive: `receipt verify`
+      // never reads it (verify semantics unchanged), it is recorded for legibility + retro-scoring.
+      const receipt: DiffReviewReceipt = {
+        ...result.receiptCandidate,
+        ...(peerReviewers.length > 0 ? { peerReviewers } : {}),
+        ...(claudeLayer
+          ? {
+              gateDisposition: gateDispositionSummary(
+                gateRecords,
+                highGate.dismissedHighIds,
+                claudeLayer.gateTrailWritten
+              ),
+            }
+          : {}),
+      };
       try {
         result.receiptPath = writeReceipt(result.receiptStore, receipt);
         result.receipt = receipt;
@@ -1007,6 +1060,15 @@ async function reviewCommand(
   // Render the self-contained Opus layer (computed above) after the core summary.
   if (claudeLayer) {
     console.log(renderClaudeLayer(claudeLayer).join('\n'));
+    // The exit-AUTHORITY block: the resolved mode + any HONORED-dismissed HIGHs rendered LOUDLY
+    // (`HIGH (dismissed by gate — reason)`) + the HIGHs that still gate. Empty (unprinted) when
+    // there are no HIGH findings at all.
+    const highGateLines = renderHighGate(gateRecords, highGate, {
+      authorityActive,
+      authorityLabel: gateAuthorityLabel(gateAuthorityInputs),
+      scrub: clean,
+    });
+    if (highGateLines.length > 0) console.log(highGateLines.join('\n'));
   }
 
   // On stdout (with the receipt + pinned-input paths) — the machine-readable trail
@@ -1039,14 +1101,25 @@ async function reviewCommand(
       return 1;
     }
   }
-  // 4 = the findings GATE: a completed review surfaced a HIGH — from ANY of the three
-  // reviewers (codex + grok + the cold Opus voice). Gate-usable by default (a pre-PR hook
-  // can fail on it); --no-fail-on-high opts out → 0.
+  // 4 = the findings GATE: a completed review surfaced a HIGH — from ANY of the three reviewers
+  // (codex + grok + the cold Opus voice). Phase 2 — the gate's DISMISS-ONLY authority may drop a
+  // HIGH from the gate, but ONLY when it is a citation-validated `false` under ACTIVE authority
+  // (local provenance, or --gate-dismissals) AND the trail durably wrote. Under STRICT (foreign
+  // provenance / --strict-high) EVERY HIGH gates (today's behavior). Every Phase-1 host-forced
+  // downgrade (truncation-ineligible · invalid-citation · packet/parse/schema fail · trail-write
+  // fail) leaves its HIGH gating. A gate FAILURE yields all-`unverified` (nothing dismissed) → the
+  // HIGH still gates — and a gate failure NEVER trips exit 1 (that is reviewer-failure only,
+  // handled above). --no-fail-on-high opts out of 4 entirely. Precedence 2 > 1 > 4 > 0 intact.
   if (
     !values['no-fail-on-high'] &&
     (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))
   ) {
-    return 4;
+    // Exit 4 UNLESS the gate honored-dismissed EVERY HIGH: authority active AND at least one HIGH
+    // dismissed AND none remaining. Fail-closed — a remaining HIGH, a STRICT run (nothing
+    // dismissed), a gate failure, or any records/raw mismatch all gate.
+    const allHighsDismissed =
+      highGate.dismissedHighIds.length > 0 && highGate.gatingHighIds.length === 0;
+    if (!allHighsDismissed) return 4;
   }
   return 0;
 }
