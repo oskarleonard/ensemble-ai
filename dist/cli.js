@@ -3737,6 +3737,7 @@ function resolveField(key, flag, gate, claude, warn, accept = () => true) {
     );
   for (const v of [fromGate, claude ? nonEmptyStr(claude[key]) : null]) {
     if (v === null) continue;
+    if (v === "default") continue;
     if (accept(v)) return { source: "file", value: v };
     warn(
       `gate seat: \`${key}\` "${v}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 falling back to the claude voice / built-in default`
@@ -3795,7 +3796,11 @@ function loadGateSeat(file = VOICES_FILE, flags = {}, warn = () => {
   let raw = {};
   try {
     raw = JSON.parse(fs12.readFileSync(file, "utf8"));
-  } catch {
+  } catch (e) {
+    if (e.code !== "ENOENT")
+      warn(
+        `gate seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the claude voice / built-in default`
+      );
     raw = {};
   }
   return resolveGateSeat(raw, flags, warn);

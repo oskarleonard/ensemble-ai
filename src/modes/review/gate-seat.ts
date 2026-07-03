@@ -70,6 +70,9 @@ function resolveField(
   // falls through rather than resolving to a value the spawn would drop.
   for (const v of [fromGate, claude ? nonEmptyStr(claude[key]) : null]) {
     if (v === null) continue;
+    // The documented 'default' sentinel means "no explicit value at this link" — fall through
+    // silently; it is the documented spelling, not junk.
+    if (v === 'default') continue;
     if (accept(v)) return { source: 'file', value: v };
     warn(
       `gate seat: \`${key}\` "${v}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — falling back to the claude voice / built-in default`,
@@ -156,7 +159,14 @@ export function loadGateSeat(
   let raw: unknown = {};
   try {
     raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
+  } catch (e) {
+    // A missing file is the normal zero-config case — silent. Any OTHER failure (unreadable,
+    // malformed JSON) silently resetting the seat would violate the junk-config-is-loud posture,
+    // so it warns before falling back.
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT')
+      warn(
+        `gate seat: could not read \`${file}\` (${(e as Error).message.split('\n')[0]}) — using the claude voice / built-in default`,
+      );
     raw = {};
   }
   return resolveGateSeat(raw, flags, warn);

@@ -156,3 +156,42 @@ describe('resolveGateSeat — per-seat gate model/effort (done-criterion 6)', ()
     expect(warnings.some((w) => w.includes('not a known effort'))).toBe(true);
   });
 });
+
+describe('loadGateSeat — file-failure loudness + the default sentinel (dogfood fixes)', () => {
+  it('warns on a malformed voices.json (loud, never silent) and still resolves the default seat', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { loadGateSeat } = await import('./gate-seat');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ea-gate-seat-'));
+    const file = path.join(dir, 'voices.json');
+    fs.writeFileSync(file, '{ not json');
+    const warnings: string[] = [];
+    const seat = loadGateSeat(file, {}, (m) => warnings.push(m));
+    expect(warnings.some((w) => w.includes('could not read'))).toBe(true);
+    expect(seat.config.model).toBe('default');
+    fs.rmSync(dir, { force: true, recursive: true });
+  });
+
+  it('stays silent on a MISSING voices.json (the normal zero-config case)', async () => {
+    const { loadGateSeat } = await import('./gate-seat');
+    const warnings: string[] = [];
+    const seat = loadGateSeat('/nonexistent/ea-gate-seat/voices.json', {}, (m) => warnings.push(m));
+    expect(warnings).toEqual([]);
+    expect(seat.config.model).toBe('default');
+  });
+
+  it("treats an explicit 'default' effort/model as the documented sentinel — no spurious warning, falls through", () => {
+    const warnings: string[] = [];
+    const seat = resolveGateSeat(
+      { claude: { effort: 'high' }, gate: { effort: 'default', model: 'default' } },
+      {} as GateSeatFlags,
+      (m) => warnings.push(m),
+    );
+    expect(warnings).toEqual([]);
+    expect(seat.config.effort).toBe('high');
+    expect(seat.effortSource).toBe('file');
+    expect(seat.config.model).toBe('default');
+    expect(seat.modelSource).toBe('default');
+  });
+});
