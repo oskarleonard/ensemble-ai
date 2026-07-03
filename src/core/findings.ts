@@ -42,6 +42,22 @@ export function oneOf<T extends string>(set: readonly T[], v: unknown, fallback:
   return (set as readonly string[]).includes(v as string) ? (v as T) : fallback;
 }
 
+// Format a finding's evidence as `file:line` (or just `file` when uncited-by-line), falling back
+// to `(uncited)` when there is no file — the ONE definition of an idiom that was re-implemented
+// across the CLI + every review renderer. `scrub` is applied to the file path (default identity: a
+// renderer that scrubs control chars passes its scrubber in; a prompt that shows the raw host-owned
+// path omits it). Line 0 renders as no line (line numbers are 1-based — matches every call site's
+// `line ?` truthiness).
+export function evidenceRef(
+  file: string | undefined,
+  line: number | null | undefined,
+  scrub: (s: string) => string = (s) => s
+): string {
+  if (!file) return '(uncited)';
+  const f = scrub(file);
+  return line ? `${f}:${line}` : f;
+}
+
 const asSeverity = (v: unknown): Severity => oneOf(SEVERITIES, v, 'medium');
 const asConfidence = (v: unknown): Confidence => oneOf(CONFIDENCES, v, 'low');
 

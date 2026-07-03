@@ -373,71 +373,6 @@ function isEntrypoint(importMetaUrl) {
   }
 }
 
-// src/core/reviewers.ts
-import fs4 from "fs";
-import os from "os";
-import path3 from "path";
-var REVIEWERS_FILE = process.env.ENSEMBLE_REVIEWERS_FILE || path3.join(os.homedir(), ".ensemble-ai", "reviewers.json");
-var REVIEWER_DEFAULTS = {
-  codex: {
-    cmd: "codex",
-    effort: "xhigh",
-    id: "codex",
-    model: "gpt-5.5",
-    vendor: "openai"
-  },
-  // Grok (xAI) — the second cross-vendor lens. grok-build is the stronger of the
-  // two CLI-available models; `sandbox` names the OS-enforced read-only profile it
-  // runs under (kernel-blocked writes + secret-read deny — see reviewers/grok.ts).
-  grok: {
-    cmd: "grok",
-    effort: "high",
-    id: "grok",
-    model: "grok-build",
-    sandbox: "ensemble-review",
-    vendor: "xai"
-  }
-};
-function str(v, fallback) {
-  return typeof v === "string" && v.trim() ? v.trim() : fallback;
-}
-function parseReviewers(raw) {
-  const out = { ...REVIEWER_DEFAULTS };
-  if (!raw || typeof raw !== "object") return out;
-  const o = raw;
-  for (const id of REVIEWER_IDS) {
-    const e = o[id];
-    if (!e || typeof e !== "object") continue;
-    const r = e;
-    const sandbox = str(r.sandbox, REVIEWER_DEFAULTS[id].sandbox ?? "");
-    out[id] = {
-      cmd: str(r.cmd, REVIEWER_DEFAULTS[id].cmd),
-      effort: str(r.effort, REVIEWER_DEFAULTS[id].effort),
-      id,
-      model: str(r.model, REVIEWER_DEFAULTS[id].model),
-      vendor: str(r.vendor, REVIEWER_DEFAULTS[id].vendor),
-      ...sandbox ? { sandbox } : {}
-    };
-  }
-  return out;
-}
-function loadReviewers(file = REVIEWERS_FILE) {
-  try {
-    return parseReviewers(JSON.parse(fs4.readFileSync(file, "utf8")));
-  } catch {
-    return { ...REVIEWER_DEFAULTS };
-  }
-}
-function listReviewers(file = REVIEWERS_FILE) {
-  const all = loadReviewers(file);
-  return REVIEWER_IDS.map((id) => all[id]);
-}
-
-// src/core/sanitize.ts
-function scrubControl(s) {
-  return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
-}
-
 // src/core/findings.ts
 var FINDINGS_INSTRUCTIONS = `## Output format \u2014 STRICT
 Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
@@ -459,6 +394,11 @@ sure you are it is real. If the change looks correct, return an empty "findings"
 array with a "summary" that says so. Do not invent issues to fill the list.`;
 function oneOf(set, v, fallback) {
   return set.includes(v) ? v : fallback;
+}
+function evidenceRef(file, line, scrub = (s) => s) {
+  if (!file) return "(uncited)";
+  const f = scrub(file);
+  return line ? `${f}:${line}` : f;
 }
 var asSeverity = (v) => oneOf(SEVERITIES, v, "medium");
 var asConfidence = (v) => oneOf(CONFIDENCES, v, "low");
@@ -525,6 +465,71 @@ function parseFindings(raw) {
     });
   });
   return { findings, summary };
+}
+
+// src/core/reviewers.ts
+import fs4 from "fs";
+import os from "os";
+import path3 from "path";
+var REVIEWERS_FILE = process.env.ENSEMBLE_REVIEWERS_FILE || path3.join(os.homedir(), ".ensemble-ai", "reviewers.json");
+var REVIEWER_DEFAULTS = {
+  codex: {
+    cmd: "codex",
+    effort: "xhigh",
+    id: "codex",
+    model: "gpt-5.5",
+    vendor: "openai"
+  },
+  // Grok (xAI) — the second cross-vendor lens. grok-build is the stronger of the
+  // two CLI-available models; `sandbox` names the OS-enforced read-only profile it
+  // runs under (kernel-blocked writes + secret-read deny — see reviewers/grok.ts).
+  grok: {
+    cmd: "grok",
+    effort: "high",
+    id: "grok",
+    model: "grok-build",
+    sandbox: "ensemble-review",
+    vendor: "xai"
+  }
+};
+function str(v, fallback) {
+  return typeof v === "string" && v.trim() ? v.trim() : fallback;
+}
+function parseReviewers(raw) {
+  const out = { ...REVIEWER_DEFAULTS };
+  if (!raw || typeof raw !== "object") return out;
+  const o = raw;
+  for (const id of REVIEWER_IDS) {
+    const e = o[id];
+    if (!e || typeof e !== "object") continue;
+    const r = e;
+    const sandbox = str(r.sandbox, REVIEWER_DEFAULTS[id].sandbox ?? "");
+    out[id] = {
+      cmd: str(r.cmd, REVIEWER_DEFAULTS[id].cmd),
+      effort: str(r.effort, REVIEWER_DEFAULTS[id].effort),
+      id,
+      model: str(r.model, REVIEWER_DEFAULTS[id].model),
+      vendor: str(r.vendor, REVIEWER_DEFAULTS[id].vendor),
+      ...sandbox ? { sandbox } : {}
+    };
+  }
+  return out;
+}
+function loadReviewers(file = REVIEWERS_FILE) {
+  try {
+    return parseReviewers(JSON.parse(fs4.readFileSync(file, "utf8")));
+  } catch {
+    return { ...REVIEWER_DEFAULTS };
+  }
+}
+function listReviewers(file = REVIEWERS_FILE) {
+  const all = loadReviewers(file);
+  return REVIEWER_IDS.map((id) => all[id]);
+}
+
+// src/core/sanitize.ts
+function scrubControl(s) {
+  return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 // src/modes/brainstorm/types.ts
@@ -1736,9 +1741,11 @@ var PACKET_BUDGETS = {
   tests: 8e3
 };
 var DIFF_USEFUL_FLOOR = 200;
+var MARKER_RE_SRC = String.raw`…\[\d+ chars truncated\]…`;
 var truncationMarker = (droppedChars) => `\u2026[${droppedChars} chars truncated]\u2026`;
+var TRUNCATION_MARKER_RE = new RegExp(MARKER_RE_SRC);
 function segmentsWithoutTruncationSplices(body) {
-  return body.split(/[^\n]*\n\n…\[\d+ chars truncated\]…\n\n[^\n]*/);
+  return body.split(new RegExp(String.raw`[^\n]*\n\n${MARKER_RE_SRC}\n\n[^\n]*`));
 }
 function truncate(text, budget) {
   if (text.length <= budget) return { text, truncated: false };
@@ -2899,7 +2906,7 @@ function hunkNote(f) {
 function findingsBlock(findings) {
   if (findings.length === 0) return "(no findings raised by any reviewer)";
   return findings.map((f) => {
-    const where = f.file ? `${f.file}${f.line ? `:${f.line}` : ""}` : "(uncited)";
+    const where = evidenceRef(f.file, f.line);
     return [
       `- ${f.findingId} \xB7 ${f.reviewer} \xB7 [${f.severity}] ${where}  ${hunkNote(f)}`,
       `  <<<CLAIM ${f.findingId} \u2014 UNTRUSTED reviewer text>>>`,
@@ -3315,16 +3322,27 @@ function honoredHighDismissals(records, trailWritten) {
   if (!trailWritten) return [];
   return records.filter((r) => r.severity === "high" && r.effectiveVerdict === "false").map((r) => r.findingId);
 }
+function gateAuthorityMode(i) {
+  if (i.strictHigh) return "strict-forced";
+  if (i.localProvenance) return "local-on";
+  if (i.gateDismissals) return "foreign-opted-in";
+  return "foreign-strict";
+}
 function gateAuthorityActive(i) {
-  if (i.strictHigh) return false;
-  if (i.localProvenance) return true;
-  return i.gateDismissals;
+  const mode = gateAuthorityMode(i);
+  return mode === "local-on" || mode === "foreign-opted-in";
 }
 function gateAuthorityLabel(i) {
-  if (i.strictHigh) return "STRICT (--strict-high \u2014 every HIGH gates)";
-  if (i.localProvenance) return "ON (local provenance \u2014 dismiss-only)";
-  if (i.gateDismissals) return "ON (--gate-dismissals \u2014 foreign provenance opted in)";
-  return "STRICT (foreign provenance \u2014 every HIGH gates; pass --gate-dismissals to enable)";
+  switch (gateAuthorityMode(i)) {
+    case "strict-forced":
+      return "STRICT (--strict-high \u2014 every HIGH gates)";
+    case "local-on":
+      return "ON (local provenance \u2014 dismiss-only)";
+    case "foreign-opted-in":
+      return "ON (--gate-dismissals \u2014 foreign provenance opted in)";
+    case "foreign-strict":
+      return "STRICT (foreign provenance \u2014 every HIGH gates; pass --gate-dismissals to enable)";
+  }
 }
 function resolveHighGate(records, trailWritten, authorityActive) {
   const highIds = records.filter((r) => r.severity === "high").map((r) => r.findingId);
@@ -3392,7 +3410,7 @@ function renderGateVerdicts(records, opts) {
     out.push("     no findings to verdict");
   } else {
     for (const r of records) {
-      const where = r.file ? `${s(r.file)}${r.line ? `:${r.line}` : ""}` : "(uncited)";
+      const where = evidenceRef(r.file, r.line, s);
       const dg = r.downgradeReason ? `  (host: ${r.downgradeReason})` : "";
       const reason = r.reason ? ` \u2014 ${s(r.reason).slice(0, 200)}` : "";
       out.push(
@@ -3432,6 +3450,13 @@ async function runGate(opts) {
     }
     return { gateTrailWritten, synthesis: synthesis2, verdicts: records };
   };
+  const bail = (logMsg, error, failure, raw) => {
+    log(logMsg);
+    return finalize(
+      { ...fallbackReviewSynthesis(opts.reviews), error, ...raw !== void 0 ? { raw } : {} },
+      { failure }
+    );
+  };
   if (healthy.length === 0) {
     return finalize(fallbackReviewSynthesis(opts.reviews), { failure: "gate-failed" });
   }
@@ -3441,25 +3466,26 @@ async function runGate(opts) {
   try {
     res = await opts.run(prompt, opts.config, { timeoutMs: opts.timeoutMs });
   } catch (e) {
-    log(`  \xB7 gate failed (${e.message}) \u2014 deterministic fallback + all unverified`);
-    return finalize(
-      { ...fallbackReviewSynthesis(opts.reviews), error: e.message },
-      { failure: "gate-failed" }
+    return bail(
+      `  \xB7 gate failed (${e.message}) \u2014 deterministic fallback + all unverified`,
+      e.message,
+      "gate-failed"
     );
   }
   if (!res.raw || res.timedOut) {
-    log("  \xB7 gate produced no usable output \u2014 deterministic fallback + all unverified");
-    return finalize(
-      { ...fallbackReviewSynthesis(opts.reviews), error: res.timedOut ? "gate timed out" : "gate produced no output" },
-      { failure: "gate-failed" }
+    return bail(
+      "  \xB7 gate produced no usable output \u2014 deterministic fallback + all unverified",
+      res.timedOut ? "gate timed out" : "gate produced no output",
+      "gate-failed"
     );
   }
   const parsed = parseGateEnvelope(res.raw);
   if ("failure" in parsed) {
-    log(`  \xB7 gate envelope not usable (${parsed.failure}) \u2014 deterministic fallback + all unverified`);
-    return finalize(
-      { ...fallbackReviewSynthesis(opts.reviews), error: parsed.failure, raw: res.raw },
-      { failure: parsed.failure }
+    return bail(
+      `  \xB7 gate envelope not usable (${parsed.failure}) \u2014 deterministic fallback + all unverified`,
+      parsed.failure,
+      parsed.failure,
+      res.raw
     );
   }
   const { synthesis, demoted } = reconcileSynthesis(
@@ -3524,7 +3550,7 @@ function renderReviewMarkdown(v) {
     lines.push("(no findings)");
   } else {
     for (const f of v.findings) {
-      const where = f.evidence.file ? `${f.evidence.file}${f.evidence.line ? `:${f.evidence.line}` : ""}` : "(uncited)";
+      const where = evidenceRef(f.evidence.file, f.evidence.line);
       lines.push(`### [${f.severity}/${f.confidence}] ${f.title}`);
       lines.push(`- where: ${where}`);
       lines.push(`- ${f.body}`, "");
@@ -3653,7 +3679,7 @@ function renderClaudeLayer(result) {
       out.push("     no findings");
     } else {
       for (const f of cr.findings) {
-        const where = f.evidence.file ? `${f.evidence.file}${f.evidence.line ? `:${f.evidence.line}` : ""}` : "(uncited)";
+        const where = evidenceRef(f.evidence.file, f.evidence.line);
         out.push(`     [${f.severity}] ${scrubControl(where)}  ${scrubControl(f.title)}`);
       }
     }
@@ -4245,13 +4271,8 @@ function oneLineSummary(result) {
   const receipt = result.receipt ? `receipt ${result.receipt.diffDigest.slice(0, 19)}\u2026` : "receipt none";
   return `${tallies} \xB7 ${receipt}`;
 }
-function evidenceRef(file, line) {
-  if (!file) return "(uncited)";
-  const f = scrubControl(file);
-  return line ? `${f}:${line}` : f;
-}
 function findingLine(f, profile) {
-  const ref = evidenceRef(f.evidence.file, f.evidence.line);
+  const ref = evidenceRef(f.evidence.file, f.evidence.line, scrubControl);
   if (profile === "security") {
     const cls = classifySecurityFinding(f);
     return `       [${cls}] ${ref}  ${scrubControl(stripSecurityTag(f.title))}`;
@@ -4293,7 +4314,7 @@ function depSurfaceBlock(d) {
     for (const s of m.samples) out.push(`         + ${scrubControl(s).slice(0, 100)}`);
   }
   for (const r of d.riskyImports) {
-    out.push(`     risky [${r.cls}] ${r.label} \u2014 ${evidenceRef(r.path, r.line)}`);
+    out.push(`     risky [${r.cls}] ${r.label} \u2014 ${evidenceRef(r.path, r.line, scrubControl)}`);
   }
   return out;
 }

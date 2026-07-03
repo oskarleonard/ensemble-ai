@@ -1,3 +1,5 @@
+import { evidenceRef } from '../../core/findings';
+
 import {
   GATE_ENVELOPE_SCHEMA_VERSION,
   type GateFinding,
@@ -31,7 +33,7 @@ function findingsBlock(findings: GateFinding[]): string {
   if (findings.length === 0) return '(no findings raised by any reviewer)';
   return findings
     .map((f) => {
-      const where = f.file ? `${f.file}${f.line ? `:${f.line}` : ''}` : '(uncited)';
+      const where = evidenceRef(f.file, f.line);
       // Host-owned, TRUSTWORTHY metadata (id · reviewer · severity · location · hunk pointer)
       // stays OUTSIDE the fence. The reviewer's OWN title + body are UNTRUSTED free text — a
       // crafted diff can influence what a reviewer wrote — so they go INSIDE an explicit data

@@ -14,6 +14,7 @@ import {
   gatherConventions,
 } from './core/conventions';
 import { isEntrypoint } from './core/entrypoint';
+import { evidenceRef } from './core/findings';
 import { listReviewers, REVIEWERS_FILE } from './core/reviewers';
 import { scrubControl as clean } from './core/sanitize';
 import {
@@ -578,12 +579,6 @@ function oneLineSummary(result: ReviewModeResult): string {
   return `${tallies} · ${receipt}`;
 }
 
-function evidenceRef(file?: string, line?: number): string {
-  if (!file) return '(uncited)';
-  const f = clean(file);
-  return line ? `${f}:${line}` : f;
-}
-
 // One finding line: `file:line  title`, with a `[class]` security-class tag prepended
 // in the security profile (the reviewer's own leading [tag] is stripped to avoid
 // duplication, then re-rendered from the canonical class).
@@ -591,7 +586,7 @@ function findingLine(
   f: StoredReview['findings'][number],
   profile: ReviewProfile
 ): string {
-  const ref = evidenceRef(f.evidence.file, f.evidence.line);
+  const ref = evidenceRef(f.evidence.file, f.evidence.line, clean);
   if (profile === 'security') {
     const cls = classifySecurityFinding(f);
     return `       [${cls}] ${ref}  ${clean(stripSecurityTag(f.title))}`;
@@ -640,7 +635,7 @@ function depSurfaceBlock(d: DepSurfaceResult): string[] {
     for (const s of m.samples) out.push(`         + ${clean(s).slice(0, 100)}`);
   }
   for (const r of d.riskyImports) {
-    out.push(`     risky [${r.cls}] ${r.label} — ${evidenceRef(r.path, r.line)}`);
+    out.push(`     risky [${r.cls}] ${r.label} — ${evidenceRef(r.path, r.line, clean)}`);
   }
   return out;
 }

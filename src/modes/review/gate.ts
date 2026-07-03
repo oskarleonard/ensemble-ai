@@ -1,5 +1,5 @@
 import { writeTrailFile } from '../../core/artifacts';
-import { extractJsonBlock } from '../../core/findings';
+import { evidenceRef, extractJsonBlock } from '../../core/findings';
 import { SEVERITIES, type Severity } from '../../core/types';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
@@ -448,18 +448,36 @@ export interface GateAuthorityInputs {
   strictHigh: boolean; // --strict-high: force STRICT anywhere
 }
 
+// The ONE precedence ladder both the boolean and the label derive from — strict-high wins, then
+// local provenance is trusted-on, then foreign is on ONLY if explicitly opted in, else foreign is
+// strict. Resolving it once means the exit decision and the user-facing "why" can never disagree
+// (the label is the stdout explanation of that exact decision).
+type GateAuthorityMode = 'strict-forced' | 'local-on' | 'foreign-opted-in' | 'foreign-strict';
+
+function gateAuthorityMode(i: GateAuthorityInputs): GateAuthorityMode {
+  if (i.strictHigh) return 'strict-forced'; // strict everywhere — no dismissals honored
+  if (i.localProvenance) return 'local-on'; // trusted self-review — authority ON
+  if (i.gateDismissals) return 'foreign-opted-in'; // foreign, explicitly opted in — authority ON
+  return 'foreign-strict'; // foreign, not opted in — strict
+}
+
 export function gateAuthorityActive(i: GateAuthorityInputs): boolean {
-  if (i.strictHigh) return false; // strict everywhere — no dismissals honored
-  if (i.localProvenance) return true; // trusted self-review — authority ON
-  return i.gateDismissals; // foreign — ON only if explicitly opted in
+  const mode = gateAuthorityMode(i);
+  return mode === 'local-on' || mode === 'foreign-opted-in';
 }
 
 // A one-line human label for the resolved authority mode (stdout legibility).
 export function gateAuthorityLabel(i: GateAuthorityInputs): string {
-  if (i.strictHigh) return 'STRICT (--strict-high — every HIGH gates)';
-  if (i.localProvenance) return 'ON (local provenance — dismiss-only)';
-  if (i.gateDismissals) return 'ON (--gate-dismissals — foreign provenance opted in)';
-  return 'STRICT (foreign provenance — every HIGH gates; pass --gate-dismissals to enable)';
+  switch (gateAuthorityMode(i)) {
+    case 'strict-forced':
+      return 'STRICT (--strict-high — every HIGH gates)';
+    case 'local-on':
+      return 'ON (local provenance — dismiss-only)';
+    case 'foreign-opted-in':
+      return 'ON (--gate-dismissals — foreign provenance opted in)';
+    case 'foreign-strict':
+      return 'STRICT (foreign provenance — every HIGH gates; pass --gate-dismissals to enable)';
+  }
 }
 
 // The exit decision over HIGH findings: which HIGHs still GATE (force exit 4) vs which the gate
@@ -595,7 +613,7 @@ export function renderGateVerdicts(
     out.push('     no findings to verdict');
   } else {
     for (const r of records) {
-      const where = r.file ? `${s(r.file)}${r.line ? `:${r.line}` : ''}` : '(uncited)';
+      const where = evidenceRef(r.file, r.line, s);
       const dg = r.downgradeReason ? `  (host: ${r.downgradeReason})` : '';
       const reason = r.reason ? ` — ${s(r.reason).slice(0, 200)}` : '';
       out.push(
@@ -680,6 +698,22 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     return { gateTrailWritten, synthesis, verdicts: records };
   };
 
+  // Every FAIL-CLOSED spawn/parse exit shares one shape: log, then finalize the deterministic
+  // fallback synthesis (carrying the error string, and the raw gate output when we have it) as a
+  // whole-envelope failure. One closure so the three failure branches can't drift on that shape.
+  const bail = (
+    logMsg: string,
+    error: string,
+    failure: WholeEnvelopeFailure['failure'],
+    raw?: string
+  ): GateRunResult => {
+    log(logMsg);
+    return finalize(
+      { ...fallbackReviewSynthesis(opts.reviews), error, ...(raw !== undefined ? { raw } : {}) },
+      { failure }
+    );
+  };
+
   // No healthy reviewer ⇒ nothing to verdict; still emit the deterministic fallback synthesis
   // and a (probably empty) trail so the artifact always exists.
   if (healthy.length === 0) {
@@ -692,26 +726,27 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   try {
     res = await opts.run(prompt, opts.config, { timeoutMs: opts.timeoutMs });
   } catch (e) {
-    log(`  · gate failed (${(e as Error).message}) — deterministic fallback + all unverified`);
-    return finalize(
-      { ...fallbackReviewSynthesis(opts.reviews), error: (e as Error).message },
-      { failure: 'gate-failed' }
+    return bail(
+      `  · gate failed (${(e as Error).message}) — deterministic fallback + all unverified`,
+      (e as Error).message,
+      'gate-failed'
     );
   }
   if (!res.raw || res.timedOut) {
-    log('  · gate produced no usable output — deterministic fallback + all unverified');
-    return finalize(
-      { ...fallbackReviewSynthesis(opts.reviews), error: res.timedOut ? 'gate timed out' : 'gate produced no output' },
-      { failure: 'gate-failed' }
+    return bail(
+      '  · gate produced no usable output — deterministic fallback + all unverified',
+      res.timedOut ? 'gate timed out' : 'gate produced no output',
+      'gate-failed'
     );
   }
 
   const parsed = parseGateEnvelope(res.raw);
   if ('failure' in parsed) {
-    log(`  · gate envelope not usable (${parsed.failure}) — deterministic fallback + all unverified`);
-    return finalize(
-      { ...fallbackReviewSynthesis(opts.reviews), error: parsed.failure, raw: res.raw },
-      { failure: parsed.failure }
+    return bail(
+      `  · gate envelope not usable (${parsed.failure}) — deterministic fallback + all unverified`,
+      parsed.failure,
+      parsed.failure,
+      res.raw
     );
   }
 

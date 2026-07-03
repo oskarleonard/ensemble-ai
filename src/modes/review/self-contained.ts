@@ -11,7 +11,7 @@
 // ./claude), accepted by design (the user runs it on their own diffs).
 
 import { readReviewsForRun, writeTrailFile } from '../../core/artifacts';
-import { parseFindings } from '../../core/findings';
+import { evidenceRef, parseFindings } from '../../core/findings';
 import { scrubControl as scrub } from '../../core/sanitize';
 import type { ReviewFinding, StoredReview } from '../../core/types';
 import { REVIEWER_IDS, type ReviewerId } from '../../core/types';
@@ -92,9 +92,7 @@ export function renderReviewMarkdown(v: VoiceReview): string {
     lines.push('(no findings)');
   } else {
     for (const f of v.findings) {
-      const where = f.evidence.file
-        ? `${f.evidence.file}${f.evidence.line ? `:${f.evidence.line}` : ''}`
-        : '(uncited)';
+      const where = evidenceRef(f.evidence.file, f.evidence.line);
       lines.push(`### [${f.severity}/${f.confidence}] ${f.title}`);
       lines.push(`- where: ${where}`);
       lines.push(`- ${f.body}`, '');
@@ -334,9 +332,7 @@ export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
       out.push('     no findings');
     } else {
       for (const f of cr.findings) {
-        const where = f.evidence.file
-          ? `${f.evidence.file}${f.evidence.line ? `:${f.evidence.line}` : ''}`
-          : '(uncited)';
+        const where = evidenceRef(f.evidence.file, f.evidence.line);
         out.push(`     [${f.severity}] ${scrub(where)}  ${scrub(f.title)}`);
       }
     }

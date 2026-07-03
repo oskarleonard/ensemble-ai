@@ -40,12 +40,17 @@ export interface PacketInput {
 // The head+tail truncation splice marker `…[N chars truncated]…` that section() inserts when a
 // body exceeds its budget. core/packet OWNS this format; the verified gate's hunk parser
 // (modes/review/gate-hunks) consumes the matcher + splitter below to stay truncation-aware, so
-// the two can never drift on what a truncated diff looks like.
+// the two can never drift on what a truncated diff looks like. The ONE regex source both the
+// standalone matcher AND the segment splitter compile from — a splitter that re-inlined the
+// pattern (as it once did) would silently stop matching if the marker text ever changed, letting
+// a marker line or a partial boundary fragment survive as a citable anchor (defeats grok-f1).
+const MARKER_RE_SRC = String.raw`…\[\d+ chars truncated\]…`;
+
 const truncationMarker = (droppedChars: number): string =>
   `…[${droppedChars} chars truncated]…`;
 
 // Detects the marker LINE (non-global — safe for .test()).
-export const TRUNCATION_MARKER_RE = /…\[\d+ chars truncated\]…/;
+export const TRUNCATION_MARKER_RE = new RegExp(MARKER_RE_SRC);
 
 // Split a (possibly truncated) body at each splice, DROPPING the marker AND the partial line on
 // either side of the cut — neither is a complete line the reviewer saw as coherent code (the
@@ -54,7 +59,7 @@ export const TRUNCATION_MARKER_RE = /…\[\d+ chars truncated\]…/;
 // The gate parses hunks WITHIN each segment independently, so no hunk ever spans a cut and neither
 // the marker nor a partial fragment can become a citable anchor.
 export function segmentsWithoutTruncationSplices(body: string): string[] {
-  return body.split(/[^\n]*\n\n…\[\d+ chars truncated\]…\n\n[^\n]*/);
+  return body.split(new RegExp(String.raw`[^\n]*\n\n${MARKER_RE_SRC}\n\n[^\n]*`));
 }
 
 // Keep the head + a tail so a budget cut never hides the end of a file/diff.

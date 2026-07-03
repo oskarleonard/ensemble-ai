@@ -37,6 +37,11 @@ array with a "summary" that says so. Do not invent issues to fill the list.`;
 function oneOf(set, v, fallback) {
   return set.includes(v) ? v : fallback;
 }
+function evidenceRef(file, line, scrub = (s) => s) {
+  if (!file) return "(uncited)";
+  const f = scrub(file);
+  return line ? `${f}:${line}` : f;
+}
 var asSeverity = (v) => oneOf(SEVERITIES, v, "medium");
 var asConfidence = (v) => oneOf(CONFIDENCES, v, "low");
 function asEvidence(v) {
@@ -116,10 +121,11 @@ var PACKET_BUDGETS = {
   tests: 8e3
 };
 var DIFF_USEFUL_FLOOR = 200;
+var MARKER_RE_SRC = String.raw`…\[\d+ chars truncated\]…`;
 var truncationMarker = (droppedChars) => `\u2026[${droppedChars} chars truncated]\u2026`;
-var TRUNCATION_MARKER_RE = /…\[\d+ chars truncated\]…/;
+var TRUNCATION_MARKER_RE = new RegExp(MARKER_RE_SRC);
 function segmentsWithoutTruncationSplices(body) {
-  return body.split(/[^\n]*\n\n…\[\d+ chars truncated\]…\n\n[^\n]*/);
+  return body.split(new RegExp(String.raw`[^\n]*\n\n${MARKER_RE_SRC}\n\n[^\n]*`));
 }
 function truncate(text, budget) {
   if (text.length <= budget) return { text, truncated: false };
@@ -357,6 +363,7 @@ export {
   TERMINAL_STATES,
   TRUNCATION_MARKER_RE,
   assembleCodePacket,
+  evidenceRef,
   extractJsonBlock,
   isReviewerId,
   oneOf,
