@@ -21,13 +21,11 @@ import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { runClaudeReviewVoice } from './claude';
 import {
-  fallbackReviewSynthesis,
-  parseReviewSynthesis,
-  reconcileSynthesis,
-  renderReviewSynthesisPrompt,
-  type ReviewSynthesis,
-  type VoiceReview,
-} from './synthesis';
+  type GateVerdictRecord,
+  renderGateVerdicts,
+  runGate,
+} from './gate';
+import { type ReviewSynthesis, type VoiceReview } from './synthesis';
 import { reviewJsonFromTrail } from './trail-io';
 
 // ── Roster resolution (registry-driven; `--reviewers` subsets, `--no-claude` opts out) ──
@@ -182,76 +180,16 @@ async function runClaudeReviewer(
   return { raw: res.raw, review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: 'claude' } };
 }
 
-// ── The synthesis pass ──────────────────────────────────────────────────────────────
-
-// Run the Claude SYNTHESIS over every voice's findings. Injectable runner (real =
-// runClaudeReviewVoice; tests inject outputs). Any failure/unparseable reply degrades to
-// the deterministic fallback (clearly flagged), never throwing.
-export async function synthesizeReviews(
-  reviews: VoiceReview[],
-  run: ClaudeRunner,
-  config: VoiceConfig,
-  opts: { log?: (m: string) => void; timeoutMs?: number } = {}
-): Promise<ReviewSynthesis> {
-  const log = opts.log ?? (() => {});
-  const healthy = reviews.filter((r) => r.ok);
-  if (healthy.length === 0) return fallbackReviewSynthesis(reviews);
-
-  const prompt = renderReviewSynthesisPrompt(reviews);
-  log('Synthesizing with claude — dedupe · agree/disagree · sanity-check…');
-  let res: VoiceRunResult;
-  try {
-    res = await run(prompt, config, { timeoutMs: opts.timeoutMs });
-  } catch (e) {
-    log(`  · synthesis failed (${(e as Error).message}) — deterministic fallback`);
-    return { ...fallbackReviewSynthesis(reviews), error: (e as Error).message };
-  }
-  if (!res.raw || res.timedOut) {
-    log('  · synthesis produced no usable output — deterministic fallback');
-    return {
-      ...fallbackReviewSynthesis(reviews),
-      error: res.timedOut ? 'synthesis timed out' : 'synthesis produced no output',
-    };
-  }
-  const parsed = parseReviewSynthesis(res.raw);
-  if (parsed.parseError) {
-    log(`  · synthesis not parseable (${parsed.parseError}) — deterministic fallback`);
-    return { ...fallbackReviewSynthesis(reviews), error: parsed.parseError, raw: res.raw };
-  }
-  // Validate the synthesizer's claims against the ACTUAL per-voice reviews so it can't
-  // fabricate confident agreement (invented consensus / phantom voices).
-  const { synthesis, demoted } = reconcileSynthesis(
-    {
-      agreements: parsed.agreements,
-      bottomLine: parsed.bottomLine,
-      by: 'claude',
-      degraded: false,
-      disagreements: parsed.disagreements,
-      ok: true,
-      raw: res.raw,
-      sanityChecks: parsed.sanityChecks,
-      summary: parsed.summary,
-    },
-    reviews
-  );
-  if (demoted > 0) {
-    log(
-      `  · synthesis: ${demoted} unverifiable "agreement(s)" demoted to look-closer (not corroborated by ≥2 real voices)`
-    );
-  }
-  log(
-    `  · synthesis: ${synthesis.agreements.length} agreement(s), ${synthesis.disagreements.length} disagreement(s), ${synthesis.sanityChecks.length} sanity-check(s)`
-  );
-  return synthesis;
-}
-
-// ── The whole layer: Opus reviewer + per-reviewer files + synthesis ───────────────────
+// ── The whole layer: Opus reviewer + per-reviewer files + the gate ────────────────────
 
 export interface ClaudeLayerOptions {
   baseDir: string;
   claudeConfig: VoiceConfig;
   // The codex+grok reviews already produced + persisted by runReviewMode (the core).
   coreReviews: StoredReview[];
+  // The head SHA the reviewers saw — the gate reads the pinned packet keyed by it, and a
+  // mismatch fails the packet closed (all verdicts unverified).
+  expectedHeadSha: string;
   // Whether the Opus voice runs as a third reviewer (roster.claude).
   includeClaudeReviewer: boolean;
   log?: (m: string) => void;
@@ -266,6 +204,11 @@ export interface ClaudeLayerOptions {
 export interface ClaudeLayerResult {
   // The cold Opus review (null when claude is not in the roster).
   claudeReview: VoiceReview | null;
+  // Whether the durable gate-verdicts.json trail wrote — dismissals are honored (Phase 2)
+  // ONLY when true (a trail-write failure means the audit trail was lost → not honored).
+  gateTrailWritten: boolean;
+  // The host-reconciled grounded verdict for every finding across all three reviewers.
+  gateVerdicts: GateVerdictRecord[];
   // The model that ACTUALLY ran the claude voice (e.g. `opus`, `sonnet`) — rendered in the
   // stdout block so the output never hardcodes "opus" when a different Claude model is
   // configured. `opus` is the design default (when the voice config leaves the model unset).
@@ -340,16 +283,29 @@ export async function runClaudeReviewLayer(
     }
   }
 
-  // Synthesize over the reviews READ BACK from the trail files (the literal "reads the three
-  // review files"), so the synthesizer's input is exactly what was persisted.
+  // Run the GATE over the reviews READ BACK from the trail files (the literal "reads the
+  // three review files") — grounding each finding against the pinned packet hunks, tagging
+  // agree/partial/false/unverified, and writing the durable gate-verdicts.json trail. The
+  // gate is FAIL-CLOSED (any spawn/packet/parse failure → deterministic fallback + all
+  // verdicts unverified) and NEVER trips exit 1 — it is the synthesis stage, not a reviewer.
   const voiceReviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
-  const synthesis = await synthesizeReviews(
-    voiceReviews,
+  const gate = await runGate({
+    baseDir: opts.baseDir,
+    config: opts.claudeConfig,
+    expectedHeadSha: opts.expectedHeadSha,
+    log,
+    reviews: voiceReviews,
     run,
-    opts.claudeConfig,
-    { log, timeoutMs: opts.timeoutMs }
-  );
-  return { claudeReview, modelLabel, synthesis };
+    runId: opts.runId,
+    timeoutMs: opts.timeoutMs,
+  });
+  return {
+    claudeReview,
+    gateTrailWritten: gate.gateTrailWritten,
+    gateVerdicts: gate.verdicts,
+    modelLabel,
+    synthesis: gate.synthesis,
+  };
 }
 
 // ── HIGH-gate contribution ────────────────────────────────────────────────────────────
@@ -405,15 +361,12 @@ export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
       for (const p of d.positions) out.push(`            − ${scrub(p).slice(0, 240)}`);
     }
   }
-  if (s.sanityChecks.length > 0) {
-    out.push('     sanity-checks');
-    for (const c of s.sanityChecks) {
-      out.push(`        [${c.verdict}] ${scrub(c.finding).slice(0, 200)}${c.note ? ` — ${scrub(c.note).slice(0, 200)}` : ''}`);
-    }
-  }
   if (s.bottomLine) {
     out.push('     → bottom line');
     out.push(`        ${scrub(s.bottomLine).slice(0, 500)}`);
   }
+  // The grounded per-finding verdict TAGS + the gate summary line + the trail marker — the
+  // gate's teeth, rendered inline (Phase 1: informational; exit is unchanged).
+  out.push(...renderGateVerdicts(result.gateVerdicts, { scrub, trailWritten: result.gateTrailWritten }));
   return out;
 }

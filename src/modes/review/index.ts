@@ -27,6 +27,7 @@ import {
   type DepSurfaceResult,
   scanDependencySurface,
 } from './dep-surface';
+import { persistGatePacket } from './gate-hunks';
 import { type ReviewProfile, SECURITY_OBJECTIVE } from './profile';
 import {
   buildDiffReceipt,
@@ -284,6 +285,20 @@ export async function runReviewMode(
   const prompt = renderReviewPrompt(packet, profile);
   if (!packet.complete) {
     log('Packet incomplete (no usable diff) — persisting an empty review.');
+  }
+
+  // Materialize the PINNED gate packet ONCE per run: the exact covered diff + the head SHA it
+  // was resolved at. The verified gate's hunk-resolver + citation-validator read ONLY this
+  // artifact (never the working tree), so a tree that mutates between the run and the gate can
+  // change no authority outcome. Best-effort — a failure just means the gate later reads no
+  // packet and degrades all-`unverified` (fail-closed).
+  try {
+    persistGatePacket(opts.out, opts.runId, {
+      diff: acquired.diff,
+      headSha: acquired.headSha,
+    });
+  } catch {
+    /* trail write is best-effort — the gate fails closed if the packet is absent */
   }
 
   log(`Running ${reviewers.length} reviewer(s): ${reviewers.join(', ')}…`);
