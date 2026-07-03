@@ -1,0 +1,623 @@
+import { writeTrailFile } from '../../core/artifacts';
+import { extractJsonBlock } from '../../core/findings';
+import type { Severity } from '../../core/types';
+import type { VoiceConfig } from '../brainstorm/types';
+import type { VoiceRunResult } from '../brainstorm/voices';
+import { type RunReviewOpts } from '../../reviewers/codex';
+
+import { renderGatePrompt } from './gate-prompt';
+import {
+  type Hunk,
+  hunkCodeLines,
+  hunkRangeKey,
+  parsePacketHunks,
+  readGatePacket,
+  resolveFindingHunk,
+  windowHunk,
+} from './gate-hunks';
+import {
+  fallbackReviewSynthesis,
+  parseAgreements,
+  parseDisagreements,
+  reconcileSynthesis,
+  type ReviewSynthesis,
+  type VoiceReview,
+} from './synthesis';
+
+// The VERIFIED GATE — the (renamed) synthesis pass with grounded, per-finding verdict TAGS.
+// It is fed each finding's CITED diff hunk from the pinned packet, tags EVERY finding
+// agree/partial/false/unverified (never removes one), records a durable schema-versioned
+// `gate-verdicts.json` trail (raw model verdict + host EFFECTIVE verdict + a machine-readable
+// downgrade reason), and renders the tags to stdout. Phase 1 is ADDITIVE: it builds the trail
+// + rendering + validation plumbing; it does NOT change exit codes (authority is Phase 2).
+// Everything here is a pure function of its inputs except runGate's spawn + the trail write.
+
+// The verdict taxonomy that replaces likely-real/look-closer/likely-false. `agree` = real;
+// `partial` = real but overstated; `false` = a refuted finding (a dismissal — REQUIRES a
+// grounded citation); `unverified` = the gate could not ground it (the safe default — an
+// unverified HIGH still gates).
+export const GATE_VERDICTS = ['agree', 'partial', 'false', 'unverified'] as const;
+export type GateVerdict = (typeof GATE_VERDICTS)[number];
+export function isGateVerdict(v: unknown): v is GateVerdict {
+  return (GATE_VERDICTS as readonly string[]).includes(v as string);
+}
+
+// Why a host EFFECTIVE verdict differs from the raw model verdict — machine-readable so the
+// trail can be retro-scored (codex-f3 / constraint #1) and a downgraded dismissal is never
+// confused with a genuine `unverified`.
+export const DOWNGRADE_REASONS = [
+  'truncated', // the cited hunk hit the per-finding window or the byte budget → dismissal-ineligible
+  'invalid-citation', // a `false` whose citation is missing / out-of-hunk / under-anchor
+  'duplicate', // >1 verdict for one findingId → all discarded
+  'missing', // no verdict returned for this finding
+  'bad-enum', // an unrecognized verdict string
+  'packet-fail', // the pinned packet was missing / corrupt / head-SHA-mismatched
+  'gate-failed', // the gate spawn errored / timed out / produced unparseable output
+  'unknown-schema', // a missing / unsupported envelope schemaVersion (fail-closed)
+  'trail-write-failed', // gate-verdicts.json did not durably write → dismissals not honored
+] as const;
+export type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
+
+// The composite envelope schema the gate prompt pins + the model must echo. A missing /
+// different value fails the whole envelope closed (all-`unverified`) — the host never
+// interprets verdicts under semantics it doesn't recognize.
+export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
+// The durable trail-artifact schema. Bumped independently if the record shape changes.
+export const GATE_TRAIL_SCHEMA_VERSION = 1;
+
+const REASON_CAP = 300;
+const CITATION_CAP = 500;
+function capStr(s: unknown, n: number): string {
+  const t = typeof s === 'string' ? s.trim() : '';
+  return t.length > n ? t.slice(0, n) : t;
+}
+
+// ── The authoritative, host-owned finding set ─────────────────────────────────────────
+
+// One finding as the HOST owns it — its stable cross-reviewer id, immutable severity, and
+// its resolved+windowed cited hunk. Nothing the gate returns can alter these (exit keys off
+// the STORED reviewer severity, never a gate echo).
+export interface GateFinding {
+  body: string;
+  file: string;
+  findingId: string; // `${voiceId}#${n}` — unique across all three reviewers
+  hunkCode: string[]; // normalized code lines of the FULL resolved hunk (citation basis; [] if unresolved)
+  hunkLabel: string | null; // the injected-hunk label shown in the prompt (null: unresolved or budget-dropped)
+  line: number | null;
+  resolved: boolean; // a hunk was found for the cite
+  reviewer: string; // voiceId
+  severity: Severity;
+  title: string;
+  truncated: boolean; // window OR byte-budget truncation → dismissal-INELIGIBLE
+}
+
+// One deduped hunk injected into the gate prompt, labeled H1.. in budget order.
+export interface GateInjection {
+  label: string;
+  rangeKey: string;
+  text: string;
+  truncated: boolean;
+}
+
+const SEVERITY_RANK: Record<Severity, number> = { high: 0, low: 2, medium: 1 };
+
+// The total UTF-8 byte budget for injected hunk text in ONE gate prompt. Bounds token cost;
+// over-budget hunks are NAMED as truncated (never silently dropped) and their findings are
+// dismissal-ineligible — a known, safe, host-enforced degradation at high finding counts.
+export const GATE_HUNK_BYTE_BUDGET = 40_960;
+
+interface RawFinding {
+  body: string;
+  file: string;
+  findingId: string;
+  index: number;
+  line: number | null;
+  reviewerRank: number;
+  reviewer: string;
+  severity: Severity;
+  title: string;
+}
+
+// Flatten the three reviewers' findings into the host-owned set with stable `voiceId#n` ids.
+function flattenFindings(reviews: VoiceReview[]): RawFinding[] {
+  const out: RawFinding[] = [];
+  reviews.forEach((r, reviewerRank) => {
+    r.findings.forEach((f, i) => {
+      out.push({
+        body: f.body,
+        file: f.evidence.file ?? '',
+        findingId: `${r.voiceId}#${i + 1}`,
+        index: i,
+        line: f.evidence.line ?? null,
+        reviewer: r.voiceId,
+        reviewerRank,
+        severity: f.severity,
+        title: f.title,
+      });
+    });
+  });
+  return out;
+}
+
+// Assemble the authoritative GateFindings + the deduped, budgeted injection list. Allocation
+// is DETERMINISTIC: severity-first (HIGH → MED → LOW — HIGHs are the only exit-relevant
+// dismissals), then reviewer rank, then finding index; identical (file, hunk-range) hunks are
+// injected once (charged once); each hunk is windowed to ±25 lines; the first hunk always
+// fits, thereafter a hunk that would exceed the byte budget is NAMED-truncated (its finding
+// dismissal-ineligible). Reads ONLY the passed packet hunks — never the working tree.
+export function prepareGateFindings(
+  reviews: VoiceReview[],
+  packetHunks: Map<string, Hunk[]>
+): { findings: GateFinding[]; injections: GateInjection[] } {
+  const raw = flattenFindings(reviews);
+  const resolved = new Map<
+    string,
+    { bodyIndex: number; hunk: Hunk } | null
+  >();
+  for (const rf of raw) {
+    const fileHunks = rf.file && rf.line !== null ? packetHunks.get(rf.file) : undefined;
+    resolved.set(
+      rf.findingId,
+      fileHunks && rf.line !== null ? resolveFindingHunk(fileHunks, rf.line) : null
+    );
+  }
+
+  // Budget order: severity → reviewer rank → finding index (stable).
+  const order = [...raw].sort(
+    (a, b) =>
+      SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] ||
+      a.reviewerRank - b.reviewerRank ||
+      a.index - b.index
+  );
+
+  const injections: GateInjection[] = [];
+  const byKey = new Map<string, GateInjection & { admitted: boolean }>();
+  const truncatedById = new Set<string>();
+  const labelById = new Map<string, string | null>();
+  let usedBytes = 0;
+  for (const rf of order) {
+    const res = resolved.get(rf.findingId) ?? null;
+    if (!res) {
+      labelById.set(rf.findingId, null);
+      continue;
+    }
+    const key = hunkRangeKey(rf.file, res.hunk);
+    const existing = byKey.get(key);
+    if (existing) {
+      if (existing.truncated || !existing.admitted) truncatedById.add(rf.findingId);
+      labelById.set(rf.findingId, existing.admitted ? existing.label : null);
+      continue;
+    }
+    const win = windowHunk(res.hunk, res.bodyIndex);
+    const bytes = Buffer.byteLength(win.text, 'utf8');
+    // The first admitted hunk always goes in (mirrors coverage's includedBytes>0 rule) so a
+    // lone over-budget hunk is still shown; subsequent over-budget hunks are truncated out.
+    const admitted = injections.length === 0 || usedBytes + bytes <= GATE_HUNK_BYTE_BUDGET;
+    const label = admitted ? `H${injections.length + 1}` : '';
+    const entry: GateInjection & { admitted: boolean } = {
+      admitted,
+      label,
+      rangeKey: key,
+      text: win.text,
+      truncated: win.truncated,
+    };
+    byKey.set(key, entry);
+    if (admitted) {
+      usedBytes += bytes;
+      injections.push({ label, rangeKey: key, text: win.text, truncated: win.truncated });
+      labelById.set(rf.findingId, label);
+      if (win.truncated) truncatedById.add(rf.findingId);
+    } else {
+      labelById.set(rf.findingId, null);
+      truncatedById.add(rf.findingId); // budget-dropped → dismissal-ineligible
+    }
+  }
+
+  const findings: GateFinding[] = raw.map((rf) => {
+    const res = resolved.get(rf.findingId) ?? null;
+    return {
+      body: rf.body,
+      file: rf.file,
+      findingId: rf.findingId,
+      hunkCode: res ? hunkCodeLines(res.hunk) : [],
+      hunkLabel: labelById.get(rf.findingId) ?? null,
+      line: rf.line,
+      resolved: res !== null,
+      reviewer: rf.reviewer,
+      severity: rf.severity,
+      title: rf.title,
+      truncated: truncatedById.has(rf.findingId),
+    };
+  });
+  return { findings, injections };
+}
+
+// ── Grounded-citation validation ──────────────────────────────────────────────────────
+
+// A `false` dismissal must QUOTE the finding's own cited hunk — proof the gate read the
+// disputed code. Validated by whitespace-normalized substring match against ONLY the pinned
+// packet's hunk (own-hunk-scoped, never the repo), with a deterministic MINIMUM-ANCHOR
+// predicate: the citation must contain at least one COMPLETE hunk code line that (a) has ≥16
+// non-whitespace chars AND (b) occurs exactly once within that hunk. `}`-only / short idiom
+// lines fail (a); repeated boilerplate fails (b). The match GROUNDS the dismissal in read
+// code — it does not prove falsity (the verdict stays the gate's judgment).
+export const MIN_ANCHOR_NONWS = 16;
+
+export function validateCitation(
+  citation: string,
+  hunkCode: string[]
+): { reason?: string; valid: boolean } {
+  const normCite = citation.replace(/\s+/g, ' ').trim();
+  if (!normCite) return { reason: 'empty citation', valid: false };
+  const counts = new Map<string, number>();
+  for (const l of hunkCode) counts.set(l, (counts.get(l) ?? 0) + 1);
+  for (const l of hunkCode) {
+    if (l.replace(/\s/g, '').length < MIN_ANCHOR_NONWS) continue; // (a) substantial
+    if (counts.get(l) !== 1) continue; // (b) unique within the hunk
+    if (normCite.includes(l)) return { valid: true };
+  }
+  return {
+    reason: 'citation contains no unique ≥16-non-whitespace-char line from the finding\'s own hunk',
+    valid: false,
+  };
+}
+
+// ── Envelope parse ────────────────────────────────────────────────────────────────────
+
+export interface RawVerdictEntry {
+  citation?: string;
+  findingId: string;
+  reason: string;
+  verdict: unknown;
+}
+
+export interface ParsedGateEnvelope {
+  agreements: ReturnType<typeof parseAgreements>;
+  bottomLine: string;
+  disagreements: ReturnType<typeof parseDisagreements>;
+  verdicts: RawVerdictEntry[];
+}
+
+export type EnvelopeFailure = { failure: 'gate-failed' | 'unknown-schema' };
+
+function parseVerdicts(v: unknown): RawVerdictEntry[] {
+  if (!Array.isArray(v)) return [];
+  const out: RawVerdictEntry[] = [];
+  for (const rv of v) {
+    if (!rv || typeof rv !== 'object') continue;
+    const e = rv as Record<string, unknown>;
+    const findingId = typeof e.findingId === 'string' ? e.findingId.trim() : '';
+    if (!findingId) continue;
+    out.push({
+      citation: typeof e.citation === 'string' ? capStr(e.citation, CITATION_CAP) : undefined,
+      findingId,
+      reason: capStr(e.reason, REASON_CAP),
+      verdict: e.verdict,
+    });
+  }
+  return out;
+}
+
+// Parse the composite envelope. Unparseable ⇒ gate-failed; a missing / unsupported
+// schemaVersion ⇒ unknown-schema (constraint #2) — both degrade the WHOLE envelope closed.
+export function parseGateEnvelope(raw: string): EnvelopeFailure | ParsedGateEnvelope {
+  const obj = extractJsonBlock(raw);
+  if (!obj || typeof obj !== 'object') return { failure: 'gate-failed' };
+  const o = obj as Record<string, unknown>;
+  if (o.schemaVersion !== GATE_ENVELOPE_SCHEMA_VERSION) return { failure: 'unknown-schema' };
+  const synth =
+    o.synthesis && typeof o.synthesis === 'object'
+      ? (o.synthesis as Record<string, unknown>)
+      : {};
+  return {
+    agreements: parseAgreements(synth.agreements),
+    bottomLine: capStr(synth.bottomLine, 1000),
+    disagreements: parseDisagreements(synth.disagreements),
+    verdicts: parseVerdicts(o.verdicts),
+  };
+}
+
+// ── Host-owned reconciliation → the durable records ───────────────────────────────────
+
+export interface GateVerdictRecord {
+  citation?: string;
+  downgradeReason: DowngradeReason | null;
+  effectiveVerdict: GateVerdict;
+  file: string;
+  findingId: string;
+  line: number | null;
+  rawVerdict: string | null; // exactly what the model returned (may be an invalid enum), null if none
+  reason: string;
+  reviewer: string;
+  severity: Severity;
+  title: string;
+}
+
+function recordBase(f: GateFinding): Omit<
+  GateVerdictRecord,
+  'citation' | 'downgradeReason' | 'effectiveVerdict' | 'rawVerdict' | 'reason'
+> {
+  return {
+    file: f.file,
+    findingId: f.findingId,
+    line: f.line,
+    reviewer: f.reviewer,
+    severity: f.severity,
+    title: f.title,
+  };
+}
+
+const FAILURE_REASON: Record<'gate-failed' | 'unknown-schema' | 'packet-fail', string> = {
+  'gate-failed': 'gate produced no usable verdicts — fail-closed to unverified',
+  'packet-fail': 'pinned packet unavailable at gate time — verdicts cannot be grounded',
+  'unknown-schema': 'gate envelope had a missing/unsupported schemaVersion — fail-closed',
+};
+
+// Reconcile the parsed envelope against the authoritative finding set — the HOST owns ids,
+// reviewer attribution, and severity; nothing the gate returns can alter them. Per-entry
+// policy: no entry ⇒ unverified(missing); duplicate ids ⇒ all discarded ⇒ unverified;
+// unknown id ⇒ ignored+warned; bad enum ⇒ unverified; a truncated finding's `false` ⇒
+// host-forced unverified(truncated) regardless of citation (constraint #3/#4 · DC12); a
+// `false` ⇒ unverified unless its citation validates against its own hunk. A whole-envelope
+// failure ⇒ every finding unverified with that machine-readable reason.
+export function reconcileGateVerdicts(
+  findings: GateFinding[],
+  parsed: EnvelopeFailure | ParsedGateEnvelope | { failure: 'packet-fail' }
+): { records: GateVerdictRecord[]; warnings: string[] } {
+  if ('failure' in parsed) {
+    const reason = FAILURE_REASON[parsed.failure];
+    return {
+      records: findings.map((f) => ({
+        ...recordBase(f),
+        downgradeReason: parsed.failure,
+        effectiveVerdict: 'unverified',
+        rawVerdict: null,
+        reason,
+      })),
+      warnings: [],
+    };
+  }
+
+  const known = new Set(findings.map((f) => f.findingId));
+  const byId = new Map<string, RawVerdictEntry[]>();
+  const warnings: string[] = [];
+  for (const v of parsed.verdicts) {
+    if (!known.has(v.findingId)) {
+      warnings.push(`gate: verdict for unknown findingId "${v.findingId}" ignored`);
+      continue;
+    }
+    const list = byId.get(v.findingId) ?? [];
+    list.push(v);
+    byId.set(v.findingId, list);
+  }
+
+  const records = findings.map((f): GateVerdictRecord => {
+    const base = recordBase(f);
+    const entries = byId.get(f.findingId) ?? [];
+    if (entries.length === 0) {
+      return { ...base, downgradeReason: 'missing', effectiveVerdict: 'unverified', rawVerdict: null, reason: 'no gate verdict returned for this finding' };
+    }
+    if (entries.length > 1) {
+      return { ...base, downgradeReason: 'duplicate', effectiveVerdict: 'unverified', rawVerdict: null, reason: `gate returned ${entries.length} verdicts for this finding — all discarded` };
+    }
+    const e = entries[0];
+    const rawVerdict = typeof e.verdict === 'string' ? e.verdict : null;
+    if (!isGateVerdict(e.verdict)) {
+      return { ...base, downgradeReason: 'bad-enum', effectiveVerdict: 'unverified', rawVerdict, reason: e.reason || 'gate returned an unrecognized verdict' };
+    }
+    const citation = e.citation;
+    if (e.verdict === 'false') {
+      // Truncation ineligibility is host-forced BEFORE citation — a dismissal on partial
+      // context is never honored, regardless of what the gate cited (DC12).
+      if (f.truncated) {
+        return { ...base, citation, downgradeReason: 'truncated', effectiveVerdict: 'unverified', rawVerdict, reason: e.reason || 'cited hunk was truncated — dismissal ineligible' };
+      }
+      const cv = validateCitation(citation ?? '', f.hunkCode);
+      if (!f.resolved || !cv.valid) {
+        return { ...base, citation, downgradeReason: 'invalid-citation', effectiveVerdict: 'unverified', rawVerdict, reason: e.reason || cv.reason || 'no valid citation' };
+      }
+      return { ...base, citation, downgradeReason: null, effectiveVerdict: 'false', rawVerdict, reason: e.reason };
+    }
+    // agree / partial / unverified pass through — not dismissals, so truncation does not force them.
+    return { ...base, citation, downgradeReason: null, effectiveVerdict: e.verdict, rawVerdict, reason: e.reason };
+  });
+  return { records, warnings };
+}
+
+// The dismissals the exit gate MAY honor (Phase 2 consumes this; Phase 1 only records +
+// renders). A `false` counts ONLY for a HIGH AND ONLY after the trail durably wrote — a
+// trail-write/finalize failure means dismissals are not honored (the audit trail the
+// traceability goal rests on can never be skipped).
+export function honoredHighDismissals(
+  records: GateVerdictRecord[],
+  trailWritten: boolean
+): string[] {
+  if (!trailWritten) return [];
+  return records
+    .filter((r) => r.severity === 'high' && r.effectiveVerdict === 'false')
+    .map((r) => r.findingId);
+}
+
+// ── Durable trail ──────────────────────────────────────────────────────────────────────
+
+export interface GateVerdictsTrail {
+  runId: string;
+  schemaVersion: number;
+  verdicts: GateVerdictRecord[];
+}
+
+// Write gate-verdicts.json atomically. Returns whether it DURABLY wrote — the caller gates
+// dismissal-honoring on this (spec fail-closed matrix). Never throws.
+export function writeGateVerdictsTrail(
+  baseDir: string,
+  runId: string,
+  records: GateVerdictRecord[]
+): boolean {
+  const trail: GateVerdictsTrail = {
+    runId,
+    schemaVersion: GATE_TRAIL_SCHEMA_VERSION,
+    verdicts: records,
+  };
+  try {
+    writeTrailFile(baseDir, runId, 'gate-verdicts.json', JSON.stringify(trail, null, 2));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ── Rendering ────────────────────────────────────────────────────────────────────────
+
+export function verdictCounts(records: GateVerdictRecord[]): Record<GateVerdict, number> {
+  const c: Record<GateVerdict, number> = { agree: 0, false: 0, partial: 0, unverified: 0 };
+  for (const r of records) c[r.effectiveVerdict]++;
+  return c;
+}
+
+// The gate block for stdout: every finding's tag inline (with its downgrade reason when the
+// host overrode the model), the summary counts line, the LOUD trail marker, and the
+// "teeth did not engage" notice when findings exist but zero verdicts landed.
+export function renderGateVerdicts(
+  records: GateVerdictRecord[],
+  opts: { scrub: (s: string) => string; trailWritten: boolean }
+): string[] {
+  const s = opts.scrub;
+  const out: string[] = ['', '  ── gate — grounded verdicts ──'];
+  if (records.length === 0) {
+    out.push('     no findings to verdict');
+  } else {
+    for (const r of records) {
+      const where = r.file ? `${s(r.file)}${r.line ? `:${r.line}` : ''}` : '(uncited)';
+      const dg = r.downgradeReason ? `  (host: ${r.downgradeReason})` : '';
+      const reason = r.reason ? ` — ${s(r.reason).slice(0, 200)}` : '';
+      out.push(
+        `     [${r.effectiveVerdict}] ${r.findingId} [${r.severity}] ${where}  ${s(r.title).slice(0, 120)}${reason}${dg}`
+      );
+    }
+  }
+  const c = verdictCounts(records);
+  out.push(
+    `  gate — ${c.agree} agree · ${c.partial} partial · ${c.false} false (dismissed) · ${c.unverified} unverified`
+  );
+  // The gate is toothless when findings exist but nothing was groundable — a capability-floor
+  // signal (a weak gate model mostly yields unverified). Deterministic, from the counts.
+  if (records.length > 0 && c.agree + c.partial + c.false === 0) {
+    out.push('  gate teeth did not engage — consider a stronger gate model');
+  }
+  out.push(
+    opts.trailWritten
+      ? '  gate trail: gate-verdicts.json written'
+      : '  gate trail: FAILED — dismissals not honored (audit trail not durably written)'
+  );
+  return out;
+}
+
+// ── The gate run (spawn + reconcile + trail) ──────────────────────────────────────────
+
+export type GateRunner = (
+  prompt: string,
+  config: VoiceConfig,
+  opts?: RunReviewOpts
+) => Promise<VoiceRunResult>;
+
+export interface GateRunResult {
+  gateTrailWritten: boolean;
+  synthesis: ReviewSynthesis;
+  verdicts: GateVerdictRecord[];
+}
+
+export interface RunGateOptions {
+  baseDir: string;
+  config: VoiceConfig;
+  expectedHeadSha: string;
+  log?: (m: string) => void;
+  reviews: VoiceReview[];
+  run: GateRunner;
+  runId: string;
+  timeoutMs?: number;
+}
+
+// Run the gate end-to-end: read the pinned packet → resolve+budget each finding's hunk →
+// render the hunk-fed prompt → spawn the gate voice → parse the composite envelope →
+// host-reconcile the verdicts → write the durable trail. FAIL-CLOSED throughout: a packet
+// read failure ⇒ all-`unverified`(packet-fail) (prose kept); a spawn error/timeout/
+// unparseable/unknown-schema ⇒ deterministic fallback synthesis + all-`unverified`; the trail
+// write result flows out so the caller can withhold dismissal-honoring on a write failure.
+export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
+  const log = opts.log ?? (() => {});
+  const healthy = opts.reviews.filter((r) => r.ok);
+
+  const packet = readGatePacket(opts.baseDir, opts.runId, opts.expectedHeadSha);
+  const packetFail = !packet.ok;
+  if (packetFail) {
+    log(`  · gate: pinned packet unusable (${packet.reason}) — verdicts cannot be grounded`);
+  }
+  const packetHunks = packet.ok ? parsePacketHunks(packet.diff) : new Map<string, Hunk[]>();
+  const { findings, injections } = prepareGateFindings(opts.reviews, packetHunks);
+
+  const finalize = (
+    synthesis: ReviewSynthesis,
+    parsed: EnvelopeFailure | ParsedGateEnvelope | { failure: 'packet-fail' }
+  ): GateRunResult => {
+    const { records, warnings } = reconcileGateVerdicts(findings, parsed);
+    for (const w of warnings) log(`  · ${w}`);
+    const gateTrailWritten = writeGateVerdictsTrail(opts.baseDir, opts.runId, records);
+    if (!gateTrailWritten) {
+      log('  · gate: gate-verdicts.json FAILED to write — dismissals not honored (trail loss is LOUD)');
+    }
+    return { gateTrailWritten, synthesis, verdicts: records };
+  };
+
+  // No healthy reviewer ⇒ nothing to verdict; still emit the deterministic fallback synthesis
+  // and a (probably empty) trail so the artifact always exists.
+  if (healthy.length === 0) {
+    return finalize(fallbackReviewSynthesis(opts.reviews), { failure: 'gate-failed' });
+  }
+
+  const prompt = renderGatePrompt(findings, injections, opts.reviews);
+  log('Gate: grounding findings against the pinned diff hunks — verdict tags…');
+  let res: VoiceRunResult;
+  try {
+    res = await opts.run(prompt, opts.config, { timeoutMs: opts.timeoutMs });
+  } catch (e) {
+    log(`  · gate failed (${(e as Error).message}) — deterministic fallback + all unverified`);
+    return finalize(
+      { ...fallbackReviewSynthesis(opts.reviews), error: (e as Error).message },
+      { failure: 'gate-failed' }
+    );
+  }
+  if (!res.raw || res.timedOut) {
+    log('  · gate produced no usable output — deterministic fallback + all unverified');
+    return finalize(
+      { ...fallbackReviewSynthesis(opts.reviews), error: res.timedOut ? 'gate timed out' : 'gate produced no output' },
+      { failure: 'gate-failed' }
+    );
+  }
+
+  const parsed = parseGateEnvelope(res.raw);
+  if ('failure' in parsed) {
+    log(`  · gate envelope not usable (${parsed.failure}) — deterministic fallback + all unverified`);
+    return finalize(
+      { ...fallbackReviewSynthesis(opts.reviews), error: parsed.failure, raw: res.raw },
+      { failure: parsed.failure }
+    );
+  }
+
+  // Prose synthesis (agreements/disagreements/bottomLine) survives even a packet-fail — only
+  // the grounded VERDICTS are killed there. Reconcile the prose against the real reviews (the
+  // unchanged corroboration guard) so the gate can't fabricate confident consensus.
+  const { synthesis } = reconcileSynthesis(
+    {
+      agreements: parsed.agreements,
+      bottomLine: parsed.bottomLine,
+      by: 'claude',
+      degraded: false,
+      disagreements: parsed.disagreements,
+      ok: true,
+      raw: res.raw,
+      summary: '',
+    },
+    opts.reviews
+  );
+  return finalize(synthesis, packetFail ? { failure: 'packet-fail' } : parsed);
+}

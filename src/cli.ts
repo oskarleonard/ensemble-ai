@@ -932,6 +932,7 @@ async function reviewCommand(
         baseDir: out,
         claudeConfig: voiceConfigs.claude,
         coreReviews: result.reviews,
+        expectedHeadSha: result.acquired.headSha,
         includeClaudeReviewer: true,
         log: (m) => console.error(`· ${m}`),
         reviewPrompt: result.prompt,

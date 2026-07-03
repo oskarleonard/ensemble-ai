@@ -214,12 +214,12 @@ describe('reviewer roster (codex+grok core; Opus/claude default-on, --no-claude 
 describe('self-contained Opus layer wiring (default-on; --no-claude opts out; feeds the gate)', () => {
   const synthesis = {
     agreements: [], bottomLine: 'ok', by: 'claude', degraded: false,
-    disagreements: [], ok: true, raw: null, sanityChecks: [], summary: 's',
+    disagreements: [], ok: true, raw: null, summary: 's',
   };
 
   it('runs the Opus layer by default over the pinned packet prompt', async () => {
     mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed')] }));
-    mockLayer.mockResolvedValue({ claudeReview: null, modelLabel: 'opus', synthesis });
+    mockLayer.mockResolvedValue({ claudeReview: null, gateTrailWritten: true, gateVerdicts: [], modelLabel: 'opus', synthesis });
     await main(['review', '--working-tree']);
     expect(mockLayer).toHaveBeenCalledWith(
       expect.objectContaining({ includeClaudeReviewer: true, reviewPrompt: 'PINNED' })
@@ -239,6 +239,8 @@ describe('self-contained Opus layer wiring (default-on; --no-claude opts out; fe
         findings: [{ body: '', confidence: 'high', evidence: {}, id: 'f1', severity: 'high', title: 't' }],
         ok: true, summary: '', voiceId: 'claude',
       },
+      gateTrailWritten: true,
+      gateVerdicts: [],
       modelLabel: 'opus',
       synthesis,
     });
@@ -252,6 +254,8 @@ describe('self-contained Opus layer wiring (default-on; --no-claude opts out; fe
     mockRun.mockResolvedValue(result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed')] }));
     mockLayer.mockResolvedValue({
       claudeReview: { findings: [], ok: false, summary: 'claude produced no output', voiceId: 'claude' },
+      gateTrailWritten: true,
+      gateVerdicts: [],
       modelLabel: 'opus',
       synthesis,
     });
@@ -268,7 +272,7 @@ describe('self-contained Opus layer wiring (default-on; --no-claude opts out; fe
 describe('receipt reflects the FULL expected roster (not just the codex/grok core)', () => {
   const synthesis = {
     agreements: [], bottomLine: 'ok', by: 'claude', degraded: false,
-    disagreements: [], ok: true, raw: null, sanityChecks: [], summary: 's',
+    disagreements: [], ok: true, raw: null, summary: 's',
   };
 
   // A codex/grok-qualified candidate the core hands off (deferred, unwritten): the CLI
@@ -301,7 +305,7 @@ describe('receipt reflects the FULL expected roster (not just the codex/grok cor
     }));
     mockLayer.mockResolvedValue({
       claudeReview: { findings: [], ok: false, summary: 'claude produced no output', voiceId: 'claude' },
-      modelLabel: 'opus', synthesis,
+      gateTrailWritten: true, gateVerdicts: [], modelLabel: 'opus', synthesis,
     });
     expect(await main(['review', '--working-tree'])).toBe(1);
     expect(readReceipt(s, keyOf(cand))).toBeNull();
@@ -315,7 +319,7 @@ describe('receipt reflects the FULL expected roster (not just the codex/grok cor
     }));
     mockLayer.mockResolvedValue({
       claudeReview: { findings: [], ok: true, summary: '', voiceId: 'claude' },
-      modelLabel: 'opus', synthesis,
+      gateTrailWritten: true, gateVerdicts: [], modelLabel: 'opus', synthesis,
     });
     expect(await main(['review', '--working-tree'])).toBe(0);
     const written = readReceipt(s, keyOf(cand));

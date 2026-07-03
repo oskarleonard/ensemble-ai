@@ -6,6 +6,20 @@ import { CONFIDENCES, type ReviewFinding, SEVERITIES } from '../../core/types';
 
 import type { VoiceReview } from './synthesis';
 
+// Read + JSON-parse ANY trail file for a run, keyed by the (sanitized) run dir — the ONE
+// generic reader so the pinned-packet reader and any future trail consumer don't each
+// re-derive the path. A missing / unreadable / unparseable file → null (the caller decides
+// how to degrade — the gate turns a null packet into all-`unverified`), never a throw.
+export function readTrailJson<T>(baseDir: string, runId: string, name: string): T | null {
+  try {
+    return JSON.parse(
+      fs.readFileSync(path.join(reviewDir(baseDir, runId), name), 'utf8')
+    ) as T;
+  } catch {
+    return null;
+  }
+}
+
 // Read a persisted VoiceReview back from a trail file (e.g. the Opus reviewer's
 // `review.claude.json`) so the synthesizer's input is exactly what was written to disk.
 // Defensive: a missing/malformed file → null (the voice simply drops out of the synthesis),

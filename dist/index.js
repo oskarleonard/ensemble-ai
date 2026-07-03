@@ -1097,9 +1097,9 @@ var GENERATED_PATTERNS = [
   /\.(js|css)\.map$/,
   /\.snap$/
 ];
-function classifyFileKind(path8, isBinary) {
+function classifyFileKind(path10, isBinary) {
   if (isBinary) return "binary";
-  return GENERATED_PATTERNS.some((re) => re.test(path8)) ? "generated" : "source";
+  return GENERATED_PATTERNS.some((re) => re.test(path10)) ? "generated" : "source";
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -1117,7 +1117,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path8 = pathOfSection(section2);
+    const path10 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -1128,8 +1128,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path8, isBinary),
-      path: path8,
+      kind: classifyFileKind(path10, isBinary),
+      path: path10,
       raw: section2,
       removed
     };
@@ -1370,10 +1370,29 @@ function hasDepSurface(r) {
   return r.manifests.length > 0 || r.riskyImports.length > 0;
 }
 
-// src/modes/review/receipt.ts
+// src/modes/review/gate-hunks.ts
+import fs8 from "fs";
+import path7 from "path";
+
+// src/modes/review/trail-io.ts
 import fs7 from "fs";
-import os5 from "os";
 import path6 from "path";
+
+// src/modes/review/gate-hunks.ts
+var GATE_PACKET_SCHEMA_VERSION = 1;
+function persistGatePacket(baseDir, runId, input) {
+  const packet = {
+    diff: input.diff,
+    headSha: input.headSha,
+    schemaVersion: GATE_PACKET_SCHEMA_VERSION
+  };
+  writeTrailFile(baseDir, runId, "packet.gate.json", JSON.stringify(packet, null, 2));
+}
+
+// src/modes/review/receipt.ts
+import fs9 from "fs";
+import os5 from "os";
+import path8 from "path";
 function computePolicyHash(args) {
   const canonical = JSON.stringify({
     coveragePolicy: args.coveragePolicy,
@@ -1396,10 +1415,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path6.join(os5.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path8.join(os5.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path6.join(
+  return path8.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -1420,11 +1439,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs7.mkdirSync(path6.dirname(file), { recursive: true, mode: 448 });
+  fs9.mkdirSync(path8.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs7.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs7.chmodSync(tmp, 384);
-  fs7.renameSync(tmp, file);
+  fs9.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs9.chmodSync(tmp, 384);
+  fs9.renameSync(tmp, file);
   return file;
 }
 function validateReceiptShape(value) {
@@ -1471,7 +1490,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs7.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs9.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -1723,6 +1742,13 @@ async function runReviewMode(opts) {
   const prompt = renderReviewPrompt(packet, profile);
   if (!packet.complete) {
     log("Packet incomplete (no usable diff) \u2014 persisting an empty review.");
+  }
+  try {
+    persistGatePacket(opts.out, opts.runId, {
+      diff: acquired.diff,
+      headSha: acquired.headSha
+    });
+  } catch {
   }
   log(`Running ${reviewers.length} reviewer(s): ${reviewers.join(", ")}\u2026`);
   const resolved = loadReviewers(opts.reviewersFile);
@@ -2011,9 +2037,9 @@ a tight ranked list of the genuinely strong ideas over a long one.
 }
 
 // src/modes/brainstorm/voices.ts
-import fs8 from "fs";
+import fs10 from "fs";
 import os6 from "os";
-import path7 from "path";
+import path9 from "path";
 
 // src/modes/brainstorm/claude.ts
 function resolveClaudeBin() {
@@ -2083,7 +2109,7 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), o),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), o)
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path7.join(os6.homedir(), ".ensemble-ai", "voices.json");
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path9.join(os6.homedir(), ".ensemble-ai", "voices.json");
 function str3(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
@@ -2109,7 +2135,7 @@ function parseVoices(raw) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs8.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs10.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
