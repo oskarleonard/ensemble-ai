@@ -90,6 +90,15 @@ describe('parseFileHunks + resolveFindingHunk — deterministic side-selection (
     expect(resolveFindingHunk(parseFileHunks(MIXED), 999)).toBeNull();
     expect(parsePacketHunks(MIXED).get('nope/missing.ts')).toBeUndefined();
   });
+
+  it('a line in the DECLARED range but ABSENT from a malformed hunk body → null, not a forged index 0 (codex-f2)', () => {
+    // The header claims 10 new-side lines; the body actually has ONE. Line 5 is "in range" per
+    // the header yet not locatable → it must NOT be grounded on body index 0 (fail-closed), else
+    // an unlocatable cite becomes a resolved + dismissible finding on unrelated first-line code.
+    const malformed = { body: ['+  const only = realCode();'], header: '@@ -1,1 +1,10 @@', newCount: 10, newStart: 1, oldCount: 1, oldStart: 1 };
+    expect(resolveFindingHunk([malformed], 5)).toBeNull();
+    expect(resolveFindingHunk([malformed], 1)).toMatchObject({ bodyIndex: 0 }); // the present line still resolves
+  });
 });
 
 describe('windowHunk — ±25-line bound → truncated flag', () => {

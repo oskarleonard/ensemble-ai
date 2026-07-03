@@ -180,13 +180,17 @@ export function resolveFindingHunk(hunks: Hunk[], line: number): ResolvedHunk | 
   for (const h of hunks) {
     if (h.newCount > 0 && line >= h.newStart && line < h.newStart + h.newCount) {
       const idx = bodyIndexForLine(h, line, 'new');
-      return { bodyIndex: idx >= 0 ? idx : 0, hunk: h };
+      // The line is in this hunk's DECLARED new-side range but absent from its body (a
+      // malformed / header-mismatched hunk) ⇒ null, NOT a fabricated body index 0. Grounding
+      // an unlocatable cite on an unrelated first line would forge a resolved+dismissible
+      // finding — "an unresolved cite is never guessed at" (fail-closed → unverified).
+      return idx >= 0 ? { bodyIndex: idx, hunk: h } : null;
     }
   }
   for (const h of hunks) {
     if (h.newCount === 0 && line >= h.oldStart && line < h.oldStart + h.oldCount) {
       const idx = bodyIndexForLine(h, line, 'old');
-      return { bodyIndex: idx >= 0 ? idx : 0, hunk: h };
+      return idx >= 0 ? { bodyIndex: idx, hunk: h } : null;
     }
   }
   return null;

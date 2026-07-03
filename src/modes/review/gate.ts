@@ -617,7 +617,10 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
       raw: res.raw,
       summary: '',
     },
-    opts.reviews
+    // Corroborate against the SAME completed (ok) reviewers the verdict half tags — reconcile
+    // self-filters ok, so this is behavior-identical, but keeps the "only completed reviewers"
+    // property uniform across the prose and verdict halves.
+    healthy
   );
   // Surface the anti-fabrication guard firing: an "agreement" no ≥2 real voices corroborate is
   // demoted to look-closer. Silent demotion would hide a caught fabricated-consensus attempt.
