@@ -3728,6 +3728,16 @@ function nonEmptyStr(v) {
 function plainObject(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : null;
 }
+function resolveField(key, flag, gate, claude, warn) {
+  if (flag) return { source: "flag", value: flag };
+  const fromGate = gate ? nonEmptyStr(gate[key]) : null;
+  if (gate && key in gate && fromGate === null)
+    warn(
+      `gate seat: \`${key}\` must be a non-empty string \u2014 falling back to the claude voice / built-in default`
+    );
+  const inherited = fromGate || claude && nonEmptyStr(claude[key]);
+  return inherited ? { source: "file", value: inherited } : { source: "default", value: "default" };
+}
 function resolveGateSeat(raw, flags, warn) {
   const root = plainObject(raw) ?? {};
   let gate = null;
@@ -3743,46 +3753,31 @@ function resolveGateSeat(raw, flags, warn) {
     warn(
       "gate seat: `cmd` is ignored \u2014 the gate is always a `claude -p` spawn (read-only plan mode + write-tool deny-list); remove it"
     );
-  let model = "default";
-  let modelSource = "default";
-  const flagModel = nonEmptyStr(flags.model);
-  if (flagModel) {
-    model = flagModel;
-    modelSource = "flag";
-  } else {
-    if (gate && "model" in gate && nonEmptyStr(gate.model) === null)
-      warn(
-        "gate seat: `model` must be a non-empty string \u2014 falling back to the claude voice / built-in default"
-      );
-    const inherited = gate && nonEmptyStr(gate.model) || claude && nonEmptyStr(claude.model);
-    if (inherited) {
-      model = inherited;
-      modelSource = "file";
-    }
-  }
-  let effort = "default";
-  let effortSource = "default";
+  const { source: modelSource, value: model } = resolveField(
+    "model",
+    nonEmptyStr(flags.model),
+    gate,
+    claude,
+    warn
+  );
   const flagEffort = nonEmptyStr(flags.effort);
-  if (flagEffort && CLAUDE_EFFORTS2.has(flagEffort)) {
-    effort = flagEffort;
-    effortSource = "flag";
-  } else {
-    if (flagEffort && !CLAUDE_EFFORTS2.has(flagEffort))
-      warn(
-        `gate seat: --gate-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 ignored`
-      );
-    if (gate && "effort" in gate && nonEmptyStr(gate.effort) === null)
-      warn(
-        "gate seat: `effort` must be a non-empty string \u2014 falling back to the claude voice / built-in default"
-      );
-    const inherited = gate && nonEmptyStr(gate.effort) || claude && nonEmptyStr(claude.effort);
-    if (inherited) {
-      effort = inherited;
-      effortSource = "file";
-    }
-  }
+  const effortFlagOk = flagEffort !== null && CLAUDE_EFFORTS2.has(flagEffort);
+  if (flagEffort && !effortFlagOk)
+    warn(
+      `gate seat: --gate-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 ignored`
+    );
+  const { source: effortSource, value: effort } = resolveField(
+    "effort",
+    effortFlagOk ? flagEffort : null,
+    gate,
+    claude,
+    warn
+  );
   return {
-    config: { cmd: "claude", effort, id: "claude", model, vendor: "anthropic" },
+    // The gate IS the claude binary with a swapped model/effort — source its identity (cmd/id/
+    // vendor) from the one canonical claude voice so it can't drift from it, overriding only the
+    // two fields the gate seat configures.
+    config: { ...VOICE_DEFAULTS.claude, effort, model },
     effortSource,
     modelSource
   };
