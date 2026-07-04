@@ -42,6 +42,13 @@ export function oneOf<T extends string>(set: readonly T[], v: unknown, fallback:
   return (set as readonly string[]).includes(v as string) ? (v as T) : fallback;
 }
 
+// The severity display vocabulary + HIGH→MED→LOW render order — the ONE copy shared by every
+// review renderer (the terminal gate/summary + the markdown PR comment) so a relabel or reorder
+// happens once, not per-renderer. `SEVERITY_LABEL[s][0]` is the single-letter form the compact
+// tally uses.
+export const SEVERITY_LABEL: Record<Severity, string> = { high: 'HIGH', low: 'LOW', medium: 'MED' };
+export const SEVERITY_ORDER: Severity[] = ['high', 'medium', 'low'];
+
 // Format a finding's evidence as `file:line` (or just `file` when uncited-by-line), falling back
 // to `(uncited)` when there is no file — the ONE definition of an idiom that was re-implemented
 // across the CLI + every review renderer. `scrub` is applied to the file path (default identity: a

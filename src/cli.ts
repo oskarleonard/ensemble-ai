@@ -14,7 +14,7 @@ import {
   gatherConventions,
 } from './core/conventions';
 import { isEntrypoint } from './core/entrypoint';
-import { evidenceRef } from './core/findings';
+import { evidenceRef, SEVERITY_LABEL, SEVERITY_ORDER } from './core/findings';
 import { listReviewers, REVIEWERS_FILE } from './core/reviewers';
 import { scrubControl as clean } from './core/sanitize';
 import {
@@ -41,6 +41,7 @@ import { runReviewMode, type ReviewModeResult } from './modes/review';
 import {
   claudeLayerHasHigh,
   type ClaudeLayerResult,
+  claudeModelLabel,
   renderClaudeLayer,
   resolveReviewRoster,
   runClaudeReviewLayer,
@@ -560,13 +561,6 @@ function resolveSource(
   }
 }
 
-const SEVERITY_LABEL: Record<Severity, string> = {
-  high: 'HIGH',
-  low: 'LOW',
-  medium: 'MED',
-};
-const SEVERITY_ORDER: Severity[] = ['high', 'medium', 'low'];
-
 // True iff any COMPLETED reviewer surfaced a HIGH finding — the gate signal.
 function hasHighFinding(reviews: StoredReview[]): boolean {
   return reviews.some(
@@ -826,16 +820,19 @@ function ghPostRunner(cwd: string): PostRunner {
 // GateSeat → the footer's resolved seat: model/effort with the 'default' sentinel spelled out
 // (a resolved-but-'default' model is the built-in Opus), plus the per-field source for provenance.
 function toCommentGateSeat(seat: GateSeat): CommentGateSeat {
-  const model = seat.config.model && seat.config.model !== 'default' ? seat.config.model : 'opus';
+  // Reuse the reviewer layer's model-label rule (resolve to the configured model, else the
+  // built-in `opus`) so the footer's seat model can't drift from the reviewer's own label.
+  const model = claudeModelLabel(seat.config);
   const effort =
     seat.config.effort && seat.config.effort !== 'default' ? seat.config.effort : 'default';
   return { effort, effortSource: seat.effortSource, model, modelSource: seat.modelSource };
 }
 
-// The review's earned exit code (precedence 2 > 1 > 4 > 0), factored out of reviewCommand so
-// `--post-comment` can be GATED on it and provably cannot change it. `blocked` (exit 2) is handled
-// by the caller before this. Emits the reviewer-incomplete stderr line (exit 1) as a side effect,
-// verbatim from the inlined logic it replaced — the gate contract is unchanged.
+// The review's earned exit code, factored out of reviewCommand so `--post-comment` can be GATED
+// on it and provably cannot change it. Owns the FULL precedence 2 > 1 > 4 > 0 — including
+// `blocked` → 2 — so it returns the right code for ANY result and can't be mis-ordered by a
+// caller. Emits the reviewer-incomplete stderr line (exit 1) as a side effect, verbatim from the
+// inlined logic it replaced — the gate contract is unchanged.
 function reviewExitCode(opts: {
   claudeLayer: ClaudeLayerResult | null;
   claudeLayerCrashed: boolean;
@@ -854,6 +851,9 @@ function reviewExitCode(opts: {
     noFailOnHigh,
     result,
   } = opts;
+  // 2 = the diff was secret-scan BLOCKED — a hard stop; no trustworthy review ran, so it
+  // outranks everything below.
+  if (result.blocked) return 2;
   // 1 = a reviewer failed to complete (crash / timeout / no parse) — the review is
   // not trustworthy, so this outranks the findings gate below.
   const allReviewed =
@@ -1250,11 +1250,11 @@ async function reviewCommand(
   // On stdout (with the receipt + pinned-input paths) — the machine-readable trail
   // location, so the doc's "paths on stdout" is accurate.
   console.log(`trail: ${trailDir}`);
-  if (result.blocked) return 2;
 
-  // The review's earned exit code (precedence 2 > 1 > 4 > 0). Computed BEFORE the optional
-  // --post-comment so posting is GATED on it and provably cannot change it (posting is a side
-  // effect of a completed review, never part of the gate contract).
+  // The review's earned exit code (full precedence 2 > 1 > 4 > 0, incl. blocked → 2 — owned by
+  // reviewExitCode). Computed BEFORE the optional --post-comment so posting is GATED on it and
+  // provably cannot change it (posting is a side effect of a completed review, never part of the
+  // gate contract).
   const exitCode = reviewExitCode({
     claudeLayer,
     claudeLayerCrashed,
@@ -1284,7 +1284,6 @@ async function reviewCommand(
           digest: result.receipt ? `${result.receipt.diffDigest.slice(0, 19)}…` : null,
           error: result.receiptError ?? null,
           path: result.receiptPath ?? null,
-          vendors: result.receipt?.vendors ?? [],
         },
         repoId: result.acquired.repoId,
         reviews: result.reviews,

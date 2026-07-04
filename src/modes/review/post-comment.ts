@@ -8,9 +8,9 @@
 // + per-reviewer findings grouped by severity + a footer with the trail path, receipt line, and
 // the resolved gate seat. Only a PR diff source has a postable target (postTargetFromSelection).
 
-import { evidenceRef } from '../../core/findings';
+import { evidenceRef, SEVERITY_LABEL, SEVERITY_ORDER } from '../../core/findings';
 import { scrubControl } from '../../core/sanitize';
-import type { Severity, StoredReview } from '../../core/types';
+import type { StoredReview } from '../../core/types';
 
 import type { GateVerdict, GateVerdictRecord } from './gate';
 import { verdictCounts } from './gate';
@@ -57,7 +57,6 @@ export interface CommentReceipt {
   digest: string | null;
   error: string | null;
   path: string | null;
-  vendors: string[];
 }
 
 export interface RenderCommentInput {
@@ -71,9 +70,6 @@ export interface RenderCommentInput {
   reviews: StoredReview[];
   trailDir: string;
 }
-
-const SEVERITY_LABEL: Record<Severity, string> = { high: 'HIGH', low: 'LOW', medium: 'MED' };
-const SEVERITY_ORDER: Severity[] = ['high', 'medium', 'low'];
 
 // The per-finding verdict tag as the directive names it: `false` → `false-dismissed` (the gate
 // dismissed it), the rest verbatim. Kept off the raw enum so the outward comment reads clearly.
@@ -115,12 +111,12 @@ function reviewerBlock(
   id: string,
   vendor: string,
   model: string,
-  state: string,
   reviewed: boolean,
   findings: StoredReview['findings'],
   summary: string,
   profile: ReviewProfile
 ): string[] {
+  const state = reviewed ? 'reviewed' : 'failed';
   const out: string[] = ['', `#### ${md(id)} — ${state} <sub>[${md(vendor)}/${md(model)}]</sub>`];
   if (!reviewed) {
     out.push(`> ${md(summary).slice(0, 300)}`);
@@ -215,7 +211,6 @@ export function renderReviewComment(input: RenderCommentInput): string {
         id,
         r.reviewer.vendor,
         r.reviewer.model,
-        r.terminalState === 'reviewed' ? 'reviewed' : 'failed',
         r.terminalState === 'reviewed',
         r.findings,
         r.summary,
@@ -232,7 +227,6 @@ export function renderReviewComment(input: RenderCommentInput): string {
         'claude',
         'anthropic',
         claudeLayer!.modelLabel,
-        cr.ok ? 'reviewed' : 'failed',
         cr.ok,
         cr.findings,
         cr.summary,

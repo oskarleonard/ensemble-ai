@@ -57,12 +57,6 @@ export const ORCHESTRATION_SKILL_SPECS: OrchestrationSkillSpec[] = [
   { drives: 'review', name: 'ensemble-ai-review-fix' },
 ];
 
-export function findOrchestrationSkill(
-  name: string
-): OrchestrationSkillSpec | undefined {
-  return ORCHESTRATION_SKILL_SPECS.find((s) => s.name === name);
-}
-
 // The engine command an orchestration skill drives — `ensemble-ai <mode>`, WITHOUT a fixed
 // $ARGUMENTS tail (the orchestration calls it in a loop with computed args — e.g. a re-review
 // after applying a fix — not one verbatim pass-through like the thin wrappers). A test asserts

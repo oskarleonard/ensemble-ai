@@ -222,7 +222,7 @@ export interface ClaudeLayerResult {
 // The Claude model label for output: the configured model when one is explicitly set, else
 // `opus` (the CLI's default for this voice, by design). So a `--model sonnet` run prints
 // `sonnet`, never a hardcoded `opus`.
-function claudeModelLabel(config: VoiceConfig): string {
+export function claudeModelLabel(config: VoiceConfig): string {
   return config.model && config.model !== 'default' ? config.model : 'opus';
 }
 

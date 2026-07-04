@@ -37,6 +37,8 @@ array with a "summary" that says so. Do not invent issues to fill the list.`;
 function oneOf(set, v, fallback) {
   return set.includes(v) ? v : fallback;
 }
+var SEVERITY_LABEL = { high: "HIGH", low: "LOW", medium: "MED" };
+var SEVERITY_ORDER = ["high", "medium", "low"];
 function evidenceRef(file, line, scrub = (s) => s) {
   if (!file) return "(uncited)";
   const f = scrub(file);
@@ -360,6 +362,8 @@ export {
   PACKET_BUDGETS,
   REVIEWER_IDS,
   SEVERITIES,
+  SEVERITY_LABEL,
+  SEVERITY_ORDER,
   TERMINAL_STATES,
   TRUNCATION_MARKER_RE,
   assembleCodePacket,

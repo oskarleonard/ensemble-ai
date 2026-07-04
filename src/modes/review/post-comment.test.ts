@@ -101,7 +101,6 @@ function renderInput(over: Partial<RenderCommentInput> = {}): RenderCommentInput
       digest: 'sha256:deadbeefcafe…',
       error: null,
       path: '/tmp/trail/receipt.json',
-      vendors: ['openai', 'xai', 'anthropic/opus'],
     },
     repoId: 'oskarleonard/ensemble-ai',
     reviews: [stored(), stored({ findings: [], reviewerId: 'grok', reviewer: { effort: 'high', model: 'grok-4', vendor: 'xai' }, summary: 'no findings' })],
@@ -203,7 +202,7 @@ describe('renderReviewComment', () => {
 
   it('renders a "none" receipt line when no receipt was minted', () => {
     const body = renderReviewComment(
-      renderInput({ receipt: { completed: [], digest: null, error: 'review INCOMPLETE', path: null, vendors: [] } })
+      renderInput({ receipt: { completed: [], digest: null, error: 'review INCOMPLETE', path: null } })
     );
     expect(body).toContain('receipt none — review INCOMPLETE');
   });

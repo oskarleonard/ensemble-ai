@@ -395,6 +395,8 @@ array with a "summary" that says so. Do not invent issues to fill the list.`;
 function oneOf(set, v, fallback) {
   return set.includes(v) ? v : fallback;
 }
+var SEVERITY_LABEL = { high: "HIGH", low: "LOW", medium: "MED" };
+var SEVERITY_ORDER = ["high", "medium", "low"];
 function evidenceRef(file, line, scrub = (s) => s) {
   if (!file) return "(uncited)";
   const f = scrub(file);
@@ -3865,8 +3867,6 @@ function postTargetFromSelection(sel) {
   if (sel.kind !== "pr" || typeof sel.pr !== "number") return null;
   return sel.owner && sel.repo ? { pr: sel.pr, repoSlug: `${sel.owner}/${sel.repo}` } : { pr: sel.pr };
 }
-var SEVERITY_LABEL = { high: "HIGH", low: "LOW", medium: "MED" };
-var SEVERITY_ORDER = ["high", "medium", "low"];
 var VERDICT_TAG = {
   agree: "agree",
   false: "false-dismissed",
@@ -3887,7 +3887,8 @@ function findingItem(f, profile) {
   }
   return `- \`${ref}\` \u2014 ${md(f.title)}`;
 }
-function reviewerBlock(id, vendor, model, state, reviewed, findings, summary, profile) {
+function reviewerBlock(id, vendor, model, reviewed, findings, summary, profile) {
+  const state = reviewed ? "reviewed" : "failed";
   const out = ["", `#### ${md(id)} \u2014 ${state} <sub>[${md(vendor)}/${md(model)}]</sub>`];
   if (!reviewed) {
     out.push(`> ${md(summary).slice(0, 300)}`);
@@ -3970,7 +3971,6 @@ function renderReviewComment(input) {
         id,
         r.reviewer.vendor,
         r.reviewer.model,
-        r.terminalState === "reviewed" ? "reviewed" : "failed",
         r.terminalState === "reviewed",
         r.findings,
         r.summary,
@@ -3985,7 +3985,6 @@ function renderReviewComment(input) {
         "claude",
         "anthropic",
         claudeLayer.modelLabel,
-        cr.ok ? "reviewed" : "failed",
         cr.ok,
         cr.findings,
         cr.summary,
@@ -4535,12 +4534,6 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
       return { localRepoTrail: true };
   }
 }
-var SEVERITY_LABEL2 = {
-  high: "HIGH",
-  low: "LOW",
-  medium: "MED"
-};
-var SEVERITY_ORDER2 = ["high", "medium", "low"];
 function hasHighFinding(reviews) {
   return reviews.some(
     (r) => r.terminalState === "reviewed" && r.findings.some((f) => f.severity === "high")
@@ -4551,8 +4544,8 @@ function reviewerTally(r) {
   if (r.terminalState !== "reviewed") return `${id} failed`;
   const counts = { high: 0, low: 0, medium: 0 };
   for (const f of r.findings) counts[f.severity]++;
-  const parts = SEVERITY_ORDER2.filter((s) => counts[s] > 0).map(
-    (s) => `${counts[s]}${SEVERITY_LABEL2[s][0]}`
+  const parts = SEVERITY_ORDER.filter((s) => counts[s] > 0).map(
+    (s) => `${counts[s]}${SEVERITY_LABEL[s][0]}`
   );
   return `${id} ${parts.length ? parts.join("/") : "clean"}`;
 }
@@ -4584,10 +4577,10 @@ function reviewerBlock2(r, profile) {
     out.push("     no findings");
     return out;
   }
-  for (const sev of SEVERITY_ORDER2) {
+  for (const sev of SEVERITY_ORDER) {
     const group = r.findings.filter((f) => f.severity === sev);
     if (group.length === 0) continue;
-    out.push(`     ${SEVERITY_LABEL2[sev]}`);
+    out.push(`     ${SEVERITY_LABEL[sev]}`);
     for (const f of group) out.push(findingLine(f, profile));
   }
   return out;
@@ -4723,7 +4716,7 @@ function ghPostRunner(cwd) {
   };
 }
 function toCommentGateSeat(seat) {
-  const model = seat.config.model && seat.config.model !== "default" ? seat.config.model : "opus";
+  const model = claudeModelLabel(seat.config);
   const effort = seat.config.effort && seat.config.effort !== "default" ? seat.config.effort : "default";
   return { effort, effortSource: seat.effortSource, model, modelSource: seat.modelSource };
 }
@@ -4737,6 +4730,7 @@ function reviewExitCode(opts) {
     noFailOnHigh,
     result
   } = opts;
+  if (result.blocked) return 2;
   const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
   if (!allReviewed) return 1;
   if (claudeLayerExpected) {
@@ -4984,7 +4978,6 @@ async function reviewCommand(args, profile = "code") {
     if (highGateLines.length > 0) console.log(highGateLines.join("\n"));
   }
   console.log(`trail: ${trailDir}`);
-  if (result.blocked) return 2;
   const exitCode = reviewExitCode({
     claudeLayer,
     claudeLayerCrashed,
@@ -5006,8 +4999,7 @@ async function reviewCommand(args, profile = "code") {
           completed: result.receipt?.completed ?? [],
           digest: result.receipt ? `${result.receipt.diffDigest.slice(0, 19)}\u2026` : null,
           error: result.receiptError ?? null,
-          path: result.receiptPath ?? null,
-          vendors: result.receipt?.vendors ?? []
+          path: result.receiptPath ?? null
         },
         repoId: result.acquired.repoId,
         reviews: result.reviews,
