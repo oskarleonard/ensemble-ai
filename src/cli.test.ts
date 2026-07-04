@@ -179,6 +179,49 @@ describe('mode dispatch + usage', () => {
   });
 });
 
+describe('--post-comment', () => {
+  it('review --help documents --post-comment', async () => {
+    const logs: string[] = [];
+    vi.mocked(console.log).mockImplementation((...a: unknown[]) => {
+      logs.push(a.join(' '));
+    });
+    expect(await main(['review', '--help'])).toBe(0);
+    expect(logs.join('\n')).toContain('--post-comment');
+  });
+
+  it('REFUSES upfront on a non-PR source (--working-tree) — exit 3, engine never runs', async () => {
+    const errs: string[] = [];
+    vi.mocked(console.error).mockImplementation((...a: unknown[]) => {
+      errs.push(a.join(' '));
+    });
+    expect(await main(['review', '--working-tree', '--post-comment'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+    expect(errs.join('\n')).toContain('--post-comment requires a PR diff source');
+  });
+
+  it('security --post-comment on a non-PR source also refuses (shared code path)', async () => {
+    const errs: string[] = [];
+    vi.mocked(console.error).mockImplementation((...a: unknown[]) => {
+      errs.push(a.join(' '));
+    });
+    expect(await main(['security', '--staged', '--post-comment'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+    expect(errs.join('\n')).toContain('--post-comment requires a PR diff source');
+  });
+
+  it('--post-comment is a recognized flag (not an unknown-flag usage error)', async () => {
+    // A non-PR source refuses with the PR-source message (exit 3) — NOT the generic
+    // "unknown option" parse error — proving the flag parsed.
+    const errs: string[] = [];
+    vi.mocked(console.error).mockImplementation((...a: unknown[]) => {
+      errs.push(a.join(' '));
+    });
+    await main(['review', '--working-tree', '--post-comment']);
+    expect(errs.join('\n')).not.toContain('Unknown option');
+    expect(errs.join('\n')).not.toContain("to specify an option argument");
+  });
+});
+
 describe('flag threading', () => {
   it('passes --reviewers, --base, --allow-sensitive through to the engine', async () => {
     mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));

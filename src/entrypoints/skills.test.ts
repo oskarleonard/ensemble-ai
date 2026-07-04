@@ -8,6 +8,8 @@ import { IMPLEMENTED_MODES, resolveMode } from '../modes';
 
 import {
   findSkill,
+  ORCHESTRATION_SKILL_SPECS,
+  orchestrationEngineCommand,
   SKILL_ARGS_PLACEHOLDER,
   SKILL_SPECS,
   skillInvocationLine,
@@ -56,6 +58,47 @@ describe('shipped SKILL.md files (no drift from the registry)', () => {
       // the wrapper invokes EXACTLY the CLI command the registry says it does
       expect(body).toContain(skillInvocationLine(spec));
       // and forwards the user's arguments placeholder
+      expect(body).toContain(SKILL_ARGS_PLACEHOLDER);
+    });
+  }
+});
+
+describe('ORCHESTRATION_SKILL_SPECS registry', () => {
+  it('registers the review-fix orchestration skill (a multi-step ritual, not a thin wrapper)', () => {
+    expect(ORCHESTRATION_SKILL_SPECS.map((s) => s.name)).toEqual([
+      'ensemble-ai-review-fix',
+    ]);
+  });
+
+  it('every orchestration skill drives an IMPLEMENTED engine mode', () => {
+    for (const spec of ORCHESTRATION_SKILL_SPECS) {
+      expect(resolveMode(spec.drives)).toBe(spec.drives);
+      expect(IMPLEMENTED_MODES).toContain(spec.drives);
+    }
+  });
+
+  it('an orchestration skill is NOT also a thin wrapper (kept out of SKILL_SPECS)', () => {
+    const wrappers = new Set(SKILL_SPECS.map((s) => s.name));
+    for (const spec of ORCHESTRATION_SKILL_SPECS) {
+      expect(wrappers.has(spec.name)).toBe(false);
+    }
+  });
+});
+
+describe('shipped orchestration SKILL.md files (no drift from the registry)', () => {
+  for (const spec of ORCHESTRATION_SKILL_SPECS) {
+    it(`skills/${spec.name}/SKILL.md drives the engine + the fix-loop contract`, () => {
+      const body = fs.readFileSync(
+        path.join(SKILLS_DIR, spec.name, 'SKILL.md'),
+        'utf8'
+      );
+      // frontmatter name matches the registry
+      expect(body).toContain(`name: ${spec.name}`);
+      // it drives the engine READ-ONLY (the session is the fixer) …
+      expect(body).toContain(orchestrationEngineCommand(spec));
+      // … reads the gate-verdicts.json fix-loop contract …
+      expect(body).toContain('gate-verdicts.json');
+      // … and forwards the user's arguments to the engine
       expect(body).toContain(SKILL_ARGS_PLACEHOLDER);
     });
   }

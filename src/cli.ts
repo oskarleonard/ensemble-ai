@@ -86,6 +86,15 @@ import {
   selectDiffSource,
 } from './modes/review/source';
 import {
+  capComment,
+  type CommentGateSeat,
+  type PostRunner,
+  type PostTarget,
+  postReviewComment,
+  postTargetFromSelection,
+  renderReviewComment,
+} from './modes/review/post-comment';
+import {
   buildPacketPreview,
   renderConventionManifest,
   renderPacketPreview,
@@ -169,6 +178,9 @@ Options:
                         reviewer, else it mostly returns unverified — the toothless mode)
   --gate-effort <e>     effort for the GATE seat (low|medium|high|xhigh|max) — overrides the
                         file; an unknown value is ignored (\`ensemble-ai config\` shows the seat)
+  --post-comment        after a COMPLETED review, ALSO post it to the PR as one markdown comment
+                        via \`gh pr comment\` (opt-in; REQUIRES a PR source — --pr <N> or a PR URL).
+                        A gh failure warns loudly and leaves the review + exit code UNCHANGED.
   --out <dir>           trail BASE dir; a per-run <run-id>/ subdir is created under it
                         (default: repo-local .ensemble-ai/reviews when reviewing this
                         repo's own diff, else an OS temp dir — the path is printed)
@@ -735,7 +747,14 @@ function resolveDiffSourceForCommand(
   positionals: string[],
   cmd: string,
   cwd: string
-): ReturnType<typeof resolveSource> {
+):
+  | { code: number }
+  | (Exclude<ReturnType<typeof resolveSource>, { code: number }> & {
+      // The PR a `--post-comment` would post to (from the SAME selection the review runs over),
+      // or null for a non-PR source. Computed here so the review command can refuse `--post-comment`
+      // upfront without re-deriving the selection.
+      postTarget: PostTarget | null;
+    }) {
   // A bare positional PR URL (`<cmd> <url>`) is sugar for `--pr <url>`.
   const positionalPr = resolvePositionalPr(
     positionals,
@@ -763,7 +782,130 @@ function resolveDiffSourceForCommand(
     console.error(`ensemble-ai ${cmd}: ${selection.error}`);
     return { code: 3 };
   }
-  return resolveSource(selection, cwd, stdinContent, cmd);
+  const resolved = resolveSource(selection, cwd, stdinContent, cmd);
+  if ('code' in resolved) return resolved;
+  return { ...resolved, postTarget: postTargetFromSelection(selection) };
+}
+
+// The default `--post-comment` exec: `gh pr comment … --body-file -` with the rendered comment on
+// gh's stdin. Injectable (PostRunner) so the post path is unit-tested WITHOUT spawning gh. gh
+// absent (ENOENT), unauthenticated, or a failed post all RETURN {ok:false} with a clear message —
+// postReviewComment turns that into a loud warning and never throws, so posting can never change
+// the review's exit code.
+function ghPostRunner(cwd: string): PostRunner {
+  return (args, body) => {
+    try {
+      const out = execFileSync('gh', args, {
+        cwd,
+        encoding: 'utf8',
+        input: body,
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: 120_000,
+      });
+      // gh prints the created comment's URL on success — surface it in the confirmation line.
+      const url = out
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .pop();
+      return url && /^https?:\/\//.test(url) ? { ok: true, url } : { ok: true };
+    } catch (e) {
+      const err = e as { code?: string; message?: string; stderr?: Buffer | string };
+      if (err.code === 'ENOENT') {
+        return {
+          error: 'the `gh` CLI is not on PATH — install GitHub CLI and run `gh auth login`',
+          ok: false,
+        };
+      }
+      const stderr = err.stderr ? String(err.stderr).trim() : '';
+      return { error: stderr || err.message || 'gh pr comment failed', ok: false };
+    }
+  };
+}
+
+// GateSeat → the footer's resolved seat: model/effort with the 'default' sentinel spelled out
+// (a resolved-but-'default' model is the built-in Opus), plus the per-field source for provenance.
+function toCommentGateSeat(seat: GateSeat): CommentGateSeat {
+  const model = seat.config.model && seat.config.model !== 'default' ? seat.config.model : 'opus';
+  const effort =
+    seat.config.effort && seat.config.effort !== 'default' ? seat.config.effort : 'default';
+  return { effort, effortSource: seat.effortSource, model, modelSource: seat.modelSource };
+}
+
+// The review's earned exit code (precedence 2 > 1 > 4 > 0), factored out of reviewCommand so
+// `--post-comment` can be GATED on it and provably cannot change it. `blocked` (exit 2) is handled
+// by the caller before this. Emits the reviewer-incomplete stderr line (exit 1) as a side effect,
+// verbatim from the inlined logic it replaced — the gate contract is unchanged.
+function reviewExitCode(opts: {
+  claudeLayer: ClaudeLayerResult | null;
+  claudeLayerCrashed: boolean;
+  claudeLayerExpected: boolean;
+  cmd: string;
+  highGate: ReturnType<typeof resolveHighGate>;
+  noFailOnHigh: boolean;
+  result: ReviewModeResult;
+}): number {
+  const {
+    claudeLayer,
+    claudeLayerCrashed,
+    claudeLayerExpected,
+    cmd,
+    highGate,
+    noFailOnHigh,
+    result,
+  } = opts;
+  // 1 = a reviewer failed to complete (crash / timeout / no parse) — the review is
+  // not trustworthy, so this outranks the findings gate below.
+  const allReviewed =
+    result.reviews.length > 0 &&
+    result.reviews.every((r) => r.terminalState === 'reviewed');
+  if (!allReviewed) return 1;
+  // The cold Opus (claude) reviewer is DEFAULT-ON — a THIRD reviewer, not an optional
+  // extra. If it was in the roster but did NOT complete, the review is INCOMPLETE.
+  // `--no-fail-on-high` does NOT suppress this — it only gates HIGH findings.
+  if (claudeLayerExpected) {
+    const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
+    if (!claudeReviewed) {
+      const why = claudeLayer?.claudeReview
+        ? clean(claudeLayer.claudeReview.summary).slice(0, 200)
+        : claudeLayerCrashed
+          ? 'the Opus review layer crashed'
+          : 'the Opus review layer did not run to completion';
+      console.error(
+        `ensemble-ai ${cmd}: reviewer claude failed (${why}) — review INCOMPLETE: the codex/grok core completed, the Opus reviewer did not, so this is NOT a full 3-reviewer pass`
+      );
+      return 1;
+    }
+  }
+  // 4 = the findings GATE: a completed review surfaced a HIGH — from ANY of the three reviewers
+  // (codex + grok + the cold Opus voice). The gate's DISMISS-ONLY authority may drop a HIGH ONLY
+  // when it is a citation-validated `false` under ACTIVE authority AND the trail durably wrote.
+  // Fail-closed by IDENTITY, not count (see the detectedHighIds reconstruction below).
+  if (
+    !noFailOnHigh &&
+    (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))
+  ) {
+    const detectedHighIds: string[] = [];
+    for (const r of result.reviews) {
+      if (r.terminalState !== 'reviewed') continue;
+      const voiceId = r.reviewerId ?? r.reviewer.vendor;
+      r.findings.forEach((f, i) => {
+        if (f.severity === 'high') detectedHighIds.push(`${voiceId}#${i + 1}`);
+      });
+    }
+    if (claudeLayer?.claudeReview?.ok) {
+      claudeLayer.claudeReview.findings.forEach((f, i) => {
+        if (f.severity === 'high') detectedHighIds.push(`claude#${i + 1}`);
+      });
+    }
+    const honoredDismissed = new Set(highGate.dismissedHighIds);
+    const allHighsDismissed =
+      detectedHighIds.length > 0 &&
+      highGate.gatingHighIds.length === 0 &&
+      detectedHighIds.every((id) => honoredDismissed.has(id));
+    if (!allHighsDismissed) return 4;
+  }
+  return 0;
 }
 
 // Shared by `review` (profile 'code') and `security` (profile 'security'): both run
@@ -796,6 +938,7 @@ async function reviewCommand(
         'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
         out: { type: 'string' },
+        'post-comment': { type: 'boolean' },
         pr: { type: 'string' },
         reviewers: { type: 'string' },
         'run-id': { type: 'string' },
@@ -819,6 +962,18 @@ async function reviewCommand(
 
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ('code' in source) return source.code;
+
+  // `--post-comment` is OPT-IN and PR-ONLY (publishing to GitHub is the review verb's one outward
+  // action). Refuse UPFRONT — before running a full review — when the source has no PR to post to,
+  // rather than reviewing for minutes and only then failing to post.
+  const postComment = Boolean(values['post-comment']);
+  if (postComment && !source.postTarget) {
+    console.error(
+      `ensemble-ai ${cmd}: --post-comment requires a PR diff source (--pr <N> or a PR URL) — ` +
+        'the current source has no PR to post to. Re-run against a PR, or drop --post-comment.'
+    );
+    return 3;
+  }
 
   // Convention gathering: the reviewers see the repo's real md web (root + touched
   // packages + linked/swept docs). Off with --no-conventions; a fs reader for local
@@ -942,6 +1097,9 @@ async function reviewCommand(
   // receipt (the codex-review fail-open).
   let claudeLayer: ClaudeLayerResult | null = null;
   let claudeLayerCrashed = false;
+  // Hoisted so the `--post-comment` footer can render the resolved gate seat; assigned inside the
+  // layer block (the only place the gate runs). Null under `--no-claude`/blocked (no gate ran).
+  let gateSeat: GateSeat | null = null;
   // The Opus layer runs iff claude is in the roster, the diff wasn't blocked, and a packet
   // was built. The exit gate below reuses this EXACT condition — a claude that was expected
   // to review but didn't must fail-loud; a claude legitimately not-run (blocked / no packet)
@@ -954,7 +1112,7 @@ async function reviewCommand(
     // default, with `--gate-model`/`--gate-effort` overriding the file. A `cmd` on the gate seat
     // is ignored (the gate is always a read-only `claude -p` spawn); a junk entry warns + falls
     // back. Warnings surface on stderr so a mis-config is loud, never silent.
-    const gateSeat: GateSeat = loadGateSeat(
+    gateSeat = loadGateSeat(
       VOICES_FILE,
       {
         effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
@@ -1093,82 +1251,54 @@ async function reviewCommand(
   // location, so the doc's "paths on stdout" is accurate.
   console.log(`trail: ${trailDir}`);
   if (result.blocked) return 2;
-  // 1 = a reviewer failed to complete (crash / timeout / no parse) — the review is
-  // not trustworthy, so this outranks the findings gate below.
-  const allReviewed =
-    result.reviews.length > 0 &&
-    result.reviews.every((r) => r.terminalState === 'reviewed');
-  if (!allReviewed) return 1;
-  // The cold Opus (claude) reviewer is DEFAULT-ON — a THIRD reviewer, not an optional
-  // extra. If it was in the roster but did NOT complete (spawn/parse failure → an ok:false
-  // review, or the layer crashed above), the review is INCOMPLETE: the user asked for 3
-  // reviewers and got 2. Fail-loud like a failed core reviewer (exit 1) rather than exit 0
-  // as if fully reviewed. `--no-fail-on-high` does NOT suppress this — it only gates HIGH
-  // findings, never a missing reviewer.
-  if (claudeLayerExpected) {
-    const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
-    if (!claudeReviewed) {
-      const why = claudeLayer?.claudeReview
-        ? clean(claudeLayer.claudeReview.summary).slice(0, 200)
-        : claudeLayerCrashed
-          ? 'the Opus review layer crashed'
-          : 'the Opus review layer did not run to completion';
-      console.error(
-        `ensemble-ai ${cmd}: reviewer claude failed (${why}) — review INCOMPLETE: the codex/grok core completed, the Opus reviewer did not, so this is NOT a full 3-reviewer pass`
-      );
-      return 1;
-    }
+
+  // The review's earned exit code (precedence 2 > 1 > 4 > 0). Computed BEFORE the optional
+  // --post-comment so posting is GATED on it and provably cannot change it (posting is a side
+  // effect of a completed review, never part of the gate contract).
+  const exitCode = reviewExitCode({
+    claudeLayer,
+    claudeLayerCrashed,
+    claudeLayerExpected,
+    cmd,
+    highGate,
+    noFailOnHigh: Boolean(values['no-fail-on-high']),
+    result,
+  });
+
+  // `--post-comment`: ALSO post the rendered review to the PR. COMPLETED runs ONLY — exit 0
+  // (clean) or 4 (a gating HIGH; still a finished review worth posting); never a reviewer-
+  // incomplete (1) or secret-blocked (2) run. Posting NEVER changes exitCode: a gh failure warns
+  // loudly (inside postReviewComment) and we return the SAME code the review already earned +
+  // printed. `source.postTarget` is guaranteed non-null here (the upfront refusal caught a
+  // non-PR source + --post-comment above).
+  if (postComment && source.postTarget && (exitCode === 0 || exitCode === 4)) {
+    const body = capComment(
+      renderReviewComment({
+        claudeLayer,
+        gateSeat: gateSeat ? toCommentGateSeat(gateSeat) : null,
+        headSha: result.acquired.headSha,
+        headline: oneLineSummary(result),
+        profile,
+        receipt: {
+          completed: result.receipt?.completed ?? [],
+          digest: result.receipt ? `${result.receipt.diffDigest.slice(0, 19)}…` : null,
+          error: result.receiptError ?? null,
+          path: result.receiptPath ?? null,
+          vendors: result.receipt?.vendors ?? [],
+        },
+        repoId: result.acquired.repoId,
+        reviews: result.reviews,
+        trailDir,
+      }),
+      trailDir
+    );
+    postReviewComment(body, source.postTarget, {
+      cmd,
+      log: (m) => console.error(m),
+      run: ghPostRunner(cwd),
+    });
   }
-  // 4 = the findings GATE: a completed review surfaced a HIGH — from ANY of the three reviewers
-  // (codex + grok + the cold Opus voice). Phase 2 — the gate's DISMISS-ONLY authority may drop a
-  // HIGH from the gate, but ONLY when it is a citation-validated `false` under ACTIVE authority
-  // (local provenance, or --gate-dismissals) AND the trail durably wrote. Under STRICT (foreign
-  // provenance / --strict-high) EVERY HIGH gates (today's behavior). Every Phase-1 host-forced
-  // downgrade (truncation-ineligible · invalid-citation · packet/parse/schema fail · trail-write
-  // fail) leaves its HIGH gating. A gate FAILURE yields all-`unverified` (nothing dismissed) → the
-  // HIGH still gates — and a gate failure NEVER trips exit 1 (that is reviewer-failure only,
-  // handled above). --no-fail-on-high opts out of 4 entirely. Precedence 2 > 1 > 4 > 0 intact.
-  if (
-    !values['no-fail-on-high'] &&
-    (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))
-  ) {
-    // Exit 4 UNLESS the gate honored-dismissed EVERY HIGH. `highGate.dismissedHighIds`/`gatingHighIds`
-    // come from the gate RECORDS, reconciled from the reviews RE-READ from the trail
-    // (loadVoiceReviewsFromTrail → readReviewsForRun / reviewJsonFromTrail, both of which SILENTLY DROP
-    // a review that fails to read back). The "is there a HIGH" trigger above, by contrast, reads the
-    // IN-MEMORY reviews. Trusting "all gate-HIGHs dismissed" alone is FAIL-OPEN — and so is an equal
-    // COUNT check (dismissed.length === detected.length): a two-source divergence (a trail read-back
-    // gap · a stale reused run-id · a concurrent same-run-id run) can leave the tallies EQUAL while the
-    // record set adjudicated a DIFFERENT HIGH than the in-memory one, dismissing the wrong finding and
-    // slipping a real HIGH to exit 0 (codex-f1 · grok-f3). Fail-closed by IDENTITY, not count:
-    // reconstruct the id of EVERY in-memory HIGH in the gate's own `${voiceId}#${n}` namespace
-    // (flattenFindings), from the SAME authoritative source the trigger keys off (core reviews that
-    // reached `terminalState === 'reviewed'` + an ok Opus voice), and require the honored-dismissed set
-    // to COVER every one — with none left gating. A HIGH the records never adjudicated is absent from
-    // the dismissed set, so it gates; it can never slip through on a coincidental count match. (voiceId
-    // mirrors storedToVoiceReview — `reviewerId ?? reviewer.vendor`; the index is the finding's
-    // position in its reviewer's full findings array, the exact key flattenFindings assigns.)
-    const detectedHighIds: string[] = [];
-    for (const r of result.reviews) {
-      if (r.terminalState !== 'reviewed') continue;
-      const voiceId = r.reviewerId ?? r.reviewer.vendor;
-      r.findings.forEach((f, i) => {
-        if (f.severity === 'high') detectedHighIds.push(`${voiceId}#${i + 1}`);
-      });
-    }
-    if (claudeLayer?.claudeReview?.ok) {
-      claudeLayer.claudeReview.findings.forEach((f, i) => {
-        if (f.severity === 'high') detectedHighIds.push(`claude#${i + 1}`);
-      });
-    }
-    const honoredDismissed = new Set(highGate.dismissedHighIds);
-    const allHighsDismissed =
-      detectedHighIds.length > 0 &&
-      highGate.gatingHighIds.length === 0 &&
-      detectedHighIds.every((id) => honoredDismissed.has(id));
-    if (!allHighsDismissed) return 4;
-  }
-  return 0;
+  return exitCode;
 }
 
 const BRAINSTORM_USAGE = `ensemble-ai brainstorm — convene multiple AI voices on a TOPIC.
