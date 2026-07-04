@@ -811,7 +811,9 @@ function ghPostRunner(cwd: string): PostRunner {
           ok: false,
         };
       }
-      const stderr = err.stderr ? String(err.stderr).trim() : '';
+      // Bound the excerpt (gh's stderr can be up to maxBuffer) so a huge error can't become a
+      // multi-MB warning line — same capping discipline as every other rendered excerpt.
+      const stderr = err.stderr ? String(err.stderr).trim().slice(0, 500) : '';
       return { error: stderr || err.message || 'gh pr comment failed', ok: false };
     }
   };
@@ -1267,35 +1269,43 @@ async function reviewCommand(
 
   // `--post-comment`: ALSO post the rendered review to the PR. COMPLETED runs ONLY — exit 0
   // (clean) or 4 (a gating HIGH; still a finished review worth posting); never a reviewer-
-  // incomplete (1) or secret-blocked (2) run. Posting NEVER changes exitCode: a gh failure warns
-  // loudly (inside postReviewComment) and we return the SAME code the review already earned +
-  // printed. `source.postTarget` is guaranteed non-null here (the upfront refusal caught a
-  // non-PR source + --post-comment above).
+  // incomplete (1) or secret-blocked (2) run. Posting NEVER changes exitCode: the WHOLE
+  // render+post is wrapped so even a rendering throw (not just a gh failure, which
+  // postReviewComment already swallows) degrades to a loud warning — we always return the SAME
+  // code the review already earned + printed. `source.postTarget` is guaranteed non-null here (the
+  // upfront refusal caught a non-PR source + --post-comment above).
   if (postComment && source.postTarget && (exitCode === 0 || exitCode === 4)) {
-    const body = capComment(
-      renderReviewComment({
-        claudeLayer,
-        gateSeat: gateSeat ? toCommentGateSeat(gateSeat) : null,
-        headSha: result.acquired.headSha,
-        headline: oneLineSummary(result),
-        profile,
-        receipt: {
-          completed: result.receipt?.completed ?? [],
-          digest: result.receipt ? `${result.receipt.diffDigest.slice(0, 19)}…` : null,
-          error: result.receiptError ?? null,
-          path: result.receiptPath ?? null,
-        },
-        repoId: result.acquired.repoId,
-        reviews: result.reviews,
-        trailDir,
-      }),
-      trailDir
-    );
-    postReviewComment(body, source.postTarget, {
-      cmd,
-      log: (m) => console.error(m),
-      run: ghPostRunner(cwd),
-    });
+    try {
+      const body = capComment(
+        renderReviewComment({
+          claudeLayer,
+          gateSeat: gateSeat ? toCommentGateSeat(gateSeat) : null,
+          headSha: result.acquired.headSha,
+          headline: oneLineSummary(result),
+          profile,
+          receipt: {
+            completed: result.receipt?.completed ?? [],
+            digest: result.receipt ? `${result.receipt.diffDigest.slice(0, 19)}…` : null,
+            error: result.receiptError ?? null,
+            path: result.receiptPath ?? null,
+          },
+          repoId: result.acquired.repoId,
+          reviews: result.reviews,
+          trailDir,
+        }),
+        trailDir
+      );
+      postReviewComment(body, source.postTarget, {
+        cmd,
+        log: (m) => console.error(m),
+        run: ghPostRunner(cwd),
+      });
+    } catch (e) {
+      console.error(
+        `⚠ --post-comment: could NOT render/post the comment — ${e instanceof Error ? e.message : String(e)}. ` +
+          `The review above and its exit code are unaffected (posting never changes the gate contract).`
+      );
+    }
   }
   return exitCode;
 }

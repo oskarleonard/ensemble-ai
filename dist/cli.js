@@ -3874,7 +3874,8 @@ var VERDICT_TAG = {
   unverified: "unverified"
 };
 function md(s) {
-  return scrubControl(s);
+  const scrubbed = scrubControl(s);
+  return /^[`~#>*+|-]/.test(scrubbed) ? `\\${scrubbed}` : scrubbed;
 }
 function code(s) {
   return scrubControl(s).replace(/`/g, "'");
@@ -4027,7 +4028,7 @@ function postReviewComment(body, target, opts) {
   try {
     result = opts.run(args, body);
   } catch (e) {
-    result = { error: e.message, ok: false };
+    result = { error: e instanceof Error ? e.message : String(e), ok: false };
   }
   if (result.ok) {
     log(`\xB7 posted the ${cmd} to ${where}${result.url ? ` \u2014 ${result.url}` : ""}`);
@@ -4710,7 +4711,7 @@ function ghPostRunner(cwd) {
           ok: false
         };
       }
-      const stderr = err.stderr ? String(err.stderr).trim() : "";
+      const stderr = err.stderr ? String(err.stderr).trim().slice(0, 500) : "";
       return { error: stderr || err.message || "gh pr comment failed", ok: false };
     }
   };
@@ -4988,30 +4989,36 @@ async function reviewCommand(args, profile = "code") {
     result
   });
   if (postComment && source.postTarget && (exitCode === 0 || exitCode === 4)) {
-    const body = capComment(
-      renderReviewComment({
-        claudeLayer,
-        gateSeat: gateSeat ? toCommentGateSeat(gateSeat) : null,
-        headSha: result.acquired.headSha,
-        headline: oneLineSummary(result),
-        profile,
-        receipt: {
-          completed: result.receipt?.completed ?? [],
-          digest: result.receipt ? `${result.receipt.diffDigest.slice(0, 19)}\u2026` : null,
-          error: result.receiptError ?? null,
-          path: result.receiptPath ?? null
-        },
-        repoId: result.acquired.repoId,
-        reviews: result.reviews,
+    try {
+      const body = capComment(
+        renderReviewComment({
+          claudeLayer,
+          gateSeat: gateSeat ? toCommentGateSeat(gateSeat) : null,
+          headSha: result.acquired.headSha,
+          headline: oneLineSummary(result),
+          profile,
+          receipt: {
+            completed: result.receipt?.completed ?? [],
+            digest: result.receipt ? `${result.receipt.diffDigest.slice(0, 19)}\u2026` : null,
+            error: result.receiptError ?? null,
+            path: result.receiptPath ?? null
+          },
+          repoId: result.acquired.repoId,
+          reviews: result.reviews,
+          trailDir
+        }),
         trailDir
-      }),
-      trailDir
-    );
-    postReviewComment(body, source.postTarget, {
-      cmd,
-      log: (m) => console.error(m),
-      run: ghPostRunner(cwd)
-    });
+      );
+      postReviewComment(body, source.postTarget, {
+        cmd,
+        log: (m) => console.error(m),
+        run: ghPostRunner(cwd)
+      });
+    } catch (e) {
+      console.error(
+        `\u26A0 --post-comment: could NOT render/post the comment \u2014 ${e instanceof Error ? e.message : String(e)}. The review above and its exit code are unaffected (posting never changes the gate contract).`
+      );
+    }
   }
   return exitCode;
 }

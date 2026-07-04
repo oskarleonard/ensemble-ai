@@ -81,12 +81,19 @@ const VERDICT_TAG: Record<GateVerdict, string> = {
 };
 
 // Reviewer/gate/synthesis text is UNTRUSTED (a crafted diff can induce a reviewer to emit
-// arbitrary strings). scrubControl already strips control chars + collapses whitespace to one
-// line — which also keeps every rendered value on a SINGLE markdown line so untrusted text can
-// never break the comment's block structure. md() is that scrub; code() additionally neutralizes
-// backticks so a path/ref can't break out of an inline code span.
+// arbitrary strings). scrubControl strips control chars + collapses whitespace to one line, so an
+// untrusted value can't inject a MULTI-line block — but a single line whose first char is a
+// block-level marker still can: a leading ``` opens a fenced code block that swallows the rest of
+// the comment (hiding the gate verdicts + findings), and #/>/-/* spoof a heading/quote/list.
+// md() therefore ALSO backslash-escapes a leading block-punctuation char, so a scrubbed value
+// renders as literal text wherever it lands (standalone line, list item, or blockquote) and can
+// never open a block. code() instead neutralizes backticks so a path/ref can't break out of an
+// inline code span.
 function md(s: string): string {
-  return scrubControl(s);
+  const scrubbed = scrubControl(s);
+  // `-` is last in the class so it's a literal, not a range. Ordered-list digits are left alone
+  // (a leading `1.` garbles only its own line, never swallows — not worth mangling numeric prose).
+  return /^[`~#>*+|-]/.test(scrubbed) ? `\\${scrubbed}` : scrubbed;
 }
 function code(s: string): string {
   return scrubControl(s).replace(/`/g, "'");
@@ -296,7 +303,10 @@ export function postReviewComment(
   try {
     result = opts.run(args, body);
   } catch (e) {
-    result = { error: (e as Error).message, ok: false };
+    // A runner MUST report failure by returning {ok:false}, but backstop a throw anyway — and read
+    // the message defensively (`throw null`/a non-Error would make `(e as Error).message` throw
+    // INSIDE the catch and escape, breaking the "NEVER throws" contract above).
+    result = { error: e instanceof Error ? e.message : String(e), ok: false };
   }
   if (result.ok) {
     log(`· posted the ${cmd} to ${where}${result.url ? ` — ${result.url}` : ''}`);
