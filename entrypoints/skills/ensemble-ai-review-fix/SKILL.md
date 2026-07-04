@@ -30,12 +30,19 @@ cross-vendor review, forwarding the user's diff-source arguments:
 ensemble-ai review $ARGUMENTS
 ```
 
-- **Sanitize `$ARGUMENTS` before running it.** The ONLY things that belong there are the
-  diff-source flags (`<pr-url>` · `--pr <N>` · `--staged` · `--working-tree` · `--diff-file
-  <path>`; at most one — no flag reviews the current branch vs its merge-base) plus
-  `--reviewers`/`--no-claude`/`--out`. If it carries any shell metacharacter (`;` `|` `&`
-  `` ` `` `$(` `>` `<`, a newline, or quote-breakouts) or anything outside that grammar, do NOT
-  run it — stop and report. Never let user text execute as a second command.
+- **Sanitize `$ARGUMENTS`, then pass it as explicit args — never paste it into a shell.** The
+  `$ARGUMENTS` in the block above stands for the user's diff-source selection; treat it as
+  UNTRUSTED. The ONLY things that belong there are the diff-source flags (`<pr-url>` · `--pr <N>` ·
+  `--staged` · `--working-tree` · `--diff-file <path>`; at most one — no flag reviews the current
+  branch vs its merge-base) plus `--reviewers`/`--out`. **`--no-claude` is NOT allowed here** — the
+  fix loop is driven by the gate's `gate-verdicts.json` (§3), which only the Claude gate produces;
+  disabling it leaves no verdicts to fix. Reject the run if `$ARGUMENTS` carries ANY shell
+  metacharacter or expansion: `;` `|` `&` `` ` ``, `$` in ANY form (`$(…)`, and `${IFS}`/`$VAR` —
+  parameter expansion word-splits into extra flags, so a bare `$` alone is disqualifying, not just
+  `$(`), `>` `<`, a glob/expansion char (`*` `?` `[` `~`), a newline, or a quote-breakout — or
+  anything outside that grammar. Then invoke the CLI with each validated token as a SEPARATE
+  argument (build the argv), so nothing is re-interpreted by a shell — a denylist is not a sandbox.
+  Never let user text run as a second command or slip in an extra flag (e.g. `--post-comment`).
 - `ensemble-ai review` spawns Codex + Grok + a cold Opus as three blind peers, then a Claude
   **gate** pass grounds each finding against its cited hunk → `agree` / `partial` / `false` /
   `unverified`. It writes ONLY its trail; it never edits code.
@@ -65,7 +72,15 @@ the review produced findings read-only; the fixes are your own subsequent, verif
 
 ## 4 · Re-review until clean — ≤ 3 rounds
 
-Re-run `ensemble-ai review` (same source) to confirm your fixes landed and introduced nothing new.
+Re-run `ensemble-ai review` over the code AS FIXED — the exact tree the PR would open from — to
+confirm your fixes landed and introduced nothing new. **Re-review the right thing, not a now-stale
+source**: your fixes are commits on the branch, so a naive "same source" re-run can review the
+WRONG code and read as a false "clean" — if the first review ran over `--working-tree`/`--staged`,
+re-review the branch (committing emptied that source); if it ran over `--pr <N>`/a PR URL, PUSH
+your commits first (the reviewer fetches the PR head from GitHub, not your local edits); if it ran
+over `--diff-file`, regenerate that diff. The final reviewed SHA must equal the head the PR opens
+from. (This skill fixes code you have checked out; if `$ARGUMENTS` targets a PR/diff for code not
+in your working tree, you can't edit it here — say so and stop.)
 Loop **fix → re-review at most 3 times total**. Stop when the review is clean (no gating HIGH, no
 new agree/partial) OR after the 3rd round. **If it is still not clean after 3 rounds, STOP and
 surface it honestly** — list what remains and why (a genuine disagreement, a fix that needs a

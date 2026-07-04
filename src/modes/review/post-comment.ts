@@ -81,20 +81,29 @@ const VERDICT_TAG: Record<GateVerdict, string> = {
 };
 
 // Reviewer/gate/synthesis text is UNTRUSTED (a crafted diff can induce a reviewer to emit
-// arbitrary strings). scrubControl strips control chars + collapses whitespace to one line, so an
-// untrusted value can't inject a MULTI-line block — but a single line whose first char is a
-// block-level marker still can: a leading ``` opens a fenced code block that swallows the rest of
-// the comment (hiding the gate verdicts + findings), and #/>/-/* spoof a heading/quote/list.
-// md() therefore ALSO backslash-escapes a leading block-punctuation char, so a scrubbed value
-// renders as literal text wherever it lands (standalone line, list item, or blockquote) and can
-// never open a block. code() instead neutralizes backticks so a path/ref can't break out of an
-// inline code span.
+// arbitrary strings). md() is the scrub for a value rendered in normal markdown FLOW (a heading,
+// list item, prose line, or `<sub>` attribute); code() is for a value inside an inline code span.
+// scrubControl strips control chars + collapses whitespace to one line, so an untrusted value can't
+// inject a MULTI-line block on its own — but two single-line vectors remain, both closed here:
+//   1. Raw HTML — GitHub renders a whitelist (<details>/<summary>/<h1>/<!-- … -->/…), so a value
+//      like `<details><summary>Clean</summary>` or an HTML comment could COLLAPSE or HIDE the gate
+//      + findings beneath it, or spoof approval. HTML-escaping &,<,> renders them as literal text
+//      (the entity shows as the char) and closes every raw-HTML vector — leading OR embedded. `&`
+//      MUST be escaped first so the < / > entities aren't themselves double-escaped.
+//   2. A leading Markdown block marker — a ``` fence swallows the rest of the comment; #/-/*/~/|
+//      spoof a heading/list/table. Backslash-escape a leading one so the value stays literal
+//      wherever it lands (standalone line, list item, or blockquote). `<`/`>` are already entity-
+//      escaped in step 1, so blockquote (`>`) needs no entry here; `-` is class-last (a literal,
+//      not a range); ordered-list digits are left alone (a leading `1.` garbles only its own line).
 function md(s: string): string {
-  const scrubbed = scrubControl(s);
-  // `-` is last in the class so it's a literal, not a range. Ordered-list digits are left alone
-  // (a leading `1.` garbles only its own line, never swallows — not worth mangling numeric prose).
-  return /^[`~#>*+|-]/.test(scrubbed) ? `\\${scrubbed}` : scrubbed;
+  const scrubbed = scrubControl(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  return /^[`~#*+|-]/.test(scrubbed) ? `\\${scrubbed}` : scrubbed;
 }
+// Inside an inline code span raw HTML/markdown is inert, so no entity-escaping is needed — only
+// neutralize backticks so the value can't terminate the span and break back out into markdown.
 function code(s: string): string {
   return scrubControl(s).replace(/`/g, "'");
 }
@@ -180,7 +189,7 @@ function gateSection(records: GateVerdictRecord[], trailWritten: boolean): strin
     const reason = r.reason ? ` — ${md(r.reason).slice(0, 300)}` : '';
     const dg = r.downgradeReason ? `  _(host: ${md(r.downgradeReason)})_` : '';
     out.push(
-      `- **[${VERDICT_TAG[r.effectiveVerdict]}]** \`${md(r.findingId)}\` · ${SEVERITY_LABEL[r.severity]} · \`${where}\` — ${md(r.title).slice(0, 160)}${reason}${dg}`
+      `- **[${VERDICT_TAG[r.effectiveVerdict]}]** \`${code(r.findingId)}\` · ${SEVERITY_LABEL[r.severity]} · \`${where}\` — ${md(r.title).slice(0, 160)}${reason}${dg}`
     );
   }
   const c = verdictCounts(records);
@@ -200,7 +209,7 @@ export function renderReviewComment(input: RenderCommentInput): string {
   const out: string[] = [];
   out.push(`## 🔭 ensemble-ai ${kind} — cross-vendor review`);
   out.push('');
-  out.push(`\`${md(input.headline)}\``);
+  out.push(`\`${code(input.headline)}\``);
   out.push('');
   out.push(`head \`${code(input.headSha)}\`${input.repoId ? ` · repo \`${code(input.repoId)}\`` : ''}`);
 

@@ -3874,8 +3874,8 @@ var VERDICT_TAG = {
   unverified: "unverified"
 };
 function md(s) {
-  const scrubbed = scrubControl(s);
-  return /^[`~#>*+|-]/.test(scrubbed) ? `\\${scrubbed}` : scrubbed;
+  const scrubbed = scrubControl(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return /^[`~#*+|-]/.test(scrubbed) ? `\\${scrubbed}` : scrubbed;
 }
 function code(s) {
   return scrubControl(s).replace(/`/g, "'");
@@ -3941,7 +3941,7 @@ function gateSection(records, trailWritten) {
     const reason = r.reason ? ` \u2014 ${md(r.reason).slice(0, 300)}` : "";
     const dg = r.downgradeReason ? `  _(host: ${md(r.downgradeReason)})_` : "";
     out.push(
-      `- **[${VERDICT_TAG[r.effectiveVerdict]}]** \`${md(r.findingId)}\` \xB7 ${SEVERITY_LABEL[r.severity]} \xB7 \`${where}\` \u2014 ${md(r.title).slice(0, 160)}${reason}${dg}`
+      `- **[${VERDICT_TAG[r.effectiveVerdict]}]** \`${code(r.findingId)}\` \xB7 ${SEVERITY_LABEL[r.severity]} \xB7 \`${where}\` \u2014 ${md(r.title).slice(0, 160)}${reason}${dg}`
     );
   }
   const c = verdictCounts(records);
@@ -3957,7 +3957,7 @@ function renderReviewComment(input) {
   const out = [];
   out.push(`## \u{1F52D} ensemble-ai ${kind} \u2014 cross-vendor review`);
   out.push("");
-  out.push(`\`${md(input.headline)}\``);
+  out.push(`\`${code(input.headline)}\``);
   out.push("");
   out.push(`head \`${code(input.headSha)}\`${input.repoId ? ` \xB7 repo \`${code(input.repoId)}\`` : ""}`);
   if (claudeLayer) {
