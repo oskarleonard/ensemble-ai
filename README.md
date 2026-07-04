@@ -6,6 +6,22 @@ Modes (architected mode-first): **`review`** (a code diff), **`security`** (a co
 
 It's the portable engine behind a cross-vendor *code review* workflow: give it a `git diff`, it runs each configured reviewer **read-only in an OS-enforced sandbox**, parses their output into typed findings, and writes a self-describing trail plus a content-tied receipt. It emits **facts** (findings + per-reviewer execution status + coverage + a receipt) — **never a gate verdict**. The gate policy belongs to whatever consumes it (a terminal, a pre-PR hook, a dashboard).
 
+## Commands at a glance
+
+| Command | What it does | Key flags |
+| --- | --- | --- |
+| `ensemble-ai review [<pr-url>]` | Self-contained cross-vendor code review — Codex + Grok + a cold Opus as blind peers, then a Claude **gate** grounds each finding (`agree`/`partial`/`false`/`unverified`) + a synthesis. | source: `--pr <N\|url>` · `--staged` · `--working-tree` · `--diff-file <p>` · stdin (default: current branch) · `--reviewers <ids>` · `--no-claude` · gate: `--strict-high` · `--gate-dismissals` · `--gate-model`/`--gate-effort` · `--no-fail-on-high` · **`--post-comment`** (also post to the PR — PR source only) · `--out <dir>` |
+| `ensemble-ai security [<pr-url>]` | `review` under a security-auditor lens + a local dependency-surface flag; findings tagged by class. | identical to `review` (same sources, gate flags, `--post-comment`) |
+| `ensemble-ai brainstorm "<topic>"` | Cross-vendor ideation: each voice generates → critiques the others → one synthesizes a ranked, deduped recommendation. | `--file <p>` · `--voices <ids>` · `--synthesizer <id>` · `--timeout <s>` · `--json` |
+| `ensemble-ai consult "<q>"` (alias `ask`) | Cross-vendor Q&A: each voice answers independently → one synthesizes AGREE (confident) vs DIVERGE (look closer) + a bottom line. | `--file <p>` · `--critique` · `--voices <ids>` · `--synthesizer <id>` · `--json` |
+| `ensemble-ai receipt verify\|show` | The content-tied gate primitive: `verify` exits 0 iff the current diff is reviewed & current; `show` pretty-prints a receipt. | `--strict`/`--require-artifacts` · `--trail <dir>` · `--store <dir>` · `--staged` · `--working-tree` · `--reviewers <ids>` |
+| `ensemble-ai reviewers` (alias `config`) | Print the **resolved** seats — reviewers (`reviewers.json`) + voices (`voices.json`): id · vendor · model · effort · sandbox + source file. Read-only. | `--json` · `--reviewers-file <p>` · `--voices-file <p>` |
+| `ensemble-ai diff [<pr-url>]` | Cost-preview / debug: the exact packet the reviewers WOULD get (identity + coverage + prompt size) — no vendor called. | same diff sources as `review` · `--profile code\|security` · `--full` · `--json` |
+| **Claude skills** | Slash wrappers: `/ensemble-ai-review` · `/ensemble-ai-security` · `/ensemble-ai-brainstorm` · `/ensemble-ai-consult` (thin) + **`/ensemble-ai-review-fix`** — the pre-PR ritual (simplify → review → fix the gate verdicts → re-review → offer a PR). | installed per config dir via `entrypoints/install.sh` |
+| **Pre-PR gate hook** | A Claude Code `PreToolUse` hook (`ensemble-ai-pre-pr-gate`) that BLOCKS `gh pr create` on a diff with no valid review receipt (fail-open if the CLI is missing; overridable). | runs `receipt verify --strict` under the hood |
+
+Full flags for any command: `ensemble-ai <command> --help`.
+
 ## Install
 
 No npm release yet — install from git:

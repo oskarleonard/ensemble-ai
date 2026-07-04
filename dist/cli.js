@@ -395,6 +395,8 @@ array with a "summary" that says so. Do not invent issues to fill the list.`;
 function oneOf(set, v, fallback) {
   return set.includes(v) ? v : fallback;
 }
+var SEVERITY_LABEL = { high: "HIGH", low: "LOW", medium: "MED" };
+var SEVERITY_ORDER = ["high", "medium", "low"];
 function evidenceRef(file, line, scrub = (s) => s) {
   if (!file) return "(uncited)";
   const f = scrub(file);
@@ -2426,8 +2428,8 @@ function windowHunk(hunk, bodyIndex, radius = HUNK_WINDOW_LINES) {
 function hunkCodeLines(hunk) {
   const out = [];
   for (const l of hunk.body) {
-    const code = l.length > 0 && /^[ +-]/.test(l) ? l.slice(1) : l;
-    const norm = code.replace(/\s+/g, " ").trim();
+    const code2 = l.length > 0 && /^[ +-]/.test(l) ? l.slice(1) : l;
+    const norm = code2.replace(/\s+/g, " ").trim();
     if (norm) out.push(norm);
   }
   return out;
@@ -3859,6 +3861,185 @@ function selectDiffSource(flags) {
   return { kind: "commit" };
 }
 
+// src/modes/review/post-comment.ts
+var GITHUB_COMMENT_MAX = 65536;
+function postTargetFromSelection(sel) {
+  if (sel.kind !== "pr" || typeof sel.pr !== "number") return null;
+  return sel.owner && sel.repo ? { pr: sel.pr, repoSlug: `${sel.owner}/${sel.repo}` } : { pr: sel.pr };
+}
+var VERDICT_TAG = {
+  agree: "agree",
+  false: "false-dismissed",
+  partial: "partial",
+  unverified: "unverified"
+};
+function md(s) {
+  const scrubbed = scrubControl(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return /^[`~#*+|-]/.test(scrubbed) ? `\\${scrubbed}` : scrubbed;
+}
+function code(s) {
+  return scrubControl(s).replace(/`/g, "'");
+}
+function findingItem(f, profile) {
+  const ref = evidenceRef(f.evidence.file, f.evidence.line, code);
+  if (profile === "security") {
+    const cls = classifySecurityFinding(f);
+    return `- \`${ref}\` \u2014 [${cls}] ${md(stripSecurityTag(f.title))}`;
+  }
+  return `- \`${ref}\` \u2014 ${md(f.title)}`;
+}
+function reviewerBlock(id, vendor, model, reviewed, findings, summary, profile) {
+  const state = reviewed ? "reviewed" : "failed";
+  const out = ["", `#### ${md(id)} \u2014 ${state} <sub>[${md(vendor)}/${md(model)}]</sub>`];
+  if (!reviewed) {
+    out.push(`> ${md(summary).slice(0, 300)}`);
+    return out;
+  }
+  if (findings.length === 0) {
+    out.push("_no findings_");
+    return out;
+  }
+  for (const sev of SEVERITY_ORDER) {
+    const group = findings.filter((f) => f.severity === sev);
+    if (group.length === 0) continue;
+    out.push(`**${SEVERITY_LABEL[sev]}**`);
+    for (const f of group) out.push(findingItem(f, profile));
+  }
+  return out;
+}
+function synthesisSection(s) {
+  const out = [
+    "",
+    `### Synthesis${s.by ? ` (by ${md(s.by)})` : ""}${s.degraded ? " \u2014 \u26A0 DEGRADED (deterministic fallback, not cross-confirmed)" : ""}`
+  ];
+  if (s.summary) out.push("", md(s.summary));
+  if (s.agreements.length > 0) {
+    out.push("", "**\u2713 Agree (confident)**");
+    for (const a of s.agreements) {
+      const who = a.voices.length ? `  _[${a.voices.map(md).join(", ")}]_` : "";
+      out.push(`- ${md(a.point)}${who}`);
+    }
+  }
+  if (s.disagreements.length > 0) {
+    out.push("", "**\u26A0 Disagree (look closer)**");
+    for (const d of s.disagreements) {
+      out.push(`- ${md(d.point)}`);
+      for (const p of d.positions) out.push(`  - ${md(p)}`);
+    }
+  }
+  if (s.bottomLine) out.push("", "**\u2192 Bottom line**", "", md(s.bottomLine));
+  return out;
+}
+function gateSection(records, trailWritten) {
+  const out = ["", "### Gate \u2014 grounded verdicts"];
+  if (records.length === 0) {
+    out.push("_no findings to verdict_");
+    return out;
+  }
+  for (const r of records) {
+    const where = evidenceRef(r.file, r.line, code);
+    const reason = r.reason ? ` \u2014 ${md(r.reason).slice(0, 300)}` : "";
+    const dg = r.downgradeReason ? `  _(host: ${md(r.downgradeReason)})_` : "";
+    out.push(
+      `- **[${VERDICT_TAG[r.effectiveVerdict]}]** \`${code(r.findingId)}\` \xB7 ${SEVERITY_LABEL[r.severity]} \xB7 \`${where}\` \u2014 ${md(r.title).slice(0, 160)}${reason}${dg}`
+    );
+  }
+  const c = verdictCounts(records);
+  out.push(
+    "",
+    `_${c.agree} agree \xB7 ${c.partial} partial \xB7 ${c.false} false (dismissed) \xB7 ${c.unverified} unverified \u2014 gate trail ${trailWritten ? "written" : "NOT durably written (dismissals not honored)"}_`
+  );
+  return out;
+}
+function renderReviewComment(input) {
+  const { profile, claudeLayer, reviews, receipt } = input;
+  const kind = profile === "security" ? "security" : "review";
+  const out = [];
+  out.push(`## \u{1F52D} ensemble-ai ${kind} \u2014 cross-vendor review`);
+  out.push("");
+  out.push(`\`${code(input.headline)}\``);
+  out.push("");
+  out.push(`head \`${code(input.headSha)}\`${input.repoId ? ` \xB7 repo \`${code(input.repoId)}\`` : ""}`);
+  if (claudeLayer) {
+    out.push(...synthesisSection(claudeLayer.synthesis));
+    out.push(...gateSection(claudeLayer.gateVerdicts, claudeLayer.gateTrailWritten));
+  }
+  out.push("", "### Findings by reviewer");
+  for (const r of reviews) {
+    const id = r.reviewerId ?? r.reviewer.vendor;
+    out.push(
+      ...reviewerBlock(
+        id,
+        r.reviewer.vendor,
+        r.reviewer.model,
+        r.terminalState === "reviewed",
+        r.findings,
+        r.summary,
+        profile
+      )
+    );
+  }
+  const cr = claudeLayer?.claudeReview;
+  if (cr) {
+    out.push(
+      ...reviewerBlock(
+        "claude",
+        "anthropic",
+        claudeLayer.modelLabel,
+        cr.ok,
+        cr.findings,
+        cr.summary,
+        profile
+      )
+    );
+  }
+  const receiptLine = receipt.path ? `receipt \`${code(receipt.path)}\`${receipt.digest ? ` (${code(receipt.digest)})` : ""}` : `receipt none \u2014 ${md(receipt.error ?? "not qualified")}`;
+  const seat = input.gateSeat;
+  const seatLine = seat ? `gate seat anthropic/${md(seat.model)} @ ${md(seat.effort)} (model: ${seat.modelSource}, effort: ${seat.effortSource})` : "gate seat n/a (no gate ran)";
+  const completed = receipt.completed.length ? ` \xB7 completed: ${receipt.completed.map(md).join(", ")}` : "";
+  out.push("", "---");
+  out.push(
+    `<sub>trail \`${code(input.trailDir)}\` \xB7 ${receiptLine}${completed} \xB7 ${seatLine} \xB7 posted by \`ensemble-ai\`</sub>`
+  );
+  return out.join("\n");
+}
+function capComment(body, trailDir, maxLen = GITHUB_COMMENT_MAX) {
+  if (body.length <= maxLen) return body;
+  const marker = `
+
+> **\u26A0 Comment truncated by ensemble-ai** \u2014 the full review exceeded GitHub's ${maxLen}-character comment limit. Read the complete trail at \`${scrubControl(trailDir)}\`.`;
+  const room = Math.max(0, maxLen - marker.length);
+  return body.slice(0, room) + marker;
+}
+function postReviewComment(body, target, opts) {
+  const log = opts.log ?? (() => {
+  });
+  const cmd = opts.cmd ?? "review";
+  const where = target.repoSlug ? `${target.repoSlug} PR #${target.pr}` : `PR #${target.pr}`;
+  const args = [
+    "pr",
+    "comment",
+    String(target.pr),
+    ...target.repoSlug ? ["-R", target.repoSlug] : [],
+    "--body-file",
+    "-"
+  ];
+  let result;
+  try {
+    result = opts.run(args, body);
+  } catch (e) {
+    result = { error: e instanceof Error ? e.message : String(e), ok: false };
+  }
+  if (result.ok) {
+    log(`\xB7 posted the ${cmd} to ${where}${result.url ? ` \u2014 ${result.url}` : ""}`);
+  } else {
+    log(
+      `\u26A0 --post-comment: could NOT post to ${where} \u2014 ${result.error}. The review above and its exit code are unaffected (posting never changes the gate contract).`
+    );
+  }
+  return result;
+}
+
 // src/plumbing/diff-preview.ts
 function buildPacketPreview(acquired, profile, agentsMd) {
   const packet = assembleCodePacket({
@@ -4103,6 +4284,9 @@ Options:
                         reviewer, else it mostly returns unverified \u2014 the toothless mode)
   --gate-effort <e>     effort for the GATE seat (low|medium|high|xhigh|max) \u2014 overrides the
                         file; an unknown value is ignored (\`ensemble-ai config\` shows the seat)
+  --post-comment        after a COMPLETED review, ALSO post it to the PR as one markdown comment
+                        via \`gh pr comment\` (opt-in; REQUIRES a PR source \u2014 --pr <N> or a PR URL).
+                        A gh failure warns loudly and leaves the review + exit code UNCHANGED.
   --out <dir>           trail BASE dir; a per-run <run-id>/ subdir is created under it
                         (default: repo-local .ensemble-ai/reviews when reviewing this
                         repo's own diff, else an OS temp dir \u2014 the path is printed)
@@ -4351,12 +4535,6 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
       return { localRepoTrail: true };
   }
 }
-var SEVERITY_LABEL = {
-  high: "HIGH",
-  low: "LOW",
-  medium: "MED"
-};
-var SEVERITY_ORDER = ["high", "medium", "low"];
 function hasHighFinding(reviews) {
   return reviews.some(
     (r) => r.terminalState === "reviewed" && r.findings.some((f) => f.severity === "high")
@@ -4385,7 +4563,7 @@ function findingLine(f, profile) {
   }
   return `       ${ref}  ${scrubControl(f.title)}`;
 }
-function reviewerBlock(r, profile) {
+function reviewerBlock2(r, profile) {
   const id = r.reviewerId ?? r.reviewer.vendor;
   const out = [];
   out.push("");
@@ -4452,7 +4630,7 @@ function printSummary(result, profile) {
     console.error(out.join("\n"));
     return;
   }
-  for (const r of result.reviews) out.push(...reviewerBlock(r, profile));
+  for (const r of result.reviews) out.push(...reviewerBlock2(r, profile));
   out.push("");
   if (result.receipt) {
     out.push(`  receipt: ${result.receiptPath}`);
@@ -4509,7 +4687,82 @@ function resolveDiffSourceForCommand(values, positionals, cmd, cwd) {
     console.error(`ensemble-ai ${cmd}: ${selection.error}`);
     return { code: 3 };
   }
-  return resolveSource(selection, cwd, stdinContent, cmd);
+  const resolved = resolveSource(selection, cwd, stdinContent, cmd);
+  if ("code" in resolved) return resolved;
+  return { ...resolved, postTarget: postTargetFromSelection(selection) };
+}
+function ghPostRunner(cwd) {
+  return (args, body) => {
+    try {
+      const out = execFileSync3("gh", args, {
+        cwd,
+        encoding: "utf8",
+        input: body,
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: 12e4
+      });
+      const url = out.split("\n").map((l) => l.trim()).filter(Boolean).pop();
+      return url && /^https?:\/\//.test(url) ? { ok: true, url } : { ok: true };
+    } catch (e) {
+      const err = e;
+      if (err.code === "ENOENT") {
+        return {
+          error: "the `gh` CLI is not on PATH \u2014 install GitHub CLI and run `gh auth login`",
+          ok: false
+        };
+      }
+      const stderr = err.stderr ? String(err.stderr).trim().slice(0, 500) : "";
+      return { error: stderr || err.message || "gh pr comment failed", ok: false };
+    }
+  };
+}
+function toCommentGateSeat(seat) {
+  const model = claudeModelLabel(seat.config);
+  const effort = seat.config.effort && seat.config.effort !== "default" ? seat.config.effort : "default";
+  return { effort, effortSource: seat.effortSource, model, modelSource: seat.modelSource };
+}
+function reviewExitCode(opts) {
+  const {
+    claudeLayer,
+    claudeLayerCrashed,
+    claudeLayerExpected,
+    cmd,
+    highGate,
+    noFailOnHigh,
+    result
+  } = opts;
+  if (result.blocked) return 2;
+  const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
+  if (!allReviewed) return 1;
+  if (claudeLayerExpected) {
+    const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
+    if (!claudeReviewed) {
+      const why = claudeLayer?.claudeReview ? scrubControl(claudeLayer.claudeReview.summary).slice(0, 200) : claudeLayerCrashed ? "the Opus review layer crashed" : "the Opus review layer did not run to completion";
+      console.error(
+        `ensemble-ai ${cmd}: reviewer claude failed (${why}) \u2014 review INCOMPLETE: the codex/grok core completed, the Opus reviewer did not, so this is NOT a full 3-reviewer pass`
+      );
+      return 1;
+    }
+  }
+  if (!noFailOnHigh && (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))) {
+    const detectedHighIds = [];
+    for (const r of result.reviews) {
+      if (r.terminalState !== "reviewed") continue;
+      const voiceId = r.reviewerId ?? r.reviewer.vendor;
+      r.findings.forEach((f, i) => {
+        if (f.severity === "high") detectedHighIds.push(`${voiceId}#${i + 1}`);
+      });
+    }
+    if (claudeLayer?.claudeReview?.ok) {
+      claudeLayer.claudeReview.findings.forEach((f, i) => {
+        if (f.severity === "high") detectedHighIds.push(`claude#${i + 1}`);
+      });
+    }
+    const honoredDismissed = new Set(highGate.dismissedHighIds);
+    const allHighsDismissed = detectedHighIds.length > 0 && highGate.gatingHighIds.length === 0 && detectedHighIds.every((id) => honoredDismissed.has(id));
+    if (!allHighsDismissed) return 4;
+  }
+  return 0;
 }
 async function reviewCommand(args, profile = "code") {
   const usage = profile === "security" ? SECURITY_USAGE : REVIEW_USAGE;
@@ -4535,6 +4788,7 @@ async function reviewCommand(args, profile = "code") {
         "no-conventions": { type: "boolean" },
         "no-fail-on-high": { type: "boolean" },
         out: { type: "string" },
+        "post-comment": { type: "boolean" },
         pr: { type: "string" },
         reviewers: { type: "string" },
         "run-id": { type: "string" },
@@ -4556,6 +4810,13 @@ async function reviewCommand(args, profile = "code") {
   const cwd = values.cwd ? path10.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
+  const postComment = Boolean(values["post-comment"]);
+  if (postComment && !source.postTarget) {
+    console.error(
+      `ensemble-ai ${cmd}: --post-comment requires a PR diff source (--pr <N> or a PR URL) \u2014 the current source has no PR to post to. Re-run against a PR, or drop --post-comment.`
+    );
+    return 3;
+  }
   const noConventions = Boolean(values["no-conventions"]);
   const conventionPaths = parseConventionPaths(values.conventions);
   if (source.noLocalConventions && !noConventions) {
@@ -4621,10 +4882,11 @@ async function reviewCommand(args, profile = "code") {
   }
   let claudeLayer = null;
   let claudeLayerCrashed = false;
+  let gateSeat = null;
   const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
   if (claudeLayerExpected && result.prompt) {
     const voiceConfigs = loadVoices();
-    const gateSeat = loadGateSeat(
+    gateSeat = loadGateSeat(
       VOICES_FILE,
       {
         effort: typeof values["gate-effort"] === "string" ? values["gate-effort"] : void 0,
@@ -4717,38 +4979,48 @@ async function reviewCommand(args, profile = "code") {
     if (highGateLines.length > 0) console.log(highGateLines.join("\n"));
   }
   console.log(`trail: ${trailDir}`);
-  if (result.blocked) return 2;
-  const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
-  if (!allReviewed) return 1;
-  if (claudeLayerExpected) {
-    const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
-    if (!claudeReviewed) {
-      const why = claudeLayer?.claudeReview ? scrubControl(claudeLayer.claudeReview.summary).slice(0, 200) : claudeLayerCrashed ? "the Opus review layer crashed" : "the Opus review layer did not run to completion";
-      console.error(
-        `ensemble-ai ${cmd}: reviewer claude failed (${why}) \u2014 review INCOMPLETE: the codex/grok core completed, the Opus reviewer did not, so this is NOT a full 3-reviewer pass`
+  const exitCode = reviewExitCode({
+    claudeLayer,
+    claudeLayerCrashed,
+    claudeLayerExpected,
+    cmd,
+    highGate,
+    noFailOnHigh: Boolean(values["no-fail-on-high"]),
+    result
+  });
+  if (postComment && source.postTarget && (exitCode === 0 || exitCode === 4)) {
+    try {
+      const body = capComment(
+        renderReviewComment({
+          claudeLayer,
+          gateSeat: gateSeat ? toCommentGateSeat(gateSeat) : null,
+          headSha: result.acquired.headSha,
+          headline: oneLineSummary(result),
+          profile,
+          receipt: {
+            completed: result.receipt?.completed ?? [],
+            digest: result.receipt ? `${result.receipt.diffDigest.slice(0, 19)}\u2026` : null,
+            error: result.receiptError ?? null,
+            path: result.receiptPath ?? null
+          },
+          repoId: result.acquired.repoId,
+          reviews: result.reviews,
+          trailDir
+        }),
+        trailDir
       );
-      return 1;
+      postReviewComment(body, source.postTarget, {
+        cmd,
+        log: (m) => console.error(m),
+        run: ghPostRunner(cwd)
+      });
+    } catch (e) {
+      console.error(
+        `\u26A0 --post-comment: could NOT render/post the comment \u2014 ${e instanceof Error ? e.message : String(e)}. The review above and its exit code are unaffected (posting never changes the gate contract).`
+      );
     }
   }
-  if (!values["no-fail-on-high"] && (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))) {
-    const detectedHighIds = [];
-    for (const r of result.reviews) {
-      if (r.terminalState !== "reviewed") continue;
-      const voiceId = r.reviewerId ?? r.reviewer.vendor;
-      r.findings.forEach((f, i) => {
-        if (f.severity === "high") detectedHighIds.push(`${voiceId}#${i + 1}`);
-      });
-    }
-    if (claudeLayer?.claudeReview?.ok) {
-      claudeLayer.claudeReview.findings.forEach((f, i) => {
-        if (f.severity === "high") detectedHighIds.push(`claude#${i + 1}`);
-      });
-    }
-    const honoredDismissed = new Set(highGate.dismissedHighIds);
-    const allHighsDismissed = detectedHighIds.length > 0 && highGate.gatingHighIds.length === 0 && detectedHighIds.every((id) => honoredDismissed.has(id));
-    if (!allHighsDismissed) return 4;
-  }
-  return 0;
+  return exitCode;
 }
 var BRAINSTORM_USAGE = `ensemble-ai brainstorm \u2014 convene multiple AI voices on a TOPIC.
 
@@ -5585,8 +5857,8 @@ async function main(argv) {
 }
 if (isEntrypoint(import.meta.url)) {
   main(process.argv.slice(2)).then(
-    (code) => {
-      process.exitCode = code;
+    (code2) => {
+      process.exitCode = code2;
     },
     (e) => {
       console.error(`ensemble-ai: ${e.stack ?? e}`);

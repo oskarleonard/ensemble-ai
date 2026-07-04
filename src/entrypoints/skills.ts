@@ -38,6 +38,33 @@ export function findSkill(name: string): SkillSpec | undefined {
   return SKILL_SPECS.find((s) => s.name === name);
 }
 
+// An ORCHESTRATION skill is NOT a thin one-mode wrapper: it drives a MULTI-STEP session ritual
+// (`/ensemble-ai-review-fix`: /simplify → /code-review → `ensemble-ai review` → fix the gate's
+// agree/partial verdicts + triage unverified HIGHs → re-review → offer `gh pr create`) with the
+// SESSION as the fixer and the CLI staying READ-ONLY ("one engine, different drivers"). It still
+// invokes the engine, so we pin the engine MODE it drives here — a unit test asserts the shipped
+// markdown actually runs `ensemble-ai <mode>` + reads the `gate-verdicts.json` fix-loop contract,
+// the same no-drift guarantee the thin wrappers get. Kept OUT of SKILL_SPECS (which is asserted to
+// be EXACTLY the four `ensemble-ai <mode> $ARGUMENTS` wrappers).
+export interface OrchestrationSkillSpec {
+  // The engine mode the orchestration drives read-only (the session does the fixing).
+  drives: ModeName;
+  // The `ensemble-ai-`-prefixed slash-command name (as the thin wrappers), for the same reason.
+  name: string;
+}
+
+export const ORCHESTRATION_SKILL_SPECS: OrchestrationSkillSpec[] = [
+  { drives: 'review', name: 'ensemble-ai-review-fix' },
+];
+
+// The engine command an orchestration skill drives — `ensemble-ai <mode>`, WITHOUT a fixed
+// $ARGUMENTS tail (the orchestration calls it in a loop with computed args — e.g. a re-review
+// after applying a fix — not one verbatim pass-through like the thin wrappers). A test asserts
+// the shipped markdown contains this command.
+export function orchestrationEngineCommand(spec: OrchestrationSkillSpec): string {
+  return `ensemble-ai ${spec.drives}`;
+}
+
 // The one-line shell invocation a SKILL.md tells Claude to run, forwarding the
 // user's `$ARGUMENTS` verbatim. The single source of truth for the shipped markdown's
 // invocation line (a test asserts each SKILL.md contains exactly this line), so the
