@@ -68,11 +68,13 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // The durable trail-artifact schema. Bumped independently if the record shape changes.
 export const GATE_TRAIL_SCHEMA_VERSION = 1;
 
-const REASON_CAP = 300;
+const REASON_CAP = 700;
 const CITATION_CAP = 500;
+// Cap a display string to n chars. When it overflows, mark the cut with an ellipsis so a
+// clipped value reads as deliberate rather than a mid-word glitch (the '…' counts toward n).
 function capStr(s: unknown, n: number): string {
   const t = typeof s === 'string' ? s.trim() : '';
-  return t.length > n ? t.slice(0, n) : t;
+  return t.length > n ? `${t.slice(0, n - 1).trimEnd()}…` : t;
 }
 
 // ── The authoritative, host-owned finding set ─────────────────────────────────────────
