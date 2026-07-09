@@ -7,6 +7,18 @@ import { sha256Hex } from '../../core/hash';
 import type { ReviewerId, StoredReview, TerminalState } from '../../core/types';
 
 import type { Coverage, DiffMode } from './diff';
+import {
+  computePolicyHashAt,
+  EVIDENCE_SEATS,
+  type EvidenceMap,
+  evidenceShortfall,
+  isEvidenceClass,
+  isEvidenceSeat,
+  isPolicyVersion,
+  POLICY_VERSION_LEGACY,
+  resolvePolicyVersion,
+  type SandboxProfileMap,
+} from './evidence';
 import { GATE_VERDICTS } from './gate';
 import type { GateDispositionSummary } from './gate';
 
@@ -73,11 +85,25 @@ export interface DiffReviewReceipt {
   diffDigest: string;
   diffMode: DiffMode;
   headSha: string;
-  // A digest of the gating policy: { reviewerPolicy, diffMode, coveragePolicy }.
+  // The per-seat evidence the POLICY asked for. Absent on a legacy (v1) receipt.
+  intendedEvidence?: EvidenceMap;
+  // A digest of the gating policy. v1: { reviewerPolicy, diffMode, coveragePolicy }.
+  // v2 additionally binds the intended evidence map + the sandbox profile identities.
   policyHash: string;
+  // The SCHEMA VERSION of the inputs hashed into policyHash. Absent ⇒ 1 (legacy). The verifier
+  // computes its comparison hash under THIS version, so growing the hasher never stales an
+  // already-issued receipt (spec §8's upgrade note).
+  policyVersion?: number;
+  // The per-seat evidence the run ACTUALLY realized — FACT, not intent. §2 permits per-seat
+  // fail-closed fallback (a seat without a qualifying sandbox keeps the packet), so a degraded
+  // mixed run is never receipt-equivalent to a full-worktree one. Absent on a legacy receipt,
+  // which `receipt verify` reads as `unknown` = weaker (gate-r3 pin 2).
+  realizedEvidence?: EvidenceMap;
   repo: string | null;
   reviewerPolicy: ReviewerId[];
   runId: string;
+  // The sandbox profile id + version each worktree seat ran under (hashed into a v2 policyHash).
+  sandboxProfiles?: SandboxProfileMap;
   vendors: string[];
 }
 
@@ -85,17 +111,14 @@ export interface CoveragePolicy {
   ceilingBytes: number;
 }
 
+// The legacy-schema policy hash. PRESERVED as the v1 entry point so every existing caller and
+// every receipt on disk keeps its identity; new callers pass evidence through computePolicyHashAt.
 export function computePolicyHash(args: {
   coveragePolicy: CoveragePolicy;
   diffMode: DiffMode;
   reviewerPolicy: ReviewerId[];
 }): string {
-  const canonical = JSON.stringify({
-    coveragePolicy: args.coveragePolicy,
-    diffMode: args.diffMode,
-    reviewerPolicy: [...args.reviewerPolicy].sort(),
-  });
-  return `sha256:${sha256Hex(canonical)}`;
+  return computePolicyHashAt(args, POLICY_VERSION_LEGACY);
 }
 
 // The full reviewed identity (Codex f5): keyed by repo + BOTH SHAs + the diff
@@ -262,6 +285,39 @@ export function validateReceiptShape(value: unknown): DiffReviewReceipt {
       isVerdictCounts((g as Record<string, unknown>).verdictCounts);
     if (!okDisp) errs.push('gateDisposition (GateDispositionSummary)');
   }
+  // The evidence-identity fields are OPTIONAL (absent on every pre-worktree receipt, so existing
+  // fixtures parse unchanged). Validate only when present — a corrupt evidence map must fail the
+  // receipt closed rather than be read as "no gap".
+  if (o.policyVersion !== undefined && !isPolicyVersion(o.policyVersion)) {
+    errs.push('policyVersion (a known policy schema version)');
+  }
+  for (const field of ['intendedEvidence', 'realizedEvidence'] as const) {
+    const m = o[field];
+    if (m === undefined) continue;
+    const okMap =
+      m !== null &&
+      typeof m === 'object' &&
+      !Array.isArray(m) &&
+      Object.entries(m as Record<string, unknown>).every(
+        ([k, v]) => isEvidenceSeat(k) && isEvidenceClass(v)
+      );
+    if (!okMap) errs.push(`${field} (EvidenceMap)`);
+  }
+  if (o.sandboxProfiles !== undefined) {
+    const sp = o.sandboxProfiles;
+    const okSp =
+      sp !== null &&
+      typeof sp === 'object' &&
+      !Array.isArray(sp) &&
+      Object.entries(sp as Record<string, unknown>).every(([k, v]) => {
+        if (!isEvidenceSeat(k) || v === null || typeof v !== 'object' || Array.isArray(v)) {
+          return false;
+        }
+        const r = v as Record<string, unknown>;
+        return isStr(r.id) && typeof r.version === 'number' && Number.isInteger(r.version);
+      });
+    if (!okSp) errs.push('sandboxProfiles (SandboxProfileMap)');
+  }
   const c = o.coverage;
   if (c === null || typeof c !== 'object' || Array.isArray(c)) {
     errs.push('coverage (object)');
@@ -339,10 +395,16 @@ export function buildDiffReceipt(args: {
   // the reviewer did NOT see the whole change → must not qualify a receipt.
   diffTruncated: boolean;
   headSha: string;
+  // The evidence the policy asked for. Omitted ⇒ an all-packet run ⇒ a v1 (legacy) receipt,
+  // byte-identical to what shipped before evidence identity existed.
+  intendedEvidence?: EvidenceMap;
+  // What the run actually realized, per seat (fail-closed fallbacks included).
+  realizedEvidence?: EvidenceMap;
   repo: string | null;
   required: ReviewerId[];
   reviews: StoredReview[];
   runId: string;
+  sandboxProfiles?: SandboxProfileMap;
 }): BuildReceiptResult {
   const summary = summarizeCoverage(args.coverage);
   const shortfall = coverageShortfall(summary);
@@ -367,6 +429,31 @@ export function buildDiffReceipt(args: {
     }
     vendors.push(r.reviewer.vendor);
   }
+  // An all-packet run hashes under the LEGACY schema, so worktree mode OFF changes no receipt
+  // identity anywhere (the packet path stays byte-compatible). Any worktree seat ⇒ v2.
+  const intendedEvidence = args.intendedEvidence ?? {};
+  const realizedEvidence = args.realizedEvidence ?? {};
+  const policyVersion = resolvePolicyVersion(intendedEvidence);
+  const isLegacy = policyVersion === POLICY_VERSION_LEGACY;
+  // A worktree seat's evidence MEANS NOTHING without the sandbox that bounded it: "the seat could
+  // read the whole project" is only a safety claim in conjunction with "under this profile, at
+  // this version". `sandboxProfiles` is hashed into the v2 policyHash precisely so a receipt
+  // minted under a weaker profile cannot verify as equivalent to one minted under a tighter one —
+  // but an absent map hashes as `{}`, which would let a caller mint a receipt CLAIMING worktree
+  // evidence while binding no profile identity at all. Refuse to build it (codex-f2).
+  if (!isLegacy) {
+    const unbound = [...EVIDENCE_SEATS].filter(
+      (seat) =>
+        (intendedEvidence[seat] === 'worktree' || realizedEvidence[seat] === 'worktree') &&
+        !args.sandboxProfiles?.[seat]
+    );
+    if (unbound.length > 0) {
+      return {
+        error: `not qualified — worktree evidence claimed for ${unbound.join(', ')} without a sandbox profile identity; a worktree seat's evidence is only meaningful bound to the profile that fenced it`,
+        ok: false,
+      };
+    }
+  }
   return {
     ok: true,
     receipt: {
@@ -377,11 +464,24 @@ export function buildDiffReceipt(args: {
       diffDigest: args.diffDigest,
       diffMode: args.diffMode,
       headSha: args.headSha,
-      policyHash: computePolicyHash({
-        coveragePolicy: args.coveragePolicy,
-        diffMode: args.diffMode,
-        reviewerPolicy: args.required,
-      }),
+      ...(isLegacy
+        ? {}
+        : {
+            intendedEvidence,
+            policyVersion,
+            realizedEvidence,
+            ...(args.sandboxProfiles ? { sandboxProfiles: args.sandboxProfiles } : {}),
+          }),
+      policyHash: computePolicyHashAt(
+        {
+          coveragePolicy: args.coveragePolicy,
+          diffMode: args.diffMode,
+          intendedEvidence,
+          reviewerPolicy: args.required,
+          sandboxProfiles: args.sandboxProfiles,
+        },
+        policyVersion
+      ),
       repo: args.repo,
       reviewerPolicy: [...args.required],
       runId: args.runId,
@@ -396,12 +496,28 @@ export type DiffReviewReason =
   | 'stale'
   | 'incomplete-policy'
   | 'incomplete-coverage'
+  | 'evidence-degraded'
   | 'artifact-missing';
 
 export interface DiffReviewState {
+  // The seats whose REALIZED evidence was weaker than the caller's intent — set only for
+  // 'evidence-degraded', so the CLI can name them (never a mystery miss).
+  evidenceGaps?: ReturnType<typeof evidenceShortfall>;
   reason: DiffReviewReason;
   receipt: DiffReviewReceipt | null;
   reviewed: boolean;
+}
+
+// SCHEMA-COMPATIBILITY lookup, the ONE place it lives. Find a receipt whose identity this build
+// can interpret: a v2 caller falls back to the v1 key so a legacy receipt is FOUND rather than
+// reported missing — it then fails on EVIDENCE QUALITY, which can name the weaker seat and point
+// at the flag, instead of a blunt `no-receipt` that hides WHY (gate-r3 pin 2).
+export function resolveReceipt(
+  readReceipt: (key: ReceiptKey) => DiffReviewReceipt | null,
+  key: ReceiptKey,
+  legacyKey?: ReceiptKey
+): DiffReviewReceipt | null {
+  return readReceipt(key) ?? (legacyKey ? readReceipt(legacyKey) : null);
 }
 
 // LIVE validation — the heart of the gate (Phase 2 calls this; Phase 1 ships +
@@ -414,8 +530,18 @@ export interface DiffReviewState {
 // pure + unit-testable, and the artifact (not the receipt's claim) is the proof.
 export function isDiffReviewed(
   live: {
+    // Accept a receipt whose realized evidence is WEAKER than the caller's intent
+    // (`--accept-degraded`). Never the default: silently accepting weaker evidence is the
+    // exact fail-open the realized map exists to close.
+    acceptDegraded?: boolean;
     coverage: Coverage;
+    // What THIS caller is asking to have been evidenced. Absent ⇒ a packet-mode caller ⇒ the
+    // evidence check is a no-op, so the legacy path is behavior-identical.
+    intendedEvidence?: EvidenceMap;
     key: ReceiptKey;
+    // The SAME identity hashed under the legacy (v1) schema. Consulted ONLY when the primary
+    // (v2) key misses — see resolveReceipt.
+    legacyKey?: ReceiptKey;
     required: ReviewerId[];
   },
   deps: {
@@ -423,7 +549,8 @@ export function isDiffReviewed(
     readReview: (runId: string, reviewerId: ReviewerId) => StoredReview | null;
   }
 ): DiffReviewState {
-  const receipt = deps.readReceipt(live.key);
+  // SCHEMA-COMPATIBILITY first, EVIDENCE-QUALITY second (below).
+  const receipt = resolveReceipt(deps.readReceipt, live.key, live.legacyKey);
   if (!receipt) return { reason: 'no-receipt', receipt: null, reviewed: false };
   if (receipt.diffDigest !== live.key.diffDigest) {
     return { reason: 'stale', receipt, reviewed: false };
@@ -433,6 +560,16 @@ export function isDiffReviewed(
   }
   if (coverageShortfall(summarizeCoverage(live.coverage)).length > 0) {
     return { reason: 'incomplete-coverage', receipt, reviewed: false };
+  }
+  // EVIDENCE-QUALITY second, and only when the caller REQUESTS worktree evidence. A legacy
+  // receipt carries no realized map: unknown = weaker. It fails here, not at lookup — so the
+  // error can name the seat and point at the flag. A packet-mode caller intends nothing
+  // stronger than packet, so every receipt passes and v1 semantics are untouched.
+  if (live.intendedEvidence && !live.acceptDegraded) {
+    const gaps = evidenceShortfall(live.intendedEvidence, receipt.realizedEvidence);
+    if (gaps.length > 0) {
+      return { evidenceGaps: gaps, reason: 'evidence-degraded', receipt, reviewed: false };
+    }
   }
   for (const id of live.required) {
     const r = deps.readReview(receipt.runId, id);

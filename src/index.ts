@@ -30,12 +30,21 @@ export * from './core/hash';
 export * from './reviewers/codex';
 export * from './reviewers/grok';
 export * from './reviewers/registry';
+// The ensemble-owned codex sandbox wrapper (worktree evidence, macOS Seatbelt).
+export * from './reviewers/codex-sandbox';
 
 // ── The review MODE: diff acquisition · secret-scan · the content-tied receipt ─
 export * from './modes/review';
 export * from './modes/review/diff';
 export * from './modes/review/secret-scan';
 export * from './modes/review/receipt';
+// ── Worktree evidence mode: identity · lifecycle · manifest · the Claude producer ─
+// Exported so a consumer (the dashboard) drives the SAME lifecycle the CLI does —
+// one engine, no drift. Evidence identity is what makes a receipt mean what it says.
+export * from './modes/review/evidence';
+export * from './modes/review/evidence-manifest';
+export * from './modes/review/worktree';
+export * from './modes/review/code-review-seat';
 // ── Review PROFILES (code · security) + the security dependency-surface flag ──
 export * from './modes/review/profile';
 export * from './modes/review/dep-surface';

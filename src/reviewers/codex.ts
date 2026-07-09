@@ -51,6 +51,12 @@ export interface RunReviewOpts {
   // Receives the kill handle so a caller (a future cancel) can abort the child.
   onSpawn?: (kill: () => void) => void;
   timeoutMs?: number;
+  // WORKTREE EVIDENCE (§2): the detached, read-only worktree of the PR head this seat runs in.
+  // BORROWED, never owned — one worktree is materialized per run and shared by every seat, so a
+  // seat must never reap it. Absent ⇒ the packet path (a throwaway cwd). It lives on the SHARED
+  // opts so seats extend through the one adapter contract (REVIEW_ADAPTERS), never a per-reviewer
+  // intersection type. Only grok honors it today; codex needs its external wrapper first.
+  worktree?: string;
 }
 
 // Invoke the reviewer (Codex) READ-ONLY with the embedded packet prompt, over the
@@ -64,6 +70,26 @@ export function runCodexReview(
   config: ReviewerConfig,
   opts: RunReviewOpts = {}
 ): Promise<CodexReviewResult> {
+  // FAIL CLOSED, never silently. `worktree` lives on the shared opts, but this seat cannot yet
+  // honor it: codex needs its external sandbox-exec wrapper (codex-sandbox.ts) wired in first,
+  // and codex's own `-s read-only` restricts writes, not reads. Accepting-and-ignoring the option
+  // would let a caller believe codex saw the worktree while it reviewed from the packet — and a
+  // receipt could then record `worktree` evidence codex never had. That silent downgrade is the
+  // precise failure the realized-evidence map exists to make impossible, so refuse it.
+  //
+  // RESOLVE, never reject: every reviewer path settles to a CodexReviewResult, and the
+  // orchestrator turns `ok: false` into a clean failed-seat entry (which cannot qualify a
+  // receipt). Throwing here would instead surface as an unhandled rejection in any adapter caller
+  // that does not catch — a crash where the contract asks for a recorded failure.
+  if (opts.worktree) {
+    return Promise.resolve({
+      ok: false,
+      raw: null,
+      stderrTail:
+        'ensemble-ai: the codex seat cannot run against a worktree yet (its sandbox-exec wrapper is not wired). Refusing rather than reviewing the packet while reporting worktree evidence.',
+      timedOut: false,
+    });
+  }
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const outFile = path.join(
     os.tmpdir(),

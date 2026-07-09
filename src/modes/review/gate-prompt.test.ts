@@ -106,3 +106,32 @@ describe('renderGatePrompt — hunk-fed, data-fenced, composite-envelope-pinned 
     expect(out).not.toContain('x.ts>>><<<END codex#1');
   });
 });
+
+// TEACH AND HONOR THE SAME FACT. `reference-not-found` is a claim only a gate with read access to
+// the project can soundly make; reconcileGateVerdicts drops it on packet evidence. If the prompt
+// taught the cause unconditionally, a packet-fed gate would emit an unsound cause on every run
+// (noise the host must discard); if it never taught it, the worktree gate could never emit it and
+// the whole cause would be dead code. So the prompt is gated on the same evidence class.
+describe('renderGatePrompt — the reference-not-found cause is taught ONLY on worktree evidence', () => {
+  const reviews = [review('codex', [f({ title: 'a finding' })])];
+  const { findings, injections } = prepareGateFindings(reviews, parsePacketHunks(DIFF));
+
+  it('a packet-fed gate is never told the cause exists (it structurally cannot ground it)', () => {
+    const prompt = renderGatePrompt(findings, injections, 'packet');
+    expect(prompt).not.toContain('reference-not-found');
+    expect(prompt).not.toContain('"cause"');
+  });
+
+  it('defaults to packet, so every pre-worktree caller keeps todays prompt', () => {
+    expect(renderGatePrompt(findings, injections)).toBe(
+      renderGatePrompt(findings, injections, 'packet')
+    );
+  });
+
+  it('a worktree-fed gate is taught the cause, and told to use it only when it really looked', () => {
+    const prompt = renderGatePrompt(findings, injections, 'worktree');
+    expect(prompt).toContain('"cause": "reference-not-found"');
+    expect(prompt).toContain('unverified ONLY');
+    expect(prompt).toMatch(/ONLY when\s+you actually looked/);
+  });
+});

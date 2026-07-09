@@ -115,17 +115,9 @@ declare function buildCodexReviewArgs(config: ReviewerConfig, outFile: string, p
 interface RunReviewOpts {
     onSpawn?: (kill: () => void) => void;
     timeoutMs?: number;
+    worktree?: string;
 }
 declare function runCodexReview(prompt: string, config: ReviewerConfig, opts?: RunReviewOpts): Promise<CodexReviewResult>;
-
-declare function resolveGrokBin(): string;
-declare function resolveReviewSandbox(configured?: string): string;
-declare function ensureSandboxProfile(profile: string, file?: string): void;
-declare function buildGrokReviewArgs(config: ReviewerConfig, prompt: string, cwd: string): string[];
-declare function extractGrokText(stdout: string): string | null;
-declare function runGrokReview(prompt: string, config: ReviewerConfig, opts?: RunReviewOpts): Promise<CodexReviewResult>;
-
-declare const REVIEW_ADAPTERS: Record<ReviewerId, (prompt: string, config: ReviewerConfig, opts?: RunReviewOpts) => Promise<CodexReviewResult>>;
 
 type DiffMode = 'commit' | 'working-tree' | 'staged' | 'pr' | 'raw';
 type FileKind = 'source' | 'generated' | 'binary';
@@ -200,26 +192,6 @@ interface AcquireDiffOpts {
     workingTree?: boolean;
 }
 declare function acquireDiff(opts: AcquireDiffOpts): AcquiredDiff;
-
-interface DepManifestHit {
-    added: number;
-    isLockfile: boolean;
-    label: string;
-    path: string;
-    samples: string[];
-}
-interface RiskyImportHit {
-    cls: string;
-    label: string;
-    line?: number;
-    path: string;
-}
-interface DepSurfaceResult {
-    manifests: DepManifestHit[];
-    riskyImports: RiskyImportHit[];
-}
-declare function scanDependencySurface(files: FileDiff[]): DepSurfaceResult;
-declare function hasDepSurface(r: DepSurfaceResult): boolean;
 
 declare const VOICE_IDS: readonly ["codex", "grok", "claude"];
 type VoiceId = (typeof VOICE_IDS)[number];
@@ -332,10 +304,14 @@ interface DiffReviewReceipt {
     diffDigest: string;
     diffMode: DiffMode;
     headSha: string;
+    intendedEvidence?: EvidenceMap;
     policyHash: string;
+    policyVersion?: number;
+    realizedEvidence?: EvidenceMap;
     repo: string | null;
     reviewerPolicy: ReviewerId[];
     runId: string;
+    sandboxProfiles?: SandboxProfileMap;
     vendors: string[];
 }
 interface CoveragePolicy {
@@ -377,25 +353,120 @@ declare function buildDiffReceipt(args: {
     diffMode: DiffMode;
     diffTruncated: boolean;
     headSha: string;
+    intendedEvidence?: EvidenceMap;
+    realizedEvidence?: EvidenceMap;
     repo: string | null;
     required: ReviewerId[];
     reviews: StoredReview[];
     runId: string;
+    sandboxProfiles?: SandboxProfileMap;
 }): BuildReceiptResult;
-type DiffReviewReason = 'reviewed' | 'no-receipt' | 'stale' | 'incomplete-policy' | 'incomplete-coverage' | 'artifact-missing';
+type DiffReviewReason = 'reviewed' | 'no-receipt' | 'stale' | 'incomplete-policy' | 'incomplete-coverage' | 'evidence-degraded' | 'artifact-missing';
 interface DiffReviewState {
+    evidenceGaps?: ReturnType<typeof evidenceShortfall>;
     reason: DiffReviewReason;
     receipt: DiffReviewReceipt | null;
     reviewed: boolean;
 }
+declare function resolveReceipt(readReceipt: (key: ReceiptKey) => DiffReviewReceipt | null, key: ReceiptKey, legacyKey?: ReceiptKey): DiffReviewReceipt | null;
 declare function isDiffReviewed(live: {
+    acceptDegraded?: boolean;
     coverage: Coverage;
+    intendedEvidence?: EvidenceMap;
     key: ReceiptKey;
+    legacyKey?: ReceiptKey;
     required: ReviewerId[];
 }, deps: {
     readReceipt: (key: ReceiptKey) => DiffReviewReceipt | null;
     readReview: (runId: string, reviewerId: ReviewerId) => StoredReview | null;
 }): DiffReviewState;
+
+declare const EVIDENCE_CLASSES: readonly ["packet", "worktree"];
+type EvidenceClass = (typeof EVIDENCE_CLASSES)[number];
+declare const EVIDENCE_SEATS: readonly ["codex", "grok", "claude", "gate"];
+type EvidenceSeat = (typeof EVIDENCE_SEATS)[number];
+declare function isEvidenceSeat(v: unknown): v is EvidenceSeat;
+declare function isEvidenceClass(v: unknown): v is EvidenceClass;
+type EvidenceMap = Partial<Record<EvidenceSeat, EvidenceClass>>;
+interface SandboxProfileRef {
+    id: string;
+    version: number;
+}
+type SandboxProfileMap = Partial<Record<EvidenceSeat, SandboxProfileRef>>;
+declare const POLICY_VERSION_LEGACY = 1;
+declare const POLICY_VERSION_EVIDENCE = 2;
+declare const POLICY_VERSIONS: readonly [1, 2];
+declare function isPolicyVersion(v: unknown): v is (typeof POLICY_VERSIONS)[number];
+declare function receiptPolicyVersion(v: unknown): number;
+declare function resolvePolicyVersion(intended: EvidenceMap): number;
+interface PolicyHashInputs {
+    coveragePolicy: CoveragePolicy;
+    diffMode: DiffMode;
+    intendedEvidence?: EvidenceMap;
+    reviewerPolicy: string[];
+    sandboxProfiles?: SandboxProfileMap;
+}
+declare function computePolicyHashAt(inputs: PolicyHashInputs, version: number): string;
+interface EvidenceGap {
+    intended: EvidenceClass;
+    realized: EvidenceClass | 'unknown';
+    seat: EvidenceSeat;
+}
+declare function evidenceShortfall(intended: EvidenceMap, realized: EvidenceMap | undefined): EvidenceGap[];
+declare function formatEvidenceShortfall(gaps: EvidenceGap[]): string;
+
+declare function resolveGrokBin(): string;
+declare function resolveReviewSandbox(configured?: string): string;
+declare function ensureSandboxProfile(profile: string, file?: string): void;
+declare const GROK_SANDBOX_PROFILE: SandboxProfileRef;
+declare function buildGrokReviewArgs(config: ReviewerConfig, prompt: string, cwd: string): string[];
+declare function extractGrokText(stdout: string): string | null;
+declare function runGrokReview(prompt: string, config: ReviewerConfig, opts?: RunReviewOpts): Promise<CodexReviewResult>;
+
+declare const REVIEW_ADAPTERS: Record<ReviewerId, (prompt: string, config: ReviewerConfig, opts?: RunReviewOpts) => Promise<CodexReviewResult>>;
+
+declare const CODEX_SANDBOX_PROFILE: SandboxProfileRef;
+declare function isUnsafeReadRoot(root: string, home?: string): boolean;
+interface CodexSandboxPaths {
+    codexHome: string;
+    nodePrefix: string;
+    worktree: string;
+}
+declare function renderCodexSandboxProfile(p: CodexSandboxPaths): string;
+declare function codexSandboxSupported(platform?: NodeJS.Platform): boolean;
+declare function defaultCodexSandboxPaths(worktree: string): CodexSandboxPaths;
+declare function writeCodexSandboxProfile(paths: CodexSandboxPaths): {
+    cleanup: () => void;
+    file: string;
+};
+declare function wrapWithSandbox(profileFile: string, bin: string, args: string[]): {
+    args: string[];
+    bin: string;
+};
+declare function buildCodexWorktreeArgs(config: {
+    effort: string;
+    model: string;
+}, outFile: string, prompt: string): string[];
+
+interface DepManifestHit {
+    added: number;
+    isLockfile: boolean;
+    label: string;
+    path: string;
+    samples: string[];
+}
+interface RiskyImportHit {
+    cls: string;
+    label: string;
+    line?: number;
+    path: string;
+}
+interface DepSurfaceResult {
+    manifests: DepManifestHit[];
+    riskyImports: RiskyImportHit[];
+}
+declare function scanDependencySurface(files: FileDiff[]): DepSurfaceResult;
+declare function hasDepSurface(r: DepSurfaceResult): boolean;
 
 interface SensitivePathHit {
     label: string;
@@ -458,6 +529,97 @@ interface ReviewModeResult {
 }
 declare const DEFAULT_OBJECTIVE = "Adversarial cross-vendor review of a code diff \u2014 find correctness, security, and convention issues a same-vendor author might miss.";
 declare function runReviewMode(opts: ReviewModeOptions): Promise<ReviewModeResult>;
+
+type GitRun = (args: string[], opts?: {
+    cwd?: string;
+    env?: Record<string, string>;
+}) => {
+    error: string;
+    ok: false;
+} | {
+    ok: true;
+    text: string;
+};
+type PreflightErrorKind = 'auth' | 'disallowed-root' | 'network' | 'no-such-pr' | 'not-a-repo' | 'sha-mismatch' | 'wrong-repo';
+interface PreflightError {
+    kind: PreflightErrorKind;
+    message: string;
+}
+interface RepoLocation {
+    fetchUrl: string;
+    repoRoot: string;
+    slug: string;
+}
+declare function isPreflightError(v: unknown): v is PreflightError;
+declare function remoteSlug(url: string): string | null;
+declare function classifyGitError(stderr: string): PreflightErrorKind;
+declare function allowedRootsFromConfig(configPath?: string): string[] | null;
+declare function rootAllowed(repoRoot: string, allowed: string[] | null): boolean;
+declare function resolveRepoLocation(args: {
+    prSlug: string;
+    repoPath: string;
+}, deps: {
+    allowedRoots?: string[] | null;
+    git: GitRun;
+}): PreflightError | RepoLocation;
+interface Worktree {
+    dir: string;
+    headSha: string;
+}
+declare function acquireRepoLock(gitCommonDir: string, opts?: {
+    retries?: number;
+    sleepMs?: number;
+    staleMs?: number;
+}): () => void;
+declare function materializeWorktree(args: {
+    headSha: string;
+    location: RepoLocation;
+    pr: number;
+    worktreeRoot?: string;
+}, deps: {
+    git: GitRun;
+    lock?: (gitCommonDir: string) => () => void;
+}): PreflightError | Worktree;
+declare function reapWorktree(repoRoot: string, dir: string, deps: {
+    git: GitRun;
+}): void;
+
+declare const EVIDENCE_MANIFEST_SCHEMA_VERSION = 1;
+declare const EVIDENCE_MANIFEST_FILE = "evidence-manifest.json";
+interface ManifestBlob {
+    blobSha: string;
+    path: string;
+}
+interface EvidenceManifest {
+    headSha: string;
+    intendedEvidence: EvidenceMap;
+    readableSurface: ManifestBlob[];
+    realizedEvidence: EvidenceMap;
+    sandboxProfiles: SandboxProfileMap;
+    schemaVersion: number;
+    scopeNote: string;
+}
+declare function parseLsTree(text: string): ManifestBlob[];
+declare function readReadableSurface(worktree: string, headSha: string, deps: {
+    git: GitRun;
+}): ManifestBlob[];
+declare function buildEvidenceManifest(args: {
+    headSha: string;
+    intendedEvidence: EvidenceMap;
+    readableSurface: ManifestBlob[];
+    realizedEvidence: EvidenceMap;
+    sandboxProfiles: SandboxProfileMap;
+}): EvidenceManifest;
+declare function writeEvidenceManifest(baseDir: string, runId: string, manifest: EvidenceManifest): boolean;
+
+declare const CODE_REVIEW_SKILL = "/code-review";
+declare const QUALITY_LENS = "Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits \u2014 they are noise on someone else's pull request.";
+interface CodeReviewSeatPromptArgs {
+    baseSha: string;
+    headSha: string;
+    worktree: string;
+}
+declare function renderCodeReviewSeatPrompt(args: CodeReviewSeatPromptArgs): string;
 
 declare const DEFAULT_VOICE_TIMEOUT_MS$1 = 300000;
 type Adapters$1 = Record<VoiceId, (prompt: string, config: VoiceConfig, opts?: {
@@ -596,4 +758,4 @@ declare function resolveMode(v: string): string;
 declare function isMode(v: string): v is ModeName;
 declare function isImplemented(mode: ModeName): boolean;
 
-export { type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormOptions, type BrainstormResult, type BuildReceiptResult, CRITIQUE_STANCES, type CodexReviewResult, type ConsultResult, type ConsultSynthesis, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type Coverage, type CoverageFileEntry, type CoveragePolicy, type Critique, type CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, type FileDiff, type FileKind, type GatherConfig, type GatheredConventions, IMPLEMENTED_MODES, type Idea, type InlineSecretHit, MODES, MODE_ALIASES, type ModeName, type OmitReason, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PersistReviewInput, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type RankedIdea, type RawIdea, type ReceiptCoverage, type ReceiptKey, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunReviewOpts, type SecretScanResult, type SensitivePathHit, StoredReview, type SynthesisResult, TerminalState, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, VOICE_IDS, type VoiceAnswerResult, type VoiceConfig, type VoiceCritiqueResult$1 as VoiceCritiqueResult, type VoiceGenerateResult, type VoiceId, type VoiceRunResult, acquireDiff, buildClaudeVoiceArgs, buildCodexReviewArgs, buildDiffReceipt, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, computeCoverage, computePolicyHash, index as consult, coverageCounts, coverageShortfall, defaultReceiptStore, diffDigest, ensureSandboxProfile, escapesRoot, extractGrokText, extractRefs, fallbackSynthesis$1 as fallbackSynthesis, fsConventionReader, gatherConventions, hasDepSurface, isDiffReviewed, isImplemented, isMode, isVoiceId, keyOf, killTree, listReviewers, listVoices, loadReviewers, loadVoices, makeEscalatingKill, memoryConventionReader, omittedLine, parseCritique, parseDiffFiles, parseIdeas, parseReviewers, parseSynthesis, parseVoiceIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, readReceipt, readReview, readReviewsForRun, receiptIdentityMatches, receiptKeyHash, receiptPath, renderCritiquePrompt, renderGeneratePrompt, renderSynthesisPrompt, resolveBase, resolveBin, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveInRepo, resolveMode, resolveRepoId, resolveReviewSandbox, resolveReviewer, reviewDir, runBrainstormMode, runClaudeVoice, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, sha256Hex, summarizeCoverage, validateReceiptShape, writeReceipt, writeTrailFile };
+export { type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormOptions, type BrainstormResult, type BuildReceiptResult, CODEX_SANDBOX_PROFILE, CODE_REVIEW_SKILL, CRITIQUE_STANCES, type CodeReviewSeatPromptArgs, type CodexReviewResult, type CodexSandboxPaths, type ConsultResult, type ConsultSynthesis, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type Coverage, type CoverageFileEntry, type CoveragePolicy, type Critique, type CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, EVIDENCE_CLASSES, EVIDENCE_MANIFEST_FILE, EVIDENCE_MANIFEST_SCHEMA_VERSION, EVIDENCE_SEATS, type EvidenceClass, type EvidenceGap, type EvidenceManifest, type EvidenceMap, type EvidenceSeat, type FileDiff, type FileKind, GROK_SANDBOX_PROFILE, type GatherConfig, type GatheredConventions, type GitRun, IMPLEMENTED_MODES, type Idea, type InlineSecretHit, MODES, MODE_ALIASES, type ManifestBlob, type ModeName, type OmitReason, POLICY_VERSIONS, POLICY_VERSION_EVIDENCE, POLICY_VERSION_LEGACY, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PersistReviewInput, type PolicyHashInputs, type PreflightError, type PreflightErrorKind, QUALITY_LENS, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type RankedIdea, type RawIdea, type ReceiptCoverage, type ReceiptKey, type RepoLocation, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunReviewOpts, type SandboxProfileMap, type SandboxProfileRef, type SecretScanResult, type SensitivePathHit, StoredReview, type SynthesisResult, TerminalState, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, VOICE_IDS, type VoiceAnswerResult, type VoiceConfig, type VoiceCritiqueResult$1 as VoiceCritiqueResult, type VoiceGenerateResult, type VoiceId, type VoiceRunResult, type Worktree, acquireDiff, acquireRepoLock, allowedRootsFromConfig, buildClaudeVoiceArgs, buildCodexReviewArgs, buildCodexWorktreeArgs, buildDiffReceipt, buildEvidenceManifest, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, classifyGitError, codexSandboxSupported, computeCoverage, computePolicyHash, computePolicyHashAt, index as consult, coverageCounts, coverageShortfall, defaultCodexSandboxPaths, defaultReceiptStore, diffDigest, ensureSandboxProfile, escapesRoot, evidenceShortfall, extractGrokText, extractRefs, fallbackSynthesis$1 as fallbackSynthesis, formatEvidenceShortfall, fsConventionReader, gatherConventions, hasDepSurface, isDiffReviewed, isEvidenceClass, isEvidenceSeat, isImplemented, isMode, isPolicyVersion, isPreflightError, isUnsafeReadRoot, isVoiceId, keyOf, killTree, listReviewers, listVoices, loadReviewers, loadVoices, makeEscalatingKill, materializeWorktree, memoryConventionReader, omittedLine, parseCritique, parseDiffFiles, parseIdeas, parseLsTree, parseReviewers, parseSynthesis, parseVoiceIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, readReadableSurface, readReceipt, readReview, readReviewsForRun, reapWorktree, receiptIdentityMatches, receiptKeyHash, receiptPath, receiptPolicyVersion, remoteSlug, renderCodeReviewSeatPrompt, renderCodexSandboxProfile, renderCritiquePrompt, renderGeneratePrompt, renderSynthesisPrompt, resolveBase, resolveBin, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveInRepo, resolveMode, resolvePolicyVersion, resolveReceipt, resolveRepoId, resolveRepoLocation, resolveReviewSandbox, resolveReviewer, reviewDir, rootAllowed, runBrainstormMode, runClaudeVoice, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, sha256Hex, summarizeCoverage, validateReceiptShape, wrapWithSandbox, writeCodexSandboxProfile, writeEvidenceManifest, writeReceipt, writeTrailFile };

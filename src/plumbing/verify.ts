@@ -9,11 +9,16 @@ import { readReview } from '../core/artifacts';
 import type { ReviewerId, StoredReview } from '../core/types';
 import { type Coverage, coverageCounts, omittedLine } from '../modes/review/diff';
 import {
+  type EvidenceMap,
+  formatEvidenceShortfall,
+} from '../modes/review/evidence';
+import {
   type DiffReviewReason,
   type DiffReviewReceipt,
   type DiffReviewState,
   isDiffReviewed,
   type ReceiptKey,
+  resolveReceipt,
 } from '../modes/review/receipt';
 
 // TRUST MODEL — two modes, by design:
@@ -56,6 +61,13 @@ export function receiptBackedReadReview(
 }
 
 export interface VerifyDeps {
+  // Accept a receipt whose realized per-seat evidence is weaker than the caller's intent
+  // (`--accept-degraded`). Off by default — a silent accept is the fail-open.
+  acceptDegraded?: boolean;
+  // What this caller asks to have been evidenced, per seat. Absent ⇒ packet-mode ⇒ no check.
+  intendedEvidence?: EvidenceMap;
+  // The same identity hashed under the legacy schema; consulted when the primary key misses.
+  legacyKey?: ReceiptKey;
   readReceipt: (key: ReceiptKey) => DiffReviewReceipt | null;
   // When true, REQUIRE the real per-reviewer trail artifacts to prove the review:
   // attestation-only (completed[]) never satisfies the gate, and a receipt without a
@@ -82,7 +94,11 @@ export function verifyReceipt(
   live: { coverage: Coverage; key: ReceiptKey; required: ReviewerId[] },
   deps: VerifyDeps
 ): DiffReviewState {
-  const receipt = deps.readReceipt(live.key);
+  // The SAME schema-compat lookup isDiffReviewed performs, so the attested-mode readReview below
+  // is backed by the receipt the state machine will read (a legacy receipt found via the legacy
+  // key must still satisfy its own completed[] attestation). Resolved ONCE here and injected as a
+  // constant, so isDiffReviewed needs no key of its own.
+  const receipt = resolveReceipt(deps.readReceipt, live.key, deps.legacyKey);
   const trailDir = deps.trailDir;
   // Resolve HOW a reviewer's terminal state is proven:
   //   trail dir → read the real immutable artifacts (strongest proof);
@@ -96,10 +112,17 @@ export function verifyReceipt(
         : receipt
           ? receiptBackedReadReview(receipt)
           : () => null;
-  return isDiffReviewed(live, {
-    readReceipt: () => receipt,
-    readReview: readReviewFn,
-  });
+  return isDiffReviewed(
+    {
+      ...live,
+      acceptDegraded: deps.acceptDegraded,
+      intendedEvidence: deps.intendedEvidence,
+    },
+    {
+      readReceipt: () => receipt,
+      readReview: readReviewFn,
+    }
+  );
 }
 
 // Gate exit code: 0 iff the current diff is reviewed & current; any not-reviewed
@@ -112,6 +135,8 @@ export function verifyExitCode(state: DiffReviewState): number {
 const REASON_EXPLANATION: Record<DiffReviewReason, string> = {
   'artifact-missing':
     'ARTIFACT MISSING — a required reviewer artifact is absent or did not complete (pass --trail <dir>)',
+  'evidence-degraded':
+    'EVIDENCE DEGRADED — a receipt exists, but a seat was evidenced more weakly than you are asking for',
   'incomplete-coverage':
     'INCOMPLETE COVERAGE — the current diff omits a source file the review did not cover',
   'incomplete-policy':
@@ -136,6 +161,11 @@ export function formatVerify(
   out.push(`  head:    ${key.headSha}`);
   out.push(`  digest:  ${key.diffDigest}`);
   out.push(`  verdict: ${REASON_EXPLANATION[state.reason]}`);
+  // A degraded verdict must NAME the weaker seat and point at the flag — never a mystery miss
+  // (gate-r3 pin 2).
+  if (state.evidenceGaps && state.evidenceGaps.length > 0) {
+    out.push(`  evidence: ${formatEvidenceShortfall(state.evidenceGaps)}`);
+  }
   if (state.receipt) {
     out.push(
       `  receipt: runId ${state.receipt.runId} · completed ${state.receipt.completed.join(', ')} · vendors ${state.receipt.vendors.join(', ')}`
