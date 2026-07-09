@@ -156,6 +156,14 @@ export function ensureSandboxProfile(
 // stateless, like codex from tmpdir) · `--disable-web-search` +
 // `--disallowed-tools bash,search_replace` (defense in depth, NOT the boundary) ·
 // `--no-memory` (no cross-session state).
+// The grok seat's sandbox identity. `ensemble-review` is a `strict` (deny-by-default READS)
+// base + a kernel secret deny-list — already exactly the repo-rooted, secret-denied shape §2
+// requires, so pointing it at the worktree root is config-only: `--cwd <worktree>` makes the
+// deny-by-default read root the worktree instead of a throwaway tmpdir. Bump `version` whenever
+// REVIEW_PROFILE_BLOCK changes — a receipt minted under a weaker profile must never verify as
+// equivalent to one minted under a tighter one.
+export const GROK_SANDBOX_PROFILE = { id: REVIEW_PROFILE_NAME, version: 1 };
+
 export function buildGrokReviewArgs(
   config: ReviewerConfig,
   prompt: string,
@@ -209,15 +217,18 @@ export function extractGrokText(stdout: string): string | null {
 export function runGrokReview(
   prompt: string,
   config: ReviewerConfig,
-  opts: RunReviewOpts = {}
+  opts: RunReviewOpts & { worktree?: string } = {}
 ): Promise<CodexReviewResult> {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   // Pin the boundary to a proven read-only profile (provisioning the resolved one,
   // which is exactly what buildGrokReviewArgs will pass to --sandbox).
   const sandbox = resolveReviewSandbox(config.sandbox);
   ensureSandboxProfile(sandbox);
-  // A unique, throwaway cwd for grok to operate in (the diff is in the prompt).
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-review-'));
+  // WORKTREE EVIDENCE (§2): `--cwd <worktree>` roots the deny-by-default `strict` read base at
+  // the PR head, so grok reads the whole project and nothing else. Without it, the historic
+  // throwaway tmpdir (the diff lives in the prompt) — the packet path, unchanged.
+  const worktreeCwd = opts.worktree;
+  const cwd = worktreeCwd ?? fs.mkdtempSync(path.join(os.tmpdir(), 'grok-review-'));
   return runReviewerExec({
     args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
     bin: resolveGrokBin(),
@@ -227,7 +238,10 @@ export function runGrokReview(
     timeoutMs,
   }).then(({ raw, stderrTail, timedOut }) => {
     try {
-      fs.rmSync(cwd, { force: true, recursive: true });
+      // ONLY the throwaway tmpdir is ours to delete. The worktree is owned by the run's
+      // materialization lifecycle (one per run, shared by every seat) and is reaped there —
+      // rm'ing it here would destroy the other seats' evidence mid-review.
+      if (!worktreeCwd) fs.rmSync(cwd, { force: true, recursive: true });
     } catch {
       // throwaway dir — best-effort cleanup
     }

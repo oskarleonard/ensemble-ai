@@ -226,7 +226,9 @@ export function acquireRepoLock(
 // proceed on wrong-SHA evidence (spec §9, grok-f1).
 export function materializeWorktree(
   args: { headSha: string; location: RepoLocation; pr: number; worktreeRoot?: string },
-  deps: { git: GitRun }
+  // `lock` is injected so the serialization can be exercised (and stubbed) independently of the
+  // real repo — the default IS the per-repo O_EXCL lock.
+  deps: { git: GitRun; lock?: (gitCommonDir: string) => () => void }
 ): PreflightError | Worktree {
   const { location } = args;
   const common = deps.git(['rev-parse', '--git-common-dir'], { cwd: location.repoRoot });
@@ -234,7 +236,7 @@ export function materializeWorktree(
     return { kind: 'not-a-repo', message: `cannot resolve the git dir of ${location.repoRoot}` };
   }
   const gitCommonDir = path.resolve(location.repoRoot, common.text.trim());
-  const release = acquireRepoLock(gitCommonDir);
+  const release = (deps.lock ?? acquireRepoLock)(gitCommonDir);
   let dir: string | null = null;
   try {
     const fetched = deps.git(

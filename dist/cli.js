@@ -1047,7 +1047,8 @@ function runGrokReview(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const sandbox = resolveReviewSandbox(config.sandbox);
   ensureSandboxProfile(sandbox);
-  const cwd = fs7.mkdtempSync(path5.join(os4.tmpdir(), "grok-review-"));
+  const worktreeCwd = opts.worktree;
+  const cwd = worktreeCwd ?? fs7.mkdtempSync(path5.join(os4.tmpdir(), "grok-review-"));
   return runReviewerExec({
     args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
     bin: resolveGrokBin(),
@@ -1057,7 +1058,7 @@ function runGrokReview(prompt, config, opts = {}) {
     timeoutMs
   }).then(({ raw, stderrTail, timedOut }) => {
     try {
-      fs7.rmSync(cwd, { force: true, recursive: true });
+      if (!worktreeCwd) fs7.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
     const text = raw ? extractGrokText(raw) : null;
@@ -2440,6 +2441,80 @@ import fs11 from "fs";
 import os6 from "os";
 import path9 from "path";
 
+// src/modes/review/evidence.ts
+var EVIDENCE_CLASSES = ["packet", "worktree"];
+var EVIDENCE_SEATS = ["codex", "grok", "claude", "gate"];
+function isEvidenceSeat(v) {
+  return EVIDENCE_SEATS.includes(v);
+}
+function isEvidenceClass(v) {
+  return EVIDENCE_CLASSES.includes(v);
+}
+var STRENGTH = { packet: 1, worktree: 2 };
+var UNKNOWN_STRENGTH = 0;
+function strengthOf(c) {
+  return c ? STRENGTH[c] : UNKNOWN_STRENGTH;
+}
+var POLICY_VERSION_LEGACY = 1;
+var POLICY_VERSION_EVIDENCE = 2;
+var POLICY_VERSIONS = [POLICY_VERSION_LEGACY, POLICY_VERSION_EVIDENCE];
+function isPolicyVersion(v) {
+  return POLICY_VERSIONS.includes(v);
+}
+function resolvePolicyVersion(intended) {
+  return Object.values(intended).some((c) => c === "worktree") ? POLICY_VERSION_EVIDENCE : POLICY_VERSION_LEGACY;
+}
+function canonicalMap(m) {
+  const out = {};
+  for (const seat of [...EVIDENCE_SEATS].sort()) {
+    const v = m[seat];
+    if (v !== void 0) out[seat] = v;
+  }
+  return out;
+}
+function computePolicyHashAt(inputs, version) {
+  if (version === POLICY_VERSION_LEGACY) {
+    const canonical2 = JSON.stringify({
+      coveragePolicy: inputs.coveragePolicy,
+      diffMode: inputs.diffMode,
+      reviewerPolicy: [...inputs.reviewerPolicy].sort()
+    });
+    return `sha256:${sha256Hex(canonical2)}`;
+  }
+  if (version !== POLICY_VERSION_EVIDENCE) {
+    throw new Error(
+      `ensemble-ai: unknown policyVersion ${version} \u2014 cannot compute a policy hash under a schema this build does not define`
+    );
+  }
+  const intended = inputs.intendedEvidence ?? {};
+  const canonical = JSON.stringify({
+    coveragePolicy: inputs.coveragePolicy,
+    diffMode: inputs.diffMode,
+    intendedEvidence: canonicalMap(intended),
+    policyVersion: POLICY_VERSION_EVIDENCE,
+    reviewerPolicy: [...inputs.reviewerPolicy].sort(),
+    sandboxProfiles: canonicalMap(inputs.sandboxProfiles ?? {}),
+    seatSet: Object.keys(canonicalMap(intended)).sort()
+  });
+  return `sha256:${sha256Hex(canonical)}`;
+}
+function evidenceShortfall(intended, realized) {
+  const gaps = [];
+  for (const seat of EVIDENCE_SEATS) {
+    const want = intended[seat];
+    if (!want) continue;
+    const got = realized?.[seat];
+    if (strengthOf(got) < strengthOf(want)) {
+      gaps.push({ intended: want, realized: got ?? "unknown", seat });
+    }
+  }
+  return gaps;
+}
+function formatEvidenceShortfall(gaps) {
+  const named = gaps.map((g) => `${g.seat} realized ${g.realized}, intended ${g.intended}`).join("; ");
+  return `evidence degraded \u2014 ${named}. This receipt does not prove the worktree-evidence review you are asking for. Re-run the review with the repo location, or pass --accept-degraded to accept the weaker evidence.`;
+}
+
 // src/modes/review/gate-dedup.ts
 var LINE_WINDOW = 12;
 var MIN_TOKEN_OVERLAP = 0.35;
@@ -2973,6 +3048,7 @@ function parseVerdicts(v) {
       verdict: e.verdict,
       // conditional so an old-shape (no-ops) entry parses to the exact prior shape
       ...ops.length ? { ops } : {},
+      ...typeof e.cause === "string" && e.cause.trim() ? { cause: e.cause.trim() } : {},
       ...fixStatus ? { fixStatus } : {},
       ...rescoredSeverity ? { rescoredSeverity } : {}
     });
@@ -3013,7 +3089,8 @@ var FAILURE_REASON = {
   "packet-fail": "pinned packet unavailable at gate time \u2014 verdicts cannot be grounded",
   "unknown-schema": "gate envelope had a missing/unsupported schemaVersion \u2014 fail-closed"
 };
-function reconcileGateVerdicts(findings, parsed) {
+function reconcileGateVerdicts(findings, parsed, opts = {}) {
+  const gateEvidence = opts.gateEvidence ?? "packet";
   if ("failure" in parsed) {
     const reason = FAILURE_REASON[parsed.failure];
     return {
@@ -3065,6 +3142,14 @@ function reconcileGateVerdicts(findings, parsed) {
         return { ...base, citation, downgradeReason: "invalid-citation", effectiveVerdict: "unverified", rawVerdict, reason: e.reason || cv.reason || "no valid citation" };
       }
       return { ...base, citation, downgradeReason: null, effectiveVerdict: "false", rawVerdict, reason: e.reason };
+    }
+    if (e.verdict === "unverified" && e.cause === "reference-not-found") {
+      if (gateEvidence === "worktree") {
+        return { ...base, citation, downgradeReason: "reference-not-found", effectiveVerdict: "unverified", rawVerdict, reason: e.reason || "the gate could not locate what this finding references at headSha" };
+      }
+      warnings.push(
+        `gate: "reference-not-found" claimed for ${f.findingId} on PACKET evidence \u2014 dropped (a packet-fed gate cannot distinguish it from a truncated window)`
+      );
     }
     return { ...base, citation, downgradeReason: null, effectiveVerdict: e.verdict, rawVerdict, reason: e.reason };
   });
@@ -3212,7 +3297,9 @@ async function runGate(opts) {
   const packetHunks = packet.ok ? parsePacketHunks(packet.diff) : /* @__PURE__ */ new Map();
   const { findings, injections } = prepareGateFindings(healthy, packetHunks);
   const finalize = (synthesis2, parsed2) => {
-    const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed2);
+    const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed2, {
+      gateEvidence: opts.gateEvidence
+    });
     for (const w of warnings) log(`  \xB7 ${w}`);
     const records = clusterPostable(reconciled);
     const gateTrailWritten = writeGateVerdictsTrail(opts.baseDir, opts.runId, records);
@@ -3283,12 +3370,7 @@ async function runGate(opts) {
 
 // src/modes/review/receipt.ts
 function computePolicyHash(args) {
-  const canonical = JSON.stringify({
-    coveragePolicy: args.coveragePolicy,
-    diffMode: args.diffMode,
-    reviewerPolicy: [...args.reviewerPolicy].sort()
-  });
-  return `sha256:${sha256Hex(canonical)}`;
+  return computePolicyHashAt(args, POLICY_VERSION_LEGACY);
 }
 function receiptKeyHash(key) {
   const canonical = JSON.stringify({
@@ -3374,6 +3456,28 @@ function validateReceiptShape(value) {
     const okDisp = g !== null && typeof g === "object" && !Array.isArray(g) && Array.isArray(g.dismissedHighIds) && g.dismissedHighIds.every((x) => isStr(x)) && typeof g.trailWritten === "boolean" && isVerdictCounts(g.verdictCounts);
     if (!okDisp) errs.push("gateDisposition (GateDispositionSummary)");
   }
+  if (o.policyVersion !== void 0 && !isPolicyVersion(o.policyVersion)) {
+    errs.push("policyVersion (a known policy schema version)");
+  }
+  for (const field of ["intendedEvidence", "realizedEvidence"]) {
+    const m = o[field];
+    if (m === void 0) continue;
+    const okMap = m !== null && typeof m === "object" && !Array.isArray(m) && Object.entries(m).every(
+      ([k, v]) => isEvidenceSeat(k) && isEvidenceClass(v)
+    );
+    if (!okMap) errs.push(`${field} (EvidenceMap)`);
+  }
+  if (o.sandboxProfiles !== void 0) {
+    const sp = o.sandboxProfiles;
+    const okSp = sp !== null && typeof sp === "object" && !Array.isArray(sp) && Object.entries(sp).every(([k, v]) => {
+      if (!isEvidenceSeat(k) || v === null || typeof v !== "object" || Array.isArray(v)) {
+        return false;
+      }
+      const r = v;
+      return isStr(r.id) && typeof r.version === "number" && Number.isInteger(r.version);
+    });
+    if (!okSp) errs.push("sandboxProfiles (SandboxProfileMap)");
+  }
   const c = o.coverage;
   if (c === null || typeof c !== "object" || Array.isArray(c)) {
     errs.push("coverage (object)");
@@ -3436,6 +3540,9 @@ function buildDiffReceipt(args) {
     }
     vendors.push(r.reviewer.vendor);
   }
+  const intendedEvidence = args.intendedEvidence ?? {};
+  const policyVersion = resolvePolicyVersion(intendedEvidence);
+  const isLegacy = policyVersion === POLICY_VERSION_LEGACY;
   return {
     ok: true,
     receipt: {
@@ -3446,11 +3553,22 @@ function buildDiffReceipt(args) {
       diffDigest: args.diffDigest,
       diffMode: args.diffMode,
       headSha: args.headSha,
-      policyHash: computePolicyHash({
-        coveragePolicy: args.coveragePolicy,
-        diffMode: args.diffMode,
-        reviewerPolicy: args.required
-      }),
+      ...isLegacy ? {} : {
+        intendedEvidence,
+        policyVersion,
+        realizedEvidence: args.realizedEvidence ?? {},
+        ...args.sandboxProfiles ? { sandboxProfiles: args.sandboxProfiles } : {}
+      },
+      policyHash: computePolicyHashAt(
+        {
+          coveragePolicy: args.coveragePolicy,
+          diffMode: args.diffMode,
+          intendedEvidence,
+          reviewerPolicy: args.required,
+          sandboxProfiles: args.sandboxProfiles
+        },
+        policyVersion
+      ),
       repo: args.repo,
       reviewerPolicy: [...args.required],
       runId: args.runId,
@@ -3459,7 +3577,7 @@ function buildDiffReceipt(args) {
   };
 }
 function isDiffReviewed(live, deps) {
-  const receipt = deps.readReceipt(live.key);
+  const receipt = deps.readReceipt(live.key) ?? (live.legacyKey ? deps.readReceipt(live.legacyKey) : null);
   if (!receipt) return { reason: "no-receipt", receipt: null, reviewed: false };
   if (receipt.diffDigest !== live.key.diffDigest) {
     return { reason: "stale", receipt, reviewed: false };
@@ -3469,6 +3587,12 @@ function isDiffReviewed(live, deps) {
   }
   if (coverageShortfall(summarizeCoverage(live.coverage)).length > 0) {
     return { reason: "incomplete-coverage", receipt, reviewed: false };
+  }
+  if (live.intendedEvidence && !live.acceptDegraded) {
+    const gaps = evidenceShortfall(live.intendedEvidence, receipt.realizedEvidence);
+    if (gaps.length > 0) {
+      return { evidenceGaps: gaps, reason: "evidence-degraded", receipt, reviewed: false };
+    }
   }
   for (const id of live.required) {
     const r = deps.readReview(receipt.runId, id);
@@ -4374,19 +4498,28 @@ function isAttestedOnly(deps) {
   return !deps.strict && !deps.trailDir;
 }
 function verifyReceipt(live, deps) {
-  const receipt = deps.readReceipt(live.key);
+  const receipt = deps.readReceipt(live.key) ?? (deps.legacyKey ? deps.readReceipt(deps.legacyKey) : null);
   const trailDir = deps.trailDir;
   const readReviewFn = trailDir ? (runId, id) => readReview(trailDir, runId, id) : deps.strict ? () => null : receipt ? receiptBackedReadReview(receipt) : () => null;
-  return isDiffReviewed(live, {
-    readReceipt: () => receipt,
-    readReview: readReviewFn
-  });
+  return isDiffReviewed(
+    {
+      ...live,
+      acceptDegraded: deps.acceptDegraded,
+      intendedEvidence: deps.intendedEvidence,
+      legacyKey: deps.legacyKey
+    },
+    {
+      readReceipt: () => receipt,
+      readReview: readReviewFn
+    }
+  );
 }
 function verifyExitCode(state) {
   return state.reviewed ? 0 : 3;
 }
 var REASON_EXPLANATION = {
   "artifact-missing": "ARTIFACT MISSING \u2014 a required reviewer artifact is absent or did not complete (pass --trail <dir>)",
+  "evidence-degraded": "EVIDENCE DEGRADED \u2014 a receipt exists, but a seat was evidenced more weakly than you are asking for",
   "incomplete-coverage": "INCOMPLETE COVERAGE \u2014 the current diff omits a source file the review did not cover",
   "incomplete-policy": "INCOMPLETE POLICY \u2014 the receipt does not cover every required reviewer",
   "no-receipt": "NO RECEIPT \u2014 the current diff identity has no review receipt; it has not been reviewed",
@@ -4401,6 +4534,9 @@ function formatVerify(state, key) {
   out.push(`  head:    ${key.headSha}`);
   out.push(`  digest:  ${key.diffDigest}`);
   out.push(`  verdict: ${REASON_EXPLANATION[state.reason]}`);
+  if (state.evidenceGaps && state.evidenceGaps.length > 0) {
+    out.push(`  evidence: ${formatEvidenceShortfall(state.evidenceGaps)}`);
+  }
   if (state.receipt) {
     out.push(
       `  receipt: runId ${state.receipt.runId} \xB7 completed ${state.receipt.completed.join(", ")} \xB7 vendors ${state.receipt.vendors.join(", ")}`
