@@ -115,23 +115,9 @@ declare function buildCodexReviewArgs(config: ReviewerConfig, outFile: string, p
 interface RunReviewOpts {
     onSpawn?: (kill: () => void) => void;
     timeoutMs?: number;
+    worktree?: string;
 }
 declare function runCodexReview(prompt: string, config: ReviewerConfig, opts?: RunReviewOpts): Promise<CodexReviewResult>;
-
-declare function resolveGrokBin(): string;
-declare function resolveReviewSandbox(configured?: string): string;
-declare function ensureSandboxProfile(profile: string, file?: string): void;
-declare const GROK_SANDBOX_PROFILE: {
-    id: string;
-    version: number;
-};
-declare function buildGrokReviewArgs(config: ReviewerConfig, prompt: string, cwd: string): string[];
-declare function extractGrokText(stdout: string): string | null;
-declare function runGrokReview(prompt: string, config: ReviewerConfig, opts?: RunReviewOpts & {
-    worktree?: string;
-}): Promise<CodexReviewResult>;
-
-declare const REVIEW_ADAPTERS: Record<ReviewerId, (prompt: string, config: ReviewerConfig, opts?: RunReviewOpts) => Promise<CodexReviewResult>>;
 
 type DiffMode = 'commit' | 'working-tree' | 'staged' | 'pr' | 'raw';
 type FileKind = 'source' | 'generated' | 'binary';
@@ -382,6 +368,7 @@ interface DiffReviewState {
     receipt: DiffReviewReceipt | null;
     reviewed: boolean;
 }
+declare function resolveReceipt(readReceipt: (key: ReceiptKey) => DiffReviewReceipt | null, key: ReceiptKey, legacyKey?: ReceiptKey): DiffReviewReceipt | null;
 declare function isDiffReviewed(live: {
     acceptDegraded?: boolean;
     coverage: Coverage;
@@ -427,7 +414,16 @@ interface EvidenceGap {
 }
 declare function evidenceShortfall(intended: EvidenceMap, realized: EvidenceMap | undefined): EvidenceGap[];
 declare function formatEvidenceShortfall(gaps: EvidenceGap[]): string;
-declare function runtimeFallbacks(intended: EvidenceMap, realized: EvidenceMap): EvidenceGap[];
+
+declare function resolveGrokBin(): string;
+declare function resolveReviewSandbox(configured?: string): string;
+declare function ensureSandboxProfile(profile: string, file?: string): void;
+declare const GROK_SANDBOX_PROFILE: SandboxProfileRef;
+declare function buildGrokReviewArgs(config: ReviewerConfig, prompt: string, cwd: string): string[];
+declare function extractGrokText(stdout: string): string | null;
+declare function runGrokReview(prompt: string, config: ReviewerConfig, opts?: RunReviewOpts): Promise<CodexReviewResult>;
+
+declare const REVIEW_ADAPTERS: Record<ReviewerId, (prompt: string, config: ReviewerConfig, opts?: RunReviewOpts) => Promise<CodexReviewResult>>;
 
 declare const CODEX_SANDBOX_PROFILE: SandboxProfileRef;
 interface CodexSandboxPaths {
@@ -447,20 +443,6 @@ declare function buildCodexWorktreeArgs(config: {
     effort: string;
     model: string;
 }, outFile: string, prompt: string): string[];
-declare const CODEX_PROBE_PROMPT = "Read the file ensemble-probe.js in your current directory using your tools, then reply with exactly one sentence naming the bug and its line number.";
-declare const CODEX_PROBE_FILE = "ensemble-probe.js";
-declare const CODEX_PROBE_CONTENT = "export function f(a){\n  const items = []\n  for (let i = 0; i <= a.length; i++) items.push(a[i].id)\n  return items\n}\n";
-interface WrapperViability {
-    detail: string;
-    viable: boolean;
-}
-type ProbeSpawn = (argv: {
-    args: string[];
-    bin: string;
-}, cwd: string) => {
-    code: number;
-    outFile: string;
-};
 
 interface DepManifestHit {
     added: number;
@@ -634,7 +616,6 @@ interface CodeReviewSeatPromptArgs {
     worktree: string;
 }
 declare function renderCodeReviewSeatPrompt(args: CodeReviewSeatPromptArgs): string;
-declare function buildCodeReviewSeatArgs(prompt: string, config?: VoiceConfig): string[];
 
 declare const DEFAULT_VOICE_TIMEOUT_MS$1 = 300000;
 type Adapters$1 = Record<VoiceId, (prompt: string, config: VoiceConfig, opts?: {
@@ -773,4 +754,4 @@ declare function resolveMode(v: string): string;
 declare function isMode(v: string): v is ModeName;
 declare function isImplemented(mode: ModeName): boolean;
 
-export { type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormOptions, type BrainstormResult, type BuildReceiptResult, CODEX_PROBE_CONTENT, CODEX_PROBE_FILE, CODEX_PROBE_PROMPT, CODEX_SANDBOX_PROFILE, CODE_REVIEW_SKILL, CRITIQUE_STANCES, type CodeReviewSeatPromptArgs, type CodexReviewResult, type CodexSandboxPaths, type ConsultResult, type ConsultSynthesis, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type Coverage, type CoverageFileEntry, type CoveragePolicy, type Critique, type CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, EVIDENCE_CLASSES, EVIDENCE_MANIFEST_FILE, EVIDENCE_MANIFEST_SCHEMA_VERSION, EVIDENCE_SEATS, type EvidenceClass, type EvidenceGap, type EvidenceManifest, type EvidenceMap, type EvidenceSeat, type FileDiff, type FileKind, GROK_SANDBOX_PROFILE, type GatherConfig, type GatheredConventions, type GitRun, IMPLEMENTED_MODES, type Idea, type InlineSecretHit, MODES, MODE_ALIASES, type ManifestBlob, type ModeName, type OmitReason, POLICY_VERSIONS, POLICY_VERSION_EVIDENCE, POLICY_VERSION_LEGACY, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PersistReviewInput, type PolicyHashInputs, type PreflightError, type PreflightErrorKind, type ProbeSpawn, QUALITY_LENS, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type RankedIdea, type RawIdea, type ReceiptCoverage, type ReceiptKey, type RepoLocation, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunReviewOpts, type SandboxProfileMap, type SandboxProfileRef, type SecretScanResult, type SensitivePathHit, StoredReview, type SynthesisResult, TerminalState, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, VOICE_IDS, type VoiceAnswerResult, type VoiceConfig, type VoiceCritiqueResult$1 as VoiceCritiqueResult, type VoiceGenerateResult, type VoiceId, type VoiceRunResult, type Worktree, type WrapperViability, acquireDiff, acquireRepoLock, allowedRootsFromConfig, buildClaudeVoiceArgs, buildCodeReviewSeatArgs, buildCodexReviewArgs, buildCodexWorktreeArgs, buildDiffReceipt, buildEvidenceManifest, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, classifyGitError, codexSandboxSupported, computeCoverage, computePolicyHash, computePolicyHashAt, index as consult, coverageCounts, coverageShortfall, defaultCodexSandboxPaths, defaultReceiptStore, diffDigest, ensureSandboxProfile, escapesRoot, evidenceShortfall, extractGrokText, extractRefs, fallbackSynthesis$1 as fallbackSynthesis, formatEvidenceShortfall, fsConventionReader, gatherConventions, hasDepSurface, isDiffReviewed, isEvidenceClass, isEvidenceSeat, isImplemented, isMode, isPolicyVersion, isPreflightError, isVoiceId, keyOf, killTree, listReviewers, listVoices, loadReviewers, loadVoices, makeEscalatingKill, materializeWorktree, memoryConventionReader, omittedLine, parseCritique, parseDiffFiles, parseIdeas, parseLsTree, parseReviewers, parseSynthesis, parseVoiceIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, readReadableSurface, readReceipt, readReview, readReviewsForRun, reapWorktree, receiptIdentityMatches, receiptKeyHash, receiptPath, receiptPolicyVersion, remoteSlug, renderCodeReviewSeatPrompt, renderCodexSandboxProfile, renderCritiquePrompt, renderGeneratePrompt, renderSynthesisPrompt, resolveBase, resolveBin, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveInRepo, resolveMode, resolvePolicyVersion, resolveRepoId, resolveRepoLocation, resolveReviewSandbox, resolveReviewer, reviewDir, rootAllowed, runBrainstormMode, runClaudeVoice, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, runtimeFallbacks, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, sha256Hex, summarizeCoverage, validateReceiptShape, wrapWithSandbox, writeCodexSandboxProfile, writeEvidenceManifest, writeReceipt, writeTrailFile };
+export { type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormOptions, type BrainstormResult, type BuildReceiptResult, CODEX_SANDBOX_PROFILE, CODE_REVIEW_SKILL, CRITIQUE_STANCES, type CodeReviewSeatPromptArgs, type CodexReviewResult, type CodexSandboxPaths, type ConsultResult, type ConsultSynthesis, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type Coverage, type CoverageFileEntry, type CoveragePolicy, type Critique, type CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, EVIDENCE_CLASSES, EVIDENCE_MANIFEST_FILE, EVIDENCE_MANIFEST_SCHEMA_VERSION, EVIDENCE_SEATS, type EvidenceClass, type EvidenceGap, type EvidenceManifest, type EvidenceMap, type EvidenceSeat, type FileDiff, type FileKind, GROK_SANDBOX_PROFILE, type GatherConfig, type GatheredConventions, type GitRun, IMPLEMENTED_MODES, type Idea, type InlineSecretHit, MODES, MODE_ALIASES, type ManifestBlob, type ModeName, type OmitReason, POLICY_VERSIONS, POLICY_VERSION_EVIDENCE, POLICY_VERSION_LEGACY, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PersistReviewInput, type PolicyHashInputs, type PreflightError, type PreflightErrorKind, QUALITY_LENS, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type RankedIdea, type RawIdea, type ReceiptCoverage, type ReceiptKey, type RepoLocation, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunReviewOpts, type SandboxProfileMap, type SandboxProfileRef, type SecretScanResult, type SensitivePathHit, StoredReview, type SynthesisResult, TerminalState, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, VOICE_IDS, type VoiceAnswerResult, type VoiceConfig, type VoiceCritiqueResult$1 as VoiceCritiqueResult, type VoiceGenerateResult, type VoiceId, type VoiceRunResult, type Worktree, acquireDiff, acquireRepoLock, allowedRootsFromConfig, buildClaudeVoiceArgs, buildCodexReviewArgs, buildCodexWorktreeArgs, buildDiffReceipt, buildEvidenceManifest, buildGrokReviewArgs, canonicalizeDiff, classifyFileKind, classifyGitError, codexSandboxSupported, computeCoverage, computePolicyHash, computePolicyHashAt, index as consult, coverageCounts, coverageShortfall, defaultCodexSandboxPaths, defaultReceiptStore, diffDigest, ensureSandboxProfile, escapesRoot, evidenceShortfall, extractGrokText, extractRefs, fallbackSynthesis$1 as fallbackSynthesis, formatEvidenceShortfall, fsConventionReader, gatherConventions, hasDepSurface, isDiffReviewed, isEvidenceClass, isEvidenceSeat, isImplemented, isMode, isPolicyVersion, isPreflightError, isVoiceId, keyOf, killTree, listReviewers, listVoices, loadReviewers, loadVoices, makeEscalatingKill, materializeWorktree, memoryConventionReader, omittedLine, parseCritique, parseDiffFiles, parseIdeas, parseLsTree, parseReviewers, parseSynthesis, parseVoiceIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, readReadableSurface, readReceipt, readReview, readReviewsForRun, reapWorktree, receiptIdentityMatches, receiptKeyHash, receiptPath, receiptPolicyVersion, remoteSlug, renderCodeReviewSeatPrompt, renderCodexSandboxProfile, renderCritiquePrompt, renderGeneratePrompt, renderSynthesisPrompt, resolveBase, resolveBin, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveInRepo, resolveMode, resolvePolicyVersion, resolveReceipt, resolveRepoId, resolveRepoLocation, resolveReviewSandbox, resolveReviewer, reviewDir, rootAllowed, runBrainstormMode, runClaudeVoice, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, sha256Hex, summarizeCoverage, validateReceiptShape, wrapWithSandbox, writeCodexSandboxProfile, writeEvidenceManifest, writeReceipt, writeTrailFile };

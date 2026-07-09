@@ -1,10 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import {
-  buildCodeReviewSeatArgs,
-  CODE_REVIEW_SKILL,
-  renderCodeReviewSeatPrompt,
-} from './code-review-seat';
+import { CODE_REVIEW_SKILL, renderCodeReviewSeatPrompt } from './code-review-seat';
 
 const args = {
   baseSha: 'b'.repeat(40),
@@ -43,21 +39,5 @@ describe('the one Claude producer — /code-review methodology seat', () => {
   it('pins the ensemble schema so one parser serves every seat', () => {
     expect(prompt).toContain('"severity":"high|medium|low"');
     expect(prompt).toContain('exactly one fenced ```json block');
-  });
-
-  it('is read-only: plan mode + the write-tool deny-list, like the packet-mode voice', () => {
-    const argv = buildCodeReviewSeatArgs('p');
-    expect(argv).toContain('--permission-mode');
-    expect(argv).toContain('plan');
-    expect(argv).toEqual(expect.arrayContaining(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']));
-  });
-
-  it('honors a configured model/effort, and omits an invalid effort rather than passing it', () => {
-    expect(buildCodeReviewSeatArgs('p', { effort: 'max', model: 'opus' } as never)).toEqual(
-      expect.arrayContaining(['--model', 'opus', '--effort', 'max'])
-    );
-    expect(buildCodeReviewSeatArgs('p', { effort: 'nonsense', model: 'default' } as never)).not.toContain(
-      '--effort'
-    );
   });
 });

@@ -2486,15 +2486,17 @@ function computePolicyHashAt(inputs, version) {
       `ensemble-ai: unknown policyVersion ${version} \u2014 cannot compute a policy hash under a schema this build does not define`
     );
   }
-  const intended = inputs.intendedEvidence ?? {};
+  const intendedEvidence = canonicalMap(inputs.intendedEvidence ?? {});
   const canonical = JSON.stringify({
     coveragePolicy: inputs.coveragePolicy,
     diffMode: inputs.diffMode,
-    intendedEvidence: canonicalMap(intended),
+    intendedEvidence,
     policyVersion: POLICY_VERSION_EVIDENCE,
     reviewerPolicy: [...inputs.reviewerPolicy].sort(),
     sandboxProfiles: canonicalMap(inputs.sandboxProfiles ?? {}),
-    seatSet: Object.keys(canonicalMap(intended)).sort()
+    // Redundant with intendedEvidence's keys, but part of the FROZEN v2 preimage: once a v2
+    // receipt exists on disk its hash cannot be renegotiated. canonicalMap already sorts.
+    seatSet: Object.keys(intendedEvidence)
   });
   return `sha256:${sha256Hex(canonical)}`;
 }
@@ -3576,8 +3578,11 @@ function buildDiffReceipt(args) {
     }
   };
 }
+function resolveReceipt(readReceipt2, key, legacyKey) {
+  return readReceipt2(key) ?? (legacyKey ? readReceipt2(legacyKey) : null);
+}
 function isDiffReviewed(live, deps) {
-  const receipt = deps.readReceipt(live.key) ?? (live.legacyKey ? deps.readReceipt(live.legacyKey) : null);
+  const receipt = resolveReceipt(deps.readReceipt, live.key, live.legacyKey);
   if (!receipt) return { reason: "no-receipt", receipt: null, reviewed: false };
   if (receipt.diffDigest !== live.key.diffDigest) {
     return { reason: "stale", receipt, reviewed: false };
@@ -4498,15 +4503,14 @@ function isAttestedOnly(deps) {
   return !deps.strict && !deps.trailDir;
 }
 function verifyReceipt(live, deps) {
-  const receipt = deps.readReceipt(live.key) ?? (deps.legacyKey ? deps.readReceipt(deps.legacyKey) : null);
+  const receipt = resolveReceipt(deps.readReceipt, live.key, deps.legacyKey);
   const trailDir = deps.trailDir;
   const readReviewFn = trailDir ? (runId, id) => readReview(trailDir, runId, id) : deps.strict ? () => null : receipt ? receiptBackedReadReview(receipt) : () => null;
   return isDiffReviewed(
     {
       ...live,
       acceptDegraded: deps.acceptDegraded,
-      intendedEvidence: deps.intendedEvidence,
-      legacyKey: deps.legacyKey
+      intendedEvidence: deps.intendedEvidence
     },
     {
       readReceipt: () => receipt,

@@ -138,20 +138,23 @@ export function computePolicyHashAt(
       `ensemble-ai: unknown policyVersion ${version} — cannot compute a policy hash under a schema this build does not define`
     );
   }
-  const intended = inputs.intendedEvidence ?? {};
+  const intendedEvidence = canonicalMap(inputs.intendedEvidence ?? {});
   const canonical = JSON.stringify({
     coveragePolicy: inputs.coveragePolicy,
     diffMode: inputs.diffMode,
-    intendedEvidence: canonicalMap(intended),
+    intendedEvidence,
     policyVersion: POLICY_VERSION_EVIDENCE,
     reviewerPolicy: [...inputs.reviewerPolicy].sort(),
     sandboxProfiles: canonicalMap(inputs.sandboxProfiles ?? {}),
-    seatSet: Object.keys(canonicalMap(intended)).sort(),
+    // Redundant with intendedEvidence's keys, but part of the FROZEN v2 preimage: once a v2
+    // receipt exists on disk its hash cannot be renegotiated. canonicalMap already sorts.
+    seatSet: Object.keys(intendedEvidence),
   });
   return `sha256:${sha256Hex(canonical)}`;
 }
 
-// ── Realized-vs-intended comparison (the teeth of `receipt verify`) ────────────────────
+// ── Realized-vs-intended comparison (the teeth of `receipt verify`, and the run-time
+//    fail-closed check: a seat whose realized class is weaker than intent fell back) ────
 
 export interface EvidenceGap {
   intended: EvidenceClass;
@@ -186,13 +189,4 @@ export function formatEvidenceShortfall(gaps: EvidenceGap[]): string {
     .map((g) => `${g.seat} realized ${g.realized}, intended ${g.intended}`)
     .join('; ');
   return `evidence degraded — ${named}. This receipt does not prove the worktree-evidence review you are asking for. Re-run the review with the repo location, or pass --accept-degraded to accept the weaker evidence.`;
-}
-
-// Did any seat fall back at RUN time (realized weaker than this run's own intent)? Drives the
-// LOUD surfacing required by spec §9: receipt + review footer + run log + stderr.
-export function runtimeFallbacks(
-  intended: EvidenceMap,
-  realized: EvidenceMap
-): EvidenceGap[] {
-  return evidenceShortfall(intended, realized);
 }

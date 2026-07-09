@@ -51,6 +51,12 @@ export interface RunReviewOpts {
   // Receives the kill handle so a caller (a future cancel) can abort the child.
   onSpawn?: (kill: () => void) => void;
   timeoutMs?: number;
+  // WORKTREE EVIDENCE (§2): the detached, read-only worktree of the PR head this seat runs in.
+  // BORROWED, never owned — one worktree is materialized per run and shared by every seat, so a
+  // seat must never reap it. Absent ⇒ the packet path (a throwaway cwd). It lives on the SHARED
+  // opts so seats extend through the one adapter contract (REVIEW_ADAPTERS), never a per-reviewer
+  // intersection type. Only grok honors it today; codex needs its external wrapper first.
+  worktree?: string;
 }
 
 // Invoke the reviewer (Codex) READ-ONLY with the embedded packet prompt, over the

@@ -160,26 +160,3 @@ export function buildCodexWorktreeArgs(
     prompt,
   ];
 }
-
-// The REAL viability check (spec §9, grok-f2): a `--version` smoke proves nothing about whether
-// codex can fork a pty, exec its own tooling, and reach its API from inside the wrapper. So the
-// probe runs codex under the profile against a REAL review prompt over a REAL file in the
-// worktree, and demands a non-empty reply in the `-o` outfile. Anything less and the seat falls
-// back to the packet, LOUDLY (spec §2: accepting a degraded codex seat is Oskar's call).
-export const CODEX_PROBE_PROMPT =
-  'Read the file ensemble-probe.js in your current directory using your tools, then reply with exactly one sentence naming the bug and its line number.';
-
-export const CODEX_PROBE_FILE = 'ensemble-probe.js';
-export const CODEX_PROBE_CONTENT =
-  'export function f(a){\n  const items = []\n  for (let i = 0; i <= a.length; i++) items.push(a[i].id)\n  return items\n}\n';
-
-export interface WrapperViability {
-  detail: string;
-  viable: boolean;
-}
-
-// Injected spawn so the probe is unit-testable without burning a real codex call.
-export type ProbeSpawn = (
-  argv: { args: string[]; bin: string },
-  cwd: string
-) => { code: number; outFile: string };

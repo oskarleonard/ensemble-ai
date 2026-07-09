@@ -78,11 +78,6 @@ export const DOWNGRADE_REASONS = [
 ] as const;
 export type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
 
-// The gate's own evidence class — it is an EVIDENCE-BEARING ACTOR, not a neutral judge
-// (gate-r3 pin 1). Defaults to 'packet' everywhere, so every existing caller keeps today's
-// semantics and `reference-not-found` can never appear on a packet-fed run.
-export type GateEvidence = EvidenceClass;
-
 // The composite envelope schema the gate prompt pins + the model must echo. A missing /
 // different value fails the whole envelope closed (all-`unverified`) — the host never
 // interprets verdicts under semantics it doesn't recognize.
@@ -424,9 +419,9 @@ export function reconcileGateVerdicts(
   findings: GateFinding[],
   parsed: ParsedGateEnvelope | WholeEnvelopeFailure,
   // The gate's REALIZED evidence class. Defaults to 'packet' — the pre-worktree behavior.
-  opts: { gateEvidence?: GateEvidence } = {}
+  opts: { gateEvidence?: EvidenceClass } = {}
 ): { records: GateVerdictRecord[]; warnings: string[] } {
-  const gateEvidence: GateEvidence = opts.gateEvidence ?? 'packet';
+  const gateEvidence: EvidenceClass = opts.gateEvidence ?? 'packet';
   if ('failure' in parsed) {
     const reason = FAILURE_REASON[parsed.failure];
     return {
@@ -760,9 +755,10 @@ export interface RunGateOptions {
   baseDir: string;
   config: VoiceConfig;
   expectedHeadSha: string;
-  // The gate's REALIZED evidence (default 'packet'). Worktree ⇒ the gate ran with read access to
-  // the PR head and may emit `reference-not-found`.
-  gateEvidence?: GateEvidence;
+  // The gate's REALIZED evidence (default 'packet'). The gate is an EVIDENCE-BEARING ACTOR, not a
+  // neutral judge (gate-r3 pin 1): worktree ⇒ it read the PR head and may emit
+  // `reference-not-found`; packet ⇒ it structurally cannot, and the cause is dropped.
+  gateEvidence?: EvidenceClass;
   log?: (m: string) => void;
   reviews: VoiceReview[];
   run: GateRunner;

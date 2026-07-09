@@ -18,6 +18,7 @@ import {
   type DiffReviewState,
   isDiffReviewed,
   type ReceiptKey,
+  resolveReceipt,
 } from '../modes/review/receipt';
 
 // TRUST MODEL — two modes, by design:
@@ -93,11 +94,11 @@ export function verifyReceipt(
   live: { coverage: Coverage; key: ReceiptKey; required: ReviewerId[] },
   deps: VerifyDeps
 ): DiffReviewState {
-  // Mirror isDiffReviewed's schema-compat lookup so the attested-mode readReview below is
-  // backed by the SAME receipt the state machine will read (a legacy receipt found via the
-  // legacy key must still satisfy its own completed[] attestation).
-  const receipt =
-    deps.readReceipt(live.key) ?? (deps.legacyKey ? deps.readReceipt(deps.legacyKey) : null);
+  // The SAME schema-compat lookup isDiffReviewed performs, so the attested-mode readReview below
+  // is backed by the receipt the state machine will read (a legacy receipt found via the legacy
+  // key must still satisfy its own completed[] attestation). Resolved ONCE here and injected as a
+  // constant, so isDiffReviewed needs no key of its own.
+  const receipt = resolveReceipt(deps.readReceipt, live.key, deps.legacyKey);
   const trailDir = deps.trailDir;
   // Resolve HOW a reviewer's terminal state is proven:
   //   trail dir → read the real immutable artifacts (strongest proof);
@@ -116,7 +117,6 @@ export function verifyReceipt(
       ...live,
       acceptDegraded: deps.acceptDegraded,
       intendedEvidence: deps.intendedEvidence,
-      legacyKey: deps.legacyKey,
     },
     {
       readReceipt: () => receipt,

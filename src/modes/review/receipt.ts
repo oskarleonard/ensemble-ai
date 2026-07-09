@@ -487,6 +487,18 @@ export interface DiffReviewState {
   reviewed: boolean;
 }
 
+// SCHEMA-COMPATIBILITY lookup, the ONE place it lives. Find a receipt whose identity this build
+// can interpret: a v2 caller falls back to the v1 key so a legacy receipt is FOUND rather than
+// reported missing — it then fails on EVIDENCE QUALITY, which can name the weaker seat and point
+// at the flag, instead of a blunt `no-receipt` that hides WHY (gate-r3 pin 2).
+export function resolveReceipt(
+  readReceipt: (key: ReceiptKey) => DiffReviewReceipt | null,
+  key: ReceiptKey,
+  legacyKey?: ReceiptKey
+): DiffReviewReceipt | null {
+  return readReceipt(key) ?? (legacyKey ? readReceipt(legacyKey) : null);
+}
+
 // LIVE validation — the heart of the gate (Phase 2 calls this; Phase 1 ships +
 // tests it). A diff counts as cross-vendor reviewed ONLY when: (a) a receipt
 // exists for the full live identity, (b) its digest still matches the live diff
@@ -507,8 +519,7 @@ export function isDiffReviewed(
     intendedEvidence?: EvidenceMap;
     key: ReceiptKey;
     // The SAME identity hashed under the legacy (v1) schema. Consulted ONLY when the primary
-    // (v2) key misses: an old receipt is schema-compatible but evidence-unknown, and reporting
-    // that as a blunt `no-receipt` would hide WHY (gate-r3 pin 2).
+    // (v2) key misses — see resolveReceipt.
     legacyKey?: ReceiptKey;
     required: ReviewerId[];
   },
@@ -517,11 +528,8 @@ export function isDiffReviewed(
     readReview: (runId: string, reviewerId: ReviewerId) => StoredReview | null;
   }
 ): DiffReviewState {
-  // SCHEMA-COMPATIBILITY first: find a receipt whose identity this build can interpret. A v2
-  // caller falls back to the v1 key so a legacy receipt is FOUND rather than reported missing.
-  const receipt =
-    deps.readReceipt(live.key) ??
-    (live.legacyKey ? deps.readReceipt(live.legacyKey) : null);
+  // SCHEMA-COMPATIBILITY first, EVIDENCE-QUALITY second (below).
+  const receipt = resolveReceipt(deps.readReceipt, live.key, live.legacyKey);
   if (!receipt) return { reason: 'no-receipt', receipt: null, reviewed: false };
   if (receipt.diffDigest !== live.key.diffDigest) {
     return { reason: 'stale', receipt, reviewed: false };

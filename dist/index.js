@@ -1192,9 +1192,6 @@ function buildCodexWorktreeArgs(config, outFile, prompt) {
     prompt
   ];
 }
-var CODEX_PROBE_PROMPT = "Read the file ensemble-probe.js in your current directory using your tools, then reply with exactly one sentence naming the bug and its line number.";
-var CODEX_PROBE_FILE = "ensemble-probe.js";
-var CODEX_PROBE_CONTENT = "export function f(a){\n  const items = []\n  for (let i = 0; i <= a.length; i++) items.push(a[i].id)\n  return items\n}\n";
 
 // src/modes/review/diff.ts
 import { execFileSync as execFileSync2 } from "child_process";
@@ -1560,15 +1557,17 @@ function computePolicyHashAt(inputs, version) {
       `ensemble-ai: unknown policyVersion ${version} \u2014 cannot compute a policy hash under a schema this build does not define`
     );
   }
-  const intended = inputs.intendedEvidence ?? {};
+  const intendedEvidence = canonicalMap(inputs.intendedEvidence ?? {});
   const canonical = JSON.stringify({
     coveragePolicy: inputs.coveragePolicy,
     diffMode: inputs.diffMode,
-    intendedEvidence: canonicalMap(intended),
+    intendedEvidence,
     policyVersion: POLICY_VERSION_EVIDENCE,
     reviewerPolicy: [...inputs.reviewerPolicy].sort(),
     sandboxProfiles: canonicalMap(inputs.sandboxProfiles ?? {}),
-    seatSet: Object.keys(canonicalMap(intended)).sort()
+    // Redundant with intendedEvidence's keys, but part of the FROZEN v2 preimage: once a v2
+    // receipt exists on disk its hash cannot be renegotiated. canonicalMap already sorts.
+    seatSet: Object.keys(intendedEvidence)
   });
   return `sha256:${sha256Hex(canonical)}`;
 }
@@ -1587,9 +1586,6 @@ function evidenceShortfall(intended, realized) {
 function formatEvidenceShortfall(gaps) {
   const named = gaps.map((g) => `${g.seat} realized ${g.realized}, intended ${g.intended}`).join("; ");
   return `evidence degraded \u2014 ${named}. This receipt does not prove the worktree-evidence review you are asking for. Re-run the review with the repo location, or pass --accept-degraded to accept the weaker evidence.`;
-}
-function runtimeFallbacks(intended, realized) {
-  return evidenceShortfall(intended, realized);
 }
 
 // src/modes/review/gate.ts
@@ -1803,8 +1799,11 @@ function buildDiffReceipt(args) {
     }
   };
 }
+function resolveReceipt(readReceipt2, key, legacyKey) {
+  return readReceipt2(key) ?? (legacyKey ? readReceipt2(legacyKey) : null);
+}
 function isDiffReviewed(live, deps) {
-  const receipt = deps.readReceipt(live.key) ?? (live.legacyKey ? deps.readReceipt(live.legacyKey) : null);
+  const receipt = resolveReceipt(deps.readReceipt, live.key, live.legacyKey);
   if (!receipt) return { reason: "no-receipt", receipt: null, reviewed: false };
   if (receipt.diffDigest !== live.key.diffDigest) {
     return { reason: "stale", receipt, reviewed: false };
@@ -2276,43 +2275,6 @@ function reapWorktree(repoRoot, dir, deps) {
   }
 }
 
-// src/modes/brainstorm/claude.ts
-function resolveClaudeBin() {
-  return resolveBin("claude", { envVar: "CLAUDE_BIN" });
-}
-var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
-function buildClaudeVoiceArgs(prompt, config) {
-  const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
-  if (config?.model && config.model !== "default") args.push("--model", config.model);
-  if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
-  return args;
-}
-function runClaudeVoice(prompt, config, opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  return runReviewerExec({
-    args: buildClaudeVoiceArgs(prompt, config),
-    bin: resolveClaudeBin(),
-    capture: "stdout",
-    onSpawn: opts.onSpawn,
-    stderrLimit: 2e3,
-    timeoutMs
-  }).then(({ raw, stderrTail, timedOut }) => ({
-    ok: raw !== null && !timedOut,
-    raw,
-    stderrTail,
-    timedOut
-  }));
-}
-
-// src/modes/review/claude.ts
-var CLAUDE_EFFORTS2 = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
-var CLAUDE_REVIEW_DENIED_TOOLS = [
-  "Write",
-  "Edit",
-  "MultiEdit",
-  "NotebookEdit"
-];
-
 // src/modes/review/code-review-seat.ts
 var CODE_REVIEW_SKILL = "/code-review";
 var QUALITY_LENS = `Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits \u2014 they are noise on someone else's pull request.`;
@@ -2334,21 +2296,6 @@ Anchor every finding at file:line as it exists at ${args.headSha}.
 After the review, your FINAL output must end with exactly one fenced \`\`\`json block, and no other
 json block, in this schema:
 ${SCHEMA_BLOCK}`;
-}
-function buildCodeReviewSeatArgs(prompt, config) {
-  const args = [
-    "-p",
-    prompt,
-    "--output-format",
-    "text",
-    "--permission-mode",
-    "plan",
-    "--disallowedTools",
-    ...CLAUDE_REVIEW_DENIED_TOOLS
-  ];
-  if (config?.model && config.model !== "default") args.push("--model", config.model);
-  if (config && CLAUDE_EFFORTS2.has(config.effort)) args.push("--effort", config.effort);
-  return args;
 }
 
 // src/modes/brainstorm/types.ts
@@ -2593,6 +2540,36 @@ a tight ranked list of the genuinely strong ideas over a long one.
 import fs12 from "fs";
 import os8 from "os";
 import path11 from "path";
+
+// src/modes/brainstorm/claude.ts
+function resolveClaudeBin() {
+  return resolveBin("claude", { envVar: "CLAUDE_BIN" });
+}
+var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
+function buildClaudeVoiceArgs(prompt, config) {
+  const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
+  if (config?.model && config.model !== "default") args.push("--model", config.model);
+  if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
+  return args;
+}
+function runClaudeVoice(prompt, config, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
+  return runReviewerExec({
+    args: buildClaudeVoiceArgs(prompt, config),
+    bin: resolveClaudeBin(),
+    capture: "stdout",
+    onSpawn: opts.onSpawn,
+    stderrLimit: 2e3,
+    timeoutMs
+  }).then(({ raw, stderrTail, timedOut }) => ({
+    ok: raw !== null && !timedOut,
+    raw,
+    stderrTail,
+    timedOut
+  }));
+}
+
+// src/modes/brainstorm/voices.ts
 var VOICE_DEFAULTS = {
   claude: {
     cmd: "claude",
@@ -3239,9 +3216,6 @@ function isImplemented(mode) {
   return IMPLEMENTED_MODES.includes(mode);
 }
 export {
-  CODEX_PROBE_CONTENT,
-  CODEX_PROBE_FILE,
-  CODEX_PROBE_PROMPT,
   CODEX_SANDBOX_PROFILE,
   CODE_REVIEW_SKILL,
   CONFIDENCES,
@@ -3287,7 +3261,6 @@ export {
   allowedRootsFromConfig,
   assembleCodePacket,
   buildClaudeVoiceArgs,
-  buildCodeReviewSeatArgs,
   buildCodexReviewArgs,
   buildCodexWorktreeArgs,
   buildDiffReceipt,
@@ -3376,6 +3349,7 @@ export {
   resolveInRepo,
   resolveMode,
   resolvePolicyVersion,
+  resolveReceipt,
   resolveRepoId,
   resolveRepoLocation,
   resolveReviewSandbox,
@@ -3389,7 +3363,6 @@ export {
   runGrokReview,
   runReviewMode,
   runReviewerExec,
-  runtimeFallbacks,
   sanitizePathSegment,
   scanDependencySurface,
   scanDiffForSecrets,

@@ -1,7 +1,3 @@
-import type { VoiceConfig } from '../brainstorm/types';
-
-import { CLAUDE_EFFORTS, CLAUDE_REVIEW_DENIED_TOOLS } from './claude';
-
 // THE ONE CLAUDE PRODUCER (spec §3) — the worktree-mode Claude seat, running the built-in
 // /code-review methodology over the whole project at headSha.
 //
@@ -56,27 +52,8 @@ json block, in this schema:
 ${SCHEMA_BLOCK}`;
 }
 
-// PURE: the claude argv for the worktree-mode producer seat. Differs from the packet-mode voice
-// (./claude) in exactly two ways: the cwd is the worktree (so the skill's git + file tools reach
-// the project) and `--add-dir` is NOT used — the seat is confined to the worktree it is given.
-// The best-effort read-only belt (`--permission-mode plan` + the write-tool deny-list) is
-// unchanged; the Anthropic seats are harness-controlled, which is what qualifies them for
-// worktree evidence under §2.
-export function buildCodeReviewSeatArgs(prompt: string, config?: VoiceConfig): string[] {
-  const args = [
-    '-p',
-    prompt,
-    '--output-format',
-    'text',
-    '--permission-mode',
-    'plan',
-    '--disallowedTools',
-    ...CLAUDE_REVIEW_DENIED_TOOLS,
-  ];
-  if (config?.model && config.model !== 'default') args.push('--model', config.model);
-  // Depth policy (§3, Oskar-corrected): the seat's DEFAULT effort stays TOP — scaling is a
-  // downward valve the CONSUMER turns, never a ladder built here. A config that names no valid
-  // effort leaves the CLI default in place rather than passing an invalid flag.
-  if (config && CLAUDE_EFFORTS.has(config.effort)) args.push('--effort', config.effort);
-  return args;
-}
+// The seat's argv is `buildClaudeReviewArgs` (./claude) verbatim — same read-only belt
+// (`--permission-mode plan` + the write-tool deny-list), same model/effort gating. What makes
+// this a WORKTREE seat is not a flag: it is the prompt above plus the spawn cwd (the worktree,
+// so the skill's git + file tools reach the project). Depth policy (§3, Oskar-corrected): the
+// seat's default effort stays TOP — scaling is a downward valve the CONSUMER turns.

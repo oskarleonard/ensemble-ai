@@ -5,6 +5,7 @@ import path from 'node:path';
 import { resolveBin } from '../core/bin';
 import { runReviewerExec } from '../core/spawn';
 import type { ReviewerConfig } from '../core/types';
+import type { SandboxProfileRef } from '../modes/review/evidence';
 
 import {
   type CodexReviewResult,
@@ -147,6 +148,14 @@ export function ensureSandboxProfile(
   }
 }
 
+// The grok seat's sandbox identity. `ensemble-review` is a `strict` (deny-by-default READS)
+// base + a kernel secret deny-list — already exactly the repo-rooted, secret-denied shape §2
+// requires, so pointing it at the worktree root is config-only: `--cwd <worktree>` makes the
+// deny-by-default read root the worktree instead of a throwaway tmpdir. Bump `version` whenever
+// REVIEW_PROFILE_BLOCK changes — a receipt minted under a weaker profile must never verify as
+// equivalent to one minted under a tighter one.
+export const GROK_SANDBOX_PROFILE: SandboxProfileRef = { id: REVIEW_PROFILE_NAME, version: 1 };
+
 // PURE: the exact grok CLI args for a review. Encodes every lived lesson as DATA
 // so a unit test pins it: `-p <prompt>` (single-turn, prints to stdout) ·
 // `--output-format json` (the envelope gives a real `stopReason` terminal signal)
@@ -156,14 +165,6 @@ export function ensureSandboxProfile(
 // stateless, like codex from tmpdir) · `--disable-web-search` +
 // `--disallowed-tools bash,search_replace` (defense in depth, NOT the boundary) ·
 // `--no-memory` (no cross-session state).
-// The grok seat's sandbox identity. `ensemble-review` is a `strict` (deny-by-default READS)
-// base + a kernel secret deny-list — already exactly the repo-rooted, secret-denied shape §2
-// requires, so pointing it at the worktree root is config-only: `--cwd <worktree>` makes the
-// deny-by-default read root the worktree instead of a throwaway tmpdir. Bump `version` whenever
-// REVIEW_PROFILE_BLOCK changes — a receipt minted under a weaker profile must never verify as
-// equivalent to one minted under a tighter one.
-export const GROK_SANDBOX_PROFILE = { id: REVIEW_PROFILE_NAME, version: 1 };
-
 export function buildGrokReviewArgs(
   config: ReviewerConfig,
   prompt: string,
@@ -217,7 +218,7 @@ export function extractGrokText(stdout: string): string | null {
 export function runGrokReview(
   prompt: string,
   config: ReviewerConfig,
-  opts: RunReviewOpts & { worktree?: string } = {}
+  opts: RunReviewOpts = {}
 ): Promise<CodexReviewResult> {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   // Pin the boundary to a proven read-only profile (provisioning the resolved one,
