@@ -1,6 +1,11 @@
-import { describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import {
+  acquireRepoLock,
   classifyGitError,
   type GitRun,
   isPreflightError,
@@ -32,8 +37,91 @@ describe('error taxonomy — a named cause, never a generic git failure', () => 
     ["couldn't find remote ref pull/9/head", 'no-such-pr'],
     ['fatal: Authentication failed for https://…', 'auth'],
     ['remote: Repository not found.', 'wrong-repo'],
+    ["fatal: repository 'https://github.com/o/r.git/' not found", 'wrong-repo'],
     ['fatal: unable to access … Could not resolve host', 'network'],
   ])('%s → %s', (stderr, kind) => expect(classifyGitError(stderr)).toBe(kind));
+
+  // `404` is git's not-found PHRASE, never a bare substring: `wrong-repo` is a definitive claim
+  // ("your checkout is not this PR's repo"), so a transient failure must not be laundered into it.
+  it('does not read an incidental "404" in a repo/host name as wrong-repo', () => {
+    expect(classifyGitError('fatal: unable to access https://github.com/o/proj404: timed out')).toBe(
+      'network'
+    );
+    expect(classifyGitError('fatal: unable to access via proxy-404.corp: connection reset')).toBe(
+      'network'
+    );
+  });
+
+  it('still catches the real 404 forms', () => {
+    expect(classifyGitError('error: 404 while accessing …')).toBe('wrong-repo');
+  });
+});
+
+describe('acquireRepoLock — a holder may only ever remove ITS OWN lock', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-lock-'));
+  afterAll(() => fs.rmSync(tmp, { force: true, recursive: true }));
+
+  const lockPath = (dir: string) => path.join(dir, 'ensemble-ai-worktree.lock');
+
+  const freshDir = () => fs.mkdtempSync(path.join(tmp, 'gitdir-'));
+
+  it('serializes: a second acquire fails once the retry budget is spent', () => {
+    const dir = freshDir();
+    const release = acquireRepoLock(dir);
+    expect(fs.existsSync(lockPath(dir))).toBe(true);
+    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1 })).toThrow(
+      /could not acquire the worktree lock/
+    );
+    release();
+    expect(fs.existsSync(lockPath(dir))).toBe(false);
+  });
+
+  // THE RECLAIM RACE. A stalls past the TTL; B reclaims and takes the lock; A finally releases.
+  // A blind unlink here would delete B's LIVE lock and let a third process in while B is still
+  // writing to the shared .git — exactly the corruption the lock exists to prevent.
+  it("a stalled holder's release() does NOT delete the lock a reclaimer now holds", () => {
+    const dir = freshDir();
+    const releaseA = acquireRepoLock(dir, { staleMs: 0 }); // A holds
+    const tokenA = fs.readFileSync(lockPath(dir), 'utf8');
+
+    // B sees the lock as stale (staleMs 0), reclaims it, and takes it.
+    const releaseB = acquireRepoLock(dir, { retries: 5, sleepMs: 1, staleMs: 0 });
+    const tokenB = fs.readFileSync(lockPath(dir), 'utf8');
+    expect(tokenB).not.toBe(tokenA);
+
+    releaseA(); // the stalled holder wakes up and releases
+    expect(fs.existsSync(lockPath(dir))).toBe(true); // B's lock SURVIVES
+    expect(fs.readFileSync(lockPath(dir), 'utf8')).toBe(tokenB);
+
+    releaseB();
+    expect(fs.existsSync(lockPath(dir))).toBe(false);
+  });
+
+  it('reclaims a genuinely stale lock left by a crashed run', () => {
+    const dir = freshDir();
+    fs.writeFileSync(lockPath(dir), 'crashed-run:deadbeef');
+    const old = Date.now() - 60 * 60_000;
+    fs.utimesSync(lockPath(dir), old / 1000, old / 1000);
+    const release = acquireRepoLock(dir, { retries: 2, sleepMs: 1 });
+    expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-run');
+    release();
+  });
+
+  it('release is idempotent and never throws', () => {
+    const dir = freshDir();
+    const release = acquireRepoLock(dir);
+    release();
+    expect(() => release()).not.toThrow();
+  });
+
+  // A budget shorter than the TTL could never reach the reclaim branch, so a sibling doing a slow
+  // (but healthy) fetch would be reported as wedged.
+  it('waits at least the staleness TTL by default, so the reclaim branch is reachable', () => {
+    const dir = freshDir();
+    const release = acquireRepoLock(dir);
+    expect(() => acquireRepoLock(dir, { retries: 0, sleepMs: 1 })).toThrow(/0s/);
+    release();
+  });
 });
 
 describe('allowed-repo-roots (pin 5) — consumer config, never engine-baked', () => {

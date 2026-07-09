@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -77,7 +78,13 @@ export function classifyGitError(stderr: string): PreflightErrorKind {
   if (/authentication failed|permission denied|could not read username|403 forbidden|access denied/.test(s)) {
     return 'auth';
   }
-  if (/repository not found|404/.test(s)) return 'wrong-repo';
+  // `404` must be matched as git's OWN not-found phrasing, never as a bare substring: a repo,
+  // branch, or proxy hostname containing "404" would otherwise be reported as the definitive
+  // security-flavored `wrong-repo` instead of the conservative retryable `network`. Both real
+  // forms are matched: `remote: Repository not found.` and `fatal: repository '<url>' not found`.
+  if (/repository not found|repository '[^']*' not found|error: 404|status code 404/.test(s)) {
+    return 'wrong-repo';
+  }
   return 'network';
 }
 
@@ -184,30 +191,50 @@ export interface Worktree {
 // Serialize per repo: `git worktree add` writes into the SHARED `.git`. O_EXCL create is the
 // lock; a stale lock older than the TTL is reclaimed (a crashed run must not wedge the repo
 // forever). Returns a release function; never throws on release.
+//
+// OWNERSHIP IS PROVEN, NOT ASSUMED. A blind `unlink(lock)` on release is unsafe once reclaim
+// exists: holder A stalls past the TTL, B reclaims and takes the lock, A finishes and its
+// release() deletes B's LIVE lock — C then enters while B is mid-`worktree add`, which is the
+// exact concurrent-write corruption this lock exists to prevent. So each holder writes a unique
+// token and only ever removes a lock still carrying ITS token. The same check guards the stale
+// reclaim, so we never unlink a lock that was replaced between our stat and our unlink.
+function lockToken(): string {
+  return `${process.pid}:${randomUUID()}`;
+}
+
+function removeLockIfOwned(lock: string, token: string): void {
+  try {
+    if (fs.readFileSync(lock, 'utf8').trim() === token) fs.unlinkSync(lock);
+  } catch {
+    /* gone, or replaced by another holder — either way it is not ours to remove */
+  }
+}
+
 export function acquireRepoLock(
   gitCommonDir: string,
   opts: { retries?: number; sleepMs?: number; staleMs?: number } = {}
 ): () => void {
   const lock = path.join(gitCommonDir, 'ensemble-ai-worktree.lock');
-  const retries = opts.retries ?? 60;
   const sleepMs = opts.sleepMs ?? 500;
   const staleMs = opts.staleMs ?? 10 * 60_000;
+  // Wait at least as long as the staleness TTL. A shorter budget could never reach the reclaim
+  // branch, so a sibling holding the lock across a legitimately slow `git fetch` (a large repo,
+  // a cold object store) would throw as "wedged" while it was merely working.
+  const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
+  const token = lockToken();
   for (let i = 0; i <= retries; i++) {
     try {
       const fd = fs.openSync(lock, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-      fs.writeSync(fd, `${process.pid}\n`);
+      fs.writeSync(fd, token);
       fs.closeSync(fd);
-      return () => {
-        try {
-          fs.unlinkSync(lock);
-        } catch {
-          /* already gone — nothing to release */
-        }
-      };
+      return () => removeLockIfOwned(lock, token);
     } catch {
       try {
+        const held = fs.readFileSync(lock, 'utf8').trim();
         const age = Date.now() - fs.statSync(lock).mtimeMs;
-        if (age > staleMs) fs.unlinkSync(lock);
+        // Reclaim ONLY the exact stale lock we just observed: if the holder released and a third
+        // process took it in between, `held` no longer matches and we leave the new lock alone.
+        if (age > staleMs) removeLockIfOwned(lock, held);
       } catch {
         /* raced with the holder — just wait */
       }
@@ -217,7 +244,7 @@ export function acquireRepoLock(
     }
   }
   throw new Error(
-    `ensemble-ai: could not acquire the worktree lock at ${lock} after ${retries} attempts — another review is materializing a worktree in this repo`
+    `ensemble-ai: could not acquire the worktree lock at ${lock} after ${retries} attempts (${Math.round((retries * sleepMs) / 1000)}s) — another review is materializing a worktree in this repo`
   );
 }
 

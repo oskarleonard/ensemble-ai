@@ -70,6 +70,19 @@ export function runCodexReview(
   config: ReviewerConfig,
   opts: RunReviewOpts = {}
 ): Promise<CodexReviewResult> {
+  // FAIL CLOSED, never silently. `worktree` lives on the shared opts, but this seat cannot yet
+  // honor it: codex needs its external sandbox-exec wrapper (codex-sandbox.ts) wired in first,
+  // and codex's own `-s read-only` restricts writes, not reads. Accepting-and-ignoring the option
+  // would let a caller believe codex saw the worktree while it reviewed from the packet — and a
+  // receipt could then record `worktree` evidence codex never had. That silent downgrade is the
+  // precise failure the realized-evidence map exists to make impossible, so refuse it loudly.
+  if (opts.worktree) {
+    return Promise.reject(
+      new Error(
+        'ensemble-ai: the codex seat cannot run against a worktree yet (the sandbox-exec wrapper is not wired). Refusing rather than reviewing the packet while reporting worktree evidence.'
+      )
+    );
+  }
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const outFile = path.join(
     os.tmpdir(),

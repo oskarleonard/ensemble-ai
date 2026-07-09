@@ -85,31 +85,48 @@ A **gate failure never opens the gate and never trips exit 1** — a spawn error
 
 By default every seat sees the **packet**: the diff, the changed files, and the repo's conventions. That is *diff-local* — a reviewer cannot see that your new helper duplicates one that already lives in an unchanged file. **Worktree evidence mode** fixes that by materializing the PR head as a **detached, read-only worktree** of a repo you already have cloned, and giving qualifying seats read access to the whole project at `headSha`.
 
-```bash
-# review a PR with whole-project context, from the clone you already have
-ensemble-ai review --pr https://github.com/o/r/pull/7 --repo ~/code/r
+> **Status — the engine is in; the CLI flags are not.** Everything below is implemented and tested,
+> and reachable through the **library** surface. The `--repo` and `--accept-degraded` flags shown
+> here are **not yet parsed** by `ensemble-ai review` / `ensemble-ai receipt`: `parseArgs` runs
+> strict, so passing them today prints `Unknown option '--repo'` and exits non-zero. Until that
+> wiring lands, every CLI run is packet-mode and mints a legacy (v1) receipt exactly as before, no
+> seat is spawned against a worktree, and the gate is always packet-fed. This section is the engine
+> contract, not yet a command you can type.
 
-# a receipt minted under weaker evidence than you asked for FAILS, loudly and by name
-ensemble-ai receipt verify --repo ~/code/r                     # → EVIDENCE DEGRADED: codex realized packet…
-ensemble-ai receipt verify --repo ~/code/r --accept-degraded   # take it anyway, deliberately
+```bash
+# NOT YET WIRED — shown as the intended surface, not as working commands:
+#
+#   ensemble-ai review --pr https://github.com/o/r/pull/7 --repo ~/code/r
+#
+#   # a receipt minted under weaker evidence than you asked for FAILS, loudly and by name
+#   ensemble-ai receipt verify --repo ~/code/r                     # → EVIDENCE DEGRADED: codex realized packet…
+#   ensemble-ai receipt verify --repo ~/code/r --accept-degraded   # take it anyway, deliberately
 ```
 
 **Your checkout is never involved.** The engine fetches `pull/N/head` from the remote's **explicit URL** (never assuming `origin` exposes PR refs), adds a detached worktree, and **asserts `HEAD == headSha` before any seat runs** — a mismatch aborts rather than reviewing wrong-SHA evidence. Materialization is inert by construction: no hooks, no submodule recursion, no LFS smudge (so an in-tree `.lfsconfig` is never honored), tracked files only, no deps installed. It is reaped in a `finally` plus a `git worktree prune` sweeper, and serialized per repo (`git worktree add` writes into the shared `.git`). Pre-flight fails **closed** with a named cause: `wrong-repo` · `no-such-pr` · `network` · `auth` · `not-a-repo` · `disallowed-root` · `sha-mismatch`. An optional `allowedRepoRoots` array in `~/.ensemble-ai/config.json` restricts which repo roots may be materialized at all — consumer policy, never baked into this engine.
 
 **A seat gets the worktree only under a deny-by-default sandbox** — repo-rooted, secret-denied. Fail-closed **per seat**: no qualifying sandbox, that seat keeps the packet, and the fallback is **loud** (receipt, footer, stderr), never silent.
 
-| Seat | Sandbox | Worktree |
-| --- | --- | --- |
-| `grok` | `ensemble-review` (Seatbelt/Landlock, `strict` base + secret deny-list), rooted at the worktree | yes |
-| `codex` | `ensemble-review-codex` — an ensemble-owned Seatbelt wrapper; codex's internal sandbox is off inside it (nested Seatbelt doesn't compose) | yes, on macOS |
-| `claude` | harness-controlled | yes |
-| `gate` | harness-controlled | yes |
+The plan per seat (**"wired" = a seat is actually spawned against a worktree today; none are yet — see the status note above**):
 
-**Honest containment.** The wrapper denies **exec** of any path inside the worktree, but a shell-capable agent can still read an untrusted file as *data* (`sh worktree/x.sh`). No-exec narrows the vector; it does not close it. The real boundary is the rest of the profile: no writes outside its own auth dir and the OS temp dir, no reads of any credential elsewhere, and **network scoped to TCP 443** — Seatbelt cannot express a per-host DNS allowlist, so a true per-host fence needs an egress proxy and is **not** claimed here. Outside macOS the codex seat falls back to the packet.
+| Seat | Sandbox | Worktree | Wired |
+| --- | --- | --- | --- |
+| `grok` | `ensemble-review` (Seatbelt/Landlock, `strict` base + secret deny-list), rooted at the worktree | yes | runner accepts `worktree`; no caller passes it |
+| `codex` | `ensemble-review-codex` — an ensemble-owned Seatbelt wrapper; codex's internal sandbox is off inside it (nested Seatbelt doesn't compose) | yes, on macOS | no — the runner **rejects** `worktree` rather than silently reviewing the packet |
+| `claude` | harness-controlled | yes | prompt + argv only |
+| `gate` | harness-controlled | yes | defaults to `packet` |
 
-**Evidence is part of the receipt's identity.** The receipt records the **intended** per-seat evidence map (policy) and the **realized** one (fact) as separate things, plus each worktree seat's sandbox profile id + version — so a degraded mixed run is never receipt-equivalent to a full-worktree run. `policyHash` is **versioned**: an all-packet run hashes under the legacy schema, byte-for-byte as before, so turning worktree mode *off* changes no receipt identity and no existing receipt is staled. `receipt verify` computes under the receipt's **own** issued version, then separately compares realized-vs-intended; a legacy receipt has no realized map, which reads as `unknown` = *weaker*, and fails **only** when you ask for worktree evidence (`--accept-degraded` overrides). An `evidence-manifest.json` joins the trail — the tracked tree at `headSha` with blob SHAs, i.e. the **readable surface** each worktree seat was given. It is advisory and never hashed. (Opaque vendor CLIs do not report their file reads, so it is honestly named: what a seat *could* read, not what it *did*.)
+**Honest containment.** The wrapper denies **exec** of any path inside the worktree, but a shell-capable agent can still read an untrusted file as *data* (`sh worktree/x.sh`). No-exec narrows the vector; it does not close it. The rest of the profile is the real boundary, and it is narrower than "nothing but the worktree" — state it exactly:
 
-**The gate reads the same worktree**, which makes it an evidence-bearing actor in its own right. On worktree evidence it may emit a new downgrade cause, **`reference-not-found`** — "I could not locate what this finding references at `headSha`", the hallucinated-reference red flag — alongside the existing `truncated` / `missing`. On a packet-fed gate the cause is **dropped with a warning**: a gate that only saw a ±25-line window cannot distinguish "does not exist" from "outside my window", and asserting the stronger cause on weaker evidence would be a lie. Consumers opt in by keying on the cause; old artifacts keep their meaning.
+- **Reads.** `$HOME` is not readable, so no ssh key, vendor credential, or other repo on disk is reachable — except `~/.codex`, which the seat must read to call its own API. The allowed *system* roots include `/private/var`, which contains the per-user `$TMPDIR`; a secret another process parked in its own temp dir **is** readable. The claim is "no credential in `$HOME`", not "no credential anywhere". A read root that is, or contains, `$HOME` (`~/bin/node` ⇒ `nodePrefix` = `$HOME`) is **refused**: the profile fails to build rather than grant it.
+- **Writes.** `~/.codex`, `/private/tmp` (the legacy world-shared `/tmp`, not the per-user `$TMPDIR`), and `/dev`.
+- **Network.** Port-scoped, never per-host, and **not 443-only**: outbound `443` **and** `53` (DNS) **and** local unix sockets; inbound on any local port. Port 53 to any address is a usable DNS-exfiltration channel, so combined with the read-as-data vector the seat has an egress path for whatever it can read. Seatbelt cannot express a per-host DNS allowlist, so a true per-host fence needs an egress proxy and is **not** claimed here.
+
+Outside macOS the codex seat falls back to the packet.
+
+**Evidence is part of the receipt's identity.** The receipt records the **intended** per-seat evidence map (policy) and the **realized** one (fact) as separate things, plus each worktree seat's sandbox profile id + version — so a degraded mixed run is never receipt-equivalent to a full-worktree run. `policyHash` is **versioned**: an all-packet run hashes under the legacy schema, byte-for-byte as before, so turning worktree mode *off* changes no receipt identity and no existing receipt is staled. The verification contract — `computePolicyHashAt` under the receipt's **own** issued version, then a separate realized-vs-intended comparison in which a legacy receipt's missing realized map reads as `unknown` = *weaker* and fails only when worktree evidence is requested (`acceptDegraded` overrides) — is implemented and tested in `isDiffReviewed` / `verifyReceipt`, but **the `receipt verify` command does not yet pass those inputs**, so today it always verifies under v1 and the evidence check is a no-op. An `evidence-manifest.json` joins the trail — the tracked tree at `headSha` with blob SHAs, i.e. the **readable surface** each worktree seat was given. It is advisory and never hashed. (Opaque vendor CLIs do not report their file reads, so it is honestly named: what a seat *could* read, not what it *did*.)
+
+**The gate reads the same worktree**, which makes it an evidence-bearing actor in its own right. On worktree evidence it may emit a new downgrade cause, **`reference-not-found`** — "I could not locate what this finding references at `headSha`", the hallucinated-reference red flag — alongside the existing `truncated` / `missing`. The gate is **taught** the cause only when its realized evidence is `worktree`, and the host **honors** it only then: a gate that saw a ±25-line window cannot distinguish "does not exist" from "outside my window", so a packet-fed gate is never told the cause exists, and a cause arriving on packet evidence anyway is dropped with a warning. Teaching and honoring are gated on the same fact. Consumers opt in by keying on the cause; old artifacts keep their meaning.
 
 **The Claude producer** in worktree mode runs the built-in `/code-review` methodology (bugs + structural quality — never style or naming nits) with whole-project context, and maps its findings into the same schema Codex and Grok emit. One Claude producer, not two: same-family corroboration is weak signal and pure dedup load.
 

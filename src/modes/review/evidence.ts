@@ -81,13 +81,15 @@ export const POLICY_VERSION_LEGACY = 1;
 export const POLICY_VERSION_EVIDENCE = 2;
 export const POLICY_VERSIONS = [POLICY_VERSION_LEGACY, POLICY_VERSION_EVIDENCE] as const;
 
-export function isPolicyVersion(v: unknown): boolean {
-  return (POLICY_VERSIONS as readonly number[]).includes(v as number);
+// A type predicate, like its siblings isEvidenceSeat/isEvidenceClass — so a caller narrows
+// instead of casting.
+export function isPolicyVersion(v: unknown): v is (typeof POLICY_VERSIONS)[number] {
+  return (POLICY_VERSIONS as readonly unknown[]).includes(v);
 }
 
 // A receipt with no `policyVersion` field was issued before evidence identity existed → v1.
 export function receiptPolicyVersion(v: unknown): number {
-  return isPolicyVersion(v) ? (v as number) : POLICY_VERSION_LEGACY;
+  return isPolicyVersion(v) ? v : POLICY_VERSION_LEGACY;
 }
 
 // The version a CALLER's intent implies. Any worktree seat ⇒ v2; an all-packet run stays v1 so

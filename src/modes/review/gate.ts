@@ -829,7 +829,10 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     return finalize(fallbackReviewSynthesis(opts.reviews), { failure: 'gate-failed' });
   }
 
-  const prompt = renderGatePrompt(findings, injections);
+  // The prompt teaches `cause: reference-not-found` ONLY when the gate's realized evidence is
+  // worktree — the same fact reconcileGateVerdicts requires to HONOR it. Teach and honor together,
+  // or the cause is either unreachable (never taught) or unsound (taught to a packet-fed gate).
+  const prompt = renderGatePrompt(findings, injections, opts.gateEvidence ?? 'packet');
   log('Gate: grounding findings against the pinned diff hunks — verdict tags…');
   let res: VoiceRunResult;
   try {

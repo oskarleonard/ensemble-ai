@@ -129,7 +129,7 @@ describe('the codex wrapper profile denies every credential outside its own auth
 
   it('DENIES exec of worktree paths (pin 3) and says so honestly in the profile itself', () => {
     expect(profile).toContain('(deny process-exec (subpath "/private/tmp/wt"))');
-    expect(profile).toMatch(/read an\s*;; untrusted file as DATA/);
+    expect(profile).toMatch(/read an untrusted file as DATA/);
   });
 
   it('network is PORT-scoped, and the profile does NOT claim a per-host allowlist', () => {
@@ -137,6 +137,24 @@ describe('the codex wrapper profile denies every credential outside its own auth
     // Seatbelt cannot express a DNS host; asserting it would be a lie we must never ship.
     expect(profile).not.toContain('api.openai.com');
     expect(profile).toContain('per-host DNS allowlist');
+  });
+
+  // The profile's own comment is the thing readers trust. Pin the FULL network rule set against
+  // it so the two can never drift into an over-claim ("443 only") the rules do not honor.
+  it('states the network surface it ACTUALLY grants — 443 and DNS and unix sockets, plus inbound', () => {
+    expect(profile).toContain('(allow network-outbound (remote ip "*:443") (remote ip "*:53") (remote unix-socket))');
+    expect(profile).toContain('(allow network-inbound (local ip "*:*"))');
+    expect(profile).not.toMatch(/network is PORT-scoped \(443\)/); // the retired over-claim
+    expect(profile).toMatch(/not 443-only/);
+    expect(profile).toMatch(/53 \(DNS\)/);
+  });
+
+  // /private/var contains the per-user $TMPDIR. The profile must SAY so rather than let a reader
+  // infer "no credential anywhere but ~/.codex" from a rule set that does not deliver it.
+  it('admits that the readable system roots include the per-user temp dir', () => {
+    expect(profile).toContain('(subpath "/private/var")');
+    expect(profile).toMatch(/\$TMPDIR/);
+    expect(profile).toMatch(/no credential in \$HOME/);
   });
 
   it('the profile version is bound into the seat identity', () => {
