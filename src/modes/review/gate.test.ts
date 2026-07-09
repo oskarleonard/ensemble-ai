@@ -121,6 +121,22 @@ describe('parseGateEnvelope — schemaVersion fail-closed + unparseable (DC10 ·
   it('a fully-unparseable reply ⇒ gate-failed', () => {
     expect(parseGateEnvelope('no json at all here')).toEqual({ failure: 'gate-failed' });
   });
+
+  it('an over-cap reason is clipped to REASON_CAP with a trailing ellipsis (not cut mid-word blind)', () => {
+    const long = 'word '.repeat(300).trim(); // ~1499 chars, well over the 700 cap
+    const p = parseGateEnvelope(envelope([{ findingId: 'codex#1', reason: long, verdict: 'agree' }]));
+    if ('failure' in p) throw new Error('expected a parsed envelope');
+    const { reason } = p.verdicts[0];
+    expect(reason.length).toBe(700);
+    expect(reason.endsWith('…')).toBe(true);
+    expect(reason.endsWith(' …')).toBe(false); // trailing space trimmed before the ellipsis
+  });
+
+  it('a reason at/under the cap is passed through untouched (no ellipsis)', () => {
+    const p = parseGateEnvelope(envelope([{ findingId: 'codex#1', reason: 'short reason.', verdict: 'agree' }]));
+    if ('failure' in p) throw new Error('expected a parsed envelope');
+    expect(p.verdicts[0].reason).toBe('short reason.');
+  });
 });
 
 describe('reconcileGateVerdicts — host-owned per-entry policy (DC10)', () => {
