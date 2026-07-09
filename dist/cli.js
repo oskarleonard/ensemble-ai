@@ -2848,11 +2848,11 @@ function isGateVerdict(v) {
 }
 var GATE_ENVELOPE_SCHEMA_VERSION = 1;
 var GATE_TRAIL_SCHEMA_VERSION = 2;
-var REASON_CAP = 300;
+var REASON_CAP = 700;
 var CITATION_CAP = 500;
 function capStr(s, n) {
   const t = typeof s === "string" ? s.trim() : "";
-  return t.length > n ? t.slice(0, n) : t;
+  return t.length > n ? `${t.slice(0, n - 1).trimEnd()}\u2026` : t;
 }
 var GATE_HUNK_BYTE_BUDGET = 40960;
 function flattenFindings(reviews) {
@@ -4161,7 +4161,7 @@ function gateSection(records, trailWritten) {
   }
   for (const r of records) {
     const where = evidenceRef(r.file, r.line, code);
-    const reason = r.reason ? ` \u2014 ${md(r.reason).slice(0, 300)}` : "";
+    const reason = r.reason ? ` \u2014 ${md(r.reason)}` : "";
     const dg = r.downgradeReason ? `  _(host: ${md(r.downgradeReason)})_` : "";
     out.push(
       `- **[${VERDICT_TAG[r.effectiveVerdict]}]** \`${code(r.findingId)}\` \xB7 ${SEVERITY_LABEL[r.severity]} \xB7 \`${where}\` \u2014 ${md(r.title).slice(0, 160)}${reason}${dg}`

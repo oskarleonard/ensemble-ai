@@ -186,7 +186,8 @@ function gateSection(records: GateVerdictRecord[], trailWritten: boolean): strin
   }
   for (const r of records) {
     const where = evidenceRef(r.file, r.line, code);
-    const reason = r.reason ? ` — ${md(r.reason).slice(0, 300)}` : '';
+    // r.reason is already capped (+ ellipsized) by the gate; don't re-clip it here.
+    const reason = r.reason ? ` — ${md(r.reason)}` : '';
     const dg = r.downgradeReason ? `  _(host: ${md(r.downgradeReason)})_` : '';
     out.push(
       `- **[${VERDICT_TAG[r.effectiveVerdict]}]** \`${code(r.findingId)}\` · ${SEVERITY_LABEL[r.severity]} · \`${where}\` — ${md(r.title).slice(0, 160)}${reason}${dg}`
