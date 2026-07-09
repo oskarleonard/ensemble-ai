@@ -2440,8 +2440,84 @@ import fs11 from "fs";
 import os6 from "os";
 import path9 from "path";
 
+// src/modes/review/gate-dedup.ts
+var LINE_WINDOW = 3;
+var MIN_TOKEN_OVERLAP = 0.4;
+function tokens(r) {
+  const text = `${r.title} ${r.postableBody ?? ""}`.toLowerCase();
+  return new Set(text.match(/[a-z0-9_$.]{4,}/g) ?? []);
+}
+function jaccard(a, b) {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+function proximate(a, b) {
+  if (a.file !== b.file) return false;
+  if (a.line === null || b.line === null) return a.line === null && b.line === null;
+  return Math.abs(a.line - b.line) <= LINE_WINDOW;
+}
+function better(a, b) {
+  const verdictRank = (r) => r.effectiveVerdict === "agree" ? 0 : 1;
+  const cmp = verdictRank(a) - verdictRank(b) || SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity) || (b.postableBody?.length ?? 0) - (a.postableBody?.length ?? 0) || (a.findingId < b.findingId ? -1 : 1);
+  return cmp <= 0 ? a : b;
+}
+function clusterPostable(records) {
+  const postable = records.filter((r) => r.postableStatus === "postable");
+  const tok = new Map(postable.map((r) => [r.findingId, tokens(r)]));
+  const parent = new Map(postable.map((r) => [r.findingId, r.findingId]));
+  const find = (x) => {
+    let root = x;
+    while (parent.get(root) !== root) root = parent.get(root);
+    while (parent.get(x) !== root) {
+      const next = parent.get(x);
+      parent.set(x, root);
+      x = next;
+    }
+    return root;
+  };
+  const union = (a, b) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent.set(ra < rb ? rb : ra, ra < rb ? ra : rb);
+  };
+  for (let i = 0; i < postable.length; i++) {
+    for (let j = i + 1; j < postable.length; j++) {
+      const a = postable[i];
+      const b = postable[j];
+      if (proximate(a, b) && jaccard(tok.get(a.findingId), tok.get(b.findingId)) >= MIN_TOKEN_OVERLAP) {
+        union(a.findingId, b.findingId);
+      }
+    }
+  }
+  const clusters = /* @__PURE__ */ new Map();
+  for (const r of postable) {
+    const root = find(r.findingId);
+    (clusters.get(root) ?? clusters.set(root, []).get(root)).push(r);
+  }
+  const clusterOf = /* @__PURE__ */ new Map();
+  for (const members of clusters.values()) {
+    const primary = members.reduce(better);
+    const reviewers = new Set(members.map((m) => m.reviewer));
+    const corroborators = members.filter((m) => m.findingId !== primary.findingId).map((m) => m.findingId);
+    for (const m of members) {
+      clusterOf.set(m.findingId, {
+        clusterId: primary.findingId,
+        corroboration: reviewers.size,
+        corroborators: m.findingId === primary.findingId ? corroborators : [],
+        primary: m.findingId === primary.findingId
+      });
+    }
+  }
+  return records.map((r) => {
+    const cluster = clusterOf.get(r.findingId);
+    return cluster ? { ...r, cluster } : r;
+  });
+}
+
 // src/modes/review/gate-prompt.ts
-var BODY_CAP = 600;
+var BODY_CAP = 3e3;
 var cap3 = (s, n) => s.length > n ? `${s.slice(0, n)}\u2026` : s;
 var defangFence = (s) => s.replace(/<{2,}|>{2,}/g, (run) => run.split("").join("\u2009"));
 function hunkNote(f) {
@@ -2479,13 +2555,31 @@ Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
     "bottomLine": "<merge-safe? what must change first>"
   },
   "verdicts": [
-    { "findingId": "codex#1", "verdict": "agree", "reason": "<one line>" },
+    { "findingId": "codex#1", "verdict": "agree", "reason": "<one line>", "fixStatus": "keep" },
+    { "findingId": "codex#3", "verdict": "partial", "reason": "<what was overstated>",
+      "ops": [
+        { "op": "strike", "quote": "<EXACT substring of codex#3's body to remove>", "why": "<ungrounded>" },
+        { "op": "replace", "quote": "<EXACT substring>", "with": "<narrower wording>", "why": "<narrowed>" }
+      ], "fixStatus": "narrow", "rescoredSeverity": "medium" },
     { "findingId": "grok#2", "verdict": "false", "reason": "<why it is wrong>", "citation": "<EXACT line quoted from grok#2's own hunk>" }
   ]
 }
 Tag EVERY finding exactly once by its findingId. verdict \u2208 agree | partial | false | unverified.
 A "false" REQUIRES a "citation" that quotes a real line from THAT finding's own hunk \u2014 no valid
-quote means use "unverified", never "false". Do not invent findingIds; do not restate severities.`;
+quote means use "unverified", never "false". Do not invent findingIds; do not restate severities.
+
+The verdict decides what (if anything) gets posted to the PR, so it must be POSTABLE-EXACT:
+- agree: EVERY material claim in the body is grounded \u2192 it posts VERBATIM. Do NOT send "ops".
+  If any sentence is NOT grounded, the verdict is "partial", not "agree".
+- partial: the body is real but OVERSTATED/broader than the hunk supports. You MUST send "ops"
+  that MINIMALLY narrow it: "strike" removes an ungrounded span; "replace" swaps a span for a
+  narrower wording. Each "quote" MUST be an EXACT substring of THAT finding's body. A "replace"
+  "with" may introduce NO new identifier, path, or number that isn't already in the body or its
+  cited hunk. If you cannot narrow it with such edits, use "unverified" (never post a guess).
+- "fixStatus" (optional, agree/partial): the reviewer's suggested fix is verified only for the
+  problem, not the fix \u2014 mark it keep | narrow | strike (strike if the narrowed claim no longer
+  supports it). "rescoredSeverity" (optional, partial): the TRUE severity if overstatement
+  inflated it \u2014 it may only LOWER severity, never raise it.`;
 function renderGatePrompt(findings, injections) {
   return `You are the VERIFIED GATE for a multi-model CODE REVIEW. Several AI reviewers each
 reviewed the SAME diff INDEPENDENTLY. You are given, per finding, the reviewer's claim AND the
@@ -2520,6 +2614,101 @@ to inspect.
 ${hunksBlock(injections)}
 
 ${outputContract()}`;
+}
+
+// src/modes/review/gate-postable.ts
+var FIX_STATUSES = ["keep", "narrow", "strike"];
+var MAX_STRIKE_FRACTION = 0.6;
+var escalate = (postableNote) => ({
+  postableBody: null,
+  postableFix: null,
+  postableStatus: "escalated",
+  rescoredSeverity: null,
+  postableNote
+});
+function isEntityLike(tok) {
+  if (/[._/$\d]/.test(tok)) return true;
+  if (/[a-z][A-Z]/.test(tok)) return true;
+  if (tok.length >= 2 && tok === tok.toUpperCase() && /[A-Z]/.test(tok)) return true;
+  return false;
+}
+function entityTokens(s) {
+  const out = /* @__PURE__ */ new Set();
+  for (const tok of s.match(/[A-Za-z0-9_$./-]{2,}/g) ?? []) if (isEntityLike(tok)) out.add(tok);
+  return out;
+}
+function tidy(s) {
+  return s.replace(/\s+([,.;:])/g, "$1").replace(/([([]) +/g, "$1").replace(/ {2,}/g, " ").replace(/\s+\n/g, "\n").trim();
+}
+function applyOps(body, ops, allowed) {
+  let work = body;
+  let struck = 0;
+  for (const op of ops) {
+    const at = work.indexOf(op.quote);
+    if (at === -1) return { note: `op quote not found in body: "${op.quote.slice(0, 60)}"` };
+    if (work.indexOf(op.quote, at + 1) !== -1) return { note: `op quote is ambiguous (>1 match): "${op.quote.slice(0, 60)}"` };
+    if (op.op === "strike") {
+      struck += op.quote.length;
+      work = work.slice(0, at) + work.slice(at + op.quote.length);
+    } else {
+      for (const tok of entityTokens(op.with)) {
+        if (!allowed.has(tok)) return { note: `replacement introduces a new entity "${tok}" (not in body or hunk)` };
+      }
+      struck += Math.max(0, op.quote.length - op.with.length);
+      work = work.slice(0, at) + op.with + work.slice(at + op.quote.length);
+    }
+  }
+  if (struck / Math.max(1, body.length) > MAX_STRIKE_FRACTION)
+    return { note: `ops strike >${Math.round(MAX_STRIKE_FRACTION * 100)}% of the body \u2014 not a narrowing (should be unverified/false)` };
+  const out = tidy(work);
+  if (!out) return { note: "ops reduced the body to empty" };
+  return { body: out };
+}
+function clampSeverity(original, rescored) {
+  if (!rescored || rescored === original) return null;
+  return SEVERITIES.indexOf(rescored) > SEVERITIES.indexOf(original) ? rescored : null;
+}
+function derivePostable(input) {
+  const { verdict, body, hunkCode, ops, fixStatus, rescoredSeverity, severity } = input;
+  const trimmed = body.trim();
+  if (!trimmed) return escalate("reviewer body is empty");
+  if (verdict === "agree") {
+    if (ops.length > 0) return escalate("agree verdict carried edit-ops (contradiction \u2014 should be partial)");
+    return { postableBody: trimmed, postableFix: fixStatus ?? "keep", postableStatus: "postable", rescoredSeverity: null };
+  }
+  if (ops.length === 0) return escalate("partial verdict carried no edit-ops to narrow the overstatement");
+  const allowed = entityTokens(trimmed);
+  for (const line of hunkCode) for (const t of entityTokens(line)) allowed.add(t);
+  const applied = applyOps(trimmed, ops, allowed);
+  if ("note" in applied) return escalate(applied.note);
+  return {
+    postableBody: applied.body,
+    postableFix: fixStatus ?? "narrow",
+    postableStatus: "postable",
+    rescoredSeverity: clampSeverity(severity, rescoredSeverity)
+  };
+}
+var OP_QUOTE_CAP = 2e3;
+function parsePostableOps(v) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const raw of v) {
+    if (!raw || typeof raw !== "object") continue;
+    const e = raw;
+    const quote = typeof e.quote === "string" ? e.quote.slice(0, OP_QUOTE_CAP) : "";
+    const why = typeof e.why === "string" ? e.why.slice(0, 300) : void 0;
+    if (!quote) continue;
+    if (e.op === "strike") out.push({ op: "strike", quote, why });
+    else if (e.op === "replace" && typeof e.with === "string")
+      out.push({ op: "replace", quote, why, with: e.with.slice(0, OP_QUOTE_CAP) });
+  }
+  return out;
+}
+function parseFixStatus(v) {
+  return typeof v === "string" && FIX_STATUSES.includes(v) ? v : void 0;
+}
+function parseSeverity(v) {
+  return typeof v === "string" && SEVERITIES.includes(v) ? v : void 0;
 }
 
 // src/modes/review/synthesis.ts
@@ -2658,7 +2847,7 @@ function isGateVerdict(v) {
   return GATE_VERDICTS.includes(v);
 }
 var GATE_ENVELOPE_SCHEMA_VERSION = 1;
-var GATE_TRAIL_SCHEMA_VERSION = 1;
+var GATE_TRAIL_SCHEMA_VERSION = 2;
 var REASON_CAP = 300;
 var CITATION_CAP = 500;
 function capStr(s, n) {
@@ -2774,11 +2963,18 @@ function parseVerdicts(v) {
     const e = rv;
     const findingId = typeof e.findingId === "string" ? e.findingId.trim() : "";
     if (!findingId) continue;
+    const ops = parsePostableOps(e.ops);
+    const fixStatus = parseFixStatus(e.fixStatus);
+    const rescoredSeverity = parseSeverity(e.rescoredSeverity);
     out.push({
       citation: typeof e.citation === "string" ? capStr(e.citation, CITATION_CAP) : void 0,
       findingId,
       reason: capStr(e.reason, REASON_CAP),
-      verdict: e.verdict
+      verdict: e.verdict,
+      // conditional so an old-shape (no-ops) entry parses to the exact prior shape
+      ...ops.length ? { ops } : {},
+      ...fixStatus ? { fixStatus } : {},
+      ...rescoredSeverity ? { rescoredSeverity } : {}
     });
   }
   return out;
@@ -2796,6 +2992,12 @@ function parseGateEnvelope(raw) {
     verdicts: parseVerdicts(o.verdicts)
   };
 }
+var NOT_POSTABLE = {
+  postableBody: null,
+  postableFix: null,
+  postableStatus: "not-postable",
+  rescoredSeverity: null
+};
 function recordBase(f) {
   return {
     file: f.file,
@@ -2817,6 +3019,7 @@ function reconcileGateVerdicts(findings, parsed) {
     return {
       records: findings.map((f) => ({
         ...recordBase(f),
+        ...NOT_POSTABLE,
         downgradeReason: parsed.failure,
         effectiveVerdict: "unverified",
         rawVerdict: null,
@@ -2837,7 +3040,8 @@ function reconcileGateVerdicts(findings, parsed) {
     list.push(v);
     byId.set(v.findingId, list);
   }
-  const records = findings.map((f) => {
+  const findingById = new Map(findings.map((f) => [f.findingId, f]));
+  const baseRecords = findings.map((f) => {
     const base = recordBase(f);
     const entries = byId.get(f.findingId) ?? [];
     if (entries.length === 0) {
@@ -2863,6 +3067,24 @@ function reconcileGateVerdicts(findings, parsed) {
       return { ...base, citation, downgradeReason: null, effectiveVerdict: "false", rawVerdict, reason: e.reason };
     }
     return { ...base, citation, downgradeReason: null, effectiveVerdict: e.verdict, rawVerdict, reason: e.reason };
+  });
+  const records = baseRecords.map((r) => {
+    if (r.effectiveVerdict !== "agree" && r.effectiveVerdict !== "partial") return { ...r, ...NOT_POSTABLE };
+    const f = findingById.get(r.findingId);
+    const e = (byId.get(r.findingId) ?? [])[0];
+    if (!f) return { ...r, ...NOT_POSTABLE };
+    return {
+      ...r,
+      ...derivePostable({
+        body: f.body,
+        fixStatus: e?.fixStatus,
+        hunkCode: f.hunkCode,
+        ops: e?.ops ?? [],
+        rescoredSeverity: e?.rescoredSeverity,
+        severity: f.severity,
+        verdict: r.effectiveVerdict
+      })
+    };
   });
   return { records, warnings };
 }
@@ -2990,8 +3212,9 @@ async function runGate(opts) {
   const packetHunks = packet.ok ? parsePacketHunks(packet.diff) : /* @__PURE__ */ new Map();
   const { findings, injections } = prepareGateFindings(healthy, packetHunks);
   const finalize = (synthesis2, parsed2) => {
-    const { records, warnings } = reconcileGateVerdicts(findings, parsed2);
+    const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed2);
     for (const w of warnings) log(`  \xB7 ${w}`);
+    const records = clusterPostable(reconciled);
     const gateTrailWritten = writeGateVerdictsTrail(opts.baseDir, opts.runId, records);
     if (!gateTrailWritten) {
       log("  \xB7 gate: gate-verdicts.json FAILED to write \u2014 dismissals not honored (trail loss is LOUD)");

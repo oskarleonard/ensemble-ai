@@ -1,0 +1,172 @@
+import { SEVERITIES, type Severity } from '../../core/types';
+
+// ── Postable text derivation (A+) ──────────────────────────────────────────────────────
+//
+// The gate produces the EXACT text that will be posted to a PR — deterministically, so the
+// posting step never runs an LLM (no downstream paraphrase / whisper-hop). The gate does NOT
+// write free prose; it returns EDIT-OPS over the reviewer's own body, and this module APPLIES
+// them under invariants that make "minimal edit" a mechanism, not a request:
+//   • agree    → the body is postable VERBATIM (byte-identical). Any edit op ⇒ malformed.
+//   • partial  → the body MINUS the overstatement: strike/replace ops narrow it. Kept text is
+//                byte-identical by construction (we only touch quoted spans); a replacement may
+//                introduce NO new entity (symbol/path/number) absent from the body or its hunk.
+//   • false / unverified → not postable (null); handled by the caller, never reaches here.
+// Any op that does not validate FAILS CLOSED to an escalation — never a silent paraphrase.
+
+export type PostableOp =
+  | { op: 'strike'; quote: string; why?: string }
+  | { op: 'replace'; quote: string; with: string; why?: string };
+
+export type FixStatus = 'keep' | 'narrow' | 'strike';
+export const FIX_STATUSES: readonly FixStatus[] = ['keep', 'narrow', 'strike'];
+
+export type PostableStatus = 'postable' | 'escalated' | 'not-postable';
+
+export interface PostableResult {
+  postableBody: string | null; // exact text to post; null ⇒ do not post
+  postableFix: FixStatus | null; // disposition of the reviewer's suggested fix
+  rescoredSeverity: Severity | null; // gate's down-scored severity (never higher); null ⇒ unchanged
+  postableStatus: PostableStatus;
+  postableNote?: string; // escalation / audit reason
+}
+
+// A partial that strikes more than this fraction of its body wasn't "narrowed" — the reviewer
+// was mostly wrong, which is `unverified`/`false` territory, not `partial`. Fail closed.
+export const MAX_STRIKE_FRACTION = 0.6;
+
+const escalate = (postableNote: string): PostableResult => ({
+  postableBody: null,
+  postableFix: null,
+  postableStatus: 'escalated',
+  rescoredSeverity: null,
+  postableNote,
+});
+
+// An "entity" is a token a paraphrase must not invent: it carries a `.`/`/`/`_`/`$`, a digit,
+// internal camelCase, or is an ALL-CAPS constant. Plain prose words are free to rephrase; a new
+// symbol/path/number is drift and is rejected. Case-sensitive on purpose (identifiers are).
+function isEntityLike(tok: string): boolean {
+  if (/[._/$\d]/.test(tok)) return true; // path / member / number
+  if (/[a-z][A-Z]/.test(tok)) return true; // camelCase / PascalCase boundary
+  if (tok.length >= 2 && tok === tok.toUpperCase() && /[A-Z]/.test(tok)) return true; // CONSTANT
+  return false;
+}
+
+function entityTokens(s: string): Set<string> {
+  const out = new Set<string>();
+  for (const tok of s.match(/[A-Za-z0-9_$./-]{2,}/g) ?? []) if (isEntityLike(tok)) out.add(tok);
+  return out;
+}
+
+// Collapse the whitespace/punctuation seam a strike leaves behind (" foo  ,bar" → "foo, bar")
+// without touching interior text — purely cosmetic tidy of the cut edge.
+function tidy(s: string): string {
+  return s
+    .replace(/\s+([,.;:])/g, '$1') // no space before punctuation
+    .replace(/([([]) +/g, '$1') // no space after an opening bracket
+    .replace(/ {2,}/g, ' ') // collapse runs
+    .replace(/\s+\n/g, '\n')
+    .trim();
+}
+
+// Apply the ops to the body. Each quote must be a UNIQUE substring of the CURRENT working body
+// (ambiguity ⇒ fail closed — we won't guess which occurrence). Returns the narrowed body or an
+// escalation note. `allowed` = entity tokens the reviewer body + cited hunk already contain.
+function applyOps(body: string, ops: PostableOp[], allowed: Set<string>): { body: string } | { note: string } {
+  let work = body;
+  let struck = 0;
+  for (const op of ops) {
+    const at = work.indexOf(op.quote);
+    if (at === -1) return { note: `op quote not found in body: "${op.quote.slice(0, 60)}"` };
+    if (work.indexOf(op.quote, at + 1) !== -1) return { note: `op quote is ambiguous (>1 match): "${op.quote.slice(0, 60)}"` };
+    if (op.op === 'strike') {
+      struck += op.quote.length;
+      work = work.slice(0, at) + work.slice(at + op.quote.length);
+    } else {
+      for (const tok of entityTokens(op.with)) {
+        if (!allowed.has(tok)) return { note: `replacement introduces a new entity "${tok}" (not in body or hunk)` };
+      }
+      // a replace that shrinks the text counts its net deletion toward the strike budget
+      struck += Math.max(0, op.quote.length - op.with.length);
+      work = work.slice(0, at) + op.with + work.slice(at + op.quote.length);
+    }
+  }
+  if (struck / Math.max(1, body.length) > MAX_STRIKE_FRACTION)
+    return { note: `ops strike >${Math.round(MAX_STRIKE_FRACTION * 100)}% of the body — not a narrowing (should be unverified/false)` };
+  const out = tidy(work);
+  if (!out) return { note: 'ops reduced the body to empty' };
+  return { body: out };
+}
+
+// Down-scored severity is honored ONLY when it's equal-or-less-severe than the host's stored
+// severity — the gate may narrow, never inflate (the host owns severity). SEVERITIES is ordered
+// most-severe-first, so a higher index = less severe.
+function clampSeverity(original: Severity, rescored: Severity | undefined): Severity | null {
+  if (!rescored || rescored === original) return null;
+  return SEVERITIES.indexOf(rescored) > SEVERITIES.indexOf(original) ? rescored : null;
+}
+
+// Derive the postable text for one already-reconciled finding. Only agree/partial reach a
+// postable outcome; everything else is not-postable. Pure.
+export function derivePostable(input: {
+  verdict: 'agree' | 'partial';
+  body: string;
+  hunkCode: string[];
+  ops: PostableOp[];
+  fixStatus: FixStatus | undefined;
+  rescoredSeverity: Severity | undefined;
+  severity: Severity;
+}): PostableResult {
+  const { verdict, body, hunkCode, ops, fixStatus, rescoredSeverity, severity } = input;
+  const trimmed = body.trim();
+  if (!trimmed) return escalate('reviewer body is empty');
+
+  if (verdict === 'agree') {
+    // "confirmed as stated" ⇒ the whole body is grounded ⇒ post it verbatim. An edit op on an
+    // agree is contradictory (if something needed striking it was partial) — fail closed.
+    if (ops.length > 0) return escalate('agree verdict carried edit-ops (contradiction — should be partial)');
+    return { postableBody: trimmed, postableFix: fixStatus ?? 'keep', postableStatus: 'postable', rescoredSeverity: null };
+  }
+
+  // partial: the body overstates ⇒ it MUST carry the edits that narrow it, else posting it
+  // verbatim re-injects the overstatement the gate caught.
+  if (ops.length === 0) return escalate('partial verdict carried no edit-ops to narrow the overstatement');
+  const allowed = entityTokens(trimmed);
+  for (const line of hunkCode) for (const t of entityTokens(line)) allowed.add(t);
+  const applied = applyOps(trimmed, ops, allowed);
+  if ('note' in applied) return escalate(applied.note);
+  return {
+    postableBody: applied.body,
+    postableFix: fixStatus ?? 'narrow',
+    postableStatus: 'postable',
+    rescoredSeverity: clampSeverity(severity, rescoredSeverity),
+  };
+}
+
+// Parse the optional postable fields off one raw verdict entry — defensive, tolerant of
+// absence (an old-shape reply simply yields []/undefined and the caller escalates a bare
+// partial). Quotes/replacements are length-capped to bound a hostile reply.
+const OP_QUOTE_CAP = 2000;
+export function parsePostableOps(v: unknown): PostableOp[] {
+  if (!Array.isArray(v)) return [];
+  const out: PostableOp[] = [];
+  for (const raw of v) {
+    if (!raw || typeof raw !== 'object') continue;
+    const e = raw as Record<string, unknown>;
+    const quote = typeof e.quote === 'string' ? e.quote.slice(0, OP_QUOTE_CAP) : '';
+    const why = typeof e.why === 'string' ? e.why.slice(0, 300) : undefined;
+    if (!quote) continue;
+    if (e.op === 'strike') out.push({ op: 'strike', quote, why });
+    else if (e.op === 'replace' && typeof e.with === 'string')
+      out.push({ op: 'replace', quote, why, with: e.with.slice(0, OP_QUOTE_CAP) });
+  }
+  return out;
+}
+
+export function parseFixStatus(v: unknown): FixStatus | undefined {
+  return typeof v === 'string' && (FIX_STATUSES as readonly string[]).includes(v) ? (v as FixStatus) : undefined;
+}
+
+export function parseSeverity(v: unknown): Severity | undefined {
+  return typeof v === 'string' && (SEVERITIES as readonly string[]).includes(v) ? (v as Severity) : undefined;
+}

@@ -5,6 +5,7 @@ import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 import { type RunReviewOpts } from '../../reviewers/codex';
 
+import { type ClusterInfo, clusterPostable } from './gate-dedup';
 import { renderGatePrompt } from './gate-prompt';
 import {
   type Hunk,
@@ -16,6 +17,15 @@ import {
   resolveFindingHunk,
   windowHunk,
 } from './gate-hunks';
+import {
+  type FixStatus,
+  type PostableOp,
+  type PostableStatus,
+  derivePostable,
+  parseFixStatus,
+  parsePostableOps,
+  parseSeverity,
+} from './gate-postable';
 import {
   fallbackReviewSynthesis,
   parseAgreements,
@@ -66,7 +76,9 @@ export type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
 // interprets verdicts under semantics it doesn't recognize.
 export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // The durable trail-artifact schema. Bumped independently if the record shape changes.
-export const GATE_TRAIL_SCHEMA_VERSION = 1;
+// v2: adds the postable-text fields (postableBody / postableFix / rescoredSeverity /
+// postableStatus) the LLM-free posting step consumes — see gate-postable.ts.
+export const GATE_TRAIL_SCHEMA_VERSION = 2;
 
 const REASON_CAP = 300;
 const CITATION_CAP = 500;
@@ -259,7 +271,10 @@ export function validateCitation(
 export interface RawVerdictEntry {
   citation?: string;
   findingId: string;
+  fixStatus?: FixStatus; // disposition the gate assigned the reviewer's suggested fix
+  ops?: PostableOp[]; // minimal edit-ops narrowing the body (partial only)
   reason: string;
+  rescoredSeverity?: Severity; // gate's down-scored severity (host clamps: never higher)
   verdict: unknown;
 }
 
@@ -286,11 +301,18 @@ function parseVerdicts(v: unknown): RawVerdictEntry[] {
     const e = rv as Record<string, unknown>;
     const findingId = typeof e.findingId === 'string' ? e.findingId.trim() : '';
     if (!findingId) continue;
+    const ops = parsePostableOps(e.ops);
+    const fixStatus = parseFixStatus(e.fixStatus);
+    const rescoredSeverity = parseSeverity(e.rescoredSeverity);
     out.push({
       citation: typeof e.citation === 'string' ? capStr(e.citation, CITATION_CAP) : undefined,
       findingId,
       reason: capStr(e.reason, REASON_CAP),
       verdict: e.verdict,
+      // conditional so an old-shape (no-ops) entry parses to the exact prior shape
+      ...(ops.length ? { ops } : {}),
+      ...(fixStatus ? { fixStatus } : {}),
+      ...(rescoredSeverity ? { rescoredSeverity } : {}),
     });
   }
   return out;
@@ -319,20 +341,42 @@ export function parseGateEnvelope(raw: string): EnvelopeFailure | ParsedGateEnve
 
 export interface GateVerdictRecord {
   citation?: string;
+  cluster?: ClusterInfo; // cross-reviewer cluster (postable records only); absent ⇒ singleton / not clustered
   downgradeReason: DowngradeReason | null;
   effectiveVerdict: GateVerdict;
   file: string;
   findingId: string;
   line: number | null;
+  postableBody: string | null; // EXACT text to post (verbatim for agree, narrowed for partial); null ⇒ do not post
+  postableFix: FixStatus | null; // disposition of the reviewer's suggested fix
+  postableNote?: string; // escalation / audit note when postableStatus is 'escalated'
+  postableStatus: PostableStatus; // postable | escalated (couldn't safely narrow) | not-postable (false/unverified)
   rawVerdict: string | null; // exactly what the model returned (may be an invalid enum), null if none
   reason: string;
+  rescoredSeverity: Severity | null; // gate's down-scored severity for a partial; null ⇒ unchanged
   reviewer: string;
   severity: Severity;
   title: string;
 }
 
-function recordBase(f: GateFinding): Omit<
+// A non-agree/partial finding never posts — false/unverified/downgraded all resolve here. The
+// postable-text pass below overwrites these for the agree/partial pass-through only.
+const NOT_POSTABLE = {
+  postableBody: null,
+  postableFix: null,
+  postableStatus: 'not-postable' as const,
+  rescoredSeverity: null,
+};
+
+// The record BEFORE the postable-text pass — every reconcile branch builds one of these; the
+// postable fields are attached once, afterward, so the branch logic stays untouched.
+type BaseRecord = Omit<
   GateVerdictRecord,
+  'postableBody' | 'postableFix' | 'postableNote' | 'postableStatus' | 'rescoredSeverity'
+>;
+
+function recordBase(f: GateFinding): Omit<
+  BaseRecord,
   'citation' | 'downgradeReason' | 'effectiveVerdict' | 'rawVerdict' | 'reason'
 > {
   return {
@@ -367,6 +411,7 @@ export function reconcileGateVerdicts(
     return {
       records: findings.map((f) => ({
         ...recordBase(f),
+        ...NOT_POSTABLE,
         downgradeReason: parsed.failure,
         effectiveVerdict: 'unverified',
         rawVerdict: null,
@@ -389,7 +434,8 @@ export function reconcileGateVerdicts(
     byId.set(v.findingId, list);
   }
 
-  const records = findings.map((f): GateVerdictRecord => {
+  const findingById = new Map(findings.map((f) => [f.findingId, f]));
+  const baseRecords: BaseRecord[] = findings.map((f): BaseRecord => {
     const base = recordBase(f);
     const entries = byId.get(f.findingId) ?? [];
     if (entries.length === 0) {
@@ -418,6 +464,28 @@ export function reconcileGateVerdicts(
     }
     // agree / partial / unverified pass through — not dismissals, so truncation does not force them.
     return { ...base, citation, downgradeReason: null, effectiveVerdict: e.verdict, rawVerdict, reason: e.reason };
+  });
+
+  // Postable-text pass: agree/partial derive their exact PR text (verbatim / narrowed) from the
+  // reviewer body + the gate's ops; everything else is not-postable. One place → one source of
+  // truth for what may cross to a PR.
+  const records = baseRecords.map((r): GateVerdictRecord => {
+    if (r.effectiveVerdict !== 'agree' && r.effectiveVerdict !== 'partial') return { ...r, ...NOT_POSTABLE };
+    const f = findingById.get(r.findingId);
+    const e = (byId.get(r.findingId) ?? [])[0];
+    if (!f) return { ...r, ...NOT_POSTABLE };
+    return {
+      ...r,
+      ...derivePostable({
+        body: f.body,
+        fixStatus: e?.fixStatus,
+        hunkCode: f.hunkCode,
+        ops: e?.ops ?? [],
+        rescoredSeverity: e?.rescoredSeverity,
+        severity: f.severity,
+        verdict: r.effectiveVerdict,
+      }),
+    };
   });
   return { records, warnings };
 }
@@ -691,8 +759,12 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     synthesis: ReviewSynthesis,
     parsed: ParsedGateEnvelope | WholeEnvelopeFailure
   ): GateRunResult => {
-    const { records, warnings } = reconcileGateVerdicts(findings, parsed);
+    const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed);
     for (const w of warnings) log(`  · ${w}`);
+    // Cross-reviewer dedup by selection — one representative per cluster posts; corroboration
+    // recorded. Runs AFTER reconcile (needs the full postable set) and BEFORE the trail write
+    // (so cluster provenance is durable).
+    const records = clusterPostable(reconciled);
     const gateTrailWritten = writeGateVerdictsTrail(opts.baseDir, opts.runId, records);
     if (!gateTrailWritten) {
       log('  · gate: gate-verdicts.json FAILED to write — dismissals not honored (trail loss is LOUD)');

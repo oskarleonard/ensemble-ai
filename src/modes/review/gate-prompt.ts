@@ -16,7 +16,10 @@ import { HUNK_WINDOW_LINES } from './gate-hunks';
 // write-denied spawn): the model is told the fenced content is untrusted data, never
 // directives. PURE — a function of the prepared findings + injections.
 
-const BODY_CAP = 600;
+// The gate must see the FULL body it will edit-op over (a mid-body cut would make its quoted
+// spans unmatchable and silently drop the overstatement past the cut) — so this is generous,
+// not a display trim. Bodies almost never approach it; the cap is only a hostile-input bound.
+const BODY_CAP = 3000;
 const cap = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n)}…` : s);
 
 // Defang the structural fence delimiters in UNTRUSTED reviewer text (title · body · the
@@ -91,13 +94,31 @@ Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
     "bottomLine": "<merge-safe? what must change first>"
   },
   "verdicts": [
-    { "findingId": "codex#1", "verdict": "agree", "reason": "<one line>" },
+    { "findingId": "codex#1", "verdict": "agree", "reason": "<one line>", "fixStatus": "keep" },
+    { "findingId": "codex#3", "verdict": "partial", "reason": "<what was overstated>",
+      "ops": [
+        { "op": "strike", "quote": "<EXACT substring of codex#3's body to remove>", "why": "<ungrounded>" },
+        { "op": "replace", "quote": "<EXACT substring>", "with": "<narrower wording>", "why": "<narrowed>" }
+      ], "fixStatus": "narrow", "rescoredSeverity": "medium" },
     { "findingId": "grok#2", "verdict": "false", "reason": "<why it is wrong>", "citation": "<EXACT line quoted from grok#2's own hunk>" }
   ]
 }
 Tag EVERY finding exactly once by its findingId. verdict ∈ agree | partial | false | unverified.
 A "false" REQUIRES a "citation" that quotes a real line from THAT finding's own hunk — no valid
-quote means use "unverified", never "false". Do not invent findingIds; do not restate severities.`;
+quote means use "unverified", never "false". Do not invent findingIds; do not restate severities.
+
+The verdict decides what (if anything) gets posted to the PR, so it must be POSTABLE-EXACT:
+- agree: EVERY material claim in the body is grounded → it posts VERBATIM. Do NOT send "ops".
+  If any sentence is NOT grounded, the verdict is "partial", not "agree".
+- partial: the body is real but OVERSTATED/broader than the hunk supports. You MUST send "ops"
+  that MINIMALLY narrow it: "strike" removes an ungrounded span; "replace" swaps a span for a
+  narrower wording. Each "quote" MUST be an EXACT substring of THAT finding's body. A "replace"
+  "with" may introduce NO new identifier, path, or number that isn't already in the body or its
+  cited hunk. If you cannot narrow it with such edits, use "unverified" (never post a guess).
+- "fixStatus" (optional, agree/partial): the reviewer's suggested fix is verified only for the
+  problem, not the fix — mark it keep | narrow | strike (strike if the narrowed claim no longer
+  supports it). "rescoredSeverity" (optional, partial): the TRUE severity if overstatement
+  inflated it — it may only LOWER severity, never raise it.`;
 
 // Render the whole gate prompt from the prepared, host-owned findings + the deduped injections.
 export function renderGatePrompt(

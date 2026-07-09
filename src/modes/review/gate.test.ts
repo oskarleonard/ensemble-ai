@@ -190,6 +190,57 @@ describe('reconcileGateVerdicts — truncated finding is dismissal-INELIGIBLE (D
   });
 });
 
+// ── Postable text (A+): agree posts verbatim, partial narrows via ops, else not-postable ──
+describe('reconcileGateVerdicts — postable text (A+)', () => {
+  const body = 'The pool leaks a connection because release() is never called, and it always crashes.';
+
+  it('agree ⇒ postableBody is the reviewer body VERBATIM', () => {
+    const r = reconcileGateVerdicts(
+      [gf({ body, findingId: 'codex#1' })],
+      parseGateEnvelope(envelope([{ findingId: 'codex#1', reason: 'ok', verdict: 'agree' }]))
+    ).records[0];
+    expect(r).toMatchObject({ effectiveVerdict: 'agree', postableBody: body, postableStatus: 'postable' });
+  });
+
+  it('partial ⇒ postableBody is the body narrowed by the ops', () => {
+    const r = reconcileGateVerdicts(
+      [gf({ body, findingId: 'codex#1' })],
+      parseGateEnvelope(
+        envelope([{ findingId: 'codex#1', ops: [{ op: 'strike', quote: ', and it always crashes' }], reason: 'overstated', rescoredSeverity: 'medium', verdict: 'partial' }])
+      )
+    ).records[0];
+    expect(r.postableStatus).toBe('postable');
+    expect(r.postableBody).toBe('The pool leaks a connection because release() is never called.');
+    expect(r.rescoredSeverity).toBe('medium');
+  });
+
+  it('a partial the gate could not narrow (no ops) ⇒ escalated, never posts', () => {
+    const r = reconcileGateVerdicts(
+      [gf({ body, findingId: 'codex#1' })],
+      parseGateEnvelope(envelope([{ findingId: 'codex#1', reason: 'overstated', verdict: 'partial' }]))
+    ).records[0];
+    expect(r).toMatchObject({ effectiveVerdict: 'partial', postableBody: null, postableStatus: 'escalated' });
+  });
+
+  it('false / unverified ⇒ not-postable (null body)', () => {
+    const [f, u] = reconcileGateVerdicts(
+      [gf({ body, findingId: 'codex#1' }), gf({ body, findingId: 'grok#1' })],
+      parseGateEnvelope(
+        envelope([
+          { citation: ANCHOR, findingId: 'codex#1', reason: 'refuted', verdict: 'false' },
+          { findingId: 'grok#1', reason: 'ungrounded', verdict: 'unverified' },
+        ])
+      )
+    ).records;
+    expect(f).toMatchObject({ effectiveVerdict: 'false', postableBody: null, postableStatus: 'not-postable' });
+    expect(u).toMatchObject({ effectiveVerdict: 'unverified', postableBody: null, postableStatus: 'not-postable' });
+  });
+
+  it('the durable trail schema is bumped to v2 (postable fields added)', () => {
+    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(2);
+  });
+});
+
 // ── DC1 — prepare findings: HIGH-first ordering, dedup, windowing + byte-budget truncation
 describe('prepareGateFindings — deterministic budgeting (DC1)', () => {
   it('orders injection labels HIGH-first (severity → reviewer → index)', () => {
