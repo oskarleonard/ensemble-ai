@@ -2441,7 +2441,7 @@ import os6 from "os";
 import path9 from "path";
 
 // src/modes/review/gate-dedup.ts
-var LINE_WINDOW = 3;
+var LINE_WINDOW = 12;
 var MIN_TOKEN_OVERLAP = 0.35;
 function tokens(r) {
   const text = `${r.title} ${r.postableBody ?? ""}`.toLowerCase();

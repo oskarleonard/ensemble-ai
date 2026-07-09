@@ -21,9 +21,11 @@ export interface ClusterInfo {
   primary: boolean; // the elected representative — the only member that posts
 }
 
-// Findings this close on the same file are candidate duplicates. Small on purpose (under-merge
-// bias): reviewers citing the exact same defect usually land on the same or an adjacent line.
-const LINE_WINDOW = 3;
+// Findings this close on the same file are candidate duplicates. ~A function's span: reviewers
+// citing one defect often land on DIFFERENT lines of the same hook/function (a real run cited
+// the same localStorage-PII defect at lines 112 and 122). The text-overlap bar below — not this
+// window — is the real guard against merging two different defects that share a file.
+const LINE_WINDOW = 12;
 // Minimum token overlap for two proximate findings to be "the same issue". Uses the overlap
 // COEFFICIENT (|A∩B| / min|A|,|B|), not Jaccard: three reviewers describe one defect in very
 // different amounts of prose, so Jaccard (which the longer body drags down) systematically
