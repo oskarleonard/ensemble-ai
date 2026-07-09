@@ -2440,6 +2440,82 @@ import fs11 from "fs";
 import os6 from "os";
 import path9 from "path";
 
+// src/modes/review/gate-dedup.ts
+var LINE_WINDOW = 3;
+var MIN_TOKEN_OVERLAP = 0.4;
+function tokens(r) {
+  const text = `${r.title} ${r.postableBody ?? ""}`.toLowerCase();
+  return new Set(text.match(/[a-z0-9_$.]{4,}/g) ?? []);
+}
+function jaccard(a, b) {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+function proximate(a, b) {
+  if (a.file !== b.file) return false;
+  if (a.line === null || b.line === null) return a.line === null && b.line === null;
+  return Math.abs(a.line - b.line) <= LINE_WINDOW;
+}
+function better(a, b) {
+  const verdictRank = (r) => r.effectiveVerdict === "agree" ? 0 : 1;
+  const cmp = verdictRank(a) - verdictRank(b) || SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity) || (b.postableBody?.length ?? 0) - (a.postableBody?.length ?? 0) || (a.findingId < b.findingId ? -1 : 1);
+  return cmp <= 0 ? a : b;
+}
+function clusterPostable(records) {
+  const postable = records.filter((r) => r.postableStatus === "postable");
+  const tok = new Map(postable.map((r) => [r.findingId, tokens(r)]));
+  const parent = new Map(postable.map((r) => [r.findingId, r.findingId]));
+  const find = (x) => {
+    let root = x;
+    while (parent.get(root) !== root) root = parent.get(root);
+    while (parent.get(x) !== root) {
+      const next = parent.get(x);
+      parent.set(x, root);
+      x = next;
+    }
+    return root;
+  };
+  const union = (a, b) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent.set(ra < rb ? rb : ra, ra < rb ? ra : rb);
+  };
+  for (let i = 0; i < postable.length; i++) {
+    for (let j = i + 1; j < postable.length; j++) {
+      const a = postable[i];
+      const b = postable[j];
+      if (proximate(a, b) && jaccard(tok.get(a.findingId), tok.get(b.findingId)) >= MIN_TOKEN_OVERLAP) {
+        union(a.findingId, b.findingId);
+      }
+    }
+  }
+  const clusters = /* @__PURE__ */ new Map();
+  for (const r of postable) {
+    const root = find(r.findingId);
+    (clusters.get(root) ?? clusters.set(root, []).get(root)).push(r);
+  }
+  const clusterOf = /* @__PURE__ */ new Map();
+  for (const members of clusters.values()) {
+    const primary = members.reduce(better);
+    const reviewers = new Set(members.map((m) => m.reviewer));
+    const corroborators = members.filter((m) => m.findingId !== primary.findingId).map((m) => m.findingId);
+    for (const m of members) {
+      clusterOf.set(m.findingId, {
+        clusterId: primary.findingId,
+        corroboration: reviewers.size,
+        corroborators: m.findingId === primary.findingId ? corroborators : [],
+        primary: m.findingId === primary.findingId
+      });
+    }
+  }
+  return records.map((r) => {
+    const cluster = clusterOf.get(r.findingId);
+    return cluster ? { ...r, cluster } : r;
+  });
+}
+
 // src/modes/review/gate-prompt.ts
 var BODY_CAP = 3e3;
 var cap3 = (s, n) => s.length > n ? `${s.slice(0, n)}\u2026` : s;
@@ -3136,8 +3212,9 @@ async function runGate(opts) {
   const packetHunks = packet.ok ? parsePacketHunks(packet.diff) : /* @__PURE__ */ new Map();
   const { findings, injections } = prepareGateFindings(healthy, packetHunks);
   const finalize = (synthesis2, parsed2) => {
-    const { records, warnings } = reconcileGateVerdicts(findings, parsed2);
+    const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed2);
     for (const w of warnings) log(`  \xB7 ${w}`);
+    const records = clusterPostable(reconciled);
     const gateTrailWritten = writeGateVerdictsTrail(opts.baseDir, opts.runId, records);
     if (!gateTrailWritten) {
       log("  \xB7 gate: gate-verdicts.json FAILED to write \u2014 dismissals not honored (trail loss is LOUD)");

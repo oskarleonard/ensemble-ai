@@ -5,6 +5,7 @@ import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 import { type RunReviewOpts } from '../../reviewers/codex';
 
+import { type ClusterInfo, clusterPostable } from './gate-dedup';
 import { renderGatePrompt } from './gate-prompt';
 import {
   type Hunk,
@@ -340,6 +341,7 @@ export function parseGateEnvelope(raw: string): EnvelopeFailure | ParsedGateEnve
 
 export interface GateVerdictRecord {
   citation?: string;
+  cluster?: ClusterInfo; // cross-reviewer cluster (postable records only); absent ⇒ singleton / not clustered
   downgradeReason: DowngradeReason | null;
   effectiveVerdict: GateVerdict;
   file: string;
@@ -757,8 +759,12 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     synthesis: ReviewSynthesis,
     parsed: ParsedGateEnvelope | WholeEnvelopeFailure
   ): GateRunResult => {
-    const { records, warnings } = reconcileGateVerdicts(findings, parsed);
+    const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed);
     for (const w of warnings) log(`  · ${w}`);
+    // Cross-reviewer dedup by selection — one representative per cluster posts; corroboration
+    // recorded. Runs AFTER reconcile (needs the full postable set) and BEFORE the trail write
+    // (so cluster provenance is durable).
+    const records = clusterPostable(reconciled);
     const gateTrailWritten = writeGateVerdictsTrail(opts.baseDir, opts.runId, records);
     if (!gateTrailWritten) {
       log('  · gate: gate-verdicts.json FAILED to write — dismissals not honored (trail loss is LOUD)');
