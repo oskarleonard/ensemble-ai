@@ -85,6 +85,20 @@ describe('clusterPostable — dedup by selection', () => {
     expect(primaries[0].cluster).toMatchObject({ corroboration: 3 });
   });
 
+  it('merges the same defect cited at DIFFERENT lines of one function (10 lines apart)', () => {
+    // Real lisk-web#690 shape: two reviewers flag the same localStorage-PII write in one hook
+    // but cite lines 112 vs 122 — beyond a tight line window, caught by the function-span window.
+    const pii = (extra: string): string =>
+      `Serializes the full KYB draft (businessDetails, personsData) to localStorage with no encryption; readable by any same-origin script and persists across sessions. ${extra}`;
+    const out = clusterPostable([
+      rec({ findingId: 'codex#1', line: 112, title: 'KYB PII is persisted in plaintext localStorage', postableBody: pii('Prefer a server-side encrypted draft.') }),
+      rec({ findingId: 'claude#1', line: 122, title: 'Sensitive KYB PII persisted to plaintext localStorage', postableBody: pii('Prefer sessionStorage or exclude the sensitive person fields.') }),
+      // a DIFFERENT defect in the same file stays separate (low text overlap)
+      rec({ findingId: 'codex#2', line: 69, title: 'Draft resume can skip required prior data', postableBody: 'resolveResumeStep maps a saved step to a later stage without checking earlier steps were completed, so a resumed draft can land past required data.' }),
+    ]);
+    expect(out.filter((r) => r.cluster?.primary)).toHaveLength(2); // the two PII findings merge; the resume bug stays
+  });
+
   it('is deterministic — same input yields the same primary', () => {
     const input = [
       rec({ findingId: 'grok#1', line: 19, postableBody: NET }),
