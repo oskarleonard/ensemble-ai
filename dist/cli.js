@@ -2442,16 +2442,16 @@ import path9 from "path";
 
 // src/modes/review/gate-dedup.ts
 var LINE_WINDOW = 3;
-var MIN_TOKEN_OVERLAP = 0.4;
+var MIN_TOKEN_OVERLAP = 0.35;
 function tokens(r) {
   const text = `${r.title} ${r.postableBody ?? ""}`.toLowerCase();
   return new Set(text.match(/[a-z0-9_$.]{4,}/g) ?? []);
 }
-function jaccard(a, b) {
+function overlapCoefficient(a, b) {
   if (a.size === 0 || b.size === 0) return 0;
   let inter = 0;
   for (const t of a) if (b.has(t)) inter++;
-  return inter / (a.size + b.size - inter);
+  return inter / Math.min(a.size, b.size);
 }
 function proximate(a, b) {
   if (a.file !== b.file) return false;
@@ -2486,7 +2486,7 @@ function clusterPostable(records) {
     for (let j = i + 1; j < postable.length; j++) {
       const a = postable[i];
       const b = postable[j];
-      if (proximate(a, b) && jaccard(tok.get(a.findingId), tok.get(b.findingId)) >= MIN_TOKEN_OVERLAP) {
+      if (proximate(a, b) && overlapCoefficient(tok.get(a.findingId), tok.get(b.findingId)) >= MIN_TOKEN_OVERLAP) {
         union(a.findingId, b.findingId);
       }
     }

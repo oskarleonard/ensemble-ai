@@ -24,19 +24,25 @@ export interface ClusterInfo {
 // Findings this close on the same file are candidate duplicates. Small on purpose (under-merge
 // bias): reviewers citing the exact same defect usually land on the same or an adjacent line.
 const LINE_WINDOW = 3;
-// Minimum Jaccard overlap of significant tokens for two findings to be "the same issue".
-const MIN_TOKEN_OVERLAP = 0.4;
+// Minimum token overlap for two proximate findings to be "the same issue". Uses the overlap
+// COEFFICIENT (|A∩B| / min|A|,|B|), not Jaccard: three reviewers describe one defect in very
+// different amounts of prose, so Jaccard (which the longer body drags down) systematically
+// undershot — real dups scored 0.17–0.30 and never merged. Overlap coefficient scores those
+// same real dups 0.38–0.51 while non-issues stay well below, so 0.35 separates cleanly. The
+// proximity gate above still does most of the work; this only guards against merging two
+// genuinely-different defects that happen to sit within a few lines.
+const MIN_TOKEN_OVERLAP = 0.35;
 
 function tokens(r: GateVerdictRecord): Set<string> {
   const text = `${r.title} ${r.postableBody ?? ''}`.toLowerCase();
   return new Set((text.match(/[a-z0-9_$.]{4,}/g) ?? []));
 }
 
-function jaccard(a: Set<string>, b: Set<string>): number {
+function overlapCoefficient(a: Set<string>, b: Set<string>): number {
   if (a.size === 0 || b.size === 0) return 0;
   let inter = 0;
   for (const t of a) if (b.has(t)) inter++;
-  return inter / (a.size + b.size - inter);
+  return inter / Math.min(a.size, b.size);
 }
 
 function proximate(a: GateVerdictRecord, b: GateVerdictRecord): boolean {
@@ -84,7 +90,7 @@ export function clusterPostable(records: GateVerdictRecord[]): GateVerdictRecord
     for (let j = i + 1; j < postable.length; j++) {
       const a = postable[i];
       const b = postable[j];
-      if (proximate(a, b) && jaccard(tok.get(a.findingId)!, tok.get(b.findingId)!) >= MIN_TOKEN_OVERLAP) {
+      if (proximate(a, b) && overlapCoefficient(tok.get(a.findingId)!, tok.get(b.findingId)!) >= MIN_TOKEN_OVERLAP) {
         union(a.findingId, b.findingId);
       }
     }
