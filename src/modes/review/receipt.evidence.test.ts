@@ -166,10 +166,60 @@ describe('buildDiffReceipt — evidence identity', () => {
   it('a worktree seat mints a v2 receipt carrying BOTH maps as distinct facts', () => {
     const intended: EvidenceMap = { codex: 'worktree', gate: 'worktree' };
     const realized: EvidenceMap = { codex: 'packet', gate: 'worktree' };
-    const r = buildDiffReceipt({ ...base, intendedEvidence: intended, realizedEvidence: realized }).receipt;
+    const sandboxProfiles = {
+      codex: { id: 'ensemble-review-codex', version: 1 },
+      gate: { id: 'harness', version: 1 },
+    };
+    const r = buildDiffReceipt({
+      ...base,
+      intendedEvidence: intended,
+      realizedEvidence: realized,
+      sandboxProfiles,
+    }).receipt;
     expect(r?.policyVersion).toBe(2);
     expect(r?.intendedEvidence).toEqual(intended);
     expect(r?.realizedEvidence).toEqual(realized);
+    expect(r?.sandboxProfiles).toEqual(sandboxProfiles);
+  });
+
+  // A worktree seat's evidence is only a safety claim BOUND to the profile that fenced it. An
+  // absent sandboxProfiles map hashes as `{}`, so without this guard a caller could mint a receipt
+  // claiming worktree evidence while binding no profile identity at all — defeating the stated
+  // guarantee that a receipt minted under a weaker profile never verifies as equivalent to one
+  // minted under a tighter one.
+  describe('a worktree seat MUST bind its sandbox profile identity', () => {
+    it('refuses a worktree INTENT with no sandbox profile for that seat', () => {
+      const built = buildDiffReceipt({ ...base, intendedEvidence: { codex: 'worktree' } });
+      expect(built.ok).toBe(false);
+      expect(built.ok ? '' : built.error).toMatch(/worktree evidence claimed for codex/);
+    });
+
+    it('refuses when a seat lacks a bound profile even though a sibling seat has one', () => {
+      const built = buildDiffReceipt({
+        ...base,
+        intendedEvidence: { codex: 'worktree', gate: 'worktree' },
+        realizedEvidence: { codex: 'worktree', gate: 'worktree' },
+        sandboxProfiles: { codex: { id: 'ensemble-review-codex', version: 1 } },
+      });
+      expect(built.ok).toBe(false);
+      expect(built.ok ? '' : built.error).toMatch(/gate/);
+    });
+
+    it('catches a seat that REALIZED worktree, not just one that intended it', () => {
+      const built = buildDiffReceipt({
+        ...base,
+        intendedEvidence: { codex: 'worktree' },
+        realizedEvidence: { codex: 'worktree', grok: 'worktree' },
+        sandboxProfiles: { codex: { id: 'ensemble-review-codex', version: 1 } },
+      });
+      expect(built.ok).toBe(false);
+      expect(built.ok ? '' : built.error).toMatch(/grok/);
+    });
+
+    it('a packet-only run needs no profiles at all (the legacy path is untouched)', () => {
+      expect(buildDiffReceipt({ ...base, intendedEvidence: { codex: 'packet' } }).ok).toBe(true);
+      expect(buildDiffReceipt(base).ok).toBe(true);
+    });
   });
 });
 

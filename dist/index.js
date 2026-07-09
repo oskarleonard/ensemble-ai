@@ -957,11 +957,12 @@ function buildCodexReviewArgs(config, outFile, prompt) {
 }
 function runCodexReview(prompt, config, opts = {}) {
   if (opts.worktree) {
-    return Promise.reject(
-      new Error(
-        "ensemble-ai: the codex seat cannot run against a worktree yet (the sandbox-exec wrapper is not wired). Refusing rather than reviewing the packet while reporting worktree evidence."
-      )
-    );
+    return Promise.resolve({
+      ok: false,
+      raw: null,
+      stderrTail: "ensemble-ai: the codex seat cannot run against a worktree yet (its sandbox-exec wrapper is not wired). Refusing rather than reviewing the packet while reporting worktree evidence.",
+      timedOut: false
+    });
   }
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const outFile = path4.join(
@@ -1079,8 +1080,16 @@ function extractGrokText(stdout) {
 function runGrokReview(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const sandbox = resolveReviewSandbox(config.sandbox);
-  ensureSandboxProfile(sandbox);
   const worktreeCwd = opts.worktree;
+  if (worktreeCwd && sandbox !== GROK_SANDBOX_PROFILE.id) {
+    return Promise.resolve({
+      ok: false,
+      raw: null,
+      stderrTail: `ensemble-ai: refusing worktree evidence for the grok seat \u2014 it resolved to the "${sandbox}" sandbox, but worktree access is only qualified under "${GROK_SANDBOX_PROFILE.id}" (the profile whose id+version the receipt attests). Configure that sandbox, or run this seat on the packet.`,
+      timedOut: false
+    });
+  }
+  ensureSandboxProfile(sandbox);
   const cwd = worktreeCwd ?? fs6.mkdtempSync(path5.join(os4.tmpdir(), "grok-review-"));
   return runReviewerExec({
     args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
@@ -1196,12 +1205,21 @@ function defaultCodexSandboxPaths(worktree) {
   };
 }
 function writeCodexSandboxProfile(paths) {
+  const profile = renderCodexSandboxProfile(paths);
   const dir = fs7.mkdtempSync(path6.join(os5.tmpdir(), "ensemble-sb-"));
   fs7.chmodSync(dir, 448);
   const file = path6.join(dir, "ensemble-review-codex.sb");
-  fs7.writeFileSync(file, renderCodexSandboxProfile(paths), { mode: 384 });
+  fs7.writeFileSync(file, profile, { mode: 384 });
   fs7.chmodSync(file, 384);
-  return file;
+  return {
+    cleanup: () => {
+      try {
+        fs7.rmSync(dir, { force: true, recursive: true });
+      } catch {
+      }
+    },
+    file
+  };
 }
 function wrapWithSandbox(profileFile, bin, args) {
   return { args: ["-f", profileFile, bin, ...args], bin: "/usr/bin/sandbox-exec" };
@@ -1550,7 +1568,7 @@ function isEvidenceClass(v) {
   return EVIDENCE_CLASSES.includes(v);
 }
 var STRENGTH = { packet: 1, worktree: 2 };
-var UNKNOWN_STRENGTH = 0;
+var UNKNOWN_STRENGTH = STRENGTH.packet;
 function strengthOf(c) {
   return c ? STRENGTH[c] : UNKNOWN_STRENGTH;
 }
@@ -1795,8 +1813,20 @@ function buildDiffReceipt(args) {
     vendors.push(r.reviewer.vendor);
   }
   const intendedEvidence = args.intendedEvidence ?? {};
+  const realizedEvidence = args.realizedEvidence ?? {};
   const policyVersion = resolvePolicyVersion(intendedEvidence);
   const isLegacy = policyVersion === POLICY_VERSION_LEGACY;
+  if (!isLegacy) {
+    const unbound = [...EVIDENCE_SEATS].filter(
+      (seat) => (intendedEvidence[seat] === "worktree" || realizedEvidence[seat] === "worktree") && !args.sandboxProfiles?.[seat]
+    );
+    if (unbound.length > 0) {
+      return {
+        error: `not qualified \u2014 worktree evidence claimed for ${unbound.join(", ")} without a sandbox profile identity; a worktree seat's evidence is only meaningful bound to the profile that fenced it`,
+        ok: false
+      };
+    }
+  }
   return {
     ok: true,
     receipt: {
@@ -1810,7 +1840,7 @@ function buildDiffReceipt(args) {
       ...isLegacy ? {} : {
         intendedEvidence,
         policyVersion,
-        realizedEvidence: args.realizedEvidence ?? {},
+        realizedEvidence,
         ...args.sandboxProfiles ? { sandboxProfiles: args.sandboxProfiles } : {}
       },
       policyHash: computePolicyHashAt(

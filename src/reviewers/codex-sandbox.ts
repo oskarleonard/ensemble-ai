@@ -164,14 +164,31 @@ export function defaultCodexSandboxPaths(worktree: string): CodexSandboxPaths {
   };
 }
 
-// Write the profile 0600 into an owner-only temp dir and return its path.
-export function writeCodexSandboxProfile(paths: CodexSandboxPaths): string {
+// Write the profile 0600 into an owner-only temp dir. The dir is the CALLER's to reap: it lives
+// only as long as the sandbox-exec that reads it, and nothing else can clean it up (mkdtemp names
+// are random, so a leaked dir is unfindable). Returning a `cleanup` alongside the path makes the
+// lifetime explicit rather than leaking one owner-only temp dir per worktree codex run.
+export function writeCodexSandboxProfile(paths: CodexSandboxPaths): {
+  cleanup: () => void;
+  file: string;
+} {
+  // Render FIRST: an unsafe read root must throw before we create anything to clean up.
+  const profile = renderCodexSandboxProfile(paths);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-sb-'));
   fs.chmodSync(dir, 0o700);
   const file = path.join(dir, 'ensemble-review-codex.sb');
-  fs.writeFileSync(file, renderCodexSandboxProfile(paths), { mode: 0o600 });
+  fs.writeFileSync(file, profile, { mode: 0o600 });
   fs.chmodSync(file, 0o600);
-  return file;
+  return {
+    cleanup: () => {
+      try {
+        fs.rmSync(dir, { force: true, recursive: true });
+      } catch {
+        /* best-effort, like every other reap in this engine */
+      }
+    },
+    file,
+  };
 }
 
 // PURE: wrap a command in `sandbox-exec -f <profile>`. The wrapped argv is what actually runs.

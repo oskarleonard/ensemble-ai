@@ -133,3 +133,34 @@ describe('runCodexReview', () => {
     }
   });
 });
+
+// The shared RunReviewOpts carries `worktree`, but codex cannot honor it until its external
+// sandbox-exec wrapper is wired. Accepting-and-ignoring it would let a receipt attest worktree
+// evidence codex never had — the exact silent downgrade the realized-evidence map exists to
+// prevent. It must fail CLOSED, and it must RESOLVE (every reviewer path settles to a result;
+// throwing would surface as an unhandled rejection in an adapter caller that does not catch).
+describe('runCodexReview — worktree evidence is refused, not silently downgraded', () => {
+  it('returns a failed seat without spawning codex', async () => {
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    const result = await runCodexReview('p', CONFIG, { worktree: '/private/tmp/wt' });
+    expect(result.ok).toBe(false);
+    expect(result.raw).toBeNull();
+    expect(result.timedOut).toBe(false);
+    expect(result.stderrTail).toMatch(/cannot run against a worktree yet/);
+    expect(spawned).not.toHaveBeenCalled();
+  });
+
+  it('resolves rather than rejects', async () => {
+    await expect(
+      runCodexReview('p', CONFIG, { worktree: '/private/tmp/wt' })
+    ).resolves.toMatchObject({ ok: false });
+  });
+
+  it('the packet path is untouched when no worktree is requested', async () => {
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    void runCodexReview('p', CONFIG, {});
+    expect(spawned).toHaveBeenCalled();
+  });
+});

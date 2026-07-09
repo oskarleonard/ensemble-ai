@@ -224,11 +224,25 @@ export function runGrokReview(
   // Pin the boundary to a proven read-only profile (provisioning the resolved one,
   // which is exactly what buildGrokReviewArgs will pass to --sandbox).
   const sandbox = resolveReviewSandbox(config.sandbox);
-  ensureSandboxProfile(sandbox);
   // WORKTREE EVIDENCE (§2): `--cwd <worktree>` roots the deny-by-default `strict` read base at
   // the PR head, so grok reads the whole project and nothing else. Without it, the historic
   // throwaway tmpdir (the diff lives in the prompt) — the packet path, unchanged.
+  //
+  // But the seat only QUALIFIES for the worktree under the profile whose identity the receipt
+  // will attest. resolveReviewSandbox admits `strict` as well as `ensemble-review`, and `strict`
+  // lacks the secret deny-list — yet GROK_SANDBOX_PROFILE hardcodes `ensemble-review`, so a
+  // `strict`-configured seat would be handed the whole project while the receipt named a profile
+  // it never ran under. Fail closed rather than attest evidence the sandbox did not fence.
   const worktreeCwd = opts.worktree;
+  if (worktreeCwd && sandbox !== GROK_SANDBOX_PROFILE.id) {
+    return Promise.resolve({
+      ok: false,
+      raw: null,
+      stderrTail: `ensemble-ai: refusing worktree evidence for the grok seat — it resolved to the "${sandbox}" sandbox, but worktree access is only qualified under "${GROK_SANDBOX_PROFILE.id}" (the profile whose id+version the receipt attests). Configure that sandbox, or run this seat on the packet.`,
+      timedOut: false,
+    });
+  }
+  ensureSandboxProfile(sandbox);
   const cwd = worktreeCwd ?? fs.mkdtempSync(path.join(os.tmpdir(), 'grok-review-'));
   return runReviewerExec({
     args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),

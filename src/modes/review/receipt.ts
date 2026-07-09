@@ -9,6 +9,7 @@ import type { ReviewerId, StoredReview, TerminalState } from '../../core/types';
 import type { Coverage, DiffMode } from './diff';
 import {
   computePolicyHashAt,
+  EVIDENCE_SEATS,
   type EvidenceMap,
   evidenceShortfall,
   isEvidenceClass,
@@ -431,8 +432,28 @@ export function buildDiffReceipt(args: {
   // An all-packet run hashes under the LEGACY schema, so worktree mode OFF changes no receipt
   // identity anywhere (the packet path stays byte-compatible). Any worktree seat ⇒ v2.
   const intendedEvidence = args.intendedEvidence ?? {};
+  const realizedEvidence = args.realizedEvidence ?? {};
   const policyVersion = resolvePolicyVersion(intendedEvidence);
   const isLegacy = policyVersion === POLICY_VERSION_LEGACY;
+  // A worktree seat's evidence MEANS NOTHING without the sandbox that bounded it: "the seat could
+  // read the whole project" is only a safety claim in conjunction with "under this profile, at
+  // this version". `sandboxProfiles` is hashed into the v2 policyHash precisely so a receipt
+  // minted under a weaker profile cannot verify as equivalent to one minted under a tighter one —
+  // but an absent map hashes as `{}`, which would let a caller mint a receipt CLAIMING worktree
+  // evidence while binding no profile identity at all. Refuse to build it (codex-f2).
+  if (!isLegacy) {
+    const unbound = [...EVIDENCE_SEATS].filter(
+      (seat) =>
+        (intendedEvidence[seat] === 'worktree' || realizedEvidence[seat] === 'worktree') &&
+        !args.sandboxProfiles?.[seat]
+    );
+    if (unbound.length > 0) {
+      return {
+        error: `not qualified — worktree evidence claimed for ${unbound.join(', ')} without a sandbox profile identity; a worktree seat's evidence is only meaningful bound to the profile that fenced it`,
+        ok: false,
+      };
+    }
+  }
   return {
     ok: true,
     receipt: {
@@ -448,7 +469,7 @@ export function buildDiffReceipt(args: {
         : {
             intendedEvidence,
             policyVersion,
-            realizedEvidence: args.realizedEvidence ?? {},
+            realizedEvidence,
             ...(args.sandboxProfiles ? { sandboxProfiles: args.sandboxProfiles } : {}),
           }),
       policyHash: computePolicyHashAt(

@@ -435,7 +435,10 @@ interface CodexSandboxPaths {
 declare function renderCodexSandboxProfile(p: CodexSandboxPaths): string;
 declare function codexSandboxSupported(platform?: NodeJS.Platform): boolean;
 declare function defaultCodexSandboxPaths(worktree: string): CodexSandboxPaths;
-declare function writeCodexSandboxProfile(paths: CodexSandboxPaths): string;
+declare function writeCodexSandboxProfile(paths: CodexSandboxPaths): {
+    cleanup: () => void;
+    file: string;
+};
 declare function wrapWithSandbox(profileFile: string, bin: string, args: string[]): {
     args: string[];
     bin: string;

@@ -3,6 +3,8 @@ import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import fs from 'node:fs';
+
 import {
   buildCodexWorktreeArgs,
   codexSandboxSupported,
@@ -10,6 +12,7 @@ import {
   isUnsafeReadRoot,
   renderCodexSandboxProfile,
   wrapWithSandbox,
+  writeCodexSandboxProfile,
 } from './codex-sandbox';
 
 // These five helpers COMPOSE the containment boundary: the argv that turns codex's internal
@@ -101,6 +104,37 @@ describe('buildCodexWorktreeArgs — codex INTERNAL sandbox off, external profil
   it('passes the configured model and reasoning effort', () => {
     expect(args[args.indexOf('-m') + 1]).toBe('gpt-5.5');
     expect(args).toContain('model_reasoning_effort="high"');
+  });
+});
+
+describe('writeCodexSandboxProfile — the temp dir is the caller\'s to reap, not a leak', () => {
+  const ok = {
+    codexHome: path.join(os.homedir(), '.codex'),
+    nodePrefix: '/usr/local',
+    worktree: '/private/tmp/wt',
+  };
+
+  it('writes an owner-only profile and hands back a cleanup that removes the dir', () => {
+    const { cleanup, file } = writeCodexSandboxProfile(ok);
+    expect(fs.readFileSync(file, 'utf8')).toContain('(deny default)');
+    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    const dir = path.dirname(file);
+    cleanup();
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  it('cleanup is idempotent', () => {
+    const { cleanup } = writeCodexSandboxProfile(ok);
+    cleanup();
+    expect(() => cleanup()).not.toThrow();
+  });
+
+  // Render before mkdtemp: an unsafe root must throw without leaving a dir behind.
+  it('creates nothing when the profile is refused', () => {
+    const before = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('ensemble-sb-')).length;
+    expect(() => writeCodexSandboxProfile({ ...ok, nodePrefix: '/' })).toThrow();
+    const after = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('ensemble-sb-')).length;
+    expect(after).toBe(before);
   });
 });
 

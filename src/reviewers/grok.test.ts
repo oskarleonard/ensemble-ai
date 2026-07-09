@@ -271,3 +271,30 @@ describe('runGrokReview (stdout capture)', () => {
     expect(result.raw).toBeNull();
   });
 });
+
+// WORKTREE EVIDENCE QUALIFICATION (codex-f3). resolveReviewSandbox admits `strict` as well as
+// `ensemble-review`, but only `ensemble-review` carries the secret deny-list, and
+// GROK_SANDBOX_PROFILE hardcodes that id. Handing a `strict` seat the whole project would attest a
+// profile it never ran under, so the seat must fail closed instead.
+describe('runGrokReview — the worktree is only granted under the QUALIFYING sandbox', () => {
+  it('refuses the worktree under `strict`, and says why, without spawning', async () => {
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    const result = await runGrokReview('p', { ...CONFIG, sandbox: 'strict' }, {
+      worktree: '/private/tmp/wt',
+    });
+    expect(result.ok).toBe(false);
+    expect(result.raw).toBeNull();
+    expect(result.timedOut).toBe(false);
+    expect(result.stderrTail).toMatch(/refusing worktree evidence/);
+    expect(result.stderrTail).toMatch(/ensemble-review/);
+    expect(spawned).not.toHaveBeenCalled();
+  });
+
+  // A failed seat, never a thrown one: the orchestrator records it, it cannot qualify a receipt.
+  it('resolves rather than rejects, so an adapter caller never sees an unhandled rejection', async () => {
+    await expect(
+      runGrokReview('p', { ...CONFIG, sandbox: 'strict' }, { worktree: '/private/tmp/wt' })
+    ).resolves.toMatchObject({ ok: false });
+  });
+});

@@ -75,13 +75,20 @@ export function runCodexReview(
   // and codex's own `-s read-only` restricts writes, not reads. Accepting-and-ignoring the option
   // would let a caller believe codex saw the worktree while it reviewed from the packet — and a
   // receipt could then record `worktree` evidence codex never had. That silent downgrade is the
-  // precise failure the realized-evidence map exists to make impossible, so refuse it loudly.
+  // precise failure the realized-evidence map exists to make impossible, so refuse it.
+  //
+  // RESOLVE, never reject: every reviewer path settles to a CodexReviewResult, and the
+  // orchestrator turns `ok: false` into a clean failed-seat entry (which cannot qualify a
+  // receipt). Throwing here would instead surface as an unhandled rejection in any adapter caller
+  // that does not catch — a crash where the contract asks for a recorded failure.
   if (opts.worktree) {
-    return Promise.reject(
-      new Error(
-        'ensemble-ai: the codex seat cannot run against a worktree yet (the sandbox-exec wrapper is not wired). Refusing rather than reviewing the packet while reporting worktree evidence.'
-      )
-    );
+    return Promise.resolve({
+      ok: false,
+      raw: null,
+      stderrTail:
+        'ensemble-ai: the codex seat cannot run against a worktree yet (its sandbox-exec wrapper is not wired). Refusing rather than reviewing the packet while reporting worktree evidence.',
+      timedOut: false,
+    });
   }
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const outFile = path.join(

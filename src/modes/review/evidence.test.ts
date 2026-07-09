@@ -102,9 +102,24 @@ describe('versioned policy hasher — contract', () => {
 });
 
 describe('realized-vs-intended evidence comparison', () => {
-  it('an ABSENT realized class is `unknown` and is WEAKER than any request', () => {
+  it('an ABSENT realized class is `unknown` and is WEAKER than a WORKTREE request', () => {
     const gaps = evidenceShortfall({ codex: 'worktree' }, undefined);
     expect(gaps).toEqual([{ intended: 'worktree', realized: 'unknown', seat: 'codex' }]);
+  });
+
+  // gate-r3 pin 2: an absent realized map fails "only when the caller requests worktree evidence".
+  // A legacy receipt provably HAD packet evidence — the packet is all that existed — so `unknown`
+  // is packet-strength. Treating it as weaker than everything would make the engine reject its own
+  // receipts: an all-packet run mints a v1 receipt with no realized map (buildDiffReceipt), which a
+  // caller verifying with an explicit `{codex:'packet'}` intent would then call evidence-degraded.
+  it('an ABSENT realized class satisfies a PACKET request — a legacy receipt is not degraded', () => {
+    expect(evidenceShortfall({ codex: 'packet' }, undefined)).toEqual([]);
+    expect(evidenceShortfall({ codex: 'packet', grok: 'packet' }, {})).toEqual([]);
+  });
+
+  it('a mixed intent reports ONLY the worktree seat against a legacy receipt', () => {
+    const gaps = evidenceShortfall({ codex: 'packet', grok: 'worktree' }, undefined);
+    expect(gaps).toEqual([{ intended: 'worktree', realized: 'unknown', seat: 'grok' }]);
   });
 
   it('packet realized under a worktree intent is a gap; the reverse is not', () => {

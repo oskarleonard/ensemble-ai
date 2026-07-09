@@ -53,11 +53,20 @@ export interface SandboxProfileRef {
 
 export type SandboxProfileMap = Partial<Record<EvidenceSeat, SandboxProfileRef>>;
 
-// Evidence strength, for the realized-vs-intended comparison. A seat MISSING from the realized
-// map is `unknown`, which is weaker than every requested class (gate-r3 pin 2: "absent realized
-// map = unknown = weaker") — the honest reading of a receipt that predates evidence identity.
+// Evidence strength, for the realized-vs-intended comparison.
+//
+// A seat MISSING from the realized map is `unknown` — a receipt issued before evidence identity
+// existed. What is the honest reading? Such a receipt PROVABLY had packet evidence: the packet is
+// all that existed, and a receipt is only ever written after every required reviewer completed.
+// So `unknown` is exactly as strong as `packet`, and strictly weaker than `worktree`. That is
+// what gate-r3 pin 2 asks for — an absent realized map fails "only when the caller requests
+// worktree evidence" — and treating unknown as weaker than EVERYTHING would break the engine
+// against its own receipts: an all-packet run mints a v1 receipt with no realized map (see
+// buildDiffReceipt), which a caller verifying with an explicit `{codex: 'packet'}` intent would
+// then reject as `evidence-degraded`. The gap still REPORTS `unknown`, so the message never
+// pretends to know a class the receipt did not record.
 const STRENGTH: Record<EvidenceClass, number> = { packet: 1, worktree: 2 };
-const UNKNOWN_STRENGTH = 0;
+const UNKNOWN_STRENGTH = STRENGTH.packet;
 
 function strengthOf(c: EvidenceClass | undefined): number {
   return c ? STRENGTH[c] : UNKNOWN_STRENGTH;
