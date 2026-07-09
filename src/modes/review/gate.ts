@@ -5,6 +5,7 @@ import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 import { type RunReviewOpts } from '../../reviewers/codex';
 
+import type { EvidenceClass } from './evidence';
 import { type ClusterInfo, clusterPostable } from './gate-dedup';
 import { renderGatePrompt } from './gate-prompt';
 import {
@@ -68,8 +69,19 @@ export const DOWNGRADE_REASONS = [
   'gate-failed', // the gate spawn errored / timed out / produced unparseable output
   'unknown-schema', // a missing / unsupported envelope schemaVersion (fail-closed)
   'trail-write-failed', // gate-verdicts.json did not durably write → dismissals not honored
+  // ADDITIVE (spec §5, ruled 2026-07-09): the gate could not locate what the finding REFERENCES
+  // at headSha — a hallucinated reference, a red flag distinct from "I couldn't see far enough".
+  // Emitted ONLY when the gate's REALIZED evidence is `worktree` (gate-r3 pin 1): a packet-fed
+  // gate sees ±25-line hunks, so it structurally cannot tell "this does not exist" from
+  // `truncated`, and asserting the stronger cause on weaker evidence would be a lie.
+  'reference-not-found',
 ] as const;
 export type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
+
+// The gate's own evidence class — it is an EVIDENCE-BEARING ACTOR, not a neutral judge
+// (gate-r3 pin 1). Defaults to 'packet' everywhere, so every existing caller keeps today's
+// semantics and `reference-not-found` can never appear on a packet-fed run.
+export type GateEvidence = EvidenceClass;
 
 // The composite envelope schema the gate prompt pins + the model must echo. A missing /
 // different value fails the whole envelope closed (all-`unverified`) — the host never
@@ -271,6 +283,9 @@ export function validateCitation(
 // ── Envelope parse ────────────────────────────────────────────────────────────────────
 
 export interface RawVerdictEntry {
+  // The gate's stated CAUSE for an `unverified`. Only 'reference-not-found' is meaningful today;
+  // the host honors it solely on worktree evidence (see reconcileGateVerdicts).
+  cause?: string;
   citation?: string;
   findingId: string;
   fixStatus?: FixStatus; // disposition the gate assigned the reviewer's suggested fix
@@ -313,6 +328,7 @@ function parseVerdicts(v: unknown): RawVerdictEntry[] {
       verdict: e.verdict,
       // conditional so an old-shape (no-ops) entry parses to the exact prior shape
       ...(ops.length ? { ops } : {}),
+      ...(typeof e.cause === 'string' && e.cause.trim() ? { cause: e.cause.trim() } : {}),
       ...(fixStatus ? { fixStatus } : {}),
       ...(rescoredSeverity ? { rescoredSeverity } : {}),
     });
@@ -406,8 +422,11 @@ const FAILURE_REASON: Record<WholeEnvelopeFailure['failure'], string> = {
 // failure ⇒ every finding unverified with that machine-readable reason.
 export function reconcileGateVerdicts(
   findings: GateFinding[],
-  parsed: ParsedGateEnvelope | WholeEnvelopeFailure
+  parsed: ParsedGateEnvelope | WholeEnvelopeFailure,
+  // The gate's REALIZED evidence class. Defaults to 'packet' — the pre-worktree behavior.
+  opts: { gateEvidence?: GateEvidence } = {}
 ): { records: GateVerdictRecord[]; warnings: string[] } {
+  const gateEvidence: GateEvidence = opts.gateEvidence ?? 'packet';
   if ('failure' in parsed) {
     const reason = FAILURE_REASON[parsed.failure];
     return {
@@ -463,6 +482,19 @@ export function reconcileGateVerdicts(
         return { ...base, citation, downgradeReason: 'invalid-citation', effectiveVerdict: 'unverified', rawVerdict, reason: e.reason || cv.reason || 'no valid citation' };
       }
       return { ...base, citation, downgradeReason: null, effectiveVerdict: 'false', rawVerdict, reason: e.reason };
+    }
+    // `unverified` + an explicit `reference-not-found` cause: the gate says the thing this
+    // finding POINTS AT does not exist at headSha. Honored ONLY on worktree evidence (gate-r3
+    // pin 1). On a packet-fed gate the claim is unsound — the gate saw a ±25-line window, so
+    // "not found" is indistinguishable from `truncated` — and it is DROPPED to a plain
+    // unverified with a warning, never laundered into the stronger cause.
+    if (e.verdict === 'unverified' && e.cause === 'reference-not-found') {
+      if (gateEvidence === 'worktree') {
+        return { ...base, citation, downgradeReason: 'reference-not-found', effectiveVerdict: 'unverified', rawVerdict, reason: e.reason || 'the gate could not locate what this finding references at headSha' };
+      }
+      warnings.push(
+        `gate: "reference-not-found" claimed for ${f.findingId} on PACKET evidence — dropped (a packet-fed gate cannot distinguish it from a truncated window)`
+      );
     }
     // agree / partial / unverified pass through — not dismissals, so truncation does not force them.
     return { ...base, citation, downgradeReason: null, effectiveVerdict: e.verdict, rawVerdict, reason: e.reason };
@@ -728,6 +760,9 @@ export interface RunGateOptions {
   baseDir: string;
   config: VoiceConfig;
   expectedHeadSha: string;
+  // The gate's REALIZED evidence (default 'packet'). Worktree ⇒ the gate ran with read access to
+  // the PR head and may emit `reference-not-found`.
+  gateEvidence?: GateEvidence;
   log?: (m: string) => void;
   reviews: VoiceReview[];
   run: GateRunner;
@@ -761,7 +796,9 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     synthesis: ReviewSynthesis,
     parsed: ParsedGateEnvelope | WholeEnvelopeFailure
   ): GateRunResult => {
-    const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed);
+    const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed, {
+      gateEvidence: opts.gateEvidence,
+    });
     for (const w of warnings) log(`  · ${w}`);
     // Cross-reviewer dedup by selection — one representative per cluster posts; corroboration
     // recorded. Runs AFTER reconcile (needs the full postable set) and BEFORE the trail write
