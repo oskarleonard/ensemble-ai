@@ -163,8 +163,10 @@ export const GROK_CLI_SANDBOX = REVIEW_PROFILE_NAME;
 //   `+proxy-env-noshell` — the engine's per-host CONNECT fence (codex-f3), reached by ENV not by
 //                        kernel rule. grok honors the standard proxy env vars (PROBED 2026-07-10: a
 //                        logging proxy saw its `cli-chat-proxy.grok.com:443` CONNECT), so the seat is
-//                        spawned pointed at the proxy and reaches that host and nothing else. Its
-//                        `api.mixpanel.com` telemetry is denied, and grok completes anyway.
+//                        spawned pointed at the proxy and reaches its two xAI hosts — that chat proxy
+//                        and `auth.x.ai`, which mints the bearer token the chat proxy demands — and
+//                        nothing else. Its `api.mixpanel.com` telemetry is denied, and grok completes
+//                        anyway.
 //
 // WHY THE ID DOES NOT SAY `+egress-proxy` LIKE CODEX'S. It used to, and that was the defect: an id
 // that reads like the codex one IMPLIES the codex one's guarantee (a kernel rule denying direct
@@ -179,12 +181,14 @@ export const GROK_CLI_SANDBOX = REVIEW_PROFILE_NAME;
 // Bump `version` whenever REVIEW_PROFILE_BLOCK, the egress allowlist, or this identity changes — a
 // receipt minted under a weaker profile must never verify as equivalent to one minted under a
 // tighter one. Versions advance across a rename and never reset (see CODEX_SANDBOX_PROFILE): this
-// seat's lineage is `ensemble-review` v1 → this, so no (id, version) pair is ever reused.
+// seat's lineage is `ensemble-review` v1 → `…+proxy-env-noshell` v2 → this, so no (id, version) pair
+// is ever reused. v3 is the `auth.x.ai` allowlist entry (see egress-hosts.ts): a strictly WIDER
+// egress fence than v2's, hence a distinct version, so a v2 receipt can never read as equivalent.
 export const GROK_SANDBOX_PROFILE: SandboxProfileRef = {
   // Egress fenced by proxy ENV VARS ONLY (grok's sandbox schema has no network keys); what bounds a
   // prompt-injected tree is that the seat has NO SHELL (`--disallowed-tools bash`) to exercise it.
   id: 'ensemble-review-grok+proxy-env-noshell',
-  version: 2,
+  version: 3,
 };
 
 // PURE: the exact grok CLI args for a review. Encodes every lived lesson as DATA

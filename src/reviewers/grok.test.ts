@@ -302,8 +302,9 @@ describe('runGrokReview — the worktree is only granted under the QUALIFYING sa
 
 // THE EGRESS FENCE, grok half (codex-f3). grok honors the standard proxy env vars — PROBED
 // 2026-07-10 the same way codex was: a logging CONNECT proxy saw its `cli-chat-proxy.grok.com:443`
-// tunnel. So its worktree seat is spawned pointed at the engine's proxy, which allows that host and
-// refuses everything else (its `api.mixpanel.com` telemetry included).
+// tunnel. So its worktree seat is spawned pointed at the engine's proxy, which allows that host plus
+// `auth.x.ai` (the bearer-auth endpoint the chat proxy's token comes from) and refuses everything
+// else (its `api.mixpanel.com` telemetry included).
 describe('runGrokReview — the worktree seat is fenced by the egress proxy', () => {
   it('hands the worktree seat the proxy env, with NO_PROXY forced empty', async () => {
     const spawned = vi.mocked(spawn);

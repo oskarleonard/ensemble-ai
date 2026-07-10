@@ -44,16 +44,37 @@ const CODEX_EGRESS_HOSTS = [
   'chatgpt.com',
 ] as const;
 
-// grok — OBSERVED 2026-07-10 through a logging proxy: `cli-chat-proxy.grok.com` is the ONLY host it
-// needs. Denied and harmless: `api.mixpanel.com` (telemetry) and `grok.com` — grok completed in 5s
-// with both refused.
+// grok — TWO hosts, both xAI-owned, and ONE review needs BOTH: the chat proxy carries the request,
+// the auth endpoint mints the bearer token that request must carry. Allow one without the other and
+// the seat has a reachable API it cannot authenticate to.
+//   cli-chat-proxy.grok.com  OBSERVED (2026-07-10, through a logging proxy). The API base: the
+//                            review prompt goes here and the findings come back. Without it, no
+//                            review.
+//   auth.x.ai                OBSERVED BEING DENIED, in production — the first worktree-mode review
+//                            munin ever ran (run `2026-07-10-14-49-44-5f601154`). The seat's
+//                            `evidence.egressDenials` recorded NINE refused CONNECTs to
+//                            `auth.x.ai:443` ("host is not on this vendor's egress allowlist"),
+//                            after which `cli-chat-proxy.grok.com` answered `401 Unauthorized —
+//                            "Invalid or expired credentials (auth_kind=bearer,
+//                            x_xai_token_auth=xai-grok-cli, upstream=PermissionDenied, reason=no
+//                            auth context)"`. The seat then failed closed to the packet, where a
+//                            retry with the SAME credentials succeeded: the credentials were always
+//                            valid, and the fence blocking the vendor's own bearer-auth host was the
+//                            whole cause. A one-host allowlist is a half-fence — it made worktree
+//                            mode unreachable for grok on every review.
 //
-// OPERATIONAL RISK, stated: grok does not fail fast when its API host is unreachable. With the host
-// denied it retried and then HUNG silently (a 5-minute probe produced no output and no error). If
-// xAI moves the host, the grok seat will hang until the 12-minute review watchdog kills it, and the
-// seat will be scored `failed-reviewer` rather than erroring quickly. That is fail-closed, but it
-// is slow — a hung grok seat is the signal to re-probe this list.
-const GROK_EGRESS_HOSTS = ['cli-chat-proxy.grok.com'] as const;
+// Denied and harmless, both observed refused while grok completed in 5s: `api.mixpanel.com`
+// (telemetry) and `grok.com`. Neither grok host appears on codex's list, nor codex's here: an
+// intersection would hand either seat the other's API as an exfil host (the fence's own test pins
+// the empty intersection).
+//
+// OPERATIONAL RISK, stated: grok does not fail fast when its API host is unreachable. With
+// `cli-chat-proxy.grok.com` denied it retried and then HUNG silently (a 5-minute probe produced no
+// output and no error). If xAI moves that host, the grok seat will hang until the 12-minute review
+// watchdog kills it, and the seat will be scored `failed-reviewer` rather than erroring quickly.
+// That is fail-closed, but it is slow — a hung grok seat is the signal to re-probe this list. Losing
+// `auth.x.ai` fails differently and better: a fast 401 and a loud, recorded packet fallback.
+const GROK_EGRESS_HOSTS = ['auth.x.ai', 'cli-chat-proxy.grok.com'] as const;
 
 export const VENDOR_EGRESS_HOSTS: Record<ReviewerId, readonly string[]> = {
   codex: CODEX_EGRESS_HOSTS,

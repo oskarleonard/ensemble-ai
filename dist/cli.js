@@ -1194,7 +1194,7 @@ var CODEX_EGRESS_HOSTS = [
   "auth.openai.com",
   "chatgpt.com"
 ];
-var GROK_EGRESS_HOSTS = ["cli-chat-proxy.grok.com"];
+var GROK_EGRESS_HOSTS = ["auth.x.ai", "cli-chat-proxy.grok.com"];
 var VENDOR_EGRESS_HOSTS = {
   codex: CODEX_EGRESS_HOSTS,
   grok: GROK_EGRESS_HOSTS
@@ -1410,7 +1410,7 @@ var GROK_SANDBOX_PROFILE = {
   // Egress fenced by proxy ENV VARS ONLY (grok's sandbox schema has no network keys); what bounds a
   // prompt-injected tree is that the seat has NO SHELL (`--disallowed-tools bash`) to exercise it.
   id: "ensemble-review-grok+proxy-env-noshell",
-  version: 2
+  version: 3
 };
 function buildGrokReviewArgs(config, prompt, cwd) {
   return [
