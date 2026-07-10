@@ -35,9 +35,15 @@ export const HARNESS_SEATS = ['claude', 'gate'] as const;
 export type HarnessSeat = (typeof HARNESS_SEATS)[number];
 
 // Every actor whose evidence class is part of the identity — INCLUDING the gate. Derived from its
-// two halves rather than re-listed, so the seat roster has exactly one source.
-export const EVIDENCE_SEATS = [...REVIEWER_IDS, ...HARNESS_SEATS] as const;
-export type EvidenceSeat = (typeof EVIDENCE_SEATS)[number];
+// two halves rather than re-listed, so the seat roster has exactly one source. `claude` is BOTH a
+// registry ReviewerId and a HARNESS_SEAT (the CLI runs it as the additive producer), so the halves
+// overlap — dedupe the runtime roster (the literal EvidenceSeat union already collapses the
+// duplicate) so no seat is iterated twice or named twice in a shortfall/unbound message.
+const EVIDENCE_SEATS_RAW = [...REVIEWER_IDS, ...HARNESS_SEATS] as const;
+export type EvidenceSeat = (typeof EVIDENCE_SEATS_RAW)[number];
+export const EVIDENCE_SEATS: readonly EvidenceSeat[] = [
+  ...new Set(EVIDENCE_SEATS_RAW),
+];
 
 export function isEvidenceSeat(v: unknown): v is EvidenceSeat {
   return (EVIDENCE_SEATS as readonly string[]).includes(v as string);

@@ -802,7 +802,9 @@ function persistReview(baseDir, input) {
   return stored;
 }
 function isStoredReviewShape(v) {
-  return typeof v.packet === "object" && v.packet !== null && typeof v.reviewer === "object" && v.reviewer !== null;
+  if (typeof v !== "object" || v === null) return false;
+  const r = v;
+  return typeof r.packet === "object" && r.packet !== null && typeof r.reviewer === "object" && r.reviewer !== null;
 }
 function readReview(baseDir, runId, reviewerId = "codex") {
   const dir = reviewDir(baseDir, runId);
@@ -2324,7 +2326,10 @@ import path15 from "path";
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
 var HARNESS_SEATS = ["claude", "gate"];
-var EVIDENCE_SEATS = [...REVIEWER_IDS, ...HARNESS_SEATS];
+var EVIDENCE_SEATS_RAW = [...REVIEWER_IDS, ...HARNESS_SEATS];
+var EVIDENCE_SEATS = [
+  ...new Set(EVIDENCE_SEATS_RAW)
+];
 function isEvidenceSeat(v) {
   return EVIDENCE_SEATS.includes(v);
 }

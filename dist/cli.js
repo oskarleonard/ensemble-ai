@@ -156,7 +156,9 @@ function persistReview(baseDir, input) {
   return stored;
 }
 function isStoredReviewShape(v) {
-  return typeof v.packet === "object" && v.packet !== null && typeof v.reviewer === "object" && v.reviewer !== null;
+  if (typeof v !== "object" || v === null) return false;
+  const r = v;
+  return typeof r.packet === "object" && r.packet !== null && typeof r.reviewer === "object" && r.reviewer !== null;
 }
 function readReview(baseDir, runId, reviewerId = "codex") {
   const dir = reviewDir(baseDir, runId);
@@ -3609,7 +3611,10 @@ import path15 from "path";
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
 var HARNESS_SEATS = ["claude", "gate"];
-var EVIDENCE_SEATS = [...REVIEWER_IDS, ...HARNESS_SEATS];
+var EVIDENCE_SEATS_RAW = [...REVIEWER_IDS, ...HARNESS_SEATS];
+var EVIDENCE_SEATS = [
+  ...new Set(EVIDENCE_SEATS_RAW)
+];
 function isEvidenceSeat(v) {
   return EVIDENCE_SEATS.includes(v);
 }
@@ -5713,15 +5718,14 @@ ${SCHEMA_BLOCK2}`;
 
 // src/modes/review/self-contained.ts
 function resolveReviewRoster(requested, noClaude) {
-  const known = REVIEWER_IDS;
   if (requested === void 0) {
     return { claude: !noClaude, core: [...CORE_REVIEWER_IDS] };
   }
   const ids = [...new Set(requested.map((s) => s.trim()).filter(Boolean))];
-  const unknown = ids.filter((id) => !known.includes(id));
+  const unknown = ids.filter((id) => !isReviewerId(id));
   if (unknown.length > 0) {
     return {
-      error: `unknown reviewer id(s): ${unknown.join(", ")} (known: ${known.join(", ")})`
+      error: `unknown reviewer id(s): ${unknown.join(", ")} (known: ${REVIEWER_IDS.join(", ")})`
     };
   }
   const core = ids.filter(isCoreReviewerId);
@@ -8402,8 +8406,8 @@ function parseReviewerList(raw, cmd) {
   }
   return parseReviewerIds(requested);
 }
-function parseRequiredReviewers(raw, cmd) {
-  return raw === void 0 ? [...REVIEWER_IDS] : parseReviewerList(raw, cmd);
+function parseRequiredReviewers(raw, cmd, defaultIds) {
+  return raw === void 0 ? [...defaultIds] : parseReviewerList(raw, cmd);
 }
 function parseConventionPaths(raw) {
   if (typeof raw !== "string") return void 0;
@@ -8533,7 +8537,8 @@ async function receiptCommand(args) {
   }
   const required = parseRequiredReviewers(
     typeof values.reviewers === "string" ? values.reviewers : void 0,
-    "receipt"
+    "receipt",
+    CORE_REVIEWER_IDS
   );
   if ("code" in required) return required.code;
   const ceiling = positiveCeiling(
@@ -8766,7 +8771,8 @@ async function diffCommand(args) {
   }
   const reviewers = parseRequiredReviewers(
     typeof values.reviewers === "string" ? values.reviewers : void 0,
-    "diff"
+    "diff",
+    REVIEWER_IDS
   );
   if ("code" in reviewers) return reviewers.code;
   const ceiling = positiveCeiling(
@@ -8946,5 +8952,6 @@ if (isEntrypoint(import.meta.url)) {
 }
 export {
   main,
+  parseRequiredReviewers,
   resolveTrailBase
 };

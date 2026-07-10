@@ -18,6 +18,7 @@ import { evidenceRef, SEVERITY_LABEL, SEVERITY_ORDER } from './core/findings';
 import { listReviewers, REVIEWERS_FILE } from './core/reviewers';
 import { scrubControl as clean } from './core/sanitize';
 import {
+  CORE_REVIEWER_IDS,
   isReviewerId,
   parseReviewerIds,
   REVIEWER_IDS,
@@ -2188,14 +2189,21 @@ function parseReviewerList(
   return parseReviewerIds(requested) as ReviewerId[];
 }
 
-// Parse a fail-closed `--reviewers` list, defaulting to the FULL registry. Unlike
-// review mode (where absent → undefined → "run all"), the gate/preview need a
-// CONCRETE required set, so absent → [...REVIEWER_IDS].
-function parseRequiredReviewers(
+// Parse a fail-closed `--reviewers` list. Unlike review mode (where absent → undefined →
+// "run all"), the gate/preview need a CONCRETE required set, so the caller supplies the
+// default for an absent flag — and the two callers need DIFFERENT defaults. The `receipt`
+// path defaults to the receipt-minting CORE (codex/grok — what index.ts keys `completed`/
+// `reviewerPolicy` by; claude rides along only as a stamped peerReviewer). Defaulting it to
+// the full registry would compute a policyHash over a reviewer no receipt was minted with, so
+// a genuinely-reviewed diff reports "no receipt". The `diff` cost-preview defaults to the full
+// REVIEWER_IDS registry — an honest 3-seat label, since the claude layer is default-on. `claude`
+// is a valid EXPLICIT `--reviewers` id in both.
+export function parseRequiredReviewers(
   raw: string | undefined,
-  cmd: string
+  cmd: string,
+  defaultIds: readonly ReviewerId[]
 ): ReviewerId[] | { code: number } {
-  return raw === undefined ? [...REVIEWER_IDS] : parseReviewerList(raw, cmd);
+  return raw === undefined ? [...defaultIds] : parseReviewerList(raw, cmd);
 }
 
 // Parse `--conventions a.md,b.md` into an explicit path list (the config lever for
@@ -2347,7 +2355,8 @@ async function receiptCommand(args: string[]): Promise<number> {
 
   const required = parseRequiredReviewers(
     typeof values.reviewers === 'string' ? values.reviewers : undefined,
-    'receipt'
+    'receipt',
+    CORE_REVIEWER_IDS
   );
   if ('code' in required) return required.code;
   const ceiling = positiveCeiling(
@@ -2626,7 +2635,8 @@ async function diffCommand(args: string[]): Promise<number> {
   }
   const reviewers = parseRequiredReviewers(
     typeof values.reviewers === 'string' ? values.reviewers : undefined,
-    'diff'
+    'diff',
+    REVIEWER_IDS
   );
   if ('code' in reviewers) return reviewers.code;
   const ceiling = positiveCeiling(

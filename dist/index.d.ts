@@ -1,5 +1,7 @@
-import { R as ReviewerId, a as ReviewerConfig, b as ReviewFinding, c as ReviewPacket, T as TerminalState, S as StoredReview, d as Severity, e as ReviewProfile } from './contracts-CfU5tfEz.js';
-export { C as CONFIDENCES, f as CORE_REVIEWER_IDS, g as Confidence, h as CoreReviewerId, D as DIFF_SECTION_TITLE, i as DIFF_USEFUL_FLOOR, E as Evidence, F as FINDINGS_INSTRUCTIONS, M as ManifestEntry, P as PACKET_BUDGETS, j as PacketInput, k as PacketSection, l as ParsedReview, m as REVIEWER_IDS, n as REVIEW_PROFILES, o as SECURITY_CLASSES, p as SECURITY_OBJECTIVE, q as SEVERITIES, r as SEVERITY_LABEL, s as SEVERITY_ORDER, t as SecurityClass, u as TERMINAL_STATES, v as TRUNCATION_MARKER_RE, w as assembleCodePacket, x as classifySecurityFinding, y as evidenceRef, z as extractJsonBlock, A as isCoreReviewerId, B as isReviewProfile, G as isReviewerId, H as oneOf, I as parseFindings, J as parseReviewerIds, K as renderReviewPrompt, L as reviewerVisibleDiff, N as section, O as securityClassLabel, Q as segmentsWithoutTruncationSplices, U as stripSecurityTag, V as titleCase } from './contracts-CfU5tfEz.js';
+import { R as ReviewerId, a as ReviewerConfig, b as ReviewFinding, c as ReviewPacket, T as TerminalState, S as StoredReview, d as Severity } from './types-eYT8NZq_.js';
+export { C as CONFIDENCES, e as CORE_REVIEWER_IDS, f as Confidence, g as CoreReviewerId, E as Evidence, M as ManifestEntry, P as PacketSection, h as REVIEWER_IDS, i as SEVERITIES, j as TERMINAL_STATES, k as isCoreReviewerId, l as isReviewerId, p as parseReviewerIds, t as titleCase } from './types-eYT8NZq_.js';
+import { R as ReviewProfile } from './contracts-s64OeJWb.js';
+export { D as DIFF_SECTION_TITLE, a as DIFF_USEFUL_FLOOR, F as FINDINGS_INSTRUCTIONS, P as PACKET_BUDGETS, b as PacketInput, c as ParsedReview, d as REVIEW_PROFILES, S as SECURITY_CLASSES, e as SECURITY_OBJECTIVE, f as SEVERITY_LABEL, g as SEVERITY_ORDER, h as SecurityClass, T as TRUNCATION_MARKER_RE, i as assembleCodePacket, j as classifySecurityFinding, k as evidenceRef, l as extractJsonBlock, m as isReviewProfile, o as oneOf, p as parseFindings, r as renderReviewPrompt, n as reviewerVisibleDiff, s as section, q as securityClassLabel, t as segmentsWithoutTruncationSplices, u as stripSecurityTag } from './contracts-s64OeJWb.js';
 
 interface ConventionReader {
     read(relPath: string, maxBytes?: number): Promise<string | null>;
@@ -655,8 +657,9 @@ declare const EVIDENCE_CLASSES: readonly ["packet", "worktree"];
 type EvidenceClass = (typeof EVIDENCE_CLASSES)[number];
 declare const HARNESS_SEATS: readonly ["claude", "gate"];
 type HarnessSeat = (typeof HARNESS_SEATS)[number];
-declare const EVIDENCE_SEATS: readonly ["codex", "grok", "claude", "claude", "gate"];
-type EvidenceSeat = (typeof EVIDENCE_SEATS)[number];
+declare const EVIDENCE_SEATS_RAW: readonly ["codex", "grok", "claude", "claude", "gate"];
+type EvidenceSeat = (typeof EVIDENCE_SEATS_RAW)[number];
+declare const EVIDENCE_SEATS: readonly EvidenceSeat[];
 declare function isEvidenceSeat(v: unknown): v is EvidenceSeat;
 declare function isEvidenceClass(v: unknown): v is EvidenceClass;
 type EvidenceMap = Partial<Record<EvidenceSeat, EvidenceClass>>;
