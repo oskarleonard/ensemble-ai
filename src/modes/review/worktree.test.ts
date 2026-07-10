@@ -11,6 +11,7 @@ import {
   isPreflightError,
   materializeWorktree,
   reapWorktree,
+  redactUrlCredentials,
   remoteSlug,
   resolveRepoLocation,
   rootAllowed,
@@ -30,6 +31,27 @@ describe('remoteSlug — every GitHub remote form normalizes to owner/repo', () 
 
   it('returns null for a non-GitHub remote (nothing to compare)', () => {
     expect(remoteSlug('git@gitlab.com:o/r.git')).toBeNull();
+  });
+});
+
+// A fetch failure prints the remote URL; an authenticated HTTPS remote carries a token there. The
+// message must never echo it (the raw URL is still what `git fetch` gets).
+describe('redactUrlCredentials — a token in the remote URL never reaches a message', () => {
+  it.each([
+    ['https://ghp_SECRETTOKEN@github.com/o/r.git', 'https://***@github.com/o/r.git'],
+    ['https://x-access-token:ghp_SECRET@github.com/o/r.git', 'https://***@github.com/o/r.git'],
+    ['ssh://git@github.com/o/r.git', 'ssh://***@github.com/o/r.git'],
+  ])('%s → %s', (url, redacted) => {
+    const out = redactUrlCredentials(url);
+    expect(out).toBe(redacted);
+    expect(out).not.toContain('SECRET');
+    expect(out).not.toContain('ghp_');
+  });
+
+  it('leaves a URL with no userinfo, and a scp-style git@ remote, untouched', () => {
+    expect(redactUrlCredentials('https://github.com/o/r.git')).toBe('https://github.com/o/r.git');
+    // scp-style has no `://`, so `git@` (a username, not a secret) stays.
+    expect(redactUrlCredentials('git@github.com:o/r.git')).toBe('git@github.com:o/r.git');
   });
 });
 

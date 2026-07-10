@@ -2770,6 +2770,9 @@ function remoteSlug(url) {
   );
   return m ? `${m[1].toLowerCase()}/${m[2].toLowerCase()}` : null;
 }
+function redactUrlCredentials(url) {
+  return url.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@]*@/, "$1***@");
+}
 function classifyGitError(stderr) {
   const s = stderr.toLowerCase();
   if (/couldn't find remote ref|no such ref|unadvertised object|not our ref/.test(s)) {
@@ -2947,7 +2950,7 @@ function materializeWorktree(args, deps) {
       { cwd: location.repoRoot, env: INERT_ENV }
     );
     if (!fetched.ok) {
-      return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${location.fetchUrl} failed: ${fetched.error.trim()}` };
+      return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
     }
     const parent = fs14.mkdtempSync(path11.join(args.worktreeRoot ?? os8.tmpdir(), WORKTREE_PARENT_PREFIX));
     fs14.chmodSync(parent, 448);

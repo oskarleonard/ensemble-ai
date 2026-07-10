@@ -81,6 +81,15 @@ export function remoteSlug(url: string): string | null {
   return m ? `${m[1].toLowerCase()}/${m[2].toLowerCase()}` : null;
 }
 
+// Strip the userinfo from a `scheme://userinfo@host/…` URL before it lands in a human-facing
+// message. An authenticated HTTPS remote (`https://<token>@github.com/o/r.git`, common in CI and
+// token-based local setups) otherwise prints its secret to stderr/logs on any fetch failure. The
+// RAW url is still what `git fetch` receives — only the message is redacted. A scp-style
+// `git@github.com:o/r` has no `://`, so its `git@` (a username, not a secret) is left untouched.
+export function redactUrlCredentials(url: string): string {
+  return url.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@]*@/, '$1***@');
+}
+
 // Map git's stderr to the taxonomy. Ordered most-specific first; anything unrecognized stays
 // `network` (the conservative default: retryable, not a security claim).
 export function classifyGitError(stderr: string): PreflightErrorKind {
@@ -375,7 +384,7 @@ export function materializeWorktree(
       { cwd: location.repoRoot, env: INERT_ENV }
     );
     if (!fetched.ok) {
-      return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${location.fetchUrl} failed: ${fetched.error.trim()}` };
+      return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
     }
     // Materialize by SHA, not FETCH_HEAD: the fetch proved the object exists locally, and
     // checking out the receipt's own headSha removes any window where FETCH_HEAD could have
