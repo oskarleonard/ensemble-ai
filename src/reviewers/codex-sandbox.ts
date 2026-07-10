@@ -48,6 +48,14 @@ export const CODEX_SANDBOX_PROFILE: SandboxProfileRef = {
   version: 1,
 };
 
+// The ONE directory a sandboxed codex seat may write to that is neither its own config nor /dev:
+// the legacy world-shared `/tmp`, spelled as the path Seatbelt resolves (`/tmp` is a symlink to
+// it). Exported because the seat must place its `-o` reply file under a root the profile below
+// actually grants — the per-user `$TMPDIR` is READ-only here, and a reply written there fails with
+// EPERM after a completed review. Two modules naming the same literal is how that regression gets
+// reintroduced, so the profile owns the constant and codex.ts imports it.
+export const SANDBOX_WRITABLE_TMP = '/private/tmp';
+
 // Read-allowed system roots. Deny-by-default means everything absent from this list — every
 // credential in $HOME, every other repo on disk — is kernel-unreadable to the seat.
 const SYSTEM_READ_ROOTS = [
@@ -140,7 +148,7 @@ export function renderCodexSandboxProfile(p: CodexSandboxPaths): string {
 (allow file-read* (subpath ${JSON.stringify(p.nodePrefix)}))
 (allow file-read* (subpath ${JSON.stringify(p.worktree)}))
 (allow file-read* (subpath ${JSON.stringify(p.codexHome)}))
-(allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath "/private/tmp") (subpath "/dev"))
+(allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath ${JSON.stringify(SANDBOX_WRITABLE_TMP)}) (subpath "/dev"))
 (allow network-outbound (remote ip "*:443") (remote ip "*:53") (remote unix-socket))
 (allow network-inbound (local ip "*:*"))
 `;

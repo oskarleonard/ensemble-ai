@@ -190,6 +190,47 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, gate 
     expect(JSON.parse(codexJson).findings[0].title).toBe('shared bug');
   });
 
+  // THE PRODUCER PROMPT under worktree evidence. `/code-review` hard-codes a structural-quality
+  // lens, so handing it to a `security` run would silently drop the security-auditor objective
+  // while still counting the seat as a completed reviewer.
+  describe('the worktree producer prompt respects the review PROFILE', () => {
+    const producerPromptFor = async (profile: 'code' | 'security'): Promise<string> => {
+      const base = tmpTrail();
+      const runId = `p-${profile}`;
+      seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+      const { calls, run } = makeRunner();
+      await runClaudeReviewLayer({
+        baseDir: base,
+        baseSha: 'b'.repeat(40),
+        claudeConfig: CFG,
+        coreReviews: [stored('codex'), stored('grok')],
+        expectedHeadSha: HEAD,
+        includeClaudeReviewer: true,
+        profile,
+        reviewPrompt: 'SECURITY AUDITOR OBJECTIVE PAYLOAD',
+        run,
+        runId,
+        worktree: '/tmp/some-worktree',
+      });
+      return calls.find((c) => c.round === 'review')?.prompt ?? '';
+    };
+
+    it('`code` takes the /code-review skill over the whole project', async () => {
+      const prompt = await producerPromptFor('code');
+      expect(prompt).toContain('/code-review');
+      expect(prompt).toContain('/tmp/some-worktree');
+    });
+
+    it('`security` KEEPS its own objective and merely learns about the worktree', async () => {
+      const prompt = await producerPromptFor('security');
+      expect(prompt).not.toContain('/code-review');
+      expect(prompt).toContain('SECURITY AUDITOR OBJECTIVE PAYLOAD');
+      // It still gets whole-project evidence — just under the objective it was asked for.
+      expect(prompt).toContain('/tmp/some-worktree');
+      expect(prompt).toContain(`git diff ${'b'.repeat(40)}...${HEAD}`);
+    });
+  });
+
   it('a failed Opus reviewer degrades to ok:false but the gate still runs over codex+grok', async () => {
     const base = tmpTrail();
     const runId = 'run2';

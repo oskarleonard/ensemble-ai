@@ -9,6 +9,7 @@ import {
   buildCodexWorktreeArgs,
   codexSandboxSupported,
   defaultCodexSandboxPaths,
+  SANDBOX_WRITABLE_TMP,
   wrapWithSandbox,
   writeCodexSandboxProfile,
 } from './codex-sandbox';
@@ -75,10 +76,6 @@ function reviewOutFile(): string {
   );
 }
 
-// The legacy world-shared `/tmp`, spelled as the resolved path Seatbelt matches (`/tmp` is a
-// symlink to it). The profile's write rule names this exact subpath.
-const SANDBOX_WRITABLE_TMP = '/private/tmp';
-
 // The WORKTREE seat's `-o` reply file, and why it is not `reviewOutFile()`.
 //
 // A worktree codex seat runs inside the `ensemble-review-codex` Seatbelt profile, whose ONLY
@@ -91,10 +88,11 @@ const SANDBOX_WRITABLE_TMP = '/private/tmp';
 // scored `failed-reviewer`, and RETRIES_ON_PACKET re-runs it on the packet. Every worktree codex
 // run would burn a full review and discard it.
 //
-// `/private/tmp` is the one writable root the profile already grants, so the reply lands in an
-// owner-only (0700) mkdtemp there — the same posture writeCodexSandboxProfile uses for the profile
-// itself. No profile RULE changes, so `CODEX_SANDBOX_PROFILE.version` — and every receipt whose
-// policyHash binds it — is untouched.
+// SANDBOX_WRITABLE_TMP is the one writable root the profile already grants, so the reply lands in
+// an owner-only (0700) mkdtemp there — the same posture writeCodexSandboxProfile uses for the
+// profile itself. The constant is owned by the profile module, so this path and the SBPL write rule
+// cannot drift apart. No profile RULE changes, so `CODEX_SANDBOX_PROFILE.version` — and every
+// receipt whose policyHash binds it — is untouched.
 function worktreeReplyFile(): { cleanup: () => void; file: string } {
   const dir = fs.mkdtempSync(path.join(SANDBOX_WRITABLE_TMP, 'ensemble-codex-'));
   fs.chmodSync(dir, 0o700);

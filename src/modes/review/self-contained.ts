@@ -34,6 +34,8 @@ import {
   runHolisticLens,
 } from './holistic';
 import { worktreeReader } from './holistic-gate';
+import type { ReviewProfile } from './profile';
+import { worktreePromptSuffix } from './seat-evidence';
 import { type ReviewSynthesis, type VoiceReview } from './synthesis';
 import { reviewJsonFromTrail } from './trail-io';
 
@@ -225,6 +227,9 @@ export interface ClaudeLayerOptions {
   // Whether the Opus voice runs as a third reviewer (roster.claude).
   includeClaudeReviewer: boolean;
   log?: (m: string) => void;
+  // The review PROFILE this run was invoked under. `code` (default) lets the worktree producer take
+  // the `/code-review` skill; `security` keeps its own security-auditor prompt (see producerPrompt).
+  profile?: ReviewProfile;
   // The exact packet prompt the core reviewers saw — the Opus reviewer sees it too.
   reviewPrompt: string;
   runId: string;
@@ -285,14 +290,27 @@ export async function runClaudeReviewLayer(
   // `/code-review` methodology over the whole project at `headSha`; without it, the cold peer
   // reviewer on the pinned packet, exactly as before. The spawn cwd — not a flag — is what grants
   // the whole-project read, so a worktree with no resolved base SHA still reads the tree.
-  const producerPrompt =
-    opts.worktree && opts.baseSha
+  //
+  // ONLY the `code` profile takes the `/code-review` skill. `security --repo` runs this same layer,
+  // and that skill hard-codes a structural-quality lens — swapping it in would silently drop the
+  // security-auditor objective while still counting the seat as a completed reviewer. A non-code
+  // profile therefore keeps its own pinned packet prompt and merely LEARNS about the worktree, so
+  // it reads the whole project under the objective it was actually asked for.
+  const isCodeProfile = (opts.profile ?? 'code') === 'code';
+  const producerPrompt = !opts.worktree
+    ? opts.reviewPrompt
+    : isCodeProfile && opts.baseSha
       ? renderCodeReviewSeatPrompt({
           baseSha: opts.baseSha,
           headSha: opts.expectedHeadSha,
           worktree: opts.worktree,
         })
-      : opts.reviewPrompt;
+      : opts.reviewPrompt +
+        worktreePromptSuffix({
+          baseSha: opts.baseSha ?? null,
+          headSha: opts.expectedHeadSha,
+          worktree: opts.worktree,
+        });
 
   let claudeReview: VoiceReview | null = null;
   if (opts.includeClaudeReviewer) {

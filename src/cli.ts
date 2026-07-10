@@ -1334,6 +1334,9 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
           : {}),
         includeClaudeReviewer: true,
         log: (m) => console.error(`· ${m}`),
+        // `security --repo` must NOT have its security-auditor prompt replaced by the
+        // `/code-review` skill's structural-quality lens (codex-f3).
+        profile,
         reviewPrompt: result.prompt,
         runId,
         // The Claude producer + the gate read the SAME worktree the core seats did (spec §3, §5).

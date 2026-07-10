@@ -946,6 +946,7 @@ var CODEX_SANDBOX_PROFILE = {
   id: "ensemble-review-codex",
   version: 1
 };
+var SANDBOX_WRITABLE_TMP = "/private/tmp";
 var SYSTEM_READ_ROOTS = [
   "/usr",
   "/bin",
@@ -1009,7 +1010,7 @@ function renderCodexSandboxProfile(p) {
 (allow file-read* (subpath ${JSON.stringify(p.nodePrefix)}))
 (allow file-read* (subpath ${JSON.stringify(p.worktree)}))
 (allow file-read* (subpath ${JSON.stringify(p.codexHome)}))
-(allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath "/private/tmp") (subpath "/dev"))
+(allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath ${JSON.stringify(SANDBOX_WRITABLE_TMP)}) (subpath "/dev"))
 (allow network-outbound (remote ip "*:443") (remote ip "*:53") (remote unix-socket))
 (allow network-inbound (local ip "*:*"))
 `;
@@ -1092,7 +1093,6 @@ function reviewOutFile() {
     `codex-review-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
   );
 }
-var SANDBOX_WRITABLE_TMP = "/private/tmp";
 function worktreeReplyFile() {
   const dir = fs7.mkdtempSync(path5.join(SANDBOX_WRITABLE_TMP, "ensemble-codex-"));
   fs7.chmodSync(dir, 448);
@@ -2895,6 +2895,7 @@ function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
 }
 
 // src/modes/review/worktree.ts
+var WORKTREE_LOCK_ERROR = "could not acquire the worktree lock";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
 }
@@ -2979,6 +2980,7 @@ var INERT_GIT_CONFIG = [
   "filter.lfs.required=false"
 ];
 var INERT_ENV = { GIT_LFS_SKIP_SMUDGE: "1" };
+var WORKTREE_PARENT_PREFIX = "ensemble-worktree-";
 function lockToken() {
   return `${process.pid}:${randomUUID()}`;
 }
@@ -3011,7 +3013,7 @@ function acquireRepoLock(gitCommonDir, opts = {}) {
     }
   }
   throw new Error(
-    `ensemble-ai: could not acquire the worktree lock at ${lock} after ${retries} attempts (${Math.round(retries * sleepMs / 1e3)}s) \u2014 another review is materializing a worktree in this repo`
+    `ensemble-ai: ${WORKTREE_LOCK_ERROR} at ${lock} after ${retries} attempts (${Math.round(retries * sleepMs / 1e3)}s) \u2014 another review is materializing a worktree in this repo`
   );
 }
 function materializeWorktree(args, deps) {
@@ -3039,8 +3041,9 @@ function materializeWorktree(args, deps) {
     if (!fetched.ok) {
       return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${location.fetchUrl} failed: ${fetched.error.trim()}` };
     }
-    dir = fs16.mkdtempSync(path13.join(args.worktreeRoot ?? os9.tmpdir(), "ensemble-worktree-"));
-    fs16.rmSync(dir, { recursive: true, force: true });
+    const parent = fs16.mkdtempSync(path13.join(args.worktreeRoot ?? os9.tmpdir(), WORKTREE_PARENT_PREFIX));
+    fs16.chmodSync(parent, 448);
+    dir = path13.join(parent, "head");
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", "--no-recurse-submodules", dir, args.headSha],
       { cwd: location.repoRoot, env: INERT_ENV }
@@ -3074,6 +3077,13 @@ function reapWorktree(repoRoot, dir, deps) {
   }
   try {
     fs16.rmSync(dir, { force: true, recursive: true });
+  } catch {
+  }
+  try {
+    const parent = path13.dirname(dir);
+    if (path13.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
+      fs16.rmSync(parent, { force: true, recursive: true });
+    }
   } catch {
   }
   try {
@@ -4332,6 +4342,7 @@ export {
   REVIEW_ADAPTERS,
   REVIEW_PROFILES,
   REVIEW_TIMEOUT_MS,
+  SANDBOX_WRITABLE_TMP,
   SECURITY_CLASSES,
   SECURITY_OBJECTIVE,
   SEVERITIES,
@@ -4345,6 +4356,7 @@ export {
   VOICE_ADAPTERS,
   VOICE_DEFAULTS,
   VOICE_IDS,
+  WORKTREE_LOCK_ERROR,
   acquireDiff,
   acquireRepoLock,
   allowedRootsFromConfig,

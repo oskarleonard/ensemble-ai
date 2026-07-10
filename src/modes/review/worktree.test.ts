@@ -10,6 +10,7 @@ import {
   type GitRun,
   isPreflightError,
   materializeWorktree,
+  reapWorktree,
   remoteSlug,
   resolveRepoLocation,
   rootAllowed,
@@ -249,6 +250,36 @@ describe('materialization hardening — untrusted content is checked out INERT',
     // reaped: worktree remove + prune both ran
     expect(calls.some((c) => c.includes('remove'))).toBe(true);
     expect(calls.some((c) => c.includes('prune'))).toBe(true);
+  });
+
+  // `git worktree add` creates its directory with the process umask — 0755 under the common 022.
+  // Directly inside a shared temp root (Linux `/tmp`, mode 1777) that publishes the PRIVATE source
+  // of the PR under review to every other local user. The tree must sit inside an owner-only parent.
+  it('nests the worktree inside an owner-only (0700) parent, and never pre-creates the tree path', () => {
+    const { calls, git } = harness(headSha);
+    const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git, lock: noLock });
+    expect(isPreflightError(res)).toBe(false);
+    const dir = (res as { dir: string }).dir;
+    const parent = path.dirname(dir);
+    expect(path.basename(parent).startsWith('ensemble-worktree-')).toBe(true);
+    expect(fs.statSync(parent).mode & 0o777).toBe(0o700);
+    // git is handed a path that does NOT exist — it creates it. No delete-then-recreate race.
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(calls.find((c) => c.includes('worktree') && c.includes('add'))).toContain(dir);
+    reapWorktree('/repo', dir, { git });
+    expect(fs.existsSync(parent)).toBe(false); // the parent is reaped too, not leaked
+  });
+
+  // The name check is the whole safety of reaping a parent: hand reap an unrelated directory and
+  // it must not walk up and delete that directory's parent.
+  it('reapWorktree removes a parent ONLY when the parent is one of ours', () => {
+    const { git } = harness(headSha);
+    const outsider = fs.mkdtempSync(path.join(os.tmpdir(), 'not-ours-'));
+    const child = path.join(outsider, 'child');
+    fs.mkdirSync(child);
+    reapWorktree('/repo', child, { git });
+    expect(fs.existsSync(outsider)).toBe(true); // parent survived
+    fs.rmSync(outsider, { force: true, recursive: true });
   });
 
   it('a fetch failure maps to the taxonomy and never proceeds to worktree add', () => {

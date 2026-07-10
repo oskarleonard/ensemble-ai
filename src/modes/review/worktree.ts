@@ -33,11 +33,22 @@ export type GitRun = (
 export type PreflightErrorKind =
   | 'auth'
   | 'disallowed-root'
+  // A sibling review held the per-repo worktree lock past the staleness TTL. Retryable, and NOT a
+  // security claim — distinct from `network` so the operator can tell "another review is running"
+  // from "GitHub is unreachable".
+  | 'lock-contended'
+  // The local materialization step itself blew up (a full or read-only temp root, a chmod refusal)
+  // — not git, not the network, not the repo's identity.
+  | 'materialize-failed'
   | 'network'
   | 'no-such-pr'
   | 'not-a-repo'
   | 'sha-mismatch'
   | 'wrong-repo';
+
+// The lock-timeout message `acquireRepoLock` throws. Exported so `openWorktree` can tell that
+// distinct, retryable cause apart from any other throw, instead of collapsing both into one.
+export const WORKTREE_LOCK_ERROR = 'could not acquire the worktree lock';
 
 export interface PreflightError {
   kind: PreflightErrorKind;
@@ -177,6 +188,17 @@ const INERT_GIT_CONFIG = [
 
 const INERT_ENV = { GIT_LFS_SKIP_SMUDGE: '1' };
 
+// The owner-only (0700) directory the worktree is created INSIDE. `git worktree add` creates its
+// own directory with the process umask — commonly 0755 — so a worktree placed directly in a shared
+// `os.tmpdir()` (`/tmp` on Linux, mode 1777) would publish the PRIVATE source of the PR under
+// review to every other local user. Nesting it under a 0700 parent means no one else can traverse
+// in, whatever mode git picks for the child. It also removes the create-delete-recreate race: the
+// child path never exists before git makes it, inside a directory only we can write.
+//
+// The prefix is load-bearing: `reapWorktree` removes a parent ONLY when it carries this name, so a
+// caller that passes an arbitrary directory can never make the reap delete that directory's parent.
+const WORKTREE_PARENT_PREFIX = 'ensemble-worktree-';
+
 export interface Worktree {
   dir: string;
   headSha: string;
@@ -238,7 +260,7 @@ export function acquireRepoLock(
     }
   }
   throw new Error(
-    `ensemble-ai: could not acquire the worktree lock at ${lock} after ${retries} attempts (${Math.round((retries * sleepMs) / 1000)}s) — another review is materializing a worktree in this repo`
+    `ensemble-ai: ${WORKTREE_LOCK_ERROR} at ${lock} after ${retries} attempts (${Math.round((retries * sleepMs) / 1000)}s) — another review is materializing a worktree in this repo`
   );
 }
 
@@ -278,8 +300,12 @@ export function materializeWorktree(
     // Materialize by SHA, not FETCH_HEAD: the fetch proved the object exists locally, and
     // checking out the receipt's own headSha removes any window where FETCH_HEAD could have
     // been rewritten by a concurrent fetch in the shared .git.
-    dir = fs.mkdtempSync(path.join(args.worktreeRoot ?? os.tmpdir(), 'ensemble-worktree-'));
-    fs.rmSync(dir, { recursive: true, force: true }); // git wants to create it itself
+    //
+    // git creates the worktree dir itself, so we hand it a path that does not exist yet — INSIDE
+    // an owner-only parent, never directly in a shared temp root (see WORKTREE_PARENT_PREFIX).
+    const parent = fs.mkdtempSync(path.join(args.worktreeRoot ?? os.tmpdir(), WORKTREE_PARENT_PREFIX));
+    fs.chmodSync(parent, 0o700); // mkdtemp already promises 0700 — assert it, don't assume
+    dir = path.join(parent, 'head');
     const added = deps.git(
       [...INERT_GIT_CONFIG, 'worktree', 'add', '--detach', '--no-recurse-submodules', dir, args.headSha],
       { cwd: location.repoRoot, env: INERT_ENV }
@@ -319,6 +345,17 @@ export function reapWorktree(repoRoot: string, dir: string, deps: { git: GitRun 
   }
   try {
     fs.rmSync(dir, { force: true, recursive: true });
+  } catch {
+    /* best-effort */
+  }
+  // The worktree lives inside the owner-only parent materializeWorktree created. Reap it too, or
+  // every run leaks an empty 0700 dir. NAME-CHECKED: a caller that hands us some other directory
+  // must never be able to make us delete that directory's parent.
+  try {
+    const parent = path.dirname(dir);
+    if (path.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
+      fs.rmSync(parent, { force: true, recursive: true });
+    }
   } catch {
     /* best-effort */
   }

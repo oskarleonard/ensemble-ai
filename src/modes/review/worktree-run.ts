@@ -7,6 +7,8 @@ import {
   type PreflightError,
   reapWorktree,
   resolveRepoLocation,
+  WORKTREE_LOCK_ERROR,
+  type Worktree,
 } from './worktree';
 
 // THE RUN-LEVEL WORKTREE LIFECYCLE — pre-flight, materialize, reap (spec §1, §9). One worktree per
@@ -44,11 +46,15 @@ export interface OpenWorktreeArgs {
 }
 
 // Fails CLOSED into the named taxonomy: `not-a-repo` · `disallowed-root` · `wrong-repo` ·
-// `no-such-pr` · `auth` · `network` · `sha-mismatch`. Never throws, never partially succeeds — a
-// failed materialization has already reaped whatever it created.
+// `no-such-pr` · `auth` · `network` · `sha-mismatch` · `lock-contended` · `materialize-failed`.
+// Never throws, never partially succeeds — a failed materialization has already reaped whatever it
+// created.
 export function openWorktree(
   args: OpenWorktreeArgs,
-  deps: { git?: GitRun } = {}
+  // `lock` is injected exactly as materializeWorktree injects it — the default IS the per-repo
+  // O_EXCL lock. A test needs the seam to prove the contended path returns a NAMED cause instead
+  // of throwing (the real lock only gives up after its 10-minute staleness TTL).
+  deps: { git?: GitRun; lock?: (gitCommonDir: string) => () => void } = {}
 ): PreflightError | WorktreeSession {
   const git = deps.git ?? execGit();
   const location = resolveRepoLocation(
@@ -57,10 +63,25 @@ export function openWorktree(
   );
   if (isPreflightError(location)) return location;
 
-  const made = materializeWorktree(
-    { headSha: args.headSha, location, pr: args.pr },
-    { git }
-  );
+  // `materializeWorktree` RETURNS its git failures, but it can still THROW: `acquireRepoLock` gives
+  // up with an Error when a sibling review holds the repo lock past the staleness TTL, and the
+  // mkdtemp/chmod of the worktree parent can fail on a full or read-only temp root. The caller
+  // (cli.ts) opens the worktree BEFORE the try/finally that reaps it, and turns a PreflightError
+  // into a legible exit 3 — a throw here would instead escape as a stack trace and a bare exit 1.
+  // So the "never throws" contract above is enforced, not merely asserted.
+  let made: PreflightError | Worktree;
+  try {
+    made = materializeWorktree(
+      { headSha: args.headSha, location, pr: args.pr },
+      { git, ...(deps.lock ? { lock: deps.lock } : {}) }
+    );
+  } catch (e) {
+    const message = (e as Error).message;
+    return {
+      kind: message.includes(WORKTREE_LOCK_ERROR) ? 'lock-contended' : 'materialize-failed',
+      message,
+    };
+  }
   if (isPreflightError(made)) return made;
 
   let reaped = false;

@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import path from 'node:path';
 
 import type { GitRun } from './worktree';
 
@@ -21,16 +22,30 @@ import type { GitRun } from './worktree';
 // prompts for a key passphrase on `/dev/tty` all by itself; the run would then wedge until the
 // GIT_TIMEOUT_MS backstop fires, minutes later, for what is really an auth failure. `BatchMode=yes`
 // makes ssh fail immediately instead, and its stderr ("Permission denied (publickey)") classifies
-// as `auth` like every other credential failure. The user's own GIT_SSH_COMMAND is PRESERVED (a
-// custom key/host config is theirs, not ours to drop) — we only append the non-interactive flag.
-const SSH_COMMAND = `${process.env.GIT_SSH_COMMAND?.trim() || 'ssh'} -o BatchMode=yes`;
+// as `auth` like every other credential failure.
+//
+// We only ever extend a PLAIN `ssh` invocation. git runs GIT_SSH_COMMAND through `sh -c`, so a
+// user whose value is a wrapper script or an alternate binary (a VPN helper, a custom agent) would
+// receive `-o BatchMode=yes` as ITS argv — which it may reject outright, turning a hypothetical
+// passphrase prompt into a guaranteed failed fetch. Their command is theirs; leave it exactly as
+// they set it, and accept that they own the interactivity of their own tooling.
+export function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND): string | null {
+  const cmd = configured?.trim();
+  if (!cmd) return 'ssh -o BatchMode=yes';
+  const bin = path.basename(cmd.split(/\s+/)[0]);
+  return bin === 'ssh' ? `${cmd} -o BatchMode=yes` : null;
+}
 
-const NON_INTERACTIVE = {
-  GIT_ASKPASS: '',
-  GIT_SSH_COMMAND: SSH_COMMAND,
-  GIT_TERMINAL_PROMPT: '0',
-  SSH_ASKPASS: '',
-};
+function nonInteractiveEnv(): Record<string, string> {
+  const ssh = nonInteractiveSshCommand();
+  return {
+    GIT_ASKPASS: '',
+    GIT_TERMINAL_PROMPT: '0',
+    SSH_ASKPASS: '',
+    // Absent ⇒ git inherits the user's own GIT_SSH_COMMAND from process.env, untouched.
+    ...(ssh ? { GIT_SSH_COMMAND: ssh } : {}),
+  };
+}
 
 // A cold `fetch` of a large repo's PR head is genuinely slow, so the bound is generous — but it IS
 // bounded: an unbounded git call would wedge the run exactly the way the reviewer watchdog exists
@@ -44,7 +59,7 @@ export function execGit(): GitRun {
       const text = execFileSync('git', args, {
         cwd: opts?.cwd,
         encoding: 'utf8',
-        env: { ...process.env, ...NON_INTERACTIVE, ...(opts?.env ?? {}) },
+        env: { ...process.env, ...nonInteractiveEnv(), ...(opts?.env ?? {}) },
         maxBuffer: GIT_MAX_BUFFER,
         timeout: GIT_TIMEOUT_MS,
       });

@@ -139,4 +139,29 @@ describe('openWorktree — the pre-flight fails CLOSED, with a named cause', () 
     expect(calls.some((c) => c.includes('remove'))).toBe(true);
     expect(calls.some((c) => c.includes('prune'))).toBe(true);
   });
+
+  // `acquireRepoLock` THROWS when a sibling review holds the repo lock past its staleness TTL, and
+  // mkdtemp can throw on a full temp root. openWorktree promises the CLI a named cause on every
+  // failure — the CLI opens the worktree before its try/finally, so a throw escapes as a stack
+  // trace and a bare exit 1 rather than the documented exit 3.
+  it('`lock-contended` / `materialize-failed`: a THROW becomes a named cause, never a stack trace', () => {
+    const { git } = happyGit();
+    const throwing = (message: string) => (): (() => void) => {
+      throw new Error(message);
+    };
+
+    const contended = openWorktree(
+      { baseSha: BASE, headSha: HEAD, pr: 7, prSlug: 'o/r', repoPath: repoRoot },
+      { git, lock: throwing('ensemble-ai: could not acquire the worktree lock at /x after 1200 attempts') }
+    );
+    expect(isPreflightError(contended) && contended.kind).toBe('lock-contended');
+    expect(isPreflightError(contended) && contended.message).toMatch(/another review|worktree lock/);
+
+    const broken = openWorktree(
+      { baseSha: BASE, headSha: HEAD, pr: 7, prSlug: 'o/r', repoPath: repoRoot },
+      { git, lock: throwing('ENOSPC: no space left on device') }
+    );
+    expect(isPreflightError(broken) && broken.kind).toBe('materialize-failed');
+    expect(isPreflightError(broken) && broken.message).toMatch(/ENOSPC/);
+  });
 });

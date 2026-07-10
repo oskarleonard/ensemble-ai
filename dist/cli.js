@@ -5,7 +5,7 @@ import { execFileSync as execFileSync4 } from "child_process";
 import crypto2 from "crypto";
 import fs19 from "fs";
 import os10 from "os";
-import path14 from "path";
+import path15 from "path";
 import { parseArgs } from "util";
 
 // src/core/artifacts.ts
@@ -919,6 +919,7 @@ var CODEX_SANDBOX_PROFILE = {
   id: "ensemble-review-codex",
   version: 1
 };
+var SANDBOX_WRITABLE_TMP = "/private/tmp";
 var SYSTEM_READ_ROOTS = [
   "/usr",
   "/bin",
@@ -982,7 +983,7 @@ function renderCodexSandboxProfile(p) {
 (allow file-read* (subpath ${JSON.stringify(p.nodePrefix)}))
 (allow file-read* (subpath ${JSON.stringify(p.worktree)}))
 (allow file-read* (subpath ${JSON.stringify(p.codexHome)}))
-(allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath "/private/tmp") (subpath "/dev"))
+(allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath ${JSON.stringify(SANDBOX_WRITABLE_TMP)}) (subpath "/dev"))
 (allow network-outbound (remote ip "*:443") (remote ip "*:53") (remote unix-socket))
 (allow network-inbound (local ip "*:*"))
 `;
@@ -1065,7 +1066,6 @@ function reviewOutFile() {
     `codex-review-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
   );
 }
-var SANDBOX_WRITABLE_TMP = "/private/tmp";
 function worktreeReplyFile() {
   const dir = fs8.mkdtempSync(path5.join(SANDBOX_WRITABLE_TMP, "ensemble-codex-"));
   fs8.chmodSync(dir, 448);
@@ -2229,9 +2229,9 @@ var GENERATED_PATTERNS = [
   /\.(js|css)\.map$/,
   /\.snap$/
 ];
-function classifyFileKind(path15, isBinary) {
+function classifyFileKind(path16, isBinary) {
   if (isBinary) return "binary";
-  return GENERATED_PATTERNS.some((re) => re.test(path15)) ? "generated" : "source";
+  return GENERATED_PATTERNS.some((re) => re.test(path16)) ? "generated" : "source";
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -2249,7 +2249,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path15 = pathOfSection(section2);
+    const path16 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -2260,8 +2260,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path15, isBinary),
-      path: path15,
+      kind: classifyFileKind(path16, isBinary),
+      path: path16,
       raw: section2,
       removed
     };
@@ -4845,11 +4845,16 @@ async function runClaudeReviewLayer(opts) {
   });
   const run = opts.run ?? runClaudeReviewVoice;
   const modelLabel = claudeModelLabel(opts.claudeConfig);
-  const producerPrompt = opts.worktree && opts.baseSha ? renderCodeReviewSeatPrompt({
+  const isCodeProfile = (opts.profile ?? "code") === "code";
+  const producerPrompt = !opts.worktree ? opts.reviewPrompt : isCodeProfile && opts.baseSha ? renderCodeReviewSeatPrompt({
     baseSha: opts.baseSha,
     headSha: opts.expectedHeadSha,
     worktree: opts.worktree
-  }) : opts.reviewPrompt;
+  }) : opts.reviewPrompt + worktreePromptSuffix({
+    baseSha: opts.baseSha ?? null,
+    headSha: opts.expectedHeadSha,
+    worktree: opts.worktree
+  });
   let claudeReview = null;
   if (opts.includeClaudeReviewer) {
     log(
@@ -5172,6 +5177,7 @@ function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
 }
 
 // src/modes/review/worktree.ts
+var WORKTREE_LOCK_ERROR = "could not acquire the worktree lock";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
 }
@@ -5256,6 +5262,7 @@ var INERT_GIT_CONFIG = [
   "filter.lfs.required=false"
 ];
 var INERT_ENV = { GIT_LFS_SKIP_SMUDGE: "1" };
+var WORKTREE_PARENT_PREFIX = "ensemble-worktree-";
 function lockToken() {
   return `${process.pid}:${randomUUID()}`;
 }
@@ -5288,7 +5295,7 @@ function acquireRepoLock(gitCommonDir, opts = {}) {
     }
   }
   throw new Error(
-    `ensemble-ai: could not acquire the worktree lock at ${lock} after ${retries} attempts (${Math.round(retries * sleepMs / 1e3)}s) \u2014 another review is materializing a worktree in this repo`
+    `ensemble-ai: ${WORKTREE_LOCK_ERROR} at ${lock} after ${retries} attempts (${Math.round(retries * sleepMs / 1e3)}s) \u2014 another review is materializing a worktree in this repo`
   );
 }
 function materializeWorktree(args, deps) {
@@ -5316,8 +5323,9 @@ function materializeWorktree(args, deps) {
     if (!fetched.ok) {
       return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${location.fetchUrl} failed: ${fetched.error.trim()}` };
     }
-    dir = fs18.mkdtempSync(path13.join(args.worktreeRoot ?? os9.tmpdir(), "ensemble-worktree-"));
-    fs18.rmSync(dir, { recursive: true, force: true });
+    const parent = fs18.mkdtempSync(path13.join(args.worktreeRoot ?? os9.tmpdir(), WORKTREE_PARENT_PREFIX));
+    fs18.chmodSync(parent, 448);
+    dir = path13.join(parent, "head");
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", "--no-recurse-submodules", dir, args.headSha],
       { cwd: location.repoRoot, env: INERT_ENV }
@@ -5354,6 +5362,13 @@ function reapWorktree(repoRoot, dir, deps) {
   } catch {
   }
   try {
+    const parent = path13.dirname(dir);
+    if (path13.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
+      fs18.rmSync(parent, { force: true, recursive: true });
+    }
+  } catch {
+  }
+  try {
     deps.git([...INERT_GIT_CONFIG, "worktree", "prune"], { cwd: repoRoot });
   } catch {
   }
@@ -5361,13 +5376,23 @@ function reapWorktree(repoRoot, dir, deps) {
 
 // src/modes/review/git-exec.ts
 import { execFileSync as execFileSync3 } from "child_process";
-var SSH_COMMAND = `${process.env.GIT_SSH_COMMAND?.trim() || "ssh"} -o BatchMode=yes`;
-var NON_INTERACTIVE = {
-  GIT_ASKPASS: "",
-  GIT_SSH_COMMAND: SSH_COMMAND,
-  GIT_TERMINAL_PROMPT: "0",
-  SSH_ASKPASS: ""
-};
+import path14 from "path";
+function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
+  const cmd = configured?.trim();
+  if (!cmd) return "ssh -o BatchMode=yes";
+  const bin = path14.basename(cmd.split(/\s+/)[0]);
+  return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
+}
+function nonInteractiveEnv() {
+  const ssh = nonInteractiveSshCommand();
+  return {
+    GIT_ASKPASS: "",
+    GIT_TERMINAL_PROMPT: "0",
+    SSH_ASKPASS: "",
+    // Absent ⇒ git inherits the user's own GIT_SSH_COMMAND from process.env, untouched.
+    ...ssh ? { GIT_SSH_COMMAND: ssh } : {}
+  };
+}
 var GIT_TIMEOUT_MS = 6e5;
 var GIT_MAX_BUFFER = 64 * 1024 * 1024;
 function execGit() {
@@ -5376,7 +5401,7 @@ function execGit() {
       const text = execFileSync3("git", args, {
         cwd: opts?.cwd,
         encoding: "utf8",
-        env: { ...process.env, ...NON_INTERACTIVE, ...opts?.env ?? {} },
+        env: { ...process.env, ...nonInteractiveEnv(), ...opts?.env ?? {} },
         maxBuffer: GIT_MAX_BUFFER,
         timeout: GIT_TIMEOUT_MS
       });
@@ -5397,10 +5422,19 @@ function openWorktree(args, deps = {}) {
     { git: git2 }
   );
   if (isPreflightError(location)) return location;
-  const made = materializeWorktree(
-    { headSha: args.headSha, location, pr: args.pr },
-    { git: git2 }
-  );
+  let made;
+  try {
+    made = materializeWorktree(
+      { headSha: args.headSha, location, pr: args.pr },
+      { git: git2, ...deps.lock ? { lock: deps.lock } : {} }
+    );
+  } catch (e) {
+    const message = e.message;
+    return {
+      kind: message.includes(WORKTREE_LOCK_ERROR) ? "lock-contended" : "materialize-failed",
+      message
+    };
+  }
   if (isPreflightError(made)) return made;
   let reaped = false;
   return {
@@ -6293,7 +6327,7 @@ function clearReusedRunTrail(baseDir, trailDir) {
   } catch {
     return;
   }
-  const rel = path14.relative(realBase, realTarget);
+  const rel = path15.relative(realBase, realTarget);
   if (!rel || escapesRoot(rel)) {
     return;
   }
@@ -6339,9 +6373,9 @@ function gitToplevel(cwd) {
 }
 function resolveTrailBase(gitRoot, localRepoTrail) {
   if (gitRoot && localRepoTrail) {
-    return path14.join(gitRoot, ".ensemble-ai", "reviews");
+    return path15.join(gitRoot, ".ensemble-ai", "reviews");
   }
-  return path14.join(os10.tmpdir(), "ensemble-ai", "reviews");
+  return path15.join(os10.tmpdir(), "ensemble-ai", "reviews");
 }
 function ghConventionReader(repoSlug, ref, cwd) {
   const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
@@ -6768,7 +6802,7 @@ async function reviewCommand(args, profile = "code") {
     console.log(usage);
     return 0;
   }
-  const cwd = values.cwd ? path14.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path15.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
   const postComment = Boolean(values["post-comment"]);
@@ -6841,7 +6875,7 @@ async function runReviewPipeline(input) {
   }
   const reviewers = requestedReviewers === void 0 ? void 0 : roster.core;
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-  const out = typeof values.out === "string" ? path14.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+  const out = typeof values.out === "string" ? path15.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
   clearReusedRunTrail(out, trailDir);
   const ceiling = positiveCeiling(
@@ -6928,6 +6962,9 @@ async function runReviewPipeline(input) {
         } : {},
         includeClaudeReviewer: true,
         log: (m) => console.error(`\xB7 ${m}`),
+        // `security --repo` must NOT have its security-auditor prompt replaced by the
+        // `/code-review` skill's structural-quality lens (codex-f3).
+        profile,
         reviewPrompt: result.prompt,
         runId,
         // The Claude producer + the gate read the SAME worktree the core seats did (spec §3, §5).
@@ -7021,7 +7058,7 @@ async function runReviewPipeline(input) {
     const first = result.reviews[0];
     const pinnedReviewerId = first.reviewerId ?? first.reviewer.vendor;
     console.log(
-      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path14.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
+      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path15.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
   }
   if (claudeLayer) {
@@ -7253,10 +7290,10 @@ async function brainstormCommand(args) {
     console.error(BRAINSTORM_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path14.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path15.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path14.resolve(cwd, values.file);
+    const filePath = path15.resolve(cwd, values.file);
     try {
       const bytes = fs19.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
@@ -7458,10 +7495,10 @@ async function consultCommand(args) {
     console.error(CONSULT_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path14.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path15.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path14.resolve(cwd, values.file);
+    const filePath = path15.resolve(cwd, values.file);
     try {
       const bytes = fs19.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
@@ -7652,7 +7689,7 @@ async function receiptCommand(args) {
     console.log(RECEIPT_USAGE);
     return 0;
   }
-  const receiptPathArg = typeof positionals[0] === "string" ? path14.resolve(positionals[0]) : void 0;
+  const receiptPathArg = typeof positionals[0] === "string" ? path15.resolve(positionals[0]) : void 0;
   const readReceiptFile = (p) => {
     let raw;
     try {
@@ -7696,8 +7733,8 @@ async function receiptCommand(args) {
     console.error(`ensemble-ai receipt ${sub}: choose at most one of --repo / --cwd (both name the repo to verify)`);
     return 3;
   }
-  const repoLocation = typeof values.repo === "string" ? path14.resolve(values.repo) : void 0;
-  const cwd = repoLocation ?? (values.cwd ? path14.resolve(String(values.cwd)) : process.cwd());
+  const repoLocation = typeof values.repo === "string" ? path15.resolve(values.repo) : void 0;
+  const cwd = repoLocation ?? (values.cwd ? path15.resolve(String(values.cwd)) : process.cwd());
   const intendedEvidence = repoLocation ? Object.fromEntries(required.map((id) => [id, "worktree"])) : void 0;
   const acceptDegraded = Boolean(values["accept-degraded"]);
   if (acceptDegraded && !intendedEvidence) {
@@ -7736,7 +7773,7 @@ async function receiptCommand(args) {
     }),
     repo: acquired.repoId
   };
-  const store = values.store ? path14.resolve(String(values.store)) : defaultReceiptStore();
+  const store = values.store ? path15.resolve(String(values.store)) : defaultReceiptStore();
   if (sub === "show") {
     const receipt = readReceipt(store, key);
     if (!receipt) {
@@ -7772,7 +7809,7 @@ async function receiptCommand(args) {
     // with isDiffReviewed so a digest-only drift still reports `stale`.
     readReceipt: receiptPathArg ? (k) => explicit && receiptIdentityMatches(explicit, k) ? explicit : null : (k) => readReceipt(store, k),
     strict: Boolean(values.strict || values["require-artifacts"]),
-    trailDir: typeof values.trail === "string" ? path14.resolve(values.trail) : void 0
+    trailDir: typeof values.trail === "string" ? path15.resolve(values.trail) : void 0
   };
   const state = verifyReceipt({ coverage: acquired.coverage, key, required }, verifyDeps);
   console.log(formatVerify(state, key));
@@ -7820,8 +7857,8 @@ async function reviewersCommand(args) {
     console.log(REVIEWERS_USAGE);
     return 0;
   }
-  const reviewersFile = typeof values["reviewers-file"] === "string" ? path14.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
-  const voicesFile = typeof values["voices-file"] === "string" ? path14.resolve(values["voices-file"]) : VOICES_FILE;
+  const reviewersFile = typeof values["reviewers-file"] === "string" ? path15.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
+  const voicesFile = typeof values["voices-file"] === "string" ? path15.resolve(values["voices-file"]) : VOICES_FILE;
   const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`\xB7 ${m}`));
   const view = {
     gate: {
@@ -7924,7 +7961,7 @@ async function diffCommand(args) {
     "diff"
   );
   if (typeof ceiling === "object") return ceiling.code;
-  const cwd = values.cwd ? path14.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path15.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
   let acquired;
@@ -8026,7 +8063,7 @@ async function pushFenceCommand(args) {
     );
     return 3;
   }
-  const cwd = values.cwd ? path14.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path15.resolve(String(values.cwd)) : process.cwd();
   const gh = ghRunner(cwd);
   const scope = selection.owner && selection.repo ? ["-R", `${selection.owner}/${selection.repo}`] : [];
   const view = gh([
