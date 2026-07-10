@@ -1151,7 +1151,6 @@ async function reviewCommand(
               holistic: {
                 baseSha: result.acquired.baseSha,
                 config: loadHolisticSeat(VOICES_FILE, (m) => console.error(`· ${m}`)),
-                requested: true,
               },
             }
           : {}),
@@ -2163,10 +2162,6 @@ Options:
   --base <ref>          base ref for the default (commit) mode
   --profile <p>         packet profile: code (default) | security
   --reviewers <ids>     reviewers to size the cost preview against (default: all)
-  --holistic            add the HOLISTIC/architecture lens: one Anthropic seat that reads the
-                        WHOLE project (reinvented patterns, convention drift, simplifiable
-                        design). Default OFF. REQUIRES worktree evidence — with none it does
-                        not run and says so; it never reviews on the packet.
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --ceiling <bytes>     coverage byte ceiling (default 200000)

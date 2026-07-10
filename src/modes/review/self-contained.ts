@@ -109,33 +109,21 @@ export function renderReviewMarkdown(v: VoiceReview): string {
   return `${lines.join('\n')}\n`;
 }
 
-// Persist the cold Opus review to the trail with parity to codex/grok's persistReview
-// artifacts — findings.claude.json + claude-review.raw.md + review.claude.json (a
-// VoiceReview so it round-trips) — so the synthesizer can READ all three reviewers from
-// disk. `claude` is not a core ReviewerId (it mints no receipt), so this is a dedicated
-// writer rather than persistReview.
-export function persistClaudeReview(
+// Persist ONE Anthropic seat's review to the trail with parity to codex/grok's persistReview
+// artifacts — findings.<id>.json + <id>-review.raw.md + review.<id>.json (a VoiceReview so it
+// round-trips) — so the gate can READ every reviewer from disk. Neither `claude` nor the holistic
+// lens is a core ReviewerId (they mint no receipt), so this is a dedicated writer rather than
+// persistReview.
+export function persistSeatReview(
   baseDir: string,
   runId: string,
+  seatId: string,
   review: VoiceReview,
   raw: string | null
 ): void {
-  writeTrailFile(baseDir, runId, 'findings.claude.json', JSON.stringify(review.findings, null, 2));
-  if (raw !== null) writeTrailFile(baseDir, runId, 'claude-review.raw.md', raw);
-  writeTrailFile(baseDir, runId, 'review.claude.json', JSON.stringify(review, null, 2));
-}
-
-// The holistic lens's trail artifacts, in parity with the claude reviewer's — so the gate reads it
-// from disk like every other voice, and a reader can audit what the lens actually said.
-export function persistHolisticReview(
-  baseDir: string,
-  runId: string,
-  review: VoiceReview,
-  raw: string | null
-): void {
-  writeTrailFile(baseDir, runId, `findings.${HOLISTIC_SEAT_ID}.json`, JSON.stringify(review.findings, null, 2));
-  if (raw !== null) writeTrailFile(baseDir, runId, `${HOLISTIC_SEAT_ID}-review.raw.md`, raw);
-  writeTrailFile(baseDir, runId, `review.${HOLISTIC_SEAT_ID}.json`, JSON.stringify(review, null, 2));
+  writeTrailFile(baseDir, runId, `findings.${seatId}.json`, JSON.stringify(review.findings, null, 2));
+  if (raw !== null) writeTrailFile(baseDir, runId, `${seatId}-review.raw.md`, raw);
+  writeTrailFile(baseDir, runId, `review.${seatId}.json`, JSON.stringify(review, null, 2));
 }
 
 // Load every reviewer's review BACK from the trail files (codex/grok via readReviewsForRun,
@@ -213,8 +201,9 @@ export interface ClaudeLayerOptions {
   conventionPaths?: readonly string[];
   // THE HOLISTIC LENS (spec §4) — DEFAULT OFF. Omit it and nothing changes: no seat is spawned, no
   // finding enters the gate, no clause enters the gate prompt, the records are the same objects.
-  // `requested` without `worktree` is a LOUD skip (holisticSkipped), never a packet-evidence run.
-  holistic?: { baseSha: string | null; config: VoiceConfig; requested: boolean };
+  // Its PRESENCE is the request; present without `worktree` is a LOUD skip (holisticSkipped),
+  // never a packet-evidence run.
+  holistic?: { baseSha: string | null; config: VoiceConfig };
   // The GATE (synthesis) seat — its own model/effort, independent of the `claude` REVIEWER above
   // ("reviewer = Opus @ high, gate = Fable @ max"). Always a `claude -p` spawn (only model/effort
   // differ). Omitted ⇒ inherits `claudeConfig` (the pre-Phase-3 behavior — one seat for both).
@@ -295,7 +284,7 @@ export async function runClaudeReviewLayer(
     // gate treats claude as an INCOMPLETE reviewer (fail-loud), matching a failed core
     // reviewer, instead of exit 0 as if 3 reviewers reviewed. It never crashes the review.
     try {
-      persistClaudeReview(opts.baseDir, opts.runId, review, raw);
+      persistSeatReview(opts.baseDir, opts.runId, 'claude', review, raw);
     } catch (e) {
       const why = (e as Error).message;
       log(`  · claude: trail persist FAILED (${why}) — reviewer counted INCOMPLETE`);
@@ -330,19 +319,20 @@ export async function runClaudeReviewLayer(
   // requested-but-unavailable lens says so out loud rather than degrading to a packet-evidence
   // architecture claim. Its persist is the same fail-loud contract as the claude reviewer's: a
   // review the trail did not take is not a review, because the gate reads voices off disk.
+  const holistic = opts.holistic;
   const plan: HolisticPlan = resolveHolisticPlan({
-    baseSha: opts.holistic?.baseSha,
-    requested: Boolean(opts.holistic?.requested),
+    baseSha: holistic?.baseSha,
+    requested: Boolean(holistic),
     worktree: opts.worktree,
   });
   let holisticReview: VoiceReview | null = null;
   if (!plan.run) {
     if (plan.skipReason) log(`  · ${plan.skipReason}`);
-  } else if (opts.holistic) {
-    log(`  · holistic lens (anthropic/${opts.holistic.config.model} @ ${opts.holistic.config.effort}) reading the whole project…`);
+  } else if (holistic) {
+    log(`  · holistic lens (anthropic/${holistic.config.model} @ ${holistic.config.effort}) reading the whole project…`);
     const { raw, review } = await runHolisticLens({
       baseSha: plan.baseSha,
-      config: opts.holistic.config,
+      config: holistic.config,
       headSha: opts.expectedHeadSha,
       log,
       run,
@@ -351,7 +341,7 @@ export async function runClaudeReviewLayer(
     });
     holisticReview = review;
     try {
-      persistHolisticReview(opts.baseDir, opts.runId, review, raw);
+      persistSeatReview(opts.baseDir, opts.runId, HOLISTIC_SEAT_ID, review, raw);
       writeTrailFile(opts.baseDir, opts.runId, `review.${HOLISTIC_SEAT_ID}.md`, renderReviewMarkdown(review));
     } catch (e) {
       const why = (e as Error).message;

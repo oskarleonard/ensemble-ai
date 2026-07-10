@@ -1943,17 +1943,16 @@ function parseConventionCitation(v) {
   const quote = nonEmptyStr2(e.quote, MAX_QUOTE_CHARS);
   return file && line && quote ? { file, line, quote } : void 0;
 }
-function worktreeReader(worktreeDir, opts = {}) {
+function worktreeReader(worktreeDir) {
   let root;
   try {
     root = fs12.realpathSync(path10.resolve(worktreeDir));
   } catch {
     return () => null;
   }
-  const maxBytes = opts.maxBytes ?? MAX_FILE_BYTES;
   const inside = (p) => {
     const rel = path10.relative(root, p);
-    return rel !== "" && !rel.startsWith("..") && !path10.isAbsolute(rel);
+    return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
@@ -1963,7 +1962,7 @@ function worktreeReader(worktreeDir, opts = {}) {
       const real = fs12.realpathSync(target);
       if (!inside(real)) return null;
       const st = fs12.statSync(real);
-      if (!st.isFile() || st.size > maxBytes) return null;
+      if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
       return fs12.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
@@ -3729,11 +3728,9 @@ export {
   FINDINGS_INSTRUCTIONS,
   GROK_SANDBOX_PROFILE,
   HOLISTIC_DEFAULTS,
-  HOLISTIC_LINE_SLACK,
   HOLISTIC_MIN_ANCHOR_NONWS,
   HOLISTIC_SEAT_ID,
   HOLISTIC_SEVERITY_CAP,
-  HOLISTIC_SITE_ROLES,
   IMPLEMENTED_MODES,
   MODES,
   MODE_ALIASES,

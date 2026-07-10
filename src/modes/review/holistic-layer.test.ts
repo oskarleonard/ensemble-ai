@@ -184,7 +184,7 @@ describe('the lens REFUSES packet evidence', () => {
     const { calls, run } = makeRunner(false);
     const result = await runClaudeReviewLayer({
       ...layerArgs(baseDir, runId, run),
-      holistic: { baseSha: BASE, config: HOLISTIC_CFG, requested: true },
+      holistic: { baseSha: BASE, config: HOLISTIC_CFG },
     });
 
     expect(calls.map((c) => c.round)).toEqual(['claude', 'gate']);
@@ -203,7 +203,7 @@ describe('the lens ON — seat, gate, and the host-verified guardrails end to en
     const result = await runClaudeReviewLayer({
       ...layerArgs(baseDir, runId, run),
       conventionPaths: ['AGENTS.md'],
-      holistic: { baseSha: BASE, config: HOLISTIC_CFG, requested: true },
+      holistic: { baseSha: BASE, config: HOLISTIC_CFG },
       worktree: wt,
     });
 
@@ -247,7 +247,7 @@ describe('the lens ON — seat, gate, and the host-verified guardrails end to en
     const { run } = makeRunner(true);
     const result = await runClaudeReviewLayer({
       ...layerArgs(baseDir, runId, run),
-      holistic: { baseSha: BASE, config: HOLISTIC_CFG, requested: true },
+      holistic: { baseSha: BASE, config: HOLISTIC_CFG },
       worktree: wt,
     });
 

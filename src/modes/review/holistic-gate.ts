@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { escapesRoot } from '../../core/artifacts';
 import { SEVERITIES, type Severity } from '../../core/types';
 
 import type { DowngradeReason, GateVerdictRecord } from './gate';
@@ -32,7 +33,7 @@ export const HOLISTIC_MIN_ANCHOR_NONWS = 16;
 // How far the cited line may sit from the matched quote span. A model quoting a function's first
 // three lines and citing its declaration line lands inside the span; ±2 absorbs an off-by-one on
 // a decorator or a wrapped signature without letting a citation float free of what it quoted.
-export const HOLISTIC_LINE_SLACK = 2;
+const HOLISTIC_LINE_SLACK = 2;
 
 const MAX_QUOTE_CHARS = 2000;
 const MAX_FILE_BYTES = 1_048_576;
@@ -40,7 +41,7 @@ const MAX_FILE_LINES = 20_000;
 
 // ── The site + citation wire shapes ───────────────────────────────────────────────────
 
-export const HOLISTIC_SITE_ROLES = ['diff', 'pattern'] as const;
+const HOLISTIC_SITE_ROLES = ['diff', 'pattern'] as const;
 export type HolisticSiteRole = (typeof HOLISTIC_SITE_ROLES)[number];
 
 export interface HolisticSite {
@@ -119,20 +120,18 @@ export type SiteReader = (file: string) => string[] | null;
 // A reader fenced to ONE worktree. The tree is untrusted PR content, so containment is checked on
 // the REALPATH: a symlink planted at `docs/CONVENTIONS.md → ~/.ssh/id_ed25519` must not let a
 // crafted "citation" quote a secret into gate-verdicts.json, the trail, or a posted comment.
-export function worktreeReader(
-  worktreeDir: string,
-  opts: { maxBytes?: number } = {}
-): SiteReader {
+// Containment uses the trail's own `escapesRoot`, so the path-escape rule cannot drift between
+// the writer and this reader; the extra `!rel` guard rejects the worktree root itself.
+export function worktreeReader(worktreeDir: string): SiteReader {
   let root: string;
   try {
     root = fs.realpathSync(path.resolve(worktreeDir));
   } catch {
     return () => null; // no worktree ⇒ nothing verifies (fail closed)
   }
-  const maxBytes = opts.maxBytes ?? MAX_FILE_BYTES;
   const inside = (p: string): boolean => {
     const rel = path.relative(root, p);
-    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+    return rel !== '' && !escapesRoot(rel);
   };
   return (file: string): string[] | null => {
     try {
@@ -142,7 +141,7 @@ export function worktreeReader(
       const real = fs.realpathSync(target);
       if (!inside(real)) return null; // symlink escape
       const st = fs.statSync(real);
-      if (!st.isFile() || st.size > maxBytes) return null;
+      if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
       return fs.readFileSync(real, 'utf8').split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
