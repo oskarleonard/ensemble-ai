@@ -1226,6 +1226,19 @@ function buildCodexReviewArgs(config, outFile, prompt) {
     "exec",
     "--skip-git-repo-check",
     "--ephemeral",
+    // Load none of the operator's ~/.codex/config.toml — above all its [mcp_servers]. Auth still
+    // uses $CODEX_HOME; the model/effort below arrive via -m/-c (an override layer), not that file.
+    "--ignore-user-config",
+    // Every OpenTelemetry exporter OFF (metrics defaults to `statsig`, so ignoring the file is not
+    // enough), and never ship the prompt — which carries the untrusted diff — to a telemetry backend.
+    "-c",
+    'otel.exporter="none"',
+    "-c",
+    'otel.metrics_exporter="none"',
+    "-c",
+    'otel.trace_exporter="none"',
+    "-c",
+    "otel.log_user_prompt=false",
     "--color",
     "never",
     "-s",

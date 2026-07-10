@@ -35,7 +35,7 @@ export interface CodexReviewResult {
   timedOut: boolean;
 }
 
-// PURE: the exact codex CLI args for a review. Encodes every lived lesson as
+// PURE: the exact codex CLI args for a PACKET-mode review. Encodes every lived lesson as
 // DATA so a unit test pins it: `-s read-only` (the reviewer can NEVER mutate the
 // work) · `-m <model>` + `-c model_reasoning_effort=<effort>` (the CONFIGURED
 // strong model, not the account default — a review wants the best) ·
@@ -43,6 +43,34 @@ export interface CodexReviewResult {
 // the cwd) · `-o <file>` (codex's reply comes from there — stdout is empty and
 // the exit code lies) · `--ephemeral` + `--color never`. stdin is closed at the
 // spawn (stdio), not via an arg — see runCodexReview.
+//
+// PACKET FENCE (packet-f1, 2026-07-10) — a packet seat has no worktree, so it has neither the
+// kernel sandbox nor the egress proxy the worktree path fences with. Two flags close the two holes
+// that left, both proved live:
+//
+//   `--ignore-user-config` — load NONE of the operator's ~/.codex/config.toml, above all its
+//     `[mcp_servers]`. A review reads its prompt; it needs no MCP. An operator MCP server is an
+//     operator-CREDENTIALED egress channel a prompt-injectable review has no business reaching:
+//     verified 2026-07-10 through a logging proxy, the un-fenced packet seat CONNECTed to the
+//     operator's `mcp.supabase.com` during a trivial exec; with this flag the same run reaches only
+//     `chatgpt.com`. The seat still authenticates (the flag drops config.toml but auth still uses
+//     $CODEX_HOME/auth.json) and still runs the CONFIGURED model/effort, which arrive via `-m`/`-c`
+//     — an override layer, NOT the ignored file — so nothing a review needs is lost. The one
+//     tradeoff, stated: an operator who defines a CUSTOM `model_providers` in config.toml and points
+//     the reviewer model at it loses it here; a review seat is meant to use the standard vendor
+//     provider. This is the WORKTREE path's `mcp.supabase.com` egress-deny expressed at the source
+//     for the packet path — that path stays byte-identical (its proxy + kernel sandbox already deny
+//     the same host); across both modes the seat never reaches an operator MCP server.
+//
+//   `otel.{exporter,metrics_exporter,trace_exporter}="none"` + `otel.log_user_prompt=false` — pin
+//     every OpenTelemetry exporter OFF and never ship the prompt to a telemetry backend. The metrics
+//     exporter DEFAULTS to `statsig`, so `--ignore-user-config` alone does not disable telemetry — it
+//     resets to that default; the explicit `-c` overrides are what force it off, and they layer on
+//     top of `--ignore-user-config`. `log_user_prompt=false` matters to the threat model: the
+//     untrusted diff rides IN the prompt, so this guarantees it is never emitted to a telemetry
+//     backend even if one is configured later. "none" is a documented value for each key (codex
+//     config reference); the 2026-07-10 probe OBSERVED no telemetry host being contacted, so this is
+//     fail-safe hardening, not the closing of an observed leak — documented honestly as such.
 export function buildCodexReviewArgs(
   config: ReviewerConfig,
   outFile: string,
@@ -52,6 +80,19 @@ export function buildCodexReviewArgs(
     'exec',
     '--skip-git-repo-check',
     '--ephemeral',
+    // Load none of the operator's ~/.codex/config.toml — above all its [mcp_servers]. Auth still
+    // uses $CODEX_HOME; the model/effort below arrive via -m/-c (an override layer), not that file.
+    '--ignore-user-config',
+    // Every OpenTelemetry exporter OFF (metrics defaults to `statsig`, so ignoring the file is not
+    // enough), and never ship the prompt — which carries the untrusted diff — to a telemetry backend.
+    '-c',
+    'otel.exporter="none"',
+    '-c',
+    'otel.metrics_exporter="none"',
+    '-c',
+    'otel.trace_exporter="none"',
+    '-c',
+    'otel.log_user_prompt=false',
     '--color',
     'never',
     '-s',

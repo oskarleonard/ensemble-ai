@@ -86,6 +86,40 @@ describe('buildCodexReviewArgs', () => {
     // no stdin flag — stdin is closed via the spawn stdio, not an arg.
     expect(args.join(' ')).not.toMatch(/stdin/i);
   });
+
+  // PACKET FENCE (packet-f1): a packet seat has neither the worktree's kernel sandbox nor its egress
+  // proxy, so these two flags close the holes that left — verified live 2026-07-10 (the un-fenced
+  // seat reached the operator's mcp.supabase.com; fenced, it reached only chatgpt.com).
+  it('ignores the operator config so it never loads MCP servers, and pins telemetry off', () => {
+    const args = buildCodexReviewArgs(CONFIG, '/tmp/out.md', 'PROMPT');
+    const s = args.join(' ');
+    // The operator's ~/.codex/config.toml — above all its [mcp_servers] — is never loaded. A review
+    // needs no MCP, and an operator MCP server is a credentialed egress channel. Auth still uses
+    // $CODEX_HOME; model/effort ride -m/-c (an override layer), not the ignored file.
+    expect(args).toContain('--ignore-user-config');
+    // Every OpenTelemetry exporter OFF — the metrics exporter DEFAULTS to `statsig`, so
+    // --ignore-user-config alone would reset it to that default, not disable it.
+    // log_user_prompt=false guarantees the untrusted diff (which rides in the prompt) is never
+    // shipped to a telemetry backend.
+    const otel = [
+      'otel.exporter="none"',
+      'otel.metrics_exporter="none"',
+      'otel.trace_exporter="none"',
+      'otel.log_user_prompt=false',
+    ];
+    for (const kv of otel) {
+      expect(args).toContain(kv);
+      // each override is a real `-c key=value` pair, not a bare token.
+      expect(args[args.indexOf(kv) - 1]).toBe('-c');
+    }
+    // …and none of the hardening breaks a valid review: read-only, the configured model/effort, the
+    // -o file, and the prompt-as-final-positional are all still intact.
+    expect(s).toContain('-s read-only');
+    expect(args[args.indexOf('-m') + 1]).toBe('gpt-5.5');
+    expect(args).toContain('model_reasoning_effort="xhigh"');
+    expect(args[args.indexOf('-o') + 1]).toBe('/tmp/out.md');
+    expect(args.at(-1)).toBe('PROMPT');
+  });
 });
 
 describe('runCodexReview', () => {
