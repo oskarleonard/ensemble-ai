@@ -53,6 +53,12 @@ export * from './modes/review/posting-config';
 export * from './modes/review/push-fence';
 export * from './modes/review/stage';
 export * from './modes/review/stage-plan';
+// ── The HOLISTIC lens: the seat · its host-verified guardrails · the acceptance fixture ─
+// Default off. Worktree evidence or it does not run. Its findings post agree-only, cap at MED
+// unless a conventions doc is cited AND verified, and never borrow a corroboration signal.
+export * from './modes/review/holistic';
+export * from './modes/review/holistic-gate';
+export * from './modes/review/holistic-fixture';
 // ── Review PROFILES (code · security) + the security dependency-surface flag ──
 export * from './modes/review/profile';
 export * from './modes/review/dep-surface';

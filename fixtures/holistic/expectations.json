@@ -1,0 +1,47 @@
+{
+  "conventionsDoc": "AGENTS.md",
+  "note": "The acceptance SUITE for the holistic lens. `plantedPositives` are reinventions the lens MUST catch; `nearMisses` are lookalikes with different semantics it MUST NOT flag. Every anchor below is asserted line-exact against this tree by holistic-fixture.test.ts, so a fixture edit that moves a symbol fails the suite instead of silently rotting. Scoring a real (model-in-the-loop) lens run against this file is scoreHolisticFixture(); the deterministic tests score synthetic finding sets, because judging a near-miss is a MODEL property the host cannot mechanize.",
+  "plantedPositives": [
+    {
+      "id": "currency-reinvention",
+      "diffSite": { "file": "src/checkout/receipt.ts", "line": 4, "symbol": "centsToDisplay" },
+      "patternSite": { "file": "src/util/money.ts", "line": 2, "symbol": "formatCents" },
+      "conventionsAnchor": { "file": "AGENTS.md", "line": 12, "symbol": "MUST go through `formatCents`" },
+      "why": "A local cents→string formatter duplicating the canonical util, and it drops the negative-amount sign the util handles."
+    },
+    {
+      "id": "retry-reinvention",
+      "diffSite": { "file": "src/sync/uploader.ts", "line": 6, "symbol": "uploadWithRetries" },
+      "patternSite": { "file": "src/util/retry.ts", "line": 10, "symbol": "withRetry" },
+      "conventionsAnchor": { "file": "AGENTS.md", "line": 17, "symbol": "MUST use `withRetry`" },
+      "why": "A hand-rolled exponential-backoff loop duplicating the canonical retry helper, minus its jitter."
+    },
+    {
+      "id": "http-convention-drift",
+      "diffSite": { "file": "src/api/client.ts", "line": 5, "symbol": "callApi" },
+      "patternSite": { "file": "src/util/http.ts", "line": 13, "symbol": "request" },
+      "conventionsAnchor": { "file": "AGENTS.md", "line": 22, "symbol": "MUST go through `request`" },
+      "why": "Hand-built request headers bypassing the canonical helper, silently omitting the mandated trace id."
+    }
+  ],
+  "nearMisses": [
+    {
+      "id": "import-key-vs-slug",
+      "site": { "file": "src/importer/keys.ts", "line": 5, "symbol": "toKey" },
+      "lookalike": { "file": "src/util/slug.ts", "line": 2, "symbol": "slugify" },
+      "why": "Preserves case, dots, and diacritics on purpose — an identity key, not a URL slug. Replacing it with slugify would merge distinct records."
+    },
+    {
+      "id": "bankers-vs-half-up",
+      "site": { "file": "src/report/rounding.ts", "line": 4, "symbol": "roundHalfEven" },
+      "lookalike": { "file": "src/util/round.ts", "line": 2, "symbol": "roundHalfUp" },
+      "why": "Half-to-even by design, so accumulated report rounding does not bias upward. Same shape, different rule."
+    },
+    {
+      "id": "queue-pacing-vs-retry-backoff",
+      "site": { "file": "src/queue/backoff.ts", "line": 4, "symbol": "delayFor" },
+      "lookalike": { "file": "src/util/retry.ts", "line": 10, "symbol": "withRetry" },
+      "why": "Paces a rate-limited queue with a deterministic delay and re-invokes nothing. withRetry cannot express it."
+    }
+  ]
+}

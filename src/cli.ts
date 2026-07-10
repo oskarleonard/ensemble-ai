@@ -56,6 +56,7 @@ import {
   resolveHighGate,
 } from './modes/review/gate';
 import { type GateSeat, loadGateSeat } from './modes/review/gate-seat';
+import { loadHolisticSeat } from './modes/review/holistic';
 import {
   acquireDiff,
   type AcquiredDiff,
@@ -172,6 +173,10 @@ Options:
                         (default: codex,grok,claude — claude is a valid id)
   --no-claude           drop the cold Opus reviewer + the synthesis pass (codex + grok
                         only) — e.g. from a terminal with no Claude CLI
+  --holistic            add the HOLISTIC/architecture lens: one Anthropic seat that reads the
+                        WHOLE project (reinvented patterns, convention drift, simplifiable
+                        design). Default OFF. REQUIRES worktree evidence — with none it does
+                        not run and says so; it never reviews on the packet.
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
@@ -980,6 +985,7 @@ async function reviewCommand(
         'gate-effort': { type: 'string' },
         'gate-model': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
+        holistic: { type: 'boolean' },
         'no-claude': { type: 'boolean' },
         'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
@@ -1222,9 +1228,24 @@ async function reviewCommand(
       claudeLayer = await runClaudeReviewLayer({
         baseDir: out,
         claudeConfig: voiceConfigs.claude,
+        // The conventions this run actually gathered — the docs a holistic finding may cite to
+        // lift its MED severity cap (the gate re-reads the citation out of the tree regardless).
+        conventionPaths: result.conventionManifest?.files.filter((f) => f.included).map((f) => f.path),
         gateConfig: gateSeat.config,
         coreReviews: result.reviews,
         expectedHeadSha: result.acquired.headSha,
+        // The HOLISTIC lens (spec §4) — off unless asked for, and it runs only with worktree
+        // evidence. No CLI path supplies a worktree yet (see the README status note), so `--holistic`
+        // today resolves to a LOUD skip rather than a packet-evidence architecture review. The seat,
+        // its guardrails, and this wiring are what Phase 1's `--repo` flag will switch on.
+        ...(values.holistic
+          ? {
+              holistic: {
+                baseSha: result.acquired.baseSha,
+                config: loadHolisticSeat(VOICES_FILE, (m) => console.error(`· ${m}`)),
+              },
+            }
+          : {}),
         includeClaudeReviewer: true,
         log: (m) => console.error(`· ${m}`),
         reviewPrompt: result.prompt,

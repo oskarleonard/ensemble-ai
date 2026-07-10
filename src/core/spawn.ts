@@ -91,6 +91,13 @@ export interface ReviewerExecOpts {
    * `-o` file). Defaults to `'outfile'` for the proven Codex path.
    */
   capture?: 'outfile' | 'stdout';
+  /**
+   * The spawn cwd. Defaults to a throwaway `os.tmpdir()` — the packet path, where a read tool has
+   * nothing of the repo to reach. A WORKTREE seat passes the detached read-only worktree here:
+   * for a harness-controlled CLI (claude), the cwd IS what grants whole-project read access. It is
+   * BORROWED, never owned — one worktree per run, shared by every seat, reaped by the run.
+   */
+  cwd?: string;
   /** Receives the kill handle so a caller (e.g. a cancel) can abort the child. */
   onSpawn?: (kill: () => void) => void;
   /** The -o tempfile the reply is read from, then unlinked. Required for 'outfile'. */
@@ -134,7 +141,7 @@ export function runReviewerExec(
   const capture = opts.capture ?? 'outfile';
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
-      cwd: os.tmpdir(),
+      cwd: opts.cwd ?? os.tmpdir(),
       detached: true,
       // stdout is piped ONLY when we read the reply from it (grok); codex keeps
       // it 'ignore' (its reply is the -o file) exactly as the proven path did.

@@ -80,6 +80,13 @@ interface ReviewerExecOpts {
      * `-o` file). Defaults to `'outfile'` for the proven Codex path.
      */
     capture?: 'outfile' | 'stdout';
+    /**
+     * The spawn cwd. Defaults to a throwaway `os.tmpdir()` — the packet path, where a read tool has
+     * nothing of the repo to reach. A WORKTREE seat passes the detached read-only worktree here:
+     * for a harness-controlled CLI (claude), the cwd IS what grants whole-project read access. It is
+     * BORROWED, never owned — one worktree per run, shared by every seat, reaped by the run.
+     */
+    cwd?: string;
     /** Receives the kill handle so a caller (e.g. a cancel) can abort the child. */
     onSpawn?: (kill: () => void) => void;
     /** The -o tempfile the reply is read from, then unlinked. Required for 'outfile'. */
@@ -288,6 +295,120 @@ interface PostableSuggestion {
     replacement: string;
 }
 
+interface VoiceReview {
+    findings: ReviewFinding[];
+    ok: boolean;
+    summary: string;
+    voiceId: string;
+}
+
+declare const HOLISTIC_SEAT_ID = "holistic";
+declare const HOLISTIC_SEVERITY_CAP: Severity;
+declare const HOLISTIC_DEFAULTS: {
+    readonly effort: "max";
+    readonly model: "opus";
+};
+declare function resolveHolisticSeat(raw: unknown, warn?: (m: string) => void): VoiceConfig;
+declare function loadHolisticSeat(file?: string, warn?: (m: string) => void): VoiceConfig;
+type HolisticPlan = {
+    run: false;
+    skipReason: string | null;
+} | {
+    baseSha: string;
+    run: true;
+    worktree: string;
+};
+declare function resolveHolisticPlan(input: {
+    baseSha?: string | null;
+    requested: boolean;
+    worktree?: string;
+}): HolisticPlan;
+interface HolisticPromptArgs {
+    baseSha: string;
+    headSha: string;
+    worktree: string;
+}
+declare function renderHolisticPrompt(args: HolisticPromptArgs): string;
+type HolisticRunner = (prompt: string, config: VoiceConfig, opts?: RunReviewOpts) => Promise<VoiceRunResult>;
+interface RunHolisticLensOptions {
+    baseSha: string;
+    config: VoiceConfig;
+    headSha: string;
+    log?: (m: string) => void;
+    run: HolisticRunner;
+    timeoutMs?: number;
+    worktree: string;
+}
+declare function runHolisticLens(opts: RunHolisticLensOptions): Promise<{
+    raw: string | null;
+    review: VoiceReview;
+}>;
+
+declare const HOLISTIC_MIN_ANCHOR_NONWS = 16;
+declare const HOLISTIC_SITE_ROLES: readonly ["diff", "pattern"];
+type HolisticSiteRole = (typeof HOLISTIC_SITE_ROLES)[number];
+interface HolisticSite {
+    file: string;
+    line: number;
+    quote: string;
+    role: HolisticSiteRole;
+}
+interface ConventionCitation {
+    file: string;
+    line: number;
+    quote: string;
+}
+interface HolisticEntry {
+    conventionCitation?: ConventionCitation;
+    sites?: HolisticSite[];
+}
+interface HolisticProvenance {
+    cappedFrom?: Severity;
+    lens: typeof HOLISTIC_SEAT_ID;
+    singleSeat: true;
+    uncapCitation?: ConventionCitation;
+    verifiedSites?: HolisticSite[];
+}
+declare function parseHolisticSites(v: unknown): HolisticSite[] | undefined;
+declare function parseConventionCitation(v: unknown): ConventionCitation | undefined;
+type SiteReader = (file: string) => string[] | null;
+declare function worktreeReader(worktreeDir: string): SiteReader;
+declare function findQuoteSpans(lines: string[], quote: string): {
+    end: number;
+    start: number;
+}[];
+declare function findQuoteSpan(lines: string[], quote: string): {
+    end: number;
+    start: number;
+} | null;
+type SiteCheck = {
+    ok: true;
+    span: {
+        end: number;
+        start: number;
+    };
+} | {
+    ok: false;
+    reason: string;
+};
+declare function verifySiteAtHead(site: {
+    file: string;
+    line: number;
+    quote: string;
+}, read: SiteReader): SiteCheck;
+declare function isConventionsDoc(file: string, gathered?: readonly string[]): boolean;
+interface HolisticPolicyDeps {
+    conventionPaths?: readonly string[];
+    diffFiles: ReadonlySet<string>;
+    readAtHead: SiteReader;
+}
+declare function isHolisticRecord(r: {
+    reviewer: string;
+}): boolean;
+declare function holisticCapWasLifted(r: GateVerdictRecord): boolean;
+declare function capHolisticSeverity(r: GateVerdictRecord): GateVerdictRecord;
+declare function applyHolisticPolicy(records: GateVerdictRecord[], entryById: ReadonlyMap<string, HolisticEntry | undefined>, deps: HolisticPolicyDeps | null): GateVerdictRecord[];
+
 declare const GATE_VERDICTS: readonly ["agree", "partial", "false", "unverified"];
 type GateVerdict = (typeof GATE_VERDICTS)[number];
 declare const DOWNGRADE_REASONS: readonly ["truncated", "invalid-citation", "duplicate", "missing", "bad-enum", "packet-fail", "gate-failed", "unknown-schema", "trail-write-failed", "reference-not-found"];
@@ -301,6 +422,7 @@ interface GateVerdictRecord {
     effectiveVerdict: GateVerdict;
     file: string;
     findingId: string;
+    holistic?: HolisticProvenance;
     line: number | null;
     postableBody: string | null;
     postableClass: PostableClass | null;
@@ -793,6 +915,44 @@ declare function stageReview(payload: StagedReviewPayload, target: StageTarget, 
     reviewedHeadSha: string;
 }): StageResult;
 
+interface FixtureAnchor {
+    file: string;
+    line: number;
+    symbol: string;
+}
+interface PlantedPositive {
+    conventionsAnchor: FixtureAnchor;
+    diffSite: FixtureAnchor;
+    id: string;
+    patternSite: FixtureAnchor;
+    why: string;
+}
+interface NearMiss {
+    id: string;
+    lookalike: FixtureAnchor;
+    site: FixtureAnchor;
+    why: string;
+}
+interface HolisticFixture {
+    conventionsDoc: string;
+    nearMisses: NearMiss[];
+    plantedPositives: PlantedPositive[];
+}
+declare function loadHolisticFixture(dir: string): HolisticFixture;
+declare function verifyFixtureAnchors(dir: string, fixture: HolisticFixture): string[];
+interface ScoredFinding {
+    file: string;
+    line: number | null;
+    postable: boolean;
+}
+interface FixtureScore {
+    caught: string[];
+    falseFlags: string[];
+    missed: string[];
+    passed: boolean;
+}
+declare function scoreHolisticFixture(findings: readonly ScoredFinding[], fixture: HolisticFixture): FixtureScore;
+
 declare const DEFAULT_VOICE_TIMEOUT_MS$1 = 300000;
 type Adapters$1 = Record<VoiceId, (prompt: string, config: VoiceConfig, opts?: {
     onSpawn?: (kill: () => void) => void;
@@ -930,4 +1090,4 @@ declare function resolveMode(v: string): string;
 declare function isMode(v: string): v is ModeName;
 declare function isImplemented(mode: ModeName): boolean;
 
-export { type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormOptions, type BrainstormResult, type BuildReceiptResult, CODEX_SANDBOX_PROFILE, CODE_REVIEW_SKILL, CRITIQUE_STANCES, type CodeReviewSeatPromptArgs, type CodexReviewResult, type CodexSandboxPaths, type ConsultResult, type ConsultSynthesis, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type Coverage, type CoverageFileEntry, type CoveragePolicy, type Critique, type CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_POSTURE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, ENSEMBLE_CONFIG_PATH, EVIDENCE_CLASSES, EVIDENCE_MANIFEST_FILE, EVIDENCE_MANIFEST_SCHEMA_VERSION, EVIDENCE_SEATS, type EvidenceClass, type EvidenceGap, type EvidenceManifest, type EvidenceMap, type EvidenceSeat, type FileDiff, type FileKind, GROK_SANDBOX_PROFILE, type GatherConfig, type GatheredConventions, type GhResult, type GhRunner, type GitRun, IMPLEMENTED_MODES, type Idea, type InlineSecretHit, MODES, MODE_ALIASES, type ManifestBlob, type ModeName, type OmitReason, POLICY_VERSIONS, POLICY_VERSION_EVIDENCE, POLICY_VERSION_LEGACY, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PendingState, type PersistReviewInput, type PlacedFinding, type PolicyHashInputs, type PostingPosture, type PrPushContext, type PreflightError, type PreflightErrorKind, type PushFenceVerdict, QUALITY_LENS, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type RankedIdea, type RawIdea, type ReceiptCoverage, type ReceiptKey, type RepoLocation, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, type ReviewSummary, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunReviewOpts, STAGE_MARKER, SUGGESTION_HARD_CAP, type SandboxProfileMap, type SandboxProfileRef, type SecretScanResult, type SensitivePathHit, Severity, type StageCounts, type StageFailure, type StagePlan, type StageResult, type StageSuccess, type StageTarget, type StagedComment, type StagedReviewPayload, StoredReview, type SummaryBodyInput, type SynthesisResult, TerminalState, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, VOICE_IDS, type VoiceAnswerResult, type VoiceConfig, type VoiceCritiqueResult$1 as VoiceCritiqueResult, type VoiceGenerateResult, type VoiceId, type VoiceRunResult, type Worktree, acquireDiff, acquireRepoLock, allowedRootsFromConfig, asRecord, buildClaudeVoiceArgs, buildCodexReviewArgs, buildCodexWorktreeArgs, buildDiffReceipt, buildEvidenceManifest, buildGrokReviewArgs, buildStagedReviewPayload, canonicalizeDiff, checkFreshness, classifyFileKind, classifyGitError, classifyPending, codexSandboxSupported, computeCoverage, computePolicyHash, computePolicyHashAt, index as consult, coverageCounts, coverageShortfall, defaultCodexSandboxPaths, defaultReceiptStore, defuseUntrusted, diffDigest, ensureSandboxProfile, escapesRoot, evaluatePushFence, evidenceShortfall, extractGrokText, extractRefs, fallbackSynthesis$1 as fallbackSynthesis, findingTrailer, formatEvidenceShortfall, fsConventionReader, gatherConventions, hasDepSurface, isCommitSha, isDiffReviewed, isEnsembleStagedReview, isEvidenceClass, isEvidenceSeat, isImplemented, isMode, isPolicyVersion, isPreflightError, isUnsafeReadRoot, isVoiceId, keyOf, killTree, listReviewers, listVoices, loadPostingPosture, loadReviewers, loadVoices, makeEscalatingKill, materializeWorktree, meetsInlineFloor, memoryConventionReader, omittedLine, parseCritique, parseDiffFiles, parseIdeas, parseLsTree, parsePushContext, parseReviewSummaries, parseReviewers, parseSynthesis, parseTrailerIds, parseVoiceIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, planPlacement, readEnsembleConfig, readReadableSurface, readReceipt, readReview, readReviewsForRun, reapWorktree, receiptIdentityMatches, receiptKeyHash, receiptPath, receiptPolicyVersion, remoteSlug, renderCodeReviewSeatPrompt, renderCodexSandboxProfile, renderCritiquePrompt, renderGeneratePrompt, renderInlineComment, renderSummaryBody, renderSynthesisPrompt, resolveBase, resolveBin, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveInRepo, resolveMode, resolvePolicyVersion, resolvePosture, resolveReceipt, resolveRepoId, resolveRepoLocation, resolveReviewSandbox, resolveReviewer, reviewDir, rootAllowed, runBrainstormMode, runClaudeVoice, runCodexReview, runGrokReview, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, sha256Hex, stageReview, summarizeCoverage, validateReceiptShape, wrapWithSandbox, writeCodexSandboxProfile, writeEvidenceManifest, writeReceipt, writeTrailFile };
+export { type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormOptions, type BrainstormResult, type BuildReceiptResult, CODEX_SANDBOX_PROFILE, CODE_REVIEW_SKILL, CRITIQUE_STANCES, type CodeReviewSeatPromptArgs, type CodexReviewResult, type CodexSandboxPaths, type ConsultResult, type ConsultSynthesis, type ConventionCitation, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type Coverage, type CoverageFileEntry, type CoveragePolicy, type Critique, type CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_POSTURE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, ENSEMBLE_CONFIG_PATH, EVIDENCE_CLASSES, EVIDENCE_MANIFEST_FILE, EVIDENCE_MANIFEST_SCHEMA_VERSION, EVIDENCE_SEATS, type EvidenceClass, type EvidenceGap, type EvidenceManifest, type EvidenceMap, type EvidenceSeat, type FileDiff, type FileKind, type FixtureAnchor, type FixtureScore, GROK_SANDBOX_PROFILE, type GatherConfig, type GatheredConventions, type GhResult, type GhRunner, type GitRun, HOLISTIC_DEFAULTS, HOLISTIC_MIN_ANCHOR_NONWS, HOLISTIC_SEAT_ID, HOLISTIC_SEVERITY_CAP, type HolisticEntry, type HolisticFixture, type HolisticPlan, type HolisticPolicyDeps, type HolisticPromptArgs, type HolisticProvenance, type HolisticRunner, type HolisticSite, type HolisticSiteRole, IMPLEMENTED_MODES, type Idea, type InlineSecretHit, MODES, MODE_ALIASES, type ManifestBlob, type ModeName, type NearMiss, type OmitReason, POLICY_VERSIONS, POLICY_VERSION_EVIDENCE, POLICY_VERSION_LEGACY, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PendingState, type PersistReviewInput, type PlacedFinding, type PlantedPositive, type PolicyHashInputs, type PostingPosture, type PrPushContext, type PreflightError, type PreflightErrorKind, type PushFenceVerdict, QUALITY_LENS, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type RankedIdea, type RawIdea, type ReceiptCoverage, type ReceiptKey, type RepoLocation, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, type ReviewSummary, ReviewerConfig, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunHolisticLensOptions, type RunReviewOpts, STAGE_MARKER, SUGGESTION_HARD_CAP, type SandboxProfileMap, type SandboxProfileRef, type ScoredFinding, type SecretScanResult, type SensitivePathHit, Severity, type SiteCheck, type SiteReader, type StageCounts, type StageFailure, type StagePlan, type StageResult, type StageSuccess, type StageTarget, type StagedComment, type StagedReviewPayload, StoredReview, type SummaryBodyInput, type SynthesisResult, TerminalState, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, VOICE_IDS, type VoiceAnswerResult, type VoiceConfig, type VoiceCritiqueResult$1 as VoiceCritiqueResult, type VoiceGenerateResult, type VoiceId, type VoiceRunResult, type Worktree, acquireDiff, acquireRepoLock, allowedRootsFromConfig, applyHolisticPolicy, asRecord, buildClaudeVoiceArgs, buildCodexReviewArgs, buildCodexWorktreeArgs, buildDiffReceipt, buildEvidenceManifest, buildGrokReviewArgs, buildStagedReviewPayload, canonicalizeDiff, capHolisticSeverity, checkFreshness, classifyFileKind, classifyGitError, classifyPending, codexSandboxSupported, computeCoverage, computePolicyHash, computePolicyHashAt, index as consult, coverageCounts, coverageShortfall, defaultCodexSandboxPaths, defaultReceiptStore, defuseUntrusted, diffDigest, ensureSandboxProfile, escapesRoot, evaluatePushFence, evidenceShortfall, extractGrokText, extractRefs, fallbackSynthesis$1 as fallbackSynthesis, findQuoteSpan, findQuoteSpans, findingTrailer, formatEvidenceShortfall, fsConventionReader, gatherConventions, hasDepSurface, holisticCapWasLifted, isCommitSha, isConventionsDoc, isDiffReviewed, isEnsembleStagedReview, isEvidenceClass, isEvidenceSeat, isHolisticRecord, isImplemented, isMode, isPolicyVersion, isPreflightError, isUnsafeReadRoot, isVoiceId, keyOf, killTree, listReviewers, listVoices, loadHolisticFixture, loadHolisticSeat, loadPostingPosture, loadReviewers, loadVoices, makeEscalatingKill, materializeWorktree, meetsInlineFloor, memoryConventionReader, omittedLine, parseConventionCitation, parseCritique, parseDiffFiles, parseHolisticSites, parseIdeas, parseLsTree, parsePushContext, parseReviewSummaries, parseReviewers, parseSynthesis, parseTrailerIds, parseVoiceIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, planPlacement, readEnsembleConfig, readReadableSurface, readReceipt, readReview, readReviewsForRun, reapWorktree, receiptIdentityMatches, receiptKeyHash, receiptPath, receiptPolicyVersion, remoteSlug, renderCodeReviewSeatPrompt, renderCodexSandboxProfile, renderCritiquePrompt, renderGeneratePrompt, renderHolisticPrompt, renderInlineComment, renderSummaryBody, renderSynthesisPrompt, resolveBase, resolveBin, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveHolisticPlan, resolveHolisticSeat, resolveInRepo, resolveMode, resolvePolicyVersion, resolvePosture, resolveReceipt, resolveRepoId, resolveRepoLocation, resolveReviewSandbox, resolveReviewer, reviewDir, rootAllowed, runBrainstormMode, runClaudeVoice, runCodexReview, runGrokReview, runHolisticLens, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, scoreHolisticFixture, sha256Hex, stageReview, summarizeCoverage, validateReceiptShape, verifyFixtureAnchors, verifySiteAtHead, worktreeReader, wrapWithSandbox, writeCodexSandboxProfile, writeEvidenceManifest, writeReceipt, writeTrailFile };
