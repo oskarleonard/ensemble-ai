@@ -34,6 +34,7 @@ import {
   runHolisticLens,
 } from './holistic';
 import { worktreeReader } from './holistic-gate';
+import type { HistoryPacket } from './history-packet';
 import type { ReviewProfile } from './profile';
 import { type ReviewSynthesis, type VoiceReview } from './synthesis';
 import { reviewJsonFromTrail } from './trail-io';
@@ -162,11 +163,17 @@ async function runClaudeReviewer(
   log: (m: string) => void,
   // The worktree, when this run has one — the spawn cwd is what makes this a worktree seat (its
   // file/git tools reach the project there). Absent ⇒ the throwaway tmpdir, as before.
-  worktree?: string
+  worktree?: string,
+  // The history packet seeded into this seat's cwd, when one was built (./history-packet).
+  historyPacket?: HistoryPacket
 ): Promise<{ review: VoiceReview; raw: string | null }> {
   let res: VoiceRunResult;
   try {
-    res = await run(reviewPrompt, config, { timeoutMs, ...(worktree ? { worktree } : {}) });
+    res = await run(reviewPrompt, config, {
+      timeoutMs,
+      ...(historyPacket ? { historyPacket: historyPacket.files } : {}),
+      ...(worktree ? { worktree } : {}),
+    });
   } catch (e) {
     log(`  · claude: failed to run — ${(e as Error).message}`);
     return {
@@ -220,6 +227,17 @@ export interface ClaudeLayerOptions {
   gateConfig?: VoiceConfig;
   // The codex+grok reviews already produced + persisted by runReviewMode (the core).
   coreReviews: StoredReview[];
+  // THE HISTORY PACKET (./history-packet), when this run built one: `git log` + `git blame` for the
+  // changed files, seeded into each PRODUCER seat's cwd as read-only data. It goes to the `claude`
+  // producer and the lens, and DELIBERATELY NOT to the gate: the gate's authority is grounded in the
+  // pinned packet hunks and nothing else (gate-hunks.ts), so handing it a second body of evidence it
+  // has no grounding rule for would widen what a verdict may rest on. History informs a FINDING;
+  // it does not adjudicate one.
+  //
+  // A SHALLOW clone yields a packet of `bytes: 0` — its README alone, explaining why there is no
+  // history here. The files are still seeded (an honest note beats an absent one), but the prompt
+  // clause is NOT rendered: a prompt must never point a seat at evidence it cannot open.
+  historyPacket?: HistoryPacket;
   // The pinned reviewer-visible diff. Under the capability fence the Anthropic seats have no shell,
   // so the engine hands them the change instead of letting them run `git diff` (see ./claude).
   // Absent ⇒ the seats fall back to the packet prompt, which already embeds the diff.
@@ -305,6 +323,9 @@ export async function runClaudeReviewLayer(
   // profile therefore keeps its own pinned packet prompt and merely LEARNS about the worktree, so
   // it reads the whole project under the objective it was actually asked for.
   const isCodeProfile = (opts.profile ?? 'code') === 'code';
+  // The `history/` clause is rendered iff the packet carries DATA — a prompt must never name
+  // evidence the seat cannot open (a shallow clone yields a README and nothing else).
+  const hasHistory = (opts.historyPacket?.bytes ?? 0) > 0;
   const producerPrompt = !opts.worktree
     ? opts.reviewPrompt
     : isCodeProfile && opts.baseSha && opts.pinnedDiff
@@ -312,11 +333,13 @@ export async function runClaudeReviewLayer(
           baseSha: opts.baseSha,
           diff: opts.pinnedDiff,
           headSha: opts.expectedHeadSha,
+          history: hasHistory,
           worktree: opts.worktree,
         })
       : opts.reviewPrompt +
         claudeWorktreePromptSuffix({
           headSha: opts.expectedHeadSha,
+          history: hasHistory,
           worktree: opts.worktree,
         });
 
@@ -333,7 +356,8 @@ export async function runClaudeReviewLayer(
       run,
       opts.timeoutMs,
       log,
-      opts.worktree
+      opts.worktree,
+      opts.historyPacket
     );
     claudeReview = review;
     // The trail persist must SUCCEED for the claude voice to count as a complete reviewer:
@@ -395,6 +419,7 @@ export async function runClaudeReviewLayer(
       config: holistic.config,
       diff: plan.diff,
       headSha: opts.expectedHeadSha,
+      ...(opts.historyPacket ? { historyPacket: opts.historyPacket } : {}),
       log,
       run,
       timeoutMs: opts.timeoutMs,

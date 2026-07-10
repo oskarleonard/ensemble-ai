@@ -94,6 +94,7 @@ const gateEnvelope = (withHolistic: boolean): string =>
   });
 
 interface Call {
+  historyPacket?: readonly { contents: string; path: string }[];
   prompt: string;
   round: 'claude' | 'gate' | 'holistic';
   worktree?: string;
@@ -101,19 +102,33 @@ interface Call {
 
 function makeRunner(withHolistic: boolean) {
   const calls: Call[] = [];
-  const run = async (prompt: string, _c: VoiceConfig, opts?: { worktree?: string }): Promise<VoiceRunResult> => {
+  const run = async (
+    prompt: string,
+    _c: VoiceConfig,
+    opts?: { historyPacket?: readonly { contents: string; path: string }[]; worktree?: string }
+  ): Promise<VoiceRunResult> => {
     const round: Call['round'] = prompt.includes('VERIFIED GATE')
       ? 'gate'
       : prompt.includes('HOLISTIC / ARCHITECTURE lens')
         ? 'holistic'
         : 'claude';
-    calls.push({ prompt, round, worktree: opts?.worktree });
+    calls.push({ historyPacket: opts?.historyPacket, prompt, round, worktree: opts?.worktree });
     if (round === 'gate') return okRun(gateEnvelope(withHolistic));
     if (round === 'holistic') return okRun(HOLISTIC_REVIEW);
     return okRun(CLAUDE_REVIEW);
   };
   return { calls, run };
 }
+
+// A packet as `buildHistoryPacket` returns it — the layer only ever reads `bytes` (does the prompt
+// claim history?) and `files` (what gets seeded into the seat's cwd).
+const HISTORY_FILES = [
+  { contents: '# history/\n', path: 'history/README.md' },
+  { contents: '# log\nabc  2026-07-10T00:00:00Z  Ada  Add the guard\n', path: 'history/log/src/x.ts.log' },
+];
+const HISTORY = { bytes: 60, files: HISTORY_FILES, shallow: false, truncated: false };
+const HISTORY_SHALLOW = { bytes: 0, files: [HISTORY_FILES[0]], shallow: true, truncated: false };
+const claimsHistory = (c: Call): boolean => c.prompt.includes('history/log/<path>.log');
 
 const PACKET: ReviewPacket = { complete: true, objective: 'o', pr: 0, repo: 'r', sections: [] };
 const CODEX: ReviewerConfig = { cmd: 'codex', effort: 'high', id: 'codex', model: 'm', vendor: 'openai' };
@@ -198,6 +213,82 @@ describe('the lens-OFF path is unchanged by the capability fence', () => {
     const gatePrompt = calls.find((c) => c.round === 'gate')!.prompt;
     expect(gatePrompt).not.toContain('Holistic severity is CAPPED');
     fs.rmSync(baseDir, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+});
+
+// THE HISTORY PACKET is orthogonal to the lens: either can be present without the other. It reaches
+// the two PRODUCER seats and never the gate — the gate's authority is grounded in the pinned packet
+// hunks alone (gate-hunks.ts), and a second body of evidence it has no grounding rule for would
+// widen what a verdict may rest on. History informs a finding; it does not adjudicate one.
+describe('the history packet and the lens are INDEPENDENT', () => {
+  it('lens OFF + packet ON: the producer gets it, the gate never does', async () => {
+    const { baseDir, runId } = seed();
+    const wt = seedWorktree();
+    const { calls, run } = makeRunner(false);
+    await runClaudeReviewLayer({ ...layerArgs(baseDir, runId, run), historyPacket: HISTORY, worktree: wt });
+
+    expect(calls.map((c) => c.round)).toEqual(['claude', 'gate']);
+    const claude = calls.find((c) => c.round === 'claude')!;
+    const gate = calls.find((c) => c.round === 'gate')!;
+    expect(claude.historyPacket).toEqual(HISTORY_FILES);
+    expect(claimsHistory(claude)).toBe(true);
+    expect(gate.historyPacket).toBeUndefined();
+    expect(claimsHistory(gate)).toBe(false);
+    fs.rmSync(baseDir, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  it('lens ON + packet OFF: the lens runs exactly as before, claiming no history', async () => {
+    const { baseDir, runId } = seed();
+    const wt = seedWorktree();
+    const { calls, run } = makeRunner(true);
+    const result = await runClaudeReviewLayer({
+      ...layerArgs(baseDir, runId, run),
+      holistic: { baseSha: BASE, config: HOLISTIC_CFG },
+      worktree: wt,
+    });
+
+    expect(calls.map((c) => c.round)).toEqual(['claude', 'holistic', 'gate']);
+    expect(result.holisticSkipped).toBeNull();
+    expect(calls.every((c) => c.historyPacket === undefined)).toBe(true);
+    expect(calls.every((c) => !claimsHistory(c))).toBe(true);
+    fs.rmSync(baseDir, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  it('lens ON + packet ON: both producers get it; a SHALLOW packet is seeded but never claimed', async () => {
+    const { baseDir, runId } = seed();
+    const wt = seedWorktree();
+    const both = makeRunner(true);
+    await runClaudeReviewLayer({
+      ...layerArgs(baseDir, runId, both.run),
+      historyPacket: HISTORY,
+      holistic: { baseSha: BASE, config: HOLISTIC_CFG },
+      worktree: wt,
+    });
+    for (const round of ['claude', 'holistic'] as const) {
+      const c = both.calls.find((x) => x.round === round)!;
+      expect(c.historyPacket).toEqual(HISTORY_FILES);
+      expect(claimsHistory(c)).toBe(true);
+    }
+
+    const shallow = makeRunner(true);
+    const { baseDir: dir2, runId: run2 } = seed();
+    await runClaudeReviewLayer({
+      ...layerArgs(dir2, run2, shallow.run),
+      historyPacket: HISTORY_SHALLOW,
+      holistic: { baseSha: BASE, config: HOLISTIC_CFG },
+      worktree: wt,
+    });
+    // The honest README is still seeded; no prompt points a seat at a history it does not have.
+    for (const round of ['claude', 'holistic'] as const) {
+      const c = shallow.calls.find((x) => x.round === round)!;
+      expect(c.historyPacket).toEqual([HISTORY_FILES[0]]);
+      expect(claimsHistory(c)).toBe(false);
+    }
+    fs.rmSync(baseDir, { force: true, recursive: true });
+    fs.rmSync(dir2, { force: true, recursive: true });
     fs.rmSync(wt, { force: true, recursive: true });
   });
 });

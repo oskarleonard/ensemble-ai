@@ -77,6 +77,13 @@ import {
 } from './modes/review/profile';
 import { formatEvidenceFooter } from './modes/review/seat-evidence';
 import { isPreflightError } from './modes/review/worktree';
+import { execGit } from './modes/review/git-exec';
+import {
+  buildHistoryPacket,
+  type HistoryPacket,
+  historyPacketConfig,
+} from './modes/review/history-packet';
+import { readEnsembleConfig } from './modes/review/ensemble-config';
 import { openWorktree, type WorktreeSession } from './modes/review/worktree-run';
 import {
   computePolicyHash,
@@ -1307,6 +1314,39 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       },
       (m) => console.error(`· ${m}`)
     );
+    // THE HISTORY PACKET (modes/review/history-packet.ts). The capability fence removed Bash from
+    // the Anthropic seats, which took away the `git log`/`git blame` a reviewer genuinely uses. The
+    // ENGINE runs those commands instead and seeds each fenced seat's own cwd with the answers as
+    // read-only data — restoring the acceptance principle (per seat, engine context >= the manual
+    // in-project baseline; the only permitted difference is the sandbox). Worktree runs only: a
+    // packet-mode seat has no repo to read a history out of. Best-effort — a git failure costs a
+    // file and a line in the packet's README, never the review.
+    let historyPacket: HistoryPacket | undefined;
+    if (worktree && result.pinnedDiff) {
+      const { capBytes, logCommits } = historyPacketConfig(readEnsembleConfig());
+      try {
+        historyPacket = buildHistoryPacket({
+          baseSha: worktree.baseSha,
+          capBytes,
+          diff: result.pinnedDiff,
+          git: execGit(),
+          headSha: worktree.headSha,
+          logCommits,
+          strippedInstructionFiles: worktree.strippedInstructionFiles,
+          worktree: worktree.dir,
+        });
+        console.error(
+          historyPacket.shallow
+            ? '· history packet: SKIPPED — this checkout is a shallow clone, so its `git log`/`git blame` would be a misleading fragment; the seats are told nothing about a history they do not have'
+            : `· history packet: ${historyPacket.files.length - 1} file(s), ${historyPacket.bytes} bytes${historyPacket.truncated ? ' (truncated to the cap)' : ''}`
+        );
+      } catch (e) {
+        console.error(
+          `· history packet: could not be built (${(e as Error).message}) — the Anthropic seats review without it`
+        );
+      }
+    }
+
     // The layer's own writes/spawn are best-effort internally, but a residual throw (an
     // unexpected FS/spawn error) must DEGRADE the Opus layer, not crash the whole review
     // after the codex/grok core already completed. Catch it here as a backstop; the
@@ -1324,6 +1364,9 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         gateConfig: gateSeat.config,
         coreReviews: result.reviews,
         expectedHeadSha: result.acquired.headSha,
+        // The `git log`/`git blame` the fence took away, restored as data in each fenced seat's own
+        // cwd. Absent on a packet-mode run, and `bytes: 0` on a shallow clone (README only).
+        ...(historyPacket ? { historyPacket } : {}),
         // The HOLISTIC lens (spec §4) — off unless asked for, and it runs ONLY with worktree
         // evidence: `--holistic` without `--repo` is a LOUD skip, never a packet-evidence
         // architecture claim (resolveHolisticPlan owns that ruling).

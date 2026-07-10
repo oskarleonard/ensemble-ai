@@ -111,6 +111,76 @@ declare function resolveBin(name: string, opts?: {
 
 declare function sha256Hex(input: string): string;
 
+type GitRun = (args: string[], opts?: {
+    cwd?: string;
+    env?: Record<string, string>;
+}) => {
+    error: string;
+    ok: false;
+} | {
+    ok: true;
+    text: string;
+};
+type PreflightErrorKind = 'auth' | 'disallowed-root' | 'lock-contended' | 'materialize-failed' | 'network' | 'no-such-pr' | 'not-a-repo' | 'sha-mismatch' | 'wrong-repo';
+declare const WORKTREE_LOCK_ERROR = "could not acquire the worktree lock";
+interface PreflightError {
+    kind: PreflightErrorKind;
+    message: string;
+}
+interface RepoLocation {
+    fetchUrl: string;
+    repoRoot: string;
+    slug: string;
+}
+declare function isPreflightError(v: unknown): v is PreflightError;
+declare function remoteSlug(url: string): string | null;
+declare function classifyGitError(stderr: string): PreflightErrorKind;
+declare function allowedRootsFromConfig(configPath?: string): string[] | null;
+declare function rootAllowed(repoRoot: string, allowed: string[] | null): boolean;
+declare function resolveRepoLocation(args: {
+    prSlug: string;
+    repoPath: string;
+}, deps: {
+    allowedRoots?: string[] | null;
+    git: GitRun;
+}): PreflightError | RepoLocation;
+interface Worktree {
+    dir: string;
+    headSha: string;
+    strippedInstructionFiles: string[];
+}
+declare const AGENT_INSTRUCTION_NAMES: readonly ["CLAUDE.md", "AGENTS.md", ".claude"];
+declare function stripAgentInstructions(dir: string): string[];
+declare function isStrippedPath(p: string, stripped: readonly string[]): boolean;
+declare function acquireRepoLock(gitCommonDir: string, opts?: {
+    retries?: number;
+    sleepMs?: number;
+    staleMs?: number;
+}): () => void;
+declare function materializeWorktree(args: {
+    headSha: string;
+    location: RepoLocation;
+    pr: number;
+    worktreeRoot?: string;
+}, deps: {
+    git: GitRun;
+    lock?: (gitCommonDir: string) => () => void;
+}): PreflightError | Worktree;
+declare function reapWorktree(repoRoot: string, dir: string, deps: {
+    git: GitRun;
+}): void;
+
+interface HistoryPacketFile {
+    contents: string;
+    path: string;
+}
+interface HistoryPacket {
+    bytes: number;
+    files: HistoryPacketFile[];
+    shallow: boolean;
+    truncated: boolean;
+}
+
 declare const REVIEW_TIMEOUT_MS = 720000;
 interface CodexReviewResult {
     ok: boolean;
@@ -120,6 +190,7 @@ interface CodexReviewResult {
 }
 declare function buildCodexReviewArgs(config: ReviewerConfig, outFile: string, prompt: string): string[];
 interface RunReviewOpts {
+    historyPacket?: readonly HistoryPacketFile[];
     onSpawn?: (kill: () => void) => void;
     timeoutMs?: number;
     worktree?: string;
@@ -329,6 +400,7 @@ interface HolisticPromptArgs {
     baseSha: string;
     diff: string;
     headSha: string;
+    history?: boolean;
     worktree: string;
 }
 declare function renderHolisticPrompt(args: HolisticPromptArgs): string;
@@ -338,6 +410,7 @@ interface RunHolisticLensOptions {
     config: VoiceConfig;
     diff: string;
     headSha: string;
+    historyPacket?: HistoryPacket;
     log?: (m: string) => void;
     run: HolisticRunner;
     timeoutMs?: number;
@@ -718,65 +791,6 @@ interface ReviewModeResult {
 declare const DEFAULT_OBJECTIVE = "Adversarial cross-vendor review of a code diff \u2014 find correctness, security, and convention issues a same-vendor author might miss.";
 declare function runReviewMode(opts: ReviewModeOptions): Promise<ReviewModeResult>;
 
-type GitRun = (args: string[], opts?: {
-    cwd?: string;
-    env?: Record<string, string>;
-}) => {
-    error: string;
-    ok: false;
-} | {
-    ok: true;
-    text: string;
-};
-type PreflightErrorKind = 'auth' | 'disallowed-root' | 'lock-contended' | 'materialize-failed' | 'network' | 'no-such-pr' | 'not-a-repo' | 'sha-mismatch' | 'wrong-repo';
-declare const WORKTREE_LOCK_ERROR = "could not acquire the worktree lock";
-interface PreflightError {
-    kind: PreflightErrorKind;
-    message: string;
-}
-interface RepoLocation {
-    fetchUrl: string;
-    repoRoot: string;
-    slug: string;
-}
-declare function isPreflightError(v: unknown): v is PreflightError;
-declare function remoteSlug(url: string): string | null;
-declare function classifyGitError(stderr: string): PreflightErrorKind;
-declare function allowedRootsFromConfig(configPath?: string): string[] | null;
-declare function rootAllowed(repoRoot: string, allowed: string[] | null): boolean;
-declare function resolveRepoLocation(args: {
-    prSlug: string;
-    repoPath: string;
-}, deps: {
-    allowedRoots?: string[] | null;
-    git: GitRun;
-}): PreflightError | RepoLocation;
-interface Worktree {
-    dir: string;
-    headSha: string;
-    strippedInstructionFiles: string[];
-}
-declare const AGENT_INSTRUCTION_NAMES: readonly ["CLAUDE.md", "AGENTS.md", ".claude"];
-declare function stripAgentInstructions(dir: string): string[];
-declare function isStrippedPath(p: string, stripped: readonly string[]): boolean;
-declare function acquireRepoLock(gitCommonDir: string, opts?: {
-    retries?: number;
-    sleepMs?: number;
-    staleMs?: number;
-}): () => void;
-declare function materializeWorktree(args: {
-    headSha: string;
-    location: RepoLocation;
-    pr: number;
-    worktreeRoot?: string;
-}, deps: {
-    git: GitRun;
-    lock?: (gitCommonDir: string) => () => void;
-}): PreflightError | Worktree;
-declare function reapWorktree(repoRoot: string, dir: string, deps: {
-    git: GitRun;
-}): void;
-
 declare const EVIDENCE_MANIFEST_SCHEMA_VERSION = 1;
 declare const EVIDENCE_MANIFEST_FILE = "evidence-manifest.json";
 interface ManifestBlob {
@@ -811,6 +825,7 @@ interface CodeReviewSeatPromptArgs {
     baseSha: string;
     diff: string;
     headSha: string;
+    history?: boolean;
     worktree: string;
 }
 declare function renderCodeReviewSeatPrompt(args: CodeReviewSeatPromptArgs): string;

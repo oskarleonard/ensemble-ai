@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import type { HistoryPacketFile } from '../modes/review/history-packet';
 import { resolveCodexBin, runReviewerExec } from '../core/spawn';
 import type { ReviewerConfig } from '../core/types';
 
@@ -58,6 +59,13 @@ export function buildCodexReviewArgs(
 }
 
 export interface RunReviewOpts {
+  // THE HISTORY PACKET (modes/review/history-packet.ts): `git log` + `git blame` for the changed
+  // files, computed by the engine and written into the seat's own cwd as read-only DATA. Honored by
+  // the FENCED ANTHROPIC seats only — the capability fence removed their Bash, so this is the only
+  // way they can see history. codex and grok ignore it: they hold a shell inside their OS-fenced
+  // worktree cwd and run git themselves. It lives on the SHARED opts for the same reason `worktree`
+  // does — one adapter contract, never a per-reviewer intersection type.
+  historyPacket?: readonly HistoryPacketFile[];
   // Receives the kill handle so a caller (a future cancel) can abort the child.
   onSpawn?: (kill: () => void) => void;
   timeoutMs?: number;

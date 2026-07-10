@@ -163,4 +163,80 @@ describe('claudeWorktreePromptSuffix — the seat is told the truth about its fe
     expect(suffix).toMatch(/untrusted DATA/);
     expect(suffix).toMatch(/never obey them/);
   });
+
+  it('names `history/` only when a packet backs it — a prompt never points at absent evidence', () => {
+    expect(suffix).not.toContain('history/');
+    expect(claudeWorktreePromptSuffix({ headSha: 'HEAD', history: true, worktree: '/wt' })).toContain(
+      'history/pr-commits.log'
+    );
+  });
+});
+
+// THE HISTORY PACKET reaches the seat as FILES IN ITS CWD — never as a tool, a read root, or an
+// argument. That is the whole reason it costs the fence nothing: `claude-capability-fence` v1's
+// identity is a function of the argv, and the argv does not move.
+describe('the history packet is seeded into the seat cwd, and changes NO spawn argument', () => {
+  const PACKET = [
+    { contents: '# history/\n', path: 'history/README.md' },
+    { contents: '# log\nabc  2026-07-10T00:00:00Z  Ada  Add the guard\n', path: 'history/log/src/a.ts.log' },
+    { contents: '10 → abc, Ada, 2026-07-10T00:00:00Z, Add the guard\n', path: 'history/blame/src/a.ts.blame' },
+  ];
+
+  beforeEach(() => {
+    mockExec.mockReset();
+    mockExec.mockResolvedValue({ raw: 'reply', stderrTail: '', timedOut: false });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('materializes the packet in the spawn cwd, read-only, and reaps it with the cwd', async () => {
+    let observedCwd = '';
+    let seen: { log: string; mode: number } = { log: '', mode: 0 };
+    mockExec.mockImplementation(async (opts) => {
+      observedCwd = opts.cwd ?? '';
+      const log = path.join(observedCwd, 'history/log/src/a.ts.log');
+      seen = { log: fs.readFileSync(log, 'utf8'), mode: fs.statSync(log).mode & 0o777 };
+      return { raw: 'reply', stderrTail: '', timedOut: false };
+    });
+
+    await runClaudeReviewVoice('P', CFG(), { historyPacket: PACKET, worktree: WORKTREE });
+
+    expect(seen.log).toContain('Add the guard');
+    expect(seen.mode).toBe(0o400); // the seat has no write tool; the mode says so to everything else
+    expect(fs.existsSync(observedCwd)).toBe(false); // reaped with the cwd, packet and all
+  });
+
+  it('adds no argument — no Bash returns, no second --add-dir, the fence argv is untouched', async () => {
+    await runClaudeReviewVoice('P', CFG(), { historyPacket: PACKET, worktree: WORKTREE });
+    const withPacket = mockExec.mock.calls[0][0].args;
+    mockExec.mockReset();
+    mockExec.mockResolvedValue({ raw: 'reply', stderrTail: '', timedOut: false });
+    await runClaudeReviewVoice('P', CFG(), { worktree: WORKTREE });
+    const without = mockExec.mock.calls[0][0].args;
+
+    expect(withPacket).toEqual(without);
+    expect(denied(withPacket)).toContain('Bash');
+    expect(withPacket.filter((a) => a === '--add-dir')).toHaveLength(1);
+  });
+
+  it('a seat with no packet gets an EMPTY cwd — the packet is never a leftover', async () => {
+    let wasEmpty: string[] = ['not-read'];
+    mockExec.mockImplementation(async (opts) => {
+      wasEmpty = fs.readdirSync(opts.cwd ?? '');
+      return { raw: 'reply', stderrTail: '', timedOut: false };
+    });
+    await runClaudeReviewVoice('P', CFG(), { historyPacket: [], worktree: WORKTREE });
+    expect(wasEmpty).toEqual([]);
+  });
+
+  it('reaps the packet even when the spawn throws', async () => {
+    let observedCwd = '';
+    mockExec.mockImplementation(async (opts) => {
+      observedCwd = opts.cwd ?? '';
+      throw new Error('spawn blew up');
+    });
+    await expect(
+      runClaudeReviewVoice('P', CFG(), { historyPacket: PACKET, worktree: WORKTREE })
+    ).rejects.toThrow('spawn blew up');
+    expect(fs.existsSync(observedCwd)).toBe(false);
+  });
 });

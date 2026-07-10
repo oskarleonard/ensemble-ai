@@ -131,6 +131,18 @@ describe('renderHolisticPrompt — every clause the host mechanizes', () => {
   it('permits an empty result — finding nothing is legitimate', () => {
     expect(prompt).toContain('Finding nothing is a legitimate outcome');
   });
+
+  // "Is this a reinvention, or the deliberate replacement of the util three commits ago?" is a
+  // question only history answers — and the fence took the lens's shell away (./history-packet).
+  it('names `history/` only when a packet backs it', () => {
+    expect(prompt).not.toContain('history/');
+    const withHistory = renderHolisticPrompt({
+      baseSha: 'BASE', diff: 'DIFFTEXT', headSha: 'HEAD', history: true, worktree: '/wt',
+    });
+    expect(withHistory).toContain('history/log/<path>.log');
+    expect(withHistory).toContain('untrusted DATA');
+    expect(withHistory).not.toMatch(/\brun `?git log\b/i);
+  });
 });
 
 describe('runHolisticLens — the seat run', () => {
@@ -153,6 +165,27 @@ describe('runHolisticLens — the seat run', () => {
     expect(review.ok).toBe(true);
     expect(review.findings).toHaveLength(1);
     expect(run).toHaveBeenCalledOnce();
+  });
+
+  it('hands the packet FILES to the seat, and claims history in the prompt only when it has bytes', async () => {
+    const files = [{ contents: '# history/\n', path: 'history/README.md' }];
+    const seen: Array<{ history: boolean; packet: unknown }> = [];
+    const run = vi.fn(async (p: string, _c: VoiceConfig, opts?: { historyPacket?: unknown }) => {
+      seen.push({ history: p.includes('history/log/<path>.log'), packet: opts?.historyPacket });
+      return okRun('```json\n{"summary":"s","findings":[]}\n```');
+    });
+    const base = { baseSha: 'B', config: CFG, diff: 'DIFFTEXT', headSha: 'H', run, worktree: '/wt' };
+
+    await runHolisticLens({ ...base, historyPacket: { bytes: 42, files, shallow: false, truncated: false } });
+    await runHolisticLens({ ...base, historyPacket: { bytes: 0, files, shallow: true, truncated: false } });
+    await runHolisticLens(base);
+
+    // A real packet: files seeded AND the clause rendered.
+    expect(seen[0]).toEqual({ history: true, packet: files });
+    // A SHALLOW packet is README-only: the honest note is still seeded, but the prompt claims nothing.
+    expect(seen[1]).toEqual({ history: false, packet: files });
+    // No packet at all: the lens runs exactly as it did before this existed.
+    expect(seen[2]).toEqual({ history: false, packet: undefined });
   });
 
   it('degrades a throw / timeout / unparseable reply to an ok:false voice, never a throw', async () => {
