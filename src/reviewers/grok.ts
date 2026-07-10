@@ -278,9 +278,11 @@ export async function runGrokReview(
   // has NO grok counterpart, and this documents why, verified rather than assumed (the task: verify,
   // document, change nothing):
   //   · VERIFIED sandboxed on every path: buildGrokReviewArgs passes `--sandbox` unconditionally and
-  //     resolveReviewSandbox floors it at `ensemble-review` (`strict` base), so a PACKET review runs
-  //     under the same deny-by-default read profile + secret deny-list as a worktree one —
-  //     credentials in $HOME are kernel-unreadable to it.
+  //     resolveReviewSandbox floors it at a DENY-BY-DEFAULT profile (`strict` base — bare `strict` or
+  //     `ensemble-review`), so a PACKET review runs deny-by-default reads: credentials in $HOME are
+  //     kernel-unreadable to it. (The `ensemble-review` secret deny-list is belt-and-suspenders for
+  //     secrets INSIDE the cwd; a packet cwd is a throwaway with the diff in the prompt, so a bare-
+  //     `strict` resolution loses nothing that matters to the packet threat model.)
   //   · The codex hole has NO analog here: codex's packet seat loaded the operator's
   //     ~/.codex/config.toml `[mcp_servers]` (an OAuth-credentialed mcp.supabase.com) — the reason it
   //     now passes `--ignore-user-config`. grok loads no such server: `grok mcp list` is empty
