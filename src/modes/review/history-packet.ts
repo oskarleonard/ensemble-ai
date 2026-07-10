@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { escapesRoot } from '../../core/artifacts';
+
 import { asRecord } from './ensemble-config';
 import { type Hunk, parsePacketHunks } from './gate-hunks';
 import { type GitRun, isStrippedPath } from './worktree';
@@ -103,6 +105,13 @@ export interface HistoryPacket {
   shallow: boolean;
   // Some entry was cut by the cap (or dropped whole). Every cut file carries its own marker.
   truncated: boolean;
+}
+
+// TRUE when the packet carries readable DATA. A shallow checkout yields a README and nothing else
+// (`bytes: 0`), and a prompt must never name evidence the seat cannot open. ONE definition — this
+// module owns `bytes` — so every seat asks the packet the same question.
+export function historyPacketHasData(packet?: HistoryPacket): boolean {
+  return (packet?.bytes ?? 0) > 0;
 }
 
 // ── git plumbing ──────────────────────────────────────────────────────────────────────
@@ -225,18 +234,32 @@ function renderEntry(e: PacketEntry): string {
   return `${lines.join('\n')}\n`;
 }
 
-function entryBytes(e: PacketEntry): number {
-  return Buffer.byteLength(renderEntry(e), 'utf8');
+// `renderEntry` stays the ONE definition of an entry's byte size — the cap loop measures THROUGH it
+// rather than duplicating the layout math. Memoized per (entry, `keep`): each pass of the loop
+// mutates exactly one entry, so without a cache every `twoLargest` scan re-renders every entry it
+// merely compares — quadratic in the entry count, on precisely the large packets that reach the cap.
+function entrySizer(): (e: PacketEntry) => number {
+  const cache = new Map<PacketEntry, { bytes: number; keep: number }>();
+  return (e) => {
+    const hit = cache.get(e);
+    if (hit?.keep === e.keep) return hit.bytes;
+    const bytes = Buffer.byteLength(renderEntry(e), 'utf8');
+    cache.set(e, { bytes, keep: e.keep });
+    return bytes;
+  };
 }
 
 // The two biggest entries, by bytes then by path (a deterministic tie-break: the same inputs must
 // always truncate the same files). O(n) — the cap loop runs this many times.
-function twoLargest(entries: readonly PacketEntry[]): { second: number; top: PacketEntry | null } {
+function twoLargest(
+  entries: readonly PacketEntry[],
+  sizeOf: (e: PacketEntry) => number
+): { second: number; top: PacketEntry | null } {
   let top: PacketEntry | null = null;
   let topBytes = -1;
   let second = 0;
   for (const e of entries) {
-    const bytes = entryBytes(e);
+    const bytes = sizeOf(e);
     if (bytes > topBytes || (bytes === topBytes && top && e.path < top.path)) {
       if (top) second = Math.max(second, topBytes);
       top = e;
@@ -261,26 +284,27 @@ function enforceCap(
   capBytes: number
 ): { dropped: string[]; truncated: boolean } {
   const dropped: string[] = [];
+  const sizeOf = entrySizer();
   let truncated = false;
-  let total = entries.reduce((n, e) => n + entryBytes(e), 0);
+  let total = entries.reduce((n, e) => n + sizeOf(e), 0);
   while (total > capBytes && entries.length > 0) {
     const shrinkable = entries.filter((e) => e.keep > 0);
     if (shrinkable.length > 0) {
-      const { second, top } = twoLargest(shrinkable);
+      const { second, top } = twoLargest(shrinkable, sizeOf);
       if (!top) break;
-      const before = entryBytes(top);
+      const before = sizeOf(top);
       const floor = Math.max(second, before - (total - capBytes));
       // Always drop at least one unit: when the two largest entries are the same size, `floor`
       // equals `before` and a purely floor-driven loop would never make progress.
       top.keep--;
-      while (top.keep > 0 && entryBytes(top) > floor) top.keep--;
+      while (top.keep > 0 && sizeOf(top) > floor) top.keep--;
       truncated = true;
-      total += entryBytes(top) - before;
+      total += sizeOf(top) - before;
       continue;
     }
-    const { top } = twoLargest(entries);
+    const { top } = twoLargest(entries, sizeOf);
     if (!top) break;
-    total -= entryBytes(top);
+    total -= sizeOf(top);
     entries.splice(entries.indexOf(top), 1);
     dropped.push(top.path);
     truncated = true;
@@ -497,11 +521,12 @@ export function buildHistoryPacket(args: BuildHistoryPacketArgs): HistoryPacket 
 
 // Resolve `rel` inside `root`, or null if it escapes. git never emits a `..` path component, so
 // this can only fire on a bug — which is exactly when a seat's cwd must not become a write primitive
-// aimed at the rest of the disk.
+// aimed at the rest of the disk. Containment uses the trail's own `escapesRoot`, so the path-escape
+// rule cannot drift; the extra `back !== ''` rejects `root` itself, which is not a file to write.
 function containedPath(root: string, rel: string): string | null {
   const abs = path.resolve(root, rel);
   const back = path.relative(path.resolve(root), abs);
-  return back && !back.startsWith('..') && !path.isAbsolute(back) ? abs : null;
+  return back !== '' && !escapesRoot(back) ? abs : null;
 }
 
 // Materialize the packet into a seat's neutral cwd, READ-ONLY (0400): the seat has no write tool,

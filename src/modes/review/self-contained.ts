@@ -34,7 +34,7 @@ import {
   runHolisticLens,
 } from './holistic';
 import { worktreeReader } from './holistic-gate';
-import type { HistoryPacket } from './history-packet';
+import { type HistoryPacket, historyPacketHasData } from './history-packet';
 import type { ReviewProfile } from './profile';
 import { type ReviewSynthesis, type VoiceReview } from './synthesis';
 import { reviewJsonFromTrail } from './trail-io';
@@ -325,7 +325,7 @@ export async function runClaudeReviewLayer(
   const isCodeProfile = (opts.profile ?? 'code') === 'code';
   // The `history/` clause is rendered iff the packet carries DATA — a prompt must never name
   // evidence the seat cannot open (a shallow clone yields a README and nothing else).
-  const hasHistory = (opts.historyPacket?.bytes ?? 0) > 0;
+  const hasHistory = historyPacketHasData(opts.historyPacket);
   const producerPrompt = !opts.worktree
     ? opts.reviewPrompt
     : isCodeProfile && opts.baseSha && opts.pinnedDiff
