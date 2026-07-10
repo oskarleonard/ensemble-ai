@@ -2783,8 +2783,8 @@ function clampSeverity(original, rescored) {
   if (!rescored || rescored === original) return null;
   return SEVERITIES.indexOf(rescored) > SEVERITIES.indexOf(original) ? rescored : null;
 }
-function deriveSuggestion(suggestion, verdict, fixStatus, allowed) {
-  if (!suggestion || verdict !== "agree" || fixStatus !== "keep") return null;
+function deriveSuggestion(suggestion, fixStatus, allowed) {
+  if (!suggestion || fixStatus !== "keep") return null;
   const replacement = suggestion.replacement.replace(/\s+$/, "");
   if (!replacement.trim()) return null;
   if (replacement.length > SUGGESTION_CHAR_CAP) return null;
@@ -2808,7 +2808,7 @@ function derivePostable(input) {
       postableBody: trimmed,
       postableFix: fix,
       postableStatus: "postable",
-      postableSuggestion: deriveSuggestion(input.suggestion, verdict, fix, allowedTokens(trimmed, hunkCode)),
+      postableSuggestion: deriveSuggestion(input.suggestion, fix, allowedTokens(trimmed, hunkCode)),
       rescoredSeverity: null
     };
   }
@@ -4480,10 +4480,23 @@ function postReviewComment(body, target, opts) {
   return result;
 }
 
-// src/modes/review/posting-config.ts
+// src/modes/review/ensemble-config.ts
 import fs13 from "fs";
 import os7 from "os";
 import path10 from "path";
+var ENSEMBLE_CONFIG_PATH = path10.join(os7.homedir(), ".ensemble-ai", "config.json");
+function asRecord(v) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+}
+function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
+  try {
+    return asRecord(JSON.parse(fs13.readFileSync(configPath, "utf8"))) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+// src/modes/review/posting-config.ts
 var SUGGESTION_HARD_CAP = 3;
 var MAX_SUGGESTION_LINES_CEILING = 10;
 var DEFAULT_POSTURE = {
@@ -4495,25 +4508,17 @@ function clampInt(v, lo, hi, fallback) {
   if (typeof v !== "number" || !Number.isFinite(v)) return fallback;
   return Math.min(hi, Math.max(lo, Math.trunc(v)));
 }
-function parseSeverityFloor(v, fallback) {
-  return typeof v === "string" && SEVERITIES.includes(v) ? v : fallback;
-}
 function resolvePosture(raw) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ...DEFAULT_POSTURE };
-  const o = raw;
+  const o = asRecord(raw);
+  if (!o) return { ...DEFAULT_POSTURE };
   return {
-    inlineSeverityFloor: parseSeverityFloor(o.inlineSeverityFloor, DEFAULT_POSTURE.inlineSeverityFloor),
+    inlineSeverityFloor: oneOf(SEVERITIES, o.inlineSeverityFloor, DEFAULT_POSTURE.inlineSeverityFloor),
     maxSuggestionLines: clampInt(o.maxSuggestionLines, 1, MAX_SUGGESTION_LINES_CEILING, DEFAULT_POSTURE.maxSuggestionLines),
     suggestionCap: clampInt(o.suggestionCap, 0, SUGGESTION_HARD_CAP, DEFAULT_POSTURE.suggestionCap)
   };
 }
-function loadPostingPosture(profile, configPath = path10.join(os7.homedir(), ".ensemble-ai", "config.json")) {
-  try {
-    const raw = JSON.parse(fs13.readFileSync(configPath, "utf8"));
-    return resolvePosture(raw.posting?.[profile]);
-  } catch {
-    return { ...DEFAULT_POSTURE };
-  }
+function loadPostingPosture(profile, configPath) {
+  return resolvePosture(asRecord(readEnsembleConfig(configPath).posting)?.[profile]);
 }
 function meetsInlineFloor(severity, floor) {
   return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf(floor);
@@ -5448,31 +5453,6 @@ function resolveDiffSourceForCommand(values, positionals, cmd, cwd) {
   if ("code" in resolved) return resolved;
   return { ...resolved, postTarget: postTargetFromSelection(selection) };
 }
-function ghPostRunner(cwd) {
-  return (args, body) => {
-    try {
-      const out = execFileSync3("gh", args, {
-        cwd,
-        encoding: "utf8",
-        input: body,
-        maxBuffer: 16 * 1024 * 1024,
-        timeout: 12e4
-      });
-      const url = out.split("\n").map((l) => l.trim()).filter(Boolean).pop();
-      return url && /^https?:\/\//.test(url) ? { ok: true, url } : { ok: true };
-    } catch (e) {
-      const err = e;
-      if (err.code === "ENOENT") {
-        return {
-          error: "the `gh` CLI is not on PATH \u2014 install GitHub CLI and run `gh auth login`",
-          ok: false
-        };
-      }
-      const stderr = err.stderr ? String(err.stderr).trim().slice(0, 500) : "";
-      return { error: stderr || err.message || "gh pr comment failed", ok: false };
-    }
-  };
-}
 function ghRunner(cwd) {
   return (args, input) => {
     try {
@@ -5494,12 +5474,21 @@ function ghRunner(cwd) {
     }
   };
 }
+function ghPostRunner(cwd) {
+  const gh = ghRunner(cwd);
+  return (args, body) => {
+    const res = gh(args, body);
+    if (!res.ok) return res;
+    const url = res.text.split("\n").map((l) => l.trim()).filter(Boolean).pop();
+    return url && /^https?:\/\//.test(url) ? { ok: true, url } : { ok: true };
+  };
+}
+function repoSlugFromCwd(gh) {
+  const res = gh(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
+  return res.ok ? res.text.trim() : "";
+}
 function resolveStageTarget(target, gh) {
-  const slug2 = target.repoSlug ?? (() => {
-    const res = gh(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
-    return res.ok ? res.text.trim() : "";
-  })();
-  const [owner, repo] = slug2.split("/");
+  const [owner, repo] = (target.repoSlug ?? repoSlugFromCwd(gh)).split("/");
   return owner && repo ? { owner, pr: target.pr, repo } : null;
 }
 function toCommentGateSeat(seat) {
@@ -6790,10 +6779,7 @@ async function pushFenceCommand(args) {
     console.error(`ensemble-ai push-fence: could not parse gh output \u2014 ${e.message}`);
     return 3;
   }
-  const base = selection.owner && selection.repo ? `${selection.owner}/${selection.repo}` : (() => {
-    const nwo = gh(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
-    return nwo.ok ? nwo.text.trim() : "";
-  })();
+  const base = selection.owner && selection.repo ? `${selection.owner}/${selection.repo}` : repoSlugFromCwd(gh);
   const perm = base ? gh(["api", `repos/${base}`, "--jq", ".permissions.push"]) : { error: "no repo", ok: false };
   const canPush = perm.ok && perm.text.trim() === "true";
   const verdict = evaluatePushFence(parsePushContext(prJson, canPush), base || `PR #${selection.pr}`);

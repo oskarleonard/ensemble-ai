@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { readEnsembleConfig } from './ensemble-config';
+
 // WORKTREE EVIDENCE MODE — materialize the PR head as a detached, read-only worktree of a repo
 // the user ALREADY has cloned, so a seat sees the whole project the way Oskar does manually,
 // without ever touching his checkout (spec §1).
@@ -92,20 +94,12 @@ export function classifyGitError(stderr: string): PreflightErrorKind {
 // from CONSUMER CONFIG — never engine-baked. ensemble-ai is public MIT: a baked denylist would
 // publish the very repo names it fences. No config ⇒ no engine policy ⇒ allow (the fence is the
 // consumer's to declare, and its absence must not silently block every user).
-export function allowedRootsFromConfig(
-  configPath = path.join(os.homedir(), '.ensemble-ai', 'config.json')
-): string[] | null {
-  try {
-    const raw = JSON.parse(fs.readFileSync(configPath, 'utf8')) as {
-      allowedRepoRoots?: unknown;
-    };
-    const roots = raw.allowedRepoRoots;
-    if (!Array.isArray(roots) || roots.length === 0) return null;
-    const strs = roots.filter((r): r is string => typeof r === 'string' && r.trim().length > 0);
-    return strs.length > 0 ? strs.map((r) => path.resolve(r)) : null;
-  } catch {
-    return null; // absent / unreadable / malformed → no consumer policy declared
-  }
+// Absent / unreadable / malformed config → no consumer policy declared → null.
+export function allowedRootsFromConfig(configPath?: string): string[] | null {
+  const roots = readEnsembleConfig(configPath).allowedRepoRoots;
+  if (!Array.isArray(roots) || roots.length === 0) return null;
+  const strs = roots.filter((r): r is string => typeof r === 'string' && r.trim().length > 0);
+  return strs.length > 0 ? strs.map((r) => path.resolve(r)) : null;
 }
 
 // Is `repoRoot` inside one of the allowed roots? Compared on RESOLVED paths with a separator

@@ -1,9 +1,7 @@
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-
+import { oneOf } from '../../core/findings';
 import { SEVERITIES, type Severity } from '../../core/types';
 
+import { asRecord, readEnsembleConfig } from './ensemble-config';
 import type { ReviewProfile } from './profile';
 
 // THE POSTING POSTURE — per-profile thresholds, read from CONSUMER CONFIG (spec §6, §Open's
@@ -44,19 +42,13 @@ function clampInt(v: unknown, lo: number, hi: number, fallback: number): number 
   return Math.min(hi, Math.max(lo, Math.trunc(v)));
 }
 
-function parseSeverityFloor(v: unknown, fallback: Severity): Severity {
-  return typeof v === 'string' && (SEVERITIES as readonly string[]).includes(v)
-    ? (v as Severity)
-    : fallback;
-}
-
 // PURE: fold one raw config object into a posture, clamping every field. Exported so the clamping
 // is testable without touching the filesystem.
 export function resolvePosture(raw: unknown): PostingPosture {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ...DEFAULT_POSTURE };
-  const o = raw as Record<string, unknown>;
+  const o = asRecord(raw);
+  if (!o) return { ...DEFAULT_POSTURE };
   return {
-    inlineSeverityFloor: parseSeverityFloor(o.inlineSeverityFloor, DEFAULT_POSTURE.inlineSeverityFloor),
+    inlineSeverityFloor: oneOf(SEVERITIES, o.inlineSeverityFloor, DEFAULT_POSTURE.inlineSeverityFloor),
     maxSuggestionLines: clampInt(o.maxSuggestionLines, 1, MAX_SUGGESTION_LINES_CEILING, DEFAULT_POSTURE.maxSuggestionLines),
     suggestionCap: clampInt(o.suggestionCap, 0, SUGGESTION_HARD_CAP, DEFAULT_POSTURE.suggestionCap),
   };
@@ -64,16 +56,8 @@ export function resolvePosture(raw: unknown): PostingPosture {
 
 // Read the posture for one profile from the consumer's config. Unreadable / absent / malformed ⇒
 // the defaults (an ensemble-ai user with no config file must still be able to stage a review).
-export function loadPostingPosture(
-  profile: ReviewProfile,
-  configPath = path.join(os.homedir(), '.ensemble-ai', 'config.json')
-): PostingPosture {
-  try {
-    const raw = JSON.parse(fs.readFileSync(configPath, 'utf8')) as { posting?: Record<string, unknown> };
-    return resolvePosture(raw.posting?.[profile]);
-  } catch {
-    return { ...DEFAULT_POSTURE };
-  }
+export function loadPostingPosture(profile: ReviewProfile, configPath?: string): PostingPosture {
+  return resolvePosture(asRecord(readEnsembleConfig(configPath).posting)?.[profile]);
 }
 
 // Is `severity` at least as severe as the floor? SEVERITIES is ordered most-severe-first, so a

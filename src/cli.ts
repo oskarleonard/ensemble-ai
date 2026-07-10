@@ -794,47 +794,12 @@ function resolveDiffSourceForCommand(
   return { ...resolved, postTarget: postTargetFromSelection(selection) };
 }
 
-// The default `--post-comment` exec: `gh pr comment … --body-file -` with the rendered comment on
-// gh's stdin. Injectable (PostRunner) so the post path is unit-tested WITHOUT spawning gh. gh
-// absent (ENOENT), unauthenticated, or a failed post all RETURN {ok:false} with a clear message —
-// postReviewComment turns that into a loud warning and never throws, so posting can never change
-// the review's exit code.
-function ghPostRunner(cwd: string): PostRunner {
-  return (args, body) => {
-    try {
-      const out = execFileSync('gh', args, {
-        cwd,
-        encoding: 'utf8',
-        input: body,
-        maxBuffer: 16 * 1024 * 1024,
-        timeout: 120_000,
-      });
-      // gh prints the created comment's URL on success — surface it in the confirmation line.
-      const url = out
-        .split('\n')
-        .map((l) => l.trim())
-        .filter(Boolean)
-        .pop();
-      return url && /^https?:\/\//.test(url) ? { ok: true, url } : { ok: true };
-    } catch (e) {
-      const err = e as { code?: string; message?: string; stderr?: Buffer | string };
-      if (err.code === 'ENOENT') {
-        return {
-          error: 'the `gh` CLI is not on PATH — install GitHub CLI and run `gh auth login`',
-          ok: false,
-        };
-      }
-      // Bound the excerpt (gh's stderr can be up to maxBuffer) so a huge error can't become a
-      // multi-MB warning line — same capping discipline as every other rendered excerpt.
-      const stderr = err.stderr ? String(err.stderr).trim().slice(0, 500) : '';
-      return { error: stderr || err.message || 'gh pr comment failed', ok: false };
-    }
-  };
-}
-
-// The `gh` exec seam shared by `--stage` and `push-fence`: run `gh <args>` with an optional JSON
-// body on stdin. Injectable at the call sites' boundary (stageReview takes a GhRunner) so the
-// staging state machine is unit-tested without spawning gh.
+// THE ONE `gh` exec seam — shared by `--post-comment`, `--stage`, and `push-fence`: run
+// `gh <args>` with an optional body on stdin. Injectable at the call sites' boundary (stageReview
+// takes a GhRunner, postReviewComment a PostRunner) so every state machine over it is unit-tested
+// without spawning gh. gh absent (ENOENT), unauthenticated, or a failed call all RETURN
+// {ok:false} with a clear message — no caller throws. The stderr excerpt is bounded so a huge gh
+// error can't become a multi-MB warning line.
 function ghRunner(cwd: string): GhRunner {
   return (args, input) => {
     try {
@@ -857,16 +822,35 @@ function ghRunner(cwd: string): GhRunner {
   };
 }
 
+// `--post-comment`'s exec: `gh pr comment … --body-file -` with the rendered comment on gh's
+// stdin. Only the SUCCESS mapping differs from the seam above — gh prints the created comment's
+// URL, which the confirmation line surfaces. postReviewComment turns a failure into a loud warning
+// and never throws, so posting can never change the review's exit code.
+function ghPostRunner(cwd: string): PostRunner {
+  const gh = ghRunner(cwd);
+  return (args, body) => {
+    const res = gh(args, body);
+    if (!res.ok) return res;
+    const url = res.text
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .pop();
+    return url && /^https?:\/\//.test(url) ? { ok: true, url } : { ok: true };
+  };
+}
+
+// The cwd repo's `owner/repo`, resolved the way `gh` itself would. `''` ⇒ not a GitHub repo, or gh
+// failed; every caller treats that as "could not resolve" and refuses.
+function repoSlugFromCwd(gh: GhRunner): string {
+  const res = gh(['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner']);
+  return res.ok ? res.text.trim() : '';
+}
+
 // A staged review addresses the GitHub API by `owner/repo`, which a bare `--pr <N>` does not carry
-// (it targets the cwd's repo). Resolve it the same way `gh` itself would. Null ⇒ report and refuse.
+// (it targets the cwd's repo). Null ⇒ report and refuse.
 function resolveStageTarget(target: PostTarget, gh: GhRunner): StageTarget | null {
-  const slug =
-    target.repoSlug ??
-    (() => {
-      const res = gh(['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner']);
-      return res.ok ? res.text.trim() : '';
-    })();
-  const [owner, repo] = slug.split('/');
+  const [owner, repo] = (target.repoSlug ?? repoSlugFromCwd(gh)).split('/');
   return owner && repo ? { owner, pr: target.pr, repo } : null;
 }
 
@@ -2532,12 +2516,8 @@ async function pushFenceCommand(args: string[]): Promise<number> {
   }
   // The BASE repo is where a same-repo PR's head branch lives, so its `permissions.push` IS the
   // "can I push to the head ref?" fact. A cross-repo PR refuses before this matters.
-  const base = selection.owner && selection.repo
-    ? `${selection.owner}/${selection.repo}`
-    : (() => {
-        const nwo = gh(['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner']);
-        return nwo.ok ? nwo.text.trim() : '';
-      })();
+  const base =
+    selection.owner && selection.repo ? `${selection.owner}/${selection.repo}` : repoSlugFromCwd(gh);
   const perm = base ? gh(['api', `repos/${base}`, '--jq', '.permissions.push']) : { error: 'no repo', ok: false as const };
   const canPush = perm.ok && perm.text.trim() === 'true';
   const verdict = evaluatePushFence(parsePushContext(prJson, canPush), base || `PR #${selection.pr}`);

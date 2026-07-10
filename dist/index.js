@@ -2154,9 +2154,27 @@ function writeEvidenceManifest(baseDir, runId, manifest) {
 
 // src/modes/review/worktree.ts
 import { randomUUID } from "crypto";
+import fs12 from "fs";
+import os8 from "os";
+import path11 from "path";
+
+// src/modes/review/ensemble-config.ts
 import fs11 from "fs";
 import os7 from "os";
 import path10 from "path";
+var ENSEMBLE_CONFIG_PATH = path10.join(os7.homedir(), ".ensemble-ai", "config.json");
+function asRecord(v) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+}
+function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
+  try {
+    return asRecord(JSON.parse(fs11.readFileSync(configPath, "utf8"))) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+// src/modes/review/worktree.ts
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
 }
@@ -2180,27 +2198,22 @@ function classifyGitError(stderr) {
   }
   return "network";
 }
-function allowedRootsFromConfig(configPath = path10.join(os7.homedir(), ".ensemble-ai", "config.json")) {
-  try {
-    const raw = JSON.parse(fs11.readFileSync(configPath, "utf8"));
-    const roots = raw.allowedRepoRoots;
-    if (!Array.isArray(roots) || roots.length === 0) return null;
-    const strs = roots.filter((r) => typeof r === "string" && r.trim().length > 0);
-    return strs.length > 0 ? strs.map((r) => path10.resolve(r)) : null;
-  } catch {
-    return null;
-  }
+function allowedRootsFromConfig(configPath) {
+  const roots = readEnsembleConfig(configPath).allowedRepoRoots;
+  if (!Array.isArray(roots) || roots.length === 0) return null;
+  const strs = roots.filter((r) => typeof r === "string" && r.trim().length > 0);
+  return strs.length > 0 ? strs.map((r) => path11.resolve(r)) : null;
 }
 function rootAllowed(repoRoot, allowed) {
   if (!allowed) return true;
-  const real = path10.resolve(repoRoot);
+  const real = path11.resolve(repoRoot);
   return allowed.some((root) => {
-    const rel = path10.relative(root, real);
-    return rel === "" || !rel.startsWith("..") && !path10.isAbsolute(rel);
+    const rel = path11.relative(root, real);
+    return rel === "" || !rel.startsWith("..") && !path11.isAbsolute(rel);
   });
 }
 function resolveRepoLocation(args, deps) {
-  const repoPath = path10.resolve(args.repoPath);
+  const repoPath = path11.resolve(args.repoPath);
   const top = deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
   if (!top.ok) {
     return {
@@ -2251,26 +2264,26 @@ function lockToken() {
 }
 function removeLockIfOwned(lock, token) {
   try {
-    if (fs11.readFileSync(lock, "utf8").trim() === token) fs11.unlinkSync(lock);
+    if (fs12.readFileSync(lock, "utf8").trim() === token) fs12.unlinkSync(lock);
   } catch {
   }
 }
 function acquireRepoLock(gitCommonDir, opts = {}) {
-  const lock = path10.join(gitCommonDir, "ensemble-ai-worktree.lock");
+  const lock = path11.join(gitCommonDir, "ensemble-ai-worktree.lock");
   const sleepMs = opts.sleepMs ?? 500;
   const staleMs = opts.staleMs ?? 10 * 6e4;
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
     try {
-      const fd = fs11.openSync(lock, fs11.constants.O_CREAT | fs11.constants.O_EXCL | fs11.constants.O_WRONLY, 384);
-      fs11.writeSync(fd, token);
-      fs11.closeSync(fd);
+      const fd = fs12.openSync(lock, fs12.constants.O_CREAT | fs12.constants.O_EXCL | fs12.constants.O_WRONLY, 384);
+      fs12.writeSync(fd, token);
+      fs12.closeSync(fd);
       return () => removeLockIfOwned(lock, token);
     } catch {
       try {
-        const held = fs11.readFileSync(lock, "utf8").trim();
-        const age = Date.now() - fs11.statSync(lock).mtimeMs;
+        const held = fs12.readFileSync(lock, "utf8").trim();
+        const age = Date.now() - fs12.statSync(lock).mtimeMs;
         if (age > staleMs) removeLockIfOwned(lock, held);
       } catch {
       }
@@ -2287,7 +2300,7 @@ function materializeWorktree(args, deps) {
   if (!common.ok) {
     return { kind: "not-a-repo", message: `cannot resolve the git dir of ${location.repoRoot}` };
   }
-  const gitCommonDir = path10.resolve(location.repoRoot, common.text.trim());
+  const gitCommonDir = path11.resolve(location.repoRoot, common.text.trim());
   const release = (deps.lock ?? acquireRepoLock)(gitCommonDir);
   let dir = null;
   try {
@@ -2306,8 +2319,8 @@ function materializeWorktree(args, deps) {
     if (!fetched.ok) {
       return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${location.fetchUrl} failed: ${fetched.error.trim()}` };
     }
-    dir = fs11.mkdtempSync(path10.join(args.worktreeRoot ?? os7.tmpdir(), "ensemble-worktree-"));
-    fs11.rmSync(dir, { recursive: true, force: true });
+    dir = fs12.mkdtempSync(path11.join(args.worktreeRoot ?? os8.tmpdir(), "ensemble-worktree-"));
+    fs12.rmSync(dir, { recursive: true, force: true });
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", "--no-recurse-submodules", dir, args.headSha],
       { cwd: location.repoRoot, env: INERT_ENV }
@@ -2340,7 +2353,7 @@ function reapWorktree(repoRoot, dir, deps) {
   } catch {
   }
   try {
-    fs11.rmSync(dir, { force: true, recursive: true });
+    fs12.rmSync(dir, { force: true, recursive: true });
   } catch {
   }
   try {
@@ -2373,9 +2386,6 @@ ${SCHEMA_BLOCK}`;
 }
 
 // src/modes/review/posting-config.ts
-import fs12 from "fs";
-import os8 from "os";
-import path11 from "path";
 var SUGGESTION_HARD_CAP = 3;
 var MAX_SUGGESTION_LINES_CEILING = 10;
 var DEFAULT_POSTURE = {
@@ -2387,25 +2397,17 @@ function clampInt(v, lo, hi, fallback) {
   if (typeof v !== "number" || !Number.isFinite(v)) return fallback;
   return Math.min(hi, Math.max(lo, Math.trunc(v)));
 }
-function parseSeverityFloor(v, fallback) {
-  return typeof v === "string" && SEVERITIES.includes(v) ? v : fallback;
-}
 function resolvePosture(raw) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ...DEFAULT_POSTURE };
-  const o = raw;
+  const o = asRecord(raw);
+  if (!o) return { ...DEFAULT_POSTURE };
   return {
-    inlineSeverityFloor: parseSeverityFloor(o.inlineSeverityFloor, DEFAULT_POSTURE.inlineSeverityFloor),
+    inlineSeverityFloor: oneOf(SEVERITIES, o.inlineSeverityFloor, DEFAULT_POSTURE.inlineSeverityFloor),
     maxSuggestionLines: clampInt(o.maxSuggestionLines, 1, MAX_SUGGESTION_LINES_CEILING, DEFAULT_POSTURE.maxSuggestionLines),
     suggestionCap: clampInt(o.suggestionCap, 0, SUGGESTION_HARD_CAP, DEFAULT_POSTURE.suggestionCap)
   };
 }
-function loadPostingPosture(profile, configPath = path11.join(os8.homedir(), ".ensemble-ai", "config.json")) {
-  try {
-    const raw = JSON.parse(fs12.readFileSync(configPath, "utf8"));
-    return resolvePosture(raw.posting?.[profile]);
-  } catch {
-    return { ...DEFAULT_POSTURE };
-  }
+function loadPostingPosture(profile, configPath) {
+  return resolvePosture(asRecord(readEnsembleConfig(configPath).posting)?.[profile]);
 }
 function meetsInlineFloor(severity, floor) {
   return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf(floor);
@@ -3610,6 +3612,7 @@ export {
   DEFAULT_VOICE_TIMEOUT_MS,
   DIFF_SECTION_TITLE,
   DIFF_USEFUL_FLOOR,
+  ENSEMBLE_CONFIG_PATH,
   EVIDENCE_CLASSES,
   EVIDENCE_MANIFEST_FILE,
   EVIDENCE_MANIFEST_SCHEMA_VERSION,
@@ -3646,6 +3649,7 @@ export {
   acquireDiff,
   acquireRepoLock,
   allowedRootsFromConfig,
+  asRecord,
   assembleCodePacket,
   buildClaudeVoiceArgs,
   buildCodexReviewArgs,
@@ -3726,6 +3730,7 @@ export {
   persistReview,
   pickSynthesizer,
   planPlacement,
+  readEnsembleConfig,
   readReadableSurface,
   readReceipt,
   readReview,

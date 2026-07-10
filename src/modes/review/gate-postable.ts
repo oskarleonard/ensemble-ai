@@ -135,15 +135,16 @@ function clampSeverity(original: Severity, rescored: Severity | undefined): Seve
 // one-click APPLY button is the most damaging robot comment there is. Fails closed to null.
 //
 // Offered ONLY on `agree` + `fixStatus: 'keep'` — i.e. the gate confirmed the finding as stated AND
-// verified the reviewer's fix. A `partial` was narrowed, so its fix no longer provably matches the
-// narrowed claim; an unverified/false has nothing to fix.
+// verified the reviewer's fix. The `agree` half is structural: the sole call site is derivePostable's
+// `agree` branch, because a `partial` was narrowed and its fix no longer provably matches the
+// narrowed claim (that branch hard-codes `postableSuggestion: null`); an unverified/false finding
+// has nothing to fix.
 function deriveSuggestion(
   suggestion: PostableSuggestion | undefined,
-  verdict: 'agree' | 'partial',
   fixStatus: FixStatus,
   allowed: Set<string>
 ): PostableSuggestion | null {
-  if (!suggestion || verdict !== 'agree' || fixStatus !== 'keep') return null;
+  if (!suggestion || fixStatus !== 'keep') return null;
   const replacement = suggestion.replacement.replace(/\s+$/, '');
   if (!replacement.trim()) return null;
   if (replacement.length > SUGGESTION_CHAR_CAP) return null;
@@ -185,7 +186,7 @@ export function derivePostable(input: {
       postableBody: trimmed,
       postableFix: fix,
       postableStatus: 'postable',
-      postableSuggestion: deriveSuggestion(input.suggestion, verdict, fix, allowedTokens(trimmed, hunkCode)),
+      postableSuggestion: deriveSuggestion(input.suggestion, fix, allowedTokens(trimmed, hunkCode)),
       rescoredSeverity: null,
     };
   }

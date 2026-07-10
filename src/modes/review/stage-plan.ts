@@ -52,9 +52,13 @@ function titleText(s: string): string {
 
 // ── The machine trailer ───────────────────────────────────────────────────────────────
 
-// An invisible, per-finding provenance record. Re-runs read it back to know which findings a staged
-// review already carries, so an update REPLACES rather than duplicates. Keys are emitted in a fixed
-// (alphabetical) order, so the same finding always renders the same bytes.
+// An invisible, per-finding provenance record, so a machine reader (the author's own AI assistant,
+// the Hugin dashboard) can consume a staged review as DATA rather than scraping its prose. Keys are
+// emitted in a fixed (alphabetical) order, so the same finding always renders the same bytes.
+//
+// It is NOT what makes a re-run idempotent — `stageReview` replaces our prior pending review whole,
+// keyed on STAGE_MARKER in the summary body (see stage.ts). The trailers are read back only by
+// `parseTrailerIds`, which the tests use to prove one finding renders exactly once per review.
 export function findingTrailer(r: GateVerdictRecord): string {
   const payload = {
     anchors: { file: r.file, line: r.line },
