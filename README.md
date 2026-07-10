@@ -10,7 +10,7 @@ It's the portable engine behind a cross-vendor *code review* workflow: give it a
 
 | Command | What it does | Key flags |
 | --- | --- | --- |
-| `ensemble-ai review [<pr-url>]` | Self-contained cross-vendor code review — Codex + Grok + a cold Opus as blind peers, then a Claude **gate** grounds each finding (`agree`/`partial`/`false`/`unverified`) + a synthesis. | source: `--pr <N\|url>` · `--staged` · `--working-tree` · `--diff-file <p>` · stdin (default: current branch) · `--reviewers <ids>` · `--no-claude` · gate: `--strict-high` · `--gate-dismissals` · `--gate-model`/`--gate-effort` · `--no-fail-on-high` · **`--stage`** (stage a PENDING review on the PR) · `--post-comment` (deprecated) · `--out <dir>` |
+| `ensemble-ai review [<pr-url>]` | Self-contained cross-vendor code review — Codex + Grok + a cold Opus as blind peers, then a Claude **gate** grounds each finding (`agree`/`partial`/`false`/`unverified`) + a synthesis. | source: `--pr <N\|url>` · `--staged` · `--working-tree` · `--diff-file <p>` · stdin (default: current branch) · `--reviewers <ids>` · `--no-claude` · gate: `--strict-high` · `--gate-dismissals` · `--gate-model`/`--gate-effort` · `--no-fail-on-high` · **`--stage`** (stage a PENDING review; needs a PR **URL**) · `--post-comment` (deprecated) · `--out <dir>` |
 | `ensemble-ai security [<pr-url>]` | `review` under a security-auditor lens + a local dependency-surface flag; findings tagged by class. | identical to `review` (same sources, gate flags, `--stage`) |
 | `ensemble-ai brainstorm "<topic>"` | Cross-vendor ideation: each voice generates → critiques the others → one synthesizes a ranked, deduped recommendation. | `--file <p>` · `--voices <ids>` · `--synthesizer <id>` · `--timeout <s>` · `--json` |
 | `ensemble-ai consult "<q>"` (alias `ask`) | Cross-vendor Q&A: each voice answers independently → one synthesizes AGREE (confident) vs DIVERGE (look closer) + a bottom line. | `--file <p>` · `--critique` · `--voices <ids>` · `--synthesizer <id>` · `--json` |
@@ -146,6 +146,13 @@ existing consumers).
 ensemble-ai review --pr https://github.com/o/r/pull/7 --stage
 ```
 
+`--stage` needs the **full PR URL**, not a bare `--pr <N>`. A staged review is bound to a commit —
+its `commit_id` and every inline line anchor are only meaningful at the head SHA the diff was read
+at, and the freshness guard compares that SHA against the PR's live head. A URL binds the diff to
+the exact head via the compare API; a bare `--pr <N>` fetches it with `gh pr diff`, which reports no
+head SHA at all. Rather than invent one (re-reading the head afterwards is a TOCTOU — it can move
+between the two calls), `--stage` refuses a review it cannot bind, up front.
+
 Everything lands as **ONE PENDING review** under your account — GitHub's create-review API with
 `event` omitted. It is author-private until you read it, edit it, and click Submit in GitHub's own
 UI. `event` is **never** sent, so this tool can never Approve or Request-Changes anywhere. A
@@ -159,7 +166,7 @@ authority is absolute, and nothing appears under your name without your click �
 | Verified bug | inline comment on its line | the main event |
 | Quality finding (structural simplification) | a **collapsed** `<details>` section of the summary | the author reads or ignores it in one gesture; their AI assistant consumes all of it |
 | Gate-verified small replacement | inline ` ```suggestion ` block, **hard-capped at 3** | one-click apply is a gift, not a nag |
-| A verified finding with no in-diff anchor | the summary body | dropping a verified bug is never the conservative choice |
+| A verified finding with no in-diff anchor, or one citing a **deleted** line | the summary body | dropping a verified bug is never the conservative choice — and GitHub rejects a RIGHT-side comment on a line that only exists on the left, which would fail the whole staged review |
 
 **No model runs in the posting path.** The gate — which already read the diff — assigns each finding
 its `class` (`bug` / `quality`) and may attach a `suggestion`, both validated by the host under the

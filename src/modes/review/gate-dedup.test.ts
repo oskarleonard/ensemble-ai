@@ -5,6 +5,7 @@ import type { GateVerdictRecord } from './gate';
 
 function rec(over: Partial<GateVerdictRecord> & { findingId: string }): GateVerdictRecord {
   return {
+    anchorSide: 'new',
     downgradeReason: null,
     effectiveVerdict: 'agree',
     file: 'src/a.ts',

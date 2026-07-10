@@ -2732,6 +2732,10 @@ var FIX_STATUSES = ["keep", "narrow", "strike"];
 var POSTABLE_CLASSES = ["bug", "quality"];
 var SUGGESTION_LINE_CEILING = 10;
 var SUGGESTION_CHAR_CAP = 800;
+var FENCE_LINE_RE = /^[ \t]*(`{3,}|~{3,})/m;
+function containsFenceLine(s) {
+  return FENCE_LINE_RE.test(s);
+}
 var MAX_STRIKE_FRACTION = 0.6;
 var escalate = (postableNote) => ({
   postableBody: null,
@@ -2789,6 +2793,7 @@ function deriveSuggestion(suggestion, fixStatus, allowed) {
   if (!replacement.trim()) return null;
   if (replacement.length > SUGGESTION_CHAR_CAP) return null;
   if (replacement.split("\n").length > SUGGESTION_LINE_CEILING) return null;
+  if (containsFenceLine(replacement)) return null;
   for (const tok of entityTokens(replacement)) if (!allowed.has(tok)) return null;
   return { replacement };
 }
@@ -2993,7 +2998,7 @@ function isGateVerdict(v) {
   return GATE_VERDICTS.includes(v);
 }
 var GATE_ENVELOPE_SCHEMA_VERSION = 1;
-var GATE_TRAIL_SCHEMA_VERSION = 3;
+var GATE_TRAIL_SCHEMA_VERSION = 4;
 var REASON_CAP = 700;
 var CITATION_CAP = 500;
 function capStr(s, n) {
@@ -3070,6 +3075,9 @@ function prepareGateFindings(reviews, packetHunks) {
   const findings = raw.map((rf) => {
     const res = resolved.get(rf.findingId) ?? null;
     return {
+      // resolveFindingHunk matches the new side first and only falls to the old side for a
+      // deletion-only hunk (newCount === 0), so the hunk's own newCount names the side.
+      anchorSide: res ? res.hunk.newCount > 0 ? "new" : "old" : null,
       body: rf.body,
       file: rf.file,
       findingId: rf.findingId,
@@ -3153,6 +3161,7 @@ var NOT_POSTABLE = {
 };
 function recordBase(f) {
   return {
+    anchorSide: f.anchorSide,
     file: f.file,
     findingId: f.findingId,
     line: f.line,
@@ -4560,7 +4569,10 @@ function defuseUntrusted(s) {
   return s.replace(/<!--/g, "<\\!--").replace(/^(\s*)(`{3,}|~{3,})[ \t]*suggestion\b/gim, "$1$2text");
 }
 function titleText(s) {
-  return defuseUntrusted(scrubControl(s)).slice(0, 200);
+  return [...defuseUntrusted(scrubControl(s))].slice(0, 200).join("");
+}
+function codeSpan(file) {
+  return defuseUntrusted(scrubControl(file)).replace(/`/g, "");
 }
 function findingTrailer(r) {
   const payload = {
@@ -4571,7 +4583,8 @@ function findingTrailer(r) {
     severity: r.rescoredSeverity ?? r.severity,
     verdict: r.effectiveVerdict
   };
-  return `<!-- ensemble-ai:finding ${JSON.stringify(payload)} -->`;
+  const json = JSON.stringify(payload).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+  return `<!-- ensemble-ai:finding ${json} -->`;
 }
 function isEnsembleStagedReview(body) {
   return typeof body === "string" && body.includes(STAGE_MARKER);
@@ -4580,10 +4593,10 @@ function effectiveSeverity(r) {
   return r.rescoredSeverity ?? r.severity;
 }
 function bySeverityThenId(a, b) {
-  return SEVERITIES.indexOf(effectiveSeverity(a)) - SEVERITIES.indexOf(effectiveSeverity(b)) || (a.findingId < b.findingId ? -1 : 1);
+  return SEVERITIES.indexOf(effectiveSeverity(a)) - SEVERITIES.indexOf(effectiveSeverity(b)) || (a.findingId < b.findingId ? -1 : a.findingId > b.findingId ? 1 : 0);
 }
 function anchorable(r) {
-  return r.resolved && typeof r.line === "number";
+  return r.anchorSide === "new" && typeof r.line === "number";
 }
 function planPlacement(records, opts) {
   const postable = records.filter((r) => r.postableStatus === "postable" && r.postableBody).filter((r) => !r.cluster || r.cluster.primary).sort(bySeverityThenId);
@@ -4593,6 +4606,7 @@ function planPlacement(records, opts) {
     const s = r.postableSuggestion;
     if (!s || !anchorable(r)) continue;
     if (s.replacement.split("\n").length > opts.posture.maxSuggestionLines) continue;
+    if (containsFenceLine(s.replacement)) continue;
     suggestionOf.set(r.findingId, s);
   }
   const inline = [];
@@ -4648,7 +4662,8 @@ function collapsed(summary, records, reviewersRun) {
   if (records.length === 0) return [];
   const out = ["", `<details>`, `<summary>${summary}</summary>`, ""];
   for (const r of records) {
-    const where = r.line ? `\`${r.file}:${r.line}\`` : `\`${r.file || "(no file)"}\``;
+    const file = codeSpan(r.file);
+    const where = r.line ? `\`${file}:${r.line}\`` : `\`${file || "(no file)"}\``;
     out.push(
       `**[${effectiveSeverity(r)}]** ${titleText(r.title)} \u2014 ${where}`,
       "",
@@ -4712,6 +4727,9 @@ function apiPath(t, suffix = "") {
 function parseJson(text) {
   return JSON.parse(text);
 }
+function isCommitSha(s) {
+  return /^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(s);
+}
 function checkFreshness(reviewedHeadSha, liveHeadSha) {
   if (reviewedHeadSha === liveHeadSha) return { ok: true };
   return {
@@ -4741,6 +4759,13 @@ function stageReview(payload, target, deps) {
       return { error: e instanceof Error ? e.message : String(e), ok: false };
     }
   };
+  if (!isCommitSha(deps.reviewedHeadSha)) {
+    return {
+      error: `the review is not bound to a commit (its head is \`${deps.reviewedHeadSha.slice(0, 60)}\`, not a SHA), so its line anchors cannot be tied to a commit and its freshness cannot be checked. Acquire the diff bound to the PR's head SHA (the compare API) before staging.`,
+      kind: "unbound-head",
+      ok: false
+    };
+  }
   const head = run(["api", apiPath(target), "--jq", ".head.sha"]);
   if (!head.ok) return { error: `could not read the PR head: ${head.error}`, kind: "gh-failed", ok: false };
   const liveHead = head.text.trim();
@@ -5039,12 +5064,14 @@ Options:
   --gate-effort <e>     effort for the GATE seat (low|medium|high|xhigh|max) \u2014 overrides the
                         file; an unknown value is ignored (\`ensemble-ai config\` shows the seat)
   --stage               after a COMPLETED review, stage it as ONE **PENDING** GitHub review under
-                        your account (opt-in; REQUIRES a PR source). Verified bugs land as inline
-                        comments, quality findings in a collapsed summary section, \u22643 gate-verified
-                        fixes as one-click \`suggestion\` blocks. NOTHING is posted until you submit
-                        it on GitHub \u2014 a zero-bug run still stages the summary. Re-running REPLACES
-                        the prior staged review (never duplicates); a moved PR head REFUSES. Prints
-                        {stagedReviewUrl, counts, receipt} as JSON on the last stdout line.
+                        your account (opt-in; REQUIRES a PR **URL**, which binds the diff to the
+                        head SHA \u2014 a bare \`--pr <N>\` has no commit identity to anchor to). Verified
+                        bugs land as inline comments, quality findings in a collapsed summary
+                        section, \u22643 gate-verified fixes as one-click \`suggestion\` blocks. NOTHING
+                        is posted until you submit it on GitHub \u2014 a zero-bug run still stages the
+                        summary. Re-running REPLACES the prior staged review (never duplicates); a
+                        moved PR head REFUSES. Prints {stagedReviewUrl, counts, receipt} as JSON on
+                        the last stdout line.
   --post-comment        DEPRECATED (prefer --stage): after a COMPLETED review, ALSO post it to the
                         PR as one markdown comment via \`gh pr comment\` \u2014 published IMMEDIATELY under
                         your account, with no submit step. Kept for existing consumers.
@@ -5487,9 +5514,12 @@ function repoSlugFromCwd(gh) {
   const res = gh(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
   return res.ok ? res.text.trim() : "";
 }
+var REPO_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 function resolveStageTarget(target, gh) {
-  const [owner, repo] = (target.repoSlug ?? repoSlugFromCwd(gh)).split("/");
-  return owner && repo ? { owner, pr: target.pr, repo } : null;
+  const parts = (target.repoSlug ?? repoSlugFromCwd(gh)).split("/");
+  if (parts.length !== 2) return null;
+  const [owner, repo] = parts;
+  return REPO_SEGMENT_RE.test(owner) && REPO_SEGMENT_RE.test(repo) ? { owner, pr: target.pr, repo } : null;
 }
 function toCommentGateSeat(seat) {
   const model = claudeModelLabel(seat.config);
@@ -5596,6 +5626,12 @@ async function reviewCommand(args, profile = "code") {
       );
       return 3;
     }
+  }
+  if (stage && !source.headShaOverride) {
+    console.error(
+      `ensemble-ai ${cmd}: --stage needs a review bound to a commit, and this source has none \u2014 \`gh pr diff\` reports no head SHA, so there is nothing to anchor the inline comments to or to check the PR head against. Re-run with the full PR URL (\`--pr https://github.com/o/r/pull/N\`), which binds the diff to the exact head SHA via the compare API.`
+    );
+    return 3;
   }
   if (postComment && stage) {
     console.error(

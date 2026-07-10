@@ -40,7 +40,7 @@ export interface StageSuccess {
 export interface StageFailure {
   error: string;
   // The machine-readable cause, so a consumer can branch without parsing prose.
-  kind: 'foreign-pending' | 'gh-failed' | 'head-moved' | 'unreadable';
+  kind: 'foreign-pending' | 'gh-failed' | 'head-moved' | 'unbound-head' | 'unreadable';
   ok: false;
 }
 
@@ -55,6 +55,14 @@ function parseJson(text: string): unknown {
 }
 
 // ── 1. Freshness guard ────────────────────────────────────────────────────────────────
+
+// Does `s` name a commit? A diff acquired via `gh pr diff` has no commit identity and carries a
+// human-readable label instead of a SHA (see acquireDiff). Staging such a review would compare a
+// label against a real head and refuse with a fabricated "the head moved" story — and its
+// `commit_id` would be rejected by GitHub anyway. SHA-1 (40) or SHA-256 (64) hex.
+export function isCommitSha(s: string): boolean {
+  return /^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(s);
+}
 
 // PURE. The review is tied to `reviewedHeadSha`; every inline anchor and the ```suggestion``` line
 // numbers are only meaningful at that commit. If the PR head moved, REFUSE — a stale anchor lands a
@@ -125,6 +133,19 @@ export function stageReview(
       return { error: e instanceof Error ? e.message : String(e), ok: false };
     }
   };
+
+  // 0. BOUND HEAD — a review with no commit identity has nothing to anchor or compare. Refuse
+  //    before any I/O, so the exported library API cannot stage one either.
+  if (!isCommitSha(deps.reviewedHeadSha)) {
+    return {
+      error:
+        `the review is not bound to a commit (its head is \`${deps.reviewedHeadSha.slice(0, 60)}\`, not a SHA), ` +
+        `so its line anchors cannot be tied to a commit and its freshness cannot be checked. ` +
+        `Acquire the diff bound to the PR's head SHA (the compare API) before staging.`,
+      kind: 'unbound-head',
+      ok: false,
+    };
+  }
 
   // 1. FRESHNESS — read the live head before writing anything.
   const head = run(['api', apiPath(target), '--jq', '.head.sha']);

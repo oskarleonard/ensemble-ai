@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { STAGE_MARKER, type StagedReviewPayload } from './stage-plan';
-import { checkFreshness, classifyPending, type GhResult, type GhRunner, parseReviewSummaries, stageReview } from './stage';
+import { checkFreshness, classifyPending, type GhResult, type GhRunner, isCommitSha, parseReviewSummaries, stageReview } from './stage';
 
 const TARGET = { owner: 'o', pr: 7, repo: 'r' };
 const HEAD = 'a'.repeat(40);
@@ -37,6 +37,33 @@ const created = (url = 'https://github.com/o/r/pull/7#pullrequestreview-1'): { m
 });
 
 // ── The freshness guard ───────────────────────────────────────────────────────────────
+
+// ── The bound-head guard ──────────────────────────────────────────────────────────────
+
+// `gh pr diff` carries no commit identity, so acquireDiff labels its headSha rather than inventing
+// one. Staging such a review would compare that label against a real SHA and refuse with a
+// fabricated "the head moved" story — and GitHub would reject the label as a `commit_id` anyway.
+describe('bound-head guard — a review with no commit identity is never staged', () => {
+  it('recognizes a SHA-1 and a SHA-256 head, and nothing else', () => {
+    expect(isCommitSha('a'.repeat(40))).toBe(true);
+    expect(isCommitSha('0123456789abcdef'.repeat(4))).toBe(true); // 64 hex
+    expect(isCommitSha('gh pr diff (no local commit identity)')).toBe(false);
+    expect(isCommitSha('A'.repeat(40))).toBe(false); // uppercase is not git's spelling
+    expect(isCommitSha('a'.repeat(39))).toBe(false);
+    expect(isCommitSha('')).toBe(false);
+  });
+
+  it('stageReview REFUSES an unbound head and makes NO gh call at all', () => {
+    const { calls, gh } = fakeGh([okHead(), reviews([]), created()]);
+    const res = stageReview(PAYLOAD, TARGET, { gh, reviewedHeadSha: 'gh pr diff (no local commit identity)' });
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.kind).toBe('unbound-head');
+      expect(res.error).toContain('not bound to a commit');
+    }
+    expect(calls).toEqual([]); // refused before any I/O
+  });
+});
 
 describe('freshness guard — never post stale anchors', () => {
   it('passes when the reviewed head IS the live head', () => {

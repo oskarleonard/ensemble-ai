@@ -42,6 +42,20 @@ export interface PostableSuggestion {
 export const SUGGESTION_LINE_CEILING = 10;
 const SUGGESTION_CHAR_CAP = 800;
 
+// A replacement is rendered INSIDE a ```suggestion fence. A fence line within it closes ours early
+// and hands the rest of the comment back to the markdown renderer — at worst opening a SECOND
+// ```suggestion block, i.e. a one-click APPLY button on text the gate never verified. The
+// no-new-entity rule cannot catch this: `entityTokens` scans `[A-Za-z0-9_$./-]{2,}`, so a backtick
+// is invisible to it. Checked explicitly, fails closed.
+//
+// Exported because the posting path re-checks it: `planPlacement` reads `postableSuggestion` off a
+// durable v4 trail record (or a hand-built one, via the exported library API), which never passed
+// through this module's validation.
+const FENCE_LINE_RE = /^[ \t]*(`{3,}|~{3,})/m;
+export function containsFenceLine(s: string): boolean {
+  return FENCE_LINE_RE.test(s);
+}
+
 export interface PostableResult {
   postableBody: string | null; // exact text to post; null ⇒ do not post
   postableFix: FixStatus | null; // disposition of the reviewer's suggested fix
@@ -149,6 +163,7 @@ function deriveSuggestion(
   if (!replacement.trim()) return null;
   if (replacement.length > SUGGESTION_CHAR_CAP) return null;
   if (replacement.split('\n').length > SUGGESTION_LINE_CEILING) return null;
+  if (containsFenceLine(replacement)) return null;
   for (const tok of entityTokens(replacement)) if (!allowed.has(tok)) return null;
   return { replacement };
 }

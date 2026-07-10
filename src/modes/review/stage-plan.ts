@@ -2,7 +2,7 @@ import { SEVERITIES, type Severity } from '../../core/types';
 import { scrubControl } from '../../core/sanitize';
 
 import type { GateVerdictRecord } from './gate';
-import type { PostableSuggestion } from './gate-postable';
+import { containsFenceLine, type PostableSuggestion } from './gate-postable';
 import { meetsInlineFloor, type PostingPosture } from './posting-config';
 
 // THE FOREIGN POSTING POSTURE — placement, not deletion (spec §6). PURE: every decision here is a
@@ -45,9 +45,18 @@ export function defuseUntrusted(s: string): string {
     .replace(/^(\s*)(`{3,}|~{3,})[ \t]*suggestion\b/gim, '$1$2text');
 }
 
-// One-line reviewer text (a title) rendered into markdown flow.
+// One-line reviewer text (a title) rendered into markdown flow. Capped by CODE POINT, so a title
+// truncated mid-emoji does not leave a lone surrogate behind.
 function titleText(s: string): string {
-  return defuseUntrusted(scrubControl(s)).slice(0, 200);
+  return [...defuseUntrusted(scrubControl(s))].slice(0, 200).join('');
+}
+
+// A model-controlled path rendered as a `code span`. Two things must go: a backtick would CLOSE the
+// span and hand the rest to the markdown renderer, and a `<!--` would then open a forged
+// `<!-- ensemble-ai:finding … -->` trailer. Defuse first (so the opener is escaped even if the
+// backtick strip changes nothing), then strip the backticks — a path never legitimately holds one.
+function codeSpan(file: string): string {
+  return defuseUntrusted(scrubControl(file)).replace(/`/g, '');
 }
 
 // ── The machine trailer ───────────────────────────────────────────────────────────────
@@ -68,7 +77,12 @@ export function findingTrailer(r: GateVerdictRecord): string {
     severity: r.rescoredSeverity ?? r.severity,
     verdict: r.effectiveVerdict,
   };
-  return `<!-- ensemble-ai:finding ${JSON.stringify(payload)} -->`;
+  // `file` and `findingId` are model-controlled, and JSON.stringify escapes neither `-` nor `>`.
+  // A path like `a-->b.ts` would close the HTML comment early and spill the remainder into the
+  // rendered review. Rewriting the angle brackets as their \u escapes keeps the payload valid JSON
+  // (it parses back to the same string) while making an early `-->` unrepresentable.
+  const json = JSON.stringify(payload).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+  return `<!-- ensemble-ai:finding ${json} -->`;
 }
 
 // Every findingId a rendered review body/comment already carries. Used to prove idempotency: the
@@ -119,19 +133,30 @@ function effectiveSeverity(r: GateVerdictRecord): Severity {
   return r.rescoredSeverity ?? r.severity;
 }
 
-// Deterministic order: most severe first, then stable id order.
+// Deterministic order: most severe first, then stable id order. Returns 0 for two records that
+// compare equal, so the comparator is a total order even if a duplicate findingId ever reaches it.
 function bySeverityThenId(a: GateVerdictRecord, b: GateVerdictRecord): number {
   return (
     SEVERITIES.indexOf(effectiveSeverity(a)) - SEVERITIES.indexOf(effectiveSeverity(b)) ||
-    (a.findingId < b.findingId ? -1 : 1)
+    (a.findingId < b.findingId ? -1 : a.findingId > b.findingId ? 1 : 0)
   );
 }
 
-// A finding may be anchored inline only when the gate RESOLVED its cite to a hunk of the reviewed
-// diff and it names a line. GitHub rejects a review comment on a line outside the diff (422, which
-// would fail the WHOLE staged review), so this is a correctness fence, not a preference.
+// A finding may be anchored inline only when the gate resolved its cite to a line on the diff's
+// RIGHT — an added or context line at the reviewed head. GitHub rejects a review comment whose
+// (path, line, side) is not in the diff with a 422, and the create-review call is ATOMIC, so ONE
+// bad anchor throws away the whole staged review (summary and every other inline comment). This is
+// a correctness fence, not a preference.
+//
+// `anchorSide: 'old'` is the trap: a cite landing in a deletion-only hunk resolves against old-side
+// line numbers (gate-hunks.ts's second pass), so `line` names a line that exists only on the LEFT —
+// e.g. a reviewer flagging "you deleted the mutex release" on a wholly-deleted file, where EVERY
+// line is old-side. Such a finding is real and still posts, in the summary body, rather than
+// 422-ing the review. (Posting it inline with `side: 'LEFT'` is what GitHub supports and is the
+// natural follow-up; it is not done here because nothing in this session can prove the LEFT
+// anchor against the live API, and a wrong side is the same 422 we are fixing.)
 function anchorable(r: GateVerdictRecord): boolean {
-  return r.resolved && typeof r.line === 'number';
+  return r.anchorSide === 'new' && typeof r.line === 'number';
 }
 
 // Decide where each postable finding lands. Only the CLUSTER PRIMARY posts — the corroborating
@@ -154,6 +179,11 @@ export function planPlacement(
     const s = r.postableSuggestion;
     if (!s || !anchorable(r)) continue;
     if (s.replacement.split('\n').length > opts.posture.maxSuggestionLines) continue;
+    // Re-check the fence here, not only in the gate: these records arrive off a durable trail
+    // artifact (or a hand-built one, via the exported library API), so nothing guarantees they went
+    // through derivePostable's validation. A fence inside the replacement would break out of the
+    // ```suggestion block this is about to be rendered into.
+    if (containsFenceLine(s.replacement)) continue;
     suggestionOf.set(r.findingId, s);
   }
 
@@ -226,7 +256,8 @@ function collapsed(summary: string, records: GateVerdictRecord[], reviewersRun: 
   if (records.length === 0) return [];
   const out = ['', `<details>`, `<summary>${summary}</summary>`, ''];
   for (const r of records) {
-    const where = r.line ? `\`${r.file}:${r.line}\`` : `\`${r.file || '(no file)'}\``;
+    const file = codeSpan(r.file);
+    const where = r.line ? `\`${file}:${r.line}\`` : `\`${file || '(no file)'}\``;
     out.push(
       `**[${effectiveSeverity(r)}]** ${titleText(r.title)} — ${where}`,
       '',

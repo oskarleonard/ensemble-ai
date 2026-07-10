@@ -185,12 +185,14 @@ Options:
   --gate-effort <e>     effort for the GATE seat (low|medium|high|xhigh|max) — overrides the
                         file; an unknown value is ignored (\`ensemble-ai config\` shows the seat)
   --stage               after a COMPLETED review, stage it as ONE **PENDING** GitHub review under
-                        your account (opt-in; REQUIRES a PR source). Verified bugs land as inline
-                        comments, quality findings in a collapsed summary section, ≤3 gate-verified
-                        fixes as one-click \`suggestion\` blocks. NOTHING is posted until you submit
-                        it on GitHub — a zero-bug run still stages the summary. Re-running REPLACES
-                        the prior staged review (never duplicates); a moved PR head REFUSES. Prints
-                        {stagedReviewUrl, counts, receipt} as JSON on the last stdout line.
+                        your account (opt-in; REQUIRES a PR **URL**, which binds the diff to the
+                        head SHA — a bare \`--pr <N>\` has no commit identity to anchor to). Verified
+                        bugs land as inline comments, quality findings in a collapsed summary
+                        section, ≤3 gate-verified fixes as one-click \`suggestion\` blocks. NOTHING
+                        is posted until you submit it on GitHub — a zero-bug run still stages the
+                        summary. Re-running REPLACES the prior staged review (never duplicates); a
+                        moved PR head REFUSES. Prints {stagedReviewUrl, counts, receipt} as JSON on
+                        the last stdout line.
   --post-comment        DEPRECATED (prefer --stage): after a COMPLETED review, ALSO post it to the
                         PR as one markdown comment via \`gh pr comment\` — published IMMEDIATELY under
                         your account, with no submit step. Kept for existing consumers.
@@ -847,11 +849,18 @@ function repoSlugFromCwd(gh: GhRunner): string {
   return res.ok ? res.text.trim() : '';
 }
 
+// GitHub's own vocabulary for an owner login / repo name. `owner` and `repo` are interpolated into
+// a `gh api repos/<owner>/<repo>/…` path, so a segment like `..` would traverse to a different
+// endpoint. Validated here rather than trusted from a pasted URL.
+const REPO_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
 // A staged review addresses the GitHub API by `owner/repo`, which a bare `--pr <N>` does not carry
 // (it targets the cwd's repo). Null ⇒ report and refuse.
 function resolveStageTarget(target: PostTarget, gh: GhRunner): StageTarget | null {
-  const [owner, repo] = (target.repoSlug ?? repoSlugFromCwd(gh)).split('/');
-  return owner && repo ? { owner, pr: target.pr, repo } : null;
+  const parts = (target.repoSlug ?? repoSlugFromCwd(gh)).split('/');
+  if (parts.length !== 2) return null;
+  const [owner, repo] = parts;
+  return REPO_SEGMENT_RE.test(owner) && REPO_SEGMENT_RE.test(repo) ? { owner, pr: target.pr, repo } : null;
 }
 
 // GateSeat → the footer's resolved seat: model/effort with the 'default' sentinel spelled out
@@ -1015,6 +1024,25 @@ async function reviewCommand(
       );
       return 3;
     }
+  }
+  // `--stage` binds a review to a COMMIT. The pending review's `commit_id` and every inline line
+  // anchor are only meaningful at the head SHA the diff was read at, and `stageReview`'s freshness
+  // guard compares that SHA against the PR's live head. A bare `--pr <N>` fetches the diff with
+  // `gh pr diff`, which carries NO commit identity — `acquireDiff` honestly labels its headSha
+  // `gh pr diff (no local commit identity)` rather than inventing one, because re-reading the head
+  // afterwards would be a TOCTOU (the head can move between the two calls). A PR URL binds the SHA
+  // via the compare API; if that lookup fails it degrades to the same unbound fetch.
+  //
+  // Staging an unbound review would compare a label against a SHA and refuse with a fabricated "the
+  // head moved" story — after reviewing for minutes. Refuse UPFRONT, and say what to do instead.
+  if (stage && !source.headShaOverride) {
+    console.error(
+      `ensemble-ai ${cmd}: --stage needs a review bound to a commit, and this source has none — ` +
+        '`gh pr diff` reports no head SHA, so there is nothing to anchor the inline comments to or ' +
+        'to check the PR head against. Re-run with the full PR URL (`--pr https://github.com/o/r/pull/N`), ' +
+        'which binds the diff to the exact head SHA via the compare API.'
+    );
+    return 3;
   }
   // The two outward actions are contradictory: `--post-comment` publishes immediately under the
   // user's account, `--stage` deliberately publishes NOTHING until they submit. Doing both would

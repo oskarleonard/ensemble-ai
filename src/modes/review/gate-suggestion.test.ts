@@ -68,6 +68,31 @@ describe('deriveSuggestion — a one-click replacement the gate verified, or not
     expect(derivePostable({ ...base, suggestion: { replacement: '   \n  ' } }).postableSuggestion).toBeNull();
   });
 
+  // The replacement is rendered INSIDE a ```suggestion fence. A fence line within it closes ours
+  // early and hands the rest back to the markdown renderer — at worst opening a SECOND suggestion
+  // block, i.e. a one-click Apply on text the gate never verified. entityTokens cannot catch this:
+  // its char class is [A-Za-z0-9_$./-], so a backtick is invisible to it.
+  it('REJECTS a replacement carrying a markdown FENCE (it would break out of the apply block)', () => {
+    for (const replacement of [
+      '  i < a.length\n```\n```suggestion\n  a.length',
+      '```',
+      '  i < a.length\n~~~\ntext',
+      '   ```suggestion',
+      '\t````',
+    ]) {
+      expect(derivePostable({ ...base, suggestion: { replacement } }).postableSuggestion).toBeNull();
+    }
+  });
+
+  it('a backtick that is NOT a fence (a template literal) is still allowed', () => {
+    const r = derivePostable({
+      ...base,
+      hunkCode: [...HUNK, 'const s = `x`;'],
+      suggestion: { replacement: 'const s = `x`;' },
+    });
+    expect(r.postableSuggestion).toEqual({ replacement: 'const s = `x`;' });
+  });
+
   it('no suggestion offered ⇒ null, and the postable body is untouched', () => {
     const r = derivePostable(base);
     expect(r.postableSuggestion).toBeNull();
@@ -98,6 +123,7 @@ describe('parsing the gate reply\'s placement fields', () => {
 
 function finding(over: Partial<GateFinding> = {}): GateFinding {
   return {
+    anchorSide: 'new',
     body: 'b',
     file: 'src/a.ts',
     findingId: 'codex#1',

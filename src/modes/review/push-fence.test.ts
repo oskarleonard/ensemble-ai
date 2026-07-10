@@ -46,6 +46,7 @@ describe('fix-tail push fence — refuse to push to a head ref the user does not
 
   it('names the stage tail as the alternative — a fence, never a dispatcher that reroutes for you', () => {
     const v = evaluatePushFence(ctx({ isCrossRepository: true }), 'o/r');
+    expect(v.allowed).toBe(false);
     if (!v.allowed) expect(v.reason).toContain('ensemble-ai review --pr <url> --stage');
   });
 });

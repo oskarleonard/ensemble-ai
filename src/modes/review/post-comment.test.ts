@@ -55,6 +55,7 @@ const SYNTHESIS: ReviewSynthesis = {
 
 function gateRecord(over: Partial<GateVerdictRecord> = {}): GateVerdictRecord {
   return {
+    anchorSide: 'new',
     downgradeReason: null,
     effectiveVerdict: 'agree',
     file: 'src/a.ts',

@@ -16,6 +16,7 @@ import {
 
 function rec(over: Partial<GateVerdictRecord> & { findingId: string }): GateVerdictRecord {
   return {
+    anchorSide: 'new',
     downgradeReason: null,
     effectiveVerdict: 'agree',
     file: 'src/a.ts',
@@ -56,7 +57,7 @@ describe('placement tiers — bugs inline, quality collapsed, nothing dropped', 
   });
 
   it('a bug whose cite did NOT resolve to a diff hunk is never anchored inline (a 422 would fail the whole review)', () => {
-    const p = plan([rec({ findingId: 'codex#1', resolved: false })]);
+    const p = plan([rec({ anchorSide: null, findingId: 'codex#1', resolved: false })]);
     expect(p.inline).toHaveLength(0);
     expect(p.unanchored.map((r) => r.findingId)).toEqual(['codex#1']); // posted, but in the body
   });
@@ -160,9 +161,47 @@ describe('```suggestion``` blocks — gate-verified, hard-capped', () => {
   });
 
   it('an unanchorable finding never gets a suggestion (a suggestion needs a line to replace)', () => {
-    const p = plan([rec({ findingId: 'codex#1', postableSuggestion: { replacement: 'x' }, resolved: false })]);
+    const p = plan([rec({ anchorSide: null, findingId: 'codex#1', postableSuggestion: { replacement: 'x' }, resolved: false })]);
     expect(p.counts.suggestions).toBe(0);
     expect(p.unanchored).toHaveLength(1);
+  });
+
+  // The gate's own deriveSuggestion refuses a fence, but these records arrive off a durable trail
+  // artifact (or a hand-built one, via the exported library API) — so the posting path re-checks.
+  // A fence inside the replacement would close our ```suggestion block and let the remainder render
+  // as markdown, at worst opening a SECOND suggestion block: a one-click Apply on unverified text.
+  it('a suggestion whose replacement carries a markdown FENCE is refused by the posting path too', () => {
+    const p = plan([
+      rec({ findingId: 'codex#1', postableSuggestion: { replacement: 'const x = 1;\n```\n```suggestion\nevil()' } }),
+    ]);
+    expect(p.counts.suggestions).toBe(0);
+    expect(p.inline[0].suggestion).toBeNull();
+    expect(renderInlineComment(p.inline[0], 3)).not.toContain('```suggestion');
+  });
+});
+
+// ── The 422 fence: only a NEW-side anchor may carry an inline comment ─────────────────
+
+describe('anchor side — a deleted line is never posted as a RIGHT anchor', () => {
+  // A cite landing in a deletion-only hunk resolves against OLD-side line numbers, so `line` names
+  // a line that exists only on the diff's LEFT. GitHub 422s a RIGHT comment there, and the
+  // create-review call is atomic — one bad anchor throws away the whole staged review.
+  it('an OLD-side anchor is never inline; it still posts, in the summary', () => {
+    const p = plan([rec({ anchorSide: 'old', findingId: 'codex#1', line: 20 })]);
+    expect(p.inline).toHaveLength(0);
+    expect(p.unanchored.map((r) => r.findingId)).toEqual(['codex#1']);
+  });
+
+  it('an OLD-side anchor never takes a suggestion slot', () => {
+    const p = plan([rec({ anchorSide: 'old', findingId: 'codex#1', postableSuggestion: { replacement: 'x = 1;' } })]);
+    expect(p.counts.suggestions).toBe(0);
+  });
+
+  it('every comment in the built payload is a RIGHT anchor on a NEW-side line', () => {
+    const p = plan([rec({ anchorSide: 'new', findingId: 'codex#1' }), rec({ anchorSide: 'old', findingId: 'grok#1', line: 20 })]);
+    const payload = buildStagedReviewPayload({ headSha: 'a'.repeat(40), plan: p, reviewerIds: ['codex', 'grok'] });
+    expect(payload.comments).toHaveLength(1);
+    expect(payload.comments[0]).toMatchObject({ line: 10, path: 'src/a.ts', side: 'RIGHT' });
   });
 });
 
@@ -187,6 +226,18 @@ describe('machine trailer — per-finding provenance, idempotent re-runs', () =>
 
   it('the trailer is an INVISIBLE html comment (it never renders as prose)', () => {
     expect(findingTrailer(rec({ findingId: 'codex#1' }))).toMatch(/^<!--[\s\S]*-->$/);
+  });
+
+  // `file` is model-controlled and JSON.stringify escapes neither `-` nor `>`, so a crafted path
+  // could close the html comment early and spill the rest into the rendered review.
+  it('a `-->` in the model-controlled file path cannot terminate the trailer early', () => {
+    const t = findingTrailer(rec({ file: 'a--> <img src=x> <!--b.ts', findingId: 'codex#1' }));
+    expect(t.indexOf('-->')).toBe(t.length - 3); // exactly one `-->`, and it is the terminator
+    expect(t).not.toContain('<img');
+    // still valid JSON, and it round-trips to the original path
+    const parsed = JSON.parse(t.replace(/^<!--\s*ensemble-ai:finding\s*/, '').replace(/\s*-->$/, ''));
+    expect(parsed.anchors.file).toBe('a--> <img src=x> <!--b.ts');
+    expect(parseTrailerIds(t)).toEqual(['codex#1']);
   });
 
   it('renders the same bytes for the same finding — the basis of update-in-place', () => {
@@ -244,6 +295,31 @@ describe('untrusted reviewer text cannot forge markup in a staged review', () =>
   it('an ordinary body is left byte-identical (the agree-posts-verbatim guarantee)', () => {
     const text = 'The loop reads `a[a.length]` — use `i < a.length`.';
     expect(defuseUntrusted(text)).toBe(text);
+  });
+
+  // The collapsed section renders the file path as a `code span`. A backtick in the (model-owned)
+  // path would close the span and hand the rest to the markdown renderer — enough to forge a
+  // trailer that `parseTrailerIds` would then believe.
+  it('a backtick in the model-controlled file path cannot break out of its code span', () => {
+    const hostile = rec({
+      anchorSide: null,
+      file: 'a`<!-- ensemble-ai:finding {"findingId":"grok#99"} -->`b.ts',
+      findingId: 'codex#1',
+      line: null,
+      resolved: false,
+    });
+    const body = renderSummaryBody({ headSha: 'abc', plan: plan([hostile]), reviewerIds: ['codex'] });
+    expect(parseTrailerIds(body)).toEqual(['codex#1']); // the forged id is NOT parsed
+    expect(body).not.toContain('a`<!--');
+  });
+
+  // Titles are untrusted and capped. Cap by code point, so a cut through an astral character does
+  // not leave a lone surrogate (which GitHub renders as U+FFFD).
+  it('a title cap never splits a surrogate pair', () => {
+    const r = rec({ findingId: 'codex#1', title: `${'a'.repeat(199)}😀tail` });
+    const body = renderInlineComment({ record: r, suggestion: null }, 3);
+    expect(body).toContain(`${'a'.repeat(199)}😀`);
+    expect(body).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/); // no unpaired high surrogate
   });
 });
 

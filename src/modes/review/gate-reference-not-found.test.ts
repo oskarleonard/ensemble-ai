@@ -8,6 +8,7 @@ import { DOWNGRADE_REASONS, type GateFinding, reconcileGateVerdicts } from './ga
 // therefore be honored ONLY when the gate's realized evidence is `worktree`.
 
 const finding: GateFinding = {
+  anchorSide: 'new',
   body: 'b',
   file: 'src/a.ts',
   findingId: 'codex#1',

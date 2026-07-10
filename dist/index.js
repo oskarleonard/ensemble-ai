@@ -1642,6 +1642,12 @@ function scrubControl(s) {
   return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
+// src/modes/review/gate-postable.ts
+var FENCE_LINE_RE = /^[ \t]*(`{3,}|~{3,})/m;
+function containsFenceLine(s) {
+  return FENCE_LINE_RE.test(s);
+}
+
 // src/modes/review/gate.ts
 var GATE_VERDICTS = ["agree", "partial", "false", "unverified"];
 
@@ -2450,7 +2456,10 @@ function defuseUntrusted(s) {
   return s.replace(/<!--/g, "<\\!--").replace(/^(\s*)(`{3,}|~{3,})[ \t]*suggestion\b/gim, "$1$2text");
 }
 function titleText(s) {
-  return defuseUntrusted(scrubControl(s)).slice(0, 200);
+  return [...defuseUntrusted(scrubControl(s))].slice(0, 200).join("");
+}
+function codeSpan(file) {
+  return defuseUntrusted(scrubControl(file)).replace(/`/g, "");
 }
 function findingTrailer(r) {
   const payload = {
@@ -2461,7 +2470,8 @@ function findingTrailer(r) {
     severity: r.rescoredSeverity ?? r.severity,
     verdict: r.effectiveVerdict
   };
-  return `<!-- ensemble-ai:finding ${JSON.stringify(payload)} -->`;
+  const json = JSON.stringify(payload).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+  return `<!-- ensemble-ai:finding ${json} -->`;
 }
 function parseTrailerIds(text) {
   const out = [];
@@ -2481,10 +2491,10 @@ function effectiveSeverity(r) {
   return r.rescoredSeverity ?? r.severity;
 }
 function bySeverityThenId(a, b) {
-  return SEVERITIES.indexOf(effectiveSeverity(a)) - SEVERITIES.indexOf(effectiveSeverity(b)) || (a.findingId < b.findingId ? -1 : 1);
+  return SEVERITIES.indexOf(effectiveSeverity(a)) - SEVERITIES.indexOf(effectiveSeverity(b)) || (a.findingId < b.findingId ? -1 : a.findingId > b.findingId ? 1 : 0);
 }
 function anchorable(r) {
-  return r.resolved && typeof r.line === "number";
+  return r.anchorSide === "new" && typeof r.line === "number";
 }
 function planPlacement(records, opts) {
   const postable = records.filter((r) => r.postableStatus === "postable" && r.postableBody).filter((r) => !r.cluster || r.cluster.primary).sort(bySeverityThenId);
@@ -2494,6 +2504,7 @@ function planPlacement(records, opts) {
     const s = r.postableSuggestion;
     if (!s || !anchorable(r)) continue;
     if (s.replacement.split("\n").length > opts.posture.maxSuggestionLines) continue;
+    if (containsFenceLine(s.replacement)) continue;
     suggestionOf.set(r.findingId, s);
   }
   const inline = [];
@@ -2549,7 +2560,8 @@ function collapsed(summary, records, reviewersRun) {
   if (records.length === 0) return [];
   const out = ["", `<details>`, `<summary>${summary}</summary>`, ""];
   for (const r of records) {
-    const where = r.line ? `\`${r.file}:${r.line}\`` : `\`${r.file || "(no file)"}\``;
+    const file = codeSpan(r.file);
+    const where = r.line ? `\`${file}:${r.line}\`` : `\`${file || "(no file)"}\``;
     out.push(
       `**[${effectiveSeverity(r)}]** ${titleText(r.title)} \u2014 ${where}`,
       "",
@@ -2613,6 +2625,9 @@ function apiPath(t, suffix = "") {
 function parseJson(text) {
   return JSON.parse(text);
 }
+function isCommitSha(s) {
+  return /^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(s);
+}
 function checkFreshness(reviewedHeadSha, liveHeadSha) {
   if (reviewedHeadSha === liveHeadSha) return { ok: true };
   return {
@@ -2642,6 +2657,13 @@ function stageReview(payload, target, deps) {
       return { error: e instanceof Error ? e.message : String(e), ok: false };
     }
   };
+  if (!isCommitSha(deps.reviewedHeadSha)) {
+    return {
+      error: `the review is not bound to a commit (its head is \`${deps.reviewedHeadSha.slice(0, 60)}\`, not a SHA), so its line anchors cannot be tied to a commit and its freshness cannot be checked. Acquire the diff bound to the PR's head SHA (the compare API) before staging.`,
+      kind: "unbound-head",
+      ok: false
+    };
+  }
   const head = run(["api", apiPath(target), "--jq", ".head.sha"]);
   if (!head.ok) return { error: `could not read the PR head: ${head.error}`, kind: "gh-failed", ok: false };
   const liveHead = head.text.trim();
@@ -3689,6 +3711,7 @@ export {
   fsConventionReader,
   gatherConventions,
   hasDepSurface,
+  isCommitSha,
   isDiffReviewed,
   isEnsembleStagedReview,
   isEvidenceClass,

@@ -93,7 +93,10 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // consumes — where a finding lands (inline vs the collapsed quality section) and the gate-verified
 // one-click replacement, both decided HERE so the posting path never runs a model. Additive: a v2
 // reader that ignores unknown keys reads a v3 record unchanged.
-export const GATE_TRAIL_SCHEMA_VERSION = 3;
+// v4: adds `anchorSide` — WHICH line space the cite resolved in. A deletion-only hunk resolves on
+// the OLD side, so its line number names a line that exists only on the diff's LEFT; posting it as
+// a RIGHT anchor is a 422 that fails the whole staged review. Additive, same as v3.
+export const GATE_TRAIL_SCHEMA_VERSION = 4;
 
 const REASON_CAP = 700;
 const CITATION_CAP = 500;
@@ -109,7 +112,16 @@ function capStr(s: unknown, n: number): string {
 // One finding as the HOST owns it — its stable cross-reviewer id, immutable severity, and
 // its resolved+windowed cited hunk. Nothing the gate returns can alter these (exit keys off
 // the STORED reviewer severity, never a gate echo).
+// WHICH line space a cite resolved in. `new` ⇒ `line` names a line on the diff's RIGHT (added or
+// context) and may be anchored there. `old` ⇒ the cite landed in a deletion-only hunk, so `line`
+// names a line that exists only on the LEFT — real, citable, but NOT a RIGHT anchor. `null` ⇒ the
+// cite resolved to no hunk at all. See resolveFindingHunk in gate-hunks.ts, whose second pass is
+// exactly the old-side branch.
+export type AnchorSide = 'new' | 'old' | null;
+
 export interface GateFinding {
+  // The line space `line` was resolved in — see AnchorSide. null when `resolved` is false.
+  anchorSide: AnchorSide;
   body: string;
   file: string;
   findingId: string; // `${voiceId}#${n}` — unique across all three reviewers
@@ -237,6 +249,9 @@ export function prepareGateFindings(
   const findings: GateFinding[] = raw.map((rf) => {
     const res = resolved.get(rf.findingId) ?? null;
     return {
+      // resolveFindingHunk matches the new side first and only falls to the old side for a
+      // deletion-only hunk (newCount === 0), so the hunk's own newCount names the side.
+      anchorSide: res ? (res.hunk.newCount > 0 ? 'new' : 'old') : null,
       body: rf.body,
       file: rf.file,
       findingId: rf.findingId,
@@ -370,6 +385,9 @@ export function parseGateEnvelope(raw: string): EnvelopeFailure | ParsedGateEnve
 // ── Host-owned reconciliation → the durable records ───────────────────────────────────
 
 export interface GateVerdictRecord {
+  // The line space `line` resolved in (see AnchorSide). Only `new` may be anchored as an inline
+  // RIGHT comment; `old` names a deleted line, which GitHub rejects on the RIGHT.
+  anchorSide: AnchorSide;
   citation?: string;
   cluster?: ClusterInfo; // cross-reviewer cluster (postable records only); absent ⇒ singleton / not clustered
   downgradeReason: DowngradeReason | null;
@@ -428,6 +446,7 @@ function recordBase(f: GateFinding): Omit<
   'citation' | 'downgradeReason' | 'effectiveVerdict' | 'rawVerdict' | 'reason'
 > {
   return {
+    anchorSide: f.anchorSide,
     file: f.file,
     findingId: f.findingId,
     line: f.line,
