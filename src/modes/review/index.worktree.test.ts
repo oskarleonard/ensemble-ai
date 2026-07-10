@@ -63,7 +63,10 @@ function stubAdapters(replies: Partial<Record<ReviewerId, CodexReviewResult>> = 
         replies[id] ?? { ok: true, raw: REVIEW, stderrTail: '', timedOut: false }
       );
     };
-  return { adapters: { codex: make('codex'), grok: make('grok') }, spawns };
+  return {
+    adapters: { claude: make('claude'), codex: make('codex'), grok: make('grok') },
+    spawns,
+  };
 }
 
 let out: string;

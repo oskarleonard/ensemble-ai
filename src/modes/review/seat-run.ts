@@ -180,4 +180,10 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
 // `ensemble-review` profile is already proven in production, so a grok failure there is a reviewer
 // failure, not a sandbox-viability signal — retrying would double a 12-minute review for no
 // evidence gain.
-export const RETRIES_ON_PACKET: Record<ReviewerId, boolean> = { codex: true, grok: false };
+// claude: like grok, its fence (the capability fence) is a proven mechanism, not the
+// unproven wrapper this retry exists to prove — a claude failure is a reviewer failure.
+export const RETRIES_ON_PACKET: Record<ReviewerId, boolean> = {
+  claude: false,
+  codex: true,
+  grok: false,
+};

@@ -3,11 +3,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type {
-  ReviewerId,
-  Severity,
-  StoredReview,
-  TerminalState,
+import {
+  CORE_REVIEWER_IDS,
+  REVIEWER_IDS,
+  type ReviewerId,
+  type Severity,
+  type StoredReview,
+  type TerminalState,
 } from './core/types';
 import type { ReviewModeResult } from './modes/review';
 
@@ -25,7 +27,7 @@ vi.mock('./modes/review/self-contained', async (importActual) => ({
   runClaudeReviewLayer: vi.fn(),
 }));
 
-import { main, resolveTrailBase } from './cli';
+import { main, parseRequiredReviewers, resolveTrailBase } from './cli';
 import { runBrainstormMode } from './modes/brainstorm';
 import type { BrainstormResult } from './modes/brainstorm/types';
 import { runConsultMode } from './modes/consult';
@@ -517,6 +519,33 @@ describe('receipt reflects the FULL expected roster (not just the codex/grok cor
     const written = readReceipt(s, keyOf(cand));
     expect(written).not.toBeNull();
     expect(written?.peerReviewers).toBeUndefined();
+  });
+});
+
+describe('parseRequiredReviewers — the receipt default matches the receipt-minting core', () => {
+  // REGRESSION: once `claude` joined REVIEWER_IDS, the receipt path's absent-flag default would
+  // silently widen from [codex,grok] to [codex,grok,claude]. But a receipt is minted keyed by the
+  // CORE roster (index.ts), with claude only a stamped peerReviewer — so `receipt verify`/`show`
+  // under the widened default computes a policyHash for a reviewer no receipt was minted with, and
+  // a genuinely-reviewed diff falsely reports "no receipt". The receipt default must be the
+  // cross-vendor CORE; the diff cost-preview legitimately stays the full registry.
+  it('the receipt path defaults to the cross-vendor core (codex, grok)', () => {
+    expect(parseRequiredReviewers(undefined, 'receipt', CORE_REVIEWER_IDS)).toEqual([
+      'codex',
+      'grok',
+    ]);
+  });
+
+  it('the diff cost-preview defaults to the full registry (codex, grok, claude)', () => {
+    expect(parseRequiredReviewers(undefined, 'diff', REVIEWER_IDS)).toEqual([
+      'codex',
+      'grok',
+      'claude',
+    ]);
+  });
+
+  it('an explicit --reviewers list overrides the default', () => {
+    expect(parseRequiredReviewers('grok', 'receipt', CORE_REVIEWER_IDS)).toEqual(['grok']);
   });
 });
 

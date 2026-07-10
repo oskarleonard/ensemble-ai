@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   computePolicyHashAt,
+  EVIDENCE_SEATS,
   evidenceShortfall,
   formatEvidenceShortfall,
   POLICY_VERSION_EVIDENCE,
@@ -141,5 +142,21 @@ describe('realized-vs-intended evidence comparison', () => {
     const msg = formatEvidenceShortfall(evidenceShortfall({ codex: 'worktree' }, { codex: 'packet' }));
     expect(msg).toContain('codex realized packet, intended worktree');
     expect(msg).toContain('--accept-degraded');
+  });
+});
+
+// REGRESSION: `claude` is in BOTH REVIEWER_IDS (the registry) and HARNESS_SEATS (the CLI's
+// additive producer). The naive [...REVIEWER_IDS, ...HARNESS_SEATS] listed it twice, so a
+// degraded/unbound claude seat got iterated + named twice. EVIDENCE_SEATS must dedupe.
+describe('EVIDENCE_SEATS — deduped across the reviewer/harness overlap', () => {
+  it('lists every actor exactly once (claude is both a ReviewerId and a HARNESS_SEAT)', () => {
+    expect([...EVIDENCE_SEATS]).toEqual(['codex', 'grok', 'claude', 'gate']);
+    expect(new Set(EVIDENCE_SEATS).size).toBe(EVIDENCE_SEATS.length);
+  });
+
+  it('a degraded claude seat appears ONCE in the shortfall, not twice', () => {
+    const gaps = evidenceShortfall({ claude: 'worktree' }, { claude: 'packet' });
+    expect(gaps).toEqual([{ intended: 'worktree', realized: 'packet', seat: 'claude' }]);
+    expect(formatEvidenceShortfall(gaps).match(/claude/g)).toHaveLength(1);
   });
 });

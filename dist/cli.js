@@ -14,9 +14,13 @@ import os from "os";
 import path from "path";
 
 // src/core/types.ts
-var REVIEWER_IDS = ["codex", "grok"];
+var CORE_REVIEWER_IDS = ["codex", "grok"];
+var REVIEWER_IDS = ["codex", "grok", "claude"];
 function isReviewerId(v) {
   return REVIEWER_IDS.includes(v);
+}
+function isCoreReviewerId(v) {
+  return CORE_REVIEWER_IDS.includes(v);
 }
 function parseReviewerIds(raw) {
   if (!Array.isArray(raw)) return void 0;
@@ -151,13 +155,22 @@ function persistReview(baseDir, input) {
   writeAtomic(baseDir, dir, reviewJson(id), JSON.stringify(stored, null, 2));
   return stored;
 }
+function isStoredReviewShape(v) {
+  if (typeof v !== "object" || v === null) return false;
+  const r = v;
+  return typeof r.packet === "object" && r.packet !== null && typeof r.reviewer === "object" && r.reviewer !== null;
+}
 function readReview(baseDir, runId, reviewerId = "codex") {
   const dir = reviewDir(baseDir, runId);
   const perId = readJson(path.join(dir, reviewJson(reviewerId)));
-  if (perId) return perId.reviewerId ? perId : { ...perId, reviewerId };
+  if (perId && isStoredReviewShape(perId)) {
+    return perId.reviewerId ? perId : { ...perId, reviewerId };
+  }
   if (reviewerId === "codex") {
     const legacy = readJson(path.join(dir, "review.json"));
-    if (legacy) return { ...legacy, reviewerId: "codex" };
+    if (legacy && isStoredReviewShape(legacy)) {
+      return { ...legacy, reviewerId: "codex" };
+    }
   }
   return null;
 }
@@ -498,6 +511,18 @@ var REVIEWER_DEFAULTS = {
     model: "grok-build",
     sandbox: "ensemble-review",
     vendor: "xai"
+  },
+  // Claude (Anthropic) — the capability-fenced peer (spec 2026-07-09 §3's ONE
+  // Claude producer, as a registry seat; fence in modes/review/claude.ts). Default
+  // matches the CLI claude layer's bar: opus @ max. It is the one EFFORT-ELASTIC
+  // seat (it rides the operator's own Anthropic subscription — consumers may step
+  // its effort down per diff); the vendor seats above stay at vendor-max always.
+  claude: {
+    cmd: "claude",
+    effort: "max",
+    id: "claude",
+    model: "opus",
+    vendor: "anthropic"
   }
 };
 function str(v, fallback) {
@@ -1196,6 +1221,7 @@ var CODEX_EGRESS_HOSTS = [
 ];
 var GROK_EGRESS_HOSTS = ["auth.x.ai", "cli-chat-proxy.grok.com"];
 var VENDOR_EGRESS_HOSTS = {
+  claude: [],
   codex: CODEX_EGRESS_HOSTS,
   grok: GROK_EGRESS_HOSTS
 };
@@ -2434,11 +2460,65 @@ ${ask}
 `;
 }
 
-// src/reviewers/registry.ts
-var REVIEW_ADAPTERS = {
-  codex: runCodexReview,
-  grok: runGrokReview
-};
+// src/modes/review/claude.ts
+import fs16 from "fs";
+import os9 from "os";
+import path13 from "path";
+
+// src/modes/review/history-packet.ts
+import fs15 from "fs";
+import path12 from "path";
+
+// src/modes/review/ensemble-config.ts
+import fs11 from "fs";
+import os8 from "os";
+import path8 from "path";
+var ENSEMBLE_CONFIG_PATH = path8.join(os8.homedir(), ".ensemble-ai", "config.json");
+function asRecord(v) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+}
+function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
+  try {
+    return asRecord(JSON.parse(fs11.readFileSync(configPath, "utf8"))) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+// src/modes/review/gate-hunks.ts
+import fs13 from "fs";
+import path10 from "path";
+
+// src/modes/review/trail-io.ts
+import fs12 from "fs";
+import path9 from "path";
+function readTrailJson(baseDir, runId, name) {
+  try {
+    return JSON.parse(
+      fs12.readFileSync(path9.join(reviewDir(baseDir, runId), name), "utf8")
+    );
+  } catch {
+    return null;
+  }
+}
+function reviewJsonFromTrail(baseDir, runId, name) {
+  const obj = readTrailJson(baseDir, runId, name);
+  if (!obj || typeof obj !== "object") return null;
+  const o = obj;
+  const voiceId = typeof o.voiceId === "string" && o.voiceId.trim() ? o.voiceId.trim() : null;
+  if (!voiceId) return null;
+  return {
+    findings: Array.isArray(o.findings) ? o.findings.filter(isFinding) : [],
+    ok: o.ok === true,
+    summary: typeof o.summary === "string" ? o.summary : "",
+    voiceId
+  };
+}
+function isFinding(v) {
+  if (!v || typeof v !== "object") return false;
+  const f = v;
+  return typeof f.id === "string" && f.id.trim() !== "" && typeof f.title === "string" && typeof f.body === "string" && typeof f.severity === "string" && SEVERITIES.includes(f.severity) && typeof f.confidence === "string" && CONFIDENCES.includes(f.confidence) && typeof f.evidence === "object" && f.evidence !== null;
+}
 
 // src/modes/review/diff.ts
 import { execFileSync as execFileSync2 } from "child_process";
@@ -2647,131 +2727,6 @@ function acquireDiff(opts) {
   };
 }
 
-// src/modes/review/dep-surface.ts
-var MANIFEST_PATTERNS = [
-  { label: "npm", re: /(^|\/)package\.json$/ },
-  { label: "npm-lock", lock: true, re: /(^|\/)(package-lock\.json|npm-shrinkwrap\.json)$/ },
-  { label: "yarn-lock", lock: true, re: /(^|\/)yarn\.lock$/ },
-  { label: "pnpm-lock", lock: true, re: /(^|\/)pnpm-lock\.yaml$/ },
-  { label: "bun-lock", lock: true, re: /(^|\/)bun\.lockb$/ },
-  { label: "python-requirements", re: /(^|\/)requirements[^/]*\.txt$/ },
-  { label: "python-pyproject", re: /(^|\/)pyproject\.toml$/ },
-  { label: "python-pipfile", re: /(^|\/)Pipfile$/ },
-  { label: "python-pipfile-lock", lock: true, re: /(^|\/)Pipfile\.lock$/ },
-  { label: "go-mod", re: /(^|\/)go\.mod$/ },
-  { label: "go-sum", lock: true, re: /(^|\/)go\.sum$/ },
-  { label: "rust-cargo", re: /(^|\/)Cargo\.toml$/ },
-  { label: "rust-cargo-lock", lock: true, re: /(^|\/)Cargo\.lock$/ },
-  { label: "ruby-gemfile", re: /(^|\/)Gemfile$/ },
-  { label: "ruby-gemfile-lock", lock: true, re: /(^|\/)Gemfile\.lock$/ },
-  { label: "php-composer", re: /(^|\/)composer\.json$/ },
-  { label: "php-composer-lock", lock: true, re: /(^|\/)composer\.lock$/ },
-  { label: "gradle", re: /(^|\/)build\.gradle(\.kts)?$/ },
-  { label: "maven", re: /(^|\/)pom\.xml$/ }
-];
-var RISKY_PATTERNS = [
-  { cls: "deserialization", label: "eval()", re: /\beval\s*\(/ },
-  { cls: "deserialization", label: "new Function()", re: /\bnew\s+Function\s*\(/ },
-  { cls: "deserialization", label: "vm module", re: /\bvm\.runIn|require\(\s*['"]vm['"]\s*\)|from\s+['"]vm['"]/ },
-  { cls: "deserialization", label: "pickle.load (py)", re: /\bpickle\.loads?\s*\(/ },
-  { cls: "deserialization", label: "yaml.load (py, unsafe)", re: /\byaml\.load\s*\(/ },
-  { cls: "deserialization", label: "unserialize (php)", re: /\bunserialize\s*\(/ },
-  { cls: "injection", label: "child_process", re: /\bchild_process\b|\bexecSync?\s*\(|\bspawnSync?\s*\(|\bexecFileSync?\s*\(/ },
-  { cls: "injection", label: "os.system / subprocess (py)", re: /\bos\.system\s*\(|\bsubprocess\.(Popen|call|run|check_output)\s*\(/ },
-  { cls: "xss", label: "dangerouslySetInnerHTML", re: /dangerouslySetInnerHTML/ },
-  { cls: "xss", label: "innerHTML assignment", re: /\.innerHTML\s*=/ },
-  { cls: "xss", label: "document.write", re: /document\.write\s*\(/ }
-];
-function addedContentLines(section2) {
-  const out = [];
-  let newLine = 0;
-  for (const l of section2.split("\n")) {
-    const hunk = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-    if (hunk) {
-      newLine = Number(hunk[1]);
-      continue;
-    }
-    if (l.startsWith("+++")) continue;
-    if (l.startsWith("+")) {
-      out.push({ line: newLine, text: l.slice(1) });
-      newLine++;
-    } else if (l.startsWith("-") && !l.startsWith("---")) {
-    } else if (l.startsWith(" ")) {
-      newLine++;
-    }
-  }
-  return out;
-}
-function scanDependencySurface(files) {
-  const manifests = [];
-  const riskyImports = [];
-  for (const f of files) {
-    if (f.isBinary) continue;
-    const added = addedContentLines(f.raw);
-    const m = MANIFEST_PATTERNS.find((p) => p.re.test(f.path));
-    if (m) {
-      manifests.push({
-        added: added.length,
-        isLockfile: Boolean(m.lock),
-        label: m.label,
-        path: f.path,
-        samples: m.lock ? [] : added.map((a) => a.text.trim()).filter(Boolean).slice(0, 5)
-      });
-    }
-    if (f.kind !== "source") continue;
-    const seen = /* @__PURE__ */ new Set();
-    for (const a of added) {
-      for (const r of RISKY_PATTERNS) {
-        if (!seen.has(r.label) && r.re.test(a.text)) {
-          seen.add(r.label);
-          riskyImports.push({
-            cls: r.cls,
-            label: r.label,
-            line: a.line || void 0,
-            path: f.path
-          });
-        }
-      }
-    }
-  }
-  return { manifests, riskyImports };
-}
-
-// src/modes/review/gate-hunks.ts
-import fs12 from "fs";
-import path9 from "path";
-
-// src/modes/review/trail-io.ts
-import fs11 from "fs";
-import path8 from "path";
-function readTrailJson(baseDir, runId, name) {
-  try {
-    return JSON.parse(
-      fs11.readFileSync(path8.join(reviewDir(baseDir, runId), name), "utf8")
-    );
-  } catch {
-    return null;
-  }
-}
-function reviewJsonFromTrail(baseDir, runId, name) {
-  const obj = readTrailJson(baseDir, runId, name);
-  if (!obj || typeof obj !== "object") return null;
-  const o = obj;
-  const voiceId = typeof o.voiceId === "string" && o.voiceId.trim() ? o.voiceId.trim() : null;
-  if (!voiceId) return null;
-  return {
-    findings: Array.isArray(o.findings) ? o.findings.filter(isFinding) : [],
-    ok: o.ok === true,
-    summary: typeof o.summary === "string" ? o.summary : "",
-    voiceId
-  };
-}
-function isFinding(v) {
-  if (!v || typeof v !== "object") return false;
-  const f = v;
-  return typeof f.id === "string" && f.id.trim() !== "" && typeof f.title === "string" && typeof f.body === "string" && typeof f.severity === "string" && SEVERITIES.includes(f.severity) && typeof f.confidence === "string" && CONFIDENCES.includes(f.confidence) && typeof f.evidence === "object" && f.evidence !== null;
-}
-
 // src/modes/review/gate-hunks.ts
 var GATE_PACKET_SCHEMA_VERSION = 2;
 function persistGatePacket(baseDir, runId, input) {
@@ -2783,8 +2738,8 @@ function persistGatePacket(baseDir, runId, input) {
   writeTrailFile(baseDir, runId, "packet.gate.json", JSON.stringify(packet, null, 2));
 }
 function readGatePacket(baseDir, runId, expectedHeadSha) {
-  const file = path9.join(reviewDir(baseDir, runId), "packet.gate.json");
-  if (!fs12.existsSync(file)) return { ok: false, reason: "missing" };
+  const file = path10.join(reviewDir(baseDir, runId), "packet.gate.json");
+  if (!fs13.existsSync(file)) return { ok: false, reason: "missing" };
   const raw = readTrailJson(baseDir, runId, "packet.gate.json");
   if (raw === null || typeof raw.diff !== "string" || typeof raw.headSha !== "string" || raw.schemaVersion !== GATE_PACKET_SCHEMA_VERSION) {
     return { ok: false, reason: "corrupt" };
@@ -2877,120 +2832,6 @@ function hunkCodeLines(hunk) {
     if (norm2) out.push(norm2);
   }
   return out;
-}
-
-// src/modes/review/receipt.ts
-import fs19 from "fs";
-import os10 from "os";
-import path15 from "path";
-
-// src/modes/review/evidence.ts
-var EVIDENCE_CLASSES = ["packet", "worktree"];
-var HARNESS_SEATS = ["claude", "gate"];
-var EVIDENCE_SEATS = [...REVIEWER_IDS, ...HARNESS_SEATS];
-function isEvidenceSeat(v) {
-  return EVIDENCE_SEATS.includes(v);
-}
-function isEvidenceClass(v) {
-  return EVIDENCE_CLASSES.includes(v);
-}
-var STRENGTH = { packet: 1, worktree: 2 };
-var UNKNOWN_STRENGTH = STRENGTH.packet;
-function strengthOf(c) {
-  return c ? STRENGTH[c] : UNKNOWN_STRENGTH;
-}
-var POLICY_VERSION_LEGACY = 1;
-var POLICY_VERSION_EVIDENCE = 2;
-var POLICY_VERSIONS = [POLICY_VERSION_LEGACY, POLICY_VERSION_EVIDENCE];
-function isPolicyVersion(v) {
-  return POLICY_VERSIONS.includes(v);
-}
-function resolvePolicyVersion(intended) {
-  return Object.values(intended).some((c) => c === "worktree") ? POLICY_VERSION_EVIDENCE : POLICY_VERSION_LEGACY;
-}
-function canonicalMap(m) {
-  const out = {};
-  for (const seat of [...EVIDENCE_SEATS].sort()) {
-    const v = m[seat];
-    if (v !== void 0) out[seat] = v;
-  }
-  return out;
-}
-function computePolicyHashAt(inputs, version) {
-  if (version === POLICY_VERSION_LEGACY) {
-    const canonical2 = JSON.stringify({
-      coveragePolicy: inputs.coveragePolicy,
-      diffMode: inputs.diffMode,
-      reviewerPolicy: [...inputs.reviewerPolicy].sort()
-    });
-    return `sha256:${sha256Hex(canonical2)}`;
-  }
-  if (version !== POLICY_VERSION_EVIDENCE) {
-    throw new Error(
-      `ensemble-ai: unknown policyVersion ${version} \u2014 cannot compute a policy hash under a schema this build does not define`
-    );
-  }
-  const intendedEvidence = canonicalMap(inputs.intendedEvidence ?? {});
-  const canonical = JSON.stringify({
-    coveragePolicy: inputs.coveragePolicy,
-    diffMode: inputs.diffMode,
-    intendedEvidence,
-    policyVersion: POLICY_VERSION_EVIDENCE,
-    reviewerPolicy: [...inputs.reviewerPolicy].sort(),
-    sandboxProfiles: canonicalMap(inputs.sandboxProfiles ?? {}),
-    // Redundant with intendedEvidence's keys, but part of the FROZEN v2 preimage: once a v2
-    // receipt exists on disk its hash cannot be renegotiated. canonicalMap already sorts.
-    seatSet: Object.keys(intendedEvidence)
-  });
-  return `sha256:${sha256Hex(canonical)}`;
-}
-function evidenceShortfall(intended, realized) {
-  const gaps = [];
-  for (const seat of EVIDENCE_SEATS) {
-    const want = intended[seat];
-    if (!want) continue;
-    const got = realized?.[seat];
-    if (strengthOf(got) < strengthOf(want)) {
-      gaps.push({ intended: want, realized: got ?? "unknown", seat });
-    }
-  }
-  return gaps;
-}
-function formatEvidenceShortfall(gaps) {
-  const named = gaps.map((g) => `${g.seat} realized ${g.realized}, intended ${g.intended}`).join("; ");
-  return `evidence degraded \u2014 ${named}. This receipt does not prove the worktree-evidence review you are asking for. Re-run the review with the repo location, or pass --accept-degraded to accept the weaker evidence.`;
-}
-
-// src/modes/review/holistic-gate.ts
-import fs18 from "fs";
-import path14 from "path";
-
-// src/modes/review/holistic.ts
-import fs17 from "fs";
-
-// src/modes/review/claude.ts
-import fs16 from "fs";
-import os9 from "os";
-import path13 from "path";
-
-// src/modes/review/history-packet.ts
-import fs15 from "fs";
-import path12 from "path";
-
-// src/modes/review/ensemble-config.ts
-import fs13 from "fs";
-import os8 from "os";
-import path10 from "path";
-var ENSEMBLE_CONFIG_PATH = path10.join(os8.homedir(), ".ensemble-ai", "config.json");
-function asRecord(v) {
-  return v && typeof v === "object" && !Array.isArray(v) ? v : null;
-}
-function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
-  try {
-    return asRecord(JSON.parse(fs13.readFileSync(configPath, "utf8"))) ?? {};
-  } catch {
-    return {};
-  }
 }
 
 // src/modes/review/worktree.ts
@@ -3676,7 +3517,199 @@ exists at ${args.headSha}.
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}`;
 }
 
+// src/reviewers/claude.ts
+function runClaudeReview(prompt, config, opts = {}) {
+  return runClaudeReviewVoice(prompt, config, opts);
+}
+
+// src/reviewers/registry.ts
+var REVIEW_ADAPTERS = {
+  claude: runClaudeReview,
+  codex: runCodexReview,
+  grok: runGrokReview
+};
+
+// src/modes/review/dep-surface.ts
+var MANIFEST_PATTERNS = [
+  { label: "npm", re: /(^|\/)package\.json$/ },
+  { label: "npm-lock", lock: true, re: /(^|\/)(package-lock\.json|npm-shrinkwrap\.json)$/ },
+  { label: "yarn-lock", lock: true, re: /(^|\/)yarn\.lock$/ },
+  { label: "pnpm-lock", lock: true, re: /(^|\/)pnpm-lock\.yaml$/ },
+  { label: "bun-lock", lock: true, re: /(^|\/)bun\.lockb$/ },
+  { label: "python-requirements", re: /(^|\/)requirements[^/]*\.txt$/ },
+  { label: "python-pyproject", re: /(^|\/)pyproject\.toml$/ },
+  { label: "python-pipfile", re: /(^|\/)Pipfile$/ },
+  { label: "python-pipfile-lock", lock: true, re: /(^|\/)Pipfile\.lock$/ },
+  { label: "go-mod", re: /(^|\/)go\.mod$/ },
+  { label: "go-sum", lock: true, re: /(^|\/)go\.sum$/ },
+  { label: "rust-cargo", re: /(^|\/)Cargo\.toml$/ },
+  { label: "rust-cargo-lock", lock: true, re: /(^|\/)Cargo\.lock$/ },
+  { label: "ruby-gemfile", re: /(^|\/)Gemfile$/ },
+  { label: "ruby-gemfile-lock", lock: true, re: /(^|\/)Gemfile\.lock$/ },
+  { label: "php-composer", re: /(^|\/)composer\.json$/ },
+  { label: "php-composer-lock", lock: true, re: /(^|\/)composer\.lock$/ },
+  { label: "gradle", re: /(^|\/)build\.gradle(\.kts)?$/ },
+  { label: "maven", re: /(^|\/)pom\.xml$/ }
+];
+var RISKY_PATTERNS = [
+  { cls: "deserialization", label: "eval()", re: /\beval\s*\(/ },
+  { cls: "deserialization", label: "new Function()", re: /\bnew\s+Function\s*\(/ },
+  { cls: "deserialization", label: "vm module", re: /\bvm\.runIn|require\(\s*['"]vm['"]\s*\)|from\s+['"]vm['"]/ },
+  { cls: "deserialization", label: "pickle.load (py)", re: /\bpickle\.loads?\s*\(/ },
+  { cls: "deserialization", label: "yaml.load (py, unsafe)", re: /\byaml\.load\s*\(/ },
+  { cls: "deserialization", label: "unserialize (php)", re: /\bunserialize\s*\(/ },
+  { cls: "injection", label: "child_process", re: /\bchild_process\b|\bexecSync?\s*\(|\bspawnSync?\s*\(|\bexecFileSync?\s*\(/ },
+  { cls: "injection", label: "os.system / subprocess (py)", re: /\bos\.system\s*\(|\bsubprocess\.(Popen|call|run|check_output)\s*\(/ },
+  { cls: "xss", label: "dangerouslySetInnerHTML", re: /dangerouslySetInnerHTML/ },
+  { cls: "xss", label: "innerHTML assignment", re: /\.innerHTML\s*=/ },
+  { cls: "xss", label: "document.write", re: /document\.write\s*\(/ }
+];
+function addedContentLines(section2) {
+  const out = [];
+  let newLine = 0;
+  for (const l of section2.split("\n")) {
+    const hunk = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      newLine = Number(hunk[1]);
+      continue;
+    }
+    if (l.startsWith("+++")) continue;
+    if (l.startsWith("+")) {
+      out.push({ line: newLine, text: l.slice(1) });
+      newLine++;
+    } else if (l.startsWith("-") && !l.startsWith("---")) {
+    } else if (l.startsWith(" ")) {
+      newLine++;
+    }
+  }
+  return out;
+}
+function scanDependencySurface(files) {
+  const manifests = [];
+  const riskyImports = [];
+  for (const f of files) {
+    if (f.isBinary) continue;
+    const added = addedContentLines(f.raw);
+    const m = MANIFEST_PATTERNS.find((p) => p.re.test(f.path));
+    if (m) {
+      manifests.push({
+        added: added.length,
+        isLockfile: Boolean(m.lock),
+        label: m.label,
+        path: f.path,
+        samples: m.lock ? [] : added.map((a) => a.text.trim()).filter(Boolean).slice(0, 5)
+      });
+    }
+    if (f.kind !== "source") continue;
+    const seen = /* @__PURE__ */ new Set();
+    for (const a of added) {
+      for (const r of RISKY_PATTERNS) {
+        if (!seen.has(r.label) && r.re.test(a.text)) {
+          seen.add(r.label);
+          riskyImports.push({
+            cls: r.cls,
+            label: r.label,
+            line: a.line || void 0,
+            path: f.path
+          });
+        }
+      }
+    }
+  }
+  return { manifests, riskyImports };
+}
+
+// src/modes/review/receipt.ts
+import fs19 from "fs";
+import os10 from "os";
+import path15 from "path";
+
+// src/modes/review/evidence.ts
+var EVIDENCE_CLASSES = ["packet", "worktree"];
+var HARNESS_SEATS = ["claude", "gate"];
+var EVIDENCE_SEATS_RAW = [...REVIEWER_IDS, ...HARNESS_SEATS];
+var EVIDENCE_SEATS = [
+  ...new Set(EVIDENCE_SEATS_RAW)
+];
+function isEvidenceSeat(v) {
+  return EVIDENCE_SEATS.includes(v);
+}
+function isEvidenceClass(v) {
+  return EVIDENCE_CLASSES.includes(v);
+}
+var STRENGTH = { packet: 1, worktree: 2 };
+var UNKNOWN_STRENGTH = STRENGTH.packet;
+function strengthOf(c) {
+  return c ? STRENGTH[c] : UNKNOWN_STRENGTH;
+}
+var POLICY_VERSION_LEGACY = 1;
+var POLICY_VERSION_EVIDENCE = 2;
+var POLICY_VERSIONS = [POLICY_VERSION_LEGACY, POLICY_VERSION_EVIDENCE];
+function isPolicyVersion(v) {
+  return POLICY_VERSIONS.includes(v);
+}
+function resolvePolicyVersion(intended) {
+  return Object.values(intended).some((c) => c === "worktree") ? POLICY_VERSION_EVIDENCE : POLICY_VERSION_LEGACY;
+}
+function canonicalMap(m) {
+  const out = {};
+  for (const seat of [...EVIDENCE_SEATS].sort()) {
+    const v = m[seat];
+    if (v !== void 0) out[seat] = v;
+  }
+  return out;
+}
+function computePolicyHashAt(inputs, version) {
+  if (version === POLICY_VERSION_LEGACY) {
+    const canonical2 = JSON.stringify({
+      coveragePolicy: inputs.coveragePolicy,
+      diffMode: inputs.diffMode,
+      reviewerPolicy: [...inputs.reviewerPolicy].sort()
+    });
+    return `sha256:${sha256Hex(canonical2)}`;
+  }
+  if (version !== POLICY_VERSION_EVIDENCE) {
+    throw new Error(
+      `ensemble-ai: unknown policyVersion ${version} \u2014 cannot compute a policy hash under a schema this build does not define`
+    );
+  }
+  const intendedEvidence = canonicalMap(inputs.intendedEvidence ?? {});
+  const canonical = JSON.stringify({
+    coveragePolicy: inputs.coveragePolicy,
+    diffMode: inputs.diffMode,
+    intendedEvidence,
+    policyVersion: POLICY_VERSION_EVIDENCE,
+    reviewerPolicy: [...inputs.reviewerPolicy].sort(),
+    sandboxProfiles: canonicalMap(inputs.sandboxProfiles ?? {}),
+    // Redundant with intendedEvidence's keys, but part of the FROZEN v2 preimage: once a v2
+    // receipt exists on disk its hash cannot be renegotiated. canonicalMap already sorts.
+    seatSet: Object.keys(intendedEvidence)
+  });
+  return `sha256:${sha256Hex(canonical)}`;
+}
+function evidenceShortfall(intended, realized) {
+  const gaps = [];
+  for (const seat of EVIDENCE_SEATS) {
+    const want = intended[seat];
+    if (!want) continue;
+    const got = realized?.[seat];
+    if (strengthOf(got) < strengthOf(want)) {
+      gaps.push({ intended: want, realized: got ?? "unknown", seat });
+    }
+  }
+  return gaps;
+}
+function formatEvidenceShortfall(gaps) {
+  const named = gaps.map((g) => `${g.seat} realized ${g.realized}, intended ${g.intended}`).join("; ");
+  return `evidence degraded \u2014 ${named}. This receipt does not prove the worktree-evidence review you are asking for. Re-run the review with the repo location, or pass --accept-degraded to accept the weaker evidence.`;
+}
+
+// src/modes/review/holistic-gate.ts
+import fs18 from "fs";
+import path14 from "path";
+
 // src/modes/review/holistic.ts
+import fs17 from "fs";
 var HOLISTIC_SEAT_ID = "holistic";
 var HOLISTIC_SEVERITY_CAP = "medium";
 var HOLISTIC_DEFAULTS = { effort: "max", model: "opus" };
@@ -5308,6 +5341,10 @@ function qualifyHarnessSeat() {
   return { profile: CLAUDE_CAPABILITY_FENCE, qualified: true, reason: null };
 }
 var SEAT_QUALIFIERS = {
+  // The Anthropic registry seat qualifies exactly like the CLI's claude layer:
+  // the capability fence (tools removed, strict MCP, neutral cwd, $HOME
+  // read-denied) is CLI-flag-based — no kernel wrapper, no platform dependency.
+  claude: () => qualifyHarnessSeat(),
   codex: ({ worktree }) => qualifyCodexSeat(worktree),
   grok: ({ config }) => qualifyGrokSeat(config.sandbox)
 };
@@ -5430,7 +5467,11 @@ async function runCoreSeat(args) {
     review: persistAttempt(args, args.packetPrompt, second)
   };
 }
-var RETRIES_ON_PACKET = { codex: true, grok: false };
+var RETRIES_ON_PACKET = {
+  claude: false,
+  codex: true,
+  grok: false
+};
 
 // src/modes/review/secret-scan.ts
 var SENSITIVE_PATH_PATTERNS = [
@@ -5499,7 +5540,7 @@ async function runReviewMode(opts) {
   });
   const ceilingBytes = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
   const profile = opts.profile ?? "code";
-  const reviewers = opts.reviewers && opts.reviewers.length > 0 ? opts.reviewers : [...REVIEWER_IDS];
+  const reviewers = opts.reviewers && opts.reviewers.length > 0 ? opts.reviewers : [...CORE_REVIEWER_IDS];
   const sourceLabel = opts.diffText !== void 0 ? opts.diffMode ?? "raw" : opts.staged ? "staged" : opts.workingTree ? "working-tree" : "commit";
   log(`Acquiring diff (${sourceLabel} mode)\u2026`);
   const acquired = acquireDiff({
@@ -5693,20 +5734,17 @@ ${SCHEMA_BLOCK2}`;
 
 // src/modes/review/self-contained.ts
 function resolveReviewRoster(requested, noClaude) {
-  const known = [...REVIEWER_IDS, "claude"];
   if (requested === void 0) {
-    return { claude: !noClaude, core: [...REVIEWER_IDS] };
+    return { claude: !noClaude, core: [...CORE_REVIEWER_IDS] };
   }
   const ids = [...new Set(requested.map((s) => s.trim()).filter(Boolean))];
-  const unknown = ids.filter((id) => !known.includes(id));
+  const unknown = ids.filter((id) => !isReviewerId(id));
   if (unknown.length > 0) {
     return {
-      error: `unknown reviewer id(s): ${unknown.join(", ")} (known: ${known.join(", ")})`
+      error: `unknown reviewer id(s): ${unknown.join(", ")} (known: ${REVIEWER_IDS.join(", ")})`
     };
   }
-  const core = ids.filter(
-    (id) => REVIEWER_IDS.includes(id)
-  );
+  const core = ids.filter(isCoreReviewerId);
   if (core.length === 0) {
     return {
       error: "select at least one cross-vendor reviewer (codex/grok) \u2014 claude is additive, not standalone"
@@ -8384,8 +8422,8 @@ function parseReviewerList(raw, cmd) {
   }
   return parseReviewerIds(requested);
 }
-function parseRequiredReviewers(raw, cmd) {
-  return raw === void 0 ? [...REVIEWER_IDS] : parseReviewerList(raw, cmd);
+function parseRequiredReviewers(raw, cmd, defaultIds) {
+  return raw === void 0 ? [...defaultIds] : parseReviewerList(raw, cmd);
 }
 function parseConventionPaths(raw) {
   if (typeof raw !== "string") return void 0;
@@ -8515,7 +8553,8 @@ async function receiptCommand(args) {
   }
   const required = parseRequiredReviewers(
     typeof values.reviewers === "string" ? values.reviewers : void 0,
-    "receipt"
+    "receipt",
+    CORE_REVIEWER_IDS
   );
   if ("code" in required) return required.code;
   const ceiling = positiveCeiling(
@@ -8748,7 +8787,8 @@ async function diffCommand(args) {
   }
   const reviewers = parseRequiredReviewers(
     typeof values.reviewers === "string" ? values.reviewers : void 0,
-    "diff"
+    "diff",
+    REVIEWER_IDS
   );
   if ("code" in reviewers) return reviewers.code;
   const ceiling = positiveCeiling(
@@ -8928,5 +8968,6 @@ if (isEntrypoint(import.meta.url)) {
 }
 export {
   main,
+  parseRequiredReviewers,
   resolveTrailBase
 };

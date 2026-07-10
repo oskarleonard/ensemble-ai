@@ -29,6 +29,7 @@ export * from './core/hash';
 // ── Reviewer adapters (codex · grok) + the adapter registry ──────────────────
 export * from './reviewers/codex';
 export * from './reviewers/grok';
+export * from './reviewers/claude';
 export * from './reviewers/registry';
 // The ensemble-owned codex sandbox wrapper (worktree evidence, macOS Seatbelt).
 export * from './reviewers/codex-sandbox';
@@ -45,6 +46,7 @@ export * from './modes/review/evidence';
 export * from './modes/review/evidence-manifest';
 export * from './modes/review/worktree';
 export * from './modes/review/code-review-seat';
+export * from './modes/review/claude';
 // ── The foreign tail: posting posture · the staged PENDING review · the push fence ─
 // Exported so a consumer (the Hugin dashboard's "Review & stage" button) drives the SAME
 // placement + staging the CLI does. `--stage` is the thin CLI over exactly these.

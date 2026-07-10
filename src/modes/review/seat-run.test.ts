@@ -145,7 +145,7 @@ describe('the codex WRAPPER VIABILITY CHECK is a real review, and its failure fa
   });
 
   it('grok does NOT retry — its profile is proven, so a failure there is a reviewer failure', async () => {
-    expect(RETRIES_ON_PACKET).toEqual({ codex: true, grok: false });
+    expect(RETRIES_ON_PACKET).toEqual({ claude: false, codex: true, grok: false });
     const { adapter, calls } = stubAdapter([empty(), reviewed()]);
     const seat = await runCoreSeat({
       ...base,

@@ -212,3 +212,47 @@ describe('writeTrailFile — hardened, symlink-safe trail writer', () => {
     expect(fs.existsSync(path.join(outsideDir, 'conventions.json'))).toBe(false);
   });
 });
+
+// The claude LAYER writes a VoiceReview-shaped review.claude.json into the same trail
+// dir (persistSeatReview); with claude now in REVIEWER_IDS, readReviewsForRun must
+// return only genuine StoredReview facts — never that layer file re-cast (the
+// synthesis would count claude twice, once degraded).
+describe('readReview · structural guard against the claude-layer VoiceReview file', () => {
+  it('skips a VoiceReview-shaped review.claude.json, returns a StoredReview-shaped one', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-artifacts-guard-'));
+    try {
+      const stored = persistReview(base, {
+        findings: [],
+        packet: { complete: true, objective: 'o', pr: 1, repo: 'r', sections: [] },
+        prompt: 'p',
+        raw: 'r',
+        reviewer: { cmd: 'codex', effort: 'xhigh', id: 'codex', model: 'm', vendor: 'openai' },
+        runId: 'run-guard',
+        summary: 's',
+        terminalState: 'reviewed',
+      });
+      expect(stored.reviewerId).toBe('codex');
+      // Plant the claude LAYER's VoiceReview-shaped file beside it.
+      fs.writeFileSync(
+        path.join(reviewDir(base, 'run-guard'), 'review.claude.json'),
+        JSON.stringify({ findings: [], ok: true, summary: 'layer', voiceId: 'claude' })
+      );
+      const all = readReviewsForRun(base, 'run-guard');
+      expect(all.map((r) => r.reviewerId)).toEqual(['codex']);
+      // A GENUINE claude StoredReview (a registry-consumer write) IS returned.
+      persistReview(base, {
+        findings: [],
+        packet: { complete: true, objective: 'o', pr: 1, repo: 'r', sections: [] },
+        prompt: 'p',
+        raw: 'r',
+        reviewer: { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' },
+        runId: 'run-guard2',
+        summary: 's',
+        terminalState: 'reviewed',
+      });
+      expect(readReviewsForRun(base, 'run-guard2').map((r) => r.reviewerId)).toEqual(['claude']);
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  });
+});

@@ -255,17 +255,38 @@ export function persistReview(
 // Read ONE reviewer's stored review. `reviewerId` defaults to Codex, and falls
 // back to the legacy bare `review.json` for pre-fan-out runs (backfilling
 // reviewerId so a consumer always has it).
+// Structural guard: a StoredReview always carries the facts persistReview wrote
+// (`packet` + `reviewer` objects). Load-bearing since `claude` joined
+// REVIEWER_IDS: the CLI's claude LAYER persists a VoiceReview-shaped
+// `review.claude.json` (persistSeatReview) into the same trail dir — without
+// this guard readReviewsForRun would return that file as a malformed
+// StoredReview and the synthesis would count claude twice (once degraded).
+function isStoredReviewShape(v: unknown): v is StoredReview {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Record<string, unknown>;
+  return (
+    typeof r.packet === 'object' &&
+    r.packet !== null &&
+    typeof r.reviewer === 'object' &&
+    r.reviewer !== null
+  );
+}
+
 export function readReview(
   baseDir: string,
   runId: string,
   reviewerId: ReviewerId = 'codex'
 ): StoredReview | null {
   const dir = reviewDir(baseDir, runId);
-  const perId = readJson<StoredReview>(path.join(dir, reviewJson(reviewerId)));
-  if (perId) return perId.reviewerId ? perId : { ...perId, reviewerId };
+  const perId = readJson<unknown>(path.join(dir, reviewJson(reviewerId)));
+  if (perId && isStoredReviewShape(perId)) {
+    return perId.reviewerId ? perId : { ...perId, reviewerId };
+  }
   if (reviewerId === 'codex') {
-    const legacy = readJson<StoredReview>(path.join(dir, 'review.json'));
-    if (legacy) return { ...legacy, reviewerId: 'codex' };
+    const legacy = readJson<unknown>(path.join(dir, 'review.json'));
+    if (legacy && isStoredReviewShape(legacy)) {
+      return { ...legacy, reviewerId: 'codex' };
+    }
   }
   return null;
 }

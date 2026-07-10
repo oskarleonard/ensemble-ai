@@ -45,7 +45,11 @@ describe('reviewers / config command', () => {
     const code = await main(['reviewers', '--json', '--reviewers-file', '/nope.json']);
     expect(code).toBe(0);
     const parsed = JSON.parse(logged);
-    expect(parsed.reviewers.map((r: { id: string }) => r.id)).toEqual(['codex', 'grok']);
+    expect(parsed.reviewers.map((r: { id: string }) => r.id)).toEqual([
+      'codex',
+      'grok',
+      'claude',
+    ]);
     expect(parsed.reviewersFileExists).toBe(false);
   });
 
@@ -109,7 +113,9 @@ describe('diff command — assembles the packet WITHOUT spawning a reviewer', ()
     expect(code).toBe(0);
     expect(logged).toContain('assembled code review packet');
     expect(logged).toContain('The diff under review');
-    expect(logged).toContain('reviewer(s) [codex, grok]');
+    // Three seats IS the CLI's true default roster (core codex+grok + the
+    // default-on claude layer), so the cost preview naming all three is honest.
+    expect(logged).toContain('reviewer(s) [codex, grok, claude]');
     expect(logged).not.toContain('## Objective'); // no full prompt by default
   });
 

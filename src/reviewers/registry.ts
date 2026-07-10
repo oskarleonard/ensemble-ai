@@ -1,14 +1,15 @@
 import type { ReviewerConfig, ReviewerId } from '../core/types';
 
+import { runClaudeReview } from './claude';
 import { type CodexReviewResult, type RunReviewOpts, runCodexReview } from './codex';
 import { runGrokReview } from './grok';
 
 // The per-reviewer invocation adapters, keyed by id. EXHAUSTIVE over ReviewerId —
 // TS errors if a new reviewer joins REVIEWER_IDS without registering its adapter
-// here, so a reviewer can never silently fall back to the wrong vendor. Both
-// adapters return the uniform {ok, raw, stderrTail, timedOut} where `raw` is ready
-// for parseFindings (codex: the -o file; grok: the `.text` of its JSON envelope).
-// A third reviewer = one more entry here + its own thin adapter.
+// here, so a reviewer can never silently fall back to the wrong vendor. Every
+// adapter returns the uniform {ok, raw, stderrTail, timedOut} where `raw` is ready
+// for parseFindings (codex: the -o file; grok: the `.text` of its JSON envelope;
+// claude: stdout). A fourth reviewer = one more entry here + its own thin adapter.
 export const REVIEW_ADAPTERS: Record<
   ReviewerId,
   (
@@ -17,6 +18,7 @@ export const REVIEW_ADAPTERS: Record<
     opts?: RunReviewOpts
   ) => Promise<CodexReviewResult>
 > = {
+  claude: runClaudeReview,
   codex: runCodexReview,
   grok: runGrokReview,
 };

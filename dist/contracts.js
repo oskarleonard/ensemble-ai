@@ -1,7 +1,11 @@
 // src/core/types.ts
-var REVIEWER_IDS = ["codex", "grok"];
+var CORE_REVIEWER_IDS = ["codex", "grok"];
+var REVIEWER_IDS = ["codex", "grok", "claude"];
 function isReviewerId(v) {
   return REVIEWER_IDS.includes(v);
+}
+function isCoreReviewerId(v) {
+  return CORE_REVIEWER_IDS.includes(v);
 }
 function titleCase(id) {
   return id ? id[0].toUpperCase() + id.slice(1) : id;
@@ -356,6 +360,7 @@ ${ask}
 }
 export {
   CONFIDENCES,
+  CORE_REVIEWER_IDS,
   DIFF_SECTION_TITLE,
   DIFF_USEFUL_FLOOR,
   FINDINGS_INSTRUCTIONS,
@@ -369,6 +374,7 @@ export {
   assembleCodePacket,
   evidenceRef,
   extractJsonBlock,
+  isCoreReviewerId,
   isReviewerId,
   oneOf,
   parseFindings,

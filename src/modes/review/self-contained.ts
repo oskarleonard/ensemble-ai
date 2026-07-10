@@ -15,7 +15,13 @@ import { readReviewsForRun, writeTrailFile } from '../../core/artifacts';
 import { evidenceRef, parseFindings } from '../../core/findings';
 import { scrubControl as scrub } from '../../core/sanitize';
 import type { ReviewFinding, StoredReview } from '../../core/types';
-import { REVIEWER_IDS, type ReviewerId } from '../../core/types';
+import {
+  CORE_REVIEWER_IDS,
+  isCoreReviewerId,
+  isReviewerId,
+  REVIEWER_IDS,
+  type ReviewerId,
+} from '../../core/types';
 import type { RunReviewOpts } from '../../reviewers/codex';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
@@ -50,24 +56,26 @@ export type RosterResolution =
 // (it is default-on now), and the cross-vendor CORE (codex/grok) mints the content-tied
 // receipt, so at least one core reviewer is required. Fails CLOSED on an unknown id (a typo
 // must never silently narrow the policy).
+//
+// `claude` is now ALSO a registry ReviewerId (the dashboard-style consumers run it through
+// REVIEW_ADAPTERS), but in THIS pipeline it stays the additive layer: the core filter is
+// CORE_REVIEWER_IDS, never REVIEWER_IDS, so a `--reviewers codex,claude` request can never
+// run claude twice (once as core, once as the layer) or let it mint a same-vendor receipt.
 export function resolveReviewRoster(
   requested: string[] | undefined,
   noClaude: boolean
 ): RosterResolution {
-  const known = [...REVIEWER_IDS, 'claude'];
   if (requested === undefined) {
-    return { claude: !noClaude, core: [...REVIEWER_IDS] };
+    return { claude: !noClaude, core: [...CORE_REVIEWER_IDS] };
   }
   const ids = [...new Set(requested.map((s) => s.trim()).filter(Boolean))];
-  const unknown = ids.filter((id) => !known.includes(id));
+  const unknown = ids.filter((id) => !isReviewerId(id));
   if (unknown.length > 0) {
     return {
-      error: `unknown reviewer id(s): ${unknown.join(', ')} (known: ${known.join(', ')})`,
+      error: `unknown reviewer id(s): ${unknown.join(', ')} (known: ${REVIEWER_IDS.join(', ')})`,
     };
   }
-  const core = ids.filter((id): id is ReviewerId =>
-    (REVIEWER_IDS as readonly string[]).includes(id)
-  );
+  const core = ids.filter(isCoreReviewerId);
   // codex/grok mint the content-tied receipt; claude is an ADDITIVE peer reviewer, never a
   // standalone one. Require ≥1 cross-vendor core.
   if (core.length === 0) {

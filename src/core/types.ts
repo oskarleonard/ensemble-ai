@@ -5,11 +5,27 @@
 // over them. No node imports — this is shared by consumers (UIs that render the
 // reviewer ids), CLIs, and the unit tests.
 
-export const REVIEWER_IDS = ['codex', 'grok'] as const;
+// The CROSS-VENDOR core: the seats that mint the content-tied receipt and that a
+// review cannot run without (self-contained.ts's roster rule). Kept separate from
+// REVIEWER_IDS so the registry can carry same-vendor-as-the-author reviewers
+// (claude) without weakening the receipt's cross-vendor meaning.
+export const CORE_REVIEWER_IDS = ['codex', 'grok'] as const;
+export type CoreReviewerId = (typeof CORE_REVIEWER_IDS)[number];
+
+// EVERY registry reviewer a consumer can run — the cross-vendor core plus the
+// capability-fenced Anthropic peer (spec 2026-07-09 §3's ONE Claude producer,
+// promoted to a first-class registry seat so library consumers key artifacts,
+// dispositions, and UI by one id space). The CLI's default roster stays the
+// core (claude remains its ADDITIVE layer); only explicit requests run claude.
+export const REVIEWER_IDS = ['codex', 'grok', 'claude'] as const;
 export type ReviewerId = (typeof REVIEWER_IDS)[number];
 
 export function isReviewerId(v: unknown): v is ReviewerId {
   return (REVIEWER_IDS as readonly string[]).includes(v as string);
+}
+
+export function isCoreReviewerId(v: unknown): v is CoreReviewerId {
+  return (CORE_REVIEWER_IDS as readonly string[]).includes(v as string);
 }
 
 // The display label for a reviewer id ("codex" → "Codex"). One source so every
