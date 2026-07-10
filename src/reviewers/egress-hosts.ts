@@ -73,7 +73,11 @@ const CODEX_EGRESS_HOSTS = [
 // output and no error). If xAI moves that host, the grok seat will hang until the 12-minute review
 // watchdog kills it, and the seat will be scored `failed-reviewer` rather than erroring quickly.
 // That is fail-closed, but it is slow — a hung grok seat is the signal to re-probe this list. Losing
-// `auth.x.ai` fails differently and better: a fast 401 and a loud, recorded packet fallback.
+// `auth.x.ai` fails differently and better: `cli-chat-proxy.grok.com` is still reachable, so it
+// answers a FAST 401 instead of hanging, loudly recorded in `evidence.egressDenials`, and the seat is
+// scored `failed-reviewer`. grok does NOT then fall back to the packet — `RETRIES_ON_PACKET.grok` is
+// false (unlike codex), so a failed grok worktree attempt fails the run rather than re-running on the
+// diff-only packet (see runCoreSeat in ../modes/review/seat-run.ts).
 const GROK_EGRESS_HOSTS = ['auth.x.ai', 'cli-chat-proxy.grok.com'] as const;
 
 export const VENDOR_EGRESS_HOSTS: Record<ReviewerId, readonly string[]> = {
