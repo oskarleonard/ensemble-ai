@@ -3,9 +3,9 @@
 // src/cli.ts
 import { execFileSync as execFileSync3 } from "child_process";
 import crypto2 from "crypto";
-import fs13 from "fs";
-import os7 from "os";
-import path10 from "path";
+import fs14 from "fs";
+import os8 from "os";
+import path11 from "path";
 import { parseArgs } from "util";
 
 // src/core/artifacts.ts
@@ -2041,9 +2041,9 @@ var GENERATED_PATTERNS = [
   /\.(js|css)\.map$/,
   /\.snap$/
 ];
-function classifyFileKind(path11, isBinary) {
+function classifyFileKind(path12, isBinary) {
   if (isBinary) return "binary";
-  return GENERATED_PATTERNS.some((re) => re.test(path11)) ? "generated" : "source";
+  return GENERATED_PATTERNS.some((re) => re.test(path12)) ? "generated" : "source";
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -2061,7 +2061,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path11 = pathOfSection(section2);
+    const path12 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -2072,8 +2072,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path11, isBinary),
-      path: path11,
+      kind: classifyFileKind(path12, isBinary),
+      path: path12,
       raw: section2,
       removed
     };
@@ -2656,7 +2656,8 @@ Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
     "bottomLine": "<merge-safe? what must change first>"
   },
   "verdicts": [
-    { "findingId": "codex#1", "verdict": "agree", "reason": "<one line>", "fixStatus": "keep" },
+    { "findingId": "codex#1", "verdict": "agree", "reason": "<one line>", "fixStatus": "keep",
+      "class": "bug", "suggestion": { "replacement": "<the corrected line(s), verbatim code>" } },
     { "findingId": "codex#3", "verdict": "partial", "reason": "<what was overstated>",
       "ops": [
         { "op": "strike", "quote": "<EXACT substring of codex#3's body to remove>", "why": "<ungrounded>" },
@@ -2680,7 +2681,16 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
 - "fixStatus" (optional, agree/partial): the reviewer's suggested fix is verified only for the
   problem, not the fix \u2014 mark it keep | narrow | strike (strike if the narrowed claim no longer
   supports it). "rescoredSeverity" (optional, partial): the TRUE severity if overstatement
-  inflated it \u2014 it may only LOWER severity, never raise it.${gateEvidence === "worktree" ? REFERENCE_NOT_FOUND_CLAUSE : ""}`;
+  inflated it \u2014 it may only LOWER severity, never raise it.
+- "class" (agree/partial): where this belongs on someone else's pull request. "bug" = a correctness
+  or security DEFECT \u2014 it earns an inline comment. "quality" = a structural simplification (dead
+  branch, narrower scope, a reinvented utility) \u2014 real, but it rides a collapsed summary section,
+  never inline prose. Default when you omit it: "bug".
+- "suggestion" (optional, agree + fixStatus "keep" ONLY): the corrected code for the finding's own
+  cited line, as a ONE-CLICK replacement. Send it only when the fix is small, obvious, and you have
+  verified it against the hunk. The replacement may introduce NO identifier, path, or number absent
+  from the body or the hunk (same rule as "ops"), and it replaces exactly the cited line. When in
+  doubt, omit it: a wrong one-click suggestion is worse than no suggestion.${gateEvidence === "worktree" ? REFERENCE_NOT_FOUND_CLAUSE : ""}`;
 function renderGatePrompt(findings, injections, gateEvidence = "packet") {
   return `You are the VERIFIED GATE for a multi-model CODE REVIEW. Several AI reviewers each
 reviewed the SAME diff INDEPENDENTLY. You are given, per finding, the reviewer's claim AND the
@@ -2719,11 +2729,15 @@ ${outputContract(gateEvidence)}`;
 
 // src/modes/review/gate-postable.ts
 var FIX_STATUSES = ["keep", "narrow", "strike"];
+var POSTABLE_CLASSES = ["bug", "quality"];
+var SUGGESTION_LINE_CEILING = 10;
+var SUGGESTION_CHAR_CAP = 800;
 var MAX_STRIKE_FRACTION = 0.6;
 var escalate = (postableNote) => ({
   postableBody: null,
   postableFix: null,
   postableStatus: "escalated",
+  postableSuggestion: null,
   rescoredSeverity: null,
   postableNote
 });
@@ -2769,23 +2783,45 @@ function clampSeverity(original, rescored) {
   if (!rescored || rescored === original) return null;
   return SEVERITIES.indexOf(rescored) > SEVERITIES.indexOf(original) ? rescored : null;
 }
+function deriveSuggestion(suggestion, verdict, fixStatus, allowed) {
+  if (!suggestion || verdict !== "agree" || fixStatus !== "keep") return null;
+  const replacement = suggestion.replacement.replace(/\s+$/, "");
+  if (!replacement.trim()) return null;
+  if (replacement.length > SUGGESTION_CHAR_CAP) return null;
+  if (replacement.split("\n").length > SUGGESTION_LINE_CEILING) return null;
+  for (const tok of entityTokens(replacement)) if (!allowed.has(tok)) return null;
+  return { replacement };
+}
+function allowedTokens(body, hunkCode) {
+  const allowed = entityTokens(body);
+  for (const line of hunkCode) for (const t of entityTokens(line)) allowed.add(t);
+  return allowed;
+}
 function derivePostable(input) {
   const { verdict, body, hunkCode, ops, fixStatus, rescoredSeverity, severity } = input;
   const trimmed = body.trim();
   if (!trimmed) return escalate("reviewer body is empty");
   if (verdict === "agree") {
     if (ops.length > 0) return escalate("agree verdict carried edit-ops (contradiction \u2014 should be partial)");
-    return { postableBody: trimmed, postableFix: fixStatus ?? "keep", postableStatus: "postable", rescoredSeverity: null };
+    const fix = fixStatus ?? "keep";
+    return {
+      postableBody: trimmed,
+      postableFix: fix,
+      postableStatus: "postable",
+      postableSuggestion: deriveSuggestion(input.suggestion, verdict, fix, allowedTokens(trimmed, hunkCode)),
+      rescoredSeverity: null
+    };
   }
   if (ops.length === 0) return escalate("partial verdict carried no edit-ops to narrow the overstatement");
-  const allowed = entityTokens(trimmed);
-  for (const line of hunkCode) for (const t of entityTokens(line)) allowed.add(t);
+  const allowed = allowedTokens(trimmed, hunkCode);
   const applied = applyOps(trimmed, ops, allowed);
   if ("note" in applied) return escalate(applied.note);
   return {
     postableBody: applied.body,
     postableFix: fixStatus ?? "narrow",
     postableStatus: "postable",
+    postableSuggestion: null,
+    // a narrowed claim no longer provably supports the reviewer's fix
     rescoredSeverity: clampSeverity(severity, rescoredSeverity)
   };
 }
@@ -2807,6 +2843,15 @@ function parsePostableOps(v) {
 }
 function parseFixStatus(v) {
   return typeof v === "string" && FIX_STATUSES.includes(v) ? v : void 0;
+}
+function parsePostableClass(v) {
+  return typeof v === "string" && POSTABLE_CLASSES.includes(v) ? v : void 0;
+}
+function parseSuggestion(v) {
+  if (!v || typeof v !== "object") return void 0;
+  const replacement = v.replacement;
+  if (typeof replacement !== "string" || !replacement.trim()) return void 0;
+  return { replacement: replacement.slice(0, SUGGESTION_CHAR_CAP) };
 }
 function parseSeverity(v) {
   return typeof v === "string" && SEVERITIES.includes(v) ? v : void 0;
@@ -2948,7 +2993,7 @@ function isGateVerdict(v) {
   return GATE_VERDICTS.includes(v);
 }
 var GATE_ENVELOPE_SCHEMA_VERSION = 1;
-var GATE_TRAIL_SCHEMA_VERSION = 2;
+var GATE_TRAIL_SCHEMA_VERSION = 3;
 var REASON_CAP = 700;
 var CITATION_CAP = 500;
 function capStr(s, n) {
@@ -3067,6 +3112,8 @@ function parseVerdicts(v) {
     const ops = parsePostableOps(e.ops);
     const fixStatus = parseFixStatus(e.fixStatus);
     const rescoredSeverity = parseSeverity(e.rescoredSeverity);
+    const postableClass = parsePostableClass(e.class);
+    const suggestion = parseSuggestion(e.suggestion);
     out.push({
       citation: typeof e.citation === "string" ? capStr(e.citation, CITATION_CAP) : void 0,
       findingId,
@@ -3075,8 +3122,10 @@ function parseVerdicts(v) {
       // conditional so an old-shape (no-ops) entry parses to the exact prior shape
       ...ops.length ? { ops } : {},
       ...typeof e.cause === "string" && e.cause.trim() ? { cause: e.cause.trim() } : {},
+      ...postableClass ? { class: postableClass } : {},
       ...fixStatus ? { fixStatus } : {},
-      ...rescoredSeverity ? { rescoredSeverity } : {}
+      ...rescoredSeverity ? { rescoredSeverity } : {},
+      ...suggestion ? { suggestion } : {}
     });
   }
   return out;
@@ -3096,8 +3145,10 @@ function parseGateEnvelope(raw) {
 }
 var NOT_POSTABLE = {
   postableBody: null,
+  postableClass: null,
   postableFix: null,
   postableStatus: "not-postable",
+  postableSuggestion: null,
   rescoredSeverity: null
 };
 function recordBase(f) {
@@ -3105,6 +3156,7 @@ function recordBase(f) {
     file: f.file,
     findingId: f.findingId,
     line: f.line,
+    resolved: f.resolved,
     reviewer: f.reviewer,
     severity: f.severity,
     title: f.title
@@ -3184,18 +3236,18 @@ function reconcileGateVerdicts(findings, parsed, opts = {}) {
     const f = findingById.get(r.findingId);
     const e = (byId.get(r.findingId) ?? [])[0];
     if (!f) return { ...r, ...NOT_POSTABLE };
-    return {
-      ...r,
-      ...derivePostable({
-        body: f.body,
-        fixStatus: e?.fixStatus,
-        hunkCode: f.hunkCode,
-        ops: e?.ops ?? [],
-        rescoredSeverity: e?.rescoredSeverity,
-        severity: f.severity,
-        verdict: r.effectiveVerdict
-      })
-    };
+    const derived = derivePostable({
+      body: f.body,
+      fixStatus: e?.fixStatus,
+      hunkCode: f.hunkCode,
+      ops: e?.ops ?? [],
+      rescoredSeverity: e?.rescoredSeverity,
+      severity: f.severity,
+      suggestion: e?.suggestion,
+      verdict: r.effectiveVerdict
+    });
+    const postableClass = derived.postableStatus === "postable" ? parsePostableClass(e?.class) ?? "bug" : null;
+    return { ...r, ...derived, postableClass };
   });
   return { records, warnings };
 }
@@ -4428,6 +4480,304 @@ function postReviewComment(body, target, opts) {
   return result;
 }
 
+// src/modes/review/posting-config.ts
+import fs13 from "fs";
+import os7 from "os";
+import path10 from "path";
+var SUGGESTION_HARD_CAP = 3;
+var MAX_SUGGESTION_LINES_CEILING = 10;
+var DEFAULT_POSTURE = {
+  inlineSeverityFloor: "low",
+  maxSuggestionLines: 6,
+  suggestionCap: SUGGESTION_HARD_CAP
+};
+function clampInt(v, lo, hi, fallback) {
+  if (typeof v !== "number" || !Number.isFinite(v)) return fallback;
+  return Math.min(hi, Math.max(lo, Math.trunc(v)));
+}
+function parseSeverityFloor(v, fallback) {
+  return typeof v === "string" && SEVERITIES.includes(v) ? v : fallback;
+}
+function resolvePosture(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ...DEFAULT_POSTURE };
+  const o = raw;
+  return {
+    inlineSeverityFloor: parseSeverityFloor(o.inlineSeverityFloor, DEFAULT_POSTURE.inlineSeverityFloor),
+    maxSuggestionLines: clampInt(o.maxSuggestionLines, 1, MAX_SUGGESTION_LINES_CEILING, DEFAULT_POSTURE.maxSuggestionLines),
+    suggestionCap: clampInt(o.suggestionCap, 0, SUGGESTION_HARD_CAP, DEFAULT_POSTURE.suggestionCap)
+  };
+}
+function loadPostingPosture(profile, configPath = path10.join(os7.homedir(), ".ensemble-ai", "config.json")) {
+  try {
+    const raw = JSON.parse(fs13.readFileSync(configPath, "utf8"));
+    return resolvePosture(raw.posting?.[profile]);
+  } catch {
+    return { ...DEFAULT_POSTURE };
+  }
+}
+function meetsInlineFloor(severity, floor) {
+  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf(floor);
+}
+
+// src/modes/review/push-fence.ts
+function evaluatePushFence(ctx, prSlug) {
+  if (ctx.isCrossRepository || !ctx.headRepoOwner) {
+    const where = ctx.headRepoOwner ? `${ctx.headRepoOwner}'s fork (branch \`${ctx.headRefName}\`)` : "a deleted fork";
+    return {
+      allowed: false,
+      reason: `REFUSED \u2014 the head of ${prSlug} lives on ${where}, not on the base repo. The fix tail never pushes to a branch you do not own. Use \`ensemble-ai review --pr <url> --stage\` to stage a pending review instead. (GitHub's "allow edits by maintainers" can make such a push technically possible; this fence deliberately does not rely on it \u2014 rewriting a contributor's branch is not a review action.)`
+    };
+  }
+  if (!ctx.viewerCanPushBase) {
+    return {
+      allowed: false,
+      reason: `REFUSED \u2014 you do not have push access to ${prSlug}, so the fix tail cannot push its fixes. Use \`ensemble-ai review --pr <url> --stage\` to stage a pending review instead.`
+    };
+  }
+  return { allowed: true };
+}
+function parsePushContext(prJson, viewerCanPushBase) {
+  const o = prJson && typeof prJson === "object" ? prJson : {};
+  const owner = o.headRepositoryOwner;
+  const login = owner && typeof owner === "object" && typeof owner.login === "string" ? owner.login : null;
+  return {
+    headRefName: typeof o.headRefName === "string" ? o.headRefName : "(unknown)",
+    headRepoOwner: login,
+    isCrossRepository: o.isCrossRepository !== false,
+    // anything but an explicit `false` fails closed
+    viewerCanPushBase: viewerCanPushBase === true
+  };
+}
+
+// src/modes/review/stage-plan.ts
+var STAGE_MARKER = "<!-- ensemble-ai:staged-review v1 -->";
+function defuseUntrusted(s) {
+  return s.replace(/<!--/g, "<\\!--").replace(/^(\s*)(`{3,}|~{3,})[ \t]*suggestion\b/gim, "$1$2text");
+}
+function titleText(s) {
+  return defuseUntrusted(scrubControl(s)).slice(0, 200);
+}
+function findingTrailer(r) {
+  const payload = {
+    anchors: { file: r.file, line: r.line },
+    corroborators: r.cluster?.corroborators ?? [],
+    findingId: r.findingId,
+    fixStatus: r.postableFix,
+    severity: r.rescoredSeverity ?? r.severity,
+    verdict: r.effectiveVerdict
+  };
+  return `<!-- ensemble-ai:finding ${JSON.stringify(payload)} -->`;
+}
+function isEnsembleStagedReview(body) {
+  return typeof body === "string" && body.includes(STAGE_MARKER);
+}
+function effectiveSeverity(r) {
+  return r.rescoredSeverity ?? r.severity;
+}
+function bySeverityThenId(a, b) {
+  return SEVERITIES.indexOf(effectiveSeverity(a)) - SEVERITIES.indexOf(effectiveSeverity(b)) || (a.findingId < b.findingId ? -1 : 1);
+}
+function anchorable(r) {
+  return r.resolved && typeof r.line === "number";
+}
+function planPlacement(records, opts) {
+  const postable = records.filter((r) => r.postableStatus === "postable" && r.postableBody).filter((r) => !r.cluster || r.cluster.primary).sort(bySeverityThenId);
+  const suggestionOf = /* @__PURE__ */ new Map();
+  for (const r of postable) {
+    if (suggestionOf.size >= opts.posture.suggestionCap) break;
+    const s = r.postableSuggestion;
+    if (!s || !anchorable(r)) continue;
+    if (s.replacement.split("\n").length > opts.posture.maxSuggestionLines) continue;
+    suggestionOf.set(r.findingId, s);
+  }
+  const inline = [];
+  const quality = [];
+  const unanchored = [];
+  for (const r of postable) {
+    const suggestion = suggestionOf.get(r.findingId) ?? null;
+    if (suggestion) {
+      inline.push({ record: r, suggestion });
+      continue;
+    }
+    if (r.postableClass === "quality") {
+      quality.push(r);
+      continue;
+    }
+    if (anchorable(r) && meetsInlineFloor(effectiveSeverity(r), opts.posture.inlineSeverityFloor)) {
+      inline.push({ record: r, suggestion: null });
+    } else {
+      unanchored.push(r);
+    }
+  }
+  return {
+    counts: {
+      inline: inline.length,
+      quality: quality.length,
+      reviewersRun: opts.reviewersRun,
+      suggestions: suggestionOf.size,
+      unanchored: unanchored.length
+    },
+    inline,
+    quality,
+    unanchored
+  };
+}
+function corroborationLine(r, reviewersRun) {
+  const n = r.cluster?.corroboration ?? 1;
+  return `<sub>flagged by ${n} of ${reviewersRun} reviewers \xB7 gate: ${r.effectiveVerdict}</sub>`;
+}
+function renderInlineComment(placed, reviewersRun) {
+  const { record: r, suggestion } = placed;
+  const out = [
+    `**[${effectiveSeverity(r)}]** ${titleText(r.title)}`,
+    "",
+    defuseUntrusted(r.postableBody ?? "")
+  ];
+  if (suggestion) {
+    out.push("", "```suggestion", suggestion.replacement, "```");
+  }
+  out.push("", corroborationLine(r, reviewersRun), findingTrailer(r));
+  return out.join("\n");
+}
+function collapsed(summary, records, reviewersRun) {
+  if (records.length === 0) return [];
+  const out = ["", `<details>`, `<summary>${summary}</summary>`, ""];
+  for (const r of records) {
+    const where = r.line ? `\`${r.file}:${r.line}\`` : `\`${r.file || "(no file)"}\``;
+    out.push(
+      `**[${effectiveSeverity(r)}]** ${titleText(r.title)} \u2014 ${where}`,
+      "",
+      defuseUntrusted(r.postableBody ?? ""),
+      "",
+      corroborationLine(r, reviewersRun),
+      findingTrailer(r),
+      "",
+      "---",
+      ""
+    );
+  }
+  out.push("</details>");
+  return out;
+}
+function renderSummaryBody(input) {
+  const { headSha, plan, reviewerIds } = input;
+  const { counts } = plan;
+  const bugs = counts.inline - counts.suggestions;
+  const out = [
+    "## \u{1F52D} ensemble-ai \u2014 cross-vendor review",
+    STAGE_MARKER,
+    "",
+    `Reviewed at \`${headSha}\` by ${counts.reviewersRun} reviewer(s): ${reviewerIds.join(", ")}.`,
+    "",
+    `- **${bugs}** verified bug(s) commented inline`,
+    `- **${counts.suggestions}** one-click suggestion(s)`,
+    `- **${counts.quality}** structural simplification(s)`,
+    `- **${counts.unanchored}** further verified finding(s) without a line anchor`
+  ];
+  if (counts.inline === 0 && counts.quality === 0 && counts.unanchored === 0) {
+    out.push("", "No verified bugs. Every reviewer finding was either refuted by the gate or could not be grounded in the diff, so nothing is commented inline.");
+  }
+  out.push(...collapsed(`${counts.quality} structural simplification opportunit${counts.quality === 1 ? "y" : "ies"} (verified)`, plan.quality, counts.reviewersRun));
+  out.push(...collapsed(`${counts.unanchored} further verified finding(s)`, plan.unanchored, counts.reviewersRun));
+  out.push(
+    "",
+    "---",
+    `<sub>Cross-vendor AI review by [ensemble-ai](https://github.com/oskarleonard/ensemble-ai) \u2014 ${reviewerIds.join(" \xB7 ")}. Every finding above was gate-verified against the diff at \`${headSha}\`; claims the gate could not ground were dropped, not posted. Deduped across reviewers, so one issue is one comment.</sub>`
+  );
+  return out.join("\n");
+}
+function buildStagedReviewPayload(input) {
+  return {
+    body: renderSummaryBody(input),
+    comments: input.plan.inline.map((p) => ({
+      body: renderInlineComment(p, input.plan.counts.reviewersRun),
+      line: p.record.line,
+      // anchorable() proved it
+      path: p.record.file,
+      side: "RIGHT"
+    })),
+    commit_id: input.headSha
+  };
+}
+
+// src/modes/review/stage.ts
+function apiPath(t, suffix = "") {
+  return `repos/${t.owner}/${t.repo}/pulls/${t.pr}${suffix}`;
+}
+function parseJson(text) {
+  return JSON.parse(text);
+}
+function checkFreshness(reviewedHeadSha, liveHeadSha) {
+  if (reviewedHeadSha === liveHeadSha) return { ok: true };
+  return {
+    error: `the PR head moved since this review: reviewed at ${reviewedHeadSha.slice(0, 12)}, live head is ${liveHeadSha.slice(0, 12)}. Refusing to stage a review whose line anchors point at code that has changed \u2014 re-run the review against the current head.`,
+    ok: false
+  };
+}
+function classifyPending(reviews) {
+  for (const r of reviews) {
+    if (r.state !== "PENDING" || typeof r.id !== "number") continue;
+    return isEnsembleStagedReview(r.body) ? { id: r.id, kind: "ours" } : { id: r.id, kind: "foreign" };
+  }
+  return { kind: "none" };
+}
+function parseReviewSummaries(text) {
+  const parsed = parseJson(text);
+  return Array.isArray(parsed) ? parsed : [];
+}
+var FOREIGN_PENDING = (t) => `you already have an unsubmitted PENDING review on ${t.owner}/${t.repo}#${t.pr} that ensemble-ai did not create. GitHub allows only one pending review per user per PR. Submit or discard it on GitHub, then re-run \u2014 refusing to touch a review you wrote by hand.`;
+function stageReview(payload, target, deps) {
+  const log = deps.log ?? (() => {
+  });
+  const run = (args, input) => {
+    try {
+      return deps.gh(args, input);
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e), ok: false };
+    }
+  };
+  const head = run(["api", apiPath(target), "--jq", ".head.sha"]);
+  if (!head.ok) return { error: `could not read the PR head: ${head.error}`, kind: "gh-failed", ok: false };
+  const liveHead = head.text.trim();
+  if (!liveHead) return { error: "the PR head SHA came back empty", kind: "unreadable", ok: false };
+  const fresh = checkFreshness(deps.reviewedHeadSha, liveHead);
+  if (!fresh.ok) return { error: fresh.error, kind: "head-moved", ok: false };
+  const list = run(["api", apiPath(target, "/reviews"), "--paginate"]);
+  if (!list.ok) return { error: `could not list PR reviews: ${list.error}`, kind: "gh-failed", ok: false };
+  let pending;
+  try {
+    pending = classifyPending(parseReviewSummaries(list.text));
+  } catch (e) {
+    return { error: `could not parse the PR review list: ${e.message}`, kind: "unreadable", ok: false };
+  }
+  if (pending.kind === "foreign") {
+    return { error: FOREIGN_PENDING(target), kind: "foreign-pending", ok: false };
+  }
+  let replaced = false;
+  if (pending.kind === "ours") {
+    const del = run(["api", "--method", "DELETE", apiPath(target, `/reviews/${pending.id}`)]);
+    if (!del.ok) {
+      return { error: `could not replace the prior ensemble-ai pending review: ${del.error}`, kind: "gh-failed", ok: false };
+    }
+    replaced = true;
+    log(`\xB7 replaced the prior ensemble-ai pending review (#${pending.id}) \u2014 updating in place`);
+  }
+  const created = run(
+    ["api", "--method", "POST", apiPath(target, "/reviews"), "--input", "-"],
+    JSON.stringify(payload)
+  );
+  if (!created.ok) {
+    return { error: `could not create the pending review: ${created.error}`, kind: "gh-failed", ok: false };
+  }
+  let url = null;
+  try {
+    const obj = parseJson(created.text);
+    if (typeof obj.html_url === "string") url = obj.html_url;
+  } catch {
+  }
+  return { ok: true, replaced, url };
+}
+
 // src/plumbing/diff-preview.ts
 function buildPacketPreview(acquired, profile, agentsMd) {
   const packet = assembleCodePacket({
@@ -4683,8 +5033,16 @@ Options:
                         reviewer, else it mostly returns unverified \u2014 the toothless mode)
   --gate-effort <e>     effort for the GATE seat (low|medium|high|xhigh|max) \u2014 overrides the
                         file; an unknown value is ignored (\`ensemble-ai config\` shows the seat)
-  --post-comment        after a COMPLETED review, ALSO post it to the PR as one markdown comment
-                        via \`gh pr comment\` (opt-in; REQUIRES a PR source \u2014 --pr <N> or a PR URL).
+  --stage               after a COMPLETED review, stage it as ONE **PENDING** GitHub review under
+                        your account (opt-in; REQUIRES a PR source). Verified bugs land as inline
+                        comments, quality findings in a collapsed summary section, \u22643 gate-verified
+                        fixes as one-click \`suggestion\` blocks. NOTHING is posted until you submit
+                        it on GitHub \u2014 a zero-bug run still stages the summary. Re-running REPLACES
+                        the prior staged review (never duplicates); a moved PR head REFUSES. Prints
+                        {stagedReviewUrl, counts, receipt} as JSON on the last stdout line.
+  --post-comment        DEPRECATED (prefer --stage): after a COMPLETED review, ALSO post it to the
+                        PR as one markdown comment via \`gh pr comment\` \u2014 published IMMEDIATELY under
+                        your account, with no submit step. Kept for existing consumers.
                         A gh failure warns loudly and leaves the review + exit code UNCHANGED.
   --out <dir>           trail BASE dir; a per-run <run-id>/ subdir is created under it
                         (default: repo-local .ensemble-ai/reviews when reviewing this
@@ -4738,28 +5096,28 @@ function genRunId() {
 }
 function clearReusedRunTrail(baseDir, trailDir) {
   try {
-    if (fs13.lstatSync(trailDir).isSymbolicLink()) return;
+    if (fs14.lstatSync(trailDir).isSymbolicLink()) return;
   } catch {
     return;
   }
   let realBase;
   let realTarget;
   try {
-    realBase = fs13.realpathSync(baseDir);
-    realTarget = fs13.realpathSync(trailDir);
+    realBase = fs14.realpathSync(baseDir);
+    realTarget = fs14.realpathSync(trailDir);
   } catch {
     return;
   }
-  const rel = path10.relative(realBase, realTarget);
+  const rel = path11.relative(realBase, realTarget);
   if (!rel || escapesRoot(rel)) {
     return;
   }
-  fs13.rmSync(realTarget, { force: true, recursive: true });
+  fs14.rmSync(realTarget, { force: true, recursive: true });
 }
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
   try {
-    const s = fs13.readFileSync(0, "utf8");
+    const s = fs14.readFileSync(0, "utf8");
     return s.trim() ? s : void 0;
   } catch {
     return void 0;
@@ -4796,9 +5154,9 @@ function gitToplevel(cwd) {
 }
 function resolveTrailBase(gitRoot, localRepoTrail) {
   if (gitRoot && localRepoTrail) {
-    return path10.join(gitRoot, ".ensemble-ai", "reviews");
+    return path11.join(gitRoot, ".ensemble-ai", "reviews");
   }
-  return path10.join(os7.tmpdir(), "ensemble-ai", "reviews");
+  return path11.join(os8.tmpdir(), "ensemble-ai", "reviews");
 }
 function ghConventionReader(repoSlug, ref, cwd) {
   const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
@@ -4909,7 +5267,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "diff-file": {
       let text;
       try {
-        text = fs13.readFileSync(String(selection.diffFile), "utf8");
+        text = fs14.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
@@ -5115,6 +5473,35 @@ function ghPostRunner(cwd) {
     }
   };
 }
+function ghRunner(cwd) {
+  return (args, input) => {
+    try {
+      const text = execFileSync3("gh", args, {
+        cwd,
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: 12e4,
+        ...input !== void 0 ? { input } : {}
+      });
+      return { ok: true, text };
+    } catch (e) {
+      const err = e;
+      if (err.code === "ENOENT") {
+        return { error: "the `gh` CLI is not on PATH \u2014 install GitHub CLI and run `gh auth login`", ok: false };
+      }
+      const stderr = err.stderr ? String(err.stderr).trim().slice(0, 500) : "";
+      return { error: stderr || err.message || "gh failed", ok: false };
+    }
+  };
+}
+function resolveStageTarget(target, gh) {
+  const slug2 = target.repoSlug ?? (() => {
+    const res = gh(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
+    return res.ok ? res.text.trim() : "";
+  })();
+  const [owner, repo] = slug2.split("/");
+  return owner && repo ? { owner, pr: target.pr, repo } : null;
+}
 function toCommentGateSeat(seat) {
   const model = claudeModelLabel(seat.config);
   const effort = seat.config.effort && seat.config.effort !== "default" ? seat.config.effort : "default";
@@ -5189,9 +5576,11 @@ async function reviewCommand(args, profile = "code") {
         out: { type: "string" },
         "post-comment": { type: "boolean" },
         pr: { type: "string" },
+        repo: { type: "string" },
         reviewers: { type: "string" },
         "run-id": { type: "string" },
         sandbox: { type: "string" },
+        stage: { type: "boolean" },
         staged: { type: "boolean" },
         "strict-high": { type: "boolean" },
         "working-tree": { type: "boolean" }
@@ -5206,13 +5595,28 @@ async function reviewCommand(args, profile = "code") {
     console.log(usage);
     return 0;
   }
-  const cwd = values.cwd ? path10.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path11.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
   const postComment = Boolean(values["post-comment"]);
-  if (postComment && !source.postTarget) {
+  const stage = Boolean(values.stage);
+  for (const [flag, on] of [["--post-comment", postComment], ["--stage", stage]]) {
+    if (on && !source.postTarget) {
+      console.error(
+        `ensemble-ai ${cmd}: ${flag} requires a PR diff source (--pr <N> or a PR URL) \u2014 the current source has no PR to post to. Re-run against a PR, or drop ${flag}.`
+      );
+      return 3;
+    }
+  }
+  if (postComment && stage) {
     console.error(
-      `ensemble-ai ${cmd}: --post-comment requires a PR diff source (--pr <N> or a PR URL) \u2014 the current source has no PR to post to. Re-run against a PR, or drop --post-comment.`
+      `ensemble-ai ${cmd}: choose ONE outward action \u2014 --stage stages a PENDING review that posts nothing until you submit it on GitHub, while --post-comment publishes a comment immediately.`
+    );
+    return 3;
+  }
+  if (typeof values.repo === "string") {
+    console.error(
+      `ensemble-ai ${cmd}: --repo (worktree evidence mode) is not wired into the review path yet \u2014 the engine lifecycle, sandbox profiles, and receipt identity all exist, but no seat is spawned against a worktree, so this run would review the packet while claiming whole-project evidence. Drop --repo for a packet-mode review. \`receipt verify --repo <path>\` DOES honor it (it asks whether a receipt was minted under worktree evidence).`
     );
     return 3;
   }
@@ -5233,7 +5637,7 @@ async function reviewCommand(args, profile = "code") {
   }
   const reviewers = requestedReviewers === void 0 ? void 0 : roster.core;
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-  const out = typeof values.out === "string" ? path10.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+  const out = typeof values.out === "string" ? path11.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
   clearReusedRunTrail(out, trailDir);
   const ceiling = positiveCeiling(
@@ -5365,7 +5769,7 @@ async function reviewCommand(args, profile = "code") {
     const first = result.reviews[0];
     const pinnedReviewerId = first.reviewerId ?? first.reviewer.vendor;
     console.log(
-      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path10.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
+      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path11.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
   }
   if (claudeLayer) {
@@ -5418,6 +5822,62 @@ async function reviewCommand(args, profile = "code") {
         `\u26A0 --post-comment: could NOT render/post the comment \u2014 ${e instanceof Error ? e.message : String(e)}. The review above and its exit code are unaffected (posting never changes the gate contract).`
       );
     }
+  }
+  if (stage && source.postTarget) {
+    const stagedRun = exitCode === 0 || exitCode === 4;
+    const reviewerIds = [
+      ...result.reviews.filter((r) => r.terminalState === "reviewed").map((r) => r.reviewerId ?? r.reviewer.vendor),
+      ...claudeLayer?.claudeReview?.ok ? ["claude"] : []
+    ];
+    const plan = planPlacement(gateRecords, {
+      posture: loadPostingPosture(profile),
+      reviewersRun: reviewerIds.length
+    });
+    let stagedReviewUrl = null;
+    let stageError = stagedRun ? null : `review did not complete (exit ${exitCode}) \u2014 nothing staged`;
+    if (stagedRun) {
+      try {
+        const gh = ghRunner(cwd);
+        const target = resolveStageTarget(source.postTarget, gh);
+        if (!target) {
+          stageError = `could not resolve owner/repo for PR #${source.postTarget.pr} \u2014 pass a full PR URL, or run inside the repo`;
+        } else {
+          const res = stageReview(
+            buildStagedReviewPayload({ headSha: result.acquired.headSha, plan, reviewerIds }),
+            target,
+            { gh, log: (m) => console.error(m), reviewedHeadSha: result.acquired.headSha }
+          );
+          if (res.ok) {
+            stagedReviewUrl = res.url;
+            console.error(
+              `\xB7 staged a PENDING review on ${target.owner}/${target.repo}#${target.pr}${res.replaced ? " (replaced the prior ensemble-ai pending review)" : ""} \u2014 it posts NOTHING until you submit it on GitHub` + (res.url ? `: ${res.url}` : "")
+            );
+          } else {
+            stageError = res.error;
+          }
+        }
+      } catch (e) {
+        stageError = e instanceof Error ? e.message : String(e);
+      }
+      if (stageError) {
+        console.error(
+          `\u26A0 --stage: could NOT stage the pending review \u2014 ${stageError}. The review above and its exit code are unaffected (staging never changes the gate contract).`
+        );
+      }
+    }
+    console.log(
+      JSON.stringify({
+        counts: plan.counts,
+        ...stageError ? { error: stageError } : {},
+        headSha: result.acquired.headSha,
+        receipt: {
+          completed: result.receipt?.completed ?? [],
+          digest: result.receipt?.diffDigest ?? null,
+          path: result.receiptPath ?? null
+        },
+        stagedReviewUrl
+      })
+    );
   }
   return exitCode;
 }
@@ -5535,19 +5995,19 @@ async function brainstormCommand(args) {
     console.error(BRAINSTORM_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path10.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path11.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path10.resolve(cwd, values.file);
+    const filePath = path11.resolve(cwd, values.file);
     try {
-      const bytes = fs13.statSync(filePath).size;
+      const bytes = fs14.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs13.readFileSync(filePath, "utf8");
+      fileContext = fs14.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${e.message}`
@@ -5740,19 +6200,19 @@ async function consultCommand(args) {
     console.error(CONSULT_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path10.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path11.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path10.resolve(cwd, values.file);
+    const filePath = path11.resolve(cwd, values.file);
     try {
-      const bytes = fs13.statSync(filePath).size;
+      const bytes = fs14.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs13.readFileSync(filePath, "utf8");
+      fileContext = fs14.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai consult: cannot read --file ${values.file}: ${e.message}`
@@ -5874,6 +6334,12 @@ Options:
   --base <ref>          base ref for the current-branch diff (default: origin/HEAD)
   --staged              use the staged diff (\`git diff --cached\`) as the current state
   --working-tree        use uncommitted tracked changes (\`git diff HEAD\`)
+  --repo <dir>          the repo to verify, AND a request for WORKTREE evidence: verify then asks
+                        the stronger question "was this reviewed with whole-project evidence?" and
+                        FAILS (evidence-degraded) on a receipt whose realized per-seat evidence is
+                        weaker, naming the seat. Every receipt minted so far is packet-evidenced.
+  --accept-degraded     with --repo: accept a receipt whose realized evidence is weaker than the
+                        worktree evidence you asked for. Deliberate, never the default.
   --reviewers <ids>     required reviewer policy (default: all configured)
   --ceiling <bytes>     coverage byte ceiling (default 200000)
   --store <dir>         receipt store dir (default: ~/.ensemble-ai/receipts)
@@ -5904,10 +6370,12 @@ async function receiptCommand(args) {
       args: args.slice(1),
       allowPositionals: true,
       options: {
+        "accept-degraded": { type: "boolean" },
         base: { type: "string" },
         ceiling: { type: "string" },
         cwd: { type: "string" },
         help: { short: "h", type: "boolean" },
+        repo: { type: "string" },
         "require-artifacts": { type: "boolean" },
         reviewers: { type: "string" },
         staged: { type: "boolean" },
@@ -5926,11 +6394,11 @@ async function receiptCommand(args) {
     console.log(RECEIPT_USAGE);
     return 0;
   }
-  const receiptPathArg = typeof positionals[0] === "string" ? path10.resolve(positionals[0]) : void 0;
+  const receiptPathArg = typeof positionals[0] === "string" ? path11.resolve(positionals[0]) : void 0;
   const readReceiptFile = (p) => {
     let raw;
     try {
-      raw = fs13.readFileSync(p, "utf8");
+      raw = fs14.readFileSync(p, "utf8");
     } catch (e) {
       return { error: `cannot read receipt ${p}: ${e.message}` };
     }
@@ -5966,7 +6434,20 @@ async function receiptCommand(args) {
   );
   if (typeof ceiling === "object") return ceiling.code;
   const ceilingBytes = ceiling ?? DEFAULT_COVERAGE_CEILING;
-  const cwd = values.cwd ? path10.resolve(String(values.cwd)) : process.cwd();
+  if (typeof values.repo === "string" && typeof values.cwd === "string") {
+    console.error(`ensemble-ai receipt ${sub}: choose at most one of --repo / --cwd (both name the repo to verify)`);
+    return 3;
+  }
+  const repoLocation = typeof values.repo === "string" ? path11.resolve(values.repo) : void 0;
+  const cwd = repoLocation ?? (values.cwd ? path11.resolve(String(values.cwd)) : process.cwd());
+  const intendedEvidence = repoLocation ? Object.fromEntries(required.map((id) => [id, "worktree"])) : void 0;
+  const acceptDegraded = Boolean(values["accept-degraded"]);
+  if (acceptDegraded && !intendedEvidence) {
+    console.error(
+      "ensemble-ai receipt: --accept-degraded only means something with --repo (it accepts evidence weaker than the worktree evidence --repo asks for)"
+    );
+    return 3;
+  }
   if (Boolean(values.staged) && Boolean(values["working-tree"])) {
     console.error(
       `ensemble-ai receipt ${sub}: choose at most one of --staged / --working-tree`
@@ -5997,7 +6478,7 @@ async function receiptCommand(args) {
     }),
     repo: acquired.repoId
   };
-  const store = values.store ? path10.resolve(String(values.store)) : defaultReceiptStore();
+  const store = values.store ? path11.resolve(String(values.store)) : defaultReceiptStore();
   if (sub === "show") {
     const receipt = readReceipt(store, key);
     if (!receipt) {
@@ -6019,6 +6500,13 @@ async function receiptCommand(args) {
     explicit = res.receipt;
   }
   const verifyDeps = {
+    acceptDegraded,
+    intendedEvidence,
+    // NOTE: `key` above is the LEGACY (v1) policy hash, which is also the key every receipt on disk
+    // is addressed by. Worktree runs will mint v2-keyed receipts once the seat spawn lands; at that
+    // point this must compute the v2 key (which binds the run's sandbox profiles) and pass the v1
+    // key as `legacyKey` — resolveReceipt already implements that fallback. Until a v2 receipt can
+    // exist, computing a v2 key here would only fail every lookup.
     // An explicit --path receipt must still match the FULL live identity — repo + both
     // SHAs + policyHash — exactly as the store lookup binds it (the store file is
     // addressed by the full-key hash). Without this, `verify <path>` degrades to a
@@ -6026,7 +6514,7 @@ async function receiptCommand(args) {
     // with isDiffReviewed so a digest-only drift still reports `stale`.
     readReceipt: receiptPathArg ? (k) => explicit && receiptIdentityMatches(explicit, k) ? explicit : null : (k) => readReceipt(store, k),
     strict: Boolean(values.strict || values["require-artifacts"]),
-    trailDir: typeof values.trail === "string" ? path10.resolve(values.trail) : void 0
+    trailDir: typeof values.trail === "string" ? path11.resolve(values.trail) : void 0
   };
   const state = verifyReceipt({ coverage: acquired.coverage, key, required }, verifyDeps);
   console.log(formatVerify(state, key));
@@ -6074,8 +6562,8 @@ async function reviewersCommand(args) {
     console.log(REVIEWERS_USAGE);
     return 0;
   }
-  const reviewersFile = typeof values["reviewers-file"] === "string" ? path10.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
-  const voicesFile = typeof values["voices-file"] === "string" ? path10.resolve(values["voices-file"]) : VOICES_FILE;
+  const reviewersFile = typeof values["reviewers-file"] === "string" ? path11.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
+  const voicesFile = typeof values["voices-file"] === "string" ? path11.resolve(values["voices-file"]) : VOICES_FILE;
   const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`\xB7 ${m}`));
   const view = {
     gate: {
@@ -6086,10 +6574,10 @@ async function reviewersCommand(args) {
     },
     reviewers: listReviewers(reviewersFile),
     reviewersFile,
-    reviewersFileExists: fs13.existsSync(reviewersFile),
+    reviewersFileExists: fs14.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
     voicesFile,
-    voicesFileExists: fs13.existsSync(voicesFile)
+    voicesFileExists: fs14.existsSync(voicesFile)
   };
   if (values.json) console.log(JSON.stringify(view, null, 2));
   else console.log(renderRegistry(view));
@@ -6178,7 +6666,7 @@ async function diffCommand(args) {
     "diff"
   );
   if (typeof ceiling === "object") return ceiling.code;
-  const cwd = values.cwd ? path10.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path11.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
   let acquired;
@@ -6231,6 +6719,91 @@ async function diffCommand(args) {
   }
   return 0;
 }
+var PUSH_FENCE_USAGE = `ensemble-ai push-fence \u2014 may the FIX tail push to this PR's head ref?
+
+Usage:
+  ensemble-ai push-fence --pr <N|url> [--cwd <dir>]
+
+The FIX tail (/ensemble-ai-review-fix) fixes findings in your session and pushes to the PR's
+head branch. It must never push to a branch you do not own \u2014 a contributor's fork branch is
+theirs, and rewriting it is not a review action. Run this BEFORE any push.
+
+Exit 0 = you own the head ref, the fix tail may push.
+Exit 5 = REFUSED (fork / no push access) \u2014 stage a pending review instead:
+         ensemble-ai review --pr <url> --stage
+Exit 3 = usage / gh error.
+
+This is a FENCE, not a dispatcher: it never chooses a tail for you and never pushes.
+
+Options:
+  --pr <N|url>          the pull request to check (required)
+  --cwd <dir>           repo working dir (default: cwd)
+  -h, --help            this help`;
+async function pushFenceCommand(args) {
+  let values;
+  try {
+    ({ values } = parseArgs({
+      args,
+      allowPositionals: false,
+      options: { cwd: { type: "string" }, help: { short: "h", type: "boolean" }, pr: { type: "string" } }
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai push-fence: ${e.message}`);
+    console.error(PUSH_FENCE_USAGE);
+    return 3;
+  }
+  if (values.help) {
+    console.log(PUSH_FENCE_USAGE);
+    return 0;
+  }
+  if (typeof values.pr !== "string") {
+    console.error("ensemble-ai push-fence: --pr <N|url> is required");
+    console.error(PUSH_FENCE_USAGE);
+    return 3;
+  }
+  const selection = selectDiffSource({ pr: values.pr });
+  if (isDiffSourceError(selection) || selection.kind !== "pr" || typeof selection.pr !== "number") {
+    console.error(
+      `ensemble-ai push-fence: ${isDiffSourceError(selection) ? selection.error : "not a PR reference"}`
+    );
+    return 3;
+  }
+  const cwd = values.cwd ? path11.resolve(String(values.cwd)) : process.cwd();
+  const gh = ghRunner(cwd);
+  const scope = selection.owner && selection.repo ? ["-R", `${selection.owner}/${selection.repo}`] : [];
+  const view = gh([
+    "pr",
+    "view",
+    String(selection.pr),
+    ...scope,
+    "--json",
+    "headRefName,headRepositoryOwner,isCrossRepository,baseRepository"
+  ]);
+  if (!view.ok) {
+    console.error(`ensemble-ai push-fence: could not read PR #${selection.pr} \u2014 ${view.error}`);
+    return 3;
+  }
+  let prJson;
+  try {
+    prJson = JSON.parse(view.text);
+  } catch (e) {
+    console.error(`ensemble-ai push-fence: could not parse gh output \u2014 ${e.message}`);
+    return 3;
+  }
+  const base = selection.owner && selection.repo ? `${selection.owner}/${selection.repo}` : (() => {
+    const nwo = gh(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
+    return nwo.ok ? nwo.text.trim() : "";
+  })();
+  const perm = base ? gh(["api", `repos/${base}`, "--jq", ".permissions.push"]) : { error: "no repo", ok: false };
+  const canPush = perm.ok && perm.text.trim() === "true";
+  const verdict = evaluatePushFence(parsePushContext(prJson, canPush), base || `PR #${selection.pr}`);
+  if (verdict.allowed) {
+    console.log(`ensemble-ai push-fence: ALLOWED \u2014 you own the head ref of ${base}#${selection.pr}; the fix tail may push.`);
+    return 0;
+  }
+  console.error(`ensemble-ai push-fence: ${verdict.reason}`);
+  return 5;
+}
 async function main(argv) {
   const raw = argv[0];
   if (!raw || raw === "-h" || raw === "--help") {
@@ -6238,6 +6811,7 @@ async function main(argv) {
     return raw ? 0 : 1;
   }
   if (raw === "receipt") return receiptCommand(argv.slice(1));
+  if (raw === "push-fence") return pushFenceCommand(argv.slice(1));
   if (raw === "reviewers" || raw === "config") return reviewersCommand(argv.slice(1));
   if (raw === "diff") return diffCommand(argv.slice(1));
   const mode = resolveMode(raw);

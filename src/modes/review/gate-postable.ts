@@ -22,9 +22,31 @@ export const FIX_STATUSES: readonly FixStatus[] = ['keep', 'narrow', 'strike'];
 
 export type PostableStatus = 'postable' | 'escalated' | 'not-postable';
 
+// WHERE a finding is allowed to land on a foreign PR (spec §6, the posting posture). The gate
+// assigns it — the posting path never runs a model, it reads this. `bug` is the DEFAULT for a
+// missing/unrecognized class: a grounded finding the gate forgot to label belongs where the
+// author will see it (inline), not hidden in a collapsed section.
+export const POSTABLE_CLASSES = ['bug', 'quality'] as const;
+export type PostableClass = (typeof POSTABLE_CLASSES)[number];
+
+// A gate-verified small replacement, postable as a GitHub ```suggestion``` block anchored at the
+// finding's own cited line. Text ONLY — the anchor is the host's (`record.line`), never the
+// model's, so a suggestion can never be applied to a line the finding did not cite.
+export interface PostableSuggestion {
+  replacement: string;
+}
+
+// A hostile-input ceiling, not the posting policy. The per-review CAP (2–3) and the per-suggestion
+// line budget are CONSUMER config (posting-config.ts); this only bounds what a crafted gate reply
+// can push into an artifact.
+export const SUGGESTION_LINE_CEILING = 10;
+const SUGGESTION_CHAR_CAP = 800;
+
 export interface PostableResult {
   postableBody: string | null; // exact text to post; null ⇒ do not post
   postableFix: FixStatus | null; // disposition of the reviewer's suggested fix
+  // A gate-verified one-click replacement; null ⇒ none offered or it failed validation.
+  postableSuggestion: PostableSuggestion | null;
   rescoredSeverity: Severity | null; // gate's down-scored severity (never higher); null ⇒ unchanged
   postableStatus: PostableStatus;
   postableNote?: string; // escalation / audit reason
@@ -38,6 +60,7 @@ const escalate = (postableNote: string): PostableResult => ({
   postableBody: null,
   postableFix: null,
   postableStatus: 'escalated',
+  postableSuggestion: null,
   rescoredSeverity: null,
   postableNote,
 });
@@ -106,6 +129,37 @@ function clampSeverity(original: Severity, rescored: Severity | undefined): Seve
   return SEVERITIES.indexOf(rescored) > SEVERITIES.indexOf(original) ? rescored : null;
 }
 
+// Validate a gate-proposed one-click replacement under the SAME no-new-entity rule the edit-ops
+// obey: a `suggestion` may only rearrange tokens the reviewer's body or its own cited hunk already
+// contain. A replacement that invents an identifier, path, or number is drift — and drift with a
+// one-click APPLY button is the most damaging robot comment there is. Fails closed to null.
+//
+// Offered ONLY on `agree` + `fixStatus: 'keep'` — i.e. the gate confirmed the finding as stated AND
+// verified the reviewer's fix. A `partial` was narrowed, so its fix no longer provably matches the
+// narrowed claim; an unverified/false has nothing to fix.
+function deriveSuggestion(
+  suggestion: PostableSuggestion | undefined,
+  verdict: 'agree' | 'partial',
+  fixStatus: FixStatus,
+  allowed: Set<string>
+): PostableSuggestion | null {
+  if (!suggestion || verdict !== 'agree' || fixStatus !== 'keep') return null;
+  const replacement = suggestion.replacement.replace(/\s+$/, '');
+  if (!replacement.trim()) return null;
+  if (replacement.length > SUGGESTION_CHAR_CAP) return null;
+  if (replacement.split('\n').length > SUGGESTION_LINE_CEILING) return null;
+  for (const tok of entityTokens(replacement)) if (!allowed.has(tok)) return null;
+  return { replacement };
+}
+
+// The entity tokens a gate reply may reuse: everything already present in the reviewer's own body
+// plus its cited hunk. Shared by the edit-ops validator and the suggestion validator.
+function allowedTokens(body: string, hunkCode: string[]): Set<string> {
+  const allowed = entityTokens(body);
+  for (const line of hunkCode) for (const t of entityTokens(line)) allowed.add(t);
+  return allowed;
+}
+
 // Derive the postable text for one already-reconciled finding. Only agree/partial reach a
 // postable outcome; everything else is not-postable. Pure.
 export function derivePostable(input: {
@@ -116,6 +170,7 @@ export function derivePostable(input: {
   fixStatus: FixStatus | undefined;
   rescoredSeverity: Severity | undefined;
   severity: Severity;
+  suggestion?: PostableSuggestion;
 }): PostableResult {
   const { verdict, body, hunkCode, ops, fixStatus, rescoredSeverity, severity } = input;
   const trimmed = body.trim();
@@ -125,20 +180,27 @@ export function derivePostable(input: {
     // "confirmed as stated" ⇒ the whole body is grounded ⇒ post it verbatim. An edit op on an
     // agree is contradictory (if something needed striking it was partial) — fail closed.
     if (ops.length > 0) return escalate('agree verdict carried edit-ops (contradiction — should be partial)');
-    return { postableBody: trimmed, postableFix: fixStatus ?? 'keep', postableStatus: 'postable', rescoredSeverity: null };
+    const fix = fixStatus ?? 'keep';
+    return {
+      postableBody: trimmed,
+      postableFix: fix,
+      postableStatus: 'postable',
+      postableSuggestion: deriveSuggestion(input.suggestion, verdict, fix, allowedTokens(trimmed, hunkCode)),
+      rescoredSeverity: null,
+    };
   }
 
   // partial: the body overstates ⇒ it MUST carry the edits that narrow it, else posting it
   // verbatim re-injects the overstatement the gate caught.
   if (ops.length === 0) return escalate('partial verdict carried no edit-ops to narrow the overstatement');
-  const allowed = entityTokens(trimmed);
-  for (const line of hunkCode) for (const t of entityTokens(line)) allowed.add(t);
+  const allowed = allowedTokens(trimmed, hunkCode);
   const applied = applyOps(trimmed, ops, allowed);
   if ('note' in applied) return escalate(applied.note);
   return {
     postableBody: applied.body,
     postableFix: fixStatus ?? 'narrow',
     postableStatus: 'postable',
+    postableSuggestion: null, // a narrowed claim no longer provably supports the reviewer's fix
     rescoredSeverity: clampSeverity(severity, rescoredSeverity),
   };
 }
@@ -165,6 +227,23 @@ export function parsePostableOps(v: unknown): PostableOp[] {
 
 export function parseFixStatus(v: unknown): FixStatus | undefined {
   return typeof v === 'string' && (FIX_STATUSES as readonly string[]).includes(v) ? (v as FixStatus) : undefined;
+}
+
+// The gate's placement class for one finding. An unrecognized value yields undefined and the
+// caller defaults to `bug` — never silently demote a grounded finding into the quiet tier.
+export function parsePostableClass(v: unknown): PostableClass | undefined {
+  return typeof v === 'string' && (POSTABLE_CLASSES as readonly string[]).includes(v)
+    ? (v as PostableClass)
+    : undefined;
+}
+
+// Parse `{"suggestion": {"replacement": "..."}}` off a raw verdict entry. Length-capped here so a
+// hostile reply cannot push an unbounded string into an artifact even before validation.
+export function parseSuggestion(v: unknown): PostableSuggestion | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const replacement = (v as Record<string, unknown>).replacement;
+  if (typeof replacement !== 'string' || !replacement.trim()) return undefined;
+  return { replacement: replacement.slice(0, SUGGESTION_CHAR_CAP) };
 }
 
 export function parseSeverity(v: unknown): Severity | undefined {

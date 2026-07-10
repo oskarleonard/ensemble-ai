@@ -322,7 +322,8 @@ describe('exit-4 gate authority — provenance-scoped dismiss-only (DC4)', () =>
   function record(over: Partial<GateVerdictRecord> & { findingId: string }): GateVerdictRecord {
     return {
       downgradeReason: null, effectiveVerdict: 'false', file: 'a.ts', line: 1,
-      postableBody: null, postableFix: null, postableStatus: 'not-postable', rescoredSeverity: null,
+      postableBody: null, postableClass: null, postableFix: null, postableStatus: 'not-postable',
+      postableSuggestion: null, rescoredSeverity: null, resolved: true,
       rawVerdict: 'false', reason: 'refuted', reviewer: over.findingId.split('#')[0],
       severity: 'high', title: 't', ...over,
     };
@@ -489,7 +490,8 @@ describe('receipt reflects the FULL expected roster (not just the codex/grok cor
       gateTrailWritten: true,
       gateVerdicts: [{
         downgradeReason: null, effectiveVerdict: 'false', file: 'a.ts', findingId: 'codex#1',
-        line: 1, postableBody: null, postableFix: null, postableStatus: 'not-postable',
+        line: 1, postableBody: null, postableClass: null, postableFix: null, postableStatus: 'not-postable',
+        postableSuggestion: null, resolved: true,
         rawVerdict: 'false', reason: 'r', rescoredSeverity: null, reviewer: 'codex', severity: 'high', title: 't',
       }],
       modelLabel: 'opus', synthesis,
