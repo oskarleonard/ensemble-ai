@@ -76,6 +76,14 @@ export interface HolisticProvenance {
   verifiedSites?: HolisticSite[];
 }
 
+// Repo-relative paths reach this module from three places that spell them differently: the pinned
+// packet's diff headers, the gate model's verdict JSON, and the run's conventions manifest. Compare
+// them on ONE normal form, or a truthful `./src/a.ts` is refused as "not a file this PR changes".
+// Case is deliberately NOT folded: on a case-sensitive filesystem `SRC/A.TS` is a different file.
+function normalizeRepoPath(p: string): string {
+  return p.replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
 function nonEmptyStr(v: unknown, cap: number): string | null {
   return typeof v === 'string' && v.trim() ? v.trim().slice(0, cap) : null;
 }
@@ -157,10 +165,13 @@ const nonWsLen = (s: string): number => s.replace(/\s/g, '').length;
 // Find the 1-based [start, end] line span where `quote` appears as a run of consecutive COMPLETE
 // lines (whitespace-normalized). Complete-line matching is what makes the anchor meaningful: a
 // substring match would let `return null;` "verify" a citation anywhere in the file.
-export function findQuoteSpan(
+// EVERY line span where `quote` appears, in file order. A substantial line can legitimately repeat
+// within one file, and the cited line is what disambiguates which occurrence is meant — so the
+// verifier must see them all rather than assume the first is the one the lens meant.
+export function findQuoteSpans(
   lines: string[],
   quote: string
-): { end: number; start: number } | null {
+): { end: number; start: number }[] {
   const want = quote.split(/\r?\n/).map(norm);
   // Trim only the LEADING/TRAILING blank lines. An INTERNAL blank line is part of the quoted run
   // and must match the file's own blank line: dropping it would make every truthful quote that
@@ -168,9 +179,10 @@ export function findQuoteSpan(
   // citation refused as `reference-not-found` is exactly the failure this module exists to prevent.
   while (want.length > 0 && !want[0]) want.shift();
   while (want.length > 0 && !want[want.length - 1]) want.pop();
-  if (want.length === 0) return null;
-  if (!want.some((l) => nonWsLen(l) >= HOLISTIC_MIN_ANCHOR_NONWS)) return null;
+  if (want.length === 0) return [];
+  if (!want.some((l) => nonWsLen(l) >= HOLISTIC_MIN_ANCHOR_NONWS)) return [];
   const hay = lines.map(norm);
+  const spans: { end: number; start: number }[] = [];
   for (let i = 0; i + want.length <= hay.length; i++) {
     let hit = true;
     for (let j = 0; j < want.length; j++) {
@@ -179,9 +191,17 @@ export function findQuoteSpan(
         break;
       }
     }
-    if (hit) return { end: i + want.length, start: i + 1 };
+    if (hit) spans.push({ end: i + want.length, start: i + 1 });
   }
-  return null;
+  return spans;
+}
+
+// The FIRST span, or null. Kept for callers that only ask "does this quote exist here at all".
+export function findQuoteSpan(
+  lines: string[],
+  quote: string
+): { end: number; start: number } | null {
+  return findQuoteSpans(lines, quote)[0] ?? null;
 }
 
 // The matched span is returned on success so a caller can compare two sites by WHAT THEY QUOTE
@@ -198,25 +218,35 @@ export function verifySiteAtHead(
 ): SiteCheck {
   const lines = read(site.file);
   if (!lines) return { ok: false, reason: `${site.file} is not a readable file in the reviewed tree` };
-  const span = findQuoteSpan(lines, site.quote);
-  if (!span)
+  const spans = findQuoteSpans(lines, site.quote);
+  if (spans.length === 0)
     return {
       ok: false,
       reason: `the quoted line(s) do not appear verbatim in ${site.file} (or carry no ≥${HOLISTIC_MIN_ANCHOR_NONWS}-non-whitespace-char anchor line)`,
     };
-  if (site.line < span.start - HOLISTIC_LINE_SLACK || site.line > span.end + HOLISTIC_LINE_SLACK)
+  // A substantial line may repeat in one file. The cited line picks the occurrence the lens meant;
+  // matching only the FIRST would reject a truthful citation of any later one.
+  const hit = spans.find(
+    (s) => site.line >= s.start - HOLISTIC_LINE_SLACK && site.line <= s.end + HOLISTIC_LINE_SLACK
+  );
+  if (!hit)
     return {
       ok: false,
-      reason: `${site.file}:${site.line} is not where that quote lives (found at ${span.start}-${span.end})`,
+      reason: `${site.file}:${site.line} is not where that quote lives (found at ${spans.map((s) => `${s.start}-${s.end}`).join(', ')})`,
     };
-  return { ok: true, span };
+  return { ok: true, span: hit };
 }
 
 // ── The conventions-doc predicate (the ONLY thing that may uncap) ─────────────────────
 
-// A conventions doc is either one the run actually GATHERED (the conventions manifest — the real
-// answer, supplied by the consumer) or one of the canonical filenames. Both are checked against
-// the path as the lens cited it, normalized. A README is deliberately NOT a conventions doc.
+// A README is deliberately NOT a conventions doc, and neither is a canonical NAME sitting anywhere
+// in an untrusted tree: a vendored `node_modules/**/CONTRIBUTING.md` or an unrelated nested
+// `AGENTS.md` would otherwise lift the MED cap on a finding that no project rule mandates.
+//
+// So the run's conventions MANIFEST is authoritative when it exists — the docs this run actually
+// gathered are the docs the reviewers were shown, and the only ones that may uncap. The canonical
+// filenames are the fallback for a caller that gathered no manifest at all (a library consumer, or
+// `--no-conventions`), never an additive back door around one.
 const CANONICAL_CONVENTION_FILES = [
   'agents.md',
   'claude.md',
@@ -227,9 +257,8 @@ const CANONICAL_CONVENTION_FILES = [
 ];
 
 export function isConventionsDoc(file: string, gathered?: readonly string[]): boolean {
-  const rel = file.replace(/^\.\//, '').replace(/\\/g, '/').toLowerCase();
-  if (gathered?.some((g) => g.replace(/^\.\//, '').replace(/\\/g, '/').toLowerCase() === rel))
-    return true;
+  const rel = normalizeRepoPath(file).toLowerCase();
+  if (gathered) return gathered.some((g) => normalizeRepoPath(g).toLowerCase() === rel);
   return CANONICAL_CONVENTION_FILES.includes(rel.split('/').pop() ?? '');
 }
 
@@ -311,13 +340,17 @@ function checkSites(
     };
   const [d] = diff;
   const [p] = pattern;
-  if (!deps.diffFiles.has(d.file))
+  // The packet spells its paths as the diff headers do; the lens spells them as it likes. Compare
+  // on one normal form so a truthful `./src/a.ts` is not refused as "not a file this PR changes".
+  const changed = new Set([...deps.diffFiles].map(normalizeRepoPath));
+  if (!changed.has(normalizeRepoPath(d.file)))
     return {
       cause: 'invalid-citation',
       ok: false,
       reason: `the "diff" site ${d.file} is not a file this PR changes — the reinvention must be cited inside the change`,
     };
-  if (d.file === p.file && d.line === p.line)
+  const sameFile = normalizeRepoPath(d.file) === normalizeRepoPath(p.file);
+  if (sameFile && d.line === p.line)
     return { cause: 'invalid-citation', ok: false, reason: 'both sites point at the same line — a pattern cannot reinvent itself' };
   const spans: Record<HolisticSiteRole, { end: number; start: number }> = {
     diff: { end: 0, start: 0 },
@@ -332,7 +365,7 @@ function checkSites(
   // The cited LINE only pins a quote to ±HOLISTIC_LINE_SLACK, so two sites can name different
   // lines and still quote the very same code. Compare the VERIFIED SPANS: if they overlap, the
   // claim is "this code reinvents itself", which is never a finding.
-  if (d.file === p.file && spans.diff.start <= spans.pattern.end && spans.pattern.start <= spans.diff.end)
+  if (sameFile && spans.diff.start <= spans.pattern.end && spans.pattern.start <= spans.diff.end)
     return {
       cause: 'invalid-citation',
       ok: false,

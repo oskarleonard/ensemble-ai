@@ -2730,6 +2730,9 @@ var MAX_QUOTE_CHARS = 2e3;
 var MAX_FILE_BYTES = 1048576;
 var MAX_FILE_LINES = 2e4;
 var HOLISTIC_SITE_ROLES = ["diff", "pattern"];
+function normalizeRepoPath(p) {
+  return p.replace(/\\/g, "/").replace(/^\.\//, "");
+}
 function nonEmptyStr2(v, cap4) {
   return typeof v === "string" && v.trim() ? v.trim().slice(0, cap4) : null;
 }
@@ -2786,13 +2789,14 @@ function worktreeReader(worktreeDir) {
 }
 var norm = (s) => s.replace(/\s+/g, " ").trim();
 var nonWsLen = (s) => s.replace(/\s/g, "").length;
-function findQuoteSpan(lines, quote) {
+function findQuoteSpans(lines, quote) {
   const want = quote.split(/\r?\n/).map(norm);
   while (want.length > 0 && !want[0]) want.shift();
   while (want.length > 0 && !want[want.length - 1]) want.pop();
-  if (want.length === 0) return null;
-  if (!want.some((l) => nonWsLen(l) >= HOLISTIC_MIN_ANCHOR_NONWS)) return null;
+  if (want.length === 0) return [];
+  if (!want.some((l) => nonWsLen(l) >= HOLISTIC_MIN_ANCHOR_NONWS)) return [];
   const hay = lines.map(norm);
+  const spans = [];
   for (let i = 0; i + want.length <= hay.length; i++) {
     let hit = true;
     for (let j = 0; j < want.length; j++) {
@@ -2801,25 +2805,28 @@ function findQuoteSpan(lines, quote) {
         break;
       }
     }
-    if (hit) return { end: i + want.length, start: i + 1 };
+    if (hit) spans.push({ end: i + want.length, start: i + 1 });
   }
-  return null;
+  return spans;
 }
 function verifySiteAtHead(site, read) {
   const lines = read(site.file);
   if (!lines) return { ok: false, reason: `${site.file} is not a readable file in the reviewed tree` };
-  const span = findQuoteSpan(lines, site.quote);
-  if (!span)
+  const spans = findQuoteSpans(lines, site.quote);
+  if (spans.length === 0)
     return {
       ok: false,
       reason: `the quoted line(s) do not appear verbatim in ${site.file} (or carry no \u2265${HOLISTIC_MIN_ANCHOR_NONWS}-non-whitespace-char anchor line)`
     };
-  if (site.line < span.start - HOLISTIC_LINE_SLACK || site.line > span.end + HOLISTIC_LINE_SLACK)
+  const hit = spans.find(
+    (s) => site.line >= s.start - HOLISTIC_LINE_SLACK && site.line <= s.end + HOLISTIC_LINE_SLACK
+  );
+  if (!hit)
     return {
       ok: false,
-      reason: `${site.file}:${site.line} is not where that quote lives (found at ${span.start}-${span.end})`
+      reason: `${site.file}:${site.line} is not where that quote lives (found at ${spans.map((s) => `${s.start}-${s.end}`).join(", ")})`
     };
-  return { ok: true, span };
+  return { ok: true, span: hit };
 }
 var CANONICAL_CONVENTION_FILES = [
   "agents.md",
@@ -2830,9 +2837,8 @@ var CANONICAL_CONVENTION_FILES = [
   "styleguide.md"
 ];
 function isConventionsDoc(file, gathered) {
-  const rel = file.replace(/^\.\//, "").replace(/\\/g, "/").toLowerCase();
-  if (gathered?.some((g) => g.replace(/^\.\//, "").replace(/\\/g, "/").toLowerCase() === rel))
-    return true;
+  const rel = normalizeRepoPath(file).toLowerCase();
+  if (gathered) return gathered.some((g) => normalizeRepoPath(g).toLowerCase() === rel);
   return CANONICAL_CONVENTION_FILES.includes(rel.split("/").pop() ?? "");
 }
 function isHolisticRecord(r) {
@@ -2876,13 +2882,15 @@ function checkSites(sites, deps) {
     };
   const [d] = diff;
   const [p] = pattern;
-  if (!deps.diffFiles.has(d.file))
+  const changed = new Set([...deps.diffFiles].map(normalizeRepoPath));
+  if (!changed.has(normalizeRepoPath(d.file)))
     return {
       cause: "invalid-citation",
       ok: false,
       reason: `the "diff" site ${d.file} is not a file this PR changes \u2014 the reinvention must be cited inside the change`
     };
-  if (d.file === p.file && d.line === p.line)
+  const sameFile = normalizeRepoPath(d.file) === normalizeRepoPath(p.file);
+  if (sameFile && d.line === p.line)
     return { cause: "invalid-citation", ok: false, reason: "both sites point at the same line \u2014 a pattern cannot reinvent itself" };
   const spans = {
     diff: { end: 0, start: 0 },
@@ -2894,7 +2902,7 @@ function checkSites(sites, deps) {
       return { cause: "reference-not-found", ok: false, reason: `the ${role} site could not be verified at headSha \u2014 ${check.reason}` };
     spans[role] = check.span;
   }
-  if (d.file === p.file && spans.diff.start <= spans.pattern.end && spans.pattern.start <= spans.diff.end)
+  if (sameFile && spans.diff.start <= spans.pattern.end && spans.pattern.start <= spans.diff.end)
     return {
       cause: "invalid-citation",
       ok: false,

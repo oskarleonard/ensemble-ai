@@ -25,6 +25,7 @@ import {
   type HolisticPolicyDeps,
   applyHolisticPolicy,
   findQuoteSpan,
+  findQuoteSpans,
   isConventionsDoc,
   parseConventionCitation,
   parseHolisticSites,
@@ -130,6 +131,34 @@ describe('findQuoteSpan', () => {
   it('a quote of only blank lines anchors nothing', () => {
     expect(findQuoteSpan(lines, '\n\n')).toBeNull();
   });
+
+  it('reports EVERY occurrence of a repeated line, in file order', () => {
+    const dup = 'return { ok: false, reason: someReallyLongReasonHere };';
+    expect(findQuoteSpans(['a', dup, 'b', dup, 'c'], dup)).toEqual([
+      { end: 2, start: 2 },
+      { end: 4, start: 4 },
+    ]);
+  });
+});
+
+describe('a repeated line is disambiguated by the CITED line, not by file order', () => {
+  const dup = 'return { ok: false, reason: someReallyLongReasonHere };';
+  // Same substantial line at 2 and 10 — far enough apart that line 6 is inside neither ±2 window.
+  const lines = ['a', dup, 'b', 'c', 'd', 'e', 'f', 'g', 'h', dup, 'i'];
+  const read = () => lines;
+
+  it('a truthful citation of the LATER occurrence verifies (not just the first)', () => {
+    const late = verifySiteAtHead({ file: 'f.ts', line: 10, quote: dup }, read);
+    expect(late.ok).toBe(true);
+    expect(late.ok === true && late.span).toEqual({ end: 10, start: 10 });
+  });
+
+  it('the first occurrence still verifies, and a line near neither is still refused', () => {
+    expect(verifySiteAtHead({ file: 'f.ts', line: 2, quote: dup }, read).ok).toBe(true);
+    const bad = verifySiteAtHead({ file: 'f.ts', line: 6, quote: dup }, read);
+    expect(bad.ok).toBe(false);
+    expect(bad.ok === false && bad.reason).toContain('2-2, 10-10'); // every occurrence is named
+  });
 });
 
 describe('worktreeReader — the untrusted-tree fence', () => {
@@ -187,10 +216,28 @@ describe('verifySiteAtHead', () => {
 });
 
 describe('isConventionsDoc — the only source that may uncap', () => {
-  it('accepts the canonical names anywhere in the tree', () => {
+  it('accepts the canonical names anywhere in the tree WHEN the run gathered no manifest', () => {
     expect(isConventionsDoc('AGENTS.md')).toBe(true);
     expect(isConventionsDoc('docs/CONVENTIONS.md')).toBe(true);
     expect(isConventionsDoc('./CLAUDE.md')).toBe(true);
+  });
+
+  it('a GATHERED manifest is authoritative — a canonical NAME it did not gather cannot uncap', () => {
+    // The reviewed tree is untrusted PR content. A vendored or unrelated nested doc that merely
+    // happens to carry a canonical filename must not lift the cap on a rule no project states.
+    const gathered = ['AGENTS.md'];
+    expect(isConventionsDoc('AGENTS.md', gathered)).toBe(true);
+    expect(isConventionsDoc('node_modules/some-pkg/CONTRIBUTING.md', gathered)).toBe(false);
+    expect(isConventionsDoc('packages/unrelated/CLAUDE.md', gathered)).toBe(false);
+  });
+
+  it('an EMPTY manifest means the run gathered no conventions — nothing uncaps', () => {
+    expect(isConventionsDoc('AGENTS.md', [])).toBe(false);
+  });
+
+  it('matches the manifest across ./ and separator spelling', () => {
+    expect(isConventionsDoc('./docs/rules.md', ['docs/rules.md'])).toBe(true);
+    expect(isConventionsDoc('docs/rules.md', ['./docs/rules.md'])).toBe(true);
   });
 
   it('rejects a README and ordinary source', () => {
@@ -248,6 +295,16 @@ describe('applyHolisticPolicy — the three guardrails, mechanized', () => {
     expect(out.effectiveVerdict).toBe('unverified');
     expect(out.downgradeReason).toBe('reference-not-found');
     expect(out.reason).toContain('pattern site could not be verified at headSha');
+  });
+
+  it('BOTH SITES: a `./`-spelled diff site is the same file the packet named', () => {
+    // The packet spells paths as the diff headers do; the gate model spells them as it likes.
+    // A truthful citation must not be refused over a leading `./`.
+    const dotted = { ...DIFF_SITE, file: `./${DIFF_SITE.file}` };
+    const [out] = applyHolisticPolicy([record()], entry({ sites: [dotted, PATTERN_SITE] }), DEPS);
+    expect(out.effectiveVerdict).toBe('agree');
+    expect(out.postableStatus).toBe('postable');
+    expect(out.holistic?.verifiedSites).toHaveLength(2);
   });
 
   it('BOTH SITES: the reinvention must be cited INSIDE the change', () => {
