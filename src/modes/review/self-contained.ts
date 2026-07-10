@@ -26,6 +26,13 @@ import {
   renderGateVerdicts,
   runGate,
 } from './gate';
+import {
+  HOLISTIC_SEAT_ID,
+  type HolisticPlan,
+  resolveHolisticPlan,
+  runHolisticLens,
+} from './holistic';
+import { worktreeReader } from './holistic-gate';
 import { type ReviewSynthesis, type VoiceReview } from './synthesis';
 import { reviewJsonFromTrail } from './trail-io';
 
@@ -118,6 +125,19 @@ export function persistClaudeReview(
   writeTrailFile(baseDir, runId, 'review.claude.json', JSON.stringify(review, null, 2));
 }
 
+// The holistic lens's trail artifacts, in parity with the claude reviewer's — so the gate reads it
+// from disk like every other voice, and a reader can audit what the lens actually said.
+export function persistHolisticReview(
+  baseDir: string,
+  runId: string,
+  review: VoiceReview,
+  raw: string | null
+): void {
+  writeTrailFile(baseDir, runId, `findings.${HOLISTIC_SEAT_ID}.json`, JSON.stringify(review.findings, null, 2));
+  if (raw !== null) writeTrailFile(baseDir, runId, `${HOLISTIC_SEAT_ID}-review.raw.md`, raw);
+  writeTrailFile(baseDir, runId, `review.${HOLISTIC_SEAT_ID}.json`, JSON.stringify(review, null, 2));
+}
+
 // Load every reviewer's review BACK from the trail files (codex/grok via readReviewsForRun,
 // claude via review.claude.json) → the VoiceReview set the synthesis operates over. This is
 // what makes "the synthesis reads the three review files" literally true (not an in-memory
@@ -129,6 +149,10 @@ export function loadVoiceReviewsFromTrail(
   const out = readReviewsForRun(baseDir, runId).map(storedToVoiceReview);
   const claude = reviewJsonFromTrail(baseDir, runId, 'review.claude.json');
   if (claude) out.push(claude);
+  // The lens is LAST so its findingIds sort after the reviewers' in the gate prompt. Absent
+  // whenever the lens did not run (the default) — no file, no voice, no findings.
+  const holistic = reviewJsonFromTrail(baseDir, runId, `review.${HOLISTIC_SEAT_ID}.json`);
+  if (holistic) out.push(holistic);
   return out;
 }
 
@@ -184,6 +208,13 @@ async function runClaudeReviewer(
 export interface ClaudeLayerOptions {
   baseDir: string;
   claudeConfig: VoiceConfig;
+  // The run's gathered conventions files (repo-relative). The ONLY docs a holistic finding may
+  // cite to lift its MED severity cap — and the gate re-reads the citation out of the tree anyway.
+  conventionPaths?: readonly string[];
+  // THE HOLISTIC LENS (spec §4) — DEFAULT OFF. Omit it and nothing changes: no seat is spawned, no
+  // finding enters the gate, no clause enters the gate prompt, the records are the same objects.
+  // `requested` without `worktree` is a LOUD skip (holisticSkipped), never a packet-evidence run.
+  holistic?: { baseSha: string | null; config: VoiceConfig; requested: boolean };
   // The GATE (synthesis) seat — its own model/effort, independent of the `claude` REVIEWER above
   // ("reviewer = Opus @ high, gate = Fable @ max"). Always a `claude -p` spawn (only model/effort
   // differ). Omitted ⇒ inherits `claudeConfig` (the pre-Phase-3 behavior — one seat for both).
@@ -202,6 +233,10 @@ export interface ClaudeLayerOptions {
   // Injectable claude runner (default: the real headless `claude -p` voice).
   run?: ClaudeRunner;
   timeoutMs?: number;
+  // The detached read-only worktree of the PR head, when this run HAS worktree evidence. Its
+  // presence makes the GATE worktree-fed (spec §5: "the gate reads the same worktree") and is the
+  // precondition for the lens. Absent ⇒ every seat and the gate stay on the packet, as before.
+  worktree?: string;
 }
 
 export interface ClaudeLayerResult {
@@ -212,6 +247,11 @@ export interface ClaudeLayerResult {
   gateTrailWritten: boolean;
   // The host-reconciled grounded verdict for every finding across all three reviewers.
   gateVerdicts: GateVerdictRecord[];
+  // The holistic lens's review — null when the lens was off (the default) or skipped. OPTIONAL:
+  // this interface is a consumer contract (the dashboard renders it), and the lens is additive.
+  holisticReview?: VoiceReview | null;
+  // Why the lens did NOT run, when it was requested. Null/absent ⇒ it ran, or was never requested.
+  holisticSkipped?: string | null;
   // The model that ACTUALLY ran the claude voice (e.g. `opus`, `sonnet`) — rendered in the
   // stdout block so the output never hardcodes "opus" when a different Claude model is
   // configured. `opus` is the design default (when the voice config leaves the model unset).
@@ -286,6 +326,40 @@ export async function runClaudeReviewLayer(
     }
   }
 
+  // THE HOLISTIC LENS. Off by default; when requested it runs ONLY with worktree evidence, and a
+  // requested-but-unavailable lens says so out loud rather than degrading to a packet-evidence
+  // architecture claim. Its persist is the same fail-loud contract as the claude reviewer's: a
+  // review the trail did not take is not a review, because the gate reads voices off disk.
+  const plan: HolisticPlan = resolveHolisticPlan({
+    baseSha: opts.holistic?.baseSha,
+    requested: Boolean(opts.holistic?.requested),
+    worktree: opts.worktree,
+  });
+  let holisticReview: VoiceReview | null = null;
+  if (!plan.run) {
+    if (plan.skipReason) log(`  · ${plan.skipReason}`);
+  } else if (opts.holistic) {
+    log(`  · holistic lens (anthropic/${opts.holistic.config.model} @ ${opts.holistic.config.effort}) reading the whole project…`);
+    const { raw, review } = await runHolisticLens({
+      baseSha: plan.baseSha,
+      config: opts.holistic.config,
+      headSha: opts.expectedHeadSha,
+      log,
+      run,
+      timeoutMs: opts.timeoutMs,
+      worktree: plan.worktree,
+    });
+    holisticReview = review;
+    try {
+      persistHolisticReview(opts.baseDir, opts.runId, review, raw);
+      writeTrailFile(opts.baseDir, opts.runId, `review.${HOLISTIC_SEAT_ID}.md`, renderReviewMarkdown(review));
+    } catch (e) {
+      const why = (e as Error).message;
+      log(`  · holistic: trail persist FAILED (${why}) — the lens's findings are dropped from this run`);
+      holisticReview = { ...review, findings: [], ok: false, summary: `the holistic lens ran but FAILED to persist to the trail (${why})` };
+    }
+  }
+
   // Run the GATE over the reviews READ BACK from the trail files (the literal "reads the
   // three review files") — grounding each finding against the pinned packet hunks, tagging
   // agree/partial/false/unverified, and writing the durable gate-verdicts.json trail. The
@@ -298,16 +372,32 @@ export async function runClaudeReviewLayer(
     // defaulting to claudeConfig keeps the one-seat behavior when no `gate` entry is configured.
     config: opts.gateConfig ?? opts.claudeConfig,
     expectedHeadSha: opts.expectedHeadSha,
+    // With a worktree the gate is an evidence-bearing actor over the PR head: it may emit
+    // `reference-not-found`, and it can verify a holistic finding's two sites. Without one, both
+    // halves stay off — the pre-worktree behavior, unchanged.
+    ...(opts.worktree
+      ? {
+          gateEvidence: 'worktree' as const,
+          holistic: {
+            conventionPaths: opts.conventionPaths,
+            readAtHead: worktreeReader(opts.worktree),
+          },
+        }
+      : {}),
     log,
     reviews: voiceReviews,
     run,
     runId: opts.runId,
     timeoutMs: opts.timeoutMs,
+    // The gate reads the same worktree the seats did (spec §5) — its own spawn cwd.
+    ...(opts.worktree ? { worktree: opts.worktree } : {}),
   });
   return {
     claudeReview,
     gateTrailWritten: gate.gateTrailWritten,
     gateVerdicts: gate.verdicts,
+    holisticReview,
+    holisticSkipped: plan.run ? null : plan.skipReason,
     modelLabel,
     synthesis: gate.synthesis,
   };
@@ -343,6 +433,27 @@ export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
         out.push(`     [${f.severity}] ${scrub(where)}  ${scrub(f.title)}`);
       }
     }
+  }
+
+  // The lens gets its OWN block, named as one seat. It is never folded into the reviewers' list,
+  // because a reader must never mistake a single whole-tree opinion for cross-vendor corroboration.
+  const hr = result.holisticReview;
+  if (hr) {
+    out.push('');
+    out.push(`  ── holistic lens — ${hr.ok ? 'reviewed the whole project' : 'failed'} (ONE seat · suggestions · never corroborated) ──`);
+    if (!hr.ok) {
+      out.push(`     ${scrub(hr.summary).slice(0, 200)}`);
+    } else if (hr.findings.length === 0) {
+      out.push('     no findings — which is NOT an architecture certification (the lens finds valuable things when it looks; whole-repo search varies run to run)');
+    } else {
+      for (const f of hr.findings) {
+        out.push(`     [${f.severity}] ${scrub(evidenceRef(f.evidence.file, f.evidence.line))}  ${scrub(f.title)}`);
+      }
+    }
+  } else if (result.holisticSkipped) {
+    out.push('');
+    out.push(`  ── holistic lens — SKIPPED ──`);
+    out.push(`     ${scrub(result.holisticSkipped)}`);
   }
 
   const s = result.synthesis;

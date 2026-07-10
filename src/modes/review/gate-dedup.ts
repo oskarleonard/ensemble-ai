@@ -1,6 +1,7 @@
 import { SEVERITIES } from '../../core/types';
 
 import type { GateVerdictRecord } from './gate';
+import { isHolisticRecord } from './holistic-gate';
 
 // ── Cross-reviewer dedup by SELECTION (A+) ─────────────────────────────────────────────
 //
@@ -68,7 +69,11 @@ function better(a: GateVerdictRecord, b: GateVerdictRecord): GateVerdictRecord {
 // Enrich postable records with cluster info; non-postable records pass through untouched. Pure
 // and deterministic (stable input order in → stable clusters out). Returns a NEW array.
 export function clusterPostable(records: GateVerdictRecord[]): GateVerdictRecord[] {
-  const postable = records.filter((r) => r.postableStatus === 'postable');
+  // The HOLISTIC lens is excluded from clustering entirely (spec §4): it is ONE seat, so it must
+  // never receive a corroboration count, and it must never inflate another cluster's — "flagged by
+  // 2 of 4" would be a lie assembled from a diff-local reviewer and a whole-tree lens that agreed
+  // by coincidence of proximity. Its findings post on their own single-seat provenance or not at all.
+  const postable = records.filter((r) => r.postableStatus === 'postable' && !isHolisticRecord(r));
   const tok = new Map(postable.map((r) => [r.findingId, tokens(r)]));
 
   // Union-find over the postable set: link every pair that is proximate AND text-similar.
