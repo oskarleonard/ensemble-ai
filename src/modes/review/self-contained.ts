@@ -240,6 +240,12 @@ export interface ClaudeLayerOptions {
 export interface ClaudeLayerResult {
   // The cold Opus review (null when claude is not in the roster).
   claudeReview: VoiceReview | null;
+  // Whether the gate SEAT actually spawned (see GateRunResult.gateSpawned). The `gate` seat's
+  // REALIZED evidence is derived from this: a gate that never ran read nothing, and must not be
+  // attested as having read the worktree. OPTIONAL because this interface is a consumer contract
+  // (the dashboard renders it) — an absent value reads as NOT spawned, the weaker, fail-closed
+  // claim.
+  gateSpawned?: boolean;
   // Whether the durable gate-verdicts.json trail wrote — dismissals are honored (Phase 2)
   // ONLY when true (a trail-write failure means the audit trail was lost → not honored).
   gateTrailWritten: boolean;
@@ -419,6 +425,7 @@ export async function runClaudeReviewLayer(
   });
   return {
     claudeReview,
+    gateSpawned: gate.gateSpawned,
     gateTrailWritten: gate.gateTrailWritten,
     gateVerdicts: gate.verdicts,
     holisticReview,

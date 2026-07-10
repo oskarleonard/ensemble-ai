@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -74,6 +75,45 @@ function reviewOutFile(): string {
   );
 }
 
+// The legacy world-shared `/tmp`, spelled as the resolved path Seatbelt matches (`/tmp` is a
+// symlink to it). The profile's write rule names this exact subpath.
+const SANDBOX_WRITABLE_TMP = '/private/tmp';
+
+// The WORKTREE seat's `-o` reply file, and why it is not `reviewOutFile()`.
+//
+// A worktree codex seat runs inside the `ensemble-review-codex` Seatbelt profile, whose ONLY
+// writable roots are `~/.codex`, `/private/tmp`, and `/dev`. The per-user `$TMPDIR` that
+// `os.tmpdir()` returns realpaths under `/private/var/folders/…`, which the profile grants
+// file-READ (via the `/private/var` system root) and never file-WRITE. So a reply file placed
+// there is unwritable BY THE SEAT: codex completes the whole review, then dies on
+// `Failed to write last message file …: Operation not permitted (os error 1)` — verified against
+// codex-cli 0.143.0 under this exact profile. `runReviewerExec` then reads no reply, the seat is
+// scored `failed-reviewer`, and RETRIES_ON_PACKET re-runs it on the packet. Every worktree codex
+// run would burn a full review and discard it.
+//
+// `/private/tmp` is the one writable root the profile already grants, so the reply lands in an
+// owner-only (0700) mkdtemp there — the same posture writeCodexSandboxProfile uses for the profile
+// itself. No profile RULE changes, so `CODEX_SANDBOX_PROFILE.version` — and every receipt whose
+// policyHash binds it — is untouched.
+function worktreeReplyFile(): { cleanup: () => void; file: string } {
+  const dir = fs.mkdtempSync(path.join(SANDBOX_WRITABLE_TMP, 'ensemble-codex-'));
+  fs.chmodSync(dir, 0o700);
+  return {
+    cleanup: () => {
+      try {
+        fs.rmSync(dir, { force: true, recursive: true });
+      } catch {
+        /* best-effort, like every other reap in this engine */
+      }
+    },
+    file: path.join(dir, 'reply.md'),
+  };
+}
+
+function refuseWorktree(message: string): Promise<CodexReviewResult> {
+  return Promise.resolve({ ok: false, raw: null, stderrTail: message, timedOut: false });
+}
+
 // WORKTREE EVIDENCE (§2) — codex under the ensemble-OWNED external Seatbelt wrapper: its INTERNAL
 // sandbox is off (nested Seatbelt does not compose) and the EXTERNAL profile is the boundary, with
 // the worktree as cwd so codex's file tools reach the project.
@@ -94,33 +134,40 @@ function runCodexWorktreeReview(
   opts: RunReviewOpts
 ): Promise<CodexReviewResult> {
   if (!codexSandboxSupported()) {
-    return Promise.resolve({
-      ok: false,
-      raw: null,
-      stderrTail: `ensemble-ai: the codex seat cannot take the worktree on ${process.platform} — its sandbox-exec wrapper is macOS-only, and codex's own \`-s read-only\` restricts writes, not reads.`,
-      timedOut: false,
-    });
+    return refuseWorktree(
+      `ensemble-ai: the codex seat cannot take the worktree on ${process.platform} — its sandbox-exec wrapper is macOS-only, and codex's own \`-s read-only\` restricts writes, not reads.`
+    );
   }
-  let profile: ReturnType<typeof writeCodexSandboxProfile>;
+  // Resolve the binary BEFORE anything acquires a temp dir: resolveCodexBin THROWS when codex is
+  // not installed, and a throw after writeCodexSandboxProfile would strand its owner-only dir —
+  // mkdtemp names are random, so a leaked one is unfindable and nothing can ever clean it up.
+  let bin: string;
+  try {
+    bin = resolveCodexBin();
+  } catch (e) {
+    return refuseWorktree(`ensemble-ai: ${(e as Error).message}`);
+  }
+  let profile: ReturnType<typeof writeCodexSandboxProfile> | undefined;
+  let reply: ReturnType<typeof worktreeReplyFile>;
   try {
     profile = writeCodexSandboxProfile(defaultCodexSandboxPaths(worktree));
+    reply = worktreeReplyFile();
   } catch (e) {
-    return Promise.resolve({
-      ok: false,
-      raw: null,
-      stderrTail: `ensemble-ai: ${(e as Error).message}`,
-      timedOut: false,
-    });
+    profile?.cleanup();
+    return refuseWorktree(`ensemble-ai: ${(e as Error).message}`);
   }
-  const outFile = reviewOutFile();
   const wrapped = wrapWithSandbox(
     profile.file,
-    resolveCodexBin(),
-    buildCodexWorktreeArgs(config, outFile, prompt)
+    bin,
+    buildCodexWorktreeArgs(config, reply.file, prompt)
   );
-  // The profile file outlives the spawn only as long as sandbox-exec reads it; the owner-only temp
-  // dir is ours to reap. `finally` on the promise (not the caller) because the dir name is random —
-  // a leaked one is unfindable. A synchronous throw from runReviewerExec is caught too.
+  // Both temp dirs (the profile sandbox-exec reads, and the reply the SEAT writes) are ours to
+  // reap. `finally` on the promise (not the caller) because the dir names are random — a leaked
+  // one is unfindable. A synchronous throw from runReviewerExec is caught too.
+  const cleanup = (): void => {
+    profile.cleanup();
+    reply.cleanup();
+  };
   try {
     return runReviewerExec({
       args: wrapped.args,
@@ -128,14 +175,14 @@ function runCodexWorktreeReview(
       // The seat BORROWS the worktree (one per run, shared by every seat). It never reaps it.
       cwd: worktree,
       onSpawn: opts.onSpawn,
-      outFile,
+      outFile: reply.file,
       stderrLimit: 2000,
       timeoutMs: opts.timeoutMs ?? REVIEW_TIMEOUT_MS,
     })
       .then(({ raw, stderrTail, timedOut }) => ({ ok: raw !== null, raw, stderrTail, timedOut }))
-      .finally(profile.cleanup);
+      .finally(cleanup);
   } catch (e) {
-    profile.cleanup();
+    cleanup();
     throw e;
   }
 }

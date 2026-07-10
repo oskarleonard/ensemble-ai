@@ -15,8 +15,19 @@ import type { GitRun } from './worktree';
 // a 12-minute review waiting behind it. With prompting off git fails immediately and its stderr
 // ("could not read Username", "Authentication failed") classifies as `auth`. The same for
 // `GIT_ASKPASS`/`SSH_ASKPASS`: an askpass helper would pop a GUI dialog on a desktop Mac.
+//
+// `GIT_TERMINAL_PROMPT` governs GIT's own prompts — it says nothing to `ssh`. A `git@github.com:`
+// remote (what `resolveRepoLocation` hands back for most checkouts) shells out to ssh, which
+// prompts for a key passphrase on `/dev/tty` all by itself; the run would then wedge until the
+// GIT_TIMEOUT_MS backstop fires, minutes later, for what is really an auth failure. `BatchMode=yes`
+// makes ssh fail immediately instead, and its stderr ("Permission denied (publickey)") classifies
+// as `auth` like every other credential failure. The user's own GIT_SSH_COMMAND is PRESERVED (a
+// custom key/host config is theirs, not ours to drop) — we only append the non-interactive flag.
+const SSH_COMMAND = `${process.env.GIT_SSH_COMMAND?.trim() || 'ssh'} -o BatchMode=yes`;
+
 const NON_INTERACTIVE = {
   GIT_ASKPASS: '',
+  GIT_SSH_COMMAND: SSH_COMMAND,
   GIT_TERMINAL_PROMPT: '0',
   SSH_ASKPASS: '',
 };

@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { buildCodexReviewArgs, runCodexReview } from './codex';
 import { codexSandboxSupported } from './codex-sandbox';
+import { resolveCodexBin } from '../core/spawn';
 import type { ReviewerConfig } from '../core/types';
 
 const CONFIG: ReviewerConfig = {
@@ -26,7 +27,7 @@ vi.mock('node:child_process', async (importOriginal) => ({
 }));
 vi.mock('../core/spawn', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../core/spawn')>()),
-  resolveCodexBin: () => 'codex',
+  resolveCodexBin: vi.fn(() => 'codex'),
 }));
 
 type FakeChild = EventEmitter & {
@@ -164,6 +165,52 @@ describe('runCodexReview — worktree evidence runs under the external sandbox w
     expect(args).not.toContain('read-only');
     // cwd = the worktree, so codex's file tools reach the project. Seatbelt matches resolved paths.
     expect(fs.realpathSync(String(lastOpts.cwd))).toBe(fs.realpathSync(wt));
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  // The seat WRITES its `-o` reply from inside the profile, whose only writable roots are
+  // `~/.codex`, `/private/tmp` and `/dev`. `os.tmpdir()` realpaths under `/private/var/folders/…`
+  // — readable, NEVER writable — so a reply file there makes codex die on "Failed to write last
+  // message file … Operation not permitted" AFTER a full review, and the seat scores
+  // failed-reviewer on every single worktree run. Pin the writable root.
+  it('puts the `-o` reply under a writable sandbox root, never the unwritable $TMPDIR', () => {
+    if (!codexSandboxSupported()) return;
+    const wt = realWorktree();
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    void runCodexReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt });
+
+    const [, args] = spawned.mock.calls[0] as unknown as [string, string[]];
+    const outFile = args[args.indexOf('-o') + 1];
+    expect(outFile.startsWith('/private/tmp/')).toBe(true);
+    expect(outFile.startsWith(fs.realpathSync(os.tmpdir()))).toBe(false);
+    // Owner-only, because /private/tmp is world-shared.
+    const dir = path.dirname(outFile);
+    expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+    fs.rmSync(dir, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  // resolveCodexBin THROWS when codex is not installed. If it is called after the profile is
+  // written, its owner-only temp dir is stranded — and mkdtemp names are random, so nothing can
+  // ever find it again. Resolve the binary first.
+  it('leaks no sandbox temp dir when the codex binary cannot be resolved', async () => {
+    if (!codexSandboxSupported()) return;
+    const wt = realWorktree();
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    const strays = (): string[] =>
+      fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('ensemble-sb-'));
+    const before = strays();
+    vi.mocked(resolveCodexBin).mockImplementationOnce(() => {
+      throw new Error('codex binary not found');
+    });
+
+    const result = await runCodexReview('p', CONFIG, { worktree: wt });
+    expect(result.ok).toBe(false);
+    expect(result.stderrTail).toContain('codex binary not found');
+    expect(spawned).not.toHaveBeenCalled();
+    expect(strays()).toEqual(before);
     fs.rmSync(wt, { force: true, recursive: true });
   });
 

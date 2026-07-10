@@ -1374,11 +1374,20 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // THE RUN'S REALIZED EVIDENCE (spec §8) — fact, not intent. The core seats' classes come back
   // from the engine (a seat whose sandbox did not qualify, or whose wrapper provably broke, fell
   // back to the packet). The Anthropic seats are harness-controlled: they read the worktree
-  // whenever one exists and the layer ran. `realizedEvidence` is never hashed, so folding the
-  // Anthropic seats in here cannot move the receipt key.
+  // whenever one exists and the seat actually spawned there. `realizedEvidence` is never hashed,
+  // so folding the Anthropic seats in here cannot move the receipt key.
+  //
+  // The GATE is not spawned unconditionally: with no healthy reviewer it is never run, and its
+  // spawn can throw. Either way it read NOTHING, so it must not be attested `worktree` — that is
+  // an evidence claim `receipt verify` would then honor for a gate that never opened the tree.
   const realizedEvidence: EvidenceMap = {
     ...(result.evidence?.realized ?? {}),
-    ...(worktree && claudeLayer ? { claude: 'worktree' as const, gate: 'worktree' as const } : {}),
+    ...(worktree && claudeLayer
+      ? {
+          claude: 'worktree' as const,
+          gate: claudeLayer.gateSpawned ? ('worktree' as const) : ('packet' as const),
+        }
+      : {}),
   };
   // LOUD (§2, §9 grok-f2): every fallback was already printed as it happened; restate them
   // together so a reader of the summary cannot miss that this run reviewed less than it asked to.

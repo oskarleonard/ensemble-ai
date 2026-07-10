@@ -3,7 +3,7 @@
 // src/cli.ts
 import { execFileSync as execFileSync4 } from "child_process";
 import crypto2 from "crypto";
-import fs18 from "fs";
+import fs19 from "fs";
 import os10 from "os";
 import path14 from "path";
 import { parseArgs } from "util";
@@ -773,11 +773,12 @@ a tight ranked list of the genuinely strong ideas over a long one.
 }
 
 // src/modes/brainstorm/voices.ts
-import fs9 from "fs";
+import fs10 from "fs";
 import os6 from "os";
 import path7 from "path";
 
 // src/reviewers/codex.ts
+import fs8 from "fs";
 import os4 from "os";
 import path5 from "path";
 
@@ -1064,32 +1065,53 @@ function reviewOutFile() {
     `codex-review-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
   );
 }
+var SANDBOX_WRITABLE_TMP = "/private/tmp";
+function worktreeReplyFile() {
+  const dir = fs8.mkdtempSync(path5.join(SANDBOX_WRITABLE_TMP, "ensemble-codex-"));
+  fs8.chmodSync(dir, 448);
+  return {
+    cleanup: () => {
+      try {
+        fs8.rmSync(dir, { force: true, recursive: true });
+      } catch {
+      }
+    },
+    file: path5.join(dir, "reply.md")
+  };
+}
+function refuseWorktree(message) {
+  return Promise.resolve({ ok: false, raw: null, stderrTail: message, timedOut: false });
+}
 function runCodexWorktreeReview(prompt, config, worktree, opts) {
   if (!codexSandboxSupported()) {
-    return Promise.resolve({
-      ok: false,
-      raw: null,
-      stderrTail: `ensemble-ai: the codex seat cannot take the worktree on ${process.platform} \u2014 its sandbox-exec wrapper is macOS-only, and codex's own \`-s read-only\` restricts writes, not reads.`,
-      timedOut: false
-    });
+    return refuseWorktree(
+      `ensemble-ai: the codex seat cannot take the worktree on ${process.platform} \u2014 its sandbox-exec wrapper is macOS-only, and codex's own \`-s read-only\` restricts writes, not reads.`
+    );
+  }
+  let bin;
+  try {
+    bin = resolveCodexBin();
+  } catch (e) {
+    return refuseWorktree(`ensemble-ai: ${e.message}`);
   }
   let profile;
+  let reply;
   try {
     profile = writeCodexSandboxProfile(defaultCodexSandboxPaths(worktree));
+    reply = worktreeReplyFile();
   } catch (e) {
-    return Promise.resolve({
-      ok: false,
-      raw: null,
-      stderrTail: `ensemble-ai: ${e.message}`,
-      timedOut: false
-    });
+    profile?.cleanup();
+    return refuseWorktree(`ensemble-ai: ${e.message}`);
   }
-  const outFile = reviewOutFile();
   const wrapped = wrapWithSandbox(
     profile.file,
-    resolveCodexBin(),
-    buildCodexWorktreeArgs(config, outFile, prompt)
+    bin,
+    buildCodexWorktreeArgs(config, reply.file, prompt)
   );
+  const cleanup = () => {
+    profile.cleanup();
+    reply.cleanup();
+  };
   try {
     return runReviewerExec({
       args: wrapped.args,
@@ -1097,12 +1119,12 @@ function runCodexWorktreeReview(prompt, config, worktree, opts) {
       // The seat BORROWS the worktree (one per run, shared by every seat). It never reaps it.
       cwd: worktree,
       onSpawn: opts.onSpawn,
-      outFile,
+      outFile: reply.file,
       stderrLimit: 2e3,
       timeoutMs: opts.timeoutMs ?? REVIEW_TIMEOUT_MS
-    }).then(({ raw, stderrTail, timedOut }) => ({ ok: raw !== null, raw, stderrTail, timedOut })).finally(profile.cleanup);
+    }).then(({ raw, stderrTail, timedOut }) => ({ ok: raw !== null, raw, stderrTail, timedOut })).finally(cleanup);
   } catch (e) {
-    profile.cleanup();
+    cleanup();
     throw e;
   }
 }
@@ -1126,7 +1148,7 @@ function runCodexReview(prompt, config, opts = {}) {
 }
 
 // src/reviewers/grok.ts
-import fs8 from "fs";
+import fs9 from "fs";
 import os5 from "os";
 import path6 from "path";
 var GROK_BIN_CANDIDATES = [path6.join(os5.homedir(), ".grok", "bin", "grok")];
@@ -1175,16 +1197,16 @@ function replaceReviewSection(content) {
 function ensureSandboxProfile(profile, file = path6.join(os5.homedir(), ".grok", "sandbox.toml")) {
   if (BUILTIN_SANDBOXES.has(profile) || profile !== REVIEW_PROFILE_NAME) return;
   try {
-    const existing = fs8.existsSync(file) ? fs8.readFileSync(file, "utf8") : "";
+    const existing = fs9.existsSync(file) ? fs9.readFileSync(file, "utf8") : "";
     if (existing.includes(REVIEW_PROFILE_BLOCK)) return;
-    fs8.mkdirSync(path6.dirname(file), { recursive: true });
+    fs9.mkdirSync(path6.dirname(file), { recursive: true });
     const updated = existing.includes(REVIEW_PROFILE_HEADER) ? replaceReviewSection(existing) : null;
     const content = updated ?? (existing.trim() ? `${existing.trimEnd()}
 
 ${REVIEW_PROFILE}` : REVIEW_PROFILE);
     const tmp = `${file}.tmp`;
-    fs8.writeFileSync(tmp, content);
-    fs8.renameSync(tmp, file);
+    fs9.writeFileSync(tmp, content);
+    fs9.renameSync(tmp, file);
   } catch {
   }
 }
@@ -1231,7 +1253,7 @@ function runGrokReview(prompt, config, opts = {}) {
     });
   }
   ensureSandboxProfile(sandbox);
-  const cwd = worktreeCwd ?? fs8.mkdtempSync(path6.join(os5.tmpdir(), "grok-review-"));
+  const cwd = worktreeCwd ?? fs9.mkdtempSync(path6.join(os5.tmpdir(), "grok-review-"));
   return runReviewerExec({
     args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
     bin: resolveGrokBin(),
@@ -1241,7 +1263,7 @@ function runGrokReview(prompt, config, opts = {}) {
     timeoutMs
   }).then(({ raw, stderrTail, timedOut }) => {
     try {
-      if (!worktreeCwd) fs8.rmSync(cwd, { force: true, recursive: true });
+      if (!worktreeCwd) fs9.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
     const text = raw ? extractGrokText(raw) : null;
@@ -1343,7 +1365,7 @@ function parseVoices(raw) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs9.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs10.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
@@ -2478,16 +2500,16 @@ function scanDependencySurface(files) {
 }
 
 // src/modes/review/gate-hunks.ts
-import fs11 from "fs";
+import fs12 from "fs";
 import path9 from "path";
 
 // src/modes/review/trail-io.ts
-import fs10 from "fs";
+import fs11 from "fs";
 import path8 from "path";
 function readTrailJson(baseDir, runId, name) {
   try {
     return JSON.parse(
-      fs10.readFileSync(path8.join(reviewDir(baseDir, runId), name), "utf8")
+      fs11.readFileSync(path8.join(reviewDir(baseDir, runId), name), "utf8")
     );
   } catch {
     return null;
@@ -2524,7 +2546,7 @@ function persistGatePacket(baseDir, runId, input) {
 }
 function readGatePacket(baseDir, runId, expectedHeadSha) {
   const file = path9.join(reviewDir(baseDir, runId), "packet.gate.json");
-  if (!fs11.existsSync(file)) return { ok: false, reason: "missing" };
+  if (!fs12.existsSync(file)) return { ok: false, reason: "missing" };
   const raw = readTrailJson(baseDir, runId, "packet.gate.json");
   if (raw === null || typeof raw.diff !== "string" || typeof raw.headSha !== "string" || raw.schemaVersion !== GATE_PACKET_SCHEMA_VERSION) {
     return { ok: false, reason: "corrupt" };
@@ -2620,7 +2642,7 @@ function hunkCodeLines(hunk) {
 }
 
 // src/modes/review/receipt.ts
-import fs14 from "fs";
+import fs15 from "fs";
 import os7 from "os";
 import path11 from "path";
 
@@ -2701,11 +2723,11 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/holistic-gate.ts
-import fs13 from "fs";
+import fs14 from "fs";
 import path10 from "path";
 
 // src/modes/review/holistic.ts
-import fs12 from "fs";
+import fs13 from "fs";
 
 // src/modes/review/claude.ts
 var CLAUDE_HARNESS_PROFILE = {
@@ -2790,7 +2812,7 @@ function loadHolisticSeat(file = VOICES_FILE, warn = () => {
 }) {
   let raw = {};
   try {
-    raw = JSON.parse(fs12.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs13.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -2934,7 +2956,7 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs13.realpathSync(path10.resolve(worktreeDir));
+    root = fs14.realpathSync(path10.resolve(worktreeDir));
   } catch {
     return () => null;
   }
@@ -2947,11 +2969,11 @@ function worktreeReader(worktreeDir) {
       if (!file || file.includes("\0") || path10.isAbsolute(file)) return null;
       const target = path10.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs13.realpathSync(target);
+      const real = fs14.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs13.statSync(real);
+      const st = fs14.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs13.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs14.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
@@ -4007,7 +4029,7 @@ async function runGate(opts) {
   }
   const packetHunks = packet.ok ? parsePacketHunks(packet.diff) : /* @__PURE__ */ new Map();
   const { findings, injections } = prepareGateFindings(healthy, packetHunks);
-  const finalize = (synthesis2, parsed2) => {
+  const finalize = (synthesis2, parsed2, gateSpawned) => {
     const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed2, {
       gateEvidence: opts.gateEvidence,
       // The pinned packet's file set IS "what this PR changes" — the same bytes the reviewers saw.
@@ -4020,17 +4042,18 @@ async function runGate(opts) {
     if (!gateTrailWritten) {
       log("  \xB7 gate: gate-verdicts.json FAILED to write \u2014 dismissals not honored (trail loss is LOUD)");
     }
-    return { gateTrailWritten, synthesis: synthesis2, verdicts: records };
+    return { gateSpawned, gateTrailWritten, synthesis: synthesis2, verdicts: records };
   };
-  const bail = (logMsg, error, failure, raw) => {
+  const bail = (logMsg, error, failure, gateSpawned, raw) => {
     log(logMsg);
     return finalize(
       { ...fallbackReviewSynthesis(opts.reviews), error, ...raw !== void 0 ? { raw } : {} },
-      { failure }
+      { failure },
+      gateSpawned
     );
   };
   if (healthy.length === 0) {
-    return finalize(fallbackReviewSynthesis(opts.reviews), { failure: "gate-failed" });
+    return finalize(fallbackReviewSynthesis(opts.reviews), { failure: "gate-failed" }, false);
   }
   const prompt = renderGatePrompt(findings, injections, opts.gateEvidence ?? "packet");
   log("Gate: grounding findings against the pinned diff hunks \u2014 verdict tags\u2026");
@@ -4044,14 +4067,16 @@ async function runGate(opts) {
     return bail(
       `  \xB7 gate failed (${e.message}) \u2014 deterministic fallback + all unverified`,
       e.message,
-      "gate-failed"
+      "gate-failed",
+      false
     );
   }
   if (!res.raw || res.timedOut) {
     return bail(
       "  \xB7 gate produced no usable output \u2014 deterministic fallback + all unverified",
       res.timedOut ? "gate timed out" : "gate produced no output",
-      "gate-failed"
+      "gate-failed",
+      true
     );
   }
   const parsed = parseGateEnvelope(res.raw);
@@ -4060,6 +4085,7 @@ async function runGate(opts) {
       `  \xB7 gate envelope not usable (${parsed.failure}) \u2014 deterministic fallback + all unverified`,
       parsed.failure,
       parsed.failure,
+      true,
       res.raw
     );
   }
@@ -4082,7 +4108,7 @@ async function runGate(opts) {
   if (demoted > 0) {
     log(`  \xB7 synthesis: ${demoted} unverifiable "agreement(s)" demoted to look-closer (not corroborated by \u22652 real voices)`);
   }
-  return finalize(synthesis, packetFail ? { failure: "packet-fail" } : parsed);
+  return finalize(synthesis, packetFail ? { failure: "packet-fail" } : parsed, true);
 }
 
 // src/modes/review/receipt.ts
@@ -4127,11 +4153,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs14.mkdirSync(path11.dirname(file), { recursive: true, mode: 448 });
+  fs15.mkdirSync(path11.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs14.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs14.chmodSync(tmp, 384);
-  fs14.renameSync(tmp, file);
+  fs15.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs15.chmodSync(tmp, 384);
+  fs15.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -4213,7 +4239,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs14.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs15.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -4926,6 +4952,7 @@ async function runClaudeReviewLayer(opts) {
   });
   return {
     claudeReview,
+    gateSpawned: gate.gateSpawned,
     gateTrailWritten: gate.gateTrailWritten,
     gateVerdicts: gate.verdicts,
     holisticReview,
@@ -5001,7 +5028,7 @@ function renderClaudeLayer(result) {
 }
 
 // src/modes/review/gate-seat.ts
-import fs15 from "fs";
+import fs16 from "fs";
 function nonEmptyStr3(v) {
   return typeof v === "string" && v.trim() ? v.trim() : null;
 }
@@ -5075,7 +5102,7 @@ function loadGateSeat(file = VOICES_FILE, flags = {}, warn = () => {
 }) {
   let raw = {};
   try {
-    raw = JSON.parse(fs15.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs16.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(
@@ -5124,12 +5151,12 @@ function writeEvidenceManifest(baseDir, runId, manifest) {
 
 // src/modes/review/worktree.ts
 import { randomUUID } from "crypto";
-import fs17 from "fs";
+import fs18 from "fs";
 import os9 from "os";
 import path13 from "path";
 
 // src/modes/review/ensemble-config.ts
-import fs16 from "fs";
+import fs17 from "fs";
 import os8 from "os";
 import path12 from "path";
 var ENSEMBLE_CONFIG_PATH = path12.join(os8.homedir(), ".ensemble-ai", "config.json");
@@ -5138,7 +5165,7 @@ function asRecord(v) {
 }
 function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
   try {
-    return asRecord(JSON.parse(fs16.readFileSync(configPath, "utf8"))) ?? {};
+    return asRecord(JSON.parse(fs17.readFileSync(configPath, "utf8"))) ?? {};
   } catch {
     return {};
   }
@@ -5234,7 +5261,7 @@ function lockToken() {
 }
 function removeLockIfOwned(lock, token) {
   try {
-    if (fs17.readFileSync(lock, "utf8").trim() === token) fs17.unlinkSync(lock);
+    if (fs18.readFileSync(lock, "utf8").trim() === token) fs18.unlinkSync(lock);
   } catch {
   }
 }
@@ -5246,14 +5273,14 @@ function acquireRepoLock(gitCommonDir, opts = {}) {
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
     try {
-      const fd = fs17.openSync(lock, fs17.constants.O_CREAT | fs17.constants.O_EXCL | fs17.constants.O_WRONLY, 384);
-      fs17.writeSync(fd, token);
-      fs17.closeSync(fd);
+      const fd = fs18.openSync(lock, fs18.constants.O_CREAT | fs18.constants.O_EXCL | fs18.constants.O_WRONLY, 384);
+      fs18.writeSync(fd, token);
+      fs18.closeSync(fd);
       return () => removeLockIfOwned(lock, token);
     } catch {
       try {
-        const held = fs17.readFileSync(lock, "utf8").trim();
-        const age = Date.now() - fs17.statSync(lock).mtimeMs;
+        const held = fs18.readFileSync(lock, "utf8").trim();
+        const age = Date.now() - fs18.statSync(lock).mtimeMs;
         if (age > staleMs) removeLockIfOwned(lock, held);
       } catch {
       }
@@ -5289,8 +5316,8 @@ function materializeWorktree(args, deps) {
     if (!fetched.ok) {
       return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${location.fetchUrl} failed: ${fetched.error.trim()}` };
     }
-    dir = fs17.mkdtempSync(path13.join(args.worktreeRoot ?? os9.tmpdir(), "ensemble-worktree-"));
-    fs17.rmSync(dir, { recursive: true, force: true });
+    dir = fs18.mkdtempSync(path13.join(args.worktreeRoot ?? os9.tmpdir(), "ensemble-worktree-"));
+    fs18.rmSync(dir, { recursive: true, force: true });
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", "--no-recurse-submodules", dir, args.headSha],
       { cwd: location.repoRoot, env: INERT_ENV }
@@ -5323,7 +5350,7 @@ function reapWorktree(repoRoot, dir, deps) {
   } catch {
   }
   try {
-    fs17.rmSync(dir, { force: true, recursive: true });
+    fs18.rmSync(dir, { force: true, recursive: true });
   } catch {
   }
   try {
@@ -5334,8 +5361,10 @@ function reapWorktree(repoRoot, dir, deps) {
 
 // src/modes/review/git-exec.ts
 import { execFileSync as execFileSync3 } from "child_process";
+var SSH_COMMAND = `${process.env.GIT_SSH_COMMAND?.trim() || "ssh"} -o BatchMode=yes`;
 var NON_INTERACTIVE = {
   GIT_ASKPASS: "",
+  GIT_SSH_COMMAND: SSH_COMMAND,
   GIT_TERMINAL_PROMPT: "0",
   SSH_ASKPASS: ""
 };
@@ -6252,15 +6281,15 @@ function genRunId() {
 }
 function clearReusedRunTrail(baseDir, trailDir) {
   try {
-    if (fs18.lstatSync(trailDir).isSymbolicLink()) return;
+    if (fs19.lstatSync(trailDir).isSymbolicLink()) return;
   } catch {
     return;
   }
   let realBase;
   let realTarget;
   try {
-    realBase = fs18.realpathSync(baseDir);
-    realTarget = fs18.realpathSync(trailDir);
+    realBase = fs19.realpathSync(baseDir);
+    realTarget = fs19.realpathSync(trailDir);
   } catch {
     return;
   }
@@ -6268,12 +6297,12 @@ function clearReusedRunTrail(baseDir, trailDir) {
   if (!rel || escapesRoot(rel)) {
     return;
   }
-  fs18.rmSync(realTarget, { force: true, recursive: true });
+  fs19.rmSync(realTarget, { force: true, recursive: true });
 }
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
   try {
-    const s = fs18.readFileSync(0, "utf8");
+    const s = fs19.readFileSync(0, "utf8");
     return s.trim() ? s : void 0;
   } catch {
     return void 0;
@@ -6423,7 +6452,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "diff-file": {
       let text;
       try {
-        text = fs18.readFileSync(String(selection.diffFile), "utf8");
+        text = fs19.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
@@ -6929,7 +6958,10 @@ async function runReviewPipeline(input) {
   );
   const realizedEvidence = {
     ...result.evidence?.realized ?? {},
-    ...worktree && claudeLayer ? { claude: "worktree", gate: "worktree" } : {}
+    ...worktree && claudeLayer ? {
+      claude: "worktree",
+      gate: claudeLayer.gateSpawned ? "worktree" : "packet"
+    } : {}
   };
   for (const reason of result.evidence?.fallbacks ?? []) {
     console.error(`\u26A0 evidence degraded \u2014 ${reason}`);
@@ -7226,14 +7258,14 @@ async function brainstormCommand(args) {
   if (typeof values.file === "string") {
     const filePath = path14.resolve(cwd, values.file);
     try {
-      const bytes = fs18.statSync(filePath).size;
+      const bytes = fs19.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs18.readFileSync(filePath, "utf8");
+      fileContext = fs19.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${e.message}`
@@ -7431,14 +7463,14 @@ async function consultCommand(args) {
   if (typeof values.file === "string") {
     const filePath = path14.resolve(cwd, values.file);
     try {
-      const bytes = fs18.statSync(filePath).size;
+      const bytes = fs19.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs18.readFileSync(filePath, "utf8");
+      fileContext = fs19.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai consult: cannot read --file ${values.file}: ${e.message}`
@@ -7624,7 +7656,7 @@ async function receiptCommand(args) {
   const readReceiptFile = (p) => {
     let raw;
     try {
-      raw = fs18.readFileSync(p, "utf8");
+      raw = fs19.readFileSync(p, "utf8");
     } catch (e) {
       return { error: `cannot read receipt ${p}: ${e.message}` };
     }
@@ -7800,10 +7832,10 @@ async function reviewersCommand(args) {
     },
     reviewers: listReviewers(reviewersFile),
     reviewersFile,
-    reviewersFileExists: fs18.existsSync(reviewersFile),
+    reviewersFileExists: fs19.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
     voicesFile,
-    voicesFileExists: fs18.existsSync(voicesFile)
+    voicesFileExists: fs19.existsSync(voicesFile)
   };
   if (values.json) console.log(JSON.stringify(view, null, 2));
   else console.log(renderRegistry(view));

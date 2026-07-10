@@ -934,6 +934,7 @@ function sha256Hex(input) {
 }
 
 // src/reviewers/codex.ts
+import fs7 from "fs";
 import os4 from "os";
 import path5 from "path";
 
@@ -1091,32 +1092,53 @@ function reviewOutFile() {
     `codex-review-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
   );
 }
+var SANDBOX_WRITABLE_TMP = "/private/tmp";
+function worktreeReplyFile() {
+  const dir = fs7.mkdtempSync(path5.join(SANDBOX_WRITABLE_TMP, "ensemble-codex-"));
+  fs7.chmodSync(dir, 448);
+  return {
+    cleanup: () => {
+      try {
+        fs7.rmSync(dir, { force: true, recursive: true });
+      } catch {
+      }
+    },
+    file: path5.join(dir, "reply.md")
+  };
+}
+function refuseWorktree(message) {
+  return Promise.resolve({ ok: false, raw: null, stderrTail: message, timedOut: false });
+}
 function runCodexWorktreeReview(prompt, config, worktree, opts) {
   if (!codexSandboxSupported()) {
-    return Promise.resolve({
-      ok: false,
-      raw: null,
-      stderrTail: `ensemble-ai: the codex seat cannot take the worktree on ${process.platform} \u2014 its sandbox-exec wrapper is macOS-only, and codex's own \`-s read-only\` restricts writes, not reads.`,
-      timedOut: false
-    });
+    return refuseWorktree(
+      `ensemble-ai: the codex seat cannot take the worktree on ${process.platform} \u2014 its sandbox-exec wrapper is macOS-only, and codex's own \`-s read-only\` restricts writes, not reads.`
+    );
+  }
+  let bin;
+  try {
+    bin = resolveCodexBin();
+  } catch (e) {
+    return refuseWorktree(`ensemble-ai: ${e.message}`);
   }
   let profile;
+  let reply;
   try {
     profile = writeCodexSandboxProfile(defaultCodexSandboxPaths(worktree));
+    reply = worktreeReplyFile();
   } catch (e) {
-    return Promise.resolve({
-      ok: false,
-      raw: null,
-      stderrTail: `ensemble-ai: ${e.message}`,
-      timedOut: false
-    });
+    profile?.cleanup();
+    return refuseWorktree(`ensemble-ai: ${e.message}`);
   }
-  const outFile = reviewOutFile();
   const wrapped = wrapWithSandbox(
     profile.file,
-    resolveCodexBin(),
-    buildCodexWorktreeArgs(config, outFile, prompt)
+    bin,
+    buildCodexWorktreeArgs(config, reply.file, prompt)
   );
+  const cleanup = () => {
+    profile.cleanup();
+    reply.cleanup();
+  };
   try {
     return runReviewerExec({
       args: wrapped.args,
@@ -1124,12 +1146,12 @@ function runCodexWorktreeReview(prompt, config, worktree, opts) {
       // The seat BORROWS the worktree (one per run, shared by every seat). It never reaps it.
       cwd: worktree,
       onSpawn: opts.onSpawn,
-      outFile,
+      outFile: reply.file,
       stderrLimit: 2e3,
       timeoutMs: opts.timeoutMs ?? REVIEW_TIMEOUT_MS
-    }).then(({ raw, stderrTail, timedOut }) => ({ ok: raw !== null, raw, stderrTail, timedOut })).finally(profile.cleanup);
+    }).then(({ raw, stderrTail, timedOut }) => ({ ok: raw !== null, raw, stderrTail, timedOut })).finally(cleanup);
   } catch (e) {
-    profile.cleanup();
+    cleanup();
     throw e;
   }
 }
@@ -1153,7 +1175,7 @@ function runCodexReview(prompt, config, opts = {}) {
 }
 
 // src/reviewers/grok.ts
-import fs7 from "fs";
+import fs8 from "fs";
 import os5 from "os";
 import path6 from "path";
 var GROK_BIN_CANDIDATES = [path6.join(os5.homedir(), ".grok", "bin", "grok")];
@@ -1202,16 +1224,16 @@ function replaceReviewSection(content) {
 function ensureSandboxProfile(profile, file = path6.join(os5.homedir(), ".grok", "sandbox.toml")) {
   if (BUILTIN_SANDBOXES.has(profile) || profile !== REVIEW_PROFILE_NAME) return;
   try {
-    const existing = fs7.existsSync(file) ? fs7.readFileSync(file, "utf8") : "";
+    const existing = fs8.existsSync(file) ? fs8.readFileSync(file, "utf8") : "";
     if (existing.includes(REVIEW_PROFILE_BLOCK)) return;
-    fs7.mkdirSync(path6.dirname(file), { recursive: true });
+    fs8.mkdirSync(path6.dirname(file), { recursive: true });
     const updated = existing.includes(REVIEW_PROFILE_HEADER) ? replaceReviewSection(existing) : null;
     const content = updated ?? (existing.trim() ? `${existing.trimEnd()}
 
 ${REVIEW_PROFILE}` : REVIEW_PROFILE);
     const tmp = `${file}.tmp`;
-    fs7.writeFileSync(tmp, content);
-    fs7.renameSync(tmp, file);
+    fs8.writeFileSync(tmp, content);
+    fs8.renameSync(tmp, file);
   } catch {
   }
 }
@@ -1258,7 +1280,7 @@ function runGrokReview(prompt, config, opts = {}) {
     });
   }
   ensureSandboxProfile(sandbox);
-  const cwd = worktreeCwd ?? fs7.mkdtempSync(path6.join(os5.tmpdir(), "grok-review-"));
+  const cwd = worktreeCwd ?? fs8.mkdtempSync(path6.join(os5.tmpdir(), "grok-review-"));
   return runReviewerExec({
     args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
     bin: resolveGrokBin(),
@@ -1268,7 +1290,7 @@ function runGrokReview(prompt, config, opts = {}) {
     timeoutMs
   }).then(({ raw, stderrTail, timedOut }) => {
     try {
-      if (!worktreeCwd) fs7.rmSync(cwd, { force: true, recursive: true });
+      if (!worktreeCwd) fs8.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
     const text = raw ? extractGrokText(raw) : null;
@@ -1575,11 +1597,11 @@ function hasDepSurface(r) {
 }
 
 // src/modes/review/gate-hunks.ts
-import fs9 from "fs";
+import fs10 from "fs";
 import path8 from "path";
 
 // src/modes/review/trail-io.ts
-import fs8 from "fs";
+import fs9 from "fs";
 import path7 from "path";
 
 // src/modes/review/gate-hunks.ts
@@ -1594,7 +1616,7 @@ function persistGatePacket(baseDir, runId, input) {
 }
 
 // src/modes/review/receipt.ts
-import fs13 from "fs";
+import fs14 from "fs";
 import os7 from "os";
 import path11 from "path";
 
@@ -1678,14 +1700,14 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/holistic-gate.ts
-import fs12 from "fs";
+import fs13 from "fs";
 import path10 from "path";
 
 // src/modes/review/holistic.ts
-import fs11 from "fs";
+import fs12 from "fs";
 
 // src/modes/brainstorm/voices.ts
-import fs10 from "fs";
+import fs11 from "fs";
 import os6 from "os";
 import path9 from "path";
 
@@ -1799,7 +1821,7 @@ function parseVoices(raw) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs10.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs11.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
@@ -1849,7 +1871,7 @@ function loadHolisticSeat(file = VOICES_FILE, warn = () => {
 }) {
   let raw = {};
   try {
-    raw = JSON.parse(fs11.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs12.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -1993,7 +2015,7 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs12.realpathSync(path10.resolve(worktreeDir));
+    root = fs13.realpathSync(path10.resolve(worktreeDir));
   } catch {
     return () => null;
   }
@@ -2006,11 +2028,11 @@ function worktreeReader(worktreeDir) {
       if (!file || file.includes("\0") || path10.isAbsolute(file)) return null;
       const target = path10.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs12.realpathSync(target);
+      const real = fs13.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs12.statSync(real);
+      const st = fs13.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs12.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs13.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
@@ -2250,11 +2272,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs13.mkdirSync(path11.dirname(file), { recursive: true, mode: 448 });
+  fs14.mkdirSync(path11.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs13.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs13.chmodSync(tmp, 384);
-  fs13.renameSync(tmp, file);
+  fs14.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs14.chmodSync(tmp, 384);
+  fs14.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -2336,7 +2358,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs13.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs14.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -2852,12 +2874,12 @@ function writeEvidenceManifest(baseDir, runId, manifest) {
 
 // src/modes/review/worktree.ts
 import { randomUUID } from "crypto";
-import fs15 from "fs";
+import fs16 from "fs";
 import os9 from "os";
 import path13 from "path";
 
 // src/modes/review/ensemble-config.ts
-import fs14 from "fs";
+import fs15 from "fs";
 import os8 from "os";
 import path12 from "path";
 var ENSEMBLE_CONFIG_PATH = path12.join(os8.homedir(), ".ensemble-ai", "config.json");
@@ -2866,7 +2888,7 @@ function asRecord(v) {
 }
 function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
   try {
-    return asRecord(JSON.parse(fs14.readFileSync(configPath, "utf8"))) ?? {};
+    return asRecord(JSON.parse(fs15.readFileSync(configPath, "utf8"))) ?? {};
   } catch {
     return {};
   }
@@ -2962,7 +2984,7 @@ function lockToken() {
 }
 function removeLockIfOwned(lock, token) {
   try {
-    if (fs15.readFileSync(lock, "utf8").trim() === token) fs15.unlinkSync(lock);
+    if (fs16.readFileSync(lock, "utf8").trim() === token) fs16.unlinkSync(lock);
   } catch {
   }
 }
@@ -2974,14 +2996,14 @@ function acquireRepoLock(gitCommonDir, opts = {}) {
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
     try {
-      const fd = fs15.openSync(lock, fs15.constants.O_CREAT | fs15.constants.O_EXCL | fs15.constants.O_WRONLY, 384);
-      fs15.writeSync(fd, token);
-      fs15.closeSync(fd);
+      const fd = fs16.openSync(lock, fs16.constants.O_CREAT | fs16.constants.O_EXCL | fs16.constants.O_WRONLY, 384);
+      fs16.writeSync(fd, token);
+      fs16.closeSync(fd);
       return () => removeLockIfOwned(lock, token);
     } catch {
       try {
-        const held = fs15.readFileSync(lock, "utf8").trim();
-        const age = Date.now() - fs15.statSync(lock).mtimeMs;
+        const held = fs16.readFileSync(lock, "utf8").trim();
+        const age = Date.now() - fs16.statSync(lock).mtimeMs;
         if (age > staleMs) removeLockIfOwned(lock, held);
       } catch {
       }
@@ -3017,8 +3039,8 @@ function materializeWorktree(args, deps) {
     if (!fetched.ok) {
       return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${location.fetchUrl} failed: ${fetched.error.trim()}` };
     }
-    dir = fs15.mkdtempSync(path13.join(args.worktreeRoot ?? os9.tmpdir(), "ensemble-worktree-"));
-    fs15.rmSync(dir, { recursive: true, force: true });
+    dir = fs16.mkdtempSync(path13.join(args.worktreeRoot ?? os9.tmpdir(), "ensemble-worktree-"));
+    fs16.rmSync(dir, { recursive: true, force: true });
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", "--no-recurse-submodules", dir, args.headSha],
       { cwd: location.repoRoot, env: INERT_ENV }
@@ -3051,7 +3073,7 @@ function reapWorktree(repoRoot, dir, deps) {
   } catch {
   }
   try {
-    fs15.rmSync(dir, { force: true, recursive: true });
+    fs16.rmSync(dir, { force: true, recursive: true });
   } catch {
   }
   try {
@@ -3404,7 +3426,7 @@ function stageReview(payload, target, deps) {
 }
 
 // src/modes/review/holistic-fixture.ts
-import fs16 from "fs";
+import fs17 from "fs";
 import path14 from "path";
 function anchor(v, where) {
   const e = v ?? {};
@@ -3413,7 +3435,7 @@ function anchor(v, where) {
   return { file: e.file, line: e.line, symbol: e.symbol };
 }
 function loadHolisticFixture(dir) {
-  const raw = JSON.parse(fs16.readFileSync(path14.join(dir, "expectations.json"), "utf8"));
+  const raw = JSON.parse(fs17.readFileSync(path14.join(dir, "expectations.json"), "utf8"));
   const positives = Array.isArray(raw.plantedPositives) ? raw.plantedPositives : [];
   const misses = Array.isArray(raw.nearMisses) ? raw.nearMisses : [];
   if (positives.length === 0 || misses.length === 0)
@@ -3446,7 +3468,7 @@ function verifyFixtureAnchors(dir, fixture) {
   const check = (a, label) => {
     let lines;
     try {
-      lines = fs16.readFileSync(path14.join(dir, a.file), "utf8").split(/\r?\n/);
+      lines = fs17.readFileSync(path14.join(dir, a.file), "utf8").split(/\r?\n/);
     } catch {
       broken.push(`${label}: ${a.file} is unreadable`);
       return;

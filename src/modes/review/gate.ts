@@ -877,6 +877,13 @@ export type GateRunner = (
 ) => Promise<VoiceRunResult>;
 
 export interface GateRunResult {
+  // Did the gate SEAT actually spawn and return? False when no healthy reviewer gave it anything
+  // to judge, or when the spawn itself threw — in both cases the seat never existed, so it read
+  // nothing. This is what the run's REALIZED evidence for the `gate` seat is derived from: a gate
+  // that never ran cannot have realized `worktree` evidence, and a receipt must not attest that it
+  // did. A seat that ran but timed out, produced no output, or returned an unparseable envelope
+  // DID spawn in the worktree — it could read the tree, so its realized class is honest.
+  gateSpawned: boolean;
   gateTrailWritten: boolean;
   synthesis: ReviewSynthesis;
   verdicts: GateVerdictRecord[];
@@ -929,7 +936,8 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
 
   const finalize = (
     synthesis: ReviewSynthesis,
-    parsed: ParsedGateEnvelope | WholeEnvelopeFailure
+    parsed: ParsedGateEnvelope | WholeEnvelopeFailure,
+    gateSpawned: boolean
   ): GateRunResult => {
     const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed, {
       gateEvidence: opts.gateEvidence,
@@ -948,29 +956,33 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     if (!gateTrailWritten) {
       log('  · gate: gate-verdicts.json FAILED to write — dismissals not honored (trail loss is LOUD)');
     }
-    return { gateTrailWritten, synthesis, verdicts: records };
+    return { gateSpawned, gateTrailWritten, synthesis, verdicts: records };
   };
 
   // Every FAIL-CLOSED spawn/parse exit shares one shape: log, then finalize the deterministic
   // fallback synthesis (carrying the error string, and the raw gate output when we have it) as a
   // whole-envelope failure. One closure so the three failure branches can't drift on that shape.
+  // `gateSpawned` is passed per-branch: a spawn that THREW never reached the worktree, while a
+  // seat that ran and returned an unusable envelope did.
   const bail = (
     logMsg: string,
     error: string,
     failure: WholeEnvelopeFailure['failure'],
+    gateSpawned: boolean,
     raw?: string
   ): GateRunResult => {
     log(logMsg);
     return finalize(
       { ...fallbackReviewSynthesis(opts.reviews), error, ...(raw !== undefined ? { raw } : {}) },
-      { failure }
+      { failure },
+      gateSpawned
     );
   };
 
   // No healthy reviewer ⇒ nothing to verdict; still emit the deterministic fallback synthesis
-  // and a (probably empty) trail so the artifact always exists.
+  // and a (probably empty) trail so the artifact always exists. The seat is never spawned.
   if (healthy.length === 0) {
-    return finalize(fallbackReviewSynthesis(opts.reviews), { failure: 'gate-failed' });
+    return finalize(fallbackReviewSynthesis(opts.reviews), { failure: 'gate-failed' }, false);
   }
 
   // The prompt teaches `cause: reference-not-found` ONLY when the gate's realized evidence is
@@ -985,17 +997,20 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
       ...(opts.worktree ? { worktree: opts.worktree } : {}),
     });
   } catch (e) {
+    // The spawn itself threw — no seat ever existed, so it read nothing (gateSpawned: false).
     return bail(
       `  · gate failed (${(e as Error).message}) — deterministic fallback + all unverified`,
       (e as Error).message,
-      'gate-failed'
+      'gate-failed',
+      false
     );
   }
   if (!res.raw || res.timedOut) {
     return bail(
       '  · gate produced no usable output — deterministic fallback + all unverified',
       res.timedOut ? 'gate timed out' : 'gate produced no output',
-      'gate-failed'
+      'gate-failed',
+      true
     );
   }
 
@@ -1005,6 +1020,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
       `  · gate envelope not usable (${parsed.failure}) — deterministic fallback + all unverified`,
       parsed.failure,
       parsed.failure,
+      true,
       res.raw
     );
   }
@@ -1033,5 +1049,5 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   if (demoted > 0) {
     log(`  · synthesis: ${demoted} unverifiable "agreement(s)" demoted to look-closer (not corroborated by ≥2 real voices)`);
   }
-  return finalize(synthesis, packetFail ? { failure: 'packet-fail' } : parsed);
+  return finalize(synthesis, packetFail ? { failure: 'packet-fail' } : parsed, true);
 }
