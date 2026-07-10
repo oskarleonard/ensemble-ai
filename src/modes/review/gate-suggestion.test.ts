@@ -110,12 +110,30 @@ describe('parsing the gate reply\'s placement fields', () => {
     expect(parsePostableClass(3)).toBeUndefined();
   });
 
-  it('parses a suggestion object and caps its length', () => {
+  it('parses a suggestion object', () => {
     expect(parseSuggestion({ replacement: 'x' })).toEqual({ replacement: 'x' });
-    expect(parseSuggestion({ replacement: 'a'.repeat(5000) })?.replacement).toHaveLength(800);
     expect(parseSuggestion({ replacement: '' })).toBeUndefined();
     expect(parseSuggestion('x')).toBeUndefined();
     expect(parseSuggestion(null)).toBeUndefined();
+  });
+
+  // An over-cap replacement used to be SLICED to 800 chars, which both changed the edit (a truncated
+  // replacement is usually syntactically incomplete) and hid it from deriveSuggestion's own cap,
+  // which then only ever saw the 800-char slice. It is rejected outright now — cross-vendor codex-f1.
+  it('REJECTS an over-cap replacement rather than truncating it into an apply block', () => {
+    expect(parseSuggestion({ replacement: 'a'.repeat(801) })).toBeUndefined();
+    expect(parseSuggestion({ replacement: 'a'.repeat(800) })?.replacement).toHaveLength(800);
+    // trailing whitespace is stripped before the cap, so a trailing newline never costs a valid fix
+    expect(parseSuggestion({ replacement: `${'a'.repeat(800)}\n` })?.replacement).toHaveLength(800);
+  });
+
+  it('an over-cap replacement never reaches a rendered suggestion, even token-clean', () => {
+    // Every token is `a.length`, which the body and hunk both contain — only the cap refuses it.
+    const long = 'a.length '.repeat(120);
+    expect(long.length).toBeGreaterThan(800);
+    const r = derivePostable({ ...base, suggestion: parseSuggestion({ replacement: long }) });
+    expect(r.postableSuggestion).toBeNull();
+    expect(r.postableBody).toBe(base.body); // the finding still posts; only the apply button is dropped
   });
 });
 

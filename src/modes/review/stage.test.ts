@@ -159,6 +159,33 @@ describe('staging a PENDING review', () => {
     expect(calls.findIndex((c) => c.includes('DELETE'))).toBeLessThan(calls.findIndex((c) => c.includes('POST')));
   });
 
+  // The replace cannot be atomic (one pending review per user per PR), so a CREATE that fails after
+  // a successful DELETE leaves the user with nothing. The failure must SAY so — the fix is a re-run,
+  // and the content is regenerated deterministically. Cross-vendor grok-f2.
+  it('a create that fails AFTER the replace-delete names the destroyed prior review', () => {
+    const { gh } = fakeGh([
+      okHead(),
+      reviews([{ body: STAGE_MARKER, id: 42, state: 'PENDING' }]),
+      { match: '--method DELETE', result: { ok: true, text: '' } },
+      { match: '--method POST', result: { error: '502 Bad Gateway', ok: false } },
+    ]);
+    const res = stageReview(PAYLOAD, TARGET, { gh, reviewedHeadSha: HEAD });
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.kind).toBe('gh-failed');
+      expect(res.error).toContain('502 Bad Gateway');
+      expect(res.error).toContain('already removed to make room for it');
+      expect(res.error).toContain('re-run to regenerate it');
+    }
+  });
+
+  it('a create that fails with NO prior review does not claim one was destroyed', () => {
+    const { gh } = fakeGh([okHead(), reviews([]), { match: '--method POST', result: { error: '502', ok: false } }]);
+    const res = stageReview(PAYLOAD, TARGET, { gh, reviewedHeadSha: HEAD });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).not.toContain('already removed');
+  });
+
   it('a failed delete aborts — it never stacks a second pending review on the author', () => {
     const { calls, gh } = fakeGh([
       okHead(),

@@ -2695,7 +2695,11 @@ function stageReview(payload, target, deps) {
     JSON.stringify(payload)
   );
   if (!created.ok) {
-    return { error: `could not create the pending review: ${created.error}`, kind: "gh-failed", ok: false };
+    return {
+      error: `could not create the pending review: ${created.error}` + (replaced ? ". Your prior ensemble-ai pending review was already removed to make room for it (GitHub allows one pending review per user per PR, so a replacement cannot be atomic) \u2014 re-run to regenerate it. Nothing was submitted, and the author saw neither review." : ""),
+      kind: "gh-failed",
+      ok: false
+    };
   }
   let url = null;
   try {

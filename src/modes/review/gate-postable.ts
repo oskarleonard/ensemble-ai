@@ -253,13 +253,19 @@ export function parsePostableClass(v: unknown): PostableClass | undefined {
     : undefined;
 }
 
-// Parse `{"suggestion": {"replacement": "..."}}` off a raw verdict entry. Length-capped here so a
-// hostile reply cannot push an unbounded string into an artifact even before validation.
+// Parse `{"suggestion": {"replacement": "..."}}` off a raw verdict entry. An over-cap replacement is
+// REJECTED, never truncated: slicing it yields a DIFFERENT edit from the one the gate verified —
+// usually a syntactically incomplete one — and it would still be rendered with a one-click Apply
+// button. Truncation also silently defeats deriveSuggestion's own cap, which sees only the slice.
+// Trailing whitespace is stripped before the cap so a trailing newline never costs a valid fix.
 export function parseSuggestion(v: unknown): PostableSuggestion | undefined {
   if (!v || typeof v !== 'object') return undefined;
-  const replacement = (v as Record<string, unknown>).replacement;
-  if (typeof replacement !== 'string' || !replacement.trim()) return undefined;
-  return { replacement: replacement.slice(0, SUGGESTION_CHAR_CAP) };
+  const raw = (v as Record<string, unknown>).replacement;
+  if (typeof raw !== 'string') return undefined;
+  const replacement = raw.replace(/\s+$/, '');
+  if (!replacement.trim()) return undefined;
+  if (replacement.length > SUGGESTION_CHAR_CAP) return undefined;
+  return { replacement };
 }
 
 export function parseSeverity(v: unknown): Severity | undefined {

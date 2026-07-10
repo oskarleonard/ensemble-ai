@@ -171,6 +171,11 @@ export function stageReview(
   // 3. IDEMPOTENCY — replace OUR prior pending review so a re-run updates in place. Deleting is
   //    safe by construction: a pending review is unsubmitted, invisible to the author, and this one
   //    carries our marker, so it is content we wrote on a previous run of this same command.
+  //
+  //    The replace CANNOT be atomic: GitHub allows one pending review per user per PR, so the old
+  //    one must go before the new one can exist. If the CREATE below then fails, the prior staged
+  //    review is gone and nothing replaced it — the failure names that explicitly, because the fix
+  //    is simply to re-run (the content is regenerated deterministically from the same records).
   let replaced = false;
   if (pending.kind === 'ours') {
     const del = run(['api', '--method', 'DELETE', apiPath(target, `/reviews/${pending.id}`)]);
@@ -187,7 +192,17 @@ export function stageReview(
     JSON.stringify(payload)
   );
   if (!created.ok) {
-    return { error: `could not create the pending review: ${created.error}`, kind: 'gh-failed', ok: false };
+    return {
+      error:
+        `could not create the pending review: ${created.error}` +
+        (replaced
+          ? '. Your prior ensemble-ai pending review was already removed to make room for it (GitHub ' +
+            'allows one pending review per user per PR, so a replacement cannot be atomic) — re-run to ' +
+            'regenerate it. Nothing was submitted, and the author saw neither review.'
+          : ''),
+      kind: 'gh-failed',
+      ok: false,
+    };
   }
   let url: string | null = null;
   try {

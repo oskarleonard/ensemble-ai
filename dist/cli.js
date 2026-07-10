@@ -2854,9 +2854,12 @@ function parsePostableClass(v) {
 }
 function parseSuggestion(v) {
   if (!v || typeof v !== "object") return void 0;
-  const replacement = v.replacement;
-  if (typeof replacement !== "string" || !replacement.trim()) return void 0;
-  return { replacement: replacement.slice(0, SUGGESTION_CHAR_CAP) };
+  const raw = v.replacement;
+  if (typeof raw !== "string") return void 0;
+  const replacement = raw.replace(/\s+$/, "");
+  if (!replacement.trim()) return void 0;
+  if (replacement.length > SUGGESTION_CHAR_CAP) return void 0;
+  return { replacement };
 }
 function parseSeverity(v) {
   return typeof v === "string" && SEVERITIES.includes(v) ? v : void 0;
@@ -4797,7 +4800,11 @@ function stageReview(payload, target, deps) {
     JSON.stringify(payload)
   );
   if (!created.ok) {
-    return { error: `could not create the pending review: ${created.error}`, kind: "gh-failed", ok: false };
+    return {
+      error: `could not create the pending review: ${created.error}` + (replaced ? ". Your prior ensemble-ai pending review was already removed to make room for it (GitHub allows one pending review per user per PR, so a replacement cannot be atomic) \u2014 re-run to regenerate it. Nothing was submitted, and the author saw neither review." : ""),
+      kind: "gh-failed",
+      ok: false
+    };
   }
   let url = null;
   try {
