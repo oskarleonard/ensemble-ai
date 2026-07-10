@@ -40,14 +40,14 @@ type FakeChild = EventEmitter & {
 };
 
 let child: FakeChild | null = null;
-let lastOpts: { detached?: boolean; stdio: unknown[] } = { stdio: [] };
+let lastOpts: { detached?: boolean; env?: unknown; stdio: unknown[] } = { stdio: [] };
 
 beforeEach(() => {
   child = null;
   vi.mocked(spawn).mockImplementation(((
     _bin: string,
     _args: string[],
-    opts: { detached?: boolean; stdio: unknown[] }
+    opts: { detached?: boolean; env?: unknown; stdio: unknown[] }
   ) => {
     const c = new EventEmitter() as FakeChild;
     c.kills = [];
@@ -296,5 +296,39 @@ describe('runGrokReview — the worktree is only granted under the QUALIFYING sa
     await expect(
       runGrokReview('p', { ...CONFIG, sandbox: 'strict' }, { worktree: '/private/tmp/wt' })
     ).resolves.toMatchObject({ ok: false });
+  });
+});
+
+// THE EGRESS FENCE, grok half (codex-f3). grok honors the standard proxy env vars — PROBED
+// 2026-07-10 the same way codex was: a logging CONNECT proxy saw its `cli-chat-proxy.grok.com:443`
+// tunnel. So its worktree seat is spawned pointed at the engine's proxy, which allows that host and
+// refuses everything else (its `api.mixpanel.com` telemetry included).
+describe('runGrokReview — the worktree seat is fenced by the egress proxy', () => {
+  it('hands the worktree seat the proxy env, with NO_PROXY forced empty', async () => {
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
+    const run = runGrokReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt });
+    await vi.waitFor(() => expect(spawned).toHaveBeenCalled());
+
+    const env = lastOpts.env as Record<string, string>;
+    expect(env.HTTPS_PROXY).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    expect(env.ALL_PROXY).toBe(env.HTTPS_PROXY);
+    expect(env.NO_PROXY).toBe('');
+    child?.emit('exit');
+    await run;
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  // A PACKET seat has no untrusted tree to be injected from, and its receipt attests no fence — so
+  // it is spawned exactly as before, with no proxy env at all.
+  it('leaves the packet path unfenced and unchanged — no proxy env', async () => {
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    const run = runGrokReview('p', CONFIG, { timeoutMs: 10_000 });
+    await vi.waitFor(() => expect(spawned).toHaveBeenCalled());
+    expect(lastOpts.env).toBeUndefined();
+    child?.emit('exit');
+    await run;
   });
 });

@@ -142,6 +142,26 @@ describe('the evidence footer — a degraded run never reads as a full-worktree 
     expect(line).toContain('DEGRADED');
   });
 
+  // §6: a denial is LOUD — a seat that reached for a host outside its allowlist is the exact event
+  // the fence exists to catch, so it rides the POSTED footer and not only a run artifact.
+  it('states egress denials on the footer, deduped by host', () => {
+    const line = formatEvidenceFooter(
+      { codex: 'worktree' },
+      [
+        { host: 'evil.example', method: 'CONNECT', port: 443, reason: 'not allowlisted' },
+        { host: 'evil.example', method: 'CONNECT', port: 443, reason: 'not allowlisted' },
+        { host: 'mcp.supabase.com', method: 'CONNECT', port: 443, reason: 'not allowlisted' },
+      ]
+    );
+    expect(line).toContain('3 connection(s) DENIED to 2 host(s)');
+    expect(line).toContain('evil.example, mcp.supabase.com');
+    expect(line).toContain('egress-denials.json');
+  });
+
+  it('says nothing about egress on a clean run — no denial, no noise', () => {
+    expect(formatEvidenceFooter({ codex: 'worktree' })).not.toContain('egress fence');
+  });
+
   it('a full-worktree run says nothing about degradation', () => {
     expect(formatEvidenceFooter({ codex: 'worktree', grok: 'worktree' })).not.toContain('DEGRADED');
   });

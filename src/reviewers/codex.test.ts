@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { buildCodexReviewArgs, runCodexReview } from './codex';
 import { codexSandboxSupported } from './codex-sandbox';
+import { startSeatEgressProxy } from './egress-seat';
 import { resolveCodexBin } from '../core/spawn';
 import type { ReviewerConfig } from '../core/types';
 
@@ -28,6 +29,13 @@ vi.mock('node:child_process', async (importOriginal) => ({
 vi.mock('../core/spawn', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../core/spawn')>()),
   resolveCodexBin: vi.fn(() => 'codex'),
+}));
+// The egress proxy is REAL in every test but the fail-closed one, which forces its bind to fail.
+vi.mock('./egress-seat', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./egress-seat')>()),
+  startSeatEgressProxy: vi.fn(
+    (await importOriginal<typeof import('./egress-seat')>()).startSeatEgressProxy
+  ),
 }));
 
 type FakeChild = EventEmitter & {
@@ -271,6 +279,25 @@ describe('runCodexReview — worktree evidence runs under the external sandbox w
     expect(result.timedOut).toBe(false);
     expect(result.stderrTail).toMatch(/^ensemble-ai:/);
     expect(spawned).not.toHaveBeenCalled();
+  });
+
+  // §7: the seat is fenced BY the proxy. If the proxy cannot bind (its port is taken, the process is
+  // out of descriptors), the seat must NOT run in the worktree with the old unrestricted :443 — it
+  // refuses, loudly, and RETRIES_ON_PACKET turns that into a packet fallback one level up.
+  it('fails CLOSED when the egress proxy cannot start — never spawns an unfenced seat', async () => {
+    if (!codexSandboxSupported()) return;
+    const wt = realWorktree();
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    vi.mocked(startSeatEgressProxy).mockRejectedValueOnce(new Error('listen EADDRINUSE'));
+
+    const result = await runCodexReview('p', CONFIG, { worktree: wt });
+    expect(result.ok).toBe(false);
+    expect(result.raw).toBeNull();
+    expect(result.stderrTail).toContain('egress proxy failed to start');
+    expect(result.stderrTail).toContain('must NOT run in the worktree without one');
+    expect(spawned).not.toHaveBeenCalled();
+    fs.rmSync(wt, { force: true, recursive: true });
   });
 
   it('the packet path is untouched when no worktree is requested', async () => {
