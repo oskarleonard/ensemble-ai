@@ -65,8 +65,8 @@ describe('parseReviewers', () => {
 });
 
 describe('listReviewers', () => {
-  it('returns every registry reviewer in id order (codex, then grok)', () => {
+  it('returns every registry reviewer in id order (codex, grok, claude)', () => {
     // grok always resolves (baked default), independent of the on-disk file.
-    expect(listReviewers().map((r) => r.id)).toEqual(['codex', 'grok']);
+    expect(listReviewers().map((r) => r.id)).toEqual(['codex', 'grok', 'claude']);
   });
 });

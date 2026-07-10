@@ -13,7 +13,7 @@ import {
 import { renderReviewPrompt } from '../../core/prompt';
 import { loadReviewers } from '../../core/reviewers';
 import {
-  REVIEWER_IDS,
+  CORE_REVIEWER_IDS,
   type ReviewerConfig,
   type ReviewerId,
   type StoredReview,
@@ -208,7 +208,7 @@ export async function runReviewMode(
   const reviewers =
     opts.reviewers && opts.reviewers.length > 0
       ? opts.reviewers
-      : [...REVIEWER_IDS];
+      : [...CORE_REVIEWER_IDS];
 
   const sourceLabel = opts.diffText !== undefined
     ? (opts.diffMode ?? 'raw')

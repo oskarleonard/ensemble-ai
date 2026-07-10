@@ -33,6 +33,18 @@ export const REVIEWER_DEFAULTS: Record<ReviewerId, ReviewerConfig> = {
     sandbox: 'ensemble-review',
     vendor: 'xai',
   },
+  // Claude (Anthropic) — the capability-fenced peer (spec 2026-07-09 §3's ONE
+  // Claude producer, as a registry seat; fence in modes/review/claude.ts). Default
+  // matches the CLI claude layer's bar: opus @ max. It is the one EFFORT-ELASTIC
+  // seat (it rides the operator's own Anthropic subscription — consumers may step
+  // its effort down per diff); the vendor seats above stay at vendor-max always.
+  claude: {
+    cmd: 'claude',
+    effort: 'max',
+    id: 'claude',
+    model: 'opus',
+    vendor: 'anthropic',
+  },
 };
 
 function str(v: unknown, fallback: string): string {

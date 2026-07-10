@@ -464,3 +464,22 @@ describe('REVIEW-ONLY — the layer writes ONLY to the trail dir', () => {
     expect(fs.readdirSync(base)).toEqual([path.basename(trail)]);
   });
 });
+
+// claude joined REVIEWER_IDS (the registry, for library consumers) — these pin that the
+// CLI pipeline's roster semantics did NOT move with it (the double-claude fence).
+describe('roster · claude in REVIEWER_IDS never leaks into the CLI core', () => {
+  it('default roster core stays the cross-vendor pair', () => {
+    const r = resolveReviewRoster(undefined, false);
+    expect(r).toEqual({ claude: true, core: ['codex', 'grok'] });
+  });
+
+  it("an explicit ['codex','claude'] request runs claude ONCE (layer), never as core", () => {
+    const r = resolveReviewRoster(['codex', 'claude'], false);
+    expect(r).toEqual({ claude: true, core: ['codex'] });
+  });
+
+  it("a claude-only request still fails closed (no cross-vendor core)", () => {
+    const r = resolveReviewRoster(['claude'], false);
+    expect('error' in r && r.error).toMatch(/at least one cross-vendor/);
+  });
+});

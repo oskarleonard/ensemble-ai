@@ -55,7 +55,12 @@ const CODEX_EGRESS_HOSTS = [
 // is slow — a hung grok seat is the signal to re-probe this list.
 const GROK_EGRESS_HOSTS = ['cli-chat-proxy.grok.com'] as const;
 
+// claude — NO egress proxy is ever started for this seat: its fence removes the
+// network tools themselves (WebFetch/WebSearch/Bash gone, --strict-mcp-config), so
+// there is no channel to allowlist. The entry exists because this Record is
+// exhaustive by design; empty means "if a proxy were ever started, allow nothing".
 export const VENDOR_EGRESS_HOSTS: Record<ReviewerId, readonly string[]> = {
+  claude: [],
   codex: CODEX_EGRESS_HOSTS,
   grok: GROK_EGRESS_HOSTS,
 };

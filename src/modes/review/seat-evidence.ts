@@ -120,6 +120,10 @@ export const SEAT_QUALIFIERS: Record<
   ReviewerId,
   (args: { config: ReviewerConfig; worktree: string }) => SeatQualification
 > = {
+  // The Anthropic registry seat qualifies exactly like the CLI's claude layer:
+  // the capability fence (tools removed, strict MCP, neutral cwd, $HOME
+  // read-denied) is CLI-flag-based — no kernel wrapper, no platform dependency.
+  claude: () => qualifyHarnessSeat(),
   codex: ({ worktree }) => qualifyCodexSeat(worktree),
   grok: ({ config }) => qualifyGrokSeat(config.sandbox),
 };

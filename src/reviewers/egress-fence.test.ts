@@ -109,6 +109,6 @@ describe('the egress allowlist is per-vendor config, never a global constant', (
 
   // EXHAUSTIVE over ReviewerId, like SEAT_QUALIFIERS: a new vendor cannot inherit another's hosts.
   it('covers every reviewer id', () => {
-    expect(Object.keys(VENDOR_EGRESS_HOSTS).sort()).toEqual(['codex', 'grok']);
+    expect(Object.keys(VENDOR_EGRESS_HOSTS).sort()).toEqual(['claude', 'codex', 'grok']);
   });
 });
