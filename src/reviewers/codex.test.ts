@@ -147,6 +147,15 @@ describe('runCodexReview', () => {
 describe('runCodexReview — worktree evidence runs under the external sandbox wrapper', () => {
   const realWorktree = (): string => fs.mkdtempSync(path.join(os.tmpdir(), 'codex-wt-'));
 
+  // `spawn` is MOCKED, so runReviewerExec's promise never settles and the `.finally(cleanup)` in
+  // runCodexWorktreeReview never fires. The two owner-only temp dirs the call created (the sandbox
+  // profile, and the seat's reply dir) are the test's to reap, or every run strands a pair.
+  const reapSpawnDirs = (args: string[]): void => {
+    for (const file of [args[1], args[args.indexOf('-o') + 1]]) {
+      fs.rmSync(path.dirname(file), { force: true, recursive: true });
+    }
+  };
+
   it('wraps codex in sandbox-exec, disables its internal sandbox, and cds into the worktree', async () => {
     if (!codexSandboxSupported()) return; // Seatbelt is macOS-only; the fallback is asserted below
     const wt = realWorktree();
@@ -165,6 +174,7 @@ describe('runCodexReview — worktree evidence runs under the external sandbox w
     expect(args).not.toContain('read-only');
     // cwd = the worktree, so codex's file tools reach the project. Seatbelt matches resolved paths.
     expect(fs.realpathSync(String(lastOpts.cwd))).toBe(fs.realpathSync(wt));
+    reapSpawnDirs(args);
     fs.rmSync(wt, { force: true, recursive: true });
   });
 
@@ -185,9 +195,8 @@ describe('runCodexReview — worktree evidence runs under the external sandbox w
     expect(outFile.startsWith('/private/tmp/')).toBe(true);
     expect(outFile.startsWith(fs.realpathSync(os.tmpdir()))).toBe(false);
     // Owner-only, because /private/tmp is world-shared.
-    const dir = path.dirname(outFile);
-    expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
-    fs.rmSync(dir, { force: true, recursive: true });
+    expect(fs.statSync(path.dirname(outFile)).mode & 0o777).toBe(0o700);
+    reapSpawnDirs(args);
     fs.rmSync(wt, { force: true, recursive: true });
   });
 
