@@ -1,11 +1,17 @@
+import type { EgressDenial } from '../../core/egress-proxy';
 import type { ReviewerConfig, ReviewerId } from '../../core/types';
 import {
   CODEX_SANDBOX_PROFILE,
   codexSandboxSupported,
   defaultCodexSandboxPaths,
+  QUALIFY_PROBE_PORT,
   renderCodexSandboxProfile,
 } from '../../reviewers/codex-sandbox';
-import { GROK_SANDBOX_PROFILE, resolveReviewSandbox } from '../../reviewers/grok';
+import {
+  GROK_CLI_SANDBOX,
+  GROK_SANDBOX_PROFILE,
+  resolveReviewSandbox,
+} from '../../reviewers/grok';
 
 import { CLAUDE_CAPABILITY_FENCE } from './claude';
 import type {
@@ -66,7 +72,10 @@ export function qualifyCodexSeat(
     };
   }
   try {
-    renderCodexSandboxProfile(defaultCodexSandboxPaths(worktree));
+    // A DRY RUN over the read roots. The real proxy port is bound at spawn (it is ephemeral, per
+    // run), so qualification renders against QUALIFY_PROBE_PORT — the port never affects whether the
+    // read roots are safe, which is the only question this check answers.
+    renderCodexSandboxProfile(defaultCodexSandboxPaths(worktree, QUALIFY_PROBE_PORT));
   } catch (e) {
     return { profile, qualified: false, reason: `codex: ${(e as Error).message}` };
   }
@@ -80,11 +89,13 @@ export function qualifyCodexSeat(
 export function qualifyGrokSeat(configuredSandbox?: string): SeatQualification {
   const profile = GROK_SANDBOX_PROFILE;
   const resolved = resolveReviewSandbox(configuredSandbox);
-  if (resolved !== profile.id) {
+  // Compared against the CLI sandbox NAME, not the receipt's profile id: since codex-f3 the id also
+  // names the egress fence (`+egress-proxy`), which grok's own sandbox schema cannot express.
+  if (resolved !== GROK_CLI_SANDBOX) {
     return {
       profile,
       qualified: false,
-      reason: `grok: resolved to the "${resolved}" sandbox, but worktree access is only qualified under "${profile.id}" (the profile whose id+version the receipt attests). The seat keeps the packet.`,
+      reason: `grok: resolved to the "${resolved}" sandbox, but worktree access is only qualified under "${GROK_CLI_SANDBOX}" (the profile whose id+version the receipt attests). The seat keeps the packet.`,
     };
   }
   return { profile, qualified: true, reason: null };
@@ -172,10 +183,25 @@ Anchor every finding at file:line as it exists at ${args.headSha}.`;
 
 // The one-line evidence statement for the posted review's footer + the receipt reader. A run where
 // any seat fell back is NEVER rendered as a full-worktree run.
-export function formatEvidenceFooter(realized: EvidenceMap): string {
+//
+// EGRESS DENIALS RIDE THE FOOTER (codex-f3, §6). A seat that tried to reach a host outside its
+// vendor allowlist is the exact event this fence exists to catch, and burying it in a run artifact
+// nobody opens would make the fence silent. Hosts are DEDUPED and NAMED — a retry storm against one
+// host is one fact, not forty.
+export function formatEvidenceFooter(
+  realized: EvidenceMap,
+  egressDenials: readonly EgressDenial[] = []
+): string {
   const seats = Object.entries(realized) as [EvidenceSeat, EvidenceClass][];
   if (seats.length === 0) return '';
   const parts = seats.map(([seat, cls]) => `${seat} ${cls}`);
   const degraded = seats.some(([, cls]) => cls === 'packet');
-  return `evidence: ${parts.join(' · ')}${degraded ? ' (DEGRADED — a seat fell back to the diff-only packet)' : ''}`;
+  const line = `evidence: ${parts.join(' · ')}${degraded ? ' (DEGRADED — a seat fell back to the diff-only packet)' : ''}`;
+  return egressDenials.length === 0 ? line : `${line}\n${formatEgressDenials(egressDenials)}`;
+}
+
+// PURE: the denial line. Exported so the artifact writer and the footer say the same thing.
+export function formatEgressDenials(denials: readonly EgressDenial[]): string {
+  const hosts = [...new Set(denials.map((d) => d.host))].sort();
+  return `egress fence: ${denials.length} connection(s) DENIED to ${hosts.length} host(s) outside the vendor allowlist — ${hosts.join(', ')}. A seat reached for a host it is not permitted to reach; review the run's egress-denials.json.`;
 }

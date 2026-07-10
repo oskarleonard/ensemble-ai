@@ -1467,7 +1467,9 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   }
   // The one honest evidence line for the posted review's footer (§8: any fallback surfaces in the
   // receipt AND the footer, never silently). Null in packet mode — nothing new to say.
-  const evidenceNote = worktree ? formatEvidenceFooter(realizedEvidence) : null;
+  const evidenceNote = worktree
+    ? formatEvidenceFooter(realizedEvidence, result.evidence?.egressDenials ?? [])
+    : null;
 
   // Persist the receipt ONLY after the full expected roster ran (fail-loud parity with the
   // exit gate): the codex/grok core qualified a candidate, but when the default-on Opus

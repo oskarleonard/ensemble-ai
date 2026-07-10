@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import type { HistoryPacketFile } from '../modes/review/history-packet';
+import { type EgressDenial, type EgressProxy, proxyEnv } from '../core/egress-proxy';
 import { resolveCodexBin, runReviewerExec } from '../core/spawn';
 import type { ReviewerConfig } from '../core/types';
 
@@ -14,6 +15,7 @@ import {
   wrapWithSandbox,
   writeCodexSandboxProfile,
 } from './codex-sandbox';
+import { egressStartFailure, startSeatEgressProxy } from './egress-seat';
 
 // A code review at xhigh reasoning is far slower than a chat turn — give the
 // reviewer real time, but ALWAYS under a watchdog. The lived 40-min 0%-CPU wedge
@@ -21,6 +23,11 @@ import {
 export const REVIEW_TIMEOUT_MS = 720_000; // 12 min
 
 export interface CodexReviewResult {
+  // Every connection the run's egress proxy REFUSED (codex-f3). Absent on a packet-mode run, which
+  // has no proxy. Empty on a clean worktree run. Non-empty means this seat tried to reach a host
+  // outside its vendor allowlist — which, under a prompt-injectable shell, is the signal the fence
+  // exists to catch. LOUD by contract: stderr at denial time, the run artifact, the posted footer.
+  egressDenials?: readonly EgressDenial[];
   ok: boolean;
   raw: string | null; // the reviewer's full reply (read from the -o file)
   stderrTail: string;
@@ -133,7 +140,7 @@ function refuseWorktree(message: string): Promise<CodexReviewResult> {
 // The VIABILITY CHECK (§9 grok-f2) is this call itself: it exercises the real subprocess/pty
 // spawn with the real review prompt under the real profile, not a `--version` smoke. If codex
 // cannot function inside the wrapper, this run produces no reply and the caller falls back.
-function runCodexWorktreeReview(
+async function runCodexWorktreeReview(
   prompt: string,
   config: ReviewerConfig,
   worktree: string,
@@ -144,22 +151,33 @@ function runCodexWorktreeReview(
       `ensemble-ai: the codex seat cannot take the worktree on ${process.platform} — its sandbox-exec wrapper is macOS-only, and codex's own \`-s read-only\` restricts writes, not reads.`
     );
   }
-  // Resolve the binary BEFORE anything acquires a temp dir: resolveCodexBin THROWS when codex is
-  // not installed, and a throw after writeCodexSandboxProfile would strand its owner-only dir —
-  // mkdtemp names are random, so a leaked one is unfindable and nothing can ever clean it up.
+  // Resolve the binary BEFORE anything acquires a temp dir or a socket: resolveCodexBin THROWS when
+  // codex is not installed, and a throw after writeCodexSandboxProfile would strand its owner-only
+  // dir — mkdtemp names are random, so a leaked one is unfindable and nothing can ever clean it up.
   let bin: string;
   try {
     bin = resolveCodexBin();
   } catch (e) {
     return refuseWorktree(`ensemble-ai: ${(e as Error).message}`);
   }
+  // THE FENCE (codex-f3). It binds BEFORE the profile is rendered, because the profile's only
+  // egress rule is this proxy's port. A proxy that cannot start means NO qualifying fence, and a
+  // seat with no fence does not run in the worktree — it refuses, LOUDLY, and the caller falls back
+  // to the packet (§7). It never spawns a bypassed codex with unrestricted :443.
+  let proxy: EgressProxy;
+  try {
+    proxy = await startSeatEgressProxy('codex');
+  } catch (e) {
+    return refuseWorktree(egressStartFailure('codex', e));
+  }
   let profile: ReturnType<typeof writeCodexSandboxProfile> | undefined;
   let reply: ReturnType<typeof worktreeReplyFile>;
   try {
-    profile = writeCodexSandboxProfile(defaultCodexSandboxPaths(worktree));
+    profile = writeCodexSandboxProfile(defaultCodexSandboxPaths(worktree, proxy.port));
     reply = worktreeReplyFile();
   } catch (e) {
     profile?.cleanup();
+    proxy.close();
     return refuseWorktree(`ensemble-ai: ${(e as Error).message}`);
   }
   const wrapped = wrapWithSandbox(
@@ -167,25 +185,35 @@ function runCodexWorktreeReview(
     bin,
     buildCodexWorktreeArgs(config, reply.file, prompt)
   );
-  // Both temp dirs (the profile sandbox-exec reads, and the reply the SEAT writes) are ours to
-  // reap. `finally` on the promise (not the caller) because the dir names are random — a leaked
-  // one is unfindable. A synchronous throw from runReviewerExec is caught too.
+  // Both temp dirs (the profile sandbox-exec reads, and the reply the SEAT writes) and the proxy
+  // socket are ours to reap. `finally` on the promise (not the caller) because the dir names are
+  // random — a leaked one is unfindable. A synchronous throw from runReviewerExec is caught too.
   const cleanup = (): void => {
     profile.cleanup();
     reply.cleanup();
+    proxy.close();
   };
   try {
-    return runReviewerExec({
+    return await runReviewerExec({
       args: wrapped.args,
       bin: wrapped.bin,
       // The seat BORROWS the worktree (one per run, shared by every seat). It never reaps it.
       cwd: worktree,
+      // The seat's ONLY route off the machine. Its Seatbelt profile denies every other outbound.
+      env: proxyEnv(proxy.url),
       onSpawn: opts.onSpawn,
       outFile: reply.file,
       stderrLimit: 2000,
       timeoutMs: opts.timeoutMs ?? REVIEW_TIMEOUT_MS,
     })
-      .then(({ raw, stderrTail, timedOut }) => ({ ok: raw !== null, raw, stderrTail, timedOut }))
+      .then(({ raw, stderrTail, timedOut }) => ({
+        // Snapshot the denials before cleanup: they are what the artifact and the footer report.
+        egressDenials: [...proxy.denials],
+        ok: raw !== null,
+        raw,
+        stderrTail,
+        timedOut,
+      }))
       .finally(cleanup);
   } catch (e) {
     cleanup();

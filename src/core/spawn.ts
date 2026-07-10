@@ -98,6 +98,13 @@ export interface ReviewerExecOpts {
    * BORROWED, never owned — one worktree per run, shared by every seat, reaped by the run.
    */
   cwd?: string;
+  /**
+   * Extra env for the child, merged OVER `process.env`. A fenced seat passes the egress proxy's
+   * `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (+ an empty `NO_PROXY`) here — merging over the parent
+   * env is what lets `NO_PROXY: ''` OVERRIDE an operator's inherited `NO_PROXY=*`, which would
+   * otherwise let the seat bypass the proxy for exactly the hosts it most wants to reach.
+   */
+  env?: Record<string, string>;
   /** Receives the kill handle so a caller (e.g. a cancel) can abort the child. */
   onSpawn?: (kill: () => void) => void;
   /** The -o tempfile the reply is read from, then unlinked. Required for 'outfile'. */
@@ -143,6 +150,7 @@ export function runReviewerExec(
     const child = spawn(bin, args, {
       cwd: opts.cwd ?? os.tmpdir(),
       detached: true,
+      ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
       // stdout is piped ONLY when we read the reply from it (grok); codex keeps
       // it 'ignore' (its reply is the -o file) exactly as the proven path did.
       stdio: ['ignore', capture === 'stdout' ? 'pipe' : 'ignore', 'pipe'],

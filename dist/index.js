@@ -868,6 +868,7 @@ function runReviewerExec(opts) {
     const child = spawn(bin, args, {
       cwd: opts.cwd ?? os2.tmpdir(),
       detached: true,
+      ...opts.env ? { env: { ...process.env, ...opts.env } } : {},
       // stdout is piped ONLY when we read the reply from it (grok); codex keeps
       // it 'ignore' (its reply is the -o file) exactly as the proven path did.
       stdio: ["ignore", capture === "stdout" ? "pipe" : "ignore", "pipe"]
@@ -938,12 +939,127 @@ import fs7 from "fs";
 import os4 from "os";
 import path5 from "path";
 
+// src/core/egress-proxy.ts
+import http from "http";
+import net from "net";
+var BIND_HOST = "127.0.0.1";
+var DEFAULT_CONNECT_PORTS = [443];
+function isHostAllowed(host, allowHosts) {
+  const normalized = normalizeHost(host);
+  if (!normalized) return false;
+  return allowHosts.some((h) => normalizeHost(h) === normalized);
+}
+function normalizeHost(host) {
+  const trimmed = host.trim().toLowerCase();
+  const unbracketed = trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
+  return unbracketed.endsWith(".") ? unbracketed.slice(0, -1) : unbracketed;
+}
+function parseAuthority(authority) {
+  const idx = authority.lastIndexOf(":");
+  if (idx <= 0) return null;
+  const host = authority.slice(0, idx);
+  const port = Number(authority.slice(idx + 1));
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { host, port };
+}
+function proxyEnv(url) {
+  return {
+    ALL_PROXY: url,
+    all_proxy: url,
+    HTTP_PROXY: url,
+    http_proxy: url,
+    HTTPS_PROXY: url,
+    https_proxy: url,
+    NO_PROXY: "",
+    no_proxy: ""
+  };
+}
+function startEgressProxy(opts) {
+  const denials = [];
+  const sockets = /* @__PURE__ */ new Set();
+  const allowPorts = opts.allowPorts ?? DEFAULT_CONNECT_PORTS;
+  const deny = (denial) => {
+    denials.push(denial);
+    opts.onDenial?.(denial);
+  };
+  const server = http.createServer((req, res) => {
+    const host = normalizeHost((req.headers.host ?? "").split(":")[0] ?? "");
+    deny({
+      host: host || "unknown",
+      method: req.method ?? "UNKNOWN",
+      port: 0,
+      reason: "plaintext HTTP through the proxy is refused \u2014 the fence tunnels TLS only"
+    });
+    res.writeHead(403, { "content-type": "text/plain" });
+    res.end("ensemble-ai egress fence: plaintext HTTP is refused\n");
+  });
+  server.on("connect", (req, clientSocket, head) => {
+    sockets.add(clientSocket);
+    clientSocket.on("close", () => sockets.delete(clientSocket));
+    clientSocket.on("error", () => clientSocket.destroy());
+    const target = parseAuthority(req.url ?? "");
+    if (!target) {
+      deny({ host: req.url ?? "unknown", method: "CONNECT", port: 0, reason: "unparseable CONNECT authority" });
+      refuse(clientSocket);
+      return;
+    }
+    if (!allowPorts.includes(target.port)) {
+      deny({ ...target, method: "CONNECT", reason: `port ${target.port} is not ${allowPorts.join("/")}` });
+      refuse(clientSocket);
+      return;
+    }
+    if (!isHostAllowed(target.host, opts.allowHosts)) {
+      deny({ ...target, method: "CONNECT", reason: "host is not on this vendor's egress allowlist" });
+      refuse(clientSocket);
+      return;
+    }
+    tunnel(clientSocket, head, target, sockets);
+  });
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(opts.port ?? 0, BIND_HOST, () => {
+      server.removeListener("error", reject);
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      resolve({
+        allowHosts: opts.allowHosts,
+        close: () => {
+          for (const s of sockets) s.destroy();
+          sockets.clear();
+          server.close();
+        },
+        denials,
+        port,
+        url: `http://${BIND_HOST}:${port}`
+      });
+    });
+  });
+}
+function refuse(clientSocket) {
+  clientSocket.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+function tunnel(clientSocket, head, target, sockets) {
+  const upstream = net.connect(target.port, target.host, () => {
+    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    upstream.write(head);
+    upstream.pipe(clientSocket);
+    clientSocket.pipe(upstream);
+  });
+  sockets.add(upstream);
+  upstream.on("close", () => sockets.delete(upstream));
+  upstream.on("error", () => {
+    upstream.destroy();
+    clientSocket.destroy();
+  });
+  clientSocket.on("error", () => upstream.destroy());
+}
+
 // src/reviewers/codex-sandbox.ts
 import fs6 from "fs";
 import os3 from "os";
 import path4 from "path";
 var CODEX_SANDBOX_PROFILE = {
-  id: "ensemble-review-codex",
+  id: "ensemble-review-codex+egress-proxy",
   version: 1
 };
 var SANDBOX_WRITABLE_TMP = "/private/tmp";
@@ -980,6 +1096,11 @@ function renderCodexSandboxProfile(p) {
       );
     }
   }
+  if (!Number.isInteger(p.proxyPort) || p.proxyPort < 1 || p.proxyPort > 65535) {
+    throw new Error(
+      `ensemble-ai: refusing to build the codex sandbox profile \u2014 proxyPort ${String(p.proxyPort)} is not a valid TCP port. The seat's only egress route is that loopback port; without it the profile would fence nothing. The codex seat must fall back to the packet.`
+    );
+  }
   return `(version 1)
 ;; ensemble-review-codex v${CODEX_SANDBOX_PROFILE.version} \u2014 generated by ensemble-ai. Do not hand-edit.
 ;; Deny-by-default. The codex seat may read the PR worktree, its own auth, and the system roots.
@@ -989,9 +1110,10 @@ function renderCodexSandboxProfile(p) {
 ;;     ("sh <worktree>/x.sh"). The write/secret/network fences are the real boundary.
 ;;   \xB7 /private/var is readable and contains the per-user $TMPDIR, so a secret another process
 ;;     parked in its own temp dir IS readable here. The claim is "no credential in $HOME".
-;;   \xB7 network is PORT-scoped, not per-host, and not 443-only: outbound 443 AND 53 (DNS) AND
-;;     unix sockets; inbound any local port. Port 53 is a usable exfiltration channel.
-;;     Seatbelt cannot express a per-host DNS allowlist; a real fence needs an egress proxy.
+;;   \xB7 outbound network is DENIED except the one loopback port below \u2014 the engine's egress proxy,
+;;     which allows CONNECT only to this vendor's host allowlist. Direct :443 and :53 (the old
+;;     DNS-exfiltration channel) are gone. The seat still sends its own credential to the ALLOWED
+;;     vendor host, and hostname resolution still works via mDNSResponder \u2014 neither is closable here.
 (deny default)
 (import "/System/Library/Sandbox/Profiles/bsd.sb")
 (allow process-fork)
@@ -1011,16 +1133,18 @@ function renderCodexSandboxProfile(p) {
 (allow file-read* (subpath ${JSON.stringify(p.worktree)}))
 (allow file-read* (subpath ${JSON.stringify(p.codexHome)}))
 (allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath ${JSON.stringify(SANDBOX_WRITABLE_TMP)}) (subpath "/dev"))
-(allow network-outbound (remote ip "*:443") (remote ip "*:53") (remote unix-socket))
+(allow network-outbound (remote ip "localhost:${p.proxyPort}") (remote unix-socket))
 (allow network-inbound (local ip "*:*"))
 `;
 }
 function codexSandboxSupported(platform = process.platform) {
   return platform === "darwin" && fs6.existsSync("/usr/bin/sandbox-exec");
 }
-function defaultCodexSandboxPaths(worktree) {
+var QUALIFY_PROBE_PORT = 1;
+function defaultCodexSandboxPaths(worktree, proxyPort) {
   return {
     codexHome: path4.join(os3.homedir(), ".codex"),
+    proxyPort,
     // process.execPath is <prefix>/bin/node → <prefix> covers node AND the codex install that
     // sits beside it in the same nvm/npm prefix. This is only as narrow as the user's install
     // layout: `/bin/node` ⇒ `/` and `~/bin/node` ⇒ `$HOME`. renderCodexSandboxProfile REJECTS
@@ -1067,6 +1191,38 @@ function buildCodexWorktreeArgs(config, outFile, prompt) {
   ];
 }
 
+// src/reviewers/egress-hosts.ts
+var CODEX_EGRESS_HOSTS = [
+  "ab.chatgpt.com",
+  "api.openai.com",
+  "auth.openai.com",
+  "chatgpt.com"
+];
+var GROK_EGRESS_HOSTS = ["cli-chat-proxy.grok.com"];
+var VENDOR_EGRESS_HOSTS = {
+  codex: CODEX_EGRESS_HOSTS,
+  grok: GROK_EGRESS_HOSTS
+};
+function egressHostsFor(id) {
+  return VENDOR_EGRESS_HOSTS[id];
+}
+
+// src/reviewers/egress-seat.ts
+function startSeatEgressProxy(id) {
+  return startEgressProxy({
+    allowHosts: egressHostsFor(id),
+    onDenial: (d) => {
+      process.stderr.write(
+        `\u26A0 ensemble-ai egress fence: DENIED ${id} \u2192 ${d.method} ${d.host}:${d.port} \u2014 ${d.reason}
+`
+      );
+    }
+  });
+}
+function egressStartFailure(id, err) {
+  return `ensemble-ai: the ${id} seat cannot take the worktree \u2014 its egress proxy failed to start (${err.message}). The seat is fenced by that proxy, so it must NOT run in the worktree without one.`;
+}
+
 // src/reviewers/codex.ts
 var REVIEW_TIMEOUT_MS = 72e4;
 function buildCodexReviewArgs(config, outFile, prompt) {
@@ -1109,7 +1265,7 @@ function worktreeReplyFile() {
 function refuseWorktree(message) {
   return Promise.resolve({ ok: false, raw: null, stderrTail: message, timedOut: false });
 }
-function runCodexWorktreeReview(prompt, config, worktree, opts) {
+async function runCodexWorktreeReview(prompt, config, worktree, opts) {
   if (!codexSandboxSupported()) {
     return refuseWorktree(
       `ensemble-ai: the codex seat cannot take the worktree on ${process.platform} \u2014 its sandbox-exec wrapper is macOS-only, and codex's own \`-s read-only\` restricts writes, not reads.`
@@ -1121,13 +1277,20 @@ function runCodexWorktreeReview(prompt, config, worktree, opts) {
   } catch (e) {
     return refuseWorktree(`ensemble-ai: ${e.message}`);
   }
+  let proxy;
+  try {
+    proxy = await startSeatEgressProxy("codex");
+  } catch (e) {
+    return refuseWorktree(egressStartFailure("codex", e));
+  }
   let profile;
   let reply;
   try {
-    profile = writeCodexSandboxProfile(defaultCodexSandboxPaths(worktree));
+    profile = writeCodexSandboxProfile(defaultCodexSandboxPaths(worktree, proxy.port));
     reply = worktreeReplyFile();
   } catch (e) {
     profile?.cleanup();
+    proxy.close();
     return refuseWorktree(`ensemble-ai: ${e.message}`);
   }
   const wrapped = wrapWithSandbox(
@@ -1138,18 +1301,28 @@ function runCodexWorktreeReview(prompt, config, worktree, opts) {
   const cleanup = () => {
     profile.cleanup();
     reply.cleanup();
+    proxy.close();
   };
   try {
-    return runReviewerExec({
+    return await runReviewerExec({
       args: wrapped.args,
       bin: wrapped.bin,
       // The seat BORROWS the worktree (one per run, shared by every seat). It never reaps it.
       cwd: worktree,
+      // The seat's ONLY route off the machine. Its Seatbelt profile denies every other outbound.
+      env: proxyEnv(proxy.url),
       onSpawn: opts.onSpawn,
       outFile: reply.file,
       stderrLimit: 2e3,
       timeoutMs: opts.timeoutMs ?? REVIEW_TIMEOUT_MS
-    }).then(({ raw, stderrTail, timedOut }) => ({ ok: raw !== null, raw, stderrTail, timedOut })).finally(cleanup);
+    }).then(({ raw, stderrTail, timedOut }) => ({
+      // Snapshot the denials before cleanup: they are what the artifact and the footer report.
+      egressDenials: [...proxy.denials],
+      ok: raw !== null,
+      raw,
+      stderrTail,
+      timedOut
+    })).finally(cleanup);
   } catch (e) {
     cleanup();
     throw e;
@@ -1237,7 +1410,11 @@ ${REVIEW_PROFILE}` : REVIEW_PROFILE);
   } catch {
   }
 }
-var GROK_SANDBOX_PROFILE = { id: REVIEW_PROFILE_NAME, version: 1 };
+var GROK_CLI_SANDBOX = REVIEW_PROFILE_NAME;
+var GROK_SANDBOX_PROFILE = {
+  id: `${REVIEW_PROFILE_NAME}+egress-proxy`,
+  version: 1
+};
 function buildGrokReviewArgs(config, prompt, cwd) {
   return [
     "-p",
@@ -1267,17 +1444,25 @@ function extractGrokText(stdout) {
   const trimmed = stdout.trim();
   return trimmed || null;
 }
-function runGrokReview(prompt, config, opts = {}) {
+async function runGrokReview(prompt, config, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const sandbox = resolveReviewSandbox(config.sandbox);
   const worktreeCwd = opts.worktree;
-  if (worktreeCwd && sandbox !== GROK_SANDBOX_PROFILE.id) {
-    return Promise.resolve({
+  if (worktreeCwd && sandbox !== GROK_CLI_SANDBOX) {
+    return {
       ok: false,
       raw: null,
-      stderrTail: `ensemble-ai: refusing worktree evidence for the grok seat \u2014 it resolved to the "${sandbox}" sandbox, but worktree access is only qualified under "${GROK_SANDBOX_PROFILE.id}" (the profile whose id+version the receipt attests). Configure that sandbox, or run this seat on the packet.`,
+      stderrTail: `ensemble-ai: refusing worktree evidence for the grok seat \u2014 it resolved to the "${sandbox}" sandbox, but worktree access is only qualified under "${GROK_CLI_SANDBOX}" (the profile whose id+version the receipt attests). Configure that sandbox, or run this seat on the packet.`,
       timedOut: false
-    });
+    };
+  }
+  let proxy;
+  if (worktreeCwd) {
+    try {
+      proxy = await startSeatEgressProxy("grok");
+    } catch (e) {
+      return { ok: false, raw: null, stderrTail: egressStartFailure("grok", e), timedOut: false };
+    }
   }
   ensureSandboxProfile(sandbox);
   const cwd = worktreeCwd ?? fs8.mkdtempSync(path6.join(os5.tmpdir(), "grok-review-"));
@@ -1285,16 +1470,25 @@ function runGrokReview(prompt, config, opts = {}) {
     args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
     bin: resolveGrokBin(),
     capture: "stdout",
+    ...proxy ? { env: proxyEnv(proxy.url) } : {},
     onSpawn: opts.onSpawn,
     stderrLimit: 2e3,
     timeoutMs
   }).then(({ raw, stderrTail, timedOut }) => {
+    const egressDenials = proxy ? [...proxy.denials] : void 0;
+    proxy?.close();
     try {
       if (!worktreeCwd) fs8.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
     const text = raw ? extractGrokText(raw) : null;
-    return { ok: text !== null, raw: text, stderrTail, timedOut };
+    return {
+      ...egressDenials ? { egressDenials } : {},
+      ok: text !== null,
+      raw: text,
+      stderrTail,
+      timedOut
+    };
   });
 }
 
@@ -2815,7 +3009,7 @@ function qualifyCodexSeat(worktree, deps = {}) {
     };
   }
   try {
-    renderCodexSandboxProfile(defaultCodexSandboxPaths(worktree));
+    renderCodexSandboxProfile(defaultCodexSandboxPaths(worktree, QUALIFY_PROBE_PORT));
   } catch (e) {
     return { profile, qualified: false, reason: `codex: ${e.message}` };
   }
@@ -2824,11 +3018,11 @@ function qualifyCodexSeat(worktree, deps = {}) {
 function qualifyGrokSeat(configuredSandbox) {
   const profile = GROK_SANDBOX_PROFILE;
   const resolved = resolveReviewSandbox(configuredSandbox);
-  if (resolved !== profile.id) {
+  if (resolved !== GROK_CLI_SANDBOX) {
     return {
       profile,
       qualified: false,
-      reason: `grok: resolved to the "${resolved}" sandbox, but worktree access is only qualified under "${profile.id}" (the profile whose id+version the receipt attests). The seat keeps the packet.`
+      reason: `grok: resolved to the "${resolved}" sandbox, but worktree access is only qualified under "${GROK_CLI_SANDBOX}" (the profile whose id+version the receipt attests). The seat keeps the packet.`
     };
   }
   return { profile, qualified: true, reason: null };
@@ -2896,6 +3090,7 @@ async function runCoreSeat(args) {
   const { log, reviewer } = args;
   if (!args.packetComplete) {
     return {
+      egressDenials: [],
       fallbackReason: null,
       realized: "packet",
       review: persistReview(args.out, {
@@ -2916,6 +3111,8 @@ async function runCoreSeat(args) {
     if (unqualified) log(`  \xB7 \u26A0 ${unqualified}`);
     const result = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
     return {
+      // A packet seat runs unfenced by design — it has no worktree, so no proxy and no denials.
+      egressDenials: [],
       fallbackReason: unqualified,
       realized: "packet",
       review: persistAttempt(args, args.packetPrompt, result)
@@ -2923,17 +3120,21 @@ async function runCoreSeat(args) {
   }
   const first = await adapterOnce(args.adapter, args.worktreePrompt, reviewer, { worktree: wt });
   const review = persistAttempt(args, args.worktreePrompt, first);
+  const egressDenials = first.egressDenials ?? [];
   if (review.terminalState === "reviewed") {
-    return { fallbackReason: null, realized: "worktree", review };
+    return { egressDenials, fallbackReason: null, realized: "worktree", review };
   }
   if (first.timedOut || !args.retryOnPacket) {
-    return { fallbackReason: null, realized: "worktree", review };
+    return { egressDenials, fallbackReason: null, realized: "worktree", review };
   }
   const why = first.stderrTail.trim().slice(0, 300) || "no output";
   const reason = `${reviewer.id}: the worktree seat produced no usable review under its \`${args.qualification.profile.id}\` sandbox (${why}) \u2014 FELL BACK to the diff-only packet. This seat reviewed less than it would have in-project.`;
   log(`  \xB7 \u26A0 ${reason}`);
   const second = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
   return {
+    // The FAILED worktree attempt's denials still count: a seat that reached for a forbidden host
+    // and then fell back must not launder that away with a clean packet re-run.
+    egressDenials,
     fallbackReason: reason,
     realized: "packet",
     review: persistAttempt(args, args.packetPrompt, second)
@@ -3125,11 +3326,20 @@ async function runReviewMode(opts) {
   }) : {};
   const realized = {};
   const fallbacks = [];
+  const egressDenials = [];
   for (const [id, seat] of seatRuns) {
     realized[id] = seat.realized;
     if (seat.fallbackReason) fallbacks.push(seat.fallbackReason);
+    egressDenials.push(...seat.egressDenials);
   }
-  const evidence = { fallbacks, intended, realized, sandboxProfiles };
+  if (egressDenials.length > 0) {
+    log(`  \xB7 \u26A0 egress fence: ${egressDenials.length} connection(s) DENIED`);
+    try {
+      writeTrailFile(opts.out, opts.runId, "egress-denials.json", JSON.stringify(egressDenials, null, 2));
+    } catch {
+    }
+  }
+  const evidence = { egressDenials, fallbacks, intended, realized, sandboxProfiles };
   const built = buildDiffReceipt({
     baseRef: acquired.baseRef,
     baseSha: acquired.baseSha,
@@ -4443,6 +4653,7 @@ export {
   EVIDENCE_MANIFEST_SCHEMA_VERSION,
   EVIDENCE_SEATS,
   FINDINGS_INSTRUCTIONS,
+  GROK_CLI_SANDBOX,
   GROK_SANDBOX_PROFILE,
   HOLISTIC_DEFAULTS,
   HOLISTIC_MIN_ANCHOR_NONWS,
@@ -4455,6 +4666,7 @@ export {
   POLICY_VERSIONS,
   POLICY_VERSION_EVIDENCE,
   POLICY_VERSION_LEGACY,
+  QUALIFY_PROBE_PORT,
   QUALITY_LENS,
   REVIEWERS_FILE,
   REVIEWER_DEFAULTS,

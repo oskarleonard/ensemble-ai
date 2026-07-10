@@ -50,6 +50,7 @@ describe('renderCodexSandboxProfile FAILS CLOSED on an unsafe read root', () => 
   const ok = {
     codexHome: path.join(os.homedir(), '.codex'),
     nodePrefix: '/usr/local',
+    proxyPort: 54321,
     worktree: '/private/tmp/wt',
   };
 
@@ -111,6 +112,7 @@ describe('writeCodexSandboxProfile — the temp dir is the caller\'s to reap, no
   const ok = {
     codexHome: path.join(os.homedir(), '.codex'),
     nodePrefix: '/usr/local',
+    proxyPort: 54321,
     worktree: '/private/tmp/wt',
   };
 
@@ -147,13 +149,13 @@ describe('codexSandboxSupported — Seatbelt is macOS-only, so elsewhere fail cl
 
 describe('defaultCodexSandboxPaths', () => {
   it('realpaths the worktree — Seatbelt matches resolved paths, so /tmp would match nothing', () => {
-    const p = defaultCodexSandboxPaths(os.tmpdir());
+    const p = defaultCodexSandboxPaths(os.tmpdir(), 54321);
     expect(p.worktree).toBe(path.resolve(p.worktree));
     expect(p.worktree.startsWith('/private/') || process.platform !== 'darwin').toBe(true);
   });
 
   it('points codexHome at ~/.codex, never at $HOME', () => {
-    expect(defaultCodexSandboxPaths(os.tmpdir()).codexHome).toBe(
+    expect(defaultCodexSandboxPaths(os.tmpdir(), 54321).codexHome).toBe(
       path.join(os.homedir(), '.codex')
     );
   });

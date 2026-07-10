@@ -7,6 +7,7 @@ import type {
   StoredReview,
   TerminalState,
 } from '../../core/types';
+import type { EgressDenial } from '../../core/egress-proxy';
 import type { CodexReviewResult, RunReviewOpts } from '../../reviewers/codex';
 
 import type { EvidenceClass } from './evidence';
@@ -23,6 +24,9 @@ export type ReviewAdapter = (
 ) => Promise<CodexReviewResult>;
 
 export interface SeatRunResult {
+  // Connections this seat's egress proxy REFUSED (codex-f3). Empty unless the seat ran fenced in
+  // the worktree and reached for a host outside its vendor allowlist. LOUD by contract.
+  egressDenials: readonly EgressDenial[];
   // Why this seat did not get the worktree it was asked for (unqualified sandbox, or a wrapper
   // that provably broke). Null when nothing degraded. LOUD by contract — the caller prints it,
   // the receipt records the weaker realized class, and the posted footer states it.
@@ -107,6 +111,7 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
     // for a change no reviewer ever saw (fail-OPEN). 'failed-reviewer' keeps a blind/empty packet
     // fail-closed.
     return {
+      egressDenials: [],
       fallbackReason: null,
       realized: 'packet',
       review: persistReview(args.out, {
@@ -130,6 +135,8 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
     if (unqualified) log(`  · ⚠ ${unqualified}`);
     const result = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
     return {
+      // A packet seat runs unfenced by design — it has no worktree, so no proxy and no denials.
+      egressDenials: [],
       fallbackReason: unqualified,
       realized: 'packet',
       review: persistAttempt(args, args.packetPrompt, result),
@@ -139,14 +146,15 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   // WORKTREE MODE — the seat runs in the tree, under the profile its qualification named.
   const first = await adapterOnce(args.adapter, args.worktreePrompt, reviewer, { worktree: wt });
   const review = persistAttempt(args, args.worktreePrompt, first);
+  const egressDenials = first.egressDenials ?? [];
   if (review.terminalState === 'reviewed') {
-    return { fallbackReason: null, realized: 'worktree', review };
+    return { egressDenials, fallbackReason: null, realized: 'worktree', review };
   }
   // A TIMEOUT is not a sandbox-viability signal — the seat ran under its profile and simply did not
   // finish. Re-running it on the packet would spend a second full review budget to learn nothing,
   // so the failed seat stands (and, having completed no review, it cannot qualify a receipt).
   if (first.timedOut || !args.retryOnPacket) {
-    return { fallbackReason: null, realized: 'worktree', review };
+    return { egressDenials, fallbackReason: null, realized: 'worktree', review };
   }
   // PROVEN BREAKAGE (§9 grok-f2, spec §2's codex branch): the wrapper's viability check IS this
   // real review run, and it produced nothing usable. Fall back to the packet, LOUDLY — this seat
@@ -157,6 +165,9 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   log(`  · ⚠ ${reason}`);
   const second = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
   return {
+    // The FAILED worktree attempt's denials still count: a seat that reached for a forbidden host
+    // and then fell back must not launder that away with a clean packet re-run.
+    egressDenials,
     fallbackReason: reason,
     realized: 'packet',
     review: persistAttempt(args, args.packetPrompt, second),

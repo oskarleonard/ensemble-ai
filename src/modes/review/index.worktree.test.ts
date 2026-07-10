@@ -216,7 +216,7 @@ describe('packet mode is byte-compatible — worktree mode OFF changes no receip
     const result = await runReviewMode(runOpts({ adapters, reviewers: ['grok'] }));
 
     expect(spawns[0].worktree).toBeUndefined();
-    expect(result.evidence).toEqual({ fallbacks: [], intended: {}, realized: { grok: 'packet' }, sandboxProfiles: {} });
+    expect(result.evidence).toEqual({ egressDenials: [], fallbacks: [], intended: {}, realized: { grok: 'packet' }, sandboxProfiles: {} });
     const receipt = result.receiptCandidate;
     expect(receipt?.policyVersion).toBeUndefined();
     expect(receipt?.intendedEvidence).toBeUndefined();

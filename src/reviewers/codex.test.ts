@@ -39,14 +39,14 @@ type FakeChild = EventEmitter & {
 let child: FakeChild | null = null;
 let lastArgs: string[] = [];
 let lastStdio: unknown[] = [];
-let lastOpts: { cwd?: string; detached?: boolean; stdio: unknown[] } = { stdio: [] };
+let lastOpts: { cwd?: string; detached?: boolean; env?: unknown; stdio: unknown[] } = { stdio: [] };
 
 beforeEach(() => {
   child = null;
   vi.mocked(spawn).mockImplementation(((
     _bin: string,
     args: string[],
-    opts: { cwd?: string; detached?: boolean; stdio: unknown[] }
+    opts: { cwd?: string; detached?: boolean; env?: unknown; stdio: unknown[] }
   ) => {
     const c = new EventEmitter() as FakeChild;
     c.kills = [];
@@ -147,13 +147,15 @@ describe('runCodexReview', () => {
 describe('runCodexReview — worktree evidence runs under the external sandbox wrapper', () => {
   const realWorktree = (): string => fs.mkdtempSync(path.join(os.tmpdir(), 'codex-wt-'));
 
-  // `spawn` is MOCKED, so runReviewerExec's promise never settles and the `.finally(cleanup)` in
-  // runCodexWorktreeReview never fires. The two owner-only temp dirs the call created (the sandbox
-  // profile, and the seat's reply dir) are the test's to reap, or every run strands a pair.
-  const reapSpawnDirs = (args: string[]): void => {
-    for (const file of [args[1], args[args.indexOf('-o') + 1]]) {
-      fs.rmSync(path.dirname(file), { force: true, recursive: true });
-    }
+  // The worktree path is ASYNC since codex-f3 — it awaits its egress proxy's `listen()` before it
+  // spawns. So a test cannot assert on `spawn` synchronously; it waits for the call, asserts, then
+  // settles the fake child so `.finally(cleanup)` reaps the two owner-only temp dirs AND closes the
+  // proxy's listening socket. Leaving the promise pending would strand a listener per test.
+  const spawnedWorktree = async (
+    spawned: ReturnType<typeof vi.mocked<typeof spawn>>
+  ): Promise<[string, string[]]> => {
+    await vi.waitFor(() => expect(spawned).toHaveBeenCalled());
+    return spawned.mock.calls[0] as unknown as [string, string[]];
   };
 
   it('wraps codex in sandbox-exec, disables its internal sandbox, and cds into the worktree', async () => {
@@ -161,10 +163,9 @@ describe('runCodexReview — worktree evidence runs under the external sandbox w
     const wt = realWorktree();
     const spawned = vi.mocked(spawn);
     spawned.mockClear();
-    void runCodexReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt });
+    const run = runCodexReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt });
 
-    expect(spawned).toHaveBeenCalled();
-    const [bin, args] = spawned.mock.calls[0] as unknown as [string, string[]];
+    const [bin, args] = await spawnedWorktree(spawned);
     expect(bin).toBe('/usr/bin/sandbox-exec');
     expect(args[0]).toBe('-f');
     expect(fs.readFileSync(args[1], 'utf8')).toContain('(deny default)');
@@ -174,7 +175,42 @@ describe('runCodexReview — worktree evidence runs under the external sandbox w
     expect(args).not.toContain('read-only');
     // cwd = the worktree, so codex's file tools reach the project. Seatbelt matches resolved paths.
     expect(fs.realpathSync(String(lastOpts.cwd))).toBe(fs.realpathSync(wt));
-    reapSpawnDirs(args);
+    child?.emit('exit');
+    await run;
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  // THE FENCE (codex-f3). The Seatbelt profile's only outbound rule is the egress proxy's loopback
+  // port, and the seat is spawned pointed at that proxy. Both halves must hold together: a profile
+  // pinned to a port the seat is not told to use would hang it; proxy env without the profile rule
+  // would leave the old any-host :443 hole wide open.
+  it('pins the profile to the proxy port and hands the seat the proxy env', async () => {
+    if (!codexSandboxSupported()) return;
+    const wt = realWorktree();
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    const run = runCodexReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt });
+
+    const [, args] = await spawnedWorktree(spawned);
+    const profile = fs.readFileSync(args[1], 'utf8');
+    // Exactly one outbound rule, naming exactly one loopback port. No `*:443`, no `*:53`.
+    const outbound = /\(allow network-outbound \(remote ip "localhost:(\d+)"\) \(remote unix-socket\)\)/.exec(profile);
+    expect(outbound).not.toBeNull();
+    expect(profile).not.toContain('*:443');
+    expect(profile).not.toContain('*:53');
+    const port = Number(outbound?.[1]);
+    expect(port).toBeGreaterThan(0);
+    // …and the seat is told to use exactly that port, for every proxy env var a CLI might read.
+    const env = lastOpts.env as Record<string, string>;
+    const url = `http://127.0.0.1:${port}`;
+    for (const k of ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'all_proxy']) {
+      expect(env[k]).toBe(url);
+    }
+    // NO_PROXY is forced EMPTY — an inherited `NO_PROXY=*` would let the seat bypass the fence.
+    expect(env.NO_PROXY).toBe('');
+    expect(env.no_proxy).toBe('');
+    child?.emit('exit');
+    await run;
     fs.rmSync(wt, { force: true, recursive: true });
   });
 
@@ -183,20 +219,21 @@ describe('runCodexReview — worktree evidence runs under the external sandbox w
   // — readable, NEVER writable — so a reply file there makes codex die on "Failed to write last
   // message file … Operation not permitted" AFTER a full review, and the seat scores
   // failed-reviewer on every single worktree run. Pin the writable root.
-  it('puts the `-o` reply under a writable sandbox root, never the unwritable $TMPDIR', () => {
+  it('puts the `-o` reply under a writable sandbox root, never the unwritable $TMPDIR', async () => {
     if (!codexSandboxSupported()) return;
     const wt = realWorktree();
     const spawned = vi.mocked(spawn);
     spawned.mockClear();
-    void runCodexReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt });
+    const run = runCodexReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt });
 
-    const [, args] = spawned.mock.calls[0] as unknown as [string, string[]];
+    const [, args] = await spawnedWorktree(spawned);
     const outFile = args[args.indexOf('-o') + 1];
     expect(outFile.startsWith('/private/tmp/')).toBe(true);
     expect(outFile.startsWith(fs.realpathSync(os.tmpdir()))).toBe(false);
     // Owner-only, because /private/tmp is world-shared.
     expect(fs.statSync(path.dirname(outFile)).mode & 0o777).toBe(0o700);
-    reapSpawnDirs(args);
+    child?.emit('exit');
+    await run;
     fs.rmSync(wt, { force: true, recursive: true });
   });
 

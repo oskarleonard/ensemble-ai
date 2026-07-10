@@ -1,8 +1,10 @@
+import { writeTrailFile } from '../../core/artifacts';
 import {
   type ConventionManifest,
   type ConventionReader,
   gatherConventions,
 } from '../../core/conventions';
+import type { EgressDenial } from '../../core/egress-proxy';
 import {
   assembleCodePacket,
   PACKET_BUDGETS,
@@ -69,6 +71,10 @@ export interface WorktreeEvidence {
 // identity (spec §8), computed for the CORE seats this mode owns. The caller folds in the
 // Anthropic seats (`claude`, `gate`) it owns.
 export interface ReviewEvidence {
+  // Every connection the run's per-vendor egress proxies REFUSED (codex-f3). Empty on a clean run.
+  // Non-empty means a seat reached for a host outside its allowlist — surfaced on stderr as it
+  // happened, written to `egress-denials.json`, and stated in the posted review's footer.
+  egressDenials: EgressDenial[];
   // Every LOUD per-seat degradation: an unqualified sandbox, or a wrapper that provably broke.
   fallbacks: string[];
   intended: EvidenceMap;
@@ -375,11 +381,24 @@ export async function runReviewMode(
     : {};
   const realized: EvidenceMap = {};
   const fallbacks: string[] = [];
+  const egressDenials: EgressDenial[] = [];
   for (const [id, seat] of seatRuns) {
     realized[id] = seat.realized;
     if (seat.fallbackReason) fallbacks.push(seat.fallbackReason);
+    egressDenials.push(...seat.egressDenials);
   }
-  const evidence: ReviewEvidence = { fallbacks, intended, realized, sandboxProfiles };
+  // THE DENIAL ARTIFACT (codex-f3 §6). Written whenever the fence refused anything, so the run's
+  // trail carries the evidence a footer line can only summarize. Best-effort, like every other trail
+  // write — the denial already reached stderr the instant it happened, and the footer restates it.
+  if (egressDenials.length > 0) {
+    log(`  · ⚠ egress fence: ${egressDenials.length} connection(s) DENIED`);
+    try {
+      writeTrailFile(opts.out, opts.runId, 'egress-denials.json', JSON.stringify(egressDenials, null, 2));
+    } catch {
+      /* trail write is best-effort — stderr + the footer already carry the denial */
+    }
+  }
+  const evidence: ReviewEvidence = { egressDenials, fallbacks, intended, realized, sandboxProfiles };
 
   // Build the content-tied receipt — only when every required reviewer completed
   // AND coverage has no omitted source file (else no receipt; the reason is
