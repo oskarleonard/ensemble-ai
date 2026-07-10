@@ -36,13 +36,43 @@ export function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAN
   return bin === 'ssh' ? `${cmd} -o BatchMode=yes` : null;
 }
 
-function nonInteractiveEnv(): Record<string, string> {
-  const ssh = nonInteractiveSshCommand();
+// `git config core.sshCommand` is the OTHER channel a user configures ssh through, and it is the
+// one a multi-key checkout normally uses (`core.sshCommand = ssh -i ~/.ssh/id_work`). Setting
+// GIT_SSH_COMMAND SILENTLY OVERRIDES it — verified against real git (2026-07-10): with both set,
+// only the env value runs. So injecting our default would drop that `-i <key>`, and a fetch that
+// works by hand would fail `Permission denied (publickey)` and classify as `auth`. Read the
+// effective value for this cwd and hand it to `nonInteractiveSshCommand` exactly like the env form,
+// so a plain `ssh` is extended and a wrapper is left alone.
+//
+// Memoized per cwd: `execGit()` is reused across the whole pre-flight and once per changed file by
+// the history packet — one `git config` probe per directory, not one per git command.
+function effectiveSshCommand(cwd: string | undefined, cache: Map<string, string | undefined>): string | undefined {
+  const key = cwd ?? '';
+  if (cache.has(key)) return cache.get(key);
+  let value = process.env.GIT_SSH_COMMAND?.trim() || undefined;
+  if (!value) {
+    try {
+      value =
+        execFileSync('git', ['config', '--get', 'core.sshCommand'], {
+          cwd,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim() || undefined;
+    } catch {
+      value = undefined; // `git config --get` exits 1 when the key is unset — nothing configured.
+    }
+  }
+  cache.set(key, value);
+  return value;
+}
+
+function nonInteractiveEnv(configuredSsh: string | undefined): Record<string, string> {
+  const ssh = nonInteractiveSshCommand(configuredSsh);
   return {
     GIT_ASKPASS: '',
     GIT_TERMINAL_PROMPT: '0',
     SSH_ASKPASS: '',
-    // Absent ⇒ git inherits the user's own GIT_SSH_COMMAND from process.env, untouched.
+    // Absent ⇒ git resolves ssh itself, from the user's own GIT_SSH_COMMAND or core.sshCommand.
     ...(ssh ? { GIT_SSH_COMMAND: ssh } : {}),
   };
 }
@@ -54,12 +84,17 @@ const GIT_TIMEOUT_MS = 600_000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
 export function execGit(): GitRun {
+  const sshByCwd = new Map<string, string | undefined>();
   return (args, opts) => {
     try {
       const text = execFileSync('git', args, {
         cwd: opts?.cwd,
         encoding: 'utf8',
-        env: { ...process.env, ...nonInteractiveEnv(), ...(opts?.env ?? {}) },
+        env: {
+          ...process.env,
+          ...nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)),
+          ...(opts?.env ?? {}),
+        },
         maxBuffer: GIT_MAX_BUFFER,
         timeout: GIT_TIMEOUT_MS,
       });

@@ -166,7 +166,7 @@ async function runClaudeReviewer(
   worktree?: string,
   // The history packet seeded into this seat's cwd, when one was built (./history-packet).
   historyPacket?: HistoryPacket
-): Promise<{ review: VoiceReview; raw: string | null }> {
+): Promise<{ review: VoiceReview; raw: string | null; spawned: boolean }> {
   let res: VoiceRunResult;
   try {
     res = await run(reviewPrompt, config, {
@@ -175,16 +175,21 @@ async function runClaudeReviewer(
       ...(worktree ? { worktree } : {}),
     });
   } catch (e) {
+    // The spawn itself threw (claude is not installed, or the fence refused an unfenceable read
+    // root) — no seat ever existed, so it read NOTHING. `spawned: false` is what stops the run's
+    // realized evidence from attesting that this seat read the worktree. Same rule as the gate's
+    // `gateSpawned`: a seat that RAN and then timed out or replied unusably DID open the tree.
     log(`  · claude: failed to run — ${(e as Error).message}`);
     return {
       raw: null,
       review: { findings: [], ok: false, summary: `claude did not run: ${(e as Error).message}`, voiceId: 'claude' },
+      spawned: false,
     };
   }
   if (!res.raw || res.timedOut) {
     const why = res.timedOut ? 'timed out' : 'produced no output';
     log(`  · claude: ${why}`);
-    return { raw: res.raw ?? null, review: { findings: [], ok: false, summary: `claude ${why}`, voiceId: 'claude' } };
+    return { raw: res.raw ?? null, review: { findings: [], ok: false, summary: `claude ${why}`, voiceId: 'claude' }, spawned: true };
   }
   const parsed = parseFindings(res.raw);
   if (parsed.parseError) {
@@ -197,10 +202,11 @@ async function runClaudeReviewer(
     return {
       raw: res.raw,
       review: { findings: [], ok: false, summary: `output not parseable (${parsed.parseError})${detail}`, voiceId: 'claude' },
+      spawned: true,
     };
   }
   log(`  · claude: reviewed — ${parsed.findings.length} finding(s)`);
-  return { raw: res.raw, review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: 'claude' } };
+  return { raw: res.raw, review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: 'claude' }, spawned: true };
 }
 
 // ── The whole layer: Opus reviewer + per-reviewer files + the gate ────────────────────
@@ -266,6 +272,13 @@ export interface ClaudeLayerOptions {
 export interface ClaudeLayerResult {
   // The cold Opus review (null when claude is not in the roster).
   claudeReview: VoiceReview | null;
+  // Whether the claude PRODUCER seat actually spawned (see GateRunResult.gateSpawned, which this
+  // mirrors). Its REALIZED evidence is derived from this: a producer whose spawn threw — claude is
+  // not installed, or the capability fence refused an unfenceable read root — read NOTHING, and must
+  // not be attested as having read the worktree in the posted footer or the evidence manifest.
+  // OPTIONAL because this interface is a consumer contract (the dashboard renders it) — an absent
+  // value reads as NOT spawned, the weaker, fail-closed claim.
+  claudeSpawned?: boolean;
   // Whether the gate SEAT actually spawned (see GateRunResult.gateSpawned). The `gate` seat's
   // REALIZED evidence is derived from this: a gate that never ran read nothing, and must not be
   // attested as having read the worktree. OPTIONAL because this interface is a consumer contract
@@ -344,13 +357,14 @@ export async function runClaudeReviewLayer(
         });
 
   let claudeReview: VoiceReview | null = null;
+  let claudeSpawned = false;
   if (opts.includeClaudeReviewer) {
     log(
       opts.worktree
         ? `  · claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (/code-review)…`
         : `  · claude (anthropic/${modelLabel}) reviewing the diff (cold)…`
     );
-    const { review, raw } = await runClaudeReviewer(
+    const { review, raw, spawned } = await runClaudeReviewer(
       producerPrompt,
       opts.claudeConfig,
       run,
@@ -359,6 +373,7 @@ export async function runClaudeReviewLayer(
       opts.worktree,
       opts.historyPacket
     );
+    claudeSpawned = spawned;
     claudeReview = review;
     // The trail persist must SUCCEED for the claude voice to count as a complete reviewer:
     // if it fails, the review never reaches the trail (so the disk-read synthesis below
@@ -478,6 +493,7 @@ export async function runClaudeReviewLayer(
   });
   return {
     claudeReview,
+    claudeSpawned,
     gateSpawned: gate.gateSpawned,
     gateTrailWritten: gate.gateTrailWritten,
     gateVerdicts: gate.verdicts,

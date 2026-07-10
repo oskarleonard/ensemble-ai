@@ -2861,6 +2861,8 @@ Read any file there for whole-project context: a finding may cite an UNCHANGED f
 utility, a convention the diff drifts from). You may not edit, stage, or push anything \u2014 the
 worktree is a throwaway the review reaps, and this is someone else's pull request.
 
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}
+
 Anchor every finding at file:line as it exists at ${args.headSha}.`;
 }
 

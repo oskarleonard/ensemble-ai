@@ -188,6 +188,50 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, gate 
     // per-reviewer review files are byte-identical before/after the gate pass (DC3)
     const codexJson = fs.readFileSync(path.join(dir, 'review.codex.json'), 'utf8');
     expect(JSON.parse(codexJson).findings[0].title).toBe('shared bug');
+    // The producer SPAWNED, so the run may attest that it read the worktree.
+    expect(res.claudeSpawned).toBe(true);
+  });
+
+  // `claudeSpawned` is what the run's REALIZED evidence for the `claude` seat is derived from, the
+  // same way `gateSpawned` drives the `gate` seat's. A producer whose SPAWN threw (claude is not
+  // installed; the capability fence refused an unfenceable read root) read NOTHING — attesting it
+  // `worktree` would put a whole-project evidence claim in the posted footer and the evidence
+  // manifest for a seat that never opened the tree. A seat that RAN and then timed out or replied
+  // unparseably did reach the tree, so it stays honest at `worktree`.
+  describe('claudeSpawned — fact, not intent', () => {
+    const spawnedFor = async (
+      onReview: () => VoiceRunResult | Promise<VoiceRunResult>
+    ): Promise<boolean | undefined> => {
+      const base = tmpTrail();
+      const runId = 'spawn';
+      seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+      const { run } = makeRunner({ onReview });
+      const res = await runClaudeReviewLayer({
+        baseDir: base,
+        claudeConfig: CFG,
+        coreReviews: [stored('codex'), stored('grok')],
+        expectedHeadSha: HEAD,
+        includeClaudeReviewer: true,
+        reviewPrompt: 'REVIEW PROMPT PAYLOAD',
+        run,
+        runId,
+        worktree: '/tmp/some-worktree',
+      });
+      return res.claudeSpawned;
+    };
+
+    it('false when the producer spawn THREW — the seat never existed', async () => {
+      expect(
+        await spawnedFor(() => {
+          throw new Error('claude: command not found');
+        })
+      ).toBe(false);
+    });
+
+    it('true when the producer RAN but timed out or produced nothing usable', async () => {
+      expect(await spawnedFor(() => ({ ok: false, raw: null, stderrTail: '', timedOut: true }))).toBe(true);
+      expect(await spawnedFor(() => okRun('not json at all'))).toBe(true);
+    });
   });
 
   // THE PRODUCER PROMPT under worktree evidence. `/code-review` hard-codes a structural-quality

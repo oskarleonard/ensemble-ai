@@ -5091,6 +5091,8 @@ Read any file there for whole-project context: a finding may cite an UNCHANGED f
 utility, a convention the diff drifts from). You may not edit, stage, or push anything \u2014 the
 worktree is a throwaway the review reaps, and this is someone else's pull request.
 
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}
+
 Anchor every finding at file:line as it exists at ${args.headSha}.`;
 }
 function formatEvidenceFooter(realized) {
@@ -5504,13 +5506,14 @@ async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log, work
     log(`  \xB7 claude: failed to run \u2014 ${e.message}`);
     return {
       raw: null,
-      review: { findings: [], ok: false, summary: `claude did not run: ${e.message}`, voiceId: "claude" }
+      review: { findings: [], ok: false, summary: `claude did not run: ${e.message}`, voiceId: "claude" },
+      spawned: false
     };
   }
   if (!res.raw || res.timedOut) {
     const why = res.timedOut ? "timed out" : "produced no output";
     log(`  \xB7 claude: ${why}`);
-    return { raw: res.raw ?? null, review: { findings: [], ok: false, summary: `claude ${why}`, voiceId: "claude" } };
+    return { raw: res.raw ?? null, review: { findings: [], ok: false, summary: `claude ${why}`, voiceId: "claude" }, spawned: true };
   }
   const parsed = parseFindings(res.raw);
   if (parsed.parseError) {
@@ -5518,11 +5521,12 @@ async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log, work
     const detail = parsed.summary ? `; model said: ${parsed.summary}` : "";
     return {
       raw: res.raw,
-      review: { findings: [], ok: false, summary: `output not parseable (${parsed.parseError})${detail}`, voiceId: "claude" }
+      review: { findings: [], ok: false, summary: `output not parseable (${parsed.parseError})${detail}`, voiceId: "claude" },
+      spawned: true
     };
   }
   log(`  \xB7 claude: reviewed \u2014 ${parsed.findings.length} finding(s)`);
-  return { raw: res.raw, review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: "claude" } };
+  return { raw: res.raw, review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: "claude" }, spawned: true };
 }
 function claudeModelLabel(config) {
   return config.model && config.model !== "default" ? config.model : "opus";
@@ -5546,11 +5550,12 @@ async function runClaudeReviewLayer(opts) {
     worktree: opts.worktree
   });
   let claudeReview = null;
+  let claudeSpawned = false;
   if (opts.includeClaudeReviewer) {
     log(
       opts.worktree ? `  \xB7 claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (/code-review)\u2026` : `  \xB7 claude (anthropic/${modelLabel}) reviewing the diff (cold)\u2026`
     );
-    const { review, raw } = await runClaudeReviewer(
+    const { review, raw, spawned } = await runClaudeReviewer(
       producerPrompt,
       opts.claudeConfig,
       run,
@@ -5559,6 +5564,7 @@ async function runClaudeReviewLayer(opts) {
       opts.worktree,
       opts.historyPacket
     );
+    claudeSpawned = spawned;
     claudeReview = review;
     try {
       persistSeatReview(opts.baseDir, opts.runId, "claude", review, raw);
@@ -5651,6 +5657,7 @@ async function runClaudeReviewLayer(opts) {
   });
   return {
     claudeReview,
+    claudeSpawned,
     gateSpawned: gate.gateSpawned,
     gateTrailWritten: gate.gateTrailWritten,
     gateVerdicts: gate.verdicts,
@@ -5857,25 +5864,48 @@ function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
   const bin = path16.basename(cmd.split(/\s+/)[0]);
   return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
 }
-function nonInteractiveEnv() {
-  const ssh = nonInteractiveSshCommand();
+function effectiveSshCommand(cwd, cache) {
+  const key = cwd ?? "";
+  if (cache.has(key)) return cache.get(key);
+  let value = process.env.GIT_SSH_COMMAND?.trim() || void 0;
+  if (!value) {
+    try {
+      value = execFileSync3("git", ["config", "--get", "core.sshCommand"], {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"]
+      }).trim() || void 0;
+    } catch {
+      value = void 0;
+    }
+  }
+  cache.set(key, value);
+  return value;
+}
+function nonInteractiveEnv(configuredSsh) {
+  const ssh = nonInteractiveSshCommand(configuredSsh);
   return {
     GIT_ASKPASS: "",
     GIT_TERMINAL_PROMPT: "0",
     SSH_ASKPASS: "",
-    // Absent ⇒ git inherits the user's own GIT_SSH_COMMAND from process.env, untouched.
+    // Absent ⇒ git resolves ssh itself, from the user's own GIT_SSH_COMMAND or core.sshCommand.
     ...ssh ? { GIT_SSH_COMMAND: ssh } : {}
   };
 }
 var GIT_TIMEOUT_MS = 6e5;
 var GIT_MAX_BUFFER = 64 * 1024 * 1024;
 function execGit() {
+  const sshByCwd = /* @__PURE__ */ new Map();
   return (args, opts) => {
     try {
       const text = execFileSync3("git", args, {
         cwd: opts?.cwd,
         encoding: "utf8",
-        env: { ...process.env, ...nonInteractiveEnv(), ...opts?.env ?? {} },
+        env: {
+          ...process.env,
+          ...nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)),
+          ...opts?.env ?? {}
+        },
         maxBuffer: GIT_MAX_BUFFER,
         timeout: GIT_TIMEOUT_MS
       });
@@ -7502,7 +7532,7 @@ async function runReviewPipeline(input) {
   const realizedEvidence = {
     ...result.evidence?.realized ?? {},
     ...worktree && claudeLayer ? {
-      claude: "worktree",
+      claude: claudeLayer.claudeSpawned ? "worktree" : "packet",
       gate: claudeLayer.gateSpawned ? "worktree" : "packet"
     } : {}
   };

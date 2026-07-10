@@ -15,6 +15,7 @@ import type {
   SandboxProfileMap,
   SandboxProfileRef,
 } from './evidence';
+import { UNTRUSTED_INSTRUCTIONS_CLAUSE } from './worktree';
 
 // SEAT POLICY (spec §2) — "a seat gets the worktree IFF it runs under a deny-by-default
 // (repo-rooted, secret-denied) sandbox. Fail closed per seat: no qualifying sandbox → that seat
@@ -137,6 +138,13 @@ export function sandboxProfilesFor(quals: SeatQualifications): SandboxProfileMap
 // reviewer-visible diff); the preamble adds what the packet structurally cannot carry — the whole
 // project, on disk, at `headSha`. It is the seat's cwd, so its file tools reach it with no path.
 //
+// It carries the SAME untrusted-instruction clause as the three Anthropic prompts, and it is the
+// seat class that needs it most: unlike the fenced Anthropic seats, codex runs with its internal
+// sandbox off (`--dangerously-bypass-approvals-and-sandbox`) and therefore holds a live shell inside
+// the untrusted tree, bounded only by a Seatbelt profile that grants outbound :443. The strip closes
+// the FILE instruction channel (CLAUDE.md, AGENTS.md, …); nothing but this clause addresses
+// directions embedded in an ordinary source file the seat reads.
+//
 // Encoded as data so a unit test pins the exact contract, like every other prompt in this engine.
 export function worktreePromptSuffix(args: {
   baseSha: string | null;
@@ -154,6 +162,8 @@ The full project at the PR head is checked out READ-ONLY at ${args.worktree} (de
 Read any file there for whole-project context: a finding may cite an UNCHANGED file (a reinvented
 utility, a convention the diff drifts from). You may not edit, stage, or push anything — the
 worktree is a throwaway the review reaps, and this is someone else's pull request.
+
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}
 
 Anchor every finding at file:line as it exists at ${args.headSha}.`;
 }

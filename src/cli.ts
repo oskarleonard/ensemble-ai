@@ -1429,14 +1429,17 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // whenever one exists and the seat actually spawned there. `realizedEvidence` is never hashed,
   // so folding the Anthropic seats in here cannot move the receipt key.
   //
-  // The GATE is not spawned unconditionally: with no healthy reviewer it is never run, and its
-  // spawn can throw. Either way it read NOTHING, so it must not be attested `worktree` — that is
-  // an evidence claim `receipt verify` would then honor for a gate that never opened the tree.
+  // NEITHER Anthropic seat is spawned unconditionally. The GATE is skipped when no healthy reviewer
+  // gave it anything to judge, and its spawn can throw; the claude PRODUCER's spawn can throw too
+  // (claude not installed, or a read root the capability fence refuses). A seat that never spawned
+  // read NOTHING, so it must not be attested `worktree` — that is an evidence claim the posted
+  // footer and the evidence manifest would then carry for a seat that never opened the tree. A seat
+  // that DID spawn and then timed out or replied unusably could read the tree, so it is honest.
   const realizedEvidence: EvidenceMap = {
     ...(result.evidence?.realized ?? {}),
     ...(worktree && claudeLayer
       ? {
-          claude: 'worktree' as const,
+          claude: claudeLayer.claudeSpawned ? ('worktree' as const) : ('packet' as const),
           gate: claudeLayer.gateSpawned ? ('worktree' as const) : ('packet' as const),
         }
       : {}),
