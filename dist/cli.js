@@ -3190,7 +3190,7 @@ function materializeWorktree(args, deps) {
     const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     dir = path11.join(parent, "head");
     const added = deps.git(
-      [...INERT_GIT_CONFIG, "worktree", "add", "--detach", "--no-recurse-submodules", dir, args.headSha],
+      [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
       { cwd: location.repoRoot, env: INERT_ENV }
     );
     if (!added.ok) {

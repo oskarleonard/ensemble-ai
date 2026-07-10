@@ -4,6 +4,7 @@ import path from 'node:path';
 
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
+import { execGit } from './git-exec';
 import {
   acquireRepoLock,
   classifyGitError,
@@ -255,11 +256,15 @@ describe('materialization hardening — untrusted content is checked out INERT',
     expect(env?.[0]).toContain('GIT_LFS_SKIP_SMUDGE');
   });
 
-  it('never recurses submodules, on fetch OR worktree add', () => {
+  it('never recurses submodules on fetch — and never passes the flag to worktree add', () => {
     const { calls, git } = harness(headSha);
     materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git, lock: noLock });
     expect(calls.find((c) => c.includes('fetch'))).toContain('--no-recurse-submodules');
-    expect(calls.find((c) => c.includes('worktree') && c.includes('add'))).toContain(
+    // `git worktree add` REJECTS --no-recurse-submodules on every git version (it is a
+    // fetch/clone/checkout flag) — passing it killed every real materialization with
+    // "unknown option" (found live by the first consumer adoption, 2026-07-10). worktree add
+    // never populates submodules anyway, so omitting the flag keeps the inert posture.
+    expect(calls.find((c) => c.includes('worktree') && c.includes('add'))).not.toContain(
       '--no-recurse-submodules'
     );
   });
@@ -315,4 +320,80 @@ describe('materialization hardening — untrusted content is checked out INERT',
     const calls = (git as unknown as { mock: { calls: [string[]][] } }).mock.calls;
     expect(calls.some(([a]) => a.includes('worktree') && a.includes('add'))).toBe(false);
   });
+});
+
+// ── REAL git, hermetic — the test that would have caught the invalid worktree-add flag ────────
+//
+// Every materialization test above scripts GitRun, so an argv git itself rejects (the
+// `--no-recurse-submodules` on `worktree add` that killed every live materialization until
+// 2026-07-10) sails through green. This suite runs the REAL git binary against a local file://
+// origin exposing a refs/pull/N/head ref — no network, no GitHub, one repo, minimal spawns.
+describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)', () => {
+  // The runner the CLI itself injects — so this drives the exact exec seam production uses,
+  // not a lookalike (which would leave `execGit`'s own env hardening unexercised).
+  const realGit = execGit();
+  // -c flags keep the FIXTURE SETUP hermetic on any machine, whatever the developer's global git
+  // config says: no identity prompt, no gpg signing, no `core.hooksPath` pre-commit hook (which
+  // would fail the setup commit), and no `core.excludesFile` — a global `*.md` ignore would make
+  // `git add .` silently skip CLAUDE.md and quietly gut the instruction-strip assertions below.
+  const g = (cwd: string, ...args: string[]) => {
+    const r = realGit(
+      [
+        '-c', 'user.email=t@t',
+        '-c', 'user.name=t',
+        '-c', 'commit.gpgsign=false',
+        '-c', 'core.hooksPath=/dev/null',
+        '-c', 'core.excludesFile=/dev/null',
+        ...args,
+      ],
+      { cwd }
+    );
+    if (!r.ok) throw new Error(`git ${args.join(' ')} failed: ${r.error}`);
+    return r.text.trim();
+  };
+
+  it('fetches pull/N/head from a file:// origin, materializes at the SHA, strips, reaps', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-realgit-'));
+    try {
+      const origin = path.join(base, 'origin');
+      fs.mkdirSync(origin);
+      g(origin, 'init', '-q');
+      fs.writeFileSync(path.join(origin, 'src.ts'), 'export const x = 1;\n');
+      fs.writeFileSync(path.join(origin, 'CLAUDE.md'), 'planted instruction channel\n');
+      g(origin, 'add', '.');
+      g(origin, 'commit', '-qm', 'pr head');
+      const headSha = g(origin, 'rev-parse', 'HEAD');
+      g(origin, 'update-ref', 'refs/pull/7/head', headSha);
+
+      // `init`, NOT `clone`: a clone would copy the head commit in, so `worktree add <sha>` would
+      // succeed even if the fetch argv were broken. Starting empty makes the fetch load-bearing —
+      // the object exists locally only because `fetch <url> pull/7/head` really ran.
+      const consumer = path.join(base, 'consumer');
+      fs.mkdirSync(consumer);
+      g(consumer, 'init', '-q');
+
+      const made = materializeWorktree(
+        {
+          headSha,
+          location: { fetchUrl: `file://${origin}`, repoRoot: consumer, slug: 'o/r' },
+          pr: 7,
+          worktreeRoot: base,
+        },
+        { git: realGit }
+      );
+      // Throw (not `expect(...); return`): an early `return` on the error path would silently PASS
+      // the test, and this surfaces git's own stderr instead of a bare `true !== false`.
+      if (isPreflightError(made)) throw new Error(`materialization failed: ${made.message}`);
+      expect(made.headSha).toBe(headSha);
+      expect(fs.readFileSync(path.join(made.dir, 'src.ts'), 'utf8')).toContain('x = 1');
+      // The instruction channel was stripped from the real checkout.
+      expect(fs.existsSync(path.join(made.dir, 'CLAUDE.md'))).toBe(false);
+      expect(made.strippedInstructionFiles).toContain('CLAUDE.md');
+
+      reapWorktree(consumer, made.dir, { git: realGit });
+      expect(fs.existsSync(made.dir)).toBe(false);
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
 });
