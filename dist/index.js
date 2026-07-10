@@ -866,7 +866,7 @@ function runReviewerExec(opts) {
   const capture = opts.capture ?? "outfile";
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
-      cwd: os2.tmpdir(),
+      cwd: opts.cwd ?? os2.tmpdir(),
       detached: true,
       // stdout is piped ONLY when we read the reply from it (grok); codex keeps
       // it 'ignore' (its reply is the -o file) exactly as the proven path did.
@@ -1261,9 +1261,9 @@ var GENERATED_PATTERNS = [
   /\.(js|css)\.map$/,
   /\.snap$/
 ];
-function classifyFileKind(path12, isBinary) {
+function classifyFileKind(path14, isBinary) {
   if (isBinary) return "binary";
-  return GENERATED_PATTERNS.some((re) => re.test(path12)) ? "generated" : "source";
+  return GENERATED_PATTERNS.some((re) => re.test(path14)) ? "generated" : "source";
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -1281,7 +1281,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path12 = pathOfSection(section2);
+    const path14 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -1292,8 +1292,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path12, isBinary),
-      path: path12,
+      kind: classifyFileKind(path14, isBinary),
+      path: path14,
       raw: section2,
       removed
     };
@@ -1554,9 +1554,9 @@ function persistGatePacket(baseDir, runId, input) {
 }
 
 // src/modes/review/receipt.ts
-import fs10 from "fs";
-import os6 from "os";
-import path9 from "path";
+import fs13 from "fs";
+import os7 from "os";
+import path11 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -1637,6 +1637,519 @@ function formatEvidenceShortfall(gaps) {
   return `evidence degraded \u2014 ${named}. This receipt does not prove the worktree-evidence review you are asking for. Re-run the review with the repo location, or pass --accept-degraded to accept the weaker evidence.`;
 }
 
+// src/modes/review/holistic-gate.ts
+import fs12 from "fs";
+import path10 from "path";
+
+// src/modes/review/holistic.ts
+import fs11 from "fs";
+
+// src/modes/brainstorm/voices.ts
+import fs10 from "fs";
+import os6 from "os";
+import path9 from "path";
+
+// src/modes/brainstorm/claude.ts
+function resolveClaudeBin() {
+  return resolveBin("claude", { envVar: "CLAUDE_BIN" });
+}
+var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
+function buildClaudeVoiceArgs(prompt, config) {
+  const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
+  if (config?.model && config.model !== "default") args.push("--model", config.model);
+  if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
+  return args;
+}
+function runClaudeVoice(prompt, config, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
+  return runReviewerExec({
+    args: buildClaudeVoiceArgs(prompt, config),
+    bin: resolveClaudeBin(),
+    capture: "stdout",
+    onSpawn: opts.onSpawn,
+    stderrLimit: 2e3,
+    timeoutMs
+  }).then(({ raw, stderrTail, timedOut }) => ({
+    ok: raw !== null && !timedOut,
+    raw,
+    stderrTail,
+    timedOut
+  }));
+}
+
+// src/modes/brainstorm/types.ts
+var VOICE_IDS = ["codex", "grok", "claude"];
+function isVoiceId(v) {
+  return VOICE_IDS.includes(v);
+}
+function parseVoiceIds(raw) {
+  const arr = Array.isArray(raw) ? raw : typeof raw === "string" ? raw.split(",") : [];
+  const ids = [
+    ...new Set(
+      arr.map((s) => typeof s === "string" ? s.trim() : s).filter(isVoiceId)
+    )
+  ];
+  return ids.length > 0 ? ids : void 0;
+}
+var CRITIQUE_STANCES = ["support", "concern", "extend"];
+
+// src/modes/brainstorm/voices.ts
+var VOICE_DEFAULTS = {
+  claude: {
+    cmd: "claude",
+    effort: "default",
+    id: "claude",
+    model: "default",
+    vendor: "anthropic"
+  },
+  codex: {
+    cmd: "codex",
+    effort: "high",
+    id: "codex",
+    model: "gpt-5.5",
+    vendor: "openai"
+  },
+  grok: {
+    cmd: "grok",
+    effort: "high",
+    id: "grok",
+    model: "grok-build",
+    sandbox: "ensemble-review",
+    vendor: "xai"
+  }
+};
+function toReviewerConfig(c) {
+  return {
+    cmd: c.cmd,
+    effort: c.effort,
+    id: c.id,
+    model: c.model,
+    vendor: c.vendor,
+    ...c.sandbox ? { sandbox: c.sandbox } : {}
+  };
+}
+var VOICE_ADAPTERS = {
+  claude: (p, c, o) => runClaudeVoice(p, c, o),
+  codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), o),
+  grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), o)
+};
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path9.join(os6.homedir(), ".ensemble-ai", "voices.json");
+function str2(v, fallback) {
+  return typeof v === "string" && v.trim() ? v.trim() : fallback;
+}
+function parseVoices(raw) {
+  const out = { ...VOICE_DEFAULTS };
+  if (!raw || typeof raw !== "object") return out;
+  const o = raw;
+  for (const id of VOICE_IDS) {
+    const e = o[id];
+    if (!e || typeof e !== "object") continue;
+    const r = e;
+    const sandbox = str2(r.sandbox, VOICE_DEFAULTS[id].sandbox ?? "");
+    out[id] = {
+      cmd: str2(r.cmd, VOICE_DEFAULTS[id].cmd),
+      effort: str2(r.effort, VOICE_DEFAULTS[id].effort),
+      id,
+      model: str2(r.model, VOICE_DEFAULTS[id].model),
+      vendor: str2(r.vendor, VOICE_DEFAULTS[id].vendor),
+      ...sandbox ? { sandbox } : {}
+    };
+  }
+  return out;
+}
+function loadVoices(file = VOICES_FILE) {
+  try {
+    return parseVoices(JSON.parse(fs10.readFileSync(file, "utf8")));
+  } catch {
+    return { ...VOICE_DEFAULTS };
+  }
+}
+function listVoices(file = VOICES_FILE) {
+  const all = loadVoices(file);
+  return VOICE_IDS.map((id) => all[id]);
+}
+
+// src/modes/review/claude.ts
+var CLAUDE_EFFORTS2 = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
+
+// src/modes/review/holistic.ts
+var HOLISTIC_SEAT_ID = "holistic";
+var HOLISTIC_SEVERITY_CAP = "medium";
+var HOLISTIC_DEFAULTS = { effort: "max", model: "opus" };
+function nonEmptyStr(v) {
+  return typeof v === "string" && v.trim() ? v.trim() : null;
+}
+function resolveHolisticSeat(raw, warn = () => {
+}) {
+  const root = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const entry = root.holistic && typeof root.holistic === "object" && !Array.isArray(root.holistic) ? root.holistic : null;
+  if (root.holistic !== void 0 && !entry) {
+    warn('holistic seat: expected an object like {"model":"\u2026","effort":"\u2026"} \u2014 using the built-in default');
+  }
+  if (entry && "cmd" in entry) {
+    warn("holistic seat: `cmd` is ignored \u2014 the lens is always a `claude -p` spawn (read-only plan mode + write-tool deny-list); remove it");
+  }
+  const model = entry && nonEmptyStr(entry.model) || HOLISTIC_DEFAULTS.model;
+  const rawEffort = entry ? nonEmptyStr(entry.effort) : null;
+  let effort = HOLISTIC_DEFAULTS.effort;
+  if (rawEffort && rawEffort !== "default") {
+    if (CLAUDE_EFFORTS2.has(rawEffort)) effort = rawEffort;
+    else
+      warn(
+        `holistic seat: \`effort\` "${rawEffort}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 using the built-in default "${HOLISTIC_DEFAULTS.effort}"`
+      );
+  }
+  return { ...VOICE_DEFAULTS.claude, effort, model };
+}
+function loadHolisticSeat(file = VOICES_FILE, warn = () => {
+}) {
+  let raw = {};
+  try {
+    raw = JSON.parse(fs11.readFileSync(file, "utf8"));
+  } catch (e) {
+    if (e.code !== "ENOENT")
+      warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
+    raw = {};
+  }
+  return resolveHolisticSeat(raw, warn);
+}
+function resolveHolisticPlan(input) {
+  if (!input.requested) return { run: false, skipReason: null };
+  if (!input.worktree)
+    return {
+      run: false,
+      skipReason: "holistic lens: requested, but this run has NO worktree evidence \u2014 the lens reads the whole project or it does not run (it never runs on packet evidence). No seat spawned, no findings added."
+    };
+  if (!input.baseSha)
+    return {
+      run: false,
+      skipReason: "holistic lens: requested, but this run resolved no base SHA \u2014 the lens could not tell the change apart from the tree around it. No seat spawned, no findings added."
+    };
+  return { baseSha: input.baseSha, run: true, worktree: input.worktree };
+}
+var SCHEMA_BLOCK = `{"summary":"<one sentence: what you looked at and what you found>","findings":[{"title":"<short>","body":"<the reinvention, WHERE the existing pattern lives (path:line), and why they are the same thing>","severity":"high|medium|low","confidence":"high|medium|low","evidence":{"file":"<the CHANGED file in this PR>","line":<number>}}]}`;
+function renderHolisticPrompt(args) {
+  return `You are the HOLISTIC / ARCHITECTURE lens of a multi-model code review, reviewing someone
+else's pull request. Read-only: you may not edit, stage, or push anything.
+
+The full project at the PR head is checked out at ${args.worktree} (detached at ${args.headSha}).
+The change under review is exactly: git diff ${args.baseSha}...${args.headSha}
+
+The other reviewers already read the diff closely and will report its bugs. Do NOT repeat them.
+Your job is the thing they structurally CANNOT see: how this change sits in the WHOLE project.
+Search the tree. Report only these three classes:
+
+1. REINVENTED PATTERN \u2014 the change adds code that duplicates something the project already has
+   (a util, a helper, an abstraction), usually in a file the diff never touches.
+2. CONVENTION DRIFT \u2014 the change violates a rule the project's own conventions docs state.
+3. SIMPLIFIABLE DESIGN \u2014 the change's structure collapses to a materially simpler one given what
+   already exists in the tree.
+
+Never report style, naming, formatting, or import-ordering nits. Never report a bug the diff shows
+on its face \u2014 that is another seat's job.
+
+## The bar, because a wrong "use the existing util X" is the most credibility-burning comment a
+## robot can leave on someone else's PR
+
+- Every finding MUST name TWO places: the site in THIS PR's diff, and the existing pattern's home
+  in the tree, each as \`path:line\` as they exist at ${args.headSha}. Put both in the body. The
+  \`evidence\` object points at the CHANGED file (the diff site).
+- Before you file a reinvention, READ the existing pattern's source and check the SEMANTICS match.
+  A function that looks like an existing util but rounds differently, preserves case, or paces
+  instead of retries is NOT a reinvention \u2014 it is a different function that resembles one. Filing
+  those is worse than filing nothing. If you are not sure the behavior is identical, do not file it.
+- Severity is CAPPED at "medium" by the host. It is lifted ONLY when a conventions doc in this
+  project explicitly mandates the pattern the change bypasses \u2014 if so, quote that doc's line in
+  your body and give its \`path:line\`. Asserting "this is important" never lifts the cap; only a
+  citation the host can find at ${args.headSha} does.
+- Finding nothing is a legitimate outcome. Return an empty findings array and say what you looked
+  at. Do not invent issues to fill the list.
+
+## Output format \u2014 STRICT
+Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
+${SCHEMA_BLOCK}`;
+}
+async function runHolisticLens(opts) {
+  const log = opts.log ?? (() => {
+  });
+  const prompt = renderHolisticPrompt({
+    baseSha: opts.baseSha,
+    headSha: opts.headSha,
+    worktree: opts.worktree
+  });
+  const fail = (summary) => ({
+    raw: null,
+    review: { findings: [], ok: false, summary, voiceId: HOLISTIC_SEAT_ID }
+  });
+  let res;
+  try {
+    res = await opts.run(prompt, opts.config, {
+      timeoutMs: opts.timeoutMs,
+      worktree: opts.worktree
+    });
+  } catch (e) {
+    log(`  \xB7 holistic: failed to run \u2014 ${e.message}`);
+    return fail(`the holistic lens did not run: ${e.message}`);
+  }
+  if (!res.raw || res.timedOut) {
+    const why = res.timedOut ? "timed out" : "produced no output";
+    log(`  \xB7 holistic: ${why}`);
+    return { ...fail(`the holistic lens ${why}`), raw: res.raw ?? null };
+  }
+  const parsed = parseFindings(res.raw);
+  if (parsed.parseError) {
+    log(`  \xB7 holistic: ${parsed.parseError}`);
+    return { raw: res.raw, review: { findings: [], ok: false, summary: `output not parseable (${parsed.parseError})`, voiceId: HOLISTIC_SEAT_ID } };
+  }
+  log(`  \xB7 holistic: reviewed the whole tree \u2014 ${parsed.findings.length} finding(s)`);
+  return {
+    raw: res.raw,
+    review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: HOLISTIC_SEAT_ID }
+  };
+}
+
+// src/modes/review/holistic-gate.ts
+var HOLISTIC_MIN_ANCHOR_NONWS = 16;
+var HOLISTIC_LINE_SLACK = 2;
+var MAX_QUOTE_CHARS = 2e3;
+var MAX_FILE_BYTES = 1048576;
+var MAX_FILE_LINES = 2e4;
+var HOLISTIC_SITE_ROLES = ["diff", "pattern"];
+function normalizeRepoPath(p) {
+  return p.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+function nonEmptyStr2(v, cap3) {
+  return typeof v === "string" && v.trim() ? v.trim().slice(0, cap3) : null;
+}
+function posInt(v) {
+  return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : null;
+}
+function parseHolisticSites(v) {
+  if (!Array.isArray(v)) return void 0;
+  const out = [];
+  for (const raw of v.slice(0, 8)) {
+    if (!raw || typeof raw !== "object") continue;
+    const e = raw;
+    const file = nonEmptyStr2(e.file, 500);
+    const line = posInt(e.line);
+    const quote = nonEmptyStr2(e.quote, MAX_QUOTE_CHARS);
+    const role = HOLISTIC_SITE_ROLES.find((r) => r === e.role);
+    if (file && line && quote && role) out.push({ file, line, quote, role });
+  }
+  return out.length > 0 ? out : void 0;
+}
+function parseConventionCitation(v) {
+  if (!v || typeof v !== "object") return void 0;
+  const e = v;
+  const file = nonEmptyStr2(e.file, 500);
+  const line = posInt(e.line);
+  const quote = nonEmptyStr2(e.quote, MAX_QUOTE_CHARS);
+  return file && line && quote ? { file, line, quote } : void 0;
+}
+function worktreeReader(worktreeDir) {
+  let root;
+  try {
+    root = fs12.realpathSync(path10.resolve(worktreeDir));
+  } catch {
+    return () => null;
+  }
+  const inside = (p) => {
+    const rel = path10.relative(root, p);
+    return rel !== "" && !escapesRoot(rel);
+  };
+  return (file) => {
+    try {
+      if (!file || file.includes("\0") || path10.isAbsolute(file)) return null;
+      const target = path10.resolve(root, file);
+      if (!inside(target)) return null;
+      const real = fs12.realpathSync(target);
+      if (!inside(real)) return null;
+      const st = fs12.statSync(real);
+      if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
+      return fs12.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+    } catch {
+      return null;
+    }
+  };
+}
+var norm = (s) => s.replace(/\s+/g, " ").trim();
+var nonWsLen = (s) => s.replace(/\s/g, "").length;
+function findQuoteSpans(lines, quote) {
+  const want = quote.split(/\r?\n/).map(norm);
+  while (want.length > 0 && !want[0]) want.shift();
+  while (want.length > 0 && !want[want.length - 1]) want.pop();
+  if (want.length === 0) return [];
+  if (!want.some((l) => nonWsLen(l) >= HOLISTIC_MIN_ANCHOR_NONWS)) return [];
+  const hay = lines.map(norm);
+  const spans = [];
+  for (let i = 0; i + want.length <= hay.length; i++) {
+    let hit = true;
+    for (let j = 0; j < want.length; j++) {
+      if (hay[i + j] !== want[j]) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) spans.push({ end: i + want.length, start: i + 1 });
+  }
+  return spans;
+}
+function findQuoteSpan(lines, quote) {
+  return findQuoteSpans(lines, quote)[0] ?? null;
+}
+function verifySiteAtHead(site, read) {
+  const lines = read(site.file);
+  if (!lines) return { ok: false, reason: `${site.file} is not a readable file in the reviewed tree` };
+  const spans = findQuoteSpans(lines, site.quote);
+  if (spans.length === 0)
+    return {
+      ok: false,
+      reason: `the quoted line(s) do not appear verbatim in ${site.file} (or carry no \u2265${HOLISTIC_MIN_ANCHOR_NONWS}-non-whitespace-char anchor line)`
+    };
+  const hit = spans.find(
+    (s) => site.line >= s.start - HOLISTIC_LINE_SLACK && site.line <= s.end + HOLISTIC_LINE_SLACK
+  );
+  if (!hit)
+    return {
+      ok: false,
+      reason: `${site.file}:${site.line} is not where that quote lives (found at ${spans.map((s) => `${s.start}-${s.end}`).join(", ")})`
+    };
+  return { ok: true, span: hit };
+}
+var CANONICAL_CONVENTION_FILES = [
+  "agents.md",
+  "claude.md",
+  "contributing.md",
+  "conventions.md",
+  "style-guide.md",
+  "styleguide.md"
+];
+function isConventionsDoc(file, gathered) {
+  const rel = normalizeRepoPath(file).toLowerCase();
+  if (gathered) return gathered.some((g) => normalizeRepoPath(g).toLowerCase() === rel);
+  return CANONICAL_CONVENTION_FILES.includes(rel.split("/").pop() ?? "");
+}
+function isHolisticRecord(r) {
+  return r.reviewer === HOLISTIC_SEAT_ID;
+}
+function capSeverity(s) {
+  return SEVERITIES.indexOf(s) < SEVERITIES.indexOf(HOLISTIC_SEVERITY_CAP) ? HOLISTIC_SEVERITY_CAP : s;
+}
+function holisticCapWasLifted(r) {
+  return Boolean(r.holistic?.uncapCitation) && SEVERITIES.indexOf(r.severity) < SEVERITIES.indexOf(HOLISTIC_SEVERITY_CAP);
+}
+function capHolisticSeverity(r) {
+  if (!isHolisticRecord(r)) return r;
+  const severity = capSeverity(r.severity);
+  return {
+    ...r,
+    holistic: {
+      lens: HOLISTIC_SEAT_ID,
+      singleSeat: true,
+      ...severity !== r.severity ? { cappedFrom: r.severity } : {}
+    },
+    severity
+  };
+}
+var notPostable = (note) => ({ postableBody: null, postableFix: null, postableNote: note, postableStatus: "not-postable", rescoredSeverity: null });
+var downgrade = (r, downgradeReason, reason) => ({
+  ...r,
+  ...notPostable(reason),
+  downgradeReason,
+  effectiveVerdict: "unverified",
+  reason
+});
+function checkSites(sites, deps) {
+  const diff = sites?.filter((s) => s.role === "diff") ?? [];
+  const pattern = sites?.filter((s) => s.role === "pattern") ?? [];
+  if (diff.length !== 1 || pattern.length !== 1)
+    return {
+      cause: "invalid-citation",
+      ok: false,
+      reason: `a holistic agree must quote BOTH sites \u2014 exactly one "diff" site (the reinvention in this PR) and one "pattern" site (the existing pattern's home)`
+    };
+  const [d] = diff;
+  const [p] = pattern;
+  const changed = new Set([...deps.diffFiles].map(normalizeRepoPath));
+  if (!changed.has(normalizeRepoPath(d.file)))
+    return {
+      cause: "invalid-citation",
+      ok: false,
+      reason: `the "diff" site ${d.file} is not a file this PR changes \u2014 the reinvention must be cited inside the change`
+    };
+  const sameFile = normalizeRepoPath(d.file) === normalizeRepoPath(p.file);
+  if (sameFile && d.line === p.line)
+    return { cause: "invalid-citation", ok: false, reason: "both sites point at the same line \u2014 a pattern cannot reinvent itself" };
+  const spans = {
+    diff: { end: 0, start: 0 },
+    pattern: { end: 0, start: 0 }
+  };
+  for (const [role, site] of [["diff", d], ["pattern", p]]) {
+    const check = verifySiteAtHead(site, deps.readAtHead);
+    if (!check.ok)
+      return { cause: "reference-not-found", ok: false, reason: `the ${role} site could not be verified at headSha \u2014 ${check.reason}` };
+    spans[role] = check.span;
+  }
+  if (sameFile && spans.diff.start <= spans.pattern.end && spans.pattern.start <= spans.diff.end)
+    return {
+      cause: "invalid-citation",
+      ok: false,
+      reason: "both sites quote the same lines \u2014 a pattern cannot reinvent itself"
+    };
+  return { ok: true, sites: [d, p] };
+}
+function applyHolisticPolicy(records, entryById, deps) {
+  return records.map((r) => {
+    if (!isHolisticRecord(r)) return r;
+    const entry = entryById.get(r.findingId);
+    const cit = entry?.conventionCitation;
+    const uncapped = Boolean(
+      deps && cit && isConventionsDoc(cit.file, deps.conventionPaths) && verifySiteAtHead(cit, deps.readAtHead).ok
+    );
+    const severity = uncapped ? r.severity : capSeverity(r.severity);
+    const holistic = {
+      lens: HOLISTIC_SEAT_ID,
+      singleSeat: true,
+      ...severity !== r.severity ? { cappedFrom: r.severity } : {},
+      ...uncapped && cit ? { uncapCitation: cit } : {}
+    };
+    const based = { ...r, holistic, severity };
+    if (!deps)
+      return downgrade(
+        based,
+        "invalid-citation",
+        "a holistic finding cannot be verified without worktree evidence \u2014 the lens must not run on packet evidence"
+      );
+    if (based.effectiveVerdict !== "agree") {
+      return {
+        ...based,
+        ...notPostable(
+          `the holistic lens posts agree-only \u2014 a "${based.effectiveVerdict}" architecture claim is not grounded enough to put on someone else's PR`
+        )
+      };
+    }
+    const sites = checkSites(entry?.sites, deps);
+    if (!sites.ok) return downgrade(based, sites.cause, sites.reason);
+    return { ...based, holistic: { ...holistic, verifiedSites: sites.sites } };
+  });
+}
+
+// src/modes/review/gate-prompt.ts
+var holisticClause = `
+- Holistic-lens findings (findingIds beginning \`${HOLISTIC_SEAT_ID}#\`) are ARCHITECTURE claims from
+  ONE seat that read the WHOLE project \u2014 not the diff. They post ONLY on "agree", and an "agree"
+  REQUIRES "sites": exactly two entries, {"role":"diff",\u2026} the reinvention inside this PR's changed
+  files and {"role":"pattern",\u2026} the existing pattern's home, each as
+  {"file","line","quote"} where "quote" is one or more COMPLETE lines copied verbatim as they exist
+  at this commit. You have read access to the tree: OPEN both files and check the semantics really
+  match before agreeing \u2014 a util that looks alike but rounds, cases, or paces differently is NOT a
+  reinvention, and "false" is the right verdict for it. The host re-reads both quotes at this commit
+  and downgrades any it cannot locate to unverified (reference-not-found).
+- Holistic severity is CAPPED at "${HOLISTIC_SEVERITY_CAP}" by the host. It lifts ONLY if you also send
+  "conventionCitation": {"file","line","quote"} quoting the project's conventions doc that mandates
+  the bypassed pattern. The host verifies that quote too, and checks the file really is a conventions
+  doc. There is no way to assert your way past the cap.`;
+
 // src/modes/review/gate.ts
 var GATE_VERDICTS = ["agree", "partial", "false", "unverified"];
 
@@ -1658,10 +2171,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path9.join(os6.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path11.join(os7.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path9.join(
+  return path11.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -1682,11 +2195,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs10.mkdirSync(path9.dirname(file), { recursive: true, mode: 448 });
+  fs13.mkdirSync(path11.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs10.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs10.chmodSync(tmp, 384);
-  fs10.renameSync(tmp, file);
+  fs13.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs13.chmodSync(tmp, 384);
+  fs13.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -1768,7 +2281,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs10.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs13.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -2149,9 +2662,9 @@ function writeEvidenceManifest(baseDir, runId, manifest) {
 
 // src/modes/review/worktree.ts
 import { randomUUID } from "crypto";
-import fs11 from "fs";
-import os7 from "os";
-import path10 from "path";
+import fs14 from "fs";
+import os8 from "os";
+import path12 from "path";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
 }
@@ -2175,27 +2688,27 @@ function classifyGitError(stderr) {
   }
   return "network";
 }
-function allowedRootsFromConfig(configPath = path10.join(os7.homedir(), ".ensemble-ai", "config.json")) {
+function allowedRootsFromConfig(configPath = path12.join(os8.homedir(), ".ensemble-ai", "config.json")) {
   try {
-    const raw = JSON.parse(fs11.readFileSync(configPath, "utf8"));
+    const raw = JSON.parse(fs14.readFileSync(configPath, "utf8"));
     const roots = raw.allowedRepoRoots;
     if (!Array.isArray(roots) || roots.length === 0) return null;
     const strs = roots.filter((r) => typeof r === "string" && r.trim().length > 0);
-    return strs.length > 0 ? strs.map((r) => path10.resolve(r)) : null;
+    return strs.length > 0 ? strs.map((r) => path12.resolve(r)) : null;
   } catch {
     return null;
   }
 }
 function rootAllowed(repoRoot, allowed) {
   if (!allowed) return true;
-  const real = path10.resolve(repoRoot);
+  const real = path12.resolve(repoRoot);
   return allowed.some((root) => {
-    const rel = path10.relative(root, real);
-    return rel === "" || !rel.startsWith("..") && !path10.isAbsolute(rel);
+    const rel = path12.relative(root, real);
+    return rel === "" || !rel.startsWith("..") && !path12.isAbsolute(rel);
   });
 }
 function resolveRepoLocation(args, deps) {
-  const repoPath = path10.resolve(args.repoPath);
+  const repoPath = path12.resolve(args.repoPath);
   const top = deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
   if (!top.ok) {
     return {
@@ -2246,26 +2759,26 @@ function lockToken() {
 }
 function removeLockIfOwned(lock, token) {
   try {
-    if (fs11.readFileSync(lock, "utf8").trim() === token) fs11.unlinkSync(lock);
+    if (fs14.readFileSync(lock, "utf8").trim() === token) fs14.unlinkSync(lock);
   } catch {
   }
 }
 function acquireRepoLock(gitCommonDir, opts = {}) {
-  const lock = path10.join(gitCommonDir, "ensemble-ai-worktree.lock");
+  const lock = path12.join(gitCommonDir, "ensemble-ai-worktree.lock");
   const sleepMs = opts.sleepMs ?? 500;
   const staleMs = opts.staleMs ?? 10 * 6e4;
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
     try {
-      const fd = fs11.openSync(lock, fs11.constants.O_CREAT | fs11.constants.O_EXCL | fs11.constants.O_WRONLY, 384);
-      fs11.writeSync(fd, token);
-      fs11.closeSync(fd);
+      const fd = fs14.openSync(lock, fs14.constants.O_CREAT | fs14.constants.O_EXCL | fs14.constants.O_WRONLY, 384);
+      fs14.writeSync(fd, token);
+      fs14.closeSync(fd);
       return () => removeLockIfOwned(lock, token);
     } catch {
       try {
-        const held = fs11.readFileSync(lock, "utf8").trim();
-        const age = Date.now() - fs11.statSync(lock).mtimeMs;
+        const held = fs14.readFileSync(lock, "utf8").trim();
+        const age = Date.now() - fs14.statSync(lock).mtimeMs;
         if (age > staleMs) removeLockIfOwned(lock, held);
       } catch {
       }
@@ -2282,7 +2795,7 @@ function materializeWorktree(args, deps) {
   if (!common.ok) {
     return { kind: "not-a-repo", message: `cannot resolve the git dir of ${location.repoRoot}` };
   }
-  const gitCommonDir = path10.resolve(location.repoRoot, common.text.trim());
+  const gitCommonDir = path12.resolve(location.repoRoot, common.text.trim());
   const release = (deps.lock ?? acquireRepoLock)(gitCommonDir);
   let dir = null;
   try {
@@ -2301,8 +2814,8 @@ function materializeWorktree(args, deps) {
     if (!fetched.ok) {
       return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${location.fetchUrl} failed: ${fetched.error.trim()}` };
     }
-    dir = fs11.mkdtempSync(path10.join(args.worktreeRoot ?? os7.tmpdir(), "ensemble-worktree-"));
-    fs11.rmSync(dir, { recursive: true, force: true });
+    dir = fs14.mkdtempSync(path12.join(args.worktreeRoot ?? os8.tmpdir(), "ensemble-worktree-"));
+    fs14.rmSync(dir, { recursive: true, force: true });
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", "--no-recurse-submodules", dir, args.headSha],
       { cwd: location.repoRoot, env: INERT_ENV }
@@ -2335,7 +2848,7 @@ function reapWorktree(repoRoot, dir, deps) {
   } catch {
   }
   try {
-    fs11.rmSync(dir, { force: true, recursive: true });
+    fs14.rmSync(dir, { force: true, recursive: true });
   } catch {
   }
   try {
@@ -2347,7 +2860,7 @@ function reapWorktree(repoRoot, dir, deps) {
 // src/modes/review/code-review-seat.ts
 var CODE_REVIEW_SKILL = "/code-review";
 var QUALITY_LENS = `Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits \u2014 they are noise on someone else's pull request.`;
-var SCHEMA_BLOCK = `{"summary":"<one sentence>","findings":[{"title":"<short>","body":"<what is wrong, why, and the fix>","severity":"high|medium|low","confidence":"high|medium|low","evidence":{"file":"<repo-relative path>","line":<number>}}]}`;
+var SCHEMA_BLOCK2 = `{"summary":"<one sentence>","findings":[{"title":"<short>","body":"<what is wrong, why, and the fix>","severity":"high|medium|low","confidence":"high|medium|low","evidence":{"file":"<repo-relative path>","line":<number>}}]}`;
 function renderCodeReviewSeatPrompt(args) {
   return `${CODE_REVIEW_SKILL}
 
@@ -2364,27 +2877,90 @@ Anchor every finding at file:line as it exists at ${args.headSha}.
 
 After the review, your FINAL output must end with exactly one fenced \`\`\`json block, and no other
 json block, in this schema:
-${SCHEMA_BLOCK}`;
+${SCHEMA_BLOCK2}`;
 }
 
-// src/modes/brainstorm/types.ts
-var VOICE_IDS = ["codex", "grok", "claude"];
-function isVoiceId(v) {
-  return VOICE_IDS.includes(v);
+// src/modes/review/holistic-fixture.ts
+import fs15 from "fs";
+import path13 from "path";
+function anchor(v, where) {
+  const e = v ?? {};
+  if (typeof e.file !== "string" || typeof e.line !== "number" || typeof e.symbol !== "string")
+    throw new Error(`holistic fixture: ${where} must be {file, line, symbol}`);
+  return { file: e.file, line: e.line, symbol: e.symbol };
 }
-function parseVoiceIds(raw) {
-  const arr = Array.isArray(raw) ? raw : typeof raw === "string" ? raw.split(",") : [];
-  const ids = [
-    ...new Set(
-      arr.map((s) => typeof s === "string" ? s.trim() : s).filter(isVoiceId)
-    )
-  ];
-  return ids.length > 0 ? ids : void 0;
+function loadHolisticFixture(dir) {
+  const raw = JSON.parse(fs15.readFileSync(path13.join(dir, "expectations.json"), "utf8"));
+  const positives = Array.isArray(raw.plantedPositives) ? raw.plantedPositives : [];
+  const misses = Array.isArray(raw.nearMisses) ? raw.nearMisses : [];
+  if (positives.length === 0 || misses.length === 0)
+    throw new Error("holistic fixture: the suite needs SEVERAL planted positives AND several near-miss negatives (gate-r3 pin 7)");
+  return {
+    conventionsDoc: typeof raw.conventionsDoc === "string" ? raw.conventionsDoc : "AGENTS.md",
+    nearMisses: misses.map((m) => {
+      const e = m;
+      return {
+        id: String(e.id),
+        lookalike: anchor(e.lookalike, `nearMisses[${String(e.id)}].lookalike`),
+        site: anchor(e.site, `nearMisses[${String(e.id)}].site`),
+        why: String(e.why ?? "")
+      };
+    }),
+    plantedPositives: positives.map((p) => {
+      const e = p;
+      return {
+        conventionsAnchor: anchor(e.conventionsAnchor, `plantedPositives[${String(e.id)}].conventionsAnchor`),
+        diffSite: anchor(e.diffSite, `plantedPositives[${String(e.id)}].diffSite`),
+        id: String(e.id),
+        patternSite: anchor(e.patternSite, `plantedPositives[${String(e.id)}].patternSite`),
+        why: String(e.why ?? "")
+      };
+    })
+  };
 }
-var CRITIQUE_STANCES = ["support", "concern", "extend"];
+function verifyFixtureAnchors(dir, fixture) {
+  const broken = [];
+  const check = (a, label) => {
+    let lines;
+    try {
+      lines = fs15.readFileSync(path13.join(dir, a.file), "utf8").split(/\r?\n/);
+    } catch {
+      broken.push(`${label}: ${a.file} is unreadable`);
+      return;
+    }
+    const line = lines[a.line - 1];
+    if (line === void 0) broken.push(`${label}: ${a.file}:${a.line} does not exist`);
+    else if (!line.includes(a.symbol)) broken.push(`${label}: ${a.file}:${a.line} no longer contains "${a.symbol}"`);
+  };
+  for (const p of fixture.plantedPositives) {
+    check(p.diffSite, `${p.id}.diffSite`);
+    check(p.patternSite, `${p.id}.patternSite`);
+    check(p.conventionsAnchor, `${p.id}.conventionsAnchor`);
+  }
+  for (const m of fixture.nearMisses) {
+    check(m.site, `${m.id}.site`);
+    check(m.lookalike, `${m.id}.lookalike`);
+  }
+  return broken;
+}
+var LANDING_WINDOW = 12;
+function lands(f, a) {
+  return f.file === a.file && (f.line === null || Math.abs(f.line - a.line) <= LANDING_WINDOW);
+}
+function scoreHolisticFixture(findings, fixture) {
+  const postable = findings.filter((f) => f.postable);
+  const caught = [];
+  const missed = [];
+  for (const p of fixture.plantedPositives) {
+    if (postable.some((f) => lands(f, p.diffSite))) caught.push(p.id);
+    else missed.push(p.id);
+  }
+  const falseFlags = fixture.nearMisses.filter((m) => postable.some((f) => lands(f, m.site))).map((m) => m.id);
+  return { caught, falseFlags, missed, passed: missed.length === 0 && falseFlags.length === 0 };
+}
 
 // src/modes/brainstorm/parse.ts
-function str2(v) {
+function str3(v) {
   return typeof v === "string" ? v.trim() : "";
 }
 function asStance(v) {
@@ -2396,8 +2972,8 @@ function parseRawIdeas(arr, placeholder) {
   arr.forEach((ri, i) => {
     if (!ri || typeof ri !== "object") return;
     const r = ri;
-    const title = str2(r.title);
-    const body = str2(r.body);
+    const title = str3(r.title);
+    const body = str3(r.body);
     if (!title && !body) return;
     out.push({ body, title: title || `${placeholder} ${i + 1}` });
   });
@@ -2409,7 +2985,7 @@ function parseIdeas(raw) {
     return { ideas: [], parseError: "no parseable JSON block in the output", summary: "" };
   }
   const o = obj;
-  const summary = str2(o.summary);
+  const summary = str3(o.summary);
   if (!Array.isArray(o.ideas)) {
     return { ideas: [], parseError: 'output has no "ideas" array', summary };
   }
@@ -2426,7 +3002,7 @@ function parseCritique(raw) {
     };
   }
   const o = obj;
-  const summary = str2(o.summary);
+  const summary = str3(o.summary);
   if (!Array.isArray(o.critiques) && !Array.isArray(o.extensions)) {
     return {
       critiques: [],
@@ -2440,8 +3016,8 @@ function parseCritique(raw) {
     for (const rc of o.critiques) {
       if (!rc || typeof rc !== "object") continue;
       const c = rc;
-      const target = str2(c.target);
-      const assessment = str2(c.assessment);
+      const target = str3(c.target);
+      const assessment = str3(c.assessment);
       if (!target && !assessment) continue;
       critiques.push({
         assessment,
@@ -2454,7 +3030,7 @@ function parseCritique(raw) {
 }
 function asContributors(v) {
   if (!Array.isArray(v)) return [];
-  return [...new Set(v.map(str2).filter(Boolean))];
+  return [...new Set(v.map(str3).filter(Boolean))];
 }
 function parseSynthesis(raw) {
   const obj = extractJsonBlock(raw);
@@ -2462,7 +3038,7 @@ function parseSynthesis(raw) {
     return { parseError: "no parseable JSON block in the output", ranked: [], summary: "" };
   }
   const o = obj;
-  const summary = str2(o.summary);
+  const summary = str3(o.summary);
   if (!Array.isArray(o.ranked)) {
     return { parseError: 'output has no "ranked" array', ranked: [], summary };
   }
@@ -2470,10 +3046,10 @@ function parseSynthesis(raw) {
   o.ranked.forEach((rr) => {
     if (!rr || typeof rr !== "object") return;
     const r = rr;
-    const title = str2(r.title);
-    const why = str2(r.why);
+    const title = str3(r.title);
+    const why = str3(r.why);
     if (!title && !why) return;
-    const risks = str2(r.risks);
+    const risks = str3(r.risks);
     ranked.push({
       contributors: asContributors(r.contributors),
       rank: ranked.length + 1,
@@ -2603,115 +3179,6 @@ ${JSON_RULE}
 Rank best-first. Merge duplicates into one entry crediting all contributors. Prefer
 a tight ranked list of the genuinely strong ideas over a long one.
 `;
-}
-
-// src/modes/brainstorm/voices.ts
-import fs12 from "fs";
-import os8 from "os";
-import path11 from "path";
-
-// src/modes/brainstorm/claude.ts
-function resolveClaudeBin() {
-  return resolveBin("claude", { envVar: "CLAUDE_BIN" });
-}
-var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
-function buildClaudeVoiceArgs(prompt, config) {
-  const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
-  if (config?.model && config.model !== "default") args.push("--model", config.model);
-  if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
-  return args;
-}
-function runClaudeVoice(prompt, config, opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  return runReviewerExec({
-    args: buildClaudeVoiceArgs(prompt, config),
-    bin: resolveClaudeBin(),
-    capture: "stdout",
-    onSpawn: opts.onSpawn,
-    stderrLimit: 2e3,
-    timeoutMs
-  }).then(({ raw, stderrTail, timedOut }) => ({
-    ok: raw !== null && !timedOut,
-    raw,
-    stderrTail,
-    timedOut
-  }));
-}
-
-// src/modes/brainstorm/voices.ts
-var VOICE_DEFAULTS = {
-  claude: {
-    cmd: "claude",
-    effort: "default",
-    id: "claude",
-    model: "default",
-    vendor: "anthropic"
-  },
-  codex: {
-    cmd: "codex",
-    effort: "high",
-    id: "codex",
-    model: "gpt-5.5",
-    vendor: "openai"
-  },
-  grok: {
-    cmd: "grok",
-    effort: "high",
-    id: "grok",
-    model: "grok-build",
-    sandbox: "ensemble-review",
-    vendor: "xai"
-  }
-};
-function toReviewerConfig(c) {
-  return {
-    cmd: c.cmd,
-    effort: c.effort,
-    id: c.id,
-    model: c.model,
-    vendor: c.vendor,
-    ...c.sandbox ? { sandbox: c.sandbox } : {}
-  };
-}
-var VOICE_ADAPTERS = {
-  claude: (p, c, o) => runClaudeVoice(p, c, o),
-  codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), o),
-  grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), o)
-};
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path11.join(os8.homedir(), ".ensemble-ai", "voices.json");
-function str3(v, fallback) {
-  return typeof v === "string" && v.trim() ? v.trim() : fallback;
-}
-function parseVoices(raw) {
-  const out = { ...VOICE_DEFAULTS };
-  if (!raw || typeof raw !== "object") return out;
-  const o = raw;
-  for (const id of VOICE_IDS) {
-    const e = o[id];
-    if (!e || typeof e !== "object") continue;
-    const r = e;
-    const sandbox = str3(r.sandbox, VOICE_DEFAULTS[id].sandbox ?? "");
-    out[id] = {
-      cmd: str3(r.cmd, VOICE_DEFAULTS[id].cmd),
-      effort: str3(r.effort, VOICE_DEFAULTS[id].effort),
-      id,
-      model: str3(r.model, VOICE_DEFAULTS[id].model),
-      vendor: str3(r.vendor, VOICE_DEFAULTS[id].vendor),
-      ...sandbox ? { sandbox } : {}
-    };
-  }
-  return out;
-}
-function loadVoices(file = VOICES_FILE) {
-  try {
-    return parseVoices(JSON.parse(fs12.readFileSync(file, "utf8")));
-  } catch {
-    return { ...VOICE_DEFAULTS };
-  }
-}
-function listVoices(file = VOICES_FILE) {
-  const all = loadVoices(file);
-  return VOICE_IDS.map((id) => all[id]);
 }
 
 // src/modes/brainstorm/index.ts
@@ -3300,6 +3767,10 @@ export {
   EVIDENCE_SEATS,
   FINDINGS_INSTRUCTIONS,
   GROK_SANDBOX_PROFILE,
+  HOLISTIC_DEFAULTS,
+  HOLISTIC_MIN_ANCHOR_NONWS,
+  HOLISTIC_SEAT_ID,
+  HOLISTIC_SEVERITY_CAP,
   IMPLEMENTED_MODES,
   MODES,
   MODE_ALIASES,
@@ -3328,6 +3799,7 @@ export {
   acquireDiff,
   acquireRepoLock,
   allowedRootsFromConfig,
+  applyHolisticPolicy,
   assembleCodePacket,
   buildClaudeVoiceArgs,
   buildCodexReviewArgs,
@@ -3336,6 +3808,7 @@ export {
   buildEvidenceManifest,
   buildGrokReviewArgs,
   canonicalizeDiff,
+  capHolisticSeverity,
   classifyFileKind,
   classifyGitError,
   classifySecurityFinding,
@@ -3357,13 +3830,18 @@ export {
   extractJsonBlock,
   extractRefs,
   fallbackSynthesis,
+  findQuoteSpan,
+  findQuoteSpans,
   formatEvidenceShortfall,
   fsConventionReader,
   gatherConventions,
   hasDepSurface,
+  holisticCapWasLifted,
+  isConventionsDoc,
   isDiffReviewed,
   isEvidenceClass,
   isEvidenceSeat,
+  isHolisticRecord,
   isImplemented,
   isMode,
   isPolicyVersion,
@@ -3376,6 +3854,8 @@ export {
   killTree,
   listReviewers,
   listVoices,
+  loadHolisticFixture,
+  loadHolisticSeat,
   loadReviewers,
   loadVoices,
   makeEscalatingKill,
@@ -3383,9 +3863,11 @@ export {
   memoryConventionReader,
   omittedLine,
   oneOf,
+  parseConventionCitation,
   parseCritique,
   parseDiffFiles,
   parseFindings,
+  parseHolisticSites,
   parseIdeas,
   parseLsTree,
   parseReviewerIds,
@@ -3409,6 +3891,7 @@ export {
   renderCodexSandboxProfile,
   renderCritiquePrompt,
   renderGeneratePrompt,
+  renderHolisticPrompt,
   renderReviewPrompt,
   renderSynthesisPrompt,
   resolveBase,
@@ -3416,6 +3899,8 @@ export {
   resolveClaudeBin,
   resolveCodexBin,
   resolveGrokBin,
+  resolveHolisticPlan,
+  resolveHolisticSeat,
   resolveInRepo,
   resolveMode,
   resolvePolicyVersion,
@@ -3431,11 +3916,13 @@ export {
   runClaudeVoice,
   runCodexReview,
   runGrokReview,
+  runHolisticLens,
   runReviewMode,
   runReviewerExec,
   sanitizePathSegment,
   scanDependencySurface,
   scanDiffForSecrets,
+  scoreHolisticFixture,
   section,
   securityClassLabel,
   segmentsWithoutTruncationSplices,
@@ -3444,6 +3931,9 @@ export {
   summarizeCoverage,
   titleCase,
   validateReceiptShape,
+  verifyFixtureAnchors,
+  verifySiteAtHead,
+  worktreeReader,
   wrapWithSandbox,
   writeCodexSandboxProfile,
   writeEvidenceManifest,

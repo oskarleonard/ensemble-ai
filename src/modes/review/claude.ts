@@ -78,6 +78,10 @@ export function runClaudeReviewVoice(
     args: buildClaudeReviewArgs(prompt, config),
     bin: resolveClaudeBin(),
     capture: 'stdout',
+    // WORKTREE EVIDENCE (§2): for this harness-controlled CLI the spawn CWD is what makes a seat a
+    // worktree seat — its file/git tools reach the project there. Absent ⇒ the throwaway tmpdir the
+    // packet path has always used. The seat never owns the worktree; the run reaps it.
+    ...(opts.worktree ? { cwd: opts.worktree } : {}),
     onSpawn: opts.onSpawn,
     stderrLimit: 2000,
     timeoutMs,

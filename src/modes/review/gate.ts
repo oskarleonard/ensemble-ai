@@ -28,6 +28,19 @@ import {
   parseSeverity,
 } from './gate-postable';
 import {
+  type ConventionCitation,
+  type HolisticEntry,
+  type HolisticPolicyDeps,
+  type HolisticProvenance,
+  type HolisticSite,
+  applyHolisticPolicy,
+  capHolisticSeverity,
+  holisticCapWasLifted,
+  isHolisticRecord,
+  parseConventionCitation,
+  parseHolisticSites,
+} from './holistic-gate';
+import {
   fallbackReviewSynthesis,
   parseAgreements,
   parseDisagreements,
@@ -282,11 +295,16 @@ export interface RawVerdictEntry {
   // the host honors it solely on worktree evidence (see reconcileGateVerdicts).
   cause?: string;
   citation?: string;
+  // HOLISTIC-lens verdicts only (spec §4): the conventions-doc citation that may lift the MED
+  // severity cap, and the two sites an `agree` must quote. Both are re-verified against the tree
+  // at headSha by the HOST (holistic-gate.ts) — the model's say-so grounds nothing.
+  conventionCitation?: ConventionCitation;
   findingId: string;
   fixStatus?: FixStatus; // disposition the gate assigned the reviewer's suggested fix
   ops?: PostableOp[]; // minimal edit-ops narrowing the body (partial only)
   reason: string;
   rescoredSeverity?: Severity; // gate's down-scored severity (host clamps: never higher)
+  sites?: HolisticSite[]; // holistic only — the reinvention in the diff + the pattern's home
   verdict: unknown;
 }
 
@@ -316,6 +334,8 @@ function parseVerdicts(v: unknown): RawVerdictEntry[] {
     const ops = parsePostableOps(e.ops);
     const fixStatus = parseFixStatus(e.fixStatus);
     const rescoredSeverity = parseSeverity(e.rescoredSeverity);
+    const sites = parseHolisticSites(e.sites);
+    const conventionCitation = parseConventionCitation(e.conventionCitation);
     out.push({
       citation: typeof e.citation === 'string' ? capStr(e.citation, CITATION_CAP) : undefined,
       findingId,
@@ -324,8 +344,10 @@ function parseVerdicts(v: unknown): RawVerdictEntry[] {
       // conditional so an old-shape (no-ops) entry parses to the exact prior shape
       ...(ops.length ? { ops } : {}),
       ...(typeof e.cause === 'string' && e.cause.trim() ? { cause: e.cause.trim() } : {}),
+      ...(conventionCitation ? { conventionCitation } : {}),
       ...(fixStatus ? { fixStatus } : {}),
       ...(rescoredSeverity ? { rescoredSeverity } : {}),
+      ...(sites ? { sites } : {}),
     });
   }
   return out;
@@ -359,6 +381,10 @@ export interface GateVerdictRecord {
   effectiveVerdict: GateVerdict;
   file: string;
   findingId: string;
+  // HOLISTIC-lens records only: single-seat provenance + what the host verified (the MED cap it
+  // applied, the conventions citation that lifted it, the two sites it located at headSha).
+  // Additive + optional — a v2 consumer reads these records exactly as before.
+  holistic?: HolisticProvenance;
   line: number | null;
   postableBody: string | null; // EXACT text to post (verbatim for agree, narrowed for partial); null ⇒ do not post
   postableFix: FixStatus | null; // disposition of the reviewer's suggested fix
@@ -419,20 +445,27 @@ export function reconcileGateVerdicts(
   findings: GateFinding[],
   parsed: ParsedGateEnvelope | WholeEnvelopeFailure,
   // The gate's REALIZED evidence class. Defaults to 'packet' — the pre-worktree behavior.
-  opts: { gateEvidence?: EvidenceClass } = {}
+  // `holistic` supplies the worktree-backed verification the lens's own guardrails need; absent
+  // ⇒ any holistic record present is fail-closed (it cannot be verified against anything).
+  opts: { gateEvidence?: EvidenceClass; holistic?: HolisticPolicyDeps } = {}
 ): { records: GateVerdictRecord[]; warnings: string[] } {
   const gateEvidence: EvidenceClass = opts.gateEvidence ?? 'packet';
   if ('failure' in parsed) {
     const reason = FAILURE_REASON[parsed.failure];
     return {
-      records: findings.map((f) => ({
-        ...recordBase(f),
-        ...NOT_POSTABLE,
-        downgradeReason: parsed.failure,
-        effectiveVerdict: 'unverified',
-        rawVerdict: null,
-        reason,
-      })),
+      // Nothing here is postable, but the lens's MED cap is a HOST guarantee on every path: a
+      // failed gate must not leave the lens's own model-asserted `high` standing in the trail or
+      // on stdout. The full policy cannot run — there are no verdict entries to read sites off.
+      records: findings.map((f) =>
+        capHolisticSeverity({
+          ...recordBase(f),
+          ...NOT_POSTABLE,
+          downgradeReason: parsed.failure,
+          effectiveVerdict: 'unverified',
+          rawVerdict: null,
+          reason,
+        })
+      ),
       warnings: [],
     };
   }
@@ -498,7 +531,7 @@ export function reconcileGateVerdicts(
   // Postable-text pass: agree/partial derive their exact PR text (verbatim / narrowed) from the
   // reviewer body + the gate's ops; everything else is not-postable. One place → one source of
   // truth for what may cross to a PR.
-  const records = baseRecords.map((r): GateVerdictRecord => {
+  const postableRecords = baseRecords.map((r): GateVerdictRecord => {
     if (r.effectiveVerdict !== 'agree' && r.effectiveVerdict !== 'partial') return { ...r, ...NOT_POSTABLE };
     const f = findingById.get(r.findingId);
     const e = (byId.get(r.findingId) ?? [])[0];
@@ -516,6 +549,21 @@ export function reconcileGateVerdicts(
       }),
     };
   });
+
+  // The HOLISTIC pass (spec §4). Skipped ENTIRELY when the lens produced no findings, so the
+  // default-off path — every packet-mode run — is byte-identical to before: same records, same
+  // object identities, no branch taken. When the lens IS on, its records are the only ones this
+  // touches: MED cap unless a conventions citation verifies, agree-only posting, both sites
+  // located in the tree at headSha.
+  const records = postableRecords.some(isHolisticRecord)
+    ? applyHolisticPolicy(
+        postableRecords,
+        new Map<string, HolisticEntry | undefined>(
+          findings.map((f) => [f.findingId, (byId.get(f.findingId) ?? [])[0]])
+        ),
+        opts.holistic ?? null
+      )
+    : postableRecords;
   return { records, warnings };
 }
 
@@ -529,7 +577,7 @@ export function honoredHighDismissals(
 ): string[] {
   if (!trailWritten) return [];
   return records
-    .filter((r) => r.severity === 'high' && r.effectiveVerdict === 'false')
+    .filter((r) => r.severity === 'high' && r.effectiveVerdict === 'false' && !isHolisticRecord(r))
     .map((r) => r.findingId);
 }
 
@@ -591,12 +639,21 @@ export interface HighGateDecision {
   gatingHighIds: string[]; // HIGHs that still gate → exit 4
 }
 
+// The records the HIGH gate considers. The holistic lens is EXCLUDED by construction: its findings
+// are suggestions from one seat, so they may never flip the exit contract in either direction — not
+// gate a run (an uncapped HIGH is still advice about architecture, not a defect in the change) and
+// not be dismissed as if a reviewer had raised them. With the lens off this set is every record, so
+// the exit contract is bit-for-bit the pre-lens one.
+function highGateRecords(records: GateVerdictRecord[]): GateVerdictRecord[] {
+  return records.filter((r) => r.severity === 'high' && !isHolisticRecord(r));
+}
+
 export function resolveHighGate(
   records: GateVerdictRecord[],
   trailWritten: boolean,
   authorityActive: boolean
 ): HighGateDecision {
-  const highIds = records.filter((r) => r.severity === 'high').map((r) => r.findingId);
+  const highIds = highGateRecords(records).map((r) => r.findingId);
   if (!authorityActive) return { dismissedHighIds: [], gatingHighIds: highIds };
   const dismissed = new Set(honoredHighDismissals(records, trailWritten));
   return {
@@ -615,7 +672,7 @@ export function renderHighGate(
   opts: { authorityActive: boolean; authorityLabel: string; scrub: (s: string) => string }
 ): string[] {
   const s = opts.scrub;
-  const highs = records.filter((r) => r.severity === 'high');
+  const highs = highGateRecords(records); // the lens is advisory — never part of the HIGH gate
   if (highs.length === 0) return [];
   const byId = new Map(records.map((r) => [r.findingId, r]));
   const out: string[] = ['', `  ── gate authority — ${opts.authorityLabel} ──`];
@@ -715,8 +772,15 @@ export function renderGateVerdicts(
       const where = evidenceRef(r.file, r.line, s);
       const dg = r.downgradeReason ? `  (host: ${r.downgradeReason})` : '';
       const reason = r.reason ? ` — ${s(r.reason).slice(0, 200)}` : '';
+      // A holistic record NAMES its lens inline. Its provenance is one seat that read the whole
+      // tree — never the cross-reviewer corroboration the other records may carry. The cap is
+      // reported as LIFTED only when the severity actually sits above it: a LOW finding may carry
+      // a verified citation too, and claiming it uncapped anything would be a false claim.
+      const lens = r.holistic
+        ? `  [holistic lens · single seat${r.holistic.cappedFrom ? ` · severity capped from ${r.holistic.cappedFrom}` : ''}${holisticCapWasLifted(r) ? ' · MED cap lifted by a verified conventions citation' : ''}]`
+        : '';
       out.push(
-        `     [${r.effectiveVerdict}] ${r.findingId} [${r.severity}] ${where}  ${s(r.title).slice(0, 120)}${reason}${dg}`
+        `     [${r.effectiveVerdict}] ${r.findingId} [${r.severity}] ${where}  ${s(r.title).slice(0, 120)}${reason}${dg}${lens}`
       );
     }
   }
@@ -728,6 +792,13 @@ export function renderGateVerdicts(
   // signal (a weak gate model mostly yields unverified). Deterministic, from the counts.
   if (records.length > 0 && c.agree + c.partial + c.false === 0) {
     out.push('  gate teeth did not engage — consider a stronger gate model');
+  }
+  // Say the honest thing about the lens wherever its findings are shown (spec §4): one seat, no
+  // corroboration signal, and silence proves nothing about the architecture.
+  if (records.some((r) => r.holistic)) {
+    out.push(
+      '  holistic lens: ONE seat that read the whole tree — its findings never carry the cross-reviewer "flagged by N of M" signal, post agree-only as suggestions, and cap at MED unless a conventions doc is cited and verified. A clean holistic pass is NOT an architecture certification (whole-repo search varies run to run).'
+    );
   }
   out.push(
     opts.trailWritten
@@ -759,11 +830,19 @@ export interface RunGateOptions {
   // neutral judge (gate-r3 pin 1): worktree ⇒ it read the PR head and may emit
   // `reference-not-found`; packet ⇒ it structurally cannot, and the cause is dropped.
   gateEvidence?: EvidenceClass;
+  // Worktree-backed verification for the holistic lens's guardrails (spec §4). `diffFiles` is
+  // derived HERE from the pinned packet (the one source of "what this PR changes"), so a caller
+  // supplies only the tree reader + the run's gathered conventions paths.
+  holistic?: Omit<HolisticPolicyDeps, 'diffFiles'>;
   log?: (m: string) => void;
   reviews: VoiceReview[];
   run: GateRunner;
   runId: string;
   timeoutMs?: number;
+  // The detached read-only worktree of the PR head — the gate's spawn cwd when it is worktree-fed.
+  // Reading the tree is what lets it locate a holistic finding's pattern site (and tell a missing
+  // reference from a truncated window). BORROWED: the run owns and reaps it.
+  worktree?: string;
 }
 
 // Run the gate end-to-end: read the pinned packet → resolve+budget each finding's hunk →
@@ -794,6 +873,11 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   ): GateRunResult => {
     const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed, {
       gateEvidence: opts.gateEvidence,
+      // The pinned packet's file set IS "what this PR changes" — the same bytes the reviewers saw.
+      // A holistic `agree` must cite its reinvention inside it.
+      ...(opts.holistic
+        ? { holistic: { ...opts.holistic, diffFiles: new Set(packetHunks.keys()) } }
+        : {}),
     });
     for (const w of warnings) log(`  · ${w}`);
     // Cross-reviewer dedup by selection — one representative per cluster posts; corroboration
@@ -836,7 +920,10 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   log('Gate: grounding findings against the pinned diff hunks — verdict tags…');
   let res: VoiceRunResult;
   try {
-    res = await opts.run(prompt, opts.config, { timeoutMs: opts.timeoutMs });
+    res = await opts.run(prompt, opts.config, {
+      timeoutMs: opts.timeoutMs,
+      ...(opts.worktree ? { worktree: opts.worktree } : {}),
+    });
   } catch (e) {
     return bail(
       `  · gate failed (${(e as Error).message}) — deterministic fallback + all unverified`,
