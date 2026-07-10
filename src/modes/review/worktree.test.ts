@@ -10,6 +10,8 @@ import {
   type GitRun,
   isPreflightError,
   materializeWorktree,
+  reapWorktree,
+  redactUrlCredentials,
   remoteSlug,
   resolveRepoLocation,
   rootAllowed,
@@ -29,6 +31,27 @@ describe('remoteSlug — every GitHub remote form normalizes to owner/repo', () 
 
   it('returns null for a non-GitHub remote (nothing to compare)', () => {
     expect(remoteSlug('git@gitlab.com:o/r.git')).toBeNull();
+  });
+});
+
+// A fetch failure prints the remote URL; an authenticated HTTPS remote carries a token there. The
+// message must never echo it (the raw URL is still what `git fetch` gets).
+describe('redactUrlCredentials — a token in the remote URL never reaches a message', () => {
+  it.each([
+    ['https://ghp_SECRETTOKEN@github.com/o/r.git', 'https://***@github.com/o/r.git'],
+    ['https://x-access-token:ghp_SECRET@github.com/o/r.git', 'https://***@github.com/o/r.git'],
+    ['ssh://git@github.com/o/r.git', 'ssh://***@github.com/o/r.git'],
+  ])('%s → %s', (url, redacted) => {
+    const out = redactUrlCredentials(url);
+    expect(out).toBe(redacted);
+    expect(out).not.toContain('SECRET');
+    expect(out).not.toContain('ghp_');
+  });
+
+  it('leaves a URL with no userinfo, and a scp-style git@ remote, untouched', () => {
+    expect(redactUrlCredentials('https://github.com/o/r.git')).toBe('https://github.com/o/r.git');
+    // scp-style has no `://`, so `git@` (a username, not a secret) stays.
+    expect(redactUrlCredentials('git@github.com:o/r.git')).toBe('git@github.com:o/r.git');
   });
 });
 
@@ -249,6 +272,36 @@ describe('materialization hardening — untrusted content is checked out INERT',
     // reaped: worktree remove + prune both ran
     expect(calls.some((c) => c.includes('remove'))).toBe(true);
     expect(calls.some((c) => c.includes('prune'))).toBe(true);
+  });
+
+  // `git worktree add` creates its directory with the process umask — 0755 under the common 022.
+  // Directly inside a shared temp root (Linux `/tmp`, mode 1777) that publishes the PRIVATE source
+  // of the PR under review to every other local user. The tree must sit inside an owner-only parent.
+  it('nests the worktree inside an owner-only (0700) parent, and never pre-creates the tree path', () => {
+    const { calls, git } = harness(headSha);
+    const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git, lock: noLock });
+    expect(isPreflightError(res)).toBe(false);
+    const dir = (res as { dir: string }).dir;
+    const parent = path.dirname(dir);
+    expect(path.basename(parent).startsWith('ensemble-worktree-')).toBe(true);
+    expect(fs.statSync(parent).mode & 0o777).toBe(0o700);
+    // git is handed a path that does NOT exist — it creates it. No delete-then-recreate race.
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(calls.find((c) => c.includes('worktree') && c.includes('add'))).toContain(dir);
+    reapWorktree('/repo', dir, { git });
+    expect(fs.existsSync(parent)).toBe(false); // the parent is reaped too, not leaked
+  });
+
+  // The name check is the whole safety of reaping a parent: hand reap an unrelated directory and
+  // it must not walk up and delete that directory's parent.
+  it('reapWorktree removes a parent ONLY when the parent is one of ours', () => {
+    const { git } = harness(headSha);
+    const outsider = fs.mkdtempSync(path.join(os.tmpdir(), 'not-ours-'));
+    const child = path.join(outsider, 'child');
+    fs.mkdirSync(child);
+    reapWorktree('/repo', child, { git });
+    expect(fs.existsSync(outsider)).toBe(true); // parent survived
+    fs.rmSync(outsider, { force: true, recursive: true });
   });
 
   it('a fetch failure maps to the taxonomy and never proceeds to worktree add', () => {

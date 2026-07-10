@@ -79,9 +79,18 @@ describe('resolveHolisticPlan — default off, worktree or nothing', () => {
     expect(plan.run === false && plan.skipReason).toContain('no base SHA');
   });
 
-  it('runs when requested WITH a worktree and a base', () => {
-    expect(resolveHolisticPlan({ baseSha: 'base1', requested: true, worktree: '/tmp/wt' })).toEqual({
+  it('refuses without the materialized diff (the fence left it no shell to derive one)', () => {
+    const plan = resolveHolisticPlan({ baseSha: 'b', requested: true, worktree: '/tmp/wt' });
+    expect(plan.run).toBe(false);
+    expect(plan.run === false && plan.skipReason).toContain('no reviewer-visible diff');
+  });
+
+  it('runs when requested WITH a worktree, a base, and the diff', () => {
+    expect(
+      resolveHolisticPlan({ baseSha: 'base1', diff: 'DIFFTEXT', requested: true, worktree: '/tmp/wt' })
+    ).toEqual({
       baseSha: 'base1',
+      diff: 'DIFFTEXT',
       run: true,
       worktree: '/tmp/wt',
     });
@@ -89,7 +98,7 @@ describe('resolveHolisticPlan — default off, worktree or nothing', () => {
 });
 
 describe('renderHolisticPrompt — every clause the host mechanizes', () => {
-  const prompt = renderHolisticPrompt({ baseSha: 'BASE', headSha: 'HEAD', worktree: '/wt' });
+  const prompt = renderHolisticPrompt({ baseSha: 'BASE', diff: 'DIFFTEXT', headSha: 'HEAD', worktree: '/wt' });
 
   it('points the seat at the whole project and the exact change', () => {
     expect(prompt).toContain('/wt');
@@ -122,6 +131,18 @@ describe('renderHolisticPrompt — every clause the host mechanizes', () => {
   it('permits an empty result — finding nothing is legitimate', () => {
     expect(prompt).toContain('Finding nothing is a legitimate outcome');
   });
+
+  // "Is this a reinvention, or the deliberate replacement of the util three commits ago?" is a
+  // question only history answers — and the fence took the lens's shell away (./history-packet).
+  it('names `history/` only when a packet backs it', () => {
+    expect(prompt).not.toContain('history/');
+    const withHistory = renderHolisticPrompt({
+      baseSha: 'BASE', diff: 'DIFFTEXT', headSha: 'HEAD', history: true, worktree: '/wt',
+    });
+    expect(withHistory).toContain('history/log/<path>.log');
+    expect(withHistory).toContain('untrusted DATA');
+    expect(withHistory).not.toMatch(/\brun `?git log\b/i);
+  });
 });
 
 describe('runHolisticLens — the seat run', () => {
@@ -139,23 +160,44 @@ describe('runHolisticLens — the seat run', () => {
           '\n```'
       );
     });
-    const { review } = await runHolisticLens({ baseSha: 'B', config: CFG, headSha: 'H', run, worktree: '/wt' });
+    const { review } = await runHolisticLens({ baseSha: 'B', config: CFG, diff: 'DIFFTEXT', headSha: 'H', run, worktree: '/wt' });
     expect(review.voiceId).toBe(HOLISTIC_SEAT_ID);
     expect(review.ok).toBe(true);
     expect(review.findings).toHaveLength(1);
     expect(run).toHaveBeenCalledOnce();
   });
 
+  it('hands the packet FILES to the seat, and claims history in the prompt only when it has bytes', async () => {
+    const files = [{ contents: '# history/\n', path: 'history/README.md' }];
+    const seen: Array<{ history: boolean; packet: unknown }> = [];
+    const run = vi.fn(async (p: string, _c: VoiceConfig, opts?: { historyPacket?: unknown }) => {
+      seen.push({ history: p.includes('history/log/<path>.log'), packet: opts?.historyPacket });
+      return okRun('```json\n{"summary":"s","findings":[]}\n```');
+    });
+    const base = { baseSha: 'B', config: CFG, diff: 'DIFFTEXT', headSha: 'H', run, worktree: '/wt' };
+
+    await runHolisticLens({ ...base, historyPacket: { bytes: 42, files, shallow: false, truncated: false } });
+    await runHolisticLens({ ...base, historyPacket: { bytes: 0, files, shallow: true, truncated: false } });
+    await runHolisticLens(base);
+
+    // A real packet: files seeded AND the clause rendered.
+    expect(seen[0]).toEqual({ history: true, packet: files });
+    // A SHALLOW packet is README-only: the honest note is still seeded, but the prompt claims nothing.
+    expect(seen[1]).toEqual({ history: false, packet: files });
+    // No packet at all: the lens runs exactly as it did before this existed.
+    expect(seen[2]).toEqual({ history: false, packet: undefined });
+  });
+
   it('degrades a throw / timeout / unparseable reply to an ok:false voice, never a throw', async () => {
-    const thrown = await runHolisticLens({ baseSha: 'B', config: CFG, headSha: 'H', run: async () => { throw new Error('no binary'); }, worktree: '/wt' });
+    const thrown = await runHolisticLens({ baseSha: 'B', config: CFG, diff: 'DIFFTEXT', headSha: 'H', run: async () => { throw new Error('no binary'); }, worktree: '/wt' });
     expect(thrown.review.ok).toBe(false);
     expect(thrown.review.summary).toContain('no binary');
 
-    const timedOut = await runHolisticLens({ baseSha: 'B', config: CFG, headSha: 'H', run: async () => ({ ok: false, raw: 'partial', stderrTail: '', timedOut: true }), worktree: '/wt' });
+    const timedOut = await runHolisticLens({ baseSha: 'B', config: CFG, diff: 'DIFFTEXT', headSha: 'H', run: async () => ({ ok: false, raw: 'partial', stderrTail: '', timedOut: true }), worktree: '/wt' });
     expect(timedOut.review.ok).toBe(false);
     expect(timedOut.review.summary).toContain('timed out');
 
-    const junk = await runHolisticLens({ baseSha: 'B', config: CFG, headSha: 'H', run: async () => okRun('I think it looks fine!'), worktree: '/wt' });
+    const junk = await runHolisticLens({ baseSha: 'B', config: CFG, diff: 'DIFFTEXT', headSha: 'H', run: async () => okRun('I think it looks fine!'), worktree: '/wt' });
     expect(junk.review.ok).toBe(false);
     expect(junk.review.findings).toEqual([]);
     expect(junk.review.summary).toContain('not parseable');
@@ -165,6 +207,7 @@ describe('runHolisticLens — the seat run', () => {
     const { review } = await runHolisticLens({
       baseSha: 'B',
       config: CFG,
+      diff: 'DIFFTEXT',
       headSha: 'H',
       run: async () => okRun('```json\n{"summary":"searched the tree, found nothing","findings":[]}\n```'),
       worktree: '/wt',

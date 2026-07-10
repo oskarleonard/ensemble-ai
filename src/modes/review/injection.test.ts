@@ -149,6 +149,7 @@ describe('the codex wrapper profile denies every credential outside its own auth
   const profile = renderCodexSandboxProfile({
     codexHome: '/home/u/.codex',
     nodePrefix: '/usr/local',
+    proxyPort: 54321,
     worktree: '/private/tmp/wt',
   });
 
@@ -171,21 +172,31 @@ describe('the codex wrapper profile denies every credential outside its own auth
     expect(profile).toMatch(/read an untrusted file as DATA/);
   });
 
-  it('network is PORT-scoped, and the profile does NOT claim a per-host allowlist', () => {
-    expect(profile).toContain('(remote ip "*:443")');
-    // Seatbelt cannot express a DNS host; asserting it would be a lie we must never ship.
+  // codex-f3: outbound is no longer PORT-scoped. The any-host :443 grant and the :53 DNS channel
+  // are GONE, and the seat's only route off the machine is the engine's loopback egress proxy.
+  it('denies the any-host :443 grant and the :53 DNS exfiltration channel', () => {
+    expect(profile).not.toContain('(remote ip "*:443")');
+    expect(profile).not.toContain('(remote ip "*:53")');
+    // Seatbelt still cannot express a host; the allowlist lives in the proxy, never in SBPL.
     expect(profile).not.toContain('api.openai.com');
-    expect(profile).toContain('per-host DNS allowlist');
+    expect(profile).not.toContain('chatgpt.com');
   });
 
   // The profile's own comment is the thing readers trust. Pin the FULL network rule set against
-  // it so the two can never drift into an over-claim ("443 only") the rules do not honor.
-  it('states the network surface it ACTUALLY grants — 443 and DNS and unix sockets, plus inbound', () => {
-    expect(profile).toContain('(allow network-outbound (remote ip "*:443") (remote ip "*:53") (remote unix-socket))');
+  // it so the two can never drift into an over-claim the rules do not honor.
+  it('grants exactly ONE loopback port — the egress proxy — plus the mDNSResponder socket and inbound', () => {
+    // The unix-socket grant is PATH-SCOPED to mDNSResponder (codex-f1), never a blanket
+    // `(remote unix-socket)` — which was an off-proxy exfil channel.
+    expect(profile).toContain(
+      '(allow network-outbound (remote ip "localhost:54321") (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))'
+    );
+    expect(profile).not.toMatch(/\(remote unix-socket\)/);
     expect(profile).toContain('(allow network-inbound (local ip "*:*"))');
-    expect(profile).not.toMatch(/network is PORT-scoped \(443\)/); // the retired over-claim
-    expect(profile).toMatch(/not 443-only/);
-    expect(profile).toMatch(/53 \(DNS\)/);
+    expect(profile).toMatch(/outbound network is DENIED except the one loopback port/);
+    // It must keep admitting what the fence does NOT close, or the comment becomes an over-claim.
+    // (Matched per-line: the SBPL comment wraps, so a sentence-long regex would test the wrapping.)
+    expect(profile).toMatch(/still sends its own credential/);
+    expect(profile).toMatch(/hostname resolution still works/i);
   });
 
   // /private/var contains the per-user $TMPDIR. The profile must SAY so rather than let a reader

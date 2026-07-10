@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import {
@@ -68,6 +69,17 @@ export function reviewDir(baseDir: string, runId: string): string {
 // an escape here — a caller that must also reject the base itself adds a `!rel` guard.
 export function escapesRoot(rel: string): boolean {
   return rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
+}
+
+// Every engine-owned temp dir is OWNER-ONLY: a shared temp root is world-readable, and these dirs
+// hold the private PR source, a seat's Seatbelt profile, and a seat's reply. `mkdtemp` already
+// promises 0700 — the chmod asserts it rather than trusting the platform's umask. ONE definition,
+// so the posture cannot drift between the worktree parent, the sandbox profile, the seat cwd, and
+// the reply dir. The caller owns the reap: mkdtemp names are random, so a leaked dir is unfindable.
+export function makeOwnerOnlyTempDir(prefix: string, root: string = os.tmpdir()): string {
+  const dir = fs.mkdtempSync(path.join(root, prefix));
+  fs.chmodSync(dir, 0o700);
+  return dir;
 }
 
 function writeAtomic(root: string, dir: string, name: string, content: string): void {

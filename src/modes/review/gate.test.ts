@@ -439,6 +439,31 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
     }
   });
 
+  // `gateSpawned` is what the run's REALIZED evidence for the `gate` seat is derived from. A gate
+  // that never spawned read NOTHING, so a receipt must not attest it read the worktree; one that
+  // spawned and returned garbage DID have the tree open, and says so honestly.
+  it('gateSpawned is false ONLY when the seat never ran (no healthy reviewer / spawn threw)', async () => {
+    const good = async (): Promise<VoiceRunResult> => okRun(goodEnvelope);
+    const threw = async (): Promise<VoiceRunResult> => { throw new Error('boom'); };
+    const timedOut = async (): Promise<VoiceRunResult> => ({ ok: false, raw: null, stderrTail: '', timedOut: true });
+    const garbage = async (): Promise<VoiceRunResult> => okRun('not json');
+    const noHealthy = [{ ...review('codex', [f({ title: 'x' })]), ok: false }];
+
+    const cases: [string, () => Promise<VoiceRunResult>, typeof reviews, boolean][] = [
+      ['a clean run', good, reviews, true],
+      ['spawn threw — never reached the worktree', threw, reviews, false],
+      ['no healthy reviewer — the seat is never spawned', good, noHealthy, false],
+      // Ran, but produced nothing usable: it still had the worktree open as its cwd.
+      ['timed out after spawning', timedOut, reviews, true],
+      ['unparseable envelope', garbage, reviews, true],
+    ];
+    for (const [label, run, rs, expected] of cases) {
+      const { base, runId } = seed();
+      const res = await runGate({ baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews: rs, run, runId });
+      expect(res.gateSpawned, label).toBe(expected);
+    }
+  });
+
   it('a missing / sha-mismatched packet at gate time ⇒ all verdicts unverified(packet-fail), prose kept (DC12)', async () => {
     // No packet seeded → packet-fail; the gate still returns a good envelope for PROSE.
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-rg-'));

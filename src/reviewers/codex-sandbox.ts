@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { makeOwnerOnlyTempDir } from '../core/artifacts';
 import type { SandboxProfileRef } from '../modes/review/evidence';
 
 // THE CODEX WRAPPER PROFILE — an ensemble-OWNED external sandbox that gives the codex seat the
@@ -32,21 +33,70 @@ import type { SandboxProfileRef } from '../modes/review/evidence';
 //     "no credential anywhere but ~/.codex" — the true claim is "no credential in $HOME".
 //   · WRITES: `~/.codex`, `/private/tmp` (the legacy world-shared /tmp, not the per-user
 //     $TMPDIR), and `/dev`. `/private/tmp` is shared with every user on the box.
-//   · NETWORK is PORT-scoped, never per-HOST, and it is NOT 443-only. Outbound: TCP/UDP 443 AND
-//     53 (DNS resolution) AND local unix sockets. Inbound: any local port (codex binds loopback
-//     helpers). Port 53 to any IP is a working DNS-exfiltration channel, so combined with the
-//     read-as-data vector above the seat has an egress path for whatever it can read.
-//     Seatbelt cannot express a DNS-host allowlist: `(remote host …)` is an unbound variable and
-//     `(remote tcp "api.openai.com:443")` is rejected with "host must be * or localhost". So the
-//     spec's per-HOST vendor-API intent is NOT achievable in Seatbelt. A true per-host fence
-//     needs an egress proxy — deliberately out of v1, and NOT claimed here.
+//   · NETWORK is now HOST-scoped, via the engine's egress proxy (codex-f3). This profile denies ALL
+//     outbound except ONE loopback port — the in-process CONNECT proxy the engine starts for this
+//     seat — plus local unix sockets. The seat is spawned with HTTPS_PROXY/HTTP_PROXY/ALL_PROXY
+//     pointed at it, so its every connection arrives there as a CONNECT and is matched against the
+//     vendor's host allowlist (see ./egress-hosts). Seatbelt still cannot express the host rule
+//     itself — `(remote tcp "api.openai.com:443")` is rejected with "host must be * or localhost" —
+//     which is why the fence is a proxy the profile pins the seat to, rather than an SBPL rule.
+//     Verified 2026-07-10 under this exact rule set: TCP `*:443` EPERM · UDP and TCP `*:53` EPERM
+//     (the old DNS-exfiltration channel is CLOSED) · the one allowed loopback port connects · a
+//     DIFFERENT loopback port EPERM. Inbound stays any local port (codex binds loopback helpers).
+//   · WHAT THE FENCE STILL DOES NOT STOP, stated rather than glossed: the seat reads its own
+//     credential in-process and sends it to the ALLOWED vendor host — irreducible without a token
+//     broker. An allowed host is allowed for arbitrary bytes. And hostname RESOLUTION survives
+//     (getaddrinfo reaches mDNSResponder over mach-lookup, not a `:53` socket; denying the DNS mach
+//     global-names was probed and does NOT stop it), so a low-bandwidth resolver side channel
+//     remains. What is closed is the DNS *socket* channel and every direct connection to a host the
+//     allowlist does not name.
 //
 // Any change to the rules below MUST bump `version` — a receipt minted under a weaker profile
 // must never verify as equivalent to one minted under a tighter one (evidence.ts).
+//
+// The id NAMES THE MECHANISM, not just the fact of a fence. `+egress-proxy` alone was ambiguous:
+// grok's seat carried a near-identical id while its egress was bounded only by proxy ENV VARS, so a
+// receipt reader could not tell a kernel-denied seat from an env-routed one without reading the PR.
+// An identity that does not encode what actually happened is the exact defect this evidence machinery
+// exists to prevent, so the two ids now diverge on the mechanism: `-kernel` here, `-proxy-env-noshell`
+// on grok (see GROK_SANDBOX_PROFILE).
+//
+// VERSIONS ADVANCE ACROSS A RENAME, never reset. The integer is monotonic over this seat's whole
+// FENCE LINEAGE (`ensemble-review-codex` v1 → `…+egress-proxy` v2 → this), so no (id, version) pair
+// is ever reused for two different fences, and a reader comparing versions alone still sees which is
+// newer. Historical receipts are never rewritten: each stays readable under the id it was issued
+// with. (Neither `…+egress-proxy` v2 nor grok's `ensemble-review+egress-proxy` v1 ever reached main —
+// both were introduced by this same unmerged PR — so no released receipt is affected by the rename.)
 export const CODEX_SANDBOX_PROFILE: SandboxProfileRef = {
-  id: 'ensemble-review-codex',
-  version: 1,
+  // KERNEL-denied outbound: Seatbelt refuses every direct connection except the one loopback port
+  // where the engine's CONNECT proxy enforces the host allowlist (`*:443` and `*:53` verified EPERM).
+  id: 'ensemble-review-codex+egress-proxy-kernel',
+  // v2 (cross-vendor codex-f1): the network-outbound rule granted `(remote unix-socket)` for ANY
+  // socket — a hole the CONNECT proxy never saw. A prompt-injected seat could reach a local agent
+  // socket (an ssh-agent, a Docker-style API) under a readable root and exfiltrate off-proxy, while
+  // `egress-denials.json` stayed empty and the receipt still claimed host-fenced egress. Verified
+  // live 2026-07-10: under the old rule a sandboxed process wrote to an arbitrary unix socket; under
+  // the narrowed rule that write is EPERM while DNS still resolves. A weaker fence must never verify
+  // as equivalent to this one, so the version bumps.
+  // v3: no RULE change — the id was renamed to name the mechanism (above), and the lineage advances.
+  version: 3,
 };
+
+// The ONE directory a sandboxed codex seat may write to that is neither its own config nor /dev:
+// the legacy world-shared `/tmp`, spelled as the path Seatbelt resolves (`/tmp` is a symlink to
+// it). Exported because the seat must place its `-o` reply file under a root the profile below
+// actually grants — the per-user `$TMPDIR` is READ-only here, and a reply written there fails with
+// EPERM after a completed review. Two modules naming the same literal is how that regression gets
+// reintroduced, so the profile owns the constant and codex.ts imports it.
+export const SANDBOX_WRITABLE_TMP = '/private/tmp';
+
+// The ONE unix-domain socket the seat may open: macOS routes `getaddrinfo` to mDNSResponder over
+// this socket, so the seat cannot resolve its vendor host without it (verified 2026-07-10: with the
+// socket denied, `dns.lookup` returns ENOTFOUND). A BLANKET `(remote unix-socket)` grant would also
+// hand the seat every other local agent socket — an off-proxy exfil channel (codex-f1) — so the
+// grant is path-scoped to exactly this. SBPL `path-literal` matches the RESOLVED path, so it is the
+// `/private/var` form, not the `/var` symlink (the `/var` spelling was verified NOT to match).
+export const MDNS_RESPONDER_SOCKET = '/private/var/run/mDNSResponder';
 
 // Read-allowed system roots. Deny-by-default means everything absent from this list — every
 // credential in $HOME, every other repo on disk — is kernel-unreadable to the seat.
@@ -86,6 +136,8 @@ export interface CodexSandboxPaths {
   codexHome: string;
   // Where node + the codex install live (resolved from the running node, not guessed).
   nodePrefix: string;
+  // The loopback port of THIS run's egress proxy — the seat's only route off the machine.
+  proxyPort: number;
   // The worktree root, ALREADY REALPATH'd. Seatbelt matches resolved paths, so a
   // `/tmp/...` (symlink to `/private/tmp/...`) subpath rule silently matches nothing.
   worktree: string;
@@ -110,8 +162,16 @@ export function renderCodexSandboxProfile(p: CodexSandboxPaths): string {
       );
     }
   }
+  // The egress rule is the whole fence: a port that is not a real port would either be dropped by
+  // Seatbelt (leaving the seat with NO route, a silent 12-minute hang) or — spelled as `*` — grant
+  // the very any-host egress this profile exists to deny. Refuse to emit either.
+  if (!Number.isInteger(p.proxyPort) || p.proxyPort < 1 || p.proxyPort > 65535) {
+    throw new Error(
+      `ensemble-ai: refusing to build the codex sandbox profile — proxyPort ${String(p.proxyPort)} is not a valid TCP port. The seat's only egress route is that loopback port; without it the profile would fence nothing. The codex seat must fall back to the packet.`
+    );
+  }
   return `(version 1)
-;; ensemble-review-codex v${CODEX_SANDBOX_PROFILE.version} — generated by ensemble-ai. Do not hand-edit.
+;; ${CODEX_SANDBOX_PROFILE.id} v${CODEX_SANDBOX_PROFILE.version} — generated by ensemble-ai. Do not hand-edit.
 ;; Deny-by-default. The codex seat may read the PR worktree, its own auth, and the system roots.
 ;; $HOME is NOT readable, so no ssh key / vendor credential / other repo is reachable.
 ;; Containment caveats, stated rather than glossed:
@@ -119,9 +179,11 @@ export function renderCodexSandboxProfile(p: CodexSandboxPaths): string {
 ;;     ("sh <worktree>/x.sh"). The write/secret/network fences are the real boundary.
 ;;   · /private/var is readable and contains the per-user $TMPDIR, so a secret another process
 ;;     parked in its own temp dir IS readable here. The claim is "no credential in $HOME".
-;;   · network is PORT-scoped, not per-host, and not 443-only: outbound 443 AND 53 (DNS) AND
-;;     unix sockets; inbound any local port. Port 53 is a usable exfiltration channel.
-;;     Seatbelt cannot express a per-host DNS allowlist; a real fence needs an egress proxy.
+;;   · outbound network is DENIED except the one loopback port below — the engine's egress proxy,
+;;     which allows CONNECT only to this vendor's host allowlist — plus the single mDNSResponder unix
+;;     socket getaddrinfo needs (path-scoped, NOT a blanket unix-socket grant: codex-f1). Direct :443
+;;     and :53 (the old DNS-exfiltration channel) are gone. The seat still sends its own credential
+;;     to the ALLOWED vendor host, and hostname resolution still works — neither closable here.
 (deny default)
 (import "/System/Library/Sandbox/Profiles/bsd.sb")
 (allow process-fork)
@@ -140,8 +202,8 @@ export function renderCodexSandboxProfile(p: CodexSandboxPaths): string {
 (allow file-read* (subpath ${JSON.stringify(p.nodePrefix)}))
 (allow file-read* (subpath ${JSON.stringify(p.worktree)}))
 (allow file-read* (subpath ${JSON.stringify(p.codexHome)}))
-(allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath "/private/tmp") (subpath "/dev"))
-(allow network-outbound (remote ip "*:443") (remote ip "*:53") (remote unix-socket))
+(allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath ${JSON.stringify(SANDBOX_WRITABLE_TMP)}) (subpath "/dev"))
+(allow network-outbound (remote ip "localhost:${p.proxyPort}") (remote unix-socket (path-literal ${JSON.stringify(MDNS_RESPONDER_SOCKET)})))
 (allow network-inbound (local ip "*:*"))
 `;
 }
@@ -152,9 +214,19 @@ export function codexSandboxSupported(platform = process.platform): boolean {
   return platform === 'darwin' && fs.existsSync('/usr/bin/sandbox-exec');
 }
 
-export function defaultCodexSandboxPaths(worktree: string): CodexSandboxPaths {
+// The port used when the profile is RENDERED as a dry run (seat qualification), before this run's
+// proxy has bound its ephemeral port. Qualification asks "would the read roots be safe here?"; the
+// real port is interpolated at spawn, when it exists. 1 is a valid port, so the dry run exercises
+// the same validation the real render does.
+export const QUALIFY_PROBE_PORT = 1;
+
+export function defaultCodexSandboxPaths(
+  worktree: string,
+  proxyPort: number
+): CodexSandboxPaths {
   return {
     codexHome: path.join(os.homedir(), '.codex'),
+    proxyPort,
     // process.execPath is <prefix>/bin/node → <prefix> covers node AND the codex install that
     // sits beside it in the same nvm/npm prefix. This is only as narrow as the user's install
     // layout: `/bin/node` ⇒ `/` and `~/bin/node` ⇒ `$HOME`. renderCodexSandboxProfile REJECTS
@@ -174,8 +246,7 @@ export function writeCodexSandboxProfile(paths: CodexSandboxPaths): {
 } {
   // Render FIRST: an unsafe read root must throw before we create anything to clean up.
   const profile = renderCodexSandboxProfile(paths);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-sb-'));
-  fs.chmodSync(dir, 0o700);
+  const dir = makeOwnerOnlyTempDir('ensemble-sb-');
   const file = path.join(dir, 'ensemble-review-codex.sb');
   fs.writeFileSync(file, profile, { mode: 0o600 });
   fs.chmodSync(file, 0o600);

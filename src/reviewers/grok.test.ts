@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -40,14 +41,14 @@ type FakeChild = EventEmitter & {
 };
 
 let child: FakeChild | null = null;
-let lastOpts: { detached?: boolean; stdio: unknown[] } = { stdio: [] };
+let lastOpts: { detached?: boolean; env?: unknown; stdio: unknown[] } = { stdio: [] };
 
 beforeEach(() => {
   child = null;
   vi.mocked(spawn).mockImplementation(((
     _bin: string,
     _args: string[],
-    opts: { detached?: boolean; stdio: unknown[] }
+    opts: { detached?: boolean; env?: unknown; stdio: unknown[] }
   ) => {
     const c = new EventEmitter() as FakeChild;
     c.kills = [];
@@ -273,9 +274,9 @@ describe('runGrokReview (stdout capture)', () => {
 });
 
 // WORKTREE EVIDENCE QUALIFICATION (codex-f3). resolveReviewSandbox admits `strict` as well as
-// `ensemble-review`, but only `ensemble-review` carries the secret deny-list, and
-// GROK_SANDBOX_PROFILE hardcodes that id. Handing a `strict` seat the whole project would attest a
-// profile it never ran under, so the seat must fail closed instead.
+// `ensemble-review`, but only `ensemble-review` carries the secret deny-list, and that is the CLI
+// profile (GROK_CLI_SANDBOX) the receipt's id attests a seat ran behind. Handing a `strict` seat the
+// whole project would attest a profile it never ran under, so the seat must fail closed instead.
 describe('runGrokReview — the worktree is only granted under the QUALIFYING sandbox', () => {
   it('refuses the worktree under `strict`, and says why, without spawning', async () => {
     const spawned = vi.mocked(spawn);
@@ -298,3 +299,79 @@ describe('runGrokReview — the worktree is only granted under the QUALIFYING sa
     ).resolves.toMatchObject({ ok: false });
   });
 });
+
+// THE EGRESS FENCE, grok half (codex-f3). grok honors the standard proxy env vars — PROBED
+// 2026-07-10 the same way codex was: a logging CONNECT proxy saw its `cli-chat-proxy.grok.com:443`
+// tunnel. So its worktree seat is spawned pointed at the engine's proxy, which allows that host and
+// refuses everything else (its `api.mixpanel.com` telemetry included).
+describe('runGrokReview — the worktree seat is fenced by the egress proxy', () => {
+  it('hands the worktree seat the proxy env, with NO_PROXY forced empty', async () => {
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
+    const run = runGrokReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt });
+    await vi.waitFor(() => expect(spawned).toHaveBeenCalled());
+
+    const env = lastOpts.env as Record<string, string>;
+    expect(env.HTTPS_PROXY).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    expect(env.ALL_PROXY).toBe(env.HTTPS_PROXY);
+    expect(env.NO_PROXY).toBe('');
+    child?.emit('exit');
+    await run;
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  // A PACKET seat has no untrusted tree to be injected from, and its receipt attests no fence — so
+  // it is spawned exactly as before, with no proxy env at all.
+  it('leaves the packet path unfenced and unchanged — no proxy env', async () => {
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    const run = runGrokReview('p', CONFIG, { timeoutMs: 10_000 });
+    await vi.waitFor(() => expect(spawned).toHaveBeenCalled());
+    expect(lastOpts.env).toBeUndefined();
+    child?.emit('exit');
+    await run;
+  });
+
+  // THE TEARDOWN IS UNCONDITIONAL. `ensureSandboxProfile`, `resolveGrokBin` and `runReviewerExec`
+  // all sit between "the proxy is listening" and "the reply came back", and each can throw. On the
+  // old `.then()`-only teardown the proxy's listening server survived the throw — and because the
+  // CLI sets `process.exitCode` instead of calling `process.exit()`, that live handle kept the
+  // event loop alive and the run never exited. Assert the socket is actually GONE, not just that a
+  // close() was called.
+  it('closes the proxy when the spawn path throws, so no listening fence outlives the seat', async () => {
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    let port = 0;
+    spawned.mockImplementation(((
+      _bin: string,
+      _args: string[],
+      opts: { env?: Record<string, string> }
+    ) => {
+      port = Number(new URL(opts.env?.HTTPS_PROXY ?? '').port);
+      throw new Error('spawn exploded');
+    }) as unknown as typeof spawn);
+
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
+    try {
+      await expect(
+        runGrokReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt })
+      ).rejects.toThrow('spawn exploded');
+      expect(port).toBeGreaterThan(0);
+      await expect(dial(port)).rejects.toMatchObject({ code: 'ECONNREFUSED' });
+    } finally {
+      fs.rmSync(wt, { force: true, recursive: true });
+    }
+  });
+});
+
+// Connect to a loopback port, or reject with the OS error — the proof that a proxy is really down.
+function dial(port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const s = net.connect(port, '127.0.0.1', () => {
+      s.destroy();
+      resolve();
+    });
+    s.on('error', reject);
+  });
+}

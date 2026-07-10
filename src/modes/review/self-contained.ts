@@ -20,7 +20,8 @@ import type { RunReviewOpts } from '../../reviewers/codex';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
-import { runClaudeReviewVoice } from './claude';
+import { claudeWorktreePromptSuffix, runClaudeReviewVoice } from './claude';
+import { renderCodeReviewSeatPrompt } from './code-review-seat';
 import {
   type GateVerdictRecord,
   renderGateVerdicts,
@@ -33,6 +34,8 @@ import {
   runHolisticLens,
 } from './holistic';
 import { worktreeReader } from './holistic-gate';
+import { type HistoryPacket, historyPacketHasData } from './history-packet';
+import type { ReviewProfile } from './profile';
 import { type ReviewSynthesis, type VoiceReview } from './synthesis';
 import { reviewJsonFromTrail } from './trail-io';
 
@@ -157,22 +160,36 @@ async function runClaudeReviewer(
   config: VoiceConfig,
   run: ClaudeRunner,
   timeoutMs: number | undefined,
-  log: (m: string) => void
-): Promise<{ review: VoiceReview; raw: string | null }> {
+  log: (m: string) => void,
+  // The worktree, when this run has one — the spawn cwd is what makes this a worktree seat (its
+  // file/git tools reach the project there). Absent ⇒ the throwaway tmpdir, as before.
+  worktree?: string,
+  // The history packet seeded into this seat's cwd, when one was built (./history-packet).
+  historyPacket?: HistoryPacket
+): Promise<{ review: VoiceReview; raw: string | null; spawned: boolean }> {
   let res: VoiceRunResult;
   try {
-    res = await run(reviewPrompt, config, { timeoutMs });
+    res = await run(reviewPrompt, config, {
+      timeoutMs,
+      ...(historyPacket ? { historyPacket: historyPacket.files } : {}),
+      ...(worktree ? { worktree } : {}),
+    });
   } catch (e) {
+    // The spawn itself threw (claude is not installed, or the fence refused an unfenceable read
+    // root) — no seat ever existed, so it read NOTHING. `spawned: false` is what stops the run's
+    // realized evidence from attesting that this seat read the worktree. Same rule as the gate's
+    // `gateSpawned`: a seat that RAN and then timed out or replied unusably DID open the tree.
     log(`  · claude: failed to run — ${(e as Error).message}`);
     return {
       raw: null,
       review: { findings: [], ok: false, summary: `claude did not run: ${(e as Error).message}`, voiceId: 'claude' },
+      spawned: false,
     };
   }
   if (!res.raw || res.timedOut) {
     const why = res.timedOut ? 'timed out' : 'produced no output';
     log(`  · claude: ${why}`);
-    return { raw: res.raw ?? null, review: { findings: [], ok: false, summary: `claude ${why}`, voiceId: 'claude' } };
+    return { raw: res.raw ?? null, review: { findings: [], ok: false, summary: `claude ${why}`, voiceId: 'claude' }, spawned: true };
   }
   const parsed = parseFindings(res.raw);
   if (parsed.parseError) {
@@ -185,16 +202,22 @@ async function runClaudeReviewer(
     return {
       raw: res.raw,
       review: { findings: [], ok: false, summary: `output not parseable (${parsed.parseError})${detail}`, voiceId: 'claude' },
+      spawned: true,
     };
   }
   log(`  · claude: reviewed — ${parsed.findings.length} finding(s)`);
-  return { raw: res.raw, review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: 'claude' } };
+  return { raw: res.raw, review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: 'claude' }, spawned: true };
 }
 
 // ── The whole layer: Opus reviewer + per-reviewer files + the gate ────────────────────
 
 export interface ClaudeLayerOptions {
   baseDir: string;
+  // The base SHA the PR diverged from. With a worktree it turns the `claude` seat into THE ONE
+  // CLAUDE PRODUCER (spec §3): the built-in `/code-review` methodology over the whole project,
+  // told the exact range under review. Absent ⇒ the seat reviews the pinned packet prompt (it
+  // still reads the tree, it is just not told the range).
+  baseSha?: string | null;
   claudeConfig: VoiceConfig;
   // The run's gathered conventions files (repo-relative). The ONLY docs a holistic finding may
   // cite to lift its MED severity cap — and the gate re-reads the citation out of the tree anyway.
@@ -210,12 +233,30 @@ export interface ClaudeLayerOptions {
   gateConfig?: VoiceConfig;
   // The codex+grok reviews already produced + persisted by runReviewMode (the core).
   coreReviews: StoredReview[];
+  // THE HISTORY PACKET (./history-packet), when this run built one: `git log` + `git blame` for the
+  // changed files, seeded into each PRODUCER seat's cwd as read-only data. It goes to the `claude`
+  // producer and the lens, and DELIBERATELY NOT to the gate: the gate's authority is grounded in the
+  // pinned packet hunks and nothing else (gate-hunks.ts), so handing it a second body of evidence it
+  // has no grounding rule for would widen what a verdict may rest on. History informs a FINDING;
+  // it does not adjudicate one.
+  //
+  // A SHALLOW clone yields a packet of `bytes: 0` — its README alone, explaining why there is no
+  // history here. The files are still seeded (an honest note beats an absent one), but the prompt
+  // clause is NOT rendered: a prompt must never point a seat at evidence it cannot open.
+  historyPacket?: HistoryPacket;
+  // The pinned reviewer-visible diff. Under the capability fence the Anthropic seats have no shell,
+  // so the engine hands them the change instead of letting them run `git diff` (see ./claude).
+  // Absent ⇒ the seats fall back to the packet prompt, which already embeds the diff.
+  pinnedDiff?: string;
   // The head SHA the reviewers saw — the gate reads the pinned packet keyed by it, and a
   // mismatch fails the packet closed (all verdicts unverified).
   expectedHeadSha: string;
   // Whether the Opus voice runs as a third reviewer (roster.claude).
   includeClaudeReviewer: boolean;
   log?: (m: string) => void;
+  // The review PROFILE this run was invoked under. `code` (default) lets the worktree producer take
+  // the `/code-review` skill; `security` keeps its own security-auditor prompt (see producerPrompt).
+  profile?: ReviewProfile;
   // The exact packet prompt the core reviewers saw — the Opus reviewer sees it too.
   reviewPrompt: string;
   runId: string;
@@ -231,6 +272,19 @@ export interface ClaudeLayerOptions {
 export interface ClaudeLayerResult {
   // The cold Opus review (null when claude is not in the roster).
   claudeReview: VoiceReview | null;
+  // Whether the claude PRODUCER seat actually spawned (see GateRunResult.gateSpawned, which this
+  // mirrors). Its REALIZED evidence is derived from this: a producer whose spawn threw — claude is
+  // not installed, or the capability fence refused an unfenceable read root — read NOTHING, and must
+  // not be attested as having read the worktree in the posted footer or the evidence manifest.
+  // OPTIONAL because this interface is a consumer contract (the dashboard renders it) — an absent
+  // value reads as NOT spawned, the weaker, fail-closed claim.
+  claudeSpawned?: boolean;
+  // Whether the gate SEAT actually spawned (see GateRunResult.gateSpawned). The `gate` seat's
+  // REALIZED evidence is derived from this: a gate that never ran read nothing, and must not be
+  // attested as having read the worktree. OPTIONAL because this interface is a consumer contract
+  // (the dashboard renders it) — an absent value reads as NOT spawned, the weaker, fail-closed
+  // claim.
+  gateSpawned?: boolean;
   // Whether the durable gate-verdicts.json trail wrote — dismissals are honored (Phase 2)
   // ONLY when true (a trail-write failure means the audit trail was lost → not honored).
   gateTrailWritten: boolean;
@@ -266,16 +320,60 @@ export async function runClaudeReviewLayer(
   const run: ClaudeRunner = opts.run ?? runClaudeReviewVoice;
   const modelLabel = claudeModelLabel(opts.claudeConfig);
 
+  // THE ONE CLAUDE PRODUCER (spec §3). With worktree evidence the seat runs the built-in
+  // `/code-review` methodology over the whole project at `headSha`; without it, the cold peer
+  // reviewer on the pinned packet, exactly as before. `--add-dir` — not the cwd — is what grants the
+  // whole-project read (the capability fence keeps the cwd neutral), so a worktree with no resolved
+  // base SHA still reads the tree.
+  //
+  // The `/code-review` path additionally needs the pinned diff: the fence removed Bash, so the skill
+  // cannot derive the change itself. Without both a base SHA and that diff, the seat keeps the packet
+  // prompt (which embeds the diff already) and merely LEARNS about the worktree.
+  //
+  // ONLY the `code` profile takes the `/code-review` skill. `security --repo` runs this same layer,
+  // and that skill hard-codes a structural-quality lens — swapping it in would silently drop the
+  // security-auditor objective while still counting the seat as a completed reviewer. A non-code
+  // profile therefore keeps its own pinned packet prompt and merely LEARNS about the worktree, so
+  // it reads the whole project under the objective it was actually asked for.
+  const isCodeProfile = (opts.profile ?? 'code') === 'code';
+  // The `history/` clause is rendered iff the packet carries DATA — a prompt must never name
+  // evidence the seat cannot open (a shallow clone yields a README and nothing else).
+  const hasHistory = historyPacketHasData(opts.historyPacket);
+  const producerPrompt = !opts.worktree
+    ? opts.reviewPrompt
+    : isCodeProfile && opts.baseSha && opts.pinnedDiff
+      ? renderCodeReviewSeatPrompt({
+          baseSha: opts.baseSha,
+          diff: opts.pinnedDiff,
+          headSha: opts.expectedHeadSha,
+          history: hasHistory,
+          worktree: opts.worktree,
+        })
+      : opts.reviewPrompt +
+        claudeWorktreePromptSuffix({
+          headSha: opts.expectedHeadSha,
+          history: hasHistory,
+          worktree: opts.worktree,
+        });
+
   let claudeReview: VoiceReview | null = null;
+  let claudeSpawned = false;
   if (opts.includeClaudeReviewer) {
-    log(`  · claude (anthropic/${modelLabel}) reviewing the diff (cold)…`);
-    const { review, raw } = await runClaudeReviewer(
-      opts.reviewPrompt,
+    log(
+      opts.worktree
+        ? `  · claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (/code-review)…`
+        : `  · claude (anthropic/${modelLabel}) reviewing the diff (cold)…`
+    );
+    const { review, raw, spawned } = await runClaudeReviewer(
+      producerPrompt,
       opts.claudeConfig,
       run,
       opts.timeoutMs,
-      log
+      log,
+      opts.worktree,
+      opts.historyPacket
     );
+    claudeSpawned = spawned;
     claudeReview = review;
     // The trail persist must SUCCEED for the claude voice to count as a complete reviewer:
     // if it fails, the review never reaches the trail (so the disk-read synthesis below
@@ -322,6 +420,7 @@ export async function runClaudeReviewLayer(
   const holistic = opts.holistic;
   const plan: HolisticPlan = resolveHolisticPlan({
     baseSha: holistic?.baseSha,
+    diff: opts.pinnedDiff,
     requested: Boolean(holistic),
     worktree: opts.worktree,
   });
@@ -333,7 +432,9 @@ export async function runClaudeReviewLayer(
     const { raw, review } = await runHolisticLens({
       baseSha: plan.baseSha,
       config: holistic.config,
+      diff: plan.diff,
       headSha: opts.expectedHeadSha,
+      ...(opts.historyPacket ? { historyPacket: opts.historyPacket } : {}),
       log,
       run,
       timeoutMs: opts.timeoutMs,
@@ -392,6 +493,8 @@ export async function runClaudeReviewLayer(
   });
   return {
     claudeReview,
+    claudeSpawned,
+    gateSpawned: gate.gateSpawned,
     gateTrailWritten: gate.gateTrailWritten,
     gateVerdicts: gate.verdicts,
     holisticReview,

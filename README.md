@@ -86,46 +86,64 @@ A **gate failure never opens the gate and never trips exit 1** — a spawn error
 
 By default every seat sees the **packet**: the diff, the changed files, and the repo's conventions. That is *diff-local* — a reviewer cannot see that your new helper duplicates one that already lives in an unchanged file. **Worktree evidence mode** fixes that by materializing the PR head as a **detached, read-only worktree** of a repo you already have cloned, and giving qualifying seats read access to the whole project at `headSha`.
 
-> **Status — the engine and the VERIFY side are wired; the review-side seat spawn is not.**
-> `receipt verify --repo <dir>` and `--accept-degraded` are parsed and honored today. `review --repo`
-> is parsed and **refuses by name**: no seat is spawned against a worktree yet, so reviewing the
-> packet while reporting whole-project evidence would be exactly the silent downgrade the realized
-> map exists to prevent. Every review run is therefore packet-mode and mints a legacy (v1) receipt,
-> as before.
+`review --repo <dir>` is **wired end to end**: it resolves the repo, runs the pre-flight, materializes
+one hardened worktree, spawns every qualifying seat inside it — codex, grok, the Claude producer, and
+the gate — records what each seat actually got, and reaps the worktree in a `finally`.
 
 ```bash
-# WIRED — `--repo` makes verify ask the STRONGER question, and a weaker receipt fails by name:
+# Review a PR with whole-project evidence, and stage the result as a PENDING review:
+ensemble-ai review --pr https://github.com/o/r/pull/7 --repo ~/code/r --stage
+
+# Add the holistic/architecture lens (it runs ONLY with worktree evidence):
+ensemble-ai review --pr https://github.com/o/r/pull/7 --repo ~/code/r --holistic
+
+# `--repo` makes `receipt verify` ask the STRONGER question, and a weaker receipt fails by name:
 ensemble-ai receipt verify --repo ~/code/r                     # → EVIDENCE DEGRADED: codex realized unknown, intended worktree…
 ensemble-ai receipt verify --repo ~/code/r --accept-degraded   # take the weaker evidence anyway, deliberately
-
-# NOT WIRED — refuses with a message naming what is missing, rather than under-delivering quietly:
-ensemble-ai review --pr https://github.com/o/r/pull/7 --repo ~/code/r
 ```
 
-Because no run has ever minted worktree evidence, `verify --repo` fails **every receipt on disk**
-today. That is the contract working, not a bug: a legacy receipt carries no realized map, which
-reads as `unknown` = weaker than `worktree`. When the seat spawn lands, `verify` must also compute
-the **v2** receipt key (which binds the run's sandbox profiles) and pass the v1 key as `legacyKey`;
-`resolveReceipt` already implements that fallback.
+`review --repo` needs the **full PR URL**. The pre-flight proves your checkout is the PR's base repo
+by comparing its remotes' fetch URLs, and materialization asserts `HEAD == headSha` — a bare `--pr <N>`
+carries neither, so it is refused upfront rather than reviewing the packet while you believe you asked
+for whole-project evidence.
+
+> **Status — `receipt verify --repo` cannot yet FIND a worktree-mode receipt.** Two gaps, both
+> pre-existing, neither introduced (nor closed) by the review-side wiring: `verify` computes only the
+> **v1** receipt key — it must compute the v2 key, which binds the run's sandbox profiles, and pass
+> the v1 key as `legacyKey` (`resolveReceipt` already implements that fallback) — and it derives its
+> live diff identity from the **local checkout** (`--staged` / `--working-tree` / a commit range),
+> which can never key a `pr`-mode diff. So a `review --repo` receipt and a `verify --repo` query are
+> addressed by different keys today. Worktree receipts *are* minted, complete and correct, and
+> `receipt show` reads them; teaching `verify` to ask for them is its own change.
 
 **Your checkout is never involved.** The engine fetches `pull/N/head` from the remote's **explicit URL** (never assuming `origin` exposes PR refs), adds a detached worktree, and **asserts `HEAD == headSha` before any seat runs** — a mismatch aborts rather than reviewing wrong-SHA evidence. Materialization is inert by construction: no hooks, no submodule recursion, no LFS smudge (so an in-tree `.lfsconfig` is never honored), tracked files only, no deps installed. It is reaped in a `finally` plus a `git worktree prune` sweeper, and serialized per repo (`git worktree add` writes into the shared `.git`). Pre-flight fails **closed** with a named cause: `wrong-repo` · `no-such-pr` · `network` · `auth` · `not-a-repo` · `disallowed-root` · `sha-mismatch`. An optional `allowedRepoRoots` array in `~/.ensemble-ai/config.json` restricts which repo roots may be materialized at all — consumer policy, never baked into this engine.
 
 **A seat gets the worktree only under a deny-by-default sandbox** — repo-rooted, secret-denied. Fail-closed **per seat**: no qualifying sandbox, that seat keeps the packet, and the fallback is **loud** (receipt, footer, stderr), never silent.
 
-The plan per seat (**"wired" = a seat is actually spawned against a worktree today; none are yet — see the status note above**):
+Per seat:
 
-| Seat | Sandbox | Worktree | Wired |
-| --- | --- | --- | --- |
-| `grok` | `ensemble-review` (Seatbelt/Landlock, `strict` base + secret deny-list), rooted at the worktree | yes | runner accepts `worktree`; no caller passes it |
-| `codex` | `ensemble-review-codex` — an ensemble-owned Seatbelt wrapper; codex's internal sandbox is off inside it (nested Seatbelt doesn't compose) | yes, on macOS | no — the runner **rejects** `worktree` rather than silently reviewing the packet |
-| `claude` | harness-controlled | yes | prompt + argv only |
-| `gate` | harness-controlled | yes | defaults to `packet` |
+| Seat | Receipt profile id (`sandboxProfiles`) | What fences it | Worktree | Falls back to the packet when |
+| --- | --- | --- | --- | --- |
+| `grok` | `ensemble-review-grok+proxy-env-noshell` v2 | **Reads:** `ensemble-review` (Seatbelt/Landlock, `strict` base + secret deny-list), rooted at the worktree via `--cwd` — kernel-enforced. **Egress:** proxy **env vars only** — grok's `sandbox.toml` schema has no network keys, so nothing at the kernel denies direct outbound; what bounds an injected tree is that the seat has **no shell** (`--disallowed-tools bash`) | yes | it resolves to any other profile (bare `strict` lacks the secret deny-list the receipt attests) |
+| `codex` | `ensemble-review-codex+egress-proxy-kernel` v3 | An ensemble-owned Seatbelt wrapper (codex's internal sandbox is off inside it — nested Seatbelt doesn't compose). **Reads and egress are both kernel-enforced:** all outbound is denied except the one loopback port where the engine's CONNECT proxy applies the vendor host allowlist | yes, on macOS | Seatbelt is unavailable · the profile refuses to build (an unsafe read root) · **the wrapped review provably produces nothing** |
+| `claude` | `claude-capability-fence` v1 | A **capability** fence, **not** a kernel sandbox: no Bash, no MCP, no network, a neutral spawn cwd (so the tree's `CLAUDE.md` is never loaded as instructions), the worktree as the sole `--add-dir` read root, and `$HOME` denied to every read tool | yes | never (it is the harness's own spawn) |
+| `gate` | `claude-capability-fence` v1 | the same capability fence | yes | never |
+
+**The two core seats' ids differ on the MECHANISM, and that is the point.** `codex`'s id says `-kernel` because Seatbelt refuses its every direct connection; `grok`'s says `proxy-env-noshell` because its egress is merely *routed* by `HTTPS_PROXY` and what actually contains it is the absence of a shell. Read a receipt's `sandboxProfiles` and you learn which guarantee you have without reading this file — an id that implied grok held codex's kernel fence would be the exact over-claim this evidence machinery exists to prevent. Versions advance across a rename and never reset, so no `(id, version)` pair is ever reused for two different fences, and receipts issued under an older id stay readable under that id.
+
+The codex **wrapper viability check is the review itself**, not a `--version` smoke: the seat runs
+its real prompt under the real profile with a real pty/subprocess, and only a run that produces
+nothing usable triggers the fallback. That fallback is **loud** — stderr, the receipt's realized map,
+and the posted review's footer all say the seat reviewed the diff-only packet. Accepting a degraded
+run is a human's call, never a silent downgrade. A seat that merely *times out* under its sandbox is
+not a viability signal, so it is not re-run: it stands as a failed reviewer, and a failed reviewer
+cannot qualify a receipt.
 
 **Honest containment.** The wrapper denies **exec** of any path inside the worktree, but a shell-capable agent can still read an untrusted file as *data* (`sh worktree/x.sh`). No-exec narrows the vector; it does not close it. The rest of the profile is the real boundary, and it is narrower than "nothing but the worktree" — state it exactly:
 
 - **Reads.** `$HOME` is not readable, so no ssh key, vendor credential, or other repo on disk is reachable — except `~/.codex`, which the seat must read to call its own API. The allowed *system* roots include `/private/var`, which contains the per-user `$TMPDIR`; a secret another process parked in its own temp dir **is** readable. The claim is "no credential in `$HOME`", not "no credential anywhere". A read root that is, or contains, `$HOME` (`~/bin/node` ⇒ `nodePrefix` = `$HOME`) is **refused**: the profile fails to build rather than grant it.
 - **Writes.** `~/.codex`, `/private/tmp` (the legacy world-shared `/tmp`, not the per-user `$TMPDIR`), and `/dev`.
-- **Network.** Port-scoped, never per-host, and **not 443-only**: outbound `443` **and** `53` (DNS) **and** local unix sockets; inbound on any local port. Port 53 to any address is a usable DNS-exfiltration channel, so combined with the read-as-data vector the seat has an egress path for whatever it can read. Seatbelt cannot express a per-host DNS allowlist, so a true per-host fence needs an egress proxy and is **not** claimed here.
+- **Network.** Host-scoped, via the engine's egress proxy. The profile denies **all** outbound except one loopback port — the in-process CONNECT proxy this run starts for the seat, which tunnels only to the vendor's host allowlist — plus the single path-scoped `mDNSResponder` unix socket `getaddrinfo` needs. Verified under this exact rule set (2026-07-10): TCP `*:443` EPERM · TCP **and** UDP `*:53` EPERM (the old DNS-exfiltration channel is closed) · the one allowed loopback port connects · a different loopback port EPERM. Inbound stays any local port (codex binds loopback helpers). Seatbelt cannot express a per-host rule itself (`(remote tcp "api.openai.com:443")` is rejected), which is *why* the fence is a proxy the profile pins the seat to rather than an SBPL rule. **Two residues, stated:** the seat sends its own credential to the **allowed** vendor host — irreducible without a token broker, and an allowed host is allowed for arbitrary bytes — and hostname *resolution* survives via `mach-lookup` to `mDNSResponder` (not a `:53` socket), so a low-bandwidth resolver side channel remains. Denials are loud: stderr, `egress-denials.json`, and the posted review's footer. A proxy that cannot start fails the seat **closed**.
 
 Outside macOS the codex seat falls back to the packet.
 

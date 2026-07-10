@@ -188,6 +188,122 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, gate 
     // per-reviewer review files are byte-identical before/after the gate pass (DC3)
     const codexJson = fs.readFileSync(path.join(dir, 'review.codex.json'), 'utf8');
     expect(JSON.parse(codexJson).findings[0].title).toBe('shared bug');
+    // The producer SPAWNED, so the run may attest that it read the worktree.
+    expect(res.claudeSpawned).toBe(true);
+  });
+
+  // `claudeSpawned` is what the run's REALIZED evidence for the `claude` seat is derived from, the
+  // same way `gateSpawned` drives the `gate` seat's. A producer whose SPAWN threw (claude is not
+  // installed; the capability fence refused an unfenceable read root) read NOTHING — attesting it
+  // `worktree` would put a whole-project evidence claim in the posted footer and the evidence
+  // manifest for a seat that never opened the tree. A seat that RAN and then timed out or replied
+  // unparseably did reach the tree, so it stays honest at `worktree`.
+  describe('claudeSpawned — fact, not intent', () => {
+    const spawnedFor = async (
+      onReview: () => VoiceRunResult | Promise<VoiceRunResult>
+    ): Promise<boolean | undefined> => {
+      const base = tmpTrail();
+      const runId = 'spawn';
+      seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+      const { run } = makeRunner({ onReview });
+      const res = await runClaudeReviewLayer({
+        baseDir: base,
+        claudeConfig: CFG,
+        coreReviews: [stored('codex'), stored('grok')],
+        expectedHeadSha: HEAD,
+        includeClaudeReviewer: true,
+        reviewPrompt: 'REVIEW PROMPT PAYLOAD',
+        run,
+        runId,
+        worktree: '/tmp/some-worktree',
+      });
+      return res.claudeSpawned;
+    };
+
+    it('false when the producer spawn THREW — the seat never existed', async () => {
+      expect(
+        await spawnedFor(() => {
+          throw new Error('claude: command not found');
+        })
+      ).toBe(false);
+    });
+
+    it('true when the producer RAN but timed out or produced nothing usable', async () => {
+      expect(await spawnedFor(() => ({ ok: false, raw: null, stderrTail: '', timedOut: true }))).toBe(true);
+      expect(await spawnedFor(() => okRun('not json at all'))).toBe(true);
+    });
+  });
+
+  // THE PRODUCER PROMPT under worktree evidence. `/code-review` hard-codes a structural-quality
+  // lens, so handing it to a `security` run would silently drop the security-auditor objective
+  // while still counting the seat as a completed reviewer.
+  describe('the worktree producer prompt respects the review PROFILE', () => {
+    const producerPromptFor = async (profile: 'code' | 'security'): Promise<string> => {
+      const base = tmpTrail();
+      const runId = `p-${profile}`;
+      seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+      const { calls, run } = makeRunner();
+      await runClaudeReviewLayer({
+        baseDir: base,
+        baseSha: 'b'.repeat(40),
+        claudeConfig: CFG,
+        coreReviews: [stored('codex'), stored('grok')],
+        expectedHeadSha: HEAD,
+        includeClaudeReviewer: true,
+        // The capability fence removed Bash, so the engine HANDS the seat the change.
+        pinnedDiff: 'PINNED DIFF BODY',
+        profile,
+        reviewPrompt: 'SECURITY AUDITOR OBJECTIVE PAYLOAD',
+        run,
+        runId,
+        worktree: '/tmp/some-worktree',
+      });
+      return calls.find((c) => c.round === 'review')?.prompt ?? '';
+    };
+
+    it('`code` takes the /code-review skill over the whole project, diff materialized', async () => {
+      const prompt = await producerPromptFor('code');
+      expect(prompt).toContain('/code-review');
+      expect(prompt).toContain('/tmp/some-worktree');
+      expect(prompt).toContain('PINNED DIFF BODY');
+      // It is TOLD the range, but never asked to compute it — it has no shell.
+      expect(prompt).toContain(`git diff ${'b'.repeat(40)}...${HEAD}`);
+      expect(prompt).toMatch(/NO shell and NO network/);
+    });
+
+    it('`security` KEEPS its own objective and merely learns about the worktree', async () => {
+      const prompt = await producerPromptFor('security');
+      expect(prompt).not.toContain('/code-review');
+      expect(prompt).toContain('SECURITY AUDITOR OBJECTIVE PAYLOAD');
+      // It still gets whole-project evidence — just under the objective it was asked for.
+      expect(prompt).toContain('/tmp/some-worktree');
+      // Its packet prompt already carries the diff, so the suffix adds the tree, not a git command.
+      expect(prompt).toMatch(/NOT your working directory/);
+      expect(prompt).not.toMatch(/Run that command/);
+    });
+
+    it('`code` WITHOUT the pinned diff keeps the packet prompt — never a blind skill run', async () => {
+      const base = tmpTrail();
+      const runId = 'p-code-nodiff';
+      seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+      const { calls, run } = makeRunner();
+      await runClaudeReviewLayer({
+        baseDir: base,
+        baseSha: 'b'.repeat(40),
+        claudeConfig: CFG,
+        coreReviews: [stored('codex'), stored('grok')],
+        expectedHeadSha: HEAD,
+        includeClaudeReviewer: true,
+        profile: 'code',
+        reviewPrompt: 'PACKET PROMPT WITH ITS OWN DIFF',
+        run,
+        runId,
+        worktree: '/tmp/some-worktree',
+      });
+      const prompt = calls.find((c) => c.round === 'review')?.prompt ?? '';
+      expect(prompt).not.toContain('/code-review');
+      expect(prompt).toContain('PACKET PROMPT WITH ITS OWN DIFF');
+    });
   });
 
   it('a failed Opus reviewer degrades to ok:false but the gate still runs over codex+grok', async () => {

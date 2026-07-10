@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { resolveBin } from '../core/bin';
+import { type EgressProxy, proxyEnv } from '../core/egress-proxy';
 import { runReviewerExec } from '../core/spawn';
 import type { ReviewerConfig } from '../core/types';
 import type { SandboxProfileRef } from '../modes/review/evidence';
@@ -12,6 +13,7 @@ import {
   REVIEW_TIMEOUT_MS,
   type RunReviewOpts,
 } from './codex';
+import { egressStartFailure, startSeatEgressProxy } from './egress-seat';
 
 // The Grok (xAI) review adapter — the second cross-vendor lens beside Codex. It
 // mirrors codex.ts but for the THREE ways grok's CLI differs (verified live
@@ -148,13 +150,42 @@ export function ensureSandboxProfile(
   }
 }
 
-// The grok seat's sandbox identity. `ensemble-review` is a `strict` (deny-by-default READS)
-// base + a kernel secret deny-list — already exactly the repo-rooted, secret-denied shape §2
-// requires, so pointing it at the worktree root is config-only: `--cwd <worktree>` makes the
-// deny-by-default read root the worktree instead of a throwaway tmpdir. Bump `version` whenever
-// REVIEW_PROFILE_BLOCK changes — a receipt minted under a weaker profile must never verify as
-// equivalent to one minted under a tighter one.
-export const GROK_SANDBOX_PROFILE: SandboxProfileRef = { id: REVIEW_PROFILE_NAME, version: 1 };
+// The name grok's CLI knows the profile by (`--sandbox <name>`, resolved from ~/.grok/sandbox.toml).
+// DISTINCT from the receipt's profile id below, which also names the egress fence — grok's sandbox
+// schema has no concept of it, so the two identities are no longer the same string.
+export const GROK_CLI_SANDBOX = REVIEW_PROFILE_NAME;
+
+// The grok seat's sandbox identity, as a RECEIPT attests it. Two fences compose:
+//
+//   `ensemble-review-grok` — grok's own kernel profile: a `strict` (deny-by-default READS) base + a
+//                        secret deny-list. Pointing it at the worktree root is config-only
+//                        (`--cwd <worktree>`).
+//   `+proxy-env-noshell` — the engine's per-host CONNECT fence (codex-f3), reached by ENV not by
+//                        kernel rule. grok honors the standard proxy env vars (PROBED 2026-07-10: a
+//                        logging proxy saw its `cli-chat-proxy.grok.com:443` CONNECT), so the seat is
+//                        spawned pointed at the proxy and reaches that host and nothing else. Its
+//                        `api.mixpanel.com` telemetry is denied, and grok completes anyway.
+//
+// WHY THE ID DOES NOT SAY `+egress-proxy` LIKE CODEX'S. It used to, and that was the defect: an id
+// that reads like the codex one IMPLIES the codex one's guarantee (a kernel rule denying direct
+// outbound), which grok does NOT have. grok's `sandbox.toml` profile schema is `extends` /
+// `read_only` / `read_write` / `allow` / `deny` — FILES ONLY, no network keys — so no rule denies
+// this process direct outbound, and a grok that chose to ignore `HTTPS_PROXY` could reach any host.
+// What actually bounds it is the SEAT HAVING NO SHELL: `--disallowed-tools bash` means there is no
+// interpreter inside the untrusted tree for a prompt-injected file to drive (and `strict` is
+// documented as "no child network"). The id now names that: env-routed egress, no-shell containment.
+// A receipt reader must be able to tell this seat from the kernel-fenced one WITHOUT reading a PR.
+//
+// Bump `version` whenever REVIEW_PROFILE_BLOCK, the egress allowlist, or this identity changes — a
+// receipt minted under a weaker profile must never verify as equivalent to one minted under a
+// tighter one. Versions advance across a rename and never reset (see CODEX_SANDBOX_PROFILE): this
+// seat's lineage is `ensemble-review` v1 → this, so no (id, version) pair is ever reused.
+export const GROK_SANDBOX_PROFILE: SandboxProfileRef = {
+  // Egress fenced by proxy ENV VARS ONLY (grok's sandbox schema has no network keys); what bounds a
+  // prompt-injected tree is that the seat has NO SHELL (`--disallowed-tools bash`) to exercise it.
+  id: 'ensemble-review-grok+proxy-env-noshell',
+  version: 2,
+};
 
 // PURE: the exact grok CLI args for a review. Encodes every lived lesson as DATA
 // so a unit test pins it: `-p <prompt>` (single-turn, prints to stdout) ·
@@ -215,7 +246,7 @@ export function extractGrokText(stdout: string): string | null {
 // uses — grok forks a leader/subagents, so the group-kill is mandatory). Returns
 // the same shape as runCodexReview so the caller treats both reviewers uniformly:
 // `raw` is grok's `.text` (ready for parseFindings). On grok's separate xAI quota.
-export function runGrokReview(
+export async function runGrokReview(
   prompt: string,
   config: ReviewerConfig,
   opts: RunReviewOpts = {}
@@ -230,37 +261,70 @@ export function runGrokReview(
   //
   // But the seat only QUALIFIES for the worktree under the profile whose identity the receipt
   // will attest. resolveReviewSandbox admits `strict` as well as `ensemble-review`, and `strict`
-  // lacks the secret deny-list — yet GROK_SANDBOX_PROFILE hardcodes `ensemble-review`, so a
-  // `strict`-configured seat would be handed the whole project while the receipt named a profile
-  // it never ran under. Fail closed rather than attest evidence the sandbox did not fence.
+  // lacks the secret deny-list — so a `strict`-configured seat would be handed the whole project
+  // while the receipt named a profile it never ran under. Compared against the CLI sandbox NAME,
+  // not the receipt's profile id: since codex-f3 the id also names the egress fence, which grok's
+  // sandbox schema knows nothing about. Fail closed rather than attest a fence that did not apply.
   const worktreeCwd = opts.worktree;
-  if (worktreeCwd && sandbox !== GROK_SANDBOX_PROFILE.id) {
-    return Promise.resolve({
+  if (worktreeCwd && sandbox !== GROK_CLI_SANDBOX) {
+    return {
       ok: false,
       raw: null,
-      stderrTail: `ensemble-ai: refusing worktree evidence for the grok seat — it resolved to the "${sandbox}" sandbox, but worktree access is only qualified under "${GROK_SANDBOX_PROFILE.id}" (the profile whose id+version the receipt attests). Configure that sandbox, or run this seat on the packet.`,
+      stderrTail: `ensemble-ai: refusing worktree evidence for the grok seat — it resolved to the "${sandbox}" sandbox, but worktree access is only qualified under "${GROK_CLI_SANDBOX}" (the profile whose id+version the receipt attests). Configure that sandbox, or run this seat on the packet.`,
       timedOut: false,
-    });
+    };
   }
-  ensureSandboxProfile(sandbox);
-  const cwd = worktreeCwd ?? fs.mkdtempSync(path.join(os.tmpdir(), 'grok-review-'));
-  return runReviewerExec({
-    args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
-    bin: resolveGrokBin(),
-    capture: 'stdout',
-    onSpawn: opts.onSpawn,
-    stderrLimit: 2000,
-    timeoutMs,
-  }).then(({ raw, stderrTail, timedOut }) => {
+  // THE EGRESS FENCE (codex-f3), on the worktree path only — a packet seat has no untrusted tree to
+  // be injected from, and the receipt attests no fence for it. grok honors the proxy env vars
+  // (probed), so this bounds which hosts it may reach. A proxy that cannot start refuses the seat
+  // LOUDLY rather than running it unfenced (§7); grok does not retry on the packet, so that refusal
+  // is a failed seat and no receipt — stricter than codex's fallback, never weaker.
+  let proxy: EgressProxy | undefined;
+  if (worktreeCwd) {
+    try {
+      proxy = await startSeatEgressProxy('grok');
+    } catch (e) {
+      return { ok: false, raw: null, stderrTail: egressStartFailure('grok', e), timedOut: false };
+    }
+  }
+  // ONCE THE FENCE IS UP IT COMES DOWN ON EVERY PATH. `ensureSandboxProfile` writes a file,
+  // `resolveGrokBin` throws when grok is not installed, and `runReviewerExec` can reject — each of
+  // those, on the old `.then()`-only teardown, left the proxy's listening server and its sockets
+  // open. The CLI sets `process.exitCode` rather than calling `process.exit()`, so a leaked handle
+  // keeps the event loop alive and the run never exits. `finally` is what makes that unreachable —
+  // the same guarantee codex's `.finally(cleanup)` already had.
+  let cwd: string | undefined;
+  try {
+    ensureSandboxProfile(sandbox);
+    cwd = worktreeCwd ?? fs.mkdtempSync(path.join(os.tmpdir(), 'grok-review-'));
+    const { raw, stderrTail, timedOut } = await runReviewerExec({
+      args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
+      bin: resolveGrokBin(),
+      capture: 'stdout',
+      ...(proxy ? { env: proxyEnv(proxy.url) } : {}),
+      onSpawn: opts.onSpawn,
+      stderrLimit: 2000,
+      timeoutMs,
+    });
+    const text = raw ? extractGrokText(raw) : null;
+    return {
+      // Snapshotted HERE, in the return expression — it is evaluated before the `finally` closes the
+      // proxy, so the denial audit the footer and `egress-denials.json` depend on is never lost.
+      ...(proxy ? { egressDenials: [...proxy.denials] } : {}),
+      ok: text !== null,
+      raw: text,
+      stderrTail,
+      timedOut,
+    };
+  } finally {
+    proxy?.close();
     try {
       // ONLY the throwaway tmpdir is ours to delete. The worktree is owned by the run's
       // materialization lifecycle (one per run, shared by every seat) and is reaped there —
       // rm'ing it here would destroy the other seats' evidence mid-review.
-      if (!worktreeCwd) fs.rmSync(cwd, { force: true, recursive: true });
+      if (!worktreeCwd && cwd) fs.rmSync(cwd, { force: true, recursive: true });
     } catch {
       // throwaway dir — best-effort cleanup
     }
-    const text = raw ? extractGrokText(raw) : null;
-    return { ok: text !== null, raw: text, stderrTail, timedOut };
-  });
+  }
 }

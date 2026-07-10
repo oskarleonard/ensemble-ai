@@ -5,6 +5,7 @@ import { CODE_REVIEW_SKILL, renderCodeReviewSeatPrompt } from './code-review-sea
 const args = {
   baseSha: 'b'.repeat(40),
   headSha: 'h'.repeat(40),
+  diff: 'DIFF BODY LINE',
   worktree: '/tmp/wt',
 };
 
@@ -39,5 +40,23 @@ describe('the one Claude producer — /code-review methodology seat', () => {
   it('pins the ensemble schema so one parser serves every seat', () => {
     expect(prompt).toContain('"severity":"high|medium|low"');
     expect(prompt).toContain('exactly one fenced ```json block');
+  });
+
+  // The fence removed Bash, and with it `git log`/`git blame`. The engine computes them into the
+  // seat's cwd instead (./history-packet); the clause is rendered only when a packet backs it.
+  it('says nothing about `history/` when this run built no packet', () => {
+    expect(prompt).not.toContain('history/');
+  });
+
+  it('points the seat at `history/` as DATA when a packet was built, never at `git`', () => {
+    const withHistory = renderCodeReviewSeatPrompt({ ...args, history: true });
+    expect(withHistory).toContain('history/log/<path>.log');
+    expect(withHistory).toContain('history/blame/<path>.blame');
+    expect(withHistory).toContain('history/pr-commits.log');
+    expect(withHistory).toContain('file:line@<sha>');
+    expect(withHistory).toContain('untrusted DATA');
+    // Still no shell: the history is READ, never produced.
+    expect(withHistory).toMatch(/do not try to run `git`/);
+    expect(withHistory).not.toMatch(/\brun `?git log\b/i);
   });
 });

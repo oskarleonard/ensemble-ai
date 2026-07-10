@@ -1,4 +1,5 @@
 import { sha256Hex } from '../../core/hash';
+import { REVIEWER_IDS } from '../../core/types';
 
 import type { DiffMode } from './diff';
 import type { CoveragePolicy } from './receipt';
@@ -27,8 +28,15 @@ import type { CoveragePolicy } from './receipt';
 export const EVIDENCE_CLASSES = ['packet', 'worktree'] as const;
 export type EvidenceClass = (typeof EVIDENCE_CLASSES)[number];
 
-// Every actor whose evidence class is part of the identity — INCLUDING the gate.
-export const EVIDENCE_SEATS = ['codex', 'grok', 'claude', 'gate'] as const;
+// The seats this engine's own harness runs after the vendor core: the `claude` producer and the
+// `gate`. Named once, so a future harness seat cannot be silently omitted from the evidence
+// INTENT map or the REALIZED fold — both are typed `Record<HarnessSeat, …>` and stop compiling.
+export const HARNESS_SEATS = ['claude', 'gate'] as const;
+export type HarnessSeat = (typeof HARNESS_SEATS)[number];
+
+// Every actor whose evidence class is part of the identity — INCLUDING the gate. Derived from its
+// two halves rather than re-listed, so the seat roster has exactly one source.
+export const EVIDENCE_SEATS = [...REVIEWER_IDS, ...HARNESS_SEATS] as const;
 export type EvidenceSeat = (typeof EVIDENCE_SEATS)[number];
 
 export function isEvidenceSeat(v: unknown): v is EvidenceSeat {
