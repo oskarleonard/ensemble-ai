@@ -202,6 +202,72 @@ const WORKTREE_PARENT_PREFIX = 'ensemble-worktree-';
 export interface Worktree {
   dir: string;
   headSha: string;
+  // Repo-relative paths of the agent-instruction files STRIPPED from the checkout before any seat
+  // ran (see stripAgentInstructions). Sorted. The evidence manifest subtracts them, so no artifact
+  // ever claims a seat could read a file the engine removed.
+  strippedInstructionFiles: string[];
+}
+
+// ── Agent-instruction strip (belt-and-braces, beside the capability fence) ────────────
+
+// Files an agent CLI treats as a trusted instruction channel rather than as data. In a foreign PR
+// they are the AUTHOR's text: `codex` reads `AGENTS.md` from its cwd, and `claude` reads `CLAUDE.md`
+// from its cwd hierarchy — verified 2026-07-10 to obey a planted "run this first" instruction.
+//
+// The Anthropic seats are already fenced structurally (a neutral cwd means the tree's CLAUDE.md is
+// never in their cwd hierarchy; see ./claude), and codex/grok are fenced by Seatbelt. Removing these
+// files is the SECOND fence: no seat, on any vendor, can be addressed by the PR author at all.
+//
+// Conventions do NOT come from here — the gatherer reads them from the BASE ref (the maintained
+// branch), never the PR head, so stripping costs the review nothing.
+export const AGENT_INSTRUCTION_NAMES = ['CLAUDE.md', 'AGENTS.md', '.claude'] as const;
+// `.cursor/rules` is a directory of `.mdc` rule files; the rest of `.cursor/` is not an instruction
+// channel, so only `rules` is removed.
+const CURSOR_DIR = '.cursor';
+const CURSOR_RULES = 'rules';
+
+// Remove every agent-instruction file from a materialized worktree, recursively (a monorepo package
+// may carry its own). Returns the sorted repo-relative paths removed. Symlinks are unlinked, never
+// followed. Never throws: a file we cannot remove is reported by its ABSENCE from the returned list,
+// and the caller's manifest subtraction is keyed off that list.
+export function stripAgentInstructions(dir: string): string[] {
+  const removed: string[] = [];
+  const remove = (rel: string): void => {
+    try {
+      fs.rmSync(path.join(dir, rel), { force: true, recursive: true });
+      removed.push(rel);
+    } catch {
+      /* left in place — it will still appear in the manifest, which is the honest report */
+    }
+  };
+  const walk = (rel: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(path.join(dir, rel), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name === '.git') continue; // the worktree's gitdir pointer — not a tree file
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if ((AGENT_INSTRUCTION_NAMES as readonly string[]).includes(e.name)) {
+        remove(childRel);
+      } else if (e.isDirectory() && e.name === CURSOR_DIR) {
+        if (fs.existsSync(path.join(dir, childRel, CURSOR_RULES))) {
+          remove(`${childRel}/${CURSOR_RULES}`);
+        }
+      } else if (e.isDirectory()) {
+        walk(childRel);
+      }
+    }
+  };
+  walk('');
+  return removed.sort();
+}
+
+// Is `p` the stripped path `s`, or a file underneath it (`.claude/settings.json` under `.claude`)?
+export function isStrippedPath(p: string, stripped: readonly string[]): boolean {
+  return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
 
 // Serialize per repo: `git worktree add` writes into the SHARED `.git`. O_EXCL create is the
@@ -326,7 +392,15 @@ export function materializeWorktree(
         message: `worktree HEAD is ${actual || '(unresolvable)'} but the review is tied to ${args.headSha} — ABORTING rather than reviewing wrong-SHA evidence`,
       };
     }
-    const made = { dir, headSha: args.headSha };
+    // STRIP AFTER the HEAD assert, BEFORE any seat can run: the assert proves we materialized the
+    // reviewed content, and the strip then removes the PR author's instruction channel from it. The
+    // working tree goes dirty; nothing depends on it being clean (the seats read files, and the
+    // range `git diff <base>...<head>` is a commit range, unaffected by the working tree).
+    const made = {
+      dir,
+      headSha: args.headSha,
+      strippedInstructionFiles: stripAgentInstructions(dir),
+    };
     dir = null; // ownership transfers to the caller's try/finally
     return made;
   } finally {

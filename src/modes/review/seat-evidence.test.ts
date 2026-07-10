@@ -7,7 +7,7 @@ import { type ReviewerConfig, REVIEWER_IDS } from '../../core/types';
 import { CODEX_SANDBOX_PROFILE } from '../../reviewers/codex-sandbox';
 import { GROK_SANDBOX_PROFILE } from '../../reviewers/grok';
 
-import { CLAUDE_HARNESS_PROFILE } from './claude';
+import { CLAUDE_CAPABILITY_FENCE } from './claude';
 import {
   formatEvidenceFooter,
   intendedEvidenceFor,
@@ -57,12 +57,12 @@ describe('seat qualification — a seat gets the worktree IFF its sandbox qualif
 
   it('the Anthropic seats are harness-controlled and always qualify, under a NAMED belt', () => {
     expect(qualifyHarnessSeat()).toEqual({
-      profile: CLAUDE_HARNESS_PROFILE,
+      profile: CLAUDE_CAPABILITY_FENCE,
       qualified: true,
       reason: null,
     });
     // Read the id literally: this is plan-mode + a write-tool deny-list, not a kernel sandbox.
-    expect(CLAUDE_HARNESS_PROFILE.id).toBe('claude-plan-mode-deny-writes');
+    expect(CLAUDE_CAPABILITY_FENCE.id).toBe('claude-capability-fence');
   });
 });
 

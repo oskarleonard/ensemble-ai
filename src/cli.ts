@@ -541,12 +541,15 @@ function resolveSource(
             cwd
           );
           const r = prResult(cmp, label, headSha);
-          // A URL PR review gathers conventions from the PR repo at its exact head SHA
-          // (same reach as the diff) — so the reviewer sees the change's own conventions
-          // even when fired from a bare terminal / non-repo cwd.
+          // A URL PR review gathers conventions from the PR repo at its BASE SHA — the maintained
+          // branch the PR targets, NEVER the PR head. Conventions are an INSTRUCTION channel: the
+          // gathered text lands verbatim in every seat's prompt, so reading them at the head would
+          // let a PR author add a `CLAUDE.md` and address the reviewers directly. The base ref is
+          // the repo owner's text; the head is the contributor's. (The worktree strip removes the
+          // same files from the checkout — belt and braces, see worktree.ts stripAgentInstructions.)
           return 'code' in r
             ? r
-            : { ...r, conventionsCtx: { ref: headSha, repoSlug }, prBaseSha: baseSha };
+            : { ...r, conventionsCtx: { ref: baseSha, repoSlug }, prBaseSha: baseSha };
         }
         // SHAs unresolved → unbound `gh pr diff -R` (no SHA binding, generic label). A
         // URL PR reviews a DIFFERENT repo than the cwd, so its conventions must come ONLY
@@ -1334,6 +1337,9 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
           : {}),
         includeClaudeReviewer: true,
         log: (m) => console.error(`· ${m}`),
+        // The pinned reviewer-visible diff. Under the capability fence the Anthropic seats have no
+        // Bash, so `/code-review` and the lens are HANDED the change instead of deriving it.
+        pinnedDiff: result.pinnedDiff,
         // `security --repo` must NOT have its security-auditor prompt replaced by the
         // `/code-review` skill's structural-quality lens (codex-f3).
         profile,

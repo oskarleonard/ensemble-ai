@@ -143,6 +143,11 @@ export interface ReviewModeResult {
   // The run's per-seat evidence identity for the CORE seats (intent, fact, and the sandbox profiles
   // that fenced them). Present on every non-blocked run; all-`packet` in packet mode.
   evidence?: ReviewEvidence;
+  // The pinned REVIEWER-VISIBLE diff — the exact bytes every reviewer saw in the packet. The
+  // Anthropic seats have no shell under the capability fence, so they cannot run `git diff`: the
+  // engine hands them this. Same bytes as the persisted gate packet, so a seat, the gate, and the
+  // trail can never disagree about what the change was. Absent only on a secret-scan block.
+  pinnedDiff?: string;
   // The exact rendered prompt every core reviewer saw (byte-identical across reviewers) —
   // returned so the self-contained layer's cold Opus reviewer reviews the SAME pinned
   // packet, never a re-derived diff. Absent only on a secret-scan block (no packet built).
@@ -296,9 +301,10 @@ export async function runReviewMode(
   // so a tree that mutates between the run and the gate can change no authority outcome.
   // Best-effort — a failure just means the gate later reads no packet and degrades
   // all-`unverified` (fail-closed).
+  const pinnedDiff = reviewerVisibleDiff(packet).text;
   try {
     persistGatePacket(opts.out, opts.runId, {
-      diff: reviewerVisibleDiff(packet).text,
+      diff: pinnedDiff,
       headSha: acquired.headSha,
     });
   } catch {
@@ -409,8 +415,8 @@ export async function runReviewMode(
     // caller writes receiptCandidate once the roster is verified complete.
     const store = opts.receiptStore ?? defaultReceiptStore();
     log('Receipt qualified by the core — deferred to the full-roster gate.');
-    return { acquired, blocked: false, conventionManifest, depSurface, evidence, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, depSurface, evidence, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
   }
   log(`No receipt — ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, evidence, prompt, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, evidence, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan };
 }

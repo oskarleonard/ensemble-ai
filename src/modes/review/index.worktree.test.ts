@@ -7,7 +7,7 @@ import type { ReviewerConfig, ReviewerId } from '../../core/types';
 import type { CodexReviewResult, RunReviewOpts } from '../../reviewers/codex';
 import { GROK_SANDBOX_PROFILE } from '../../reviewers/grok';
 
-import { CLAUDE_HARNESS_PROFILE } from './claude';
+import { CLAUDE_CAPABILITY_FENCE } from './claude';
 import { computePolicyHashAt, POLICY_VERSION_EVIDENCE, POLICY_VERSION_LEGACY } from './evidence';
 import { runReviewMode } from './index';
 import type { ReviewAdapter } from './seat-run';
@@ -120,8 +120,8 @@ describe('review --repo: a QUALIFIED seat is spawned against the worktree', () =
       grok: 'worktree',
     });
     expect(result.evidence?.sandboxProfiles).toEqual({
-      claude: CLAUDE_HARNESS_PROFILE,
-      gate: CLAUDE_HARNESS_PROFILE,
+      claude: CLAUDE_CAPABILITY_FENCE,
+      gate: CLAUDE_CAPABILITY_FENCE,
       grok: GROK_SANDBOX_PROFILE,
     });
   });
@@ -155,6 +155,29 @@ describe('review --repo: a QUALIFIED seat is spawned against the worktree', () =
         POLICY_VERSION_EVIDENCE
       )
     );
+  });
+
+  // A worktree seat's evidence is only meaningful bound to the fence that bounded it, so the receipt
+  // must NAME that fence. `claude-plan-mode-deny-writes` was an honest name for a belt that did not
+  // meet spec §2; a receipt minted under the real fence must say `claude-capability-fence`.
+  it('binds the Anthropic seats to `claude-capability-fence` v1 in the receipt', async () => {
+    const { adapters } = stubAdapters();
+    const result = await runReviewMode(
+      runOpts({
+        adapters,
+        peerSeats: ['claude', 'gate'],
+        reviewers: ['grok'],
+        worktree: { baseSha: BASE, dir: worktreeDir, headSha: HEAD },
+      })
+    );
+    for (const seat of ['claude', 'gate'] as const) {
+      expect(result.receiptCandidate?.sandboxProfiles?.[seat]).toEqual({
+        id: 'claude-capability-fence',
+        version: 1,
+      });
+    }
+    // grok keeps its OS-enforced Seatbelt profile — the fence is per-seat, never a global claim.
+    expect(result.receiptCandidate?.sandboxProfiles?.grok).toEqual(GROK_SANDBOX_PROFILE);
   });
 });
 

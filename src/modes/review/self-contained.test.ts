@@ -206,6 +206,8 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, gate 
         coreReviews: [stored('codex'), stored('grok')],
         expectedHeadSha: HEAD,
         includeClaudeReviewer: true,
+        // The capability fence removed Bash, so the engine HANDS the seat the change.
+        pinnedDiff: 'PINNED DIFF BODY',
         profile,
         reviewPrompt: 'SECURITY AUDITOR OBJECTIVE PAYLOAD',
         run,
@@ -215,10 +217,14 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, gate 
       return calls.find((c) => c.round === 'review')?.prompt ?? '';
     };
 
-    it('`code` takes the /code-review skill over the whole project', async () => {
+    it('`code` takes the /code-review skill over the whole project, diff materialized', async () => {
       const prompt = await producerPromptFor('code');
       expect(prompt).toContain('/code-review');
       expect(prompt).toContain('/tmp/some-worktree');
+      expect(prompt).toContain('PINNED DIFF BODY');
+      // It is TOLD the range, but never asked to compute it — it has no shell.
+      expect(prompt).toContain(`git diff ${'b'.repeat(40)}...${HEAD}`);
+      expect(prompt).toMatch(/NO shell and NO network/);
     });
 
     it('`security` KEEPS its own objective and merely learns about the worktree', async () => {
@@ -227,7 +233,32 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, gate 
       expect(prompt).toContain('SECURITY AUDITOR OBJECTIVE PAYLOAD');
       // It still gets whole-project evidence — just under the objective it was asked for.
       expect(prompt).toContain('/tmp/some-worktree');
-      expect(prompt).toContain(`git diff ${'b'.repeat(40)}...${HEAD}`);
+      // Its packet prompt already carries the diff, so the suffix adds the tree, not a git command.
+      expect(prompt).toMatch(/NOT your working directory/);
+      expect(prompt).not.toMatch(/Run that command/);
+    });
+
+    it('`code` WITHOUT the pinned diff keeps the packet prompt — never a blind skill run', async () => {
+      const base = tmpTrail();
+      const runId = 'p-code-nodiff';
+      seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+      const { calls, run } = makeRunner();
+      await runClaudeReviewLayer({
+        baseDir: base,
+        baseSha: 'b'.repeat(40),
+        claudeConfig: CFG,
+        coreReviews: [stored('codex'), stored('grok')],
+        expectedHeadSha: HEAD,
+        includeClaudeReviewer: true,
+        profile: 'code',
+        reviewPrompt: 'PACKET PROMPT WITH ITS OWN DIFF',
+        run,
+        runId,
+        worktree: '/tmp/some-worktree',
+      });
+      const prompt = calls.find((c) => c.round === 'review')?.prompt ?? '';
+      expect(prompt).not.toContain('/code-review');
+      expect(prompt).toContain('PACKET PROMPT WITH ITS OWN DIFF');
     });
   });
 

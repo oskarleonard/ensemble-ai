@@ -79,9 +79,18 @@ describe('resolveHolisticPlan — default off, worktree or nothing', () => {
     expect(plan.run === false && plan.skipReason).toContain('no base SHA');
   });
 
-  it('runs when requested WITH a worktree and a base', () => {
-    expect(resolveHolisticPlan({ baseSha: 'base1', requested: true, worktree: '/tmp/wt' })).toEqual({
+  it('refuses without the materialized diff (the fence left it no shell to derive one)', () => {
+    const plan = resolveHolisticPlan({ baseSha: 'b', requested: true, worktree: '/tmp/wt' });
+    expect(plan.run).toBe(false);
+    expect(plan.run === false && plan.skipReason).toContain('no reviewer-visible diff');
+  });
+
+  it('runs when requested WITH a worktree, a base, and the diff', () => {
+    expect(
+      resolveHolisticPlan({ baseSha: 'base1', diff: 'DIFFTEXT', requested: true, worktree: '/tmp/wt' })
+    ).toEqual({
       baseSha: 'base1',
+      diff: 'DIFFTEXT',
       run: true,
       worktree: '/tmp/wt',
     });
@@ -89,7 +98,7 @@ describe('resolveHolisticPlan — default off, worktree or nothing', () => {
 });
 
 describe('renderHolisticPrompt — every clause the host mechanizes', () => {
-  const prompt = renderHolisticPrompt({ baseSha: 'BASE', headSha: 'HEAD', worktree: '/wt' });
+  const prompt = renderHolisticPrompt({ baseSha: 'BASE', diff: 'DIFFTEXT', headSha: 'HEAD', worktree: '/wt' });
 
   it('points the seat at the whole project and the exact change', () => {
     expect(prompt).toContain('/wt');
@@ -139,7 +148,7 @@ describe('runHolisticLens — the seat run', () => {
           '\n```'
       );
     });
-    const { review } = await runHolisticLens({ baseSha: 'B', config: CFG, headSha: 'H', run, worktree: '/wt' });
+    const { review } = await runHolisticLens({ baseSha: 'B', config: CFG, diff: 'DIFFTEXT', headSha: 'H', run, worktree: '/wt' });
     expect(review.voiceId).toBe(HOLISTIC_SEAT_ID);
     expect(review.ok).toBe(true);
     expect(review.findings).toHaveLength(1);
@@ -147,15 +156,15 @@ describe('runHolisticLens — the seat run', () => {
   });
 
   it('degrades a throw / timeout / unparseable reply to an ok:false voice, never a throw', async () => {
-    const thrown = await runHolisticLens({ baseSha: 'B', config: CFG, headSha: 'H', run: async () => { throw new Error('no binary'); }, worktree: '/wt' });
+    const thrown = await runHolisticLens({ baseSha: 'B', config: CFG, diff: 'DIFFTEXT', headSha: 'H', run: async () => { throw new Error('no binary'); }, worktree: '/wt' });
     expect(thrown.review.ok).toBe(false);
     expect(thrown.review.summary).toContain('no binary');
 
-    const timedOut = await runHolisticLens({ baseSha: 'B', config: CFG, headSha: 'H', run: async () => ({ ok: false, raw: 'partial', stderrTail: '', timedOut: true }), worktree: '/wt' });
+    const timedOut = await runHolisticLens({ baseSha: 'B', config: CFG, diff: 'DIFFTEXT', headSha: 'H', run: async () => ({ ok: false, raw: 'partial', stderrTail: '', timedOut: true }), worktree: '/wt' });
     expect(timedOut.review.ok).toBe(false);
     expect(timedOut.review.summary).toContain('timed out');
 
-    const junk = await runHolisticLens({ baseSha: 'B', config: CFG, headSha: 'H', run: async () => okRun('I think it looks fine!'), worktree: '/wt' });
+    const junk = await runHolisticLens({ baseSha: 'B', config: CFG, diff: 'DIFFTEXT', headSha: 'H', run: async () => okRun('I think it looks fine!'), worktree: '/wt' });
     expect(junk.review.ok).toBe(false);
     expect(junk.review.findings).toEqual([]);
     expect(junk.review.summary).toContain('not parseable');
@@ -165,6 +174,7 @@ describe('runHolisticLens — the seat run', () => {
     const { review } = await runHolisticLens({
       baseSha: 'B',
       config: CFG,
+      diff: 'DIFFTEXT',
       headSha: 'H',
       run: async () => okRun('```json\n{"summary":"searched the tree, found nothing","findings":[]}\n```'),
       worktree: '/wt',

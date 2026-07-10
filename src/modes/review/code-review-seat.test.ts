@@ -5,6 +5,7 @@ import { CODE_REVIEW_SKILL, renderCodeReviewSeatPrompt } from './code-review-sea
 const args = {
   baseSha: 'b'.repeat(40),
   headSha: 'h'.repeat(40),
+  diff: 'DIFF BODY LINE',
   worktree: '/tmp/wt',
 };
 

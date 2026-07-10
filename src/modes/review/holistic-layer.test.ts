@@ -149,6 +149,9 @@ const layerArgs = (baseDir: string, runId: string, run: ReturnType<typeof makeRu
   coreReviews: [],
   expectedHeadSha: HEAD,
   includeClaudeReviewer: true,
+  // The capability fence removed Bash from the Anthropic seats, so the lens (like the producer) is
+  // HANDED the change instead of running `git diff` for it.
+  pinnedDiff: GATE_DIFF,
   reviewPrompt: 'PINNED',
   run,
   runId,
@@ -175,6 +178,27 @@ describe('the lens is DEFAULT OFF — nothing is added', () => {
     expect(gatePrompt).not.toContain('Holistic severity is CAPPED');
     expect(gatePrompt).not.toContain('reference-not-found');
     fs.rmSync(baseDir, { force: true, recursive: true });
+  });
+});
+
+describe('the lens-OFF path is unchanged by the capability fence', () => {
+  it('a worktree run with no lens spawns exactly claude + gate, and adds no lens clause', async () => {
+    const { baseDir, runId } = seed();
+    const wt = seedWorktree();
+    const { calls, run } = makeRunner(false);
+    const result = await runClaudeReviewLayer({ ...layerArgs(baseDir, runId, run), worktree: wt });
+
+    // Two seats, never three. The lens is a SEAT: absent means absent.
+    expect(calls.map((c) => c.round)).toEqual(['claude', 'gate']);
+    expect(result.holisticReview).toBeNull();
+    expect(result.holisticSkipped).toBeNull(); // not requested ⇒ silence, not a skip notice
+    expect(result.gateVerdicts.some((r) => r.reviewer === HOLISTIC_SEAT_ID)).toBe(false);
+    expect(fs.existsSync(path.join(reviewDir(baseDir, runId), `review.${HOLISTIC_SEAT_ID}.json`))).toBe(false);
+
+    const gatePrompt = calls.find((c) => c.round === 'gate')!.prompt;
+    expect(gatePrompt).not.toContain('Holistic severity is CAPPED');
+    fs.rmSync(baseDir, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
   });
 });
 

@@ -107,10 +107,47 @@ describe('URL PR conventions never fall back to the LOCAL repo', () => {
     resolveShas = true;
     const code = await main(['review', 'https://github.com/o/r/pull/7']);
     expect(code).toBe(0);
-    // With SHAs resolved, conventions come from the PR repo at its head — a non-null
-    // reader, proving the suppression is scoped to the unresolvable case only.
+    // With SHAs resolved, conventions come from the PR repo — a non-null reader, proving the
+    // suppression is scoped to the unresolvable case only.
     expect(mockRun).toHaveBeenCalledWith(
       expect.objectContaining({ conventionReader: expect.anything() })
     );
+  });
+});
+
+// Conventions land VERBATIM in every seat's prompt, so the ref they are read at is a security
+// boundary, not a freshness preference: at the PR head a contributor could add a `CLAUDE.md` and
+// address the reviewers directly. The base ref is the repo owner's text.
+describe('URL PR conventions are read at the BASE ref, never the PR head', () => {
+  const BASE = 'b'.repeat(40);
+  const HEAD = 'h'.repeat(40);
+
+  const ghUrls = (): string[] =>
+    mockExec.mock.calls.map((c) => ((c[1] ?? []) as string[]).join(' '));
+
+  it('the threaded reader fetches file contents at ?ref=<baseSha>', async () => {
+    resolveShas = true;
+    expect(await main(['review', 'https://github.com/o/r/pull/7'])).toBe(0);
+
+    const reader = mockRun.mock.calls[0][0].conventionReader;
+    expect(reader).toBeTruthy();
+    mockExec.mockClear();
+    // The gh reader mints its URL from the ref it closed over — exercise it, read that URL back.
+    await reader?.read('CLAUDE.md');
+
+    expect(ghUrls().some((u) => u.includes(`contents/CLAUDE.md?ref=${BASE}`))).toBe(true);
+    expect(ghUrls().some((u) => u.includes(HEAD))).toBe(false);
+  });
+
+  it('the same base ref governs the directory sweeps (docs/, ai-spec/)', async () => {
+    resolveShas = true;
+    expect(await main(['review', 'https://github.com/o/r/pull/7'])).toBe(0);
+
+    const reader = mockRun.mock.calls[0][0].conventionReader;
+    mockExec.mockClear();
+    await reader?.list('docs');
+
+    expect(ghUrls().some((u) => u.includes(`?ref=${BASE}`))).toBe(true);
+    expect(ghUrls().some((u) => u.includes(HEAD))).toBe(false);
   });
 });

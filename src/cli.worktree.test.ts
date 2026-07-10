@@ -69,6 +69,7 @@ function session(): WorktreeSession {
     reap: () => {
       reaps += 1;
     },
+    strippedInstructionFiles: [],
   };
 }
 

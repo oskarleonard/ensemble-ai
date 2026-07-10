@@ -7,7 +7,7 @@ import {
 } from '../../reviewers/codex-sandbox';
 import { GROK_SANDBOX_PROFILE, resolveReviewSandbox } from '../../reviewers/grok';
 
-import { CLAUDE_HARNESS_PROFILE } from './claude';
+import { CLAUDE_CAPABILITY_FENCE } from './claude';
 import type {
   EvidenceClass,
   EvidenceMap,
@@ -89,10 +89,14 @@ export function qualifyGrokSeat(configuredSandbox?: string): SeatQualification {
   return { profile, qualified: true, reason: null };
 }
 
-// claude + gate: harness-controlled (spec §2). They qualify whenever a worktree exists — the belt
-// is `--permission-mode plan` + the write-tool deny-list, whose identity is CLAUDE_HARNESS_PROFILE.
+// claude + gate: fenced by CAPABILITY, not by the kernel (spec §2, corrected 2026-07-10). The old
+// `claude-plan-mode-deny-writes` belt did NOT satisfy §2's deny-by-default predicate — plan mode
+// still executes Bash, and the tree's CLAUDE.md was an instruction channel. What qualifies these
+// seats now is CLAUDE_CAPABILITY_FENCE: no Bash, no network, no MCP, a neutral cwd, the worktree as
+// the sole `--add-dir` read root, and `$HOME` denied to every read tool (see ./claude for the probe
+// results behind each clause).
 export function qualifyHarnessSeat(): SeatQualification {
-  return { profile: CLAUDE_HARNESS_PROFILE, qualified: true, reason: null };
+  return { profile: CLAUDE_CAPABILITY_FENCE, qualified: true, reason: null };
 }
 
 // The per-reviewer qualifier, keyed by id. EXHAUSTIVE over ReviewerId, like REVIEW_ADAPTERS and

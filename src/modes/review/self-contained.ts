@@ -20,7 +20,7 @@ import type { RunReviewOpts } from '../../reviewers/codex';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
-import { runClaudeReviewVoice } from './claude';
+import { claudeWorktreePromptSuffix, runClaudeReviewVoice } from './claude';
 import { renderCodeReviewSeatPrompt } from './code-review-seat';
 import {
   type GateVerdictRecord,
@@ -35,7 +35,6 @@ import {
 } from './holistic';
 import { worktreeReader } from './holistic-gate';
 import type { ReviewProfile } from './profile';
-import { worktreePromptSuffix } from './seat-evidence';
 import { type ReviewSynthesis, type VoiceReview } from './synthesis';
 import { reviewJsonFromTrail } from './trail-io';
 
@@ -221,6 +220,10 @@ export interface ClaudeLayerOptions {
   gateConfig?: VoiceConfig;
   // The codex+grok reviews already produced + persisted by runReviewMode (the core).
   coreReviews: StoredReview[];
+  // The pinned reviewer-visible diff. Under the capability fence the Anthropic seats have no shell,
+  // so the engine hands them the change instead of letting them run `git diff` (see ./claude).
+  // Absent ⇒ the seats fall back to the packet prompt, which already embeds the diff.
+  pinnedDiff?: string;
   // The head SHA the reviewers saw — the gate reads the pinned packet keyed by it, and a
   // mismatch fails the packet closed (all verdicts unverified).
   expectedHeadSha: string;
@@ -288,8 +291,13 @@ export async function runClaudeReviewLayer(
 
   // THE ONE CLAUDE PRODUCER (spec §3). With worktree evidence the seat runs the built-in
   // `/code-review` methodology over the whole project at `headSha`; without it, the cold peer
-  // reviewer on the pinned packet, exactly as before. The spawn cwd — not a flag — is what grants
-  // the whole-project read, so a worktree with no resolved base SHA still reads the tree.
+  // reviewer on the pinned packet, exactly as before. `--add-dir` — not the cwd — is what grants the
+  // whole-project read (the capability fence keeps the cwd neutral), so a worktree with no resolved
+  // base SHA still reads the tree.
+  //
+  // The `/code-review` path additionally needs the pinned diff: the fence removed Bash, so the skill
+  // cannot derive the change itself. Without both a base SHA and that diff, the seat keeps the packet
+  // prompt (which embeds the diff already) and merely LEARNS about the worktree.
   //
   // ONLY the `code` profile takes the `/code-review` skill. `security --repo` runs this same layer,
   // and that skill hard-codes a structural-quality lens — swapping it in would silently drop the
@@ -299,15 +307,15 @@ export async function runClaudeReviewLayer(
   const isCodeProfile = (opts.profile ?? 'code') === 'code';
   const producerPrompt = !opts.worktree
     ? opts.reviewPrompt
-    : isCodeProfile && opts.baseSha
+    : isCodeProfile && opts.baseSha && opts.pinnedDiff
       ? renderCodeReviewSeatPrompt({
           baseSha: opts.baseSha,
+          diff: opts.pinnedDiff,
           headSha: opts.expectedHeadSha,
           worktree: opts.worktree,
         })
       : opts.reviewPrompt +
-        worktreePromptSuffix({
-          baseSha: opts.baseSha ?? null,
+        claudeWorktreePromptSuffix({
           headSha: opts.expectedHeadSha,
           worktree: opts.worktree,
         });
@@ -373,6 +381,7 @@ export async function runClaudeReviewLayer(
   const holistic = opts.holistic;
   const plan: HolisticPlan = resolveHolisticPlan({
     baseSha: holistic?.baseSha,
+    diff: opts.pinnedDiff,
     requested: Boolean(holistic),
     worktree: opts.worktree,
   });
@@ -384,6 +393,7 @@ export async function runClaudeReviewLayer(
     const { raw, review } = await runHolisticLens({
       baseSha: plan.baseSha,
       config: holistic.config,
+      diff: plan.diff,
       headSha: opts.expectedHeadSha,
       log,
       run,

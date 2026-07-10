@@ -3,6 +3,7 @@ import { type ManifestBlob, readReadableSurface } from './evidence-manifest';
 import {
   type GitRun,
   isPreflightError,
+  isStrippedPath,
   materializeWorktree,
   type PreflightError,
   reapWorktree,
@@ -25,12 +26,16 @@ export interface WorktreeSession {
   baseSha: string | null;
   dir: string;
   headSha: string;
-  // What the worktree seats could read: the tracked tree at headSha, keyed by blob SHA. Advisory
-  // (evidence-manifest.ts), never hashed into the receipt.
+  // What the worktree seats could read: the tracked tree at headSha, keyed by blob SHA, MINUS the
+  // agent-instruction files the engine stripped. Advisory (evidence-manifest.ts), never hashed into
+  // the receipt. Subtracting the stripped set is what keeps the artifact honest: `git ls-tree` reads
+  // the COMMIT, which still carries a planted CLAUDE.md that no seat could actually open.
   readableSurface: () => ManifestBlob[];
   // Idempotent + never throws — reap is best-effort by contract, plus a `git worktree prune` sweep
   // that self-heals the crash/SIGTERM path on the next run.
   reap: () => void;
+  // The agent-instruction files removed from the checkout before any seat ran. Sorted, repo-relative.
+  strippedInstructionFiles: string[];
 }
 
 export interface OpenWorktreeArgs {
@@ -89,11 +94,15 @@ export function openWorktree(
     baseSha: args.baseSha,
     dir: made.dir,
     headSha: made.headSha,
-    readableSurface: () => readReadableSurface(made.dir, made.headSha, { git }),
+    readableSurface: () =>
+      readReadableSurface(made.dir, made.headSha, { git }).filter(
+        (b) => !isStrippedPath(b.path, made.strippedInstructionFiles)
+      ),
     reap: () => {
       if (reaped) return;
       reaped = true;
       reapWorktree(location.repoRoot, made.dir, { git });
     },
+    strippedInstructionFiles: made.strippedInstructionFiles,
   };
 }
