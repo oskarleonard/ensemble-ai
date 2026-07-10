@@ -161,7 +161,13 @@ export function findQuoteSpan(
   lines: string[],
   quote: string
 ): { end: number; start: number } | null {
-  const want = quote.split(/\r?\n/).map(norm).filter(Boolean);
+  const want = quote.split(/\r?\n/).map(norm);
+  // Trim only the LEADING/TRAILING blank lines. An INTERNAL blank line is part of the quoted run
+  // and must match the file's own blank line: dropping it would make every truthful quote that
+  // spans a blank line (a function with a breathing line in it) fail to verify, and a truthful
+  // citation refused as `reference-not-found` is exactly the failure this module exists to prevent.
+  while (want.length > 0 && !want[0]) want.shift();
+  while (want.length > 0 && !want[want.length - 1]) want.pop();
   if (want.length === 0) return null;
   if (!want.some((l) => nonWsLen(l) >= HOLISTIC_MIN_ANCHOR_NONWS)) return null;
   const hay = lines.map(norm);
@@ -178,7 +184,11 @@ export function findQuoteSpan(
   return null;
 }
 
-export type SiteCheck = { ok: true } | { ok: false; reason: string };
+// The matched span is returned on success so a caller can compare two sites by WHAT THEY QUOTE
+// rather than by the line they cited — the cited line is only accurate to ±HOLISTIC_LINE_SLACK.
+export type SiteCheck =
+  | { ok: true; span: { end: number; start: number } }
+  | { ok: false; reason: string };
 
 // Verify one `file:line@headSha` + quote against the tree. Two independent facts must hold: the
 // quoted lines EXIST verbatim, and the cited line is where they live (±HOLISTIC_LINE_SLACK).
@@ -199,7 +209,7 @@ export function verifySiteAtHead(
       ok: false,
       reason: `${site.file}:${site.line} is not where that quote lives (found at ${span.start}-${span.end})`,
     };
-  return { ok: true };
+  return { ok: true, span };
 }
 
 // ── The conventions-doc predicate (the ONLY thing that may uncap) ─────────────────────
@@ -243,6 +253,33 @@ function capSeverity(s: Severity): Severity {
   return SEVERITIES.indexOf(s) < SEVERITIES.indexOf(HOLISTIC_SEVERITY_CAP) ? HOLISTIC_SEVERITY_CAP : s;
 }
 
+// TRUE when this record's severity sits ABOVE the cap — i.e. a verified citation actually lifted
+// it. `uncapCitation` alone does not mean the cap moved: a LOW finding may carry one too.
+export function holisticCapWasLifted(r: GateVerdictRecord): boolean {
+  return (
+    Boolean(r.holistic?.uncapCitation) &&
+    SEVERITIES.indexOf(r.severity) < SEVERITIES.indexOf(HOLISTIC_SEVERITY_CAP)
+  );
+}
+
+// The MED cap + single-seat provenance ALONE, with no site/citation verification. The full policy
+// (applyHolisticPolicy) cannot run when the gate's envelope failed wholesale — there are no
+// verdict entries to read sites off — but the cap is a HOST guarantee that must hold on every
+// path, or a failed gate would render the lens's own model-asserted `high` in the trail and stdout.
+export function capHolisticSeverity(r: GateVerdictRecord): GateVerdictRecord {
+  if (!isHolisticRecord(r)) return r;
+  const severity = capSeverity(r.severity);
+  return {
+    ...r,
+    holistic: {
+      lens: HOLISTIC_SEAT_ID,
+      singleSeat: true,
+      ...(severity !== r.severity ? { cappedFrom: r.severity } : {}),
+    },
+    severity,
+  };
+}
+
 const notPostable = (note: string) =>
   ({ postableBody: null, postableFix: null, postableNote: note, postableStatus: 'not-postable' as const, rescoredSeverity: null });
 
@@ -282,11 +319,25 @@ function checkSites(
     };
   if (d.file === p.file && d.line === p.line)
     return { cause: 'invalid-citation', ok: false, reason: 'both sites point at the same line — a pattern cannot reinvent itself' };
+  const spans: Record<HolisticSiteRole, { end: number; start: number }> = {
+    diff: { end: 0, start: 0 },
+    pattern: { end: 0, start: 0 },
+  };
   for (const [role, site] of [['diff', d], ['pattern', p]] as const) {
     const check = verifySiteAtHead(site, deps.readAtHead);
     if (!check.ok)
       return { cause: 'reference-not-found', ok: false, reason: `the ${role} site could not be verified at headSha — ${check.reason}` };
+    spans[role] = check.span;
   }
+  // The cited LINE only pins a quote to ±HOLISTIC_LINE_SLACK, so two sites can name different
+  // lines and still quote the very same code. Compare the VERIFIED SPANS: if they overlap, the
+  // claim is "this code reinvents itself", which is never a finding.
+  if (d.file === p.file && spans.diff.start <= spans.pattern.end && spans.pattern.start <= spans.diff.end)
+    return {
+      cause: 'invalid-citation',
+      ok: false,
+      reason: 'both sites quote the same lines — a pattern cannot reinvent itself',
+    };
   return { ok: true, sites: [d, p] };
 }
 

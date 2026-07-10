@@ -1972,7 +1972,9 @@ function worktreeReader(worktreeDir) {
 var norm = (s) => s.replace(/\s+/g, " ").trim();
 var nonWsLen = (s) => s.replace(/\s/g, "").length;
 function findQuoteSpan(lines, quote) {
-  const want = quote.split(/\r?\n/).map(norm).filter(Boolean);
+  const want = quote.split(/\r?\n/).map(norm);
+  while (want.length > 0 && !want[0]) want.shift();
+  while (want.length > 0 && !want[want.length - 1]) want.pop();
   if (want.length === 0) return null;
   if (!want.some((l) => nonWsLen(l) >= HOLISTIC_MIN_ANCHOR_NONWS)) return null;
   const hay = lines.map(norm);
@@ -2002,7 +2004,7 @@ function verifySiteAtHead(site, read) {
       ok: false,
       reason: `${site.file}:${site.line} is not where that quote lives (found at ${span.start}-${span.end})`
     };
-  return { ok: true };
+  return { ok: true, span };
 }
 var CANONICAL_CONVENTION_FILES = [
   "agents.md",
@@ -2023,6 +2025,22 @@ function isHolisticRecord(r) {
 }
 function capSeverity(s) {
   return SEVERITIES.indexOf(s) < SEVERITIES.indexOf(HOLISTIC_SEVERITY_CAP) ? HOLISTIC_SEVERITY_CAP : s;
+}
+function holisticCapWasLifted(r) {
+  return Boolean(r.holistic?.uncapCitation) && SEVERITIES.indexOf(r.severity) < SEVERITIES.indexOf(HOLISTIC_SEVERITY_CAP);
+}
+function capHolisticSeverity(r) {
+  if (!isHolisticRecord(r)) return r;
+  const severity = capSeverity(r.severity);
+  return {
+    ...r,
+    holistic: {
+      lens: HOLISTIC_SEAT_ID,
+      singleSeat: true,
+      ...severity !== r.severity ? { cappedFrom: r.severity } : {}
+    },
+    severity
+  };
 }
 var notPostable = (note) => ({ postableBody: null, postableFix: null, postableNote: note, postableStatus: "not-postable", rescoredSeverity: null });
 var downgrade = (r, downgradeReason, reason) => ({
@@ -2051,11 +2069,22 @@ function checkSites(sites, deps) {
     };
   if (d.file === p.file && d.line === p.line)
     return { cause: "invalid-citation", ok: false, reason: "both sites point at the same line \u2014 a pattern cannot reinvent itself" };
+  const spans = {
+    diff: { end: 0, start: 0 },
+    pattern: { end: 0, start: 0 }
+  };
   for (const [role, site] of [["diff", d], ["pattern", p]]) {
     const check = verifySiteAtHead(site, deps.readAtHead);
     if (!check.ok)
       return { cause: "reference-not-found", ok: false, reason: `the ${role} site could not be verified at headSha \u2014 ${check.reason}` };
+    spans[role] = check.span;
   }
+  if (d.file === p.file && spans.diff.start <= spans.pattern.end && spans.pattern.start <= spans.diff.end)
+    return {
+      cause: "invalid-citation",
+      ok: false,
+      reason: "both sites quote the same lines \u2014 a pattern cannot reinvent itself"
+    };
   return { ok: true, sites: [d, p] };
 }
 function applyHolisticPolicy(records, entryById, deps) {
@@ -3768,6 +3797,7 @@ export {
   buildEvidenceManifest,
   buildGrokReviewArgs,
   canonicalizeDiff,
+  capHolisticSeverity,
   classifyFileKind,
   classifyGitError,
   classifySecurityFinding,
@@ -3794,6 +3824,7 @@ export {
   fsConventionReader,
   gatherConventions,
   hasDepSurface,
+  holisticCapWasLifted,
   isConventionsDoc,
   isDiffReviewed,
   isEvidenceClass,

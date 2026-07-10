@@ -342,11 +342,19 @@ export async function runClaudeReviewLayer(
     holisticReview = review;
     try {
       persistSeatReview(opts.baseDir, opts.runId, HOLISTIC_SEAT_ID, review, raw);
-      writeTrailFile(opts.baseDir, opts.runId, `review.${HOLISTIC_SEAT_ID}.md`, renderReviewMarkdown(review));
     } catch (e) {
       const why = (e as Error).message;
       log(`  · holistic: trail persist FAILED (${why}) — the lens's findings are dropped from this run`);
       holisticReview = { ...review, findings: [], ok: false, summary: `the holistic lens ran but FAILED to persist to the trail (${why})` };
+    }
+    // The rendered markdown is a human-readable artifact, NOT the gate's input — the gate reads
+    // review.<id>.json. Its write is best-effort, exactly like review.claude.md above: folding it
+    // into the persist above would report "findings dropped" while review.holistic.json — already
+    // on disk — still fed those findings to the gate.
+    try {
+      writeTrailFile(opts.baseDir, opts.runId, `review.${HOLISTIC_SEAT_ID}.md`, renderReviewMarkdown(review));
+    } catch (e) {
+      log(`  · trail write review.${HOLISTIC_SEAT_ID}.md failed (${(e as Error).message}) — continuing`);
     }
   }
 

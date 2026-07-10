@@ -34,6 +34,8 @@ import {
   type HolisticProvenance,
   type HolisticSite,
   applyHolisticPolicy,
+  capHolisticSeverity,
+  holisticCapWasLifted,
   isHolisticRecord,
   parseConventionCitation,
   parseHolisticSites,
@@ -451,14 +453,19 @@ export function reconcileGateVerdicts(
   if ('failure' in parsed) {
     const reason = FAILURE_REASON[parsed.failure];
     return {
-      records: findings.map((f) => ({
-        ...recordBase(f),
-        ...NOT_POSTABLE,
-        downgradeReason: parsed.failure,
-        effectiveVerdict: 'unverified',
-        rawVerdict: null,
-        reason,
-      })),
+      // Nothing here is postable, but the lens's MED cap is a HOST guarantee on every path: a
+      // failed gate must not leave the lens's own model-asserted `high` standing in the trail or
+      // on stdout. The full policy cannot run — there are no verdict entries to read sites off.
+      records: findings.map((f) =>
+        capHolisticSeverity({
+          ...recordBase(f),
+          ...NOT_POSTABLE,
+          downgradeReason: parsed.failure,
+          effectiveVerdict: 'unverified',
+          rawVerdict: null,
+          reason,
+        })
+      ),
       warnings: [],
     };
   }
@@ -766,9 +773,11 @@ export function renderGateVerdicts(
       const dg = r.downgradeReason ? `  (host: ${r.downgradeReason})` : '';
       const reason = r.reason ? ` — ${s(r.reason).slice(0, 200)}` : '';
       // A holistic record NAMES its lens inline. Its provenance is one seat that read the whole
-      // tree — never the cross-reviewer corroboration the other records may carry.
+      // tree — never the cross-reviewer corroboration the other records may carry. The cap is
+      // reported as LIFTED only when the severity actually sits above it: a LOW finding may carry
+      // a verified citation too, and claiming it uncapped anything would be a false claim.
       const lens = r.holistic
-        ? `  [holistic lens · single seat${r.holistic.cappedFrom ? ` · severity capped from ${r.holistic.cappedFrom}` : ''}${r.holistic.uncapCitation ? ' · MED cap lifted by a verified conventions citation' : ''}]`
+        ? `  [holistic lens · single seat${r.holistic.cappedFrom ? ` · severity capped from ${r.holistic.cappedFrom}` : ''}${holisticCapWasLifted(r) ? ' · MED cap lifted by a verified conventions citation' : ''}]`
         : '';
       out.push(
         `     [${r.effectiveVerdict}] ${r.findingId} [${r.severity}] ${where}  ${s(r.title).slice(0, 120)}${reason}${dg}${lens}`

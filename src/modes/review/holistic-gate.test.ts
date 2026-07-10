@@ -9,8 +9,11 @@ import type { Severity } from '../../core/types';
 
 import {
   MIN_ANCHOR_NONWS,
+  type GateFinding,
   type GateVerdictRecord,
   honoredHighDismissals,
+  reconcileGateVerdicts,
+  renderGateVerdicts,
   renderHighGate,
   resolveHighGate,
 } from './gate';
@@ -109,6 +112,24 @@ describe('findQuoteSpan', () => {
     expect(findQuoteSpan(lines, 'export function neverWrittenAnywhere(): void {')).toBeNull();
     expect(findQuoteSpan(lines, 'function longEnoughToAnchor(x: number)')).toBeNull();
   });
+
+  it('matches a quote whose run of lines contains an INTERNAL blank line', () => {
+    // A function with a breathing line in it is the common case, not an exotic one. Dropping the
+    // blank from the quote (but not from the file) would refuse a truthful citation.
+    const spaced = ['export function longEnoughToAnchor(x: number): number {', '', '  return x;', '}'];
+    expect(findQuoteSpan(spaced, 'export function longEnoughToAnchor(x: number): number {\n\n  return x;')).toEqual({
+      end: 3,
+      start: 1,
+    });
+  });
+
+  it('still ignores LEADING and TRAILING blank lines in the quote', () => {
+    expect(findQuoteSpan(lines, '\n\nexport function longEnoughToAnchor(x: number): number {\n\n')).toEqual({ end: 2, start: 2 });
+  });
+
+  it('a quote of only blank lines anchors nothing', () => {
+    expect(findQuoteSpan(lines, '\n\n')).toBeNull();
+  });
 });
 
 describe('worktreeReader — the untrusted-tree fence', () => {
@@ -140,8 +161,10 @@ describe('worktreeReader — the untrusted-tree fence', () => {
 });
 
 describe('verifySiteAtHead', () => {
-  it('accepts a verbatim quote at its cited line', () => {
-    expect(verifySiteAtHead(PATTERN_SITE, read)).toEqual({ ok: true });
+  it('accepts a verbatim quote at its cited line, and reports the span it matched', () => {
+    const good = verifySiteAtHead(PATTERN_SITE, read);
+    expect(good.ok).toBe(true);
+    expect(good.ok === true && good.span).toEqual({ end: PATTERN_SITE.line, start: PATTERN_SITE.line });
   });
 
   it('rejects a quote that is real but cited at the wrong place', () => {
@@ -239,6 +262,18 @@ describe('applyHolisticPolicy — the three guardrails, mechanized', () => {
     const [out] = applyHolisticPolicy([record()], entry({ sites: [DIFF_SITE, self] }), DEPS);
     expect(out.downgradeReason).toBe('invalid-citation');
     expect(out.reason).toContain('same line');
+  });
+
+  it('BOTH SITES: nor via the line slack — two sites quoting the SAME span are refused', () => {
+    // Same file, same quote, cited two lines apart. Each site verifies on its own (the cited line
+    // only has to sit within ±2 of the quote's span), so only comparing the matched SPANS catches
+    // a claim that this code reinvents itself.
+    const selfViaSlack = { ...DIFF_SITE, line: DIFF_SITE.line + 2, role: 'pattern' as const };
+    expect(verifySiteAtHead(selfViaSlack, read).ok).toBe(true); // each site passes alone
+    const [out] = applyHolisticPolicy([record()], entry({ sites: [DIFF_SITE, selfViaSlack] }), DEPS);
+    expect(out.downgradeReason).toBe('invalid-citation');
+    expect(out.reason).toContain('same lines');
+    expect(out.postableStatus).toBe('not-postable');
   });
 
   it('AGREE-ONLY: a partial keeps its verdict in the trail but never posts', () => {
@@ -374,5 +409,49 @@ describe('the lens is advisory — it can never flip the exit contract', () => {
       authorityLabel: 'ON',
       scrub: (s) => s,
     })).toEqual([]);
+  });
+});
+
+describe('the MED cap is a host guarantee on EVERY path, including a failed gate', () => {
+  const holisticFinding: GateFinding = {
+    body: 'b',
+    file: DIFF_SITE.file,
+    findingId: `${HOLISTIC_SEAT_ID}#1`,
+    hunkCode: [],
+    hunkLabel: null,
+    line: DIFF_SITE.line,
+    resolved: false,
+    reviewer: HOLISTIC_SEAT_ID,
+    severity: 'high',
+    title: 'architecture claim',
+    truncated: false,
+  };
+
+  it('a whole-envelope failure still caps the lens and records its single-seat provenance', () => {
+    // This path never reaches applyHolisticPolicy (there are no verdict entries to read sites
+    // off), so without an explicit cap the lens's own asserted `high` would stand in the trail.
+    const { records } = reconcileGateVerdicts([holisticFinding], { failure: 'gate-failed' });
+    expect(records[0].severity).toBe('medium');
+    expect(records[0].holistic?.cappedFrom).toBe('high');
+    expect(records[0].holistic?.singleSeat).toBe(true);
+    expect(records[0].effectiveVerdict).toBe('unverified');
+    expect(records[0].downgradeReason).toBe('gate-failed'); // the failure cause is not clobbered
+    expect(records[0].postableStatus).toBe('not-postable');
+  });
+
+  it('a non-holistic finding is untouched on that same path', () => {
+    const codex: GateFinding = { ...holisticFinding, findingId: 'codex#1', reviewer: 'codex' };
+    const { records } = reconcileGateVerdicts([codex], { failure: 'gate-failed' });
+    expect(records[0].severity).toBe('high');
+    expect(records[0].holistic).toBeUndefined();
+  });
+
+  it('renderGateVerdicts claims a lifted cap only when severity really sits above it', () => {
+    const lifted = record({ holistic: { lens: HOLISTIC_SEAT_ID, singleSeat: true, uncapCitation: CONVENTION_CITATION }, severity: 'high' });
+    const notLifted = record({ holistic: { lens: HOLISTIC_SEAT_ID, singleSeat: true, uncapCitation: CONVENTION_CITATION }, severity: 'low' });
+    const out = (r: GateVerdictRecord) => renderGateVerdicts([r], { scrub: (s) => s, trailWritten: true }).join('\n');
+
+    expect(out(lifted)).toContain('MED cap lifted');
+    expect(out(notLifted)).not.toContain('MED cap lifted');
   });
 });

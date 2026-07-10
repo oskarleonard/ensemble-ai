@@ -2787,7 +2787,9 @@ function worktreeReader(worktreeDir) {
 var norm = (s) => s.replace(/\s+/g, " ").trim();
 var nonWsLen = (s) => s.replace(/\s/g, "").length;
 function findQuoteSpan(lines, quote) {
-  const want = quote.split(/\r?\n/).map(norm).filter(Boolean);
+  const want = quote.split(/\r?\n/).map(norm);
+  while (want.length > 0 && !want[0]) want.shift();
+  while (want.length > 0 && !want[want.length - 1]) want.pop();
   if (want.length === 0) return null;
   if (!want.some((l) => nonWsLen(l) >= HOLISTIC_MIN_ANCHOR_NONWS)) return null;
   const hay = lines.map(norm);
@@ -2817,7 +2819,7 @@ function verifySiteAtHead(site, read) {
       ok: false,
       reason: `${site.file}:${site.line} is not where that quote lives (found at ${span.start}-${span.end})`
     };
-  return { ok: true };
+  return { ok: true, span };
 }
 var CANONICAL_CONVENTION_FILES = [
   "agents.md",
@@ -2838,6 +2840,22 @@ function isHolisticRecord(r) {
 }
 function capSeverity(s) {
   return SEVERITIES.indexOf(s) < SEVERITIES.indexOf(HOLISTIC_SEVERITY_CAP) ? HOLISTIC_SEVERITY_CAP : s;
+}
+function holisticCapWasLifted(r) {
+  return Boolean(r.holistic?.uncapCitation) && SEVERITIES.indexOf(r.severity) < SEVERITIES.indexOf(HOLISTIC_SEVERITY_CAP);
+}
+function capHolisticSeverity(r) {
+  if (!isHolisticRecord(r)) return r;
+  const severity = capSeverity(r.severity);
+  return {
+    ...r,
+    holistic: {
+      lens: HOLISTIC_SEAT_ID,
+      singleSeat: true,
+      ...severity !== r.severity ? { cappedFrom: r.severity } : {}
+    },
+    severity
+  };
 }
 var notPostable = (note) => ({ postableBody: null, postableFix: null, postableNote: note, postableStatus: "not-postable", rescoredSeverity: null });
 var downgrade = (r, downgradeReason, reason) => ({
@@ -2866,11 +2884,22 @@ function checkSites(sites, deps) {
     };
   if (d.file === p.file && d.line === p.line)
     return { cause: "invalid-citation", ok: false, reason: "both sites point at the same line \u2014 a pattern cannot reinvent itself" };
+  const spans = {
+    diff: { end: 0, start: 0 },
+    pattern: { end: 0, start: 0 }
+  };
   for (const [role, site] of [["diff", d], ["pattern", p]]) {
     const check = verifySiteAtHead(site, deps.readAtHead);
     if (!check.ok)
       return { cause: "reference-not-found", ok: false, reason: `the ${role} site could not be verified at headSha \u2014 ${check.reason}` };
+    spans[role] = check.span;
   }
+  if (d.file === p.file && spans.diff.start <= spans.pattern.end && spans.pattern.start <= spans.diff.end)
+    return {
+      cause: "invalid-citation",
+      ok: false,
+      reason: "both sites quote the same lines \u2014 a pattern cannot reinvent itself"
+    };
   return { ok: true, sites: [d, p] };
 }
 function applyHolisticPolicy(records, entryById, deps) {
@@ -3513,14 +3542,19 @@ function reconcileGateVerdicts(findings, parsed, opts = {}) {
   if ("failure" in parsed) {
     const reason = FAILURE_REASON[parsed.failure];
     return {
-      records: findings.map((f) => ({
-        ...recordBase(f),
-        ...NOT_POSTABLE,
-        downgradeReason: parsed.failure,
-        effectiveVerdict: "unverified",
-        rawVerdict: null,
-        reason
-      })),
+      // Nothing here is postable, but the lens's MED cap is a HOST guarantee on every path: a
+      // failed gate must not leave the lens's own model-asserted `high` standing in the trail or
+      // on stdout. The full policy cannot run — there are no verdict entries to read sites off.
+      records: findings.map(
+        (f) => capHolisticSeverity({
+          ...recordBase(f),
+          ...NOT_POSTABLE,
+          downgradeReason: parsed.failure,
+          effectiveVerdict: "unverified",
+          rawVerdict: null,
+          reason
+        })
+      ),
       warnings: []
     };
   }
@@ -3697,7 +3731,7 @@ function renderGateVerdicts(records, opts) {
       const where = evidenceRef(r.file, r.line, s);
       const dg = r.downgradeReason ? `  (host: ${r.downgradeReason})` : "";
       const reason = r.reason ? ` \u2014 ${s(r.reason).slice(0, 200)}` : "";
-      const lens = r.holistic ? `  [holistic lens \xB7 single seat${r.holistic.cappedFrom ? ` \xB7 severity capped from ${r.holistic.cappedFrom}` : ""}${r.holistic.uncapCitation ? " \xB7 MED cap lifted by a verified conventions citation" : ""}]` : "";
+      const lens = r.holistic ? `  [holistic lens \xB7 single seat${r.holistic.cappedFrom ? ` \xB7 severity capped from ${r.holistic.cappedFrom}` : ""}${holisticCapWasLifted(r) ? " \xB7 MED cap lifted by a verified conventions citation" : ""}]` : "";
       out.push(
         `     [${r.effectiveVerdict}] ${r.findingId} [${r.severity}] ${where}  ${s(r.title).slice(0, 120)}${reason}${dg}${lens}`
       );
@@ -4439,11 +4473,15 @@ async function runClaudeReviewLayer(opts) {
     holisticReview = review;
     try {
       persistSeatReview(opts.baseDir, opts.runId, HOLISTIC_SEAT_ID, review, raw);
-      writeTrailFile(opts.baseDir, opts.runId, `review.${HOLISTIC_SEAT_ID}.md`, renderReviewMarkdown(review));
     } catch (e) {
       const why = e.message;
       log(`  \xB7 holistic: trail persist FAILED (${why}) \u2014 the lens's findings are dropped from this run`);
       holisticReview = { ...review, findings: [], ok: false, summary: `the holistic lens ran but FAILED to persist to the trail (${why})` };
+    }
+    try {
+      writeTrailFile(opts.baseDir, opts.runId, `review.${HOLISTIC_SEAT_ID}.md`, renderReviewMarkdown(review));
+    } catch (e) {
+      log(`  \xB7 trail write review.${HOLISTIC_SEAT_ID}.md failed (${e.message}) \u2014 continuing`);
     }
   }
   const voiceReviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
