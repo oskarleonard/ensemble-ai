@@ -271,10 +271,13 @@ export function wrapWithSandbox(
   return { args: ['-f', profileFile, bin, ...args], bin: '/usr/bin/sandbox-exec' };
 }
 
-// PURE: the codex argv for a WORKTREE-mode review. Differs from the packet argv in exactly two
-// ways: the internal sandbox is off (the external profile governs — nested Seatbelt does not
-// compose) and the cwd is the worktree (so codex's file tools reach the project). `-o <file>`
-// still carries the reply, as in packet mode.
+// PURE: the codex argv for a WORKTREE-mode review. Differs from the packet argv: the internal
+// sandbox is off (the external profile governs — nested Seatbelt does not compose), the cwd is the
+// worktree (so codex's file tools reach the project), and it carries NONE of the packet FENCE flags
+// (`--ignore-user-config` + `--strict-config` + the `otel.*` overrides) — on the worktree path the egress proxy + kernel
+// sandbox already deny the same operator-MCP/telemetry hosts at the network layer, so the packet's
+// source-level fence is that path's substitute for them, not a second copy. `-o <file>` still
+// carries the reply, as in packet mode.
 export function buildCodexWorktreeArgs(
   config: { effort: string; model: string },
   outFile: string,

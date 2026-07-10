@@ -278,6 +278,28 @@ export async function runGrokReview(
       timedOut: false,
     };
   }
+  // PACKET-MODE VERIFICATION (packet-f1, 2026-07-10) — the codex packet fence (buildCodexReviewArgs)
+  // has NO grok counterpart, and this documents why, verified rather than assumed (the task: verify,
+  // document, change nothing):
+  //   · VERIFIED sandboxed on every path: buildGrokReviewArgs passes `--sandbox` unconditionally and
+  //     resolveReviewSandbox floors it at a DENY-BY-DEFAULT profile (`strict` base — bare `strict` or
+  //     `ensemble-review`), so a PACKET review runs deny-by-default reads: credentials in $HOME are
+  //     kernel-unreadable to it. (The `ensemble-review` secret deny-list is belt-and-suspenders for
+  //     secrets INSIDE the cwd; a packet cwd is a throwaway with the diff in the prompt, so a bare-
+  //     `strict` resolution loses nothing that matters to the packet threat model.)
+  //   · The codex hole has NO analog here: codex's packet seat loaded the operator's
+  //     ~/.codex/config.toml `[mcp_servers]` (an OAuth-credentialed mcp.supabase.com) — the reason it
+  //     now passes `--ignore-user-config`. grok loads no such server: `grok mcp list` is empty
+  //     (verified live 2026-07-10). There is no operator-credentialed MCP egress channel to fence.
+  //   · What the sandbox does NOT deny, stated plainly: grok's OWN first-party usage telemetry. Under
+  //     `--sandbox strict` a grok process still ATTEMPTS `api.mixpanel.com` (observed live 2026-07-10
+  //     through a logging proxy) — `strict` denies CHILD-process network, not the main agent's
+  //     outbound. The worktree egress proxy below DENIES that host; a packet seat has no proxy, so its
+  //     telemetry is not network-fenced. ACCEPTED, not a cred-exfil hole: the packet diff is prompt
+  //     DATA (no untrusted tree to inject from), the seat has no shell (`--disallowed-tools bash`),
+  //     and grok holds no operator credentials — so that channel can carry only grok's first-party
+  //     usage stats, a privacy nit, never a diff/secret leak. The packet path is left byte-identical.
+  //
   // THE EGRESS FENCE (codex-f3), on the worktree path only — a packet seat has no untrusted tree to
   // be injected from, and the receipt attests no fence for it. grok honors the proxy env vars
   // (probed), so this bounds which hosts it may reach. A proxy that cannot start refuses the seat
