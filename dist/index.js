@@ -996,7 +996,7 @@ function startEgressProxy(opts) {
       port: 0,
       reason: "plaintext HTTP through the proxy is refused \u2014 the fence tunnels TLS only"
     });
-    res.writeHead(403, { "content-type": "text/plain" });
+    res.writeHead(403, { connection: "close", "content-type": "text/plain" });
     res.end("ensemble-ai egress fence: plaintext HTTP is refused\n");
   });
   server.on("connect", (req, clientSocket, head) => {
@@ -1025,6 +1025,11 @@ function startEgressProxy(opts) {
     server.once("error", reject);
     server.listen(opts.port ?? 0, BIND_HOST, () => {
       server.removeListener("error", reject);
+      server.on(
+        "error",
+        (e) => process.stderr.write(`\u26A0 ensemble-ai egress fence: proxy server error \u2014 ${e.message}
+`)
+      );
       const addr = server.address();
       const port = typeof addr === "object" && addr ? addr.port : 0;
       resolve({
@@ -1032,6 +1037,7 @@ function startEgressProxy(opts) {
         close: () => {
           for (const s of sockets) s.destroy();
           sockets.clear();
+          server.closeAllConnections();
           server.close();
         },
         denials,
@@ -1468,32 +1474,36 @@ async function runGrokReview(prompt, config, opts = {}) {
       return { ok: false, raw: null, stderrTail: egressStartFailure("grok", e), timedOut: false };
     }
   }
-  ensureSandboxProfile(sandbox);
-  const cwd = worktreeCwd ?? fs8.mkdtempSync(path6.join(os6.tmpdir(), "grok-review-"));
-  return runReviewerExec({
-    args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
-    bin: resolveGrokBin(),
-    capture: "stdout",
-    ...proxy ? { env: proxyEnv(proxy.url) } : {},
-    onSpawn: opts.onSpawn,
-    stderrLimit: 2e3,
-    timeoutMs
-  }).then(({ raw, stderrTail, timedOut }) => {
-    const egressDenials = proxy ? [...proxy.denials] : void 0;
-    proxy?.close();
-    try {
-      if (!worktreeCwd) fs8.rmSync(cwd, { force: true, recursive: true });
-    } catch {
-    }
+  let cwd;
+  try {
+    ensureSandboxProfile(sandbox);
+    cwd = worktreeCwd ?? fs8.mkdtempSync(path6.join(os6.tmpdir(), "grok-review-"));
+    const { raw, stderrTail, timedOut } = await runReviewerExec({
+      args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
+      bin: resolveGrokBin(),
+      capture: "stdout",
+      ...proxy ? { env: proxyEnv(proxy.url) } : {},
+      onSpawn: opts.onSpawn,
+      stderrLimit: 2e3,
+      timeoutMs
+    });
     const text = raw ? extractGrokText(raw) : null;
     return {
-      ...egressDenials ? { egressDenials } : {},
+      // Snapshotted HERE, in the return expression — it is evaluated before the `finally` closes the
+      // proxy, so the denial audit the footer and `egress-denials.json` depend on is never lost.
+      ...proxy ? { egressDenials: [...proxy.denials] } : {},
       ok: text !== null,
       raw: text,
       stderrTail,
       timedOut
     };
-  });
+  } finally {
+    proxy?.close();
+    try {
+      if (!worktreeCwd && cwd) fs8.rmSync(cwd, { force: true, recursive: true });
+    } catch {
+    }
+  }
 }
 
 // src/reviewers/registry.ts

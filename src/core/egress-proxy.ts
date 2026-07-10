@@ -144,7 +144,10 @@ export function startEgressProxy(opts: StartEgressProxyOpts): Promise<EgressProx
       port: 0,
       reason: 'plaintext HTTP through the proxy is refused — the fence tunnels TLS only',
     });
-    res.writeHead(403, { 'content-type': 'text/plain' });
+    // `Connection: close` is load-bearing, not politeness: an HTTP/1.1 403 defaults to keep-alive,
+    // and that socket belongs to the http server, not to the `sockets` set below — it would outlive
+    // `close()` and keep the run's event loop alive.
+    res.writeHead(403, { connection: 'close', 'content-type': 'text/plain' });
     res.end('ensemble-ai egress fence: plaintext HTTP is refused\n');
   });
 
@@ -178,6 +181,12 @@ export function startEgressProxy(opts: StartEgressProxyOpts): Promise<EgressProx
     server.once('error', reject); // EADDRINUSE and friends → the caller fails the seat closed
     server.listen(opts.port ?? 0, BIND_HOST, () => {
       server.removeListener('error', reject);
+      // With `reject` gone the server has NO 'error' listener, and an 'error' event without one
+      // THROWS — an accept-time failure (EMFILE) would kill the whole review rather than this seat.
+      // Own it: loud on stderr, never fatal.
+      server.on('error', (e) =>
+        process.stderr.write(`⚠ ensemble-ai egress fence: proxy server error — ${e.message}\n`)
+      );
       // A listening server always has an AddressInfo here; the union is a `net` typing artifact.
       const addr = server.address();
       const port = typeof addr === 'object' && addr ? addr.port : 0;
@@ -186,6 +195,9 @@ export function startEgressProxy(opts: StartEgressProxyOpts): Promise<EgressProx
         close: () => {
           for (const s of sockets) s.destroy();
           sockets.clear();
+          // `sockets` holds only the CONNECT tunnels. Any socket the plaintext deny path opened is
+          // the http server's own, so `server.close()` would wait on it forever; drop those too.
+          server.closeAllConnections();
           server.close();
         },
         denials,

@@ -281,34 +281,44 @@ export async function runGrokReview(
       return { ok: false, raw: null, stderrTail: egressStartFailure('grok', e), timedOut: false };
     }
   }
-  ensureSandboxProfile(sandbox);
-  const cwd = worktreeCwd ?? fs.mkdtempSync(path.join(os.tmpdir(), 'grok-review-'));
-  return runReviewerExec({
-    args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
-    bin: resolveGrokBin(),
-    capture: 'stdout',
-    ...(proxy ? { env: proxyEnv(proxy.url) } : {}),
-    onSpawn: opts.onSpawn,
-    stderrLimit: 2000,
-    timeoutMs,
-  }).then(({ raw, stderrTail, timedOut }) => {
-    const egressDenials = proxy ? [...proxy.denials] : undefined;
-    proxy?.close();
-    try {
-      // ONLY the throwaway tmpdir is ours to delete. The worktree is owned by the run's
-      // materialization lifecycle (one per run, shared by every seat) and is reaped there —
-      // rm'ing it here would destroy the other seats' evidence mid-review.
-      if (!worktreeCwd) fs.rmSync(cwd, { force: true, recursive: true });
-    } catch {
-      // throwaway dir — best-effort cleanup
-    }
+  // ONCE THE FENCE IS UP IT COMES DOWN ON EVERY PATH. `ensureSandboxProfile` writes a file,
+  // `resolveGrokBin` throws when grok is not installed, and `runReviewerExec` can reject — each of
+  // those, on the old `.then()`-only teardown, left the proxy's listening server and its sockets
+  // open. The CLI sets `process.exitCode` rather than calling `process.exit()`, so a leaked handle
+  // keeps the event loop alive and the run never exits. `finally` is what makes that unreachable —
+  // the same guarantee codex's `.finally(cleanup)` already had.
+  let cwd: string | undefined;
+  try {
+    ensureSandboxProfile(sandbox);
+    cwd = worktreeCwd ?? fs.mkdtempSync(path.join(os.tmpdir(), 'grok-review-'));
+    const { raw, stderrTail, timedOut } = await runReviewerExec({
+      args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
+      bin: resolveGrokBin(),
+      capture: 'stdout',
+      ...(proxy ? { env: proxyEnv(proxy.url) } : {}),
+      onSpawn: opts.onSpawn,
+      stderrLimit: 2000,
+      timeoutMs,
+    });
     const text = raw ? extractGrokText(raw) : null;
     return {
-      ...(egressDenials ? { egressDenials } : {}),
+      // Snapshotted HERE, in the return expression — it is evaluated before the `finally` closes the
+      // proxy, so the denial audit the footer and `egress-denials.json` depend on is never lost.
+      ...(proxy ? { egressDenials: [...proxy.denials] } : {}),
       ok: text !== null,
       raw: text,
       stderrTail,
       timedOut,
     };
-  });
+  } finally {
+    proxy?.close();
+    try {
+      // ONLY the throwaway tmpdir is ours to delete. The worktree is owned by the run's
+      // materialization lifecycle (one per run, shared by every seat) and is reaped there —
+      // rm'ing it here would destroy the other seats' evidence mid-review.
+      if (!worktreeCwd && cwd) fs.rmSync(cwd, { force: true, recursive: true });
+    } catch {
+      // throwaway dir — best-effort cleanup
+    }
+  }
 }

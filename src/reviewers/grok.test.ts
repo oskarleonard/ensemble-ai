@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -331,4 +332,46 @@ describe('runGrokReview — the worktree seat is fenced by the egress proxy', ()
     child?.emit('exit');
     await run;
   });
+
+  // THE TEARDOWN IS UNCONDITIONAL. `ensureSandboxProfile`, `resolveGrokBin` and `runReviewerExec`
+  // all sit between "the proxy is listening" and "the reply came back", and each can throw. On the
+  // old `.then()`-only teardown the proxy's listening server survived the throw — and because the
+  // CLI sets `process.exitCode` instead of calling `process.exit()`, that live handle kept the
+  // event loop alive and the run never exited. Assert the socket is actually GONE, not just that a
+  // close() was called.
+  it('closes the proxy when the spawn path throws, so no listening fence outlives the seat', async () => {
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    let port = 0;
+    spawned.mockImplementation(((
+      _bin: string,
+      _args: string[],
+      opts: { env?: Record<string, string> }
+    ) => {
+      port = Number(new URL(opts.env?.HTTPS_PROXY ?? '').port);
+      throw new Error('spawn exploded');
+    }) as unknown as typeof spawn);
+
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
+    try {
+      await expect(
+        runGrokReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt })
+      ).rejects.toThrow('spawn exploded');
+      expect(port).toBeGreaterThan(0);
+      await expect(dial(port)).rejects.toMatchObject({ code: 'ECONNREFUSED' });
+    } finally {
+      fs.rmSync(wt, { force: true, recursive: true });
+    }
+  });
 });
+
+// Connect to a loopback port, or reject with the OS error — the proof that a proxy is really down.
+function dial(port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const s = net.connect(port, '127.0.0.1', () => {
+      s.destroy();
+      resolve();
+    });
+    s.on('error', reject);
+  });
+}
