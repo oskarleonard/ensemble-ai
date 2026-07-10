@@ -86,6 +86,26 @@ new agree/partial) OR after the 3rd round. **If it is still not clean after 3 ro
 surface it honestly** — list what remains and why (a genuine disagreement, a fix that needs a
 design call, a flaky reviewer) rather than looping forever or quietly declaring success.
 
+## 4.5 · The push fence — MANDATORY before pushing to an existing PR
+
+This skill is the **fix tail**: it edits code and pushes. When you are fixing an EXISTING pull
+request rather than opening a new one, run the fence FIRST and honor its exit code:
+
+```bash
+ensemble-ai push-fence --pr <N|url>   # exit 0 = you own the head ref; exit 5 = REFUSED
+```
+
+**Never push to a head ref the user does not own.** A contributor's fork branch is theirs —
+rewriting it is not a review action, whatever "allow edits by maintainers" makes technically
+possible. On exit 5, stop and offer the **stage tail** instead:
+
+```bash
+ensemble-ai review --pr <url> --stage   # one PENDING review; posts nothing until the user submits
+```
+
+This is a fence, not a dispatcher: which tail runs is decided by which command the user invoked,
+never by the engine sniffing the PR.
+
 ## 5 · OFFER a PR — never open one unprompted
 
 When it is clean (or you have surfaced the residual honestly), **offer** to open the PR:
@@ -103,6 +123,8 @@ review is auditable from the PR.
 
 - **The CLI is read-only; the SESSION fixes.** `ensemble-ai review` never edits code — every
   change in this flow is your own edit, on a branch, verified.
+- **Never push to a PR head-ref the user does not own.** Run `ensemble-ai push-fence` (§4.5) before
+  any push to an existing PR; exit 5 means stage a pending review, not push.
 - **Never auto-create the PR.** §5 OFFERS; the user ratifies.
 - **≤ 3 review rounds, then honesty.** No infinite loops, no silent "it's fine".
 - **Trail stays out of the personal brain.** If the repo under review is a `_work` repo, do NOT

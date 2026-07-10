@@ -55,17 +55,21 @@ const SYNTHESIS: ReviewSynthesis = {
 
 function gateRecord(over: Partial<GateVerdictRecord> = {}): GateVerdictRecord {
   return {
+    anchorSide: 'new',
     downgradeReason: null,
     effectiveVerdict: 'agree',
     file: 'src/a.ts',
     findingId: 'codex#1',
     line: 12,
     postableBody: null,
+    postableClass: null,
     postableFix: null,
     postableStatus: 'not-postable',
+    postableSuggestion: null,
     rawVerdict: 'agree',
     reason: 'confirmed against the hunk',
     rescoredSeverity: null,
+    resolved: true,
     reviewer: 'codex',
     severity: 'high',
     title: 'Unbounded read',

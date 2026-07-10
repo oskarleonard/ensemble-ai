@@ -129,7 +129,8 @@ Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
     "bottomLine": "<merge-safe? what must change first>"
   },
   "verdicts": [
-    { "findingId": "codex#1", "verdict": "agree", "reason": "<one line>", "fixStatus": "keep" },
+    { "findingId": "codex#1", "verdict": "agree", "reason": "<one line>", "fixStatus": "keep",
+      "class": "bug", "suggestion": { "replacement": "<the corrected line(s), verbatim code>" } },
     { "findingId": "codex#3", "verdict": "partial", "reason": "<what was overstated>",
       "ops": [
         { "op": "strike", "quote": "<EXACT substring of codex#3's body to remove>", "why": "<ungrounded>" },
@@ -153,7 +154,16 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
 - "fixStatus" (optional, agree/partial): the reviewer's suggested fix is verified only for the
   problem, not the fix — mark it keep | narrow | strike (strike if the narrowed claim no longer
   supports it). "rescoredSeverity" (optional, partial): the TRUE severity if overstatement
-  inflated it — it may only LOWER severity, never raise it.${
+  inflated it — it may only LOWER severity, never raise it.
+- "class" (agree/partial): where this belongs on someone else's pull request. "bug" = a correctness
+  or security DEFECT — it earns an inline comment. "quality" = a structural simplification (dead
+  branch, narrower scope, a reinvented utility) — real, but it rides a collapsed summary section,
+  never inline prose. Default when you omit it: "bug".
+- "suggestion" (optional, agree + fixStatus "keep" ONLY): the corrected code for the finding's own
+  cited line, as a ONE-CLICK replacement. Send it only when the fix is small, obvious, and you have
+  verified it against the hunk. The replacement may introduce NO identifier, path, or number absent
+  from the body or the hunk (same rule as "ops"), and it replaces exactly the cited line. When in
+  doubt, omit it: a wrong one-click suggestion is worse than no suggestion.${
     gateEvidence === 'worktree' ? REFERENCE_NOT_FOUND_CLAUSE : ''
   }${hasHolistic ? holisticClause : ''}`;
 

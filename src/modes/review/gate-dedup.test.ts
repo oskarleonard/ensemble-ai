@@ -5,16 +5,20 @@ import type { GateVerdictRecord } from './gate';
 
 function rec(over: Partial<GateVerdictRecord> & { findingId: string }): GateVerdictRecord {
   return {
+    anchorSide: 'new',
     downgradeReason: null,
     effectiveVerdict: 'agree',
     file: 'src/a.ts',
     line: 10,
     postableBody: 'body',
+    postableClass: 'bug',
     postableFix: 'keep',
     postableStatus: 'postable',
+    postableSuggestion: null,
     rawVerdict: 'agree',
     reason: 'r',
     rescoredSeverity: null,
+    resolved: true,
     reviewer: over.findingId.split('#')[0],
     severity: 'medium',
     title: 't',

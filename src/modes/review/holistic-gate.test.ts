@@ -66,6 +66,10 @@ function record(over: Partial<GateVerdictRecord> = {}): GateVerdictRecord {
   return {
     downgradeReason: null,
     effectiveVerdict: 'agree',
+    anchorSide: 'new',
+    postableClass: 'quality',
+    postableSuggestion: null,
+    resolved: true,
     file: DIFF_SITE.file,
     findingId: `${HOLISTIC_SEAT_ID}#1`,
     line: DIFF_SITE.line,
@@ -471,6 +475,7 @@ describe('the lens is advisory — it can never flip the exit contract', () => {
 
 describe('the MED cap is a host guarantee on EVERY path, including a failed gate', () => {
   const holisticFinding: GateFinding = {
+    anchorSide: null,
     body: 'b',
     file: DIFF_SITE.file,
     findingId: `${HOLISTIC_SEAT_ID}#1`,

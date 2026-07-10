@@ -38,6 +38,10 @@ function holisticRecord(file: string, line: number, severity: 'high' | 'medium' 
   return {
     downgradeReason: null,
     effectiveVerdict: 'agree',
+    anchorSide: 'new',
+    postableClass: 'quality',
+    postableSuggestion: null,
+    resolved: true,
     file,
     findingId: `${HOLISTIC_SEAT_ID}#1`,
     line,

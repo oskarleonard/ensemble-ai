@@ -20,12 +20,16 @@ import {
 } from './gate-hunks';
 import {
   type FixStatus,
+  type PostableClass,
   type PostableOp,
   type PostableStatus,
+  type PostableSuggestion,
   derivePostable,
   parseFixStatus,
+  parsePostableClass,
   parsePostableOps,
   parseSeverity,
+  parseSuggestion,
 } from './gate-postable';
 import {
   type ConventionCitation,
@@ -98,7 +102,14 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // The durable trail-artifact schema. Bumped independently if the record shape changes.
 // v2: adds the postable-text fields (postableBody / postableFix / rescoredSeverity /
 // postableStatus) the LLM-free posting step consumes — see gate-postable.ts.
-export const GATE_TRAIL_SCHEMA_VERSION = 2;
+// v3: adds the PLACEMENT fields (postableClass / postableSuggestion) the staged-review tail
+// consumes — where a finding lands (inline vs the collapsed quality section) and the gate-verified
+// one-click replacement, both decided HERE so the posting path never runs a model. Additive: a v2
+// reader that ignores unknown keys reads a v3 record unchanged.
+// v4: adds `anchorSide` — WHICH line space the cite resolved in. A deletion-only hunk resolves on
+// the OLD side, so its line number names a line that exists only on the diff's LEFT; posting it as
+// a RIGHT anchor is a 422 that fails the whole staged review. Additive, same as v3.
+export const GATE_TRAIL_SCHEMA_VERSION = 4;
 
 const REASON_CAP = 700;
 const CITATION_CAP = 500;
@@ -114,7 +125,16 @@ function capStr(s: unknown, n: number): string {
 // One finding as the HOST owns it — its stable cross-reviewer id, immutable severity, and
 // its resolved+windowed cited hunk. Nothing the gate returns can alter these (exit keys off
 // the STORED reviewer severity, never a gate echo).
+// WHICH line space a cite resolved in. `new` ⇒ `line` names a line on the diff's RIGHT (added or
+// context) and may be anchored there. `old` ⇒ the cite landed in a deletion-only hunk, so `line`
+// names a line that exists only on the LEFT — real, citable, but NOT a RIGHT anchor. `null` ⇒ the
+// cite resolved to no hunk at all. See resolveFindingHunk in gate-hunks.ts, whose second pass is
+// exactly the old-side branch.
+export type AnchorSide = 'new' | 'old' | null;
+
 export interface GateFinding {
+  // The line space `line` was resolved in — see AnchorSide. null when `resolved` is false.
+  anchorSide: AnchorSide;
   body: string;
   file: string;
   findingId: string; // `${voiceId}#${n}` — unique across all three reviewers
@@ -242,6 +262,9 @@ export function prepareGateFindings(
   const findings: GateFinding[] = raw.map((rf) => {
     const res = resolved.get(rf.findingId) ?? null;
     return {
+      // resolveFindingHunk matches the new side first and only falls to the old side for a
+      // deletion-only hunk (newCount === 0), so the hunk's own newCount names the side.
+      anchorSide: res ? (res.hunk.newCount > 0 ? 'new' : 'old') : null,
       body: rf.body,
       file: rf.file,
       findingId: rf.findingId,
@@ -295,6 +318,9 @@ export interface RawVerdictEntry {
   // the host honors it solely on worktree evidence (see reconcileGateVerdicts).
   cause?: string;
   citation?: string;
+  // Where this finding may land on a foreign PR: `bug` (inline) or `quality` (collapsed section).
+  // Absent / unrecognized ⇒ the host defaults to `bug`.
+  class?: PostableClass;
   // HOLISTIC-lens verdicts only (spec §4): the conventions-doc citation that may lift the MED
   // severity cap, and the two sites an `agree` must quote. Both are re-verified against the tree
   // at headSha by the HOST (holistic-gate.ts) — the model's say-so grounds nothing.
@@ -304,6 +330,8 @@ export interface RawVerdictEntry {
   ops?: PostableOp[]; // minimal edit-ops narrowing the body (partial only)
   reason: string;
   rescoredSeverity?: Severity; // gate's down-scored severity (host clamps: never higher)
+  // A gate-verified small replacement for the finding's own cited line (agree + fixStatus keep).
+  suggestion?: PostableSuggestion;
   sites?: HolisticSite[]; // holistic only — the reinvention in the diff + the pattern's home
   verdict: unknown;
 }
@@ -334,6 +362,8 @@ function parseVerdicts(v: unknown): RawVerdictEntry[] {
     const ops = parsePostableOps(e.ops);
     const fixStatus = parseFixStatus(e.fixStatus);
     const rescoredSeverity = parseSeverity(e.rescoredSeverity);
+    const postableClass = parsePostableClass(e.class);
+    const suggestion = parseSuggestion(e.suggestion);
     const sites = parseHolisticSites(e.sites);
     const conventionCitation = parseConventionCitation(e.conventionCitation);
     out.push({
@@ -344,9 +374,11 @@ function parseVerdicts(v: unknown): RawVerdictEntry[] {
       // conditional so an old-shape (no-ops) entry parses to the exact prior shape
       ...(ops.length ? { ops } : {}),
       ...(typeof e.cause === 'string' && e.cause.trim() ? { cause: e.cause.trim() } : {}),
-      ...(conventionCitation ? { conventionCitation } : {}),
+      ...(postableClass ? { class: postableClass } : {}),
       ...(fixStatus ? { fixStatus } : {}),
       ...(rescoredSeverity ? { rescoredSeverity } : {}),
+      ...(suggestion ? { suggestion } : {}),
+      ...(conventionCitation ? { conventionCitation } : {}),
       ...(sites ? { sites } : {}),
     });
   }
@@ -375,6 +407,9 @@ export function parseGateEnvelope(raw: string): EnvelopeFailure | ParsedGateEnve
 // ── Host-owned reconciliation → the durable records ───────────────────────────────────
 
 export interface GateVerdictRecord {
+  // The line space `line` resolved in (see AnchorSide). Only `new` may be anchored as an inline
+  // RIGHT comment; `old` names a deleted line, which GitHub rejects on the RIGHT.
+  anchorSide: AnchorSide;
   citation?: string;
   cluster?: ClusterInfo; // cross-reviewer cluster (postable records only); absent ⇒ singleton / not clustered
   downgradeReason: DowngradeReason | null;
@@ -387,12 +422,22 @@ export interface GateVerdictRecord {
   holistic?: HolisticProvenance;
   line: number | null;
   postableBody: string | null; // EXACT text to post (verbatim for agree, narrowed for partial); null ⇒ do not post
+  // Where this finding lands on a foreign PR (spec §6). null ⇒ not postable. Decided by the gate,
+  // defaulted to `bug` — the posting path reads it and never re-judges.
+  postableClass: PostableClass | null;
   postableFix: FixStatus | null; // disposition of the reviewer's suggested fix
   postableNote?: string; // escalation / audit note when postableStatus is 'escalated'
   postableStatus: PostableStatus; // postable | escalated (couldn't safely narrow) | not-postable (false/unverified)
+  // A gate-verified one-click replacement for `line`; null ⇒ none. The per-review CAP is applied
+  // by the posting path (consumer config), not here.
+  postableSuggestion: PostableSuggestion | null;
   rawVerdict: string | null; // exactly what the model returned (may be an invalid enum), null if none
   reason: string;
   rescoredSeverity: Severity | null; // gate's down-scored severity for a partial; null ⇒ unchanged
+  // Did this finding's cite RESOLVE to a hunk of the reviewed diff? The posting path needs it: a
+  // GitHub review comment on a line outside the diff is a 422 that fails the whole staged review,
+  // so only a resolved cite may be anchored inline.
+  resolved: boolean;
   reviewer: string;
   severity: Severity;
   title: string;
@@ -402,8 +447,10 @@ export interface GateVerdictRecord {
 // postable-text pass below overwrites these for the agree/partial pass-through only.
 const NOT_POSTABLE = {
   postableBody: null,
+  postableClass: null,
   postableFix: null,
   postableStatus: 'not-postable' as const,
+  postableSuggestion: null,
   rescoredSeverity: null,
 };
 
@@ -411,7 +458,13 @@ const NOT_POSTABLE = {
 // postable fields are attached once, afterward, so the branch logic stays untouched.
 type BaseRecord = Omit<
   GateVerdictRecord,
-  'postableBody' | 'postableFix' | 'postableNote' | 'postableStatus' | 'rescoredSeverity'
+  | 'postableBody'
+  | 'postableClass'
+  | 'postableFix'
+  | 'postableNote'
+  | 'postableStatus'
+  | 'postableSuggestion'
+  | 'rescoredSeverity'
 >;
 
 function recordBase(f: GateFinding): Omit<
@@ -419,9 +472,11 @@ function recordBase(f: GateFinding): Omit<
   'citation' | 'downgradeReason' | 'effectiveVerdict' | 'rawVerdict' | 'reason'
 > {
   return {
+    anchorSide: f.anchorSide,
     file: f.file,
     findingId: f.findingId,
     line: f.line,
+    resolved: f.resolved,
     reviewer: f.reviewer,
     severity: f.severity,
     title: f.title,
@@ -536,18 +591,23 @@ export function reconcileGateVerdicts(
     const f = findingById.get(r.findingId);
     const e = (byId.get(r.findingId) ?? [])[0];
     if (!f) return { ...r, ...NOT_POSTABLE };
-    return {
-      ...r,
-      ...derivePostable({
-        body: f.body,
-        fixStatus: e?.fixStatus,
-        hunkCode: f.hunkCode,
-        ops: e?.ops ?? [],
-        rescoredSeverity: e?.rescoredSeverity,
-        severity: f.severity,
-        verdict: r.effectiveVerdict,
-      }),
-    };
+    const derived = derivePostable({
+      body: f.body,
+      fixStatus: e?.fixStatus,
+      hunkCode: f.hunkCode,
+      ops: e?.ops ?? [],
+      rescoredSeverity: e?.rescoredSeverity,
+      severity: f.severity,
+      suggestion: e?.suggestion,
+      verdict: r.effectiveVerdict,
+    });
+    // A finding that failed to derive postable text has no placement — `bug` would advertise an
+    // inline comment for a body that will never be posted. The class is RE-VALIDATED here rather
+    // than trusted off the entry: reconcile is exported and callable with a hand-built envelope, and
+    // an unrecognized class must land on the loud default (`bug`), never leak through as itself.
+    const postableClass: PostableClass | null =
+      derived.postableStatus === 'postable' ? (parsePostableClass(e?.class) ?? 'bug') : null;
+    return { ...r, ...derived, postableClass };
   });
 
   // The HOLISTIC pass (spec §4). Skipped ENTIRELY when the lens produced no findings, so the

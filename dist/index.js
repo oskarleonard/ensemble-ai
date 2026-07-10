@@ -1261,9 +1261,9 @@ var GENERATED_PATTERNS = [
   /\.(js|css)\.map$/,
   /\.snap$/
 ];
-function classifyFileKind(path14, isBinary) {
+function classifyFileKind(path15, isBinary) {
   if (isBinary) return "binary";
-  return GENERATED_PATTERNS.some((re) => re.test(path14)) ? "generated" : "source";
+  return GENERATED_PATTERNS.some((re) => re.test(path15)) ? "generated" : "source";
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -1281,7 +1281,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path14 = pathOfSection(section2);
+    const path15 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -1292,8 +1292,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path14, isBinary),
-      path: path14,
+      kind: classifyFileKind(path15, isBinary),
+      path: path15,
       raw: section2,
       removed
     };
@@ -2134,6 +2134,11 @@ function applyHolisticPolicy(records, entryById, deps) {
   });
 }
 
+// src/core/sanitize.ts
+function scrubControl(s) {
+  return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
 // src/modes/review/gate-prompt.ts
 var holisticClause = `
 - Holistic-lens findings (findingIds beginning \`${HOLISTIC_SEAT_ID}#\`) are ARCHITECTURE claims from
@@ -2149,6 +2154,12 @@ var holisticClause = `
   "conventionCitation": {"file","line","quote"} quoting the project's conventions doc that mandates
   the bypassed pattern. The host verifies that quote too, and checks the file really is a conventions
   doc. There is no way to assert your way past the cap.`;
+
+// src/modes/review/gate-postable.ts
+var FENCE_LINE_RE = /^[ \t]*(`{3,}|~{3,})/m;
+function containsFenceLine(s) {
+  return FENCE_LINE_RE.test(s);
+}
 
 // src/modes/review/gate.ts
 var GATE_VERDICTS = ["agree", "partial", "false", "unverified"];
@@ -2662,9 +2673,27 @@ function writeEvidenceManifest(baseDir, runId, manifest) {
 
 // src/modes/review/worktree.ts
 import { randomUUID } from "crypto";
+import fs15 from "fs";
+import os9 from "os";
+import path13 from "path";
+
+// src/modes/review/ensemble-config.ts
 import fs14 from "fs";
 import os8 from "os";
 import path12 from "path";
+var ENSEMBLE_CONFIG_PATH = path12.join(os8.homedir(), ".ensemble-ai", "config.json");
+function asRecord(v) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+}
+function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
+  try {
+    return asRecord(JSON.parse(fs14.readFileSync(configPath, "utf8"))) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+// src/modes/review/worktree.ts
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
 }
@@ -2688,27 +2717,22 @@ function classifyGitError(stderr) {
   }
   return "network";
 }
-function allowedRootsFromConfig(configPath = path12.join(os8.homedir(), ".ensemble-ai", "config.json")) {
-  try {
-    const raw = JSON.parse(fs14.readFileSync(configPath, "utf8"));
-    const roots = raw.allowedRepoRoots;
-    if (!Array.isArray(roots) || roots.length === 0) return null;
-    const strs = roots.filter((r) => typeof r === "string" && r.trim().length > 0);
-    return strs.length > 0 ? strs.map((r) => path12.resolve(r)) : null;
-  } catch {
-    return null;
-  }
+function allowedRootsFromConfig(configPath) {
+  const roots = readEnsembleConfig(configPath).allowedRepoRoots;
+  if (!Array.isArray(roots) || roots.length === 0) return null;
+  const strs = roots.filter((r) => typeof r === "string" && r.trim().length > 0);
+  return strs.length > 0 ? strs.map((r) => path13.resolve(r)) : null;
 }
 function rootAllowed(repoRoot, allowed) {
   if (!allowed) return true;
-  const real = path12.resolve(repoRoot);
+  const real = path13.resolve(repoRoot);
   return allowed.some((root) => {
-    const rel = path12.relative(root, real);
-    return rel === "" || !rel.startsWith("..") && !path12.isAbsolute(rel);
+    const rel = path13.relative(root, real);
+    return rel === "" || !rel.startsWith("..") && !path13.isAbsolute(rel);
   });
 }
 function resolveRepoLocation(args, deps) {
-  const repoPath = path12.resolve(args.repoPath);
+  const repoPath = path13.resolve(args.repoPath);
   const top = deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
   if (!top.ok) {
     return {
@@ -2759,26 +2783,26 @@ function lockToken() {
 }
 function removeLockIfOwned(lock, token) {
   try {
-    if (fs14.readFileSync(lock, "utf8").trim() === token) fs14.unlinkSync(lock);
+    if (fs15.readFileSync(lock, "utf8").trim() === token) fs15.unlinkSync(lock);
   } catch {
   }
 }
 function acquireRepoLock(gitCommonDir, opts = {}) {
-  const lock = path12.join(gitCommonDir, "ensemble-ai-worktree.lock");
+  const lock = path13.join(gitCommonDir, "ensemble-ai-worktree.lock");
   const sleepMs = opts.sleepMs ?? 500;
   const staleMs = opts.staleMs ?? 10 * 6e4;
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
     try {
-      const fd = fs14.openSync(lock, fs14.constants.O_CREAT | fs14.constants.O_EXCL | fs14.constants.O_WRONLY, 384);
-      fs14.writeSync(fd, token);
-      fs14.closeSync(fd);
+      const fd = fs15.openSync(lock, fs15.constants.O_CREAT | fs15.constants.O_EXCL | fs15.constants.O_WRONLY, 384);
+      fs15.writeSync(fd, token);
+      fs15.closeSync(fd);
       return () => removeLockIfOwned(lock, token);
     } catch {
       try {
-        const held = fs14.readFileSync(lock, "utf8").trim();
-        const age = Date.now() - fs14.statSync(lock).mtimeMs;
+        const held = fs15.readFileSync(lock, "utf8").trim();
+        const age = Date.now() - fs15.statSync(lock).mtimeMs;
         if (age > staleMs) removeLockIfOwned(lock, held);
       } catch {
       }
@@ -2795,7 +2819,7 @@ function materializeWorktree(args, deps) {
   if (!common.ok) {
     return { kind: "not-a-repo", message: `cannot resolve the git dir of ${location.repoRoot}` };
   }
-  const gitCommonDir = path12.resolve(location.repoRoot, common.text.trim());
+  const gitCommonDir = path13.resolve(location.repoRoot, common.text.trim());
   const release = (deps.lock ?? acquireRepoLock)(gitCommonDir);
   let dir = null;
   try {
@@ -2814,8 +2838,8 @@ function materializeWorktree(args, deps) {
     if (!fetched.ok) {
       return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${location.fetchUrl} failed: ${fetched.error.trim()}` };
     }
-    dir = fs14.mkdtempSync(path12.join(args.worktreeRoot ?? os8.tmpdir(), "ensemble-worktree-"));
-    fs14.rmSync(dir, { recursive: true, force: true });
+    dir = fs15.mkdtempSync(path13.join(args.worktreeRoot ?? os9.tmpdir(), "ensemble-worktree-"));
+    fs15.rmSync(dir, { recursive: true, force: true });
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", "--no-recurse-submodules", dir, args.headSha],
       { cwd: location.repoRoot, env: INERT_ENV }
@@ -2848,7 +2872,7 @@ function reapWorktree(repoRoot, dir, deps) {
   } catch {
   }
   try {
-    fs14.rmSync(dir, { force: true, recursive: true });
+    fs15.rmSync(dir, { force: true, recursive: true });
   } catch {
   }
   try {
@@ -2880,9 +2904,328 @@ json block, in this schema:
 ${SCHEMA_BLOCK2}`;
 }
 
+// src/modes/review/posting-config.ts
+var SUGGESTION_HARD_CAP = 3;
+var MAX_SUGGESTION_LINES_CEILING = 10;
+var DEFAULT_POSTURE = {
+  inlineSeverityFloor: "low",
+  maxSuggestionLines: 6,
+  suggestionCap: SUGGESTION_HARD_CAP
+};
+function clampInt(v, lo, hi, fallback) {
+  if (typeof v !== "number" || !Number.isFinite(v)) return fallback;
+  return Math.min(hi, Math.max(lo, Math.trunc(v)));
+}
+function resolvePosture(raw) {
+  const o = asRecord(raw);
+  if (!o) return { ...DEFAULT_POSTURE };
+  return {
+    inlineSeverityFloor: oneOf(SEVERITIES, o.inlineSeverityFloor, DEFAULT_POSTURE.inlineSeverityFloor),
+    maxSuggestionLines: clampInt(o.maxSuggestionLines, 1, MAX_SUGGESTION_LINES_CEILING, DEFAULT_POSTURE.maxSuggestionLines),
+    suggestionCap: clampInt(o.suggestionCap, 0, SUGGESTION_HARD_CAP, DEFAULT_POSTURE.suggestionCap)
+  };
+}
+function loadPostingPosture(profile, configPath) {
+  return resolvePosture(asRecord(readEnsembleConfig(configPath).posting)?.[profile]);
+}
+function meetsInlineFloor(severity, floor) {
+  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf(floor);
+}
+
+// src/modes/review/push-fence.ts
+function evaluatePushFence(ctx, prSlug) {
+  if (ctx.isCrossRepository || !ctx.headRepoOwner) {
+    const where = ctx.headRepoOwner ? `${ctx.headRepoOwner}'s fork (branch \`${ctx.headRefName}\`)` : "a deleted fork";
+    return {
+      allowed: false,
+      reason: `REFUSED \u2014 the head of ${prSlug} lives on ${where}, not on the base repo. The fix tail never pushes to a branch you do not own. Use \`ensemble-ai review --pr <url> --stage\` to stage a pending review instead. (GitHub's "allow edits by maintainers" can make such a push technically possible; this fence deliberately does not rely on it \u2014 rewriting a contributor's branch is not a review action.)`
+    };
+  }
+  if (!ctx.viewerCanPushBase) {
+    return {
+      allowed: false,
+      reason: `REFUSED \u2014 you do not have push access to ${prSlug}, so the fix tail cannot push its fixes. Use \`ensemble-ai review --pr <url> --stage\` to stage a pending review instead.`
+    };
+  }
+  return { allowed: true };
+}
+function parsePushContext(prJson, viewerCanPushBase) {
+  const o = prJson && typeof prJson === "object" ? prJson : {};
+  const owner = o.headRepositoryOwner;
+  const login = owner && typeof owner === "object" && typeof owner.login === "string" ? owner.login : null;
+  return {
+    headRefName: typeof o.headRefName === "string" ? o.headRefName : "(unknown)",
+    headRepoOwner: login,
+    isCrossRepository: o.isCrossRepository !== false,
+    // anything but an explicit `false` fails closed
+    viewerCanPushBase: viewerCanPushBase === true
+  };
+}
+
+// src/modes/review/stage-plan.ts
+var STAGE_MARKER = "<!-- ensemble-ai:staged-review v1 -->";
+var TRAILER_RE = /<!--\s*ensemble-ai:finding\s+(\{[\s\S]*?\})\s*-->/g;
+function defuseUntrusted(s) {
+  return s.replace(/<!--/g, "<\\!--").replace(/^(\s*)(`{3,}|~{3,})[ \t]*suggestion\b/gim, "$1$2text");
+}
+function titleText(s) {
+  return [...defuseUntrusted(scrubControl(s))].slice(0, 200).join("");
+}
+function codeSpan(file) {
+  return defuseUntrusted(scrubControl(file)).replace(/`/g, "");
+}
+function findingTrailer(r) {
+  const payload = {
+    anchors: { file: r.file, line: r.line },
+    corroborators: r.cluster?.corroborators ?? [],
+    findingId: r.findingId,
+    fixStatus: r.postableFix,
+    severity: r.rescoredSeverity ?? r.severity,
+    verdict: r.effectiveVerdict
+  };
+  const json = JSON.stringify(payload).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+  return `<!-- ensemble-ai:finding ${json} -->`;
+}
+function parseTrailerIds(text) {
+  const out = [];
+  for (const m of text.matchAll(TRAILER_RE)) {
+    try {
+      const id = JSON.parse(m[1]).findingId;
+      if (typeof id === "string") out.push(id);
+    } catch {
+    }
+  }
+  return out;
+}
+function isEnsembleStagedReview(body) {
+  return typeof body === "string" && body.includes(STAGE_MARKER);
+}
+function effectiveSeverity(r) {
+  return r.rescoredSeverity ?? r.severity;
+}
+function bySeverityThenId(a, b) {
+  return SEVERITIES.indexOf(effectiveSeverity(a)) - SEVERITIES.indexOf(effectiveSeverity(b)) || (a.findingId < b.findingId ? -1 : a.findingId > b.findingId ? 1 : 0);
+}
+function anchorable(r) {
+  return r.anchorSide === "new" && typeof r.line === "number";
+}
+function planPlacement(records, opts) {
+  const postable = records.filter((r) => r.postableStatus === "postable" && r.postableBody).filter((r) => !r.cluster || r.cluster.primary).sort(bySeverityThenId);
+  const suggestionOf = /* @__PURE__ */ new Map();
+  for (const r of postable) {
+    if (suggestionOf.size >= opts.posture.suggestionCap) break;
+    const s = r.postableSuggestion;
+    if (!s || !anchorable(r)) continue;
+    if (s.replacement.split("\n").length > opts.posture.maxSuggestionLines) continue;
+    if (containsFenceLine(s.replacement)) continue;
+    suggestionOf.set(r.findingId, s);
+  }
+  const inline = [];
+  const quality = [];
+  const unanchored = [];
+  for (const r of postable) {
+    const suggestion = suggestionOf.get(r.findingId) ?? null;
+    if (suggestion) {
+      inline.push({ record: r, suggestion });
+      continue;
+    }
+    if (r.postableClass === "quality") {
+      quality.push(r);
+      continue;
+    }
+    if (anchorable(r) && meetsInlineFloor(effectiveSeverity(r), opts.posture.inlineSeverityFloor)) {
+      inline.push({ record: r, suggestion: null });
+    } else {
+      unanchored.push(r);
+    }
+  }
+  return {
+    counts: {
+      inline: inline.length,
+      quality: quality.length,
+      reviewersRun: opts.reviewersRun,
+      suggestions: suggestionOf.size,
+      unanchored: unanchored.length
+    },
+    inline,
+    quality,
+    unanchored
+  };
+}
+function corroborationLine(r, reviewersRun) {
+  const n = r.cluster?.corroboration ?? 1;
+  return `<sub>flagged by ${n} of ${reviewersRun} reviewers \xB7 gate: ${r.effectiveVerdict}</sub>`;
+}
+function renderInlineComment(placed, reviewersRun) {
+  const { record: r, suggestion } = placed;
+  const out = [
+    `**[${effectiveSeverity(r)}]** ${titleText(r.title)}`,
+    "",
+    defuseUntrusted(r.postableBody ?? "")
+  ];
+  if (suggestion) {
+    out.push("", "```suggestion", suggestion.replacement, "```");
+  }
+  out.push("", corroborationLine(r, reviewersRun), findingTrailer(r));
+  return out.join("\n");
+}
+function collapsed(summary, records, reviewersRun) {
+  if (records.length === 0) return [];
+  const out = ["", `<details>`, `<summary>${summary}</summary>`, ""];
+  for (const r of records) {
+    const file = codeSpan(r.file);
+    const where = r.line ? `\`${file}:${r.line}\`` : `\`${file || "(no file)"}\``;
+    out.push(
+      `**[${effectiveSeverity(r)}]** ${titleText(r.title)} \u2014 ${where}`,
+      "",
+      defuseUntrusted(r.postableBody ?? ""),
+      "",
+      corroborationLine(r, reviewersRun),
+      findingTrailer(r),
+      "",
+      "---",
+      ""
+    );
+  }
+  out.push("</details>");
+  return out;
+}
+function renderSummaryBody(input) {
+  const { headSha, plan, reviewerIds } = input;
+  const { counts } = plan;
+  const bugs = counts.inline - counts.suggestions;
+  const out = [
+    "## \u{1F52D} ensemble-ai \u2014 cross-vendor review",
+    STAGE_MARKER,
+    "",
+    `Reviewed at \`${headSha}\` by ${counts.reviewersRun} reviewer(s): ${reviewerIds.join(", ")}.`,
+    "",
+    `- **${bugs}** verified bug(s) commented inline`,
+    `- **${counts.suggestions}** one-click suggestion(s)`,
+    `- **${counts.quality}** structural simplification(s)`,
+    `- **${counts.unanchored}** further verified finding(s) without a line anchor`
+  ];
+  if (counts.inline === 0 && counts.quality === 0 && counts.unanchored === 0) {
+    out.push("", "No verified bugs. Every reviewer finding was either refuted by the gate or could not be grounded in the diff, so nothing is commented inline.");
+  }
+  out.push(...collapsed(`${counts.quality} structural simplification opportunit${counts.quality === 1 ? "y" : "ies"} (verified)`, plan.quality, counts.reviewersRun));
+  out.push(...collapsed(`${counts.unanchored} further verified finding(s)`, plan.unanchored, counts.reviewersRun));
+  out.push(
+    "",
+    "---",
+    `<sub>Cross-vendor AI review by [ensemble-ai](https://github.com/oskarleonard/ensemble-ai) \u2014 ${reviewerIds.join(" \xB7 ")}. Every finding above was gate-verified against the diff at \`${headSha}\`; claims the gate could not ground were dropped, not posted. Deduped across reviewers, so one issue is one comment.</sub>`
+  );
+  return out.join("\n");
+}
+function buildStagedReviewPayload(input) {
+  return {
+    body: renderSummaryBody(input),
+    comments: input.plan.inline.map((p) => ({
+      body: renderInlineComment(p, input.plan.counts.reviewersRun),
+      line: p.record.line,
+      // anchorable() proved it
+      path: p.record.file,
+      side: "RIGHT"
+    })),
+    commit_id: input.headSha
+  };
+}
+
+// src/modes/review/stage.ts
+function apiPath(t, suffix = "") {
+  return `repos/${t.owner}/${t.repo}/pulls/${t.pr}${suffix}`;
+}
+function parseJson(text) {
+  return JSON.parse(text);
+}
+function isCommitSha(s) {
+  return /^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(s);
+}
+function checkFreshness(reviewedHeadSha, liveHeadSha) {
+  if (reviewedHeadSha === liveHeadSha) return { ok: true };
+  return {
+    error: `the PR head moved since this review: reviewed at ${reviewedHeadSha.slice(0, 12)}, live head is ${liveHeadSha.slice(0, 12)}. Refusing to stage a review whose line anchors point at code that has changed \u2014 re-run the review against the current head.`,
+    ok: false
+  };
+}
+function classifyPending(reviews) {
+  for (const r of reviews) {
+    if (r.state !== "PENDING" || typeof r.id !== "number") continue;
+    return isEnsembleStagedReview(r.body) ? { id: r.id, kind: "ours" } : { id: r.id, kind: "foreign" };
+  }
+  return { kind: "none" };
+}
+function parseReviewSummaries(text) {
+  const parsed = parseJson(text);
+  return Array.isArray(parsed) ? parsed : [];
+}
+var FOREIGN_PENDING = (t) => `you already have an unsubmitted PENDING review on ${t.owner}/${t.repo}#${t.pr} that ensemble-ai did not create. GitHub allows only one pending review per user per PR. Submit or discard it on GitHub, then re-run \u2014 refusing to touch a review you wrote by hand.`;
+function stageReview(payload, target, deps) {
+  const log = deps.log ?? (() => {
+  });
+  const run = (args, input) => {
+    try {
+      return deps.gh(args, input);
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e), ok: false };
+    }
+  };
+  if (!isCommitSha(deps.reviewedHeadSha)) {
+    return {
+      error: `the review is not bound to a commit (its head is \`${deps.reviewedHeadSha.slice(0, 60)}\`, not a SHA), so its line anchors cannot be tied to a commit and its freshness cannot be checked. Acquire the diff bound to the PR's head SHA (the compare API) before staging.`,
+      kind: "unbound-head",
+      ok: false
+    };
+  }
+  const head = run(["api", apiPath(target), "--jq", ".head.sha"]);
+  if (!head.ok) return { error: `could not read the PR head: ${head.error}`, kind: "gh-failed", ok: false };
+  const liveHead = head.text.trim();
+  if (!liveHead) return { error: "the PR head SHA came back empty", kind: "unreadable", ok: false };
+  const fresh = checkFreshness(deps.reviewedHeadSha, liveHead);
+  if (!fresh.ok) return { error: fresh.error, kind: "head-moved", ok: false };
+  const list = run(["api", apiPath(target, "/reviews"), "--paginate"]);
+  if (!list.ok) return { error: `could not list PR reviews: ${list.error}`, kind: "gh-failed", ok: false };
+  let pending;
+  try {
+    pending = classifyPending(parseReviewSummaries(list.text));
+  } catch (e) {
+    return { error: `could not parse the PR review list: ${e.message}`, kind: "unreadable", ok: false };
+  }
+  if (pending.kind === "foreign") {
+    return { error: FOREIGN_PENDING(target), kind: "foreign-pending", ok: false };
+  }
+  let replaced = false;
+  if (pending.kind === "ours") {
+    const del = run(["api", "--method", "DELETE", apiPath(target, `/reviews/${pending.id}`)]);
+    if (!del.ok) {
+      return { error: `could not replace the prior ensemble-ai pending review: ${del.error}`, kind: "gh-failed", ok: false };
+    }
+    replaced = true;
+    log(`\xB7 replaced the prior ensemble-ai pending review (#${pending.id}) \u2014 updating in place`);
+  }
+  const created = run(
+    ["api", "--method", "POST", apiPath(target, "/reviews"), "--input", "-"],
+    JSON.stringify(payload)
+  );
+  if (!created.ok) {
+    return {
+      error: `could not create the pending review: ${created.error}` + (replaced ? ". Your prior ensemble-ai pending review was already removed to make room for it (GitHub allows one pending review per user per PR, so a replacement cannot be atomic) \u2014 re-run to regenerate it. Nothing was submitted, and the author saw neither review." : ""),
+      kind: "gh-failed",
+      ok: false
+    };
+  }
+  let url = null;
+  try {
+    const obj = parseJson(created.text);
+    if (typeof obj.html_url === "string") url = obj.html_url;
+  } catch {
+  }
+  return { ok: true, replaced, url };
+}
+
 // src/modes/review/holistic-fixture.ts
-import fs15 from "fs";
-import path13 from "path";
+import fs16 from "fs";
+import path14 from "path";
 function anchor(v, where) {
   const e = v ?? {};
   if (typeof e.file !== "string" || typeof e.line !== "number" || typeof e.symbol !== "string")
@@ -2890,7 +3233,7 @@ function anchor(v, where) {
   return { file: e.file, line: e.line, symbol: e.symbol };
 }
 function loadHolisticFixture(dir) {
-  const raw = JSON.parse(fs15.readFileSync(path13.join(dir, "expectations.json"), "utf8"));
+  const raw = JSON.parse(fs16.readFileSync(path14.join(dir, "expectations.json"), "utf8"));
   const positives = Array.isArray(raw.plantedPositives) ? raw.plantedPositives : [];
   const misses = Array.isArray(raw.nearMisses) ? raw.nearMisses : [];
   if (positives.length === 0 || misses.length === 0)
@@ -2923,7 +3266,7 @@ function verifyFixtureAnchors(dir, fixture) {
   const check = (a, label) => {
     let lines;
     try {
-      lines = fs15.readFileSync(path13.join(dir, a.file), "utf8").split(/\r?\n/);
+      lines = fs16.readFileSync(path14.join(dir, a.file), "utf8").split(/\r?\n/);
     } catch {
       broken.push(`${label}: ${a.file} is unreadable`);
       return;
@@ -3758,9 +4101,11 @@ export {
   CRITIQUE_STANCES,
   DEFAULT_COVERAGE_CEILING,
   DEFAULT_OBJECTIVE,
+  DEFAULT_POSTURE,
   DEFAULT_VOICE_TIMEOUT_MS,
   DIFF_SECTION_TITLE,
   DIFF_USEFUL_FLOOR,
+  ENSEMBLE_CONFIG_PATH,
   EVIDENCE_CLASSES,
   EVIDENCE_MANIFEST_FILE,
   EVIDENCE_MANIFEST_SCHEMA_VERSION,
@@ -3790,6 +4135,8 @@ export {
   SEVERITIES,
   SEVERITY_LABEL,
   SEVERITY_ORDER,
+  STAGE_MARKER,
+  SUGGESTION_HARD_CAP,
   TERMINAL_STATES,
   TRUNCATION_MARKER_RE,
   VOICES_FILE,
@@ -3800,6 +4147,7 @@ export {
   acquireRepoLock,
   allowedRootsFromConfig,
   applyHolisticPolicy,
+  asRecord,
   assembleCodePacket,
   buildClaudeVoiceArgs,
   buildCodexReviewArgs,
@@ -3807,10 +4155,13 @@ export {
   buildDiffReceipt,
   buildEvidenceManifest,
   buildGrokReviewArgs,
+  buildStagedReviewPayload,
   canonicalizeDiff,
   capHolisticSeverity,
+  checkFreshness,
   classifyFileKind,
   classifyGitError,
+  classifyPending,
   classifySecurityFinding,
   codexSandboxSupported,
   computeCoverage,
@@ -3821,9 +4172,11 @@ export {
   coverageShortfall,
   defaultCodexSandboxPaths,
   defaultReceiptStore,
+  defuseUntrusted,
   diffDigest,
   ensureSandboxProfile,
   escapesRoot,
+  evaluatePushFence,
   evidenceRef,
   evidenceShortfall,
   extractGrokText,
@@ -3832,13 +4185,16 @@ export {
   fallbackSynthesis,
   findQuoteSpan,
   findQuoteSpans,
+  findingTrailer,
   formatEvidenceShortfall,
   fsConventionReader,
   gatherConventions,
   hasDepSurface,
   holisticCapWasLifted,
+  isCommitSha,
   isConventionsDoc,
   isDiffReviewed,
+  isEnsembleStagedReview,
   isEvidenceClass,
   isEvidenceSeat,
   isHolisticRecord,
@@ -3856,10 +4212,12 @@ export {
   listVoices,
   loadHolisticFixture,
   loadHolisticSeat,
+  loadPostingPosture,
   loadReviewers,
   loadVoices,
   makeEscalatingKill,
   materializeWorktree,
+  meetsInlineFloor,
   memoryConventionReader,
   omittedLine,
   oneOf,
@@ -3870,13 +4228,18 @@ export {
   parseHolisticSites,
   parseIdeas,
   parseLsTree,
+  parsePushContext,
+  parseReviewSummaries,
   parseReviewerIds,
   parseReviewers,
   parseSynthesis,
+  parseTrailerIds,
   parseVoiceIds,
   parseVoices,
   persistReview,
   pickSynthesizer,
+  planPlacement,
+  readEnsembleConfig,
   readReadableSurface,
   readReceipt,
   readReview,
@@ -3892,7 +4255,9 @@ export {
   renderCritiquePrompt,
   renderGeneratePrompt,
   renderHolisticPrompt,
+  renderInlineComment,
   renderReviewPrompt,
+  renderSummaryBody,
   renderSynthesisPrompt,
   resolveBase,
   resolveBin,
@@ -3904,6 +4269,7 @@ export {
   resolveInRepo,
   resolveMode,
   resolvePolicyVersion,
+  resolvePosture,
   resolveReceipt,
   resolveRepoId,
   resolveRepoLocation,
@@ -3927,6 +4293,7 @@ export {
   securityClassLabel,
   segmentsWithoutTruncationSplices,
   sha256Hex,
+  stageReview,
   stripSecurityTag,
   summarizeCoverage,
   titleCase,

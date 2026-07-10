@@ -65,6 +65,7 @@ import {
   type DiffMode,
   omittedLine,
 } from './modes/review/diff';
+import type { EvidenceMap } from './modes/review/evidence';
 import {
   classifySecurityFinding,
   type ReviewProfile,
@@ -96,6 +97,10 @@ import {
   postTargetFromSelection,
   renderReviewComment,
 } from './modes/review/post-comment';
+import { loadPostingPosture } from './modes/review/posting-config';
+import { evaluatePushFence, parsePushContext } from './modes/review/push-fence';
+import { buildStagedReviewPayload, planPlacement } from './modes/review/stage-plan';
+import { type GhRunner, type StageTarget, stageReview } from './modes/review/stage';
 import {
   buildPacketPreview,
   renderConventionManifest,
@@ -184,8 +189,18 @@ Options:
                         reviewer, else it mostly returns unverified — the toothless mode)
   --gate-effort <e>     effort for the GATE seat (low|medium|high|xhigh|max) — overrides the
                         file; an unknown value is ignored (\`ensemble-ai config\` shows the seat)
-  --post-comment        after a COMPLETED review, ALSO post it to the PR as one markdown comment
-                        via \`gh pr comment\` (opt-in; REQUIRES a PR source — --pr <N> or a PR URL).
+  --stage               after a COMPLETED review, stage it as ONE **PENDING** GitHub review under
+                        your account (opt-in; REQUIRES a PR **URL**, which binds the diff to the
+                        head SHA — a bare \`--pr <N>\` has no commit identity to anchor to). Verified
+                        bugs land as inline comments, quality findings in a collapsed summary
+                        section, ≤3 gate-verified fixes as one-click \`suggestion\` blocks. NOTHING
+                        is posted until you submit it on GitHub — a zero-bug run still stages the
+                        summary. Re-running REPLACES the prior staged review (never duplicates); a
+                        moved PR head REFUSES. Prints {stagedReviewUrl, counts, receipt} as JSON on
+                        the last stdout line.
+  --post-comment        DEPRECATED (prefer --stage): after a COMPLETED review, ALSO post it to the
+                        PR as one markdown comment via \`gh pr comment\` — published IMMEDIATELY under
+                        your account, with no submit step. Kept for existing consumers.
                         A gh failure warns loudly and leaves the review + exit code UNCHANGED.
   --out <dir>           trail BASE dir; a per-run <run-id>/ subdir is created under it
                         (default: repo-local .ensemble-ai/reviews when reviewing this
@@ -786,42 +801,71 @@ function resolveDiffSourceForCommand(
   return { ...resolved, postTarget: postTargetFromSelection(selection) };
 }
 
-// The default `--post-comment` exec: `gh pr comment … --body-file -` with the rendered comment on
-// gh's stdin. Injectable (PostRunner) so the post path is unit-tested WITHOUT spawning gh. gh
-// absent (ENOENT), unauthenticated, or a failed post all RETURN {ok:false} with a clear message —
-// postReviewComment turns that into a loud warning and never throws, so posting can never change
-// the review's exit code.
-function ghPostRunner(cwd: string): PostRunner {
-  return (args, body) => {
+// THE ONE `gh` exec seam — shared by `--post-comment`, `--stage`, and `push-fence`: run
+// `gh <args>` with an optional body on stdin. Injectable at the call sites' boundary (stageReview
+// takes a GhRunner, postReviewComment a PostRunner) so every state machine over it is unit-tested
+// without spawning gh. gh absent (ENOENT), unauthenticated, or a failed call all RETURN
+// {ok:false} with a clear message — no caller throws. The stderr excerpt is bounded so a huge gh
+// error can't become a multi-MB warning line.
+function ghRunner(cwd: string): GhRunner {
+  return (args, input) => {
     try {
-      const out = execFileSync('gh', args, {
+      const text = execFileSync('gh', args, {
         cwd,
         encoding: 'utf8',
-        input: body,
         maxBuffer: 16 * 1024 * 1024,
         timeout: 120_000,
+        ...(input !== undefined ? { input } : {}),
       });
-      // gh prints the created comment's URL on success — surface it in the confirmation line.
-      const url = out
-        .split('\n')
-        .map((l) => l.trim())
-        .filter(Boolean)
-        .pop();
-      return url && /^https?:\/\//.test(url) ? { ok: true, url } : { ok: true };
+      return { ok: true, text };
     } catch (e) {
       const err = e as { code?: string; message?: string; stderr?: Buffer | string };
       if (err.code === 'ENOENT') {
-        return {
-          error: 'the `gh` CLI is not on PATH — install GitHub CLI and run `gh auth login`',
-          ok: false,
-        };
+        return { error: 'the `gh` CLI is not on PATH — install GitHub CLI and run `gh auth login`', ok: false };
       }
-      // Bound the excerpt (gh's stderr can be up to maxBuffer) so a huge error can't become a
-      // multi-MB warning line — same capping discipline as every other rendered excerpt.
       const stderr = err.stderr ? String(err.stderr).trim().slice(0, 500) : '';
-      return { error: stderr || err.message || 'gh pr comment failed', ok: false };
+      return { error: stderr || err.message || 'gh failed', ok: false };
     }
   };
+}
+
+// `--post-comment`'s exec: `gh pr comment … --body-file -` with the rendered comment on gh's
+// stdin. Only the SUCCESS mapping differs from the seam above — gh prints the created comment's
+// URL, which the confirmation line surfaces. postReviewComment turns a failure into a loud warning
+// and never throws, so posting can never change the review's exit code.
+function ghPostRunner(cwd: string): PostRunner {
+  const gh = ghRunner(cwd);
+  return (args, body) => {
+    const res = gh(args, body);
+    if (!res.ok) return res;
+    const url = res.text
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .pop();
+    return url && /^https?:\/\//.test(url) ? { ok: true, url } : { ok: true };
+  };
+}
+
+// The cwd repo's `owner/repo`, resolved the way `gh` itself would. `''` ⇒ not a GitHub repo, or gh
+// failed; every caller treats that as "could not resolve" and refuses.
+function repoSlugFromCwd(gh: GhRunner): string {
+  const res = gh(['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner']);
+  return res.ok ? res.text.trim() : '';
+}
+
+// GitHub's own vocabulary for an owner login / repo name. `owner` and `repo` are interpolated into
+// a `gh api repos/<owner>/<repo>/…` path, so a segment like `..` would traverse to a different
+// endpoint. Validated here rather than trusted from a pasted URL.
+const REPO_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+// A staged review addresses the GitHub API by `owner/repo`, which a bare `--pr <N>` does not carry
+// (it targets the cwd's repo). Null ⇒ report and refuse.
+function resolveStageTarget(target: PostTarget, gh: GhRunner): StageTarget | null {
+  const parts = (target.repoSlug ?? repoSlugFromCwd(gh)).split('/');
+  if (parts.length !== 2) return null;
+  const [owner, repo] = parts;
+  return REPO_SEGMENT_RE.test(owner) && REPO_SEGMENT_RE.test(repo) ? { owner, pr: target.pr, repo } : null;
 }
 
 // GateSeat → the footer's resolved seat: model/effort with the 'default' sentinel spelled out
@@ -948,9 +992,11 @@ async function reviewCommand(
         out: { type: 'string' },
         'post-comment': { type: 'boolean' },
         pr: { type: 'string' },
+        repo: { type: 'string' },
         reviewers: { type: 'string' },
         'run-id': { type: 'string' },
         sandbox: { type: 'string' },
+        stage: { type: 'boolean' },
         staged: { type: 'boolean' },
         'strict-high': { type: 'boolean' },
         'working-tree': { type: 'boolean' },
@@ -971,14 +1017,60 @@ async function reviewCommand(
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ('code' in source) return source.code;
 
-  // `--post-comment` is OPT-IN and PR-ONLY (publishing to GitHub is the review verb's one outward
-  // action). Refuse UPFRONT — before running a full review — when the source has no PR to post to,
-  // rather than reviewing for minutes and only then failing to post.
+  // `--post-comment` / `--stage` are OPT-IN and PR-ONLY (publishing to GitHub is the review verb's
+  // one outward action). Refuse UPFRONT — before running a full review — when the source has no PR
+  // to post to, rather than reviewing for minutes and only then failing to post.
   const postComment = Boolean(values['post-comment']);
-  if (postComment && !source.postTarget) {
+  const stage = Boolean(values.stage);
+  for (const [flag, on] of [['--post-comment', postComment], ['--stage', stage]] as const) {
+    if (on && !source.postTarget) {
+      console.error(
+        `ensemble-ai ${cmd}: ${flag} requires a PR diff source (--pr <N> or a PR URL) — ` +
+          `the current source has no PR to post to. Re-run against a PR, or drop ${flag}.`
+      );
+      return 3;
+    }
+  }
+  // `--stage` binds a review to a COMMIT. The pending review's `commit_id` and every inline line
+  // anchor are only meaningful at the head SHA the diff was read at, and `stageReview`'s freshness
+  // guard compares that SHA against the PR's live head. A bare `--pr <N>` fetches the diff with
+  // `gh pr diff`, which carries NO commit identity — `acquireDiff` honestly labels its headSha
+  // `gh pr diff (no local commit identity)` rather than inventing one, because re-reading the head
+  // afterwards would be a TOCTOU (the head can move between the two calls). A PR URL binds the SHA
+  // via the compare API; if that lookup fails it degrades to the same unbound fetch.
+  //
+  // Staging an unbound review would compare a label against a SHA and refuse with a fabricated "the
+  // head moved" story — after reviewing for minutes. Refuse UPFRONT, and say what to do instead.
+  if (stage && !source.headShaOverride) {
     console.error(
-      `ensemble-ai ${cmd}: --post-comment requires a PR diff source (--pr <N> or a PR URL) — ` +
-        'the current source has no PR to post to. Re-run against a PR, or drop --post-comment.'
+      `ensemble-ai ${cmd}: --stage needs a review bound to a commit, and this source has none — ` +
+        '`gh pr diff` reports no head SHA, so there is nothing to anchor the inline comments to or ' +
+        'to check the PR head against. Re-run with the full PR URL (`--pr https://github.com/o/r/pull/N`), ' +
+        'which binds the diff to the exact head SHA via the compare API.'
+    );
+    return 3;
+  }
+  // The two outward actions are contradictory: `--post-comment` publishes immediately under the
+  // user's account, `--stage` deliberately publishes NOTHING until they submit. Doing both would
+  // silently defeat the staged review's whole point (posting authority).
+  if (postComment && stage) {
+    console.error(
+      `ensemble-ai ${cmd}: choose ONE outward action — --stage stages a PENDING review that posts ` +
+        'nothing until you submit it on GitHub, while --post-comment publishes a comment immediately.'
+    );
+    return 3;
+  }
+  // `--repo` (worktree evidence mode) is PARSED but its seat-spawn wiring is not built: no seat is
+  // spawned against a worktree today (see README). Reviewing the packet while the caller believes
+  // they asked for whole-project evidence is the exact silent downgrade the realized-evidence map
+  // exists to prevent — so refuse, by name, rather than under-deliver quietly.
+  if (typeof values.repo === 'string') {
+    console.error(
+      `ensemble-ai ${cmd}: --repo (worktree evidence mode) is not wired into the review path yet — ` +
+        'the engine lifecycle, sandbox profiles, and receipt identity all exist, but no seat is ' +
+        'spawned against a worktree, so this run would review the packet while claiming whole-project ' +
+        'evidence. Drop --repo for a packet-mode review. `receipt verify --repo <path>` DOES honor it ' +
+        '(it asks whether a receipt was minted under worktree evidence).'
     );
     return 3;
   }
@@ -1327,6 +1419,73 @@ async function reviewCommand(
           `The review above and its exit code are unaffected (posting never changes the gate contract).`
       );
     }
+  }
+
+  // `--stage`: the FOREIGN tail. Everything lands as ONE PENDING review under the user's account —
+  // author-private until they submit it on GitHub. COMPLETED runs only (exit 0 or 4), exactly like
+  // `--post-comment`, and staging NEVER changes the exit code the review already earned. A single
+  // JSON object is printed on the LAST stdout line for thin consumers, whatever the outcome.
+  if (stage && source.postTarget) {
+    const stagedRun = exitCode === 0 || exitCode === 4;
+    const reviewerIds = [
+      ...result.reviews.filter((r) => r.terminalState === 'reviewed').map((r) => r.reviewerId ?? r.reviewer.vendor),
+      ...(claudeLayer?.claudeReview?.ok ? ['claude'] : []),
+    ];
+    const plan = planPlacement(gateRecords, {
+      posture: loadPostingPosture(profile),
+      reviewersRun: reviewerIds.length,
+    });
+    let stagedReviewUrl: string | null = null;
+    let stageError: string | null = stagedRun
+      ? null
+      : `review did not complete (exit ${exitCode}) — nothing staged`;
+    if (stagedRun) {
+      try {
+        const gh = ghRunner(cwd);
+        const target = resolveStageTarget(source.postTarget, gh);
+        if (!target) {
+          stageError = `could not resolve owner/repo for PR #${source.postTarget.pr} — pass a full PR URL, or run inside the repo`;
+        } else {
+          const res = stageReview(
+            buildStagedReviewPayload({ headSha: result.acquired.headSha, plan, reviewerIds }),
+            target,
+            { gh, log: (m) => console.error(m), reviewedHeadSha: result.acquired.headSha }
+          );
+          if (res.ok) {
+            stagedReviewUrl = res.url;
+            console.error(
+              `· staged a PENDING review on ${target.owner}/${target.repo}#${target.pr}${res.replaced ? ' (replaced the prior ensemble-ai pending review)' : ''} — ` +
+                'it posts NOTHING until you submit it on GitHub' +
+                (res.url ? `: ${res.url}` : '')
+            );
+          } else {
+            stageError = res.error;
+          }
+        }
+      } catch (e) {
+        stageError = e instanceof Error ? e.message : String(e);
+      }
+      if (stageError) {
+        console.error(
+          `⚠ --stage: could NOT stage the pending review — ${stageError}. ` +
+            'The review above and its exit code are unaffected (staging never changes the gate contract).'
+        );
+      }
+    }
+    // The CLI contract for thin consumers (spec §7): one JSON object, last line of stdout.
+    console.log(
+      JSON.stringify({
+        counts: plan.counts,
+        ...(stageError ? { error: stageError } : {}),
+        headSha: result.acquired.headSha,
+        receipt: {
+          completed: result.receipt?.completed ?? [],
+          digest: result.receipt?.diffDigest ?? null,
+          path: result.receiptPath ?? null,
+        },
+        stagedReviewUrl,
+      })
+    );
   }
   return exitCode;
 }
@@ -1875,6 +2034,12 @@ Options:
   --base <ref>          base ref for the current-branch diff (default: origin/HEAD)
   --staged              use the staged diff (\`git diff --cached\`) as the current state
   --working-tree        use uncommitted tracked changes (\`git diff HEAD\`)
+  --repo <dir>          the repo to verify, AND a request for WORKTREE evidence: verify then asks
+                        the stronger question "was this reviewed with whole-project evidence?" and
+                        FAILS (evidence-degraded) on a receipt whose realized per-seat evidence is
+                        weaker, naming the seat. Every receipt minted so far is packet-evidenced.
+  --accept-degraded     with --repo: accept a receipt whose realized evidence is weaker than the
+                        worktree evidence you asked for. Deliberate, never the default.
   --reviewers <ids>     required reviewer policy (default: all configured)
   --ceiling <bytes>     coverage byte ceiling (default 200000)
   --store <dir>         receipt store dir (default: ~/.ensemble-ai/receipts)
@@ -1906,10 +2071,12 @@ async function receiptCommand(args: string[]): Promise<number> {
       args: args.slice(1),
       allowPositionals: true,
       options: {
+        'accept-degraded': { type: 'boolean' },
         base: { type: 'string' },
         ceiling: { type: 'string' },
         cwd: { type: 'string' },
         help: { short: 'h', type: 'boolean' },
+        repo: { type: 'string' },
         'require-artifacts': { type: 'boolean' },
         reviewers: { type: 'string' },
         staged: { type: 'boolean' },
@@ -1982,7 +2149,33 @@ async function receiptCommand(args: string[]): Promise<number> {
   // key's policyHash are sized under the SAME value — no second `?? DEFAULT` that could
   // silently drift and make a genuinely-reviewed diff report no-receipt.
   const ceilingBytes = ceiling ?? DEFAULT_COVERAGE_CEILING;
-  const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
+  if (typeof values.repo === 'string' && typeof values.cwd === 'string') {
+    console.error(`ensemble-ai receipt ${sub}: choose at most one of --repo / --cwd (both name the repo to verify)`);
+    return 3;
+  }
+  const repoLocation = typeof values.repo === 'string' ? path.resolve(values.repo) : undefined;
+  const cwd = repoLocation ?? (values.cwd ? path.resolve(String(values.cwd)) : process.cwd());
+
+  // WORKTREE-EVIDENCE INTENT (spec §8, narrowed by gate-r2): passing the repo location IS the
+  // request for worktree evidence. So `--repo` makes `verify` ask a strictly stronger question —
+  // "was this diff reviewed with whole-project evidence?" — and a receipt whose REALIZED per-seat
+  // evidence is weaker fails with `evidence-degraded`, naming the seat. Every receipt on disk today
+  // is a legacy (v1) one with no realized map = `unknown` = weaker, so `--repo` fails them all: that
+  // is the contract, not a bug. `--accept-degraded` takes the weaker evidence deliberately.
+  //
+  // Only the REQUIRED reviewer seats are compared — the seats this caller's policy names. The gate's
+  // own realized class is recorded in the receipt (pin 1) and readable via `receipt show`; it is not
+  // folded in here, because a `--no-claude` run legitimately has no gate and must not read as a gap.
+  const intendedEvidence: EvidenceMap | undefined = repoLocation
+    ? Object.fromEntries(required.map((id) => [id, 'worktree' as const]))
+    : undefined;
+  const acceptDegraded = Boolean(values['accept-degraded']);
+  if (acceptDegraded && !intendedEvidence) {
+    console.error(
+      'ensemble-ai receipt: --accept-degraded only means something with --repo (it accepts evidence weaker than the worktree evidence --repo asks for)'
+    );
+    return 3;
+  }
 
   // At most one explicit source, mirroring selectDiffSource for the review/diff commands
   // — otherwise acquireDiff silently prefers --staged and drops --working-tree, gating
@@ -2046,6 +2239,13 @@ async function receiptCommand(args: string[]): Promise<number> {
     explicit = res.receipt;
   }
   const verifyDeps = {
+    acceptDegraded,
+    intendedEvidence,
+    // NOTE: `key` above is the LEGACY (v1) policy hash, which is also the key every receipt on disk
+    // is addressed by. Worktree runs will mint v2-keyed receipts once the seat spawn lands; at that
+    // point this must compute the v2 key (which binds the run's sandbox profiles) and pass the v1
+    // key as `legacyKey` — resolveReceipt already implements that fallback. Until a v2 receipt can
+    // exist, computing a v2 key here would only fail every lookup.
     // An explicit --path receipt must still match the FULL live identity — repo + both
     // SHAs + policyHash — exactly as the store lookup binds it (the store file is
     // addressed by the full-key hash). Without this, `verify <path>` degrades to a
@@ -2290,6 +2490,94 @@ async function diffCommand(args: string[]): Promise<number> {
   return 0;
 }
 
+const PUSH_FENCE_USAGE = `ensemble-ai push-fence — may the FIX tail push to this PR's head ref?
+
+Usage:
+  ensemble-ai push-fence --pr <N|url> [--cwd <dir>]
+
+The FIX tail (/ensemble-ai-review-fix) fixes findings in your session and pushes to the PR's
+head branch. It must never push to a branch you do not own — a contributor's fork branch is
+theirs, and rewriting it is not a review action. Run this BEFORE any push.
+
+Exit 0 = you own the head ref, the fix tail may push.
+Exit 5 = REFUSED (fork / no push access) — stage a pending review instead:
+         ensemble-ai review --pr <url> --stage
+Exit 3 = usage / gh error.
+
+This is a FENCE, not a dispatcher: it never chooses a tail for you and never pushes.
+
+Options:
+  --pr <N|url>          the pull request to check (required)
+  --cwd <dir>           repo working dir (default: cwd)
+  -h, --help            this help`;
+
+// The fix-tail push fence as a command the fix skill MUST run before pushing. Reads the PR's head
+// provenance + the viewer's push permission on the BASE repo through `gh`, then applies the pure
+// fence. Fails CLOSED: any unreadable field refuses.
+async function pushFenceCommand(args: string[]): Promise<number> {
+  let values: Record<string, string | boolean | undefined>;
+  try {
+    ({ values } = parseArgs({
+      args,
+      allowPositionals: false,
+      options: { cwd: { type: 'string' }, help: { short: 'h', type: 'boolean' }, pr: { type: 'string' } },
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai push-fence: ${(e as Error).message}`);
+    console.error(PUSH_FENCE_USAGE);
+    return 3;
+  }
+  if (values.help) {
+    console.log(PUSH_FENCE_USAGE);
+    return 0;
+  }
+  if (typeof values.pr !== 'string') {
+    console.error('ensemble-ai push-fence: --pr <N|url> is required');
+    console.error(PUSH_FENCE_USAGE);
+    return 3;
+  }
+  const selection = selectDiffSource({ pr: values.pr });
+  if (isDiffSourceError(selection) || selection.kind !== 'pr' || typeof selection.pr !== 'number') {
+    console.error(
+      `ensemble-ai push-fence: ${isDiffSourceError(selection) ? selection.error : 'not a PR reference'}`
+    );
+    return 3;
+  }
+  const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
+  const gh = ghRunner(cwd);
+  const scope = selection.owner && selection.repo ? ['-R', `${selection.owner}/${selection.repo}`] : [];
+  // Exactly the three fields parsePushContext reads. `gh pr view --json` rejects an unknown field
+  // name outright, so an unused extra would break the command, not merely bloat it.
+  const view = gh([
+    'pr', 'view', String(selection.pr), ...scope,
+    '--json', 'headRefName,headRepositoryOwner,isCrossRepository',
+  ]);
+  if (!view.ok) {
+    console.error(`ensemble-ai push-fence: could not read PR #${selection.pr} — ${view.error}`);
+    return 3;
+  }
+  let prJson: unknown;
+  try {
+    prJson = JSON.parse(view.text);
+  } catch (e) {
+    console.error(`ensemble-ai push-fence: could not parse gh output — ${(e as Error).message}`);
+    return 3;
+  }
+  // The BASE repo is where a same-repo PR's head branch lives, so its `permissions.push` IS the
+  // "can I push to the head ref?" fact. A cross-repo PR refuses before this matters.
+  const base =
+    selection.owner && selection.repo ? `${selection.owner}/${selection.repo}` : repoSlugFromCwd(gh);
+  const perm = base ? gh(['api', `repos/${base}`, '--jq', '.permissions.push']) : { error: 'no repo', ok: false as const };
+  const canPush = perm.ok && perm.text.trim() === 'true';
+  const verdict = evaluatePushFence(parsePushContext(prJson, canPush), base || `PR #${selection.pr}`);
+  if (verdict.allowed) {
+    console.log(`ensemble-ai push-fence: ALLOWED — you own the head ref of ${base}#${selection.pr}; the fix tail may push.`);
+    return 0;
+  }
+  console.error(`ensemble-ai push-fence: ${verdict.reason}`);
+  return 5;
+}
+
 export async function main(argv: string[]): Promise<number> {
   const raw = argv[0];
   if (!raw || raw === '-h' || raw === '--help') {
@@ -2298,6 +2586,7 @@ export async function main(argv: string[]): Promise<number> {
   }
   // Plumbing commands (no reviewer runs) dispatch before the mode registry.
   if (raw === 'receipt') return receiptCommand(argv.slice(1));
+  if (raw === 'push-fence') return pushFenceCommand(argv.slice(1));
   if (raw === 'reviewers' || raw === 'config') return reviewersCommand(argv.slice(1));
   if (raw === 'diff') return diffCommand(argv.slice(1));
 

@@ -55,7 +55,7 @@ function review(voiceId: string, findings: ReviewFinding[]): VoiceReview {
 }
 function gf(over: Partial<GateFinding> = {}): GateFinding {
   return {
-    body: 'b', file: 'src/x.ts', findingId: 'codex#1', hunkCode: [ANCHOR],
+    anchorSide: 'new', body: 'b', file: 'src/x.ts', findingId: 'codex#1', hunkCode: [ANCHOR],
     hunkLabel: 'H1', line: 3, resolved: true, reviewer: 'codex', severity: 'high',
     title: 't', truncated: false, ...over,
   };
@@ -252,8 +252,8 @@ describe('reconcileGateVerdicts — postable text (A+)', () => {
     expect(u).toMatchObject({ effectiveVerdict: 'unverified', postableBody: null, postableStatus: 'not-postable' });
   });
 
-  it('the durable trail schema is bumped to v2 (postable fields added)', () => {
-    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(2);
+  it('the durable trail schema is bumped to v4 (postable + placement + anchorSide fields added)', () => {
+    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(4);
   });
 });
 
@@ -309,7 +309,31 @@ describe('prepareGateFindings — deterministic budgeting (DC1)', () => {
       [review('codex', [f({ evidence: { file: 'nope.ts', line: 1 } })])],
       parsePacketHunks(DIFF)
     );
-    expect(findings[0]).toMatchObject({ hunkLabel: null, resolved: false });
+    expect(findings[0]).toMatchObject({ anchorSide: null, hunkLabel: null, resolved: false });
+  });
+
+  // WHICH line space a cite resolved in decides whether it may be anchored as a RIGHT comment on a
+  // staged review. resolveFindingHunk falls back to OLD-side numbers for a deletion-only hunk, and
+  // posting one of those on the RIGHT is a 422 that fails the whole review.
+  it('a cite into a NORMAL hunk anchors on the NEW side', () => {
+    const { findings } = prepareGateFindings([review('codex', [f({ evidence: { file: 'src/x.ts', line: 3 } })])], parsePacketHunks(DIFF));
+    expect(findings[0]).toMatchObject({ anchorSide: 'new', resolved: true });
+  });
+
+  it('a cite into a DELETION-ONLY hunk resolves, but on the OLD side', () => {
+    const DELETION = `diff --git a/src/d.ts b/src/d.ts
+--- a/src/d.ts
++++ b/src/d.ts
+@@ -20,3 +19,0 @@ ctx
+-  const goneAtOldLineTwenty = releaseTheLock();
+-  const alsoGoneAtOldLineTwentyOne = removedTwo();
+-  const thirdGoneAtOldLineTwentyTwo = removedThree();
+`;
+    const { findings } = prepareGateFindings(
+      [review('codex', [f({ evidence: { file: 'src/d.ts', line: 21 } })])],
+      parsePacketHunks(DELETION)
+    );
+    expect(findings[0]).toMatchObject({ anchorSide: 'old', line: 21, resolved: true });
   });
 });
 
