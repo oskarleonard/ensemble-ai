@@ -1,10 +1,10 @@
-import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
+import { execGit } from './git-exec';
 import {
   acquireRepoLock,
   classifyGitError,
@@ -329,20 +329,9 @@ describe('materialization hardening — untrusted content is checked out INERT',
 // 2026-07-10) sails through green. This suite runs the REAL git binary against a local file://
 // origin exposing a refs/pull/N/head ref — no network, no GitHub, one repo, minimal spawns.
 describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)', () => {
-  const realGit: GitRun = (args, opts) => {
-    try {
-      const text = execFileSync('git', args, {
-        cwd: opts?.cwd,
-        encoding: 'utf8',
-        env: { ...process.env, ...opts?.env },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      return { ok: true, text };
-    } catch (e) {
-      const stderr = (e as { stderr?: string }).stderr;
-      return { error: stderr?.toString() ?? String(e), ok: false };
-    }
-  };
+  // The runner the CLI itself injects — so this drives the exact exec seam production uses,
+  // not a lookalike (which would leave `execGit`'s own env hardening unexercised).
+  const realGit = execGit();
   // -c flags keep the test hermetic on any machine: no gpg signing, no identity prompt.
   const g = (cwd: string, ...args: string[]) => {
     const r = realGit(
@@ -366,8 +355,12 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
       const headSha = g(origin, 'rev-parse', 'HEAD');
       g(origin, 'update-ref', 'refs/pull/7/head', headSha);
 
+      // `init`, NOT `clone`: a clone would copy the head commit in, so `worktree add <sha>` would
+      // succeed even if the fetch argv were broken. Starting empty makes the fetch load-bearing —
+      // the object exists locally only because `fetch <url> pull/7/head` really ran.
       const consumer = path.join(base, 'consumer');
-      g(base, 'clone', '-q', `file://${origin}`, consumer);
+      fs.mkdirSync(consumer);
+      g(consumer, 'init', '-q');
 
       const made = materializeWorktree(
         {
@@ -378,8 +371,9 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
         },
         { git: realGit }
       );
-      expect(isPreflightError(made) && (made as { message: string }).message).toBe(false);
-      if (isPreflightError(made)) return;
+      // Throw (not `expect(...); return`): an early `return` on the error path would silently PASS
+      // the test, and this surfaces git's own stderr instead of a bare `true !== false`.
+      if (isPreflightError(made)) throw new Error(`materialization failed: ${made.message}`);
       expect(made.headSha).toBe(headSha);
       expect(fs.readFileSync(path.join(made.dir, 'src.ts'), 'utf8')).toContain('x = 1');
       // The instruction channel was stripped from the real checkout.

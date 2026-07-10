@@ -424,11 +424,9 @@ export function materializeWorktree(
     // git creates the worktree dir itself, so we hand it a path that does not exist yet — INSIDE
     // an owner-only parent, never directly in a shared temp root (see WORKTREE_PARENT_PREFIX).
     //
-    // NO --no-recurse-submodules here: `git worktree add` does not accept it on ANY git (it is a
-    // fetch/clone/checkout flag — every real materialization died with "unknown option" until the
-    // first live consumer run caught it, 2026-07-10). The submodule posture is unchanged without
-    // it: `worktree add` never populates submodules — a new worktree's submodules stay
-    // uninitialized until someone runs `submodule update`, which nothing here does.
+    // Do NOT add --no-recurse-submodules here: `git worktree add` rejects it on every git ("unknown
+    // option" — it killed every real materialization until 2026-07-10). The inert posture holds
+    // without it; see the submodule bullet in this file's header.
     const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     dir = path.join(parent, 'head');
     const added = deps.git(
