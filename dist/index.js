@@ -2491,6 +2491,10 @@ function qualifyGrokSeat(configuredSandbox) {
 function qualifyHarnessSeat() {
   return { profile: CLAUDE_HARNESS_PROFILE, qualified: true, reason: null };
 }
+var SEAT_QUALIFIERS = {
+  codex: ({ worktree }) => qualifyCodexSeat(worktree),
+  grok: ({ config }) => qualifyGrokSeat(config.sandbox)
+};
 function intendedEvidenceFor(seats) {
   const map = {};
   for (const seat of seats) map[seat] = "worktree";
@@ -2648,7 +2652,7 @@ var DEFAULT_OBJECTIVE = "Adversarial cross-vendor review of a code diff \u2014 f
 function qualifyCoreSeats(reviewers, worktree, configs) {
   const quals = {};
   for (const id of reviewers) {
-    quals[id] = id === "codex" ? qualifyCodexSeat(worktree) : qualifyGrokSeat(configs[id].sandbox);
+    quals[id] = SEAT_QUALIFIERS[id]({ config: configs[id], worktree });
   }
   return quals;
 }

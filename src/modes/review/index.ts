@@ -42,9 +42,8 @@ import {
 } from './receipt';
 import {
   intendedEvidenceFor,
-  qualifyCodexSeat,
-  qualifyGrokSeat,
   qualifyHarnessSeat,
+  SEAT_QUALIFIERS,
   type SeatQualifications,
   sandboxProfilesFor,
   worktreePromptSuffix,
@@ -178,10 +177,7 @@ function qualifyCoreSeats(
 ): SeatQualifications {
   const quals: SeatQualifications = {};
   for (const id of reviewers) {
-    quals[id] =
-      id === 'codex'
-        ? qualifyCodexSeat(worktree)
-        : qualifyGrokSeat(configs[id].sandbox);
+    quals[id] = SEAT_QUALIFIERS[id]({ config: configs[id], worktree });
   }
   return quals;
 }

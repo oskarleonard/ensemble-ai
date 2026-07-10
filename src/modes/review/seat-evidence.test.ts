@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
+import { type ReviewerConfig, REVIEWER_IDS } from '../../core/types';
 import { CODEX_SANDBOX_PROFILE } from '../../reviewers/codex-sandbox';
 import { GROK_SANDBOX_PROFILE } from '../../reviewers/grok';
 
@@ -14,6 +15,7 @@ import {
   qualifyGrokSeat,
   qualifyHarnessSeat,
   sandboxProfilesFor,
+  SEAT_QUALIFIERS,
   worktreePromptSuffix,
 } from './seat-evidence';
 
@@ -61,6 +63,22 @@ describe('seat qualification — a seat gets the worktree IFF its sandbox qualif
     });
     // Read the id literally: this is plan-mode + a write-tool deny-list, not a kernel sandbox.
     expect(CLAUDE_HARNESS_PROFILE.id).toBe('claude-plan-mode-deny-writes');
+  });
+});
+
+describe('the qualifier table is EXHAUSTIVE — a new reviewer cannot default into the worktree', () => {
+  it('every REVIEWER_ID has its own qualifier, and each binds its OWN profile', () => {
+    expect(Object.keys(SEAT_QUALIFIERS).sort()).toEqual([...REVIEWER_IDS].sort());
+    const dir = wt();
+    const config: ReviewerConfig = {
+      cmd: 'x', effort: 'high', id: 'grok', model: 'm', sandbox: 'strict', vendor: 'v',
+    };
+    // grok's qualifier reads the seat's configured sandbox (bare `strict` ⇒ unqualified); codex's
+    // reads the worktree. Routing one seat's qualifier to the other is what the table prevents.
+    expect(SEAT_QUALIFIERS.grok({ config, worktree: dir }).profile).toEqual(GROK_SANDBOX_PROFILE);
+    expect(SEAT_QUALIFIERS.grok({ config, worktree: dir }).qualified).toBe(false);
+    expect(SEAT_QUALIFIERS.codex({ config, worktree: dir }).profile).toEqual(CODEX_SANDBOX_PROFILE);
+    fs.rmSync(dir, { force: true, recursive: true });
   });
 });
 

@@ -1,3 +1,4 @@
+import type { ReviewerConfig, ReviewerId } from '../../core/types';
 import {
   CODEX_SANDBOX_PROFILE,
   codexSandboxSupported,
@@ -93,6 +94,19 @@ export function qualifyGrokSeat(configuredSandbox?: string): SeatQualification {
 export function qualifyHarnessSeat(): SeatQualification {
   return { profile: CLAUDE_HARNESS_PROFILE, qualified: true, reason: null };
 }
+
+// The per-reviewer qualifier, keyed by id. EXHAUSTIVE over ReviewerId, like REVIEW_ADAPTERS and
+// RETRIES_ON_PACKET: TS errors if a new reviewer joins REVIEWER_IDS without an explicit ruling on
+// how its sandbox qualifies. A default branch here would be fail-OPEN — the new seat would inherit
+// some other vendor's qualifier, be handed the worktree, and attest evidence under a profile it
+// never ran behind, which is the one thing the realized-evidence map exists to make impossible.
+export const SEAT_QUALIFIERS: Record<
+  ReviewerId,
+  (args: { config: ReviewerConfig; worktree: string }) => SeatQualification
+> = {
+  codex: ({ worktree }) => qualifyCodexSeat(worktree),
+  grok: ({ config }) => qualifyGrokSeat(config.sandbox),
+};
 
 export type SeatQualifications = Partial<Record<EvidenceSeat, SeatQualification>>;
 
