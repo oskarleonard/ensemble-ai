@@ -1229,6 +1229,9 @@ function buildCodexReviewArgs(config, outFile, prompt) {
     // Load none of the operator's ~/.codex/config.toml — above all its [mcp_servers]. Auth still
     // uses $CODEX_HOME; the model/effort below arrive via -m/-c (an override layer), not that file.
     "--ignore-user-config",
+    // FAIL CLOSED on config drift: reject any `-c` key this codex version does not recognize, so a
+    // renamed/typo'd otel.* key hard-fails the review instead of silently using the default exporter.
+    "--strict-config",
     // Every OpenTelemetry exporter OFF (metrics defaults to `statsig`, so ignoring the file is not
     // enough), and never ship the prompt — which carries the untrusted diff — to a telemetry backend.
     "-c",

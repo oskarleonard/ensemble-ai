@@ -35,7 +35,10 @@ export interface CodexReviewResult {
   timedOut: boolean;
 }
 
-// PURE: the exact codex CLI args for a PACKET-mode review. Encodes every lived lesson as
+// PURE: the exact codex CLI args for a PACKET-mode codex seat. Despite the name, this is the packet
+// builder for EVERY codex seat — the reviewer (via registry.ts) AND the brainstorm/consult voices
+// (via modes/brainstorm/voices.ts) — so the FENCE below hardens all of them, not the review seat
+// alone. Encodes every lived lesson as
 // DATA so a unit test pins it: `-s read-only` (the reviewer can NEVER mutate the
 // work) · `-m <model>` + `-c model_reasoning_effort=<effort>` (the CONFIGURED
 // strong model, not the account default — a review wants the best) ·
@@ -71,6 +74,20 @@ export interface CodexReviewResult {
 //     backend even if one is configured later. "none" is a documented value for each key (codex
 //     config reference); the 2026-07-10 probe OBSERVED no telemetry host being contacted, so this is
 //     fail-safe hardening, not the closing of an observed leak — documented honestly as such.
+//
+//   `--strict-config` — FAIL CLOSED on config drift: codex 0.143 accepts unknown `-c` keys SILENTLY
+//     (verified), so without this a renamed/typo'd `otel.*` key would fall back to the DEFAULT
+//     exporter and the fence above would be a silent no-op. With it, any `-c` key this codex version
+//     does not recognize HARD-FAILS the review (loud) rather than degrading quietly. The four otel
+//     keys + `model_reasoning_effort` all validate under it on 0.143 (checked against the native
+//     config schema). (cross-vendor review: codex-f2 / grok-f2)
+//
+// KNOWN RESIDUAL (packet fs-read — cross-vendor codex-f1, deferred): `-s read-only` blocks WRITES but
+// does NOT scope reads (verified live: a read-only codex sandbox still reads $HOME), and the packet
+// seat keeps shell + file tools — so a prompt-injected packet review could read operator files and
+// carry them out in the model transcript. The WORKTREE path's kernel sandbox denies this; closing it
+// on the packet path (an external read-deny profile, or restricting the seat's tools) is a separate
+// hardening PR — this PR's scope is operator-MCP + telemetry only.
 export function buildCodexReviewArgs(
   config: ReviewerConfig,
   outFile: string,
@@ -83,6 +100,9 @@ export function buildCodexReviewArgs(
     // Load none of the operator's ~/.codex/config.toml — above all its [mcp_servers]. Auth still
     // uses $CODEX_HOME; the model/effort below arrive via -m/-c (an override layer), not that file.
     '--ignore-user-config',
+    // FAIL CLOSED on config drift: reject any `-c` key this codex version does not recognize, so a
+    // renamed/typo'd otel.* key hard-fails the review instead of silently using the default exporter.
+    '--strict-config',
     // Every OpenTelemetry exporter OFF (metrics defaults to `statsig`, so ignoring the file is not
     // enough), and never ship the prompt — which carries the untrusted diff — to a telemetry backend.
     '-c',

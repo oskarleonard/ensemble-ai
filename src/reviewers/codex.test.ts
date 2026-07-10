@@ -97,6 +97,9 @@ describe('buildCodexReviewArgs', () => {
     // needs no MCP, and an operator MCP server is a credentialed egress channel. Auth still uses
     // $CODEX_HOME; model/effort ride -m/-c (an override layer), not the ignored file.
     expect(args).toContain('--ignore-user-config');
+    // …and fail CLOSED on config drift: a renamed/typo'd otel.* key hard-fails the review (codex
+    // accepts unknown -c keys silently WITHOUT this) instead of silently reverting to the default.
+    expect(args).toContain('--strict-config');
     // Every OpenTelemetry exporter OFF — the metrics exporter DEFAULTS to `statsig`, so
     // --ignore-user-config alone would reset it to that default, not disable it.
     // log_user_prompt=false guarantees the untrusted diff (which rides in the prompt) is never
@@ -341,13 +344,16 @@ describe('runCodexReview — worktree evidence runs under the external sandbox w
     fs.rmSync(wt, { force: true, recursive: true });
   });
 
-  it('the packet path is untouched when no worktree is requested', async () => {
+  it('takes the fenced packet path (bare read-only codex, no worktree wrap) when no worktree is requested', async () => {
     const spawned = vi.mocked(spawn);
     spawned.mockClear();
     void runCodexReview('p', CONFIG, {});
     expect(spawned).toHaveBeenCalled();
     const [bin, args] = spawned.mock.calls[0] as unknown as [string, string[]];
-    expect(bin).toBe('codex');
-    expect(args).toContain('read-only'); // codex's own `-s read-only`, as before
+    expect(bin).toBe('codex'); // spawned directly, NOT wrapped in the worktree sandbox-exec
+    expect(args).toContain('read-only'); // codex's own `-s read-only`
+    // the packet argv also carries the source fence (buildCodexReviewArgs) — assert it reaches spawn.
+    expect(args).toContain('--ignore-user-config');
+    expect(args).toContain('--strict-config');
   });
 });
