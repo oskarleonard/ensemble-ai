@@ -176,7 +176,8 @@ describe('review --repo: a QUALIFIED seat is spawned against the worktree', () =
         version: 1,
       });
     }
-    // grok keeps its OS-enforced Seatbelt profile — the fence is per-seat, never a global claim.
+    // grok keeps its own id — the fence is per-seat, never a global claim. Its READS are OS-enforced
+    // (the `strict` base); its EGRESS is env-routed, and the id says exactly that.
     expect(result.receiptCandidate?.sandboxProfiles?.grok).toEqual(GROK_SANDBOX_PROFILE);
   });
 });

@@ -9,11 +9,12 @@ import type { ReviewerId } from '../core/types';
 //   SEAT_QUALIFIERS and RETRIES_ON_PACKET — TS errors if a new reviewer joins REVIEWER_IDS without
 //   an explicit ruling on where it may talk. A default branch here would be fail-OPEN.
 //
-//   Not user-overridable, because the seat's realized-evidence profile id (`…+egress-proxy`) is what
-//   a receipt attests, and that id does not carry the host list. If `~/.ensemble-ai` could widen the
-//   allowlist, two runs could mint receipts under the same profile id having been fenced very
-//   differently — precisely the equivalence the sandbox profile version exists to forbid. Hosts are
-//   code, so a change to them is a diff, a review, and a `version` bump.
+//   Not user-overridable, because the seat's sandbox profile id (`…+egress-proxy-kernel` for codex,
+//   `…+proxy-env-noshell` for grok) is what a receipt attests, and that id does not carry the host
+//   list. If `~/.ensemble-ai` could widen the allowlist, two runs could mint receipts under the same
+//   profile id having been fenced very differently — precisely the equivalence the sandbox profile
+//   version exists to forbid. Hosts are code, so a change to them is a diff, a review, and a
+//   `version` bump.
 //
 // EVERY HOST IS EVIDENCED. "It might need it" is not a reason to open a hole.
 

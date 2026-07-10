@@ -61,8 +61,37 @@ describe('seat qualification — a seat gets the worktree IFF its sandbox qualif
       qualified: true,
       reason: null,
     });
-    // Read the id literally: this is plan-mode + a write-tool deny-list, not a kernel sandbox.
+    // Read the id literally: these seats are fenced by CAPABILITY (no Bash, no network, no MCP, a
+    // neutral cwd, $HOME denied), not by a kernel sandbox.
     expect(CLAUDE_CAPABILITY_FENCE.id).toBe('claude-capability-fence');
+  });
+});
+
+// THE IDENTITY GUARD. A receipt may never over-claim what fenced a seat — the same defect class the
+// whole evidence machinery exists to close. codex and grok are fenced by DIFFERENT mechanisms:
+// codex's outbound is denied BY THE KERNEL except the one loopback proxy port; grok's is merely
+// ROUTED by proxy env vars (its sandbox.toml schema has no network keys), and what bounds a
+// prompt-injected tree there is that the seat has no shell (`--disallowed-tools bash`). The two ids
+// once both ended `+egress-proxy`, so a receipt reader inferred codex's kernel guarantee for grok.
+// These assertions pin the distinction against a future copy-paste collapsing them back together.
+describe('the seat profile ids encode the MECHANISM, not merely the existence of a fence', () => {
+  const KERNEL_TOKEN = 'kernel';
+
+  it('codex and grok never share a profile id', () => {
+    expect(CODEX_SANDBOX_PROFILE.id).not.toBe(GROK_SANDBOX_PROFILE.id);
+  });
+
+  it("codex's id claims the kernel fence; grok's must NOT", () => {
+    expect(CODEX_SANDBOX_PROFILE.id).toContain(KERNEL_TOKEN);
+    // The load-bearing assertion: grok has no kernel network rule, so its id must never carry the
+    // token that promises one. (Asserting codex's id DOES carry it stops the guard from being
+    // satisfied by simply deleting the token from both.)
+    expect(GROK_SANDBOX_PROFILE.id).not.toContain(KERNEL_TOKEN);
+  });
+
+  it("grok's id names what actually bounds it: env-routed egress, no shell", () => {
+    expect(GROK_SANDBOX_PROFILE.id).toContain('proxy-env');
+    expect(GROK_SANDBOX_PROFILE.id).toContain('noshell');
   });
 });
 

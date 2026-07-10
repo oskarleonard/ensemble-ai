@@ -157,28 +157,34 @@ export const GROK_CLI_SANDBOX = REVIEW_PROFILE_NAME;
 
 // The grok seat's sandbox identity, as a RECEIPT attests it. Two fences compose:
 //
-//   `ensemble-review`  — grok's own kernel profile: a `strict` (deny-by-default READS) base + a
+//   `ensemble-review-grok` — grok's own kernel profile: a `strict` (deny-by-default READS) base + a
 //                        secret deny-list. Pointing it at the worktree root is config-only
 //                        (`--cwd <worktree>`).
-//   `+egress-proxy`    — the engine's per-host CONNECT fence (codex-f3). grok honors the standard
-//                        proxy env vars (PROBED 2026-07-10: a logging proxy saw its
-//                        `cli-chat-proxy.grok.com:443` CONNECT), so the seat is spawned pointed at
-//                        the proxy and reaches that host and nothing else. Its `api.mixpanel.com`
-//                        telemetry is denied, and grok completes anyway.
+//   `+proxy-env-noshell` — the engine's per-host CONNECT fence (codex-f3), reached by ENV not by
+//                        kernel rule. grok honors the standard proxy env vars (PROBED 2026-07-10: a
+//                        logging proxy saw its `cli-chat-proxy.grok.com:443` CONNECT), so the seat is
+//                        spawned pointed at the proxy and reaches that host and nothing else. Its
+//                        `api.mixpanel.com` telemetry is denied, and grok completes anyway.
 //
-// WHAT WE COULD NOT DO, stated: grok's `sandbox.toml` profile schema is `extends` / `read_only` /
-// `read_write` / `allow` / `deny` — FILES ONLY, no network keys. So unlike codex's Seatbelt profile
-// there is no rule that denies grok's process direct outbound; the proxy env is the fence, and a
-// grok that chose to ignore it could still reach any host. What bounds that is grok's own profile:
-// `strict` is documented as "no child network", and the seat runs `--disallowed-tools bash` — so
-// there is no shell inside the untrusted tree to prompt-inject in the first place. This is a WEAKER
-// fence than codex's, and the id says only what it is.
+// WHY THE ID DOES NOT SAY `+egress-proxy` LIKE CODEX'S. It used to, and that was the defect: an id
+// that reads like the codex one IMPLIES the codex one's guarantee (a kernel rule denying direct
+// outbound), which grok does NOT have. grok's `sandbox.toml` profile schema is `extends` /
+// `read_only` / `read_write` / `allow` / `deny` — FILES ONLY, no network keys — so no rule denies
+// this process direct outbound, and a grok that chose to ignore `HTTPS_PROXY` could reach any host.
+// What actually bounds it is the SEAT HAVING NO SHELL: `--disallowed-tools bash` means there is no
+// interpreter inside the untrusted tree for a prompt-injected file to drive (and `strict` is
+// documented as "no child network"). The id now names that: env-routed egress, no-shell containment.
+// A receipt reader must be able to tell this seat from the kernel-fenced one WITHOUT reading a PR.
 //
-// Bump `version` whenever REVIEW_PROFILE_BLOCK or the egress allowlist changes — a receipt minted
-// under a weaker profile must never verify as equivalent to one minted under a tighter one.
+// Bump `version` whenever REVIEW_PROFILE_BLOCK, the egress allowlist, or this identity changes — a
+// receipt minted under a weaker profile must never verify as equivalent to one minted under a
+// tighter one. Versions advance across a rename and never reset (see CODEX_SANDBOX_PROFILE): this
+// seat's lineage is `ensemble-review` v1 → this, so no (id, version) pair is ever reused.
 export const GROK_SANDBOX_PROFILE: SandboxProfileRef = {
-  id: `${REVIEW_PROFILE_NAME}+egress-proxy`,
-  version: 1,
+  // Egress fenced by proxy ENV VARS ONLY (grok's sandbox schema has no network keys); what bounds a
+  // prompt-injected tree is that the seat has NO SHELL (`--disallowed-tools bash`) to exercise it.
+  id: 'ensemble-review-grok+proxy-env-noshell',
+  version: 2,
 };
 
 // PURE: the exact grok CLI args for a review. Encodes every lived lesson as DATA

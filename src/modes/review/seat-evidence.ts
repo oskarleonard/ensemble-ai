@@ -90,7 +90,7 @@ export function qualifyGrokSeat(configuredSandbox?: string): SeatQualification {
   const profile = GROK_SANDBOX_PROFILE;
   const resolved = resolveReviewSandbox(configuredSandbox);
   // Compared against the CLI sandbox NAME, not the receipt's profile id: since codex-f3 the id also
-  // names the egress fence (`+egress-proxy`), which grok's own sandbox schema cannot express.
+  // names the egress fence (`+proxy-env-noshell`), which grok's own sandbox schema cannot express.
   if (resolved !== GROK_CLI_SANDBOX) {
     return {
       profile,

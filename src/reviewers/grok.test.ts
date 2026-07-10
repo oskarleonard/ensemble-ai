@@ -274,9 +274,9 @@ describe('runGrokReview (stdout capture)', () => {
 });
 
 // WORKTREE EVIDENCE QUALIFICATION (codex-f3). resolveReviewSandbox admits `strict` as well as
-// `ensemble-review`, but only `ensemble-review` carries the secret deny-list, and
-// GROK_SANDBOX_PROFILE hardcodes that id. Handing a `strict` seat the whole project would attest a
-// profile it never ran under, so the seat must fail closed instead.
+// `ensemble-review`, but only `ensemble-review` carries the secret deny-list, and that is the CLI
+// profile (GROK_CLI_SANDBOX) the receipt's id attests a seat ran behind. Handing a `strict` seat the
+// whole project would attest a profile it never ran under, so the seat must fail closed instead.
 describe('runGrokReview — the worktree is only granted under the QUALIFYING sandbox', () => {
   it('refuses the worktree under `strict`, and says why, without spawning', async () => {
     const spawned = vi.mocked(spawn);
