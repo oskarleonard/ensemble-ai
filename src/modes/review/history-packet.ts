@@ -107,18 +107,21 @@ export interface HistoryPacket {
 
 // ── git plumbing ──────────────────────────────────────────────────────────────────────
 
-// ASCII unit separator: it cannot occur in a sha, an ISO date, or an author name, and `%s` is the
+// ASCII unit separator: it cannot occur in a sha, an epoch, or an author name, and `%s` is the
 // subject's FIRST line, so a field split on it is unambiguous — no quoting, no escaping.
 const FIELD_SEP = '\u001f';
-const LOG_FORMAT = `--format=%h${FIELD_SEP}%aI${FIELD_SEP}%an${FIELD_SEP}%s`;
+// `%at` (author epoch), NOT `%aI`: blame's porcelain hands back an epoch, and one packet rendering
+// the same instant two ways (`…+02:00` in the log, `…Z` in the blame) is a trap for the reader. Both
+// go through `isoFromEpoch`, so both are UTC — and neither varies with the operator's timezone.
+const LOG_FORMAT = `--format=%h${FIELD_SEP}%at${FIELD_SEP}%an${FIELD_SEP}%s`;
 
 function renderLogLines(text: string): string[] {
   return text
     .split('\n')
     .filter((l) => l.length > 0)
     .map((l) => {
-      const [sha, date, author, ...subject] = l.split(FIELD_SEP);
-      return `${sha}  ${date}  ${author}  ${subject.join(FIELD_SEP)}`;
+      const [sha, epoch, author, ...subject] = l.split(FIELD_SEP);
+      return `${sha}  ${isoFromEpoch(epoch)}  ${author}  ${subject.join(FIELD_SEP)}`;
     });
 }
 
@@ -418,6 +421,10 @@ export function buildHistoryPacket(args: BuildHistoryPacketArgs): HistoryPacket 
       );
       continue;
     }
+    // REV-PINNED (`<headSha>` before `--`), never the working-tree file: the instruction strip left
+    // this checkout dirty, and a bare `git blame -- <path>` blames what is on disk. Pinning also
+    // means the packet's line numbers are the ones the seat's prompt and the gate's hunks agree on.
+    // `-L` is repeatable — verified against real git (2026-07-10) in a detached linked worktree.
     const blame = args.git(
       [
         'blame',

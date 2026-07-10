@@ -49,10 +49,12 @@ index 333..444 100644
 +export const c = 2;
 `;
 
-// `git log --format=%h<US>%aI<US>%an<US>%s` — the unit separator keeps the subject unambiguous.
+// `git log --format=%h<US>%at<US>%an<US>%s` — the unit separator keeps the subject unambiguous, and
+// `%at` (epoch) is what makes the log's dates render in the same UTC form blame's porcelain does.
 const US = '\u001f';
+const EPOCH = 1_700_000_000;
 const logReply = (n: number): string =>
-  Array.from({ length: n }, (_, i) => `abc${i}${US}2026-07-0${(i % 9) + 1}T10:00:00Z${US}Author ${i}${US}Subject ${i}`).join('\n');
+  Array.from({ length: n }, (_, i) => `abc${i}${US}${EPOCH + i}${US}Author ${i}${US}Subject ${i}`).join('\n');
 
 // A two-line `git blame --porcelain` reply: the second record reuses the first's commit, so its
 // headers are omitted — exactly as porcelain caches them.
@@ -105,11 +107,11 @@ const build = (
 
 // Every git command a full two-file run makes, all succeeding.
 const HAPPY: Record<string, ReturnType<GitRun>> = {
-  [`log -n 10 --format=%h${US}%aI${US}%an${US}%s -- src/a.ts`]: ok(logReply(3)),
-  [`log -n 10 --format=%h${US}%aI${US}%an${US}%s -- src/b.ts`]: ok(logReply(2)),
+  [`log -n 10 --format=%h${US}%at${US}%an${US}%s -- src/a.ts`]: ok(logReply(3)),
+  [`log -n 10 --format=%h${US}%at${US}%an${US}%s -- src/b.ts`]: ok(logReply(2)),
   [`blame --porcelain -L 10,13 -L 41,42 ${HEAD} -- src/a.ts`]: ok(BLAME),
   [`blame --porcelain -L 1,3 ${HEAD} -- src/b.ts`]: ok(BLAME),
-  [`log --format=%h${US}%aI${US}%an${US}%s ${BASE}..${HEAD}`]: ok(logReply(2)),
+  [`log --format=%h${US}%at${US}%an${US}%s ${BASE}..${HEAD}`]: ok(logReply(2)),
 };
 
 const pathsOf = (p: { files: Array<{ path: string }> }): string[] => p.files.map((f) => f.path);
@@ -143,10 +145,11 @@ describe('the packet describes the CHANGED files, and only those', () => {
   });
 
   it('renders each log line as `sha  date  author  subject`', () => {
+    // Both the log and the blame render the instant as UTC ISO — one packet, one date format.
     expect(contentsOf(build(HAPPY), 'history/log/src/b.ts.log')).toBe(
       `# the last 10 commits touching src/b.ts (newest first)
-abc0  2026-07-01T10:00:00Z  Author 0  Subject 0
-abc1  2026-07-02T10:00:00Z  Author 1  Subject 1
+abc0  2023-11-14T22:13:20.000Z  Author 0  Subject 0
+abc1  2023-11-14T22:13:21.000Z  Author 1  Subject 1
 `
     );
   });
@@ -189,7 +192,7 @@ describe('blame is restricted to the CHANGED line ranges', () => {
 -
 `;
     const packet = build(
-      { [`log -n 10 --format=%h${US}%aI${US}%an${US}%s -- src/gone.ts`]: ok(logReply(1)) },
+      { [`log -n 10 --format=%h${US}%at${US}%an${US}%s -- src/gone.ts`]: ok(logReply(1)) },
       { baseSha: null, diff: deletionDiff }
     );
     expect(pathsOf(packet)).toEqual(['history/README.md', 'history/log/src/gone.ts.log']);
@@ -215,9 +218,9 @@ describe('the byte cap is hard, and a cut file SAYS it was cut', () => {
   // A corpus where one entry is UNAMBIGUOUSLY the biggest: a.ts has 60 commits, b.ts has 2, and
   // both blames fail (so only the three log entries compete for the budget).
   const LOPSIDED: Record<string, ReturnType<GitRun>> = {
-    [`log -n 60 --format=%h${US}%aI${US}%an${US}%s -- src/a.ts`]: ok(logReply(60)),
-    [`log -n 60 --format=%h${US}%aI${US}%an${US}%s -- src/b.ts`]: ok(logReply(2)),
-    [`log --format=%h${US}%aI${US}%an${US}%s ${BASE}..${HEAD}`]: ok(logReply(2)),
+    [`log -n 60 --format=%h${US}%at${US}%an${US}%s -- src/a.ts`]: ok(logReply(60)),
+    [`log -n 60 --format=%h${US}%at${US}%an${US}%s -- src/b.ts`]: ok(logReply(2)),
+    [`log --format=%h${US}%at${US}%an${US}%s ${BASE}..${HEAD}`]: ok(logReply(2)),
   };
   const lopsided = (capBytes: number): ReturnType<typeof build> =>
     build(LOPSIDED, { capBytes, logCommits: 60 });
@@ -296,8 +299,8 @@ describe('a failing git costs a file, never the review', () => {
   it('names the missing file in the README instead of writing an empty one', () => {
     const packet = build({
       ...HAPPY,
-      [`log -n 10 --format=%h${US}%aI${US}%an${US}%s -- src/b.ts`]: err('fatal: bad object'),
-      [`log --format=%h${US}%aI${US}%an${US}%s ${BASE}..${HEAD}`]: err(`fatal: bad revision '${BASE}..${HEAD}'`),
+      [`log -n 10 --format=%h${US}%at${US}%an${US}%s -- src/b.ts`]: err('fatal: bad object'),
+      [`log --format=%h${US}%at${US}%an${US}%s ${BASE}..${HEAD}`]: err(`fatal: bad revision '${BASE}..${HEAD}'`),
     });
     expect(pathsOf(packet)).not.toContain('history/log/src/b.ts.log');
     expect(pathsOf(packet)).not.toContain(HISTORY_PR_COMMITS_PATH);
