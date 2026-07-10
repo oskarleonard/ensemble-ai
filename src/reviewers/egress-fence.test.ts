@@ -95,7 +95,20 @@ describe('the egress allowlist is per-vendor config, never a global constant', (
       'auth.openai.com',
       'chatgpt.com',
     ]);
-    expect(egressHostsFor('grok')).toEqual(['cli-chat-proxy.grok.com']);
+    // grok needs BOTH, and a review fails without either: `cli-chat-proxy.grok.com` is the API base
+    // the prompt and findings travel over, and `auth.x.ai` mints the bearer token that API demands.
+    // Pinned as a PAIR because the one-host list was a live production defect — the worktree seat
+    // could reach the chat proxy, could not reach its own auth host, and 401'd into a packet
+    // fallback on every review (9 denied `auth.x.ai:443` CONNECTs, munin run
+    // `2026-07-10-14-49-44-5f601154`). A future edit that drops either host reintroduces that bug.
+    expect([...egressHostsFor('grok')].sort()).toEqual(['auth.x.ai', 'cli-chat-proxy.grok.com']);
+  });
+
+  // grok's auth host is grok's ALONE. The intersection test above forbids it appearing on codex's
+  // list; this says why that is not pedantry — an xAI bearer-auth endpoint reachable from the codex
+  // seat is a credentialed host codex has no reason to dial, i.e. an exfil channel.
+  it('keeps grok\'s auth host off codex\'s list', () => {
+    expect(egressHostsFor('codex')).not.toContain('auth.x.ai');
   });
 
   // The observed-but-unneeded hosts a review seat must NOT be able to reach: the operator's MCP
