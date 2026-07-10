@@ -13,7 +13,8 @@ import { readEnsembleConfig } from './ensemble-config';
 // UNTRUSTED CONTENT IS CHECKED OUT BEFORE ANY SEAT SANDBOX EXISTS, so the materialization itself
 // must be inert (spec §9, codex-f2):
 //   · no hooks               — `-c core.hooksPath=/dev/null` on every git invocation
-//   · no submodule recursion — `--no-recurse-submodules` on fetch AND worktree add
+//   · no submodule recursion — `--no-recurse-submodules` on fetch; `worktree add` needs (and
+//                              accepts) no flag: it never populates submodules by design
 //   · no LFS smudge          — `GIT_LFS_SKIP_SMUDGE=1` + the lfs filters emptied, so git-lfs
 //                              never runs and therefore never reads the tree's own `.lfsconfig`
 //   · tracked files only     — a fresh detached worktree carries no .env / WIP / node_modules
@@ -422,10 +423,16 @@ export function materializeWorktree(
     //
     // git creates the worktree dir itself, so we hand it a path that does not exist yet — INSIDE
     // an owner-only parent, never directly in a shared temp root (see WORKTREE_PARENT_PREFIX).
+    //
+    // NO --no-recurse-submodules here: `git worktree add` does not accept it on ANY git (it is a
+    // fetch/clone/checkout flag — every real materialization died with "unknown option" until the
+    // first live consumer run caught it, 2026-07-10). The submodule posture is unchanged without
+    // it: `worktree add` never populates submodules — a new worktree's submodules stay
+    // uninitialized until someone runs `submodule update`, which nothing here does.
     const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     dir = path.join(parent, 'head');
     const added = deps.git(
-      [...INERT_GIT_CONFIG, 'worktree', 'add', '--detach', '--no-recurse-submodules', dir, args.headSha],
+      [...INERT_GIT_CONFIG, 'worktree', 'add', '--detach', dir, args.headSha],
       { cwd: location.repoRoot, env: INERT_ENV }
     );
     if (!added.ok) {

@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -255,11 +256,15 @@ describe('materialization hardening — untrusted content is checked out INERT',
     expect(env?.[0]).toContain('GIT_LFS_SKIP_SMUDGE');
   });
 
-  it('never recurses submodules, on fetch OR worktree add', () => {
+  it('never recurses submodules on fetch — and never passes the flag to worktree add', () => {
     const { calls, git } = harness(headSha);
     materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git, lock: noLock });
     expect(calls.find((c) => c.includes('fetch'))).toContain('--no-recurse-submodules');
-    expect(calls.find((c) => c.includes('worktree') && c.includes('add'))).toContain(
+    // `git worktree add` REJECTS --no-recurse-submodules on every git version (it is a
+    // fetch/clone/checkout flag) — passing it killed every real materialization with
+    // "unknown option" (found live by the first consumer adoption, 2026-07-10). worktree add
+    // never populates submodules anyway, so omitting the flag keeps the inert posture.
+    expect(calls.find((c) => c.includes('worktree') && c.includes('add'))).not.toContain(
       '--no-recurse-submodules'
     );
   });
@@ -315,4 +320,76 @@ describe('materialization hardening — untrusted content is checked out INERT',
     const calls = (git as unknown as { mock: { calls: [string[]][] } }).mock.calls;
     expect(calls.some(([a]) => a.includes('worktree') && a.includes('add'))).toBe(false);
   });
+});
+
+// ── REAL git, hermetic — the test that would have caught the invalid worktree-add flag ────────
+//
+// Every materialization test above scripts GitRun, so an argv git itself rejects (the
+// `--no-recurse-submodules` on `worktree add` that killed every live materialization until
+// 2026-07-10) sails through green. This suite runs the REAL git binary against a local file://
+// origin exposing a refs/pull/N/head ref — no network, no GitHub, one repo, minimal spawns.
+describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)', () => {
+  const realGit: GitRun = (args, opts) => {
+    try {
+      const text = execFileSync('git', args, {
+        cwd: opts?.cwd,
+        encoding: 'utf8',
+        env: { ...process.env, ...opts?.env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      return { ok: true, text };
+    } catch (e) {
+      const stderr = (e as { stderr?: string }).stderr;
+      return { error: stderr?.toString() ?? String(e), ok: false };
+    }
+  };
+  // -c flags keep the test hermetic on any machine: no gpg signing, no identity prompt.
+  const g = (cwd: string, ...args: string[]) => {
+    const r = realGit(
+      ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', ...args],
+      { cwd }
+    );
+    if (!r.ok) throw new Error(`git ${args.join(' ')} failed: ${r.error}`);
+    return r.text.trim();
+  };
+
+  it('fetches pull/N/head from a file:// origin, materializes at the SHA, strips, reaps', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-realgit-'));
+    try {
+      const origin = path.join(base, 'origin');
+      fs.mkdirSync(origin);
+      g(origin, 'init', '-q');
+      fs.writeFileSync(path.join(origin, 'src.ts'), 'export const x = 1;\n');
+      fs.writeFileSync(path.join(origin, 'CLAUDE.md'), 'planted instruction channel\n');
+      g(origin, 'add', '.');
+      g(origin, 'commit', '-qm', 'pr head');
+      const headSha = g(origin, 'rev-parse', 'HEAD');
+      g(origin, 'update-ref', 'refs/pull/7/head', headSha);
+
+      const consumer = path.join(base, 'consumer');
+      g(base, 'clone', '-q', `file://${origin}`, consumer);
+
+      const made = materializeWorktree(
+        {
+          headSha,
+          location: { fetchUrl: `file://${origin}`, repoRoot: consumer, slug: 'o/r' },
+          pr: 7,
+          worktreeRoot: base,
+        },
+        { git: realGit }
+      );
+      expect(isPreflightError(made) && (made as { message: string }).message).toBe(false);
+      if (isPreflightError(made)) return;
+      expect(made.headSha).toBe(headSha);
+      expect(fs.readFileSync(path.join(made.dir, 'src.ts'), 'utf8')).toContain('x = 1');
+      // The instruction channel was stripped from the real checkout.
+      expect(fs.existsSync(path.join(made.dir, 'CLAUDE.md'))).toBe(false);
+      expect(made.strippedInstructionFiles).toContain('CLAUDE.md');
+
+      reapWorktree(consumer, made.dir, { git: realGit });
+      expect(fs.existsSync(made.dir)).toBe(false);
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
 });
