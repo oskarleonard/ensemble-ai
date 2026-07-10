@@ -4,6 +4,8 @@ import type { VoiceRunResult } from '../brainstorm/voices';
 import { runReviewerExec } from '../../core/spawn';
 import { type RunReviewOpts, REVIEW_TIMEOUT_MS } from '../../reviewers/codex';
 
+import type { SandboxProfileRef } from './evidence';
+
 // The COLD headless `claude -p` used as a review VOICE (a peer reviewer) and as the
 // SYNTHESIZER. It reuses the SAME group-aware, watchdog'd spawn primitive the codex/grok
 // reviewers use (claude forks node subprocesses, so the group-kill is mandatory) in
@@ -21,6 +23,23 @@ import { type RunReviewOpts, REVIEW_TIMEOUT_MS } from '../../reviewers/codex';
 // RATIFIED by Oskar (2026-07-02): the claude voice's read-only being weaker than codex's
 // `-s read-only` / grok's kernel sandbox is accepted, NOT a bug to fix — own-diffs threat
 // model + parity with the dashboard's full-tool review worker.
+
+// THE ANTHROPIC SEATS' PROFILE IDENTITY. Spec §2 qualifies the Anthropic seats (the `claude`
+// producer + the gate) for the worktree because they are HARNESS-controlled, and receipt.ts refuses
+// to mint a receipt claiming worktree evidence for a seat with no profile identity — a worktree
+// seat's evidence means nothing without the fence it ran behind. So the belt below IS this seat's
+// profile, and it is named for what it actually is.
+//
+// READ THE ID LITERALLY: this is `--permission-mode plan` + the write-tool deny-list, NOT an
+// OS-enforced sandbox like grok's `ensemble-review` or codex's `ensemble-review-codex` wrapper. It
+// bounds WRITES (best-effort, per the ratified posture above); it does not kernel-fence reads.
+// `version` MUST be bumped whenever the belt changes (CLAUDE_REVIEW_DENIED_TOOLS or the
+// permission mode) — a receipt minted under a weaker belt must never verify as equivalent to one
+// minted under a tighter one.
+export const CLAUDE_HARNESS_PROFILE: SandboxProfileRef = {
+  id: 'claude-plan-mode-deny-writes',
+  version: 1,
+};
 
 // Claude's `--effort` accepts these levels; anything else ('default' sentinel included)
 // means "leave it to the CLI default", so the flag is omitted rather than passed invalid.

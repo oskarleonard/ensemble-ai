@@ -65,12 +65,19 @@ import {
   type DiffMode,
   omittedLine,
 } from './modes/review/diff';
-import type { EvidenceMap } from './modes/review/evidence';
+import type { EvidenceMap, EvidenceSeat } from './modes/review/evidence';
+import {
+  buildEvidenceManifest,
+  writeEvidenceManifest,
+} from './modes/review/evidence-manifest';
 import {
   classifySecurityFinding,
   type ReviewProfile,
   stripSecurityTag,
 } from './modes/review/profile';
+import { formatEvidenceFooter } from './modes/review/seat-evidence';
+import { isPreflightError } from './modes/review/worktree';
+import { openWorktree, type WorktreeSession } from './modes/review/worktree-run';
 import {
   computePolicyHash,
   defaultReceiptStore,
@@ -458,6 +465,12 @@ function resolveSource(
       // resolved (no gh ref to read conventions at), suppress the LOCAL-repo fallback:
       // gather NOTHING rather than the wrong repo's conventions.
       noLocalConventions?: boolean;
+      // The PR's BASE SHA, resolved from the compare API alongside `headShaOverride` (the two are
+      // resolved together or not at all). It is prompt context — the range `git diff <base>...<head>`
+      // that the worktree seats and the holistic lens are told the change spans — and is
+      // deliberately NOT fed to `acquireDiff`: the receipt's `baseSha` is part of the receipt KEY,
+      // so populating it here would stale every PR-mode receipt on disk.
+      prBaseSha?: string;
       staged?: boolean;
       workingTree?: boolean;
     } {
@@ -531,7 +544,9 @@ function resolveSource(
           // A URL PR review gathers conventions from the PR repo at its exact head SHA
           // (same reach as the diff) — so the reviewer sees the change's own conventions
           // even when fired from a bare terminal / non-repo cwd.
-          return 'code' in r ? r : { ...r, conventionsCtx: { ref: headSha, repoSlug } };
+          return 'code' in r
+            ? r
+            : { ...r, conventionsCtx: { ref: headSha, repoSlug }, prBaseSha: baseSha };
         }
         // SHAs unresolved → unbound `gh pr diff -R` (no SHA binding, generic label). A
         // URL PR reviews a DIFFERENT repo than the cwd, so its conventions must come ONLY
@@ -1060,20 +1075,79 @@ async function reviewCommand(
     );
     return 3;
   }
-  // `--repo` (worktree evidence mode) is PARSED but its seat-spawn wiring is not built: no seat is
-  // spawned against a worktree today (see README). Reviewing the packet while the caller believes
-  // they asked for whole-project evidence is the exact silent downgrade the realized-evidence map
-  // exists to prevent — so refuse, by name, rather than under-deliver quietly.
-  if (typeof values.repo === 'string') {
+  // `--repo` = WORKTREE EVIDENCE MODE (spec §1). It materializes the PR head as a detached,
+  // read-only worktree of a repo the user already has cloned, and hands it to every seat whose
+  // sandbox qualifies. Two things are structurally required and neither can be invented:
+  //   · the PR's `owner/repo` — the pre-flight PROVES the local checkout is that repo before any
+  //     fetch, by comparing its remotes' fetch URLs (a bare `--pr <N>` carries no slug);
+  //   · the head + base SHAs — materialization asserts `HEAD == headSha` before a seat runs, and
+  //     the seats are told the exact `git diff <base>...<head>` range under review.
+  // Both come from the compare API, which only a full PR URL reaches. Refuse UPFRONT otherwise,
+  // rather than reviewing the packet while the caller believes they asked for whole-project
+  // evidence — the exact silent downgrade the realized-evidence map exists to prevent.
+  const repoFlag = typeof values.repo === 'string' ? String(values.repo) : null;
+  if (repoFlag && !(source.postTarget?.repoSlug && source.headShaOverride && source.prBaseSha)) {
     console.error(
-      `ensemble-ai ${cmd}: --repo (worktree evidence mode) is not wired into the review path yet — ` +
-        'the engine lifecycle, sandbox profiles, and receipt identity all exist, but no seat is ' +
-        'spawned against a worktree, so this run would review the packet while claiming whole-project ' +
-        'evidence. Drop --repo for a packet-mode review. `receipt verify --repo <path>` DOES honor it ' +
-        '(it asks whether a receipt was minted under worktree evidence).'
+      `ensemble-ai ${cmd}: --repo (worktree evidence mode) needs a PR bound to a commit — ` +
+        're-run with the full PR URL (`--pr https://github.com/<owner>/<repo>/pull/<N>`), which ' +
+        'carries the base repo to verify your checkout against and binds the base+head SHAs via ' +
+        'the compare API. A bare `--pr <N>` or a local/raw diff source has neither, so there is ' +
+        'nothing to fetch, nothing to assert HEAD against, and no repo identity to check.'
     );
     return 3;
   }
+
+  // ONE worktree per run, opened here and reaped in the `finally` below — plus a `git worktree
+  // prune` sweeper inside the reap, which self-heals the crash/SIGTERM path on the next run
+  // (spec §9, grok-f1). Every failure is a NAMED cause, never a generic "git failed".
+  let worktree: WorktreeSession | null = null;
+  if (repoFlag && source.postTarget && source.headShaOverride && source.prBaseSha) {
+    console.error(`· materializing the PR head as a read-only worktree of ${repoFlag}…`);
+    const opened = openWorktree({
+      baseSha: source.prBaseSha,
+      headSha: source.headShaOverride,
+      pr: source.postTarget.pr,
+      prSlug: source.postTarget.repoSlug as string,
+      repoPath: repoFlag,
+    });
+    if (isPreflightError(opened)) {
+      console.error(`ensemble-ai ${cmd}: --repo pre-flight failed [${opened.kind}] — ${opened.message}`);
+      return 3;
+    }
+    worktree = opened;
+  }
+
+  try {
+    return await runReviewPipeline({ cmd, cwd, postComment, profile, source, stage, values, worktree });
+  } finally {
+    worktree?.reap();
+  }
+}
+
+// The diff source, already resolved + validated by reviewCommand.
+type ResolvedSource = Exclude<
+  ReturnType<typeof resolveDiffSourceForCommand>,
+  { code: number }
+>;
+
+interface ReviewPipelineInput {
+  cmd: string;
+  cwd: string;
+  postComment: boolean;
+  profile: ReviewProfile;
+  source: ResolvedSource;
+  stage: boolean;
+  values: Record<string, string | boolean | undefined>;
+  // The run's worktree evidence, or null for a packet-mode review. BORROWED here: the caller owns
+  // its lifetime, so nothing below may reap it.
+  worktree: WorktreeSession | null;
+}
+
+// The review itself — everything after the source + worktree are settled. Factored out of
+// reviewCommand so the worktree's `finally` reap wraps EVERY exit path of the pipeline, including
+// an early usage return and an unexpected throw.
+async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
+  const { cmd, cwd, postComment, profile, source, stage, values, worktree } = input;
 
   // Convention gathering: the reviewers see the repo's real md web (root + touched
   // packages + linked/swept docs). Off with --no-conventions; a fs reader for local
@@ -1139,6 +1213,12 @@ async function reviewCommand(
   if (typeof ceiling === 'object') return ceiling.code;
   const ceilingBytes = ceiling;
 
+  // The Anthropic seats this command runs AFTER the core: the `claude` producer (default-on) and
+  // the `gate`. They are part of the run's evidence INTENT — the gate is an evidence-bearing actor
+  // (pin 1), not a neutral judge — so runReviewMode hashes them into the receipt's policy identity
+  // even though it never spawns them. `--no-claude` runs neither.
+  const peerSeats: EvidenceSeat[] = roster.claude ? ['claude', 'gate'] : [];
+
   let result: ReviewModeResult;
   try {
     result = await runReviewMode({
@@ -1154,12 +1234,16 @@ async function reviewCommand(
       noConventions,
       onProgress: (m) => console.error(`· ${m}`),
       out,
+      peerSeats,
       profile,
       reviewers,
       runId,
       sandbox: typeof values.sandbox === 'string' ? values.sandbox : undefined,
       staged: source.staged,
       workingTree: source.workingTree,
+      ...(worktree
+        ? { worktree: { baseSha: worktree.baseSha, dir: worktree.dir, headSha: worktree.headSha } }
+        : {}),
     });
   } catch (e) {
     console.error(`ensemble-ai ${cmd}: ${(e as Error).message}`);
@@ -1227,6 +1311,9 @@ async function reviewCommand(
     try {
       claudeLayer = await runClaudeReviewLayer({
         baseDir: out,
+        // The PR's base SHA when the compare API bound it (a URL PR), else the local diff's. It is
+        // the range the worktree seats + the lens are told the change spans — never a receipt field.
+        baseSha: source.prBaseSha ?? result.acquired.baseSha,
         claudeConfig: voiceConfigs.claude,
         // The conventions this run actually gathered — the docs a holistic finding may cite to
         // lift its MED severity cap (the gate re-reads the citation out of the tree regardless).
@@ -1234,14 +1321,13 @@ async function reviewCommand(
         gateConfig: gateSeat.config,
         coreReviews: result.reviews,
         expectedHeadSha: result.acquired.headSha,
-        // The HOLISTIC lens (spec §4) — off unless asked for, and it runs only with worktree
-        // evidence. No CLI path supplies a worktree yet (see the README status note), so `--holistic`
-        // today resolves to a LOUD skip rather than a packet-evidence architecture review. The seat,
-        // its guardrails, and this wiring are what Phase 1's `--repo` flag will switch on.
+        // The HOLISTIC lens (spec §4) — off unless asked for, and it runs ONLY with worktree
+        // evidence: `--holistic` without `--repo` is a LOUD skip, never a packet-evidence
+        // architecture claim (resolveHolisticPlan owns that ruling).
         ...(values.holistic
           ? {
               holistic: {
-                baseSha: result.acquired.baseSha,
+                baseSha: source.prBaseSha ?? result.acquired.baseSha,
                 config: loadHolisticSeat(VOICES_FILE, (m) => console.error(`· ${m}`)),
               },
             }
@@ -1250,6 +1336,8 @@ async function reviewCommand(
         log: (m) => console.error(`· ${m}`),
         reviewPrompt: result.prompt,
         runId,
+        // The Claude producer + the gate read the SAME worktree the core seats did (spec §3, §5).
+        ...(worktree ? { worktree: worktree.dir } : {}),
       });
       try {
         writeTrailFile(out, runId, 'claude-synthesis.json', JSON.stringify(claudeLayer, null, 2));
@@ -1283,6 +1371,40 @@ async function reviewCommand(
     authorityActive
   );
 
+  // THE RUN'S REALIZED EVIDENCE (spec §8) — fact, not intent. The core seats' classes come back
+  // from the engine (a seat whose sandbox did not qualify, or whose wrapper provably broke, fell
+  // back to the packet). The Anthropic seats are harness-controlled: they read the worktree
+  // whenever one exists and the layer ran. `realizedEvidence` is never hashed, so folding the
+  // Anthropic seats in here cannot move the receipt key.
+  const realizedEvidence: EvidenceMap = {
+    ...(result.evidence?.realized ?? {}),
+    ...(worktree && claudeLayer ? { claude: 'worktree' as const, gate: 'worktree' as const } : {}),
+  };
+  // LOUD (§2, §9 grok-f2): every fallback was already printed as it happened; restate them
+  // together so a reader of the summary cannot miss that this run reviewed less than it asked to.
+  for (const reason of result.evidence?.fallbacks ?? []) {
+    console.error(`⚠ evidence degraded — ${reason}`);
+  }
+  // The evidence manifest joins the TRAIL (advisory, never hashed): the tracked tree at headSha —
+  // the readable SURFACE each worktree seat was given, not a record of what it read. Best-effort,
+  // and it inherits the trail fence like every other artifact.
+  if (worktree && result.evidence) {
+    writeEvidenceManifest(
+      out,
+      runId,
+      buildEvidenceManifest({
+        headSha: worktree.headSha,
+        intendedEvidence: result.evidence.intended,
+        readableSurface: worktree.readableSurface(),
+        realizedEvidence,
+        sandboxProfiles: result.evidence.sandboxProfiles,
+      })
+    );
+  }
+  // The one honest evidence line for the posted review's footer (§8: any fallback surfaces in the
+  // receipt AND the footer, never silently). Null in packet mode — nothing new to say.
+  const evidenceNote = worktree ? formatEvidenceFooter(realizedEvidence) : null;
+
   // Persist the receipt ONLY after the full expected roster ran (fail-loud parity with the
   // exit gate): the codex/grok core qualified a candidate, but when the default-on Opus
   // reviewer was EXPECTED it must ALSO have completed — else NO clean receipt is written
@@ -1308,6 +1430,10 @@ async function reviewCommand(
       const receipt: DiffReviewReceipt = {
         ...result.receiptCandidate,
         ...(peerReviewers.length > 0 ? { peerReviewers } : {}),
+        // Stamp the Anthropic seats' realized classes in beside the core's (a v2 receipt only —
+        // a packet run's candidate carries no evidence maps at all, and must stay byte-identical
+        // to a legacy one). Never hashed, so the receipt key is unchanged.
+        ...(worktree ? { realizedEvidence } : {}),
         ...(claudeLayer
           ? {
               gateDisposition: gateDispositionSummary(
@@ -1392,6 +1518,7 @@ async function reviewCommand(
       const body = capComment(
         renderReviewComment({
           claudeLayer,
+          evidenceNote,
           gateSeat: gateSeat ? toCommentGateSeat(gateSeat) : null,
           headSha: result.acquired.headSha,
           headline: oneLineSummary(result),
@@ -1447,7 +1574,12 @@ async function reviewCommand(
           stageError = `could not resolve owner/repo for PR #${source.postTarget.pr} — pass a full PR URL, or run inside the repo`;
         } else {
           const res = stageReview(
-            buildStagedReviewPayload({ headSha: result.acquired.headSha, plan, reviewerIds }),
+            buildStagedReviewPayload({
+              ...(evidenceNote ? { evidenceNote } : {}),
+              headSha: result.acquired.headSha,
+              plan,
+              reviewerIds,
+            }),
             target,
             { gh, log: (m) => console.error(m), reviewedHeadSha: result.acquired.headSha }
           );

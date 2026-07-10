@@ -1,10 +1,8 @@
-import { persistReview } from '../../core/artifacts';
 import {
   type ConventionManifest,
   type ConventionReader,
   gatherConventions,
 } from '../../core/conventions';
-import { parseFindings } from '../../core/findings';
 import {
   assembleCodePacket,
   PACKET_BUDGETS,
@@ -17,7 +15,6 @@ import {
   type ReviewerConfig,
   type ReviewerId,
   type StoredReview,
-  type TerminalState,
 } from '../../core/types';
 import { REVIEW_ADAPTERS } from '../../reviewers/registry';
 
@@ -31,6 +28,11 @@ import {
   type DepSurfaceResult,
   scanDependencySurface,
 } from './dep-surface';
+import type {
+  EvidenceMap,
+  EvidenceSeat,
+  SandboxProfileMap,
+} from './evidence';
 import { persistGatePacket } from './gate-hunks';
 import { type ReviewProfile, SECURITY_OBJECTIVE } from './profile';
 import {
@@ -38,9 +40,48 @@ import {
   type DiffReviewReceipt,
   defaultReceiptStore,
 } from './receipt';
+import {
+  intendedEvidenceFor,
+  qualifyCodexSeat,
+  qualifyGrokSeat,
+  qualifyHarnessSeat,
+  type SeatQualifications,
+  sandboxProfilesFor,
+  worktreePromptSuffix,
+} from './seat-evidence';
+import {
+  type ReviewAdapter,
+  RETRIES_ON_PACKET,
+  runCoreSeat,
+} from './seat-run';
 import { scanDiffForSecrets, type SecretScanResult } from './secret-scan';
 
+// The detached, read-only worktree of the PR head this run materialized (spec §1) — one per run,
+// shared by every seat, owned and reaped by the CALLER. Its presence is the request for worktree
+// evidence. `baseSha` is the range the seats are told the change spans; it is prompt context, never
+// a receipt field (the receipt's own baseSha comes from the acquired diff).
+export interface WorktreeEvidence {
+  baseSha: string | null;
+  dir: string;
+  headSha: string;
+}
+
+// What the run intended, what it realized, and the fences it named — the receipt's evidence
+// identity (spec §8), computed for the CORE seats this mode owns. The caller folds in the
+// Anthropic seats (`claude`, `gate`) it owns.
+export interface ReviewEvidence {
+  // Every LOUD per-seat degradation: an unqualified sandbox, or a wrapper that provably broke.
+  fallbacks: string[];
+  intended: EvidenceMap;
+  realized: EvidenceMap;
+  sandboxProfiles: SandboxProfileMap;
+}
+
 export interface ReviewModeOptions {
+  // The per-reviewer invocation adapters. Defaults to the real vendor CLIs (REVIEW_ADAPTERS);
+  // injected in tests so the seat wiring (spawn cwd, sandbox qualification, realized evidence) is
+  // exercised without spawning codex or grok.
+  adapters?: Record<ReviewerId, ReviewAdapter>;
   agentsMd?: string;
   allowSensitive?: boolean;
   authorSummary?: string;
@@ -81,6 +122,13 @@ export interface ReviewModeOptions {
   // Review staged changes (`git diff --cached`) vs HEAD.
   staged?: boolean;
   workingTree?: boolean;
+  // The Anthropic seats the CALLER will run after this mode returns (`claude`, `gate`). They are
+  // part of the run's evidence INTENT — and therefore of `policyHash` — but this mode never spawns
+  // them, so it records their intent and the caller records what they realized.
+  peerSeats?: readonly EvidenceSeat[];
+  // The materialized worktree (spec §1). Absent ⇒ every seat reviews the packet, the receipt hashes
+  // under the legacy (v1) schema, and nothing about the packet path changes.
+  worktree?: WorktreeEvidence;
 }
 
 export interface ReviewModeResult {
@@ -93,6 +141,9 @@ export interface ReviewModeResult {
   // The local dependency-surface scan — present ONLY for the 'security' profile
   // (manifest changes + risky imports drawn from the diff; no network).
   depSurface?: DepSurfaceResult;
+  // The run's per-seat evidence identity for the CORE seats (intent, fact, and the sandbox profiles
+  // that fenced them). Present on every non-blocked run; all-`packet` in packet mode.
+  evidence?: ReviewEvidence;
   // The exact rendered prompt every core reviewer saw (byte-identical across reviewers) —
   // returned so the self-contained layer's cold Opus reviewer reviews the SAME pinned
   // packet, never a re-derived diff. Absent only on a secret-scan block (no packet built).
@@ -117,73 +168,22 @@ export interface ReviewModeResult {
 export const DEFAULT_OBJECTIVE =
   'Adversarial cross-vendor review of a code diff — find correctness, security, and convention issues a same-vendor author might miss.';
 
-// Run ONE reviewer over the prepared prompt + persist its per-reviewer artifact.
-// Mirrors the proven dashboard flow: a watchdog timeout/parse-failure marks the
-// reviewer failed-reviewer (a cut-off review is not trusted even if it partly
-// parsed); an incomplete packet skips the (separate-quota) call entirely.
-async function reviewOne(
-  out: string,
-  runId: string,
-  reviewer: ReviewerConfig,
-  prompt: string,
-  packetComplete: boolean,
-  packet: ReturnType<typeof assembleCodePacket>
-): Promise<StoredReview> {
-  if (!packetComplete) {
-    // No usable diff → the reviewer is NOT run, and this is recorded as a
-    // NON-completion (never 'reviewed'). buildDiffReceipt and isDiffReviewed both
-    // key "did this reviewer complete?" off terminalState === 'reviewed'; marking a
-    // skipped reviewer 'reviewed' would qualify a receipt for a change no reviewer
-    // ever saw (fail-OPEN). 'failed-reviewer' keeps a blind/empty packet fail-closed.
-    return persistReview(out, {
-      findings: [],
-      packet,
-      prompt,
-      raw: null,
-      reviewer,
-      runId,
-      summary: `Did not review with ${reviewer.id} — the diff could not be assembled (incomplete packet), so no trustworthy review ran. Surfaced for review.`,
-      terminalState: 'failed-reviewer',
-    });
+// Which sandbox each CORE seat qualifies for against THIS run's worktree (spec §2). Computed once,
+// before any seat spawns, so an unsafe read root or an unsupported platform is a legible pre-flight
+// fact rather than a discovery made after a 12-minute review.
+function qualifyCoreSeats(
+  reviewers: readonly ReviewerId[],
+  worktree: string,
+  configs: Record<ReviewerId, ReviewerConfig>
+): SeatQualifications {
+  const quals: SeatQualifications = {};
+  for (const id of reviewers) {
+    quals[id] =
+      id === 'codex'
+        ? qualifyCodexSeat(worktree)
+        : qualifyGrokSeat(configs[id].sandbox);
   }
-  // Isolate a per-reviewer failure (e.g. its CLI binary can't be resolved, which
-  // throws): record it as THIS reviewer's failed-reviewer instead of rejecting the
-  // whole Promise.all fan-out, so one missing or broken vendor can't take down the
-  // others' reviews.
-  const adapter = REVIEW_ADAPTERS[reviewer.id];
-  let result: Awaited<ReturnType<typeof adapter>>;
-  try {
-    result = await adapter(prompt, reviewer);
-  } catch (e) {
-    return persistReview(out, {
-      findings: [],
-      packet,
-      prompt,
-      raw: null,
-      reviewer,
-      runId,
-      summary: `The ${reviewer.id} reviewer could not run: ${(e as Error).message}`,
-      terminalState: 'failed-reviewer',
-    });
-  }
-  const parsed = result.raw ? parseFindings(result.raw) : null;
-  const terminalState: TerminalState =
-    parsed && !parsed.parseError && !result.timedOut
-      ? 'reviewed'
-      : 'failed-reviewer';
-  const summary = result.timedOut
-    ? 'The reviewer timed out before completing — its output is incomplete and not trusted.'
-    : parsed?.summary || 'The reviewer produced no parseable findings.';
-  return persistReview(out, {
-    findings: parsed?.findings ?? [],
-    packet,
-    prompt,
-    raw: result.raw,
-    reviewer,
-    runId,
-    summary,
-    terminalState,
-  });
+  return quals;
 }
 
 // The review MODE end-to-end: acquire the diff (+ identity + coverage + digest) →
@@ -313,27 +313,71 @@ export async function runReviewMode(
   // Load the reviewers config ONCE per run (a file read + JSON parse), then index
   // it per reviewer — not once per reviewer inside the fan-out.
   const resolved = loadReviewers(opts.reviewersFile);
-  const reviews = await Promise.all(
+  const configs = Object.fromEntries(
+    reviewers.map((id) => [
+      id,
+      { ...resolved[id], ...(opts.sandbox ? { sandbox: opts.sandbox } : {}) },
+    ])
+  ) as Record<ReviewerId, ReviewerConfig>;
+
+  // WORKTREE EVIDENCE MODE (spec §1–§2). The worktree's presence is the request; qualification
+  // decides, per seat, whether the request is granted. The worktree prompt is the pinned packet
+  // prompt PLUS the whole-project preamble — a packet seat never sees it.
+  const wt = opts.worktree;
+  const quals = wt ? qualifyCoreSeats(reviewers, wt.dir, configs) : {};
+  const worktreePrompt = wt
+    ? prompt + worktreePromptSuffix({ baseSha: wt.baseSha, headSha: wt.headSha, worktree: wt.dir })
+    : undefined;
+  if (wt) {
+    log(`Worktree evidence: ${wt.dir} (detached at ${wt.headSha.slice(0, 12)})`);
+  }
+
+  const adapters = opts.adapters ?? REVIEW_ADAPTERS;
+  const seatRuns = await Promise.all(
     reviewers.map(async (id) => {
-      const reviewer: ReviewerConfig = {
-        ...resolved[id],
-        ...(opts.sandbox ? { sandbox: opts.sandbox } : {}),
-      };
+      const reviewer = configs[id];
       log(`  · ${id} (${reviewer.vendor} · ${reviewer.model})…`);
-      const r = await reviewOne(
-        opts.out,
-        opts.runId,
+      const seat = await runCoreSeat({
+        adapter: adapters[id],
+        log,
+        out: opts.out,
+        packet,
+        packetComplete: packet.complete,
+        packetPrompt: prompt,
+        qualification: quals[id],
+        retryOnPacket: RETRIES_ON_PACKET[id],
         reviewer,
-        prompt,
-        packet.complete,
-        packet
-      );
+        runId: opts.runId,
+        ...(wt ? { worktree: wt.dir, worktreePrompt } : {}),
+      });
       log(
-        `  · ${id}: ${r.terminalState} — ${r.findings.length} finding(s)`
+        `  · ${id}: ${seat.review.terminalState} — ${seat.review.findings.length} finding(s) · evidence ${seat.realized}`
       );
-      return r;
+      return [id, seat] as const;
     })
   );
+  const reviews = seatRuns.map(([, seat]) => seat.review);
+
+  // The evidence identity (spec §8). INTENT covers every seat the caller asked for — including the
+  // Anthropic seats it will run itself — because `policyHash` binds intent and must not vary with a
+  // runtime fallback: "has this diff been reviewed at full quality?" has to be askable before the
+  // outcome is known. FACT is what the core seats realized; the caller folds in its own.
+  const intended = wt
+    ? intendedEvidenceFor([...reviewers, ...(opts.peerSeats ?? [])])
+    : {};
+  const sandboxProfiles = wt
+    ? sandboxProfilesFor({
+        ...quals,
+        ...Object.fromEntries((opts.peerSeats ?? []).map((s) => [s, qualifyHarnessSeat()])),
+      })
+    : {};
+  const realized: EvidenceMap = {};
+  const fallbacks: string[] = [];
+  for (const [id, seat] of seatRuns) {
+    realized[id] = seat.realized;
+    if (seat.fallbackReason) fallbacks.push(seat.fallbackReason);
+  }
+  const evidence: ReviewEvidence = { fallbacks, intended, realized, sandboxProfiles };
 
   // Build the content-tied receipt — only when every required reviewer completed
   // AND coverage has no omitted source file (else no receipt; the reason is
@@ -349,10 +393,17 @@ export async function runReviewMode(
     // a truncated payload must not qualify a receipt (the reviewer saw head+tail).
     diffTruncated: acquired.diff.length > PACKET_BUDGETS.diff,
     headSha: acquired.headSha,
+    // An all-packet run passes empty maps ⇒ a legacy (v1) receipt, byte-identical to what shipped
+    // before evidence identity existed. Any worktree seat ⇒ v2. The realized map here covers the
+    // CORE seats only; the caller stamps the Anthropic seats in before writing (realizedEvidence is
+    // never hashed, so folding it in afterwards cannot move the receipt key).
+    intendedEvidence: intended,
+    realizedEvidence: realized,
     repo: acquired.repoId,
     required: reviewers,
     reviews,
     runId: opts.runId,
+    sandboxProfiles,
   });
   if (built.ok && built.receipt) {
     // The core (codex/grok) QUALIFIES the receipt here, but writing is DEFERRED to the
@@ -362,8 +413,8 @@ export async function runReviewMode(
     // caller writes receiptCandidate once the roster is verified complete.
     const store = opts.receiptStore ?? defaultReceiptStore();
     log('Receipt qualified by the core — deferred to the full-roster gate.');
-    return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, depSurface, evidence, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
   }
   log(`No receipt — ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, prompt, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, evidence, prompt, receiptError: built.error, reviews, secretScan };
 }

@@ -275,6 +275,11 @@ function collapsed(summary: string, records: GateVerdictRecord[], reviewersRun: 
 }
 
 export interface SummaryBodyInput {
+  // The run's realized per-seat evidence, one line. A staged review whose seats fell back to the
+  // diff-only packet SAYS so in its own footer (spec §8) — the author reading it must never have to
+  // infer that a review claiming whole-project context saw less than the whole project. Absent in
+  // packet mode, where there is nothing new to state.
+  evidenceNote?: string;
   headSha: string;
   plan: StagePlan;
   reviewerIds: string[];
@@ -303,10 +308,11 @@ export function renderSummaryBody(input: SummaryBodyInput): string {
   }
   out.push(...collapsed(`${counts.quality} structural simplification opportunit${counts.quality === 1 ? 'y' : 'ies'} (verified)`, plan.quality, counts.reviewersRun));
   out.push(...collapsed(`${counts.unanchored} further verified finding(s)`, plan.unanchored, counts.reviewersRun));
+  const evidence = input.evidenceNote ? ` ${defuseUntrusted(input.evidenceNote)}.` : '';
   out.push(
     '',
     '---',
-    `<sub>Cross-vendor AI review by [ensemble-ai](https://github.com/oskarleonard/ensemble-ai) — ${reviewerIds.join(' · ')}. Every finding above was gate-verified against the diff at \`${headSha}\`; claims the gate could not ground were dropped, not posted. Deduped across reviewers, so one issue is one comment.</sub>`
+    `<sub>Cross-vendor AI review by [ensemble-ai](https://github.com/oskarleonard/ensemble-ai) — ${reviewerIds.join(' · ')}. Every finding above was gate-verified against the diff at \`${headSha}\`; claims the gate could not ground were dropped, not posted. Deduped across reviewers, so one issue is one comment.${evidence}</sub>`
   );
   return out.join('\n');
 }

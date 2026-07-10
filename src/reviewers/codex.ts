@@ -4,6 +4,14 @@ import path from 'node:path';
 import { resolveCodexBin, runReviewerExec } from '../core/spawn';
 import type { ReviewerConfig } from '../core/types';
 
+import {
+  buildCodexWorktreeArgs,
+  codexSandboxSupported,
+  defaultCodexSandboxPaths,
+  wrapWithSandbox,
+  writeCodexSandboxProfile,
+} from './codex-sandbox';
+
 // A code review at xhigh reasoning is far slower than a chat turn — give the
 // reviewer real time, but ALWAYS under a watchdog. The lived 40-min 0%-CPU wedge
 // on open stdin proved the timeout is mandatory, not optional.
@@ -59,6 +67,79 @@ export interface RunReviewOpts {
   worktree?: string;
 }
 
+function reviewOutFile(): string {
+  return path.join(
+    os.tmpdir(),
+    `codex-review-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
+  );
+}
+
+// WORKTREE EVIDENCE (§2) — codex under the ensemble-OWNED external Seatbelt wrapper: its INTERNAL
+// sandbox is off (nested Seatbelt does not compose) and the EXTERNAL profile is the boundary, with
+// the worktree as cwd so codex's file tools reach the project.
+//
+// FAIL CLOSED, never silently: an unsupported platform or a profile that refuses to build (an
+// unsafe read root — see renderCodexSandboxProfile) RESOLVES to `ok:false` with a named reason,
+// which the orchestrator turns into a LOUD per-seat packet fallback. It never resolves `ok:true`
+// while reviewing anything other than the worktree — a receipt recording `worktree` evidence codex
+// never had is precisely the silent downgrade the realized-evidence map exists to make impossible.
+//
+// The VIABILITY CHECK (§9 grok-f2) is this call itself: it exercises the real subprocess/pty
+// spawn with the real review prompt under the real profile, not a `--version` smoke. If codex
+// cannot function inside the wrapper, this run produces no reply and the caller falls back.
+function runCodexWorktreeReview(
+  prompt: string,
+  config: ReviewerConfig,
+  worktree: string,
+  opts: RunReviewOpts
+): Promise<CodexReviewResult> {
+  if (!codexSandboxSupported()) {
+    return Promise.resolve({
+      ok: false,
+      raw: null,
+      stderrTail: `ensemble-ai: the codex seat cannot take the worktree on ${process.platform} — its sandbox-exec wrapper is macOS-only, and codex's own \`-s read-only\` restricts writes, not reads.`,
+      timedOut: false,
+    });
+  }
+  let profile: ReturnType<typeof writeCodexSandboxProfile>;
+  try {
+    profile = writeCodexSandboxProfile(defaultCodexSandboxPaths(worktree));
+  } catch (e) {
+    return Promise.resolve({
+      ok: false,
+      raw: null,
+      stderrTail: `ensemble-ai: ${(e as Error).message}`,
+      timedOut: false,
+    });
+  }
+  const outFile = reviewOutFile();
+  const wrapped = wrapWithSandbox(
+    profile.file,
+    resolveCodexBin(),
+    buildCodexWorktreeArgs(config, outFile, prompt)
+  );
+  // The profile file outlives the spawn only as long as sandbox-exec reads it; the owner-only temp
+  // dir is ours to reap. `finally` on the promise (not the caller) because the dir name is random —
+  // a leaked one is unfindable. A synchronous throw from runReviewerExec is caught too.
+  try {
+    return runReviewerExec({
+      args: wrapped.args,
+      bin: wrapped.bin,
+      // The seat BORROWS the worktree (one per run, shared by every seat). It never reaps it.
+      cwd: worktree,
+      onSpawn: opts.onSpawn,
+      outFile,
+      stderrLimit: 2000,
+      timeoutMs: opts.timeoutMs ?? REVIEW_TIMEOUT_MS,
+    })
+      .then(({ raw, stderrTail, timedOut }) => ({ ok: raw !== null, raw, stderrTail, timedOut }))
+      .finally(profile.cleanup);
+  } catch (e) {
+    profile.cleanup();
+    throw e;
+  }
+}
+
 // Invoke the reviewer (Codex) READ-ONLY with the embedded packet prompt, over the
 // shared runReviewerExec spawn contract (group-aware watchdog, settle-on-`exit`,
 // an absolute backstop — so a wedged rmcp grandchild can never hang the request;
@@ -70,31 +151,9 @@ export function runCodexReview(
   config: ReviewerConfig,
   opts: RunReviewOpts = {}
 ): Promise<CodexReviewResult> {
-  // FAIL CLOSED, never silently. `worktree` lives on the shared opts, but this seat cannot yet
-  // honor it: codex needs its external sandbox-exec wrapper (codex-sandbox.ts) wired in first,
-  // and codex's own `-s read-only` restricts writes, not reads. Accepting-and-ignoring the option
-  // would let a caller believe codex saw the worktree while it reviewed from the packet — and a
-  // receipt could then record `worktree` evidence codex never had. That silent downgrade is the
-  // precise failure the realized-evidence map exists to make impossible, so refuse it.
-  //
-  // RESOLVE, never reject: every reviewer path settles to a CodexReviewResult, and the
-  // orchestrator turns `ok: false` into a clean failed-seat entry (which cannot qualify a
-  // receipt). Throwing here would instead surface as an unhandled rejection in any adapter caller
-  // that does not catch — a crash where the contract asks for a recorded failure.
-  if (opts.worktree) {
-    return Promise.resolve({
-      ok: false,
-      raw: null,
-      stderrTail:
-        'ensemble-ai: the codex seat cannot run against a worktree yet (its sandbox-exec wrapper is not wired). Refusing rather than reviewing the packet while reporting worktree evidence.',
-      timedOut: false,
-    });
-  }
+  if (opts.worktree) return runCodexWorktreeReview(prompt, config, opts.worktree, opts);
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  const outFile = path.join(
-    os.tmpdir(),
-    `codex-review-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
-  );
+  const outFile = reviewOutFile();
   return runReviewerExec({
     bin: resolveCodexBin(),
     args: buildCodexReviewArgs(config, outFile, prompt),

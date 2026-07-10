@@ -1,9 +1,12 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { buildCodexReviewArgs, runCodexReview } from './codex';
+import { codexSandboxSupported } from './codex-sandbox';
 import type { ReviewerConfig } from '../core/types';
 
 const CONFIG: ReviewerConfig = {
@@ -35,14 +38,14 @@ type FakeChild = EventEmitter & {
 let child: FakeChild | null = null;
 let lastArgs: string[] = [];
 let lastStdio: unknown[] = [];
-let lastOpts: { detached?: boolean; stdio: unknown[] } = { stdio: [] };
+let lastOpts: { cwd?: string; detached?: boolean; stdio: unknown[] } = { stdio: [] };
 
 beforeEach(() => {
   child = null;
   vi.mocked(spawn).mockImplementation(((
     _bin: string,
     args: string[],
-    opts: { detached?: boolean; stdio: unknown[] }
+    opts: { cwd?: string; detached?: boolean; stdio: unknown[] }
   ) => {
     const c = new EventEmitter() as FakeChild;
     c.kills = [];
@@ -134,27 +137,47 @@ describe('runCodexReview', () => {
   });
 });
 
-// The shared RunReviewOpts carries `worktree`, but codex cannot honor it until its external
-// sandbox-exec wrapper is wired. Accepting-and-ignoring it would let a receipt attest worktree
-// evidence codex never had — the exact silent downgrade the realized-evidence map exists to
-// prevent. It must fail CLOSED, and it must RESOLVE (every reviewer path settles to a result;
-// throwing would surface as an unhandled rejection in an adapter caller that does not catch).
-describe('runCodexReview — worktree evidence is refused, not silently downgraded', () => {
-  it('returns a failed seat without spawning codex', async () => {
+// WORKTREE EVIDENCE (§2): codex takes the worktree ONLY inside the ensemble-owned external
+// Seatbelt wrapper — `sandbox-exec -f <profile> codex exec … --dangerously-bypass-approvals-and-
+// sandbox`, cwd = the worktree. Anything that would make it review the packet while a receipt
+// attests worktree evidence must fail CLOSED, and it must RESOLVE (every reviewer path settles to
+// a result; throwing would surface as an unhandled rejection in an adapter caller that does not
+// catch).
+describe('runCodexReview — worktree evidence runs under the external sandbox wrapper', () => {
+  const realWorktree = (): string => fs.mkdtempSync(path.join(os.tmpdir(), 'codex-wt-'));
+
+  it('wraps codex in sandbox-exec, disables its internal sandbox, and cds into the worktree', async () => {
+    if (!codexSandboxSupported()) return; // Seatbelt is macOS-only; the fallback is asserted below
+    const wt = realWorktree();
     const spawned = vi.mocked(spawn);
     spawned.mockClear();
-    const result = await runCodexReview('p', CONFIG, { worktree: '/private/tmp/wt' });
+    void runCodexReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt });
+
+    expect(spawned).toHaveBeenCalled();
+    const [bin, args] = spawned.mock.calls[0] as unknown as [string, string[]];
+    expect(bin).toBe('/usr/bin/sandbox-exec');
+    expect(args[0]).toBe('-f');
+    expect(fs.readFileSync(args[1], 'utf8')).toContain('(deny default)');
+    expect(args[2]).toBe('codex'); // the wrapped binary, from resolveCodexBin
+    // The INTERNAL sandbox is off (nested Seatbelt does not compose) — the external profile governs.
+    expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(args).not.toContain('read-only');
+    // cwd = the worktree, so codex's file tools reach the project. Seatbelt matches resolved paths.
+    expect(fs.realpathSync(String(lastOpts.cwd))).toBe(fs.realpathSync(wt));
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  it('fails CLOSED (never spawns, never rejects) when the profile cannot be built', async () => {
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    // A worktree path that does not exist: the profile's realpath resolution throws, so no naked
+    // codex is ever spawned against a tree it would read unfenced.
+    const result = await runCodexReview('p', CONFIG, { worktree: '/private/tmp/does-not-exist-wt' });
     expect(result.ok).toBe(false);
     expect(result.raw).toBeNull();
     expect(result.timedOut).toBe(false);
-    expect(result.stderrTail).toMatch(/cannot run against a worktree yet/);
+    expect(result.stderrTail).toMatch(/^ensemble-ai:/);
     expect(spawned).not.toHaveBeenCalled();
-  });
-
-  it('resolves rather than rejects', async () => {
-    await expect(
-      runCodexReview('p', CONFIG, { worktree: '/private/tmp/wt' })
-    ).resolves.toMatchObject({ ok: false });
   });
 
   it('the packet path is untouched when no worktree is requested', async () => {
@@ -162,5 +185,8 @@ describe('runCodexReview — worktree evidence is refused, not silently downgrad
     spawned.mockClear();
     void runCodexReview('p', CONFIG, {});
     expect(spawned).toHaveBeenCalled();
+    const [bin, args] = spawned.mock.calls[0] as unknown as [string, string[]];
+    expect(bin).toBe('codex');
+    expect(args).toContain('read-only'); // codex's own `-s read-only`, as before
   });
 });

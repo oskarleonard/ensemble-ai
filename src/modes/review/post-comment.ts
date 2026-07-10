@@ -61,6 +61,9 @@ export interface CommentReceipt {
 
 export interface RenderCommentInput {
   claudeLayer: ClaudeLayerResult | null;
+  // The run's realized per-seat evidence, one line (spec §8: any fallback surfaces in the receipt
+  // AND the posted footer, never silently). Null/absent in packet mode — nothing new to state.
+  evidenceNote?: string | null;
   gateSeat: CommentGateSeat | null;
   headSha: string;
   headline: string;
@@ -262,9 +265,10 @@ export function renderReviewComment(input: RenderCommentInput): string {
     ? `gate seat anthropic/${md(seat.model)} @ ${md(seat.effort)} (model: ${seat.modelSource}, effort: ${seat.effortSource})`
     : 'gate seat n/a (no gate ran)';
   const completed = receipt.completed.length ? ` · completed: ${receipt.completed.map(md).join(', ')}` : '';
+  const evidence = input.evidenceNote ? ` · ${md(input.evidenceNote)}` : '';
   out.push('', '---');
   out.push(
-    `<sub>trail \`${code(input.trailDir)}\` · ${receiptLine}${completed} · ${seatLine} · posted by \`ensemble-ai\`</sub>`
+    `<sub>trail \`${code(input.trailDir)}\` · ${receiptLine}${completed}${evidence} · ${seatLine} · posted by \`ensemble-ai\`</sub>`
   );
   return out.join('\n');
 }

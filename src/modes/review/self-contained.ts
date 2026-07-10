@@ -21,6 +21,7 @@ import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { runClaudeReviewVoice } from './claude';
+import { renderCodeReviewSeatPrompt } from './code-review-seat';
 import {
   type GateVerdictRecord,
   renderGateVerdicts,
@@ -157,11 +158,14 @@ async function runClaudeReviewer(
   config: VoiceConfig,
   run: ClaudeRunner,
   timeoutMs: number | undefined,
-  log: (m: string) => void
+  log: (m: string) => void,
+  // The worktree, when this run has one — the spawn cwd is what makes this a worktree seat (its
+  // file/git tools reach the project there). Absent ⇒ the throwaway tmpdir, as before.
+  worktree?: string
 ): Promise<{ review: VoiceReview; raw: string | null }> {
   let res: VoiceRunResult;
   try {
-    res = await run(reviewPrompt, config, { timeoutMs });
+    res = await run(reviewPrompt, config, { timeoutMs, ...(worktree ? { worktree } : {}) });
   } catch (e) {
     log(`  · claude: failed to run — ${(e as Error).message}`);
     return {
@@ -195,6 +199,11 @@ async function runClaudeReviewer(
 
 export interface ClaudeLayerOptions {
   baseDir: string;
+  // The base SHA the PR diverged from. With a worktree it turns the `claude` seat into THE ONE
+  // CLAUDE PRODUCER (spec §3): the built-in `/code-review` methodology over the whole project,
+  // told the exact range under review. Absent ⇒ the seat reviews the pinned packet prompt (it
+  // still reads the tree, it is just not told the range).
+  baseSha?: string | null;
   claudeConfig: VoiceConfig;
   // The run's gathered conventions files (repo-relative). The ONLY docs a holistic finding may
   // cite to lift its MED severity cap — and the gate re-reads the citation out of the tree anyway.
@@ -266,15 +275,33 @@ export async function runClaudeReviewLayer(
   const run: ClaudeRunner = opts.run ?? runClaudeReviewVoice;
   const modelLabel = claudeModelLabel(opts.claudeConfig);
 
+  // THE ONE CLAUDE PRODUCER (spec §3). With worktree evidence the seat runs the built-in
+  // `/code-review` methodology over the whole project at `headSha`; without it, the cold peer
+  // reviewer on the pinned packet, exactly as before. The spawn cwd — not a flag — is what grants
+  // the whole-project read, so a worktree with no resolved base SHA still reads the tree.
+  const producerPrompt =
+    opts.worktree && opts.baseSha
+      ? renderCodeReviewSeatPrompt({
+          baseSha: opts.baseSha,
+          headSha: opts.expectedHeadSha,
+          worktree: opts.worktree,
+        })
+      : opts.reviewPrompt;
+
   let claudeReview: VoiceReview | null = null;
   if (opts.includeClaudeReviewer) {
-    log(`  · claude (anthropic/${modelLabel}) reviewing the diff (cold)…`);
+    log(
+      opts.worktree
+        ? `  · claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (/code-review)…`
+        : `  · claude (anthropic/${modelLabel}) reviewing the diff (cold)…`
+    );
     const { review, raw } = await runClaudeReviewer(
-      opts.reviewPrompt,
+      producerPrompt,
       opts.claudeConfig,
       run,
       opts.timeoutMs,
-      log
+      log,
+      opts.worktree
     );
     claudeReview = review;
     // The trail persist must SUCCEED for the claude voice to count as a complete reviewer:
