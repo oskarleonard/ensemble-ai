@@ -1,5 +1,9 @@
 import { HISTORY_PACKET_CLAUSE } from './history-packet';
-import { UNTRUSTED_INSTRUCTIONS_CLAUSE } from './worktree';
+import {
+  materializedDiffClause,
+  readOnlyWorktreeClause,
+  UNTRUSTED_INSTRUCTIONS_CLAUSE,
+} from './worktree';
 
 // THE ONE CLAUDE PRODUCER (spec §3) — the worktree-mode Claude seat, running the built-in
 // /code-review methodology over the whole project at headSha.
@@ -57,17 +61,10 @@ export function renderCodeReviewSeatPrompt(args: CodeReviewSeatPromptArgs): stri
 You are reviewing someone else's pull request, read-only. You may not edit, stage, or push anything.
 You have NO shell and NO network: there is no Bash tool, so do not try to run \`git\` or any command.
 
-The full project at the PR head is checked out READ-ONLY at ${args.worktree} (detached at
-${args.headSha}). It is NOT your working directory — reach every file by ABSOLUTE path under that
-directory, with Read, Grep, and Glob. Read any file there for whole-project context: a finding may
+${readOnlyWorktreeClause({ headSha: args.headSha, reach: 'reach every file', worktree: args.worktree })} Read any file there for whole-project context: a finding may
 cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from).
 
-The change under review is exactly \`git diff ${args.baseSha}...${args.headSha}\`, already
-materialized for you:
-
-\`\`\`diff
-${args.diff}
-\`\`\`
+${materializedDiffClause(args)}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}
 

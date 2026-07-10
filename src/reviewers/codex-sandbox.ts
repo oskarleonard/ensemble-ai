@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { makeOwnerOnlyTempDir } from '../core/artifacts';
 import type { SandboxProfileRef } from '../modes/review/evidence';
 
 // THE CODEX WRAPPER PROFILE — an ensemble-OWNED external sandbox that gives the codex seat the
@@ -217,8 +218,7 @@ export function writeCodexSandboxProfile(paths: CodexSandboxPaths): {
 } {
   // Render FIRST: an unsafe read root must throw before we create anything to clean up.
   const profile = renderCodexSandboxProfile(paths);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-sb-'));
-  fs.chmodSync(dir, 0o700);
+  const dir = makeOwnerOnlyTempDir('ensemble-sb-');
   const file = path.join(dir, 'ensemble-review-codex.sb');
   fs.writeFileSync(file, profile, { mode: 0o600 });
   fs.chmodSync(file, 0o600);

@@ -10,7 +10,11 @@ import type { VoiceRunResult } from '../brainstorm/voices';
 import { CLAUDE_EFFORTS } from './claude';
 import { HISTORY_PACKET_CLAUSE, historyPacketHasData, type HistoryPacket } from './history-packet';
 import type { VoiceReview } from './synthesis';
-import { UNTRUSTED_INSTRUCTIONS_CLAUSE } from './worktree';
+import {
+  materializedDiffClause,
+  readOnlyWorktreeClause,
+  UNTRUSTED_INSTRUCTIONS_CLAUSE,
+} from './worktree';
 
 // THE HOLISTIC / ARCHITECTURE LENS (spec §4) — a SEAT in the registry, not a parallel pipeline
 // and not a bespoke flag. It reads the WHOLE project at `headSha` and generates findings the
@@ -166,16 +170,9 @@ export function renderHolisticPrompt(args: HolisticPromptArgs): string {
 else's pull request. Read-only: you may not edit, stage, or push anything. You have NO shell and NO
 network: there is no Bash tool, so do not try to run \`git\` or any command.
 
-The full project at the PR head is checked out READ-ONLY at ${args.worktree} (detached at
-${args.headSha}). It is NOT your working directory — search and read it by ABSOLUTE path under that
-directory, with Read, Grep, and Glob.
+${readOnlyWorktreeClause({ headSha: args.headSha, reach: 'search and read it', worktree: args.worktree })}
 
-The change under review is exactly \`git diff ${args.baseSha}...${args.headSha}\`, already
-materialized for you:
-
-\`\`\`diff
-${args.diff}
-\`\`\`
+${materializedDiffClause(args)}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}
 

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { makeOwnerOnlyTempDir } from '../core/artifacts';
 import type { HistoryPacketFile } from '../modes/review/history-packet';
 import { type EgressDenial, type EgressProxy, proxyEnv } from '../core/egress-proxy';
 import { resolveCodexBin, runReviewerExec } from '../core/spawn';
@@ -109,8 +110,7 @@ function reviewOutFile(): string {
 // cannot drift apart. No profile RULE changes, so `CODEX_SANDBOX_PROFILE.version` — and every
 // receipt whose policyHash binds it — is untouched.
 function worktreeReplyFile(): { cleanup: () => void; file: string } {
-  const dir = fs.mkdtempSync(path.join(SANDBOX_WRITABLE_TMP, 'ensemble-codex-'));
-  fs.chmodSync(dir, 0o700);
+  const dir = makeOwnerOnlyTempDir('ensemble-codex-', SANDBOX_WRITABLE_TMP);
   return {
     cleanup: () => {
       try {

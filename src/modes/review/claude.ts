@@ -5,7 +5,7 @@ import path from 'node:path';
 import { resolveClaudeBin } from '../brainstorm/claude';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
-import { escapesRoot } from '../../core/artifacts';
+import { escapesRoot, makeOwnerOnlyTempDir } from '../../core/artifacts';
 import { runReviewerExec } from '../../core/spawn';
 import { type RunReviewOpts, REVIEW_TIMEOUT_MS } from '../../reviewers/codex';
 
@@ -153,9 +153,7 @@ export function buildClaudeReviewArgs(
 // The seat's cwd: an engine-owned, owner-only, EMPTY directory. Never the worktree, never a shared
 // temp root — a `CLAUDE.md` sitting in either would be loaded and obeyed as instructions.
 export function makeNeutralSeatCwd(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-seat-cwd-'));
-  fs.chmodSync(dir, 0o700);
-  return dir;
+  return makeOwnerOnlyTempDir('ensemble-seat-cwd-');
 }
 
 // Invoke Claude headless over the review/synthesis prompt via the shared group-kill

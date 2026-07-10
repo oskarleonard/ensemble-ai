@@ -65,7 +65,13 @@ import {
   type DiffMode,
   omittedLine,
 } from './modes/review/diff';
-import type { EvidenceMap, EvidenceSeat } from './modes/review/evidence';
+import {
+  type EvidenceClass,
+  type EvidenceMap,
+  type EvidenceSeat,
+  HARNESS_SEATS,
+  type HarnessSeat,
+} from './modes/review/evidence';
 import {
   buildEvidenceManifest,
   writeEvidenceManifest,
@@ -1095,7 +1101,7 @@ async function reviewCommand(
   // Both come from the compare API, which only a full PR URL reaches. Refuse UPFRONT otherwise,
   // rather than reviewing the packet while the caller believes they asked for whole-project
   // evidence — the exact silent downgrade the realized-evidence map exists to prevent.
-  const repoFlag = typeof values.repo === 'string' ? String(values.repo) : null;
+  const repoFlag = typeof values.repo === 'string' ? values.repo : null;
   if (repoFlag && !(source.postTarget?.repoSlug && source.headShaOverride && source.prBaseSha)) {
     console.error(
       `ensemble-ai ${cmd}: --repo (worktree evidence mode) needs a PR bound to a commit — ` +
@@ -1227,7 +1233,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // the `gate`. They are part of the run's evidence INTENT — the gate is an evidence-bearing actor
   // (pin 1), not a neutral judge — so runReviewMode hashes them into the receipt's policy identity
   // even though it never spawns them. `--no-claude` runs neither.
-  const peerSeats: EvidenceSeat[] = roster.claude ? ['claude', 'gate'] : [];
+  const peerSeats: EvidenceSeat[] = roster.claude ? [...HARNESS_SEATS] : [];
 
   let result: ReviewModeResult;
   try {
@@ -1347,6 +1353,10 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       }
     }
 
+    // The PR's base SHA when the compare API bound it (a URL PR), else the local diff's. It is
+    // the range the worktree seats + the lens are told the change spans — never a receipt field.
+    const layerBaseSha = source.prBaseSha ?? result.acquired.baseSha;
+
     // The layer's own writes/spawn are best-effort internally, but a residual throw (an
     // unexpected FS/spawn error) must DEGRADE the Opus layer, not crash the whole review
     // after the codex/grok core already completed. Catch it here as a backstop; the
@@ -1354,9 +1364,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
     try {
       claudeLayer = await runClaudeReviewLayer({
         baseDir: out,
-        // The PR's base SHA when the compare API bound it (a URL PR), else the local diff's. It is
-        // the range the worktree seats + the lens are told the change spans — never a receipt field.
-        baseSha: source.prBaseSha ?? result.acquired.baseSha,
+        baseSha: layerBaseSha,
         claudeConfig: voiceConfigs.claude,
         // The conventions this run actually gathered — the docs a holistic finding may cite to
         // lift its MED severity cap (the gate re-reads the citation out of the tree regardless).
@@ -1373,7 +1381,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         ...(values.holistic
           ? {
               holistic: {
-                baseSha: source.prBaseSha ?? result.acquired.baseSha,
+                baseSha: layerBaseSha,
                 config: loadHolisticSeat(VOICES_FILE, (m) => console.error(`· ${m}`)),
               },
             }
@@ -1435,14 +1443,18 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // read NOTHING, so it must not be attested `worktree` — that is an evidence claim the posted
   // footer and the evidence manifest would then carry for a seat that never opened the tree. A seat
   // that DID spawn and then timed out or replied unusably could read the tree, so it is honest.
+  // Typed `Record<HarnessSeat, …>`, so a harness seat added to HARNESS_SEATS stops compiling here
+  // rather than silently vanishing from the footer, the manifest, and the receipt.
+  const harnessRealized: Record<HarnessSeat, EvidenceClass> | null =
+    worktree && claudeLayer
+      ? {
+          claude: claudeLayer.claudeSpawned ? 'worktree' : 'packet',
+          gate: claudeLayer.gateSpawned ? 'worktree' : 'packet',
+        }
+      : null;
   const realizedEvidence: EvidenceMap = {
     ...(result.evidence?.realized ?? {}),
-    ...(worktree && claudeLayer
-      ? {
-          claude: claudeLayer.claudeSpawned ? ('worktree' as const) : ('packet' as const),
-          gate: claudeLayer.gateSpawned ? ('worktree' as const) : ('packet' as const),
-        }
-      : {}),
+    ...(harnessRealized ?? {}),
   };
   // LOUD (§2, §9 grok-f2): every fallback was already printed as it happened; restate them
   // together so a reader of the summary cannot miss that this run reviewed less than it asked to.
