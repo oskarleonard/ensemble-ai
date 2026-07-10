@@ -332,10 +332,20 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
   // The runner the CLI itself injects — so this drives the exact exec seam production uses,
   // not a lookalike (which would leave `execGit`'s own env hardening unexercised).
   const realGit = execGit();
-  // -c flags keep the test hermetic on any machine: no gpg signing, no identity prompt.
+  // -c flags keep the FIXTURE SETUP hermetic on any machine, whatever the developer's global git
+  // config says: no identity prompt, no gpg signing, no `core.hooksPath` pre-commit hook (which
+  // would fail the setup commit), and no `core.excludesFile` — a global `*.md` ignore would make
+  // `git add .` silently skip CLAUDE.md and quietly gut the instruction-strip assertions below.
   const g = (cwd: string, ...args: string[]) => {
     const r = realGit(
-      ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', ...args],
+      [
+        '-c', 'user.email=t@t',
+        '-c', 'user.name=t',
+        '-c', 'commit.gpgsign=false',
+        '-c', 'core.hooksPath=/dev/null',
+        '-c', 'core.excludesFile=/dev/null',
+        ...args,
+      ],
       { cwd }
     );
     if (!r.ok) throw new Error(`git ${args.join(' ')} failed: ${r.error}`);
