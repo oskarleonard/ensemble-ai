@@ -201,9 +201,16 @@ describe('runCodexReview — worktree evidence runs under the external sandbox w
 
     const [, args] = await spawnedWorktree(spawned);
     const profile = fs.readFileSync(args[1], 'utf8');
-    // Exactly one outbound rule, naming exactly one loopback port. No `*:443`, no `*:53`.
-    const outbound = /\(allow network-outbound \(remote ip "localhost:(\d+)"\) \(remote unix-socket\)\)/.exec(profile);
+    // Exactly one loopback egress port, and the ONE unix socket is PATH-SCOPED to mDNSResponder —
+    // never a blanket `(remote unix-socket)` grant, which was an off-proxy exfil channel (codex-f1).
+    const outbound =
+      /\(allow network-outbound \(remote ip "localhost:(\d+)"\) \(remote unix-socket \(path-literal "\/private\/var\/run\/mDNSResponder"\)\)\)/.exec(
+        profile
+      );
     expect(outbound).not.toBeNull();
+    // The blanket grant must be gone: a bare `(remote unix-socket)` with no path predicate lets the
+    // seat reach any local agent socket.
+    expect(profile).not.toMatch(/\(remote unix-socket\)/);
     expect(profile).not.toContain('*:443');
     expect(profile).not.toContain('*:53');
     const port = Number(outbound?.[1]);

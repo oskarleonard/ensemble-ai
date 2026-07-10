@@ -60,7 +60,14 @@ import type { SandboxProfileRef } from '../modes/review/evidence';
 // exactly what a distinct id gives us.
 export const CODEX_SANDBOX_PROFILE: SandboxProfileRef = {
   id: 'ensemble-review-codex+egress-proxy',
-  version: 1,
+  // v2 (cross-vendor codex-f1): the network-outbound rule granted `(remote unix-socket)` for ANY
+  // socket — a hole the CONNECT proxy never saw. A prompt-injected seat could reach a local agent
+  // socket (an ssh-agent, a Docker-style API) under a readable root and exfiltrate off-proxy, while
+  // `egress-denials.json` stayed empty and the receipt still claimed host-fenced egress. Verified
+  // live 2026-07-10: under the old rule a sandboxed process wrote to an arbitrary unix socket; under
+  // the narrowed rule that write is EPERM while DNS still resolves. A weaker fence must never verify
+  // as equivalent to this one, so the version bumps.
+  version: 2,
 };
 
 // The ONE directory a sandboxed codex seat may write to that is neither its own config nor /dev:
@@ -70,6 +77,14 @@ export const CODEX_SANDBOX_PROFILE: SandboxProfileRef = {
 // EPERM after a completed review. Two modules naming the same literal is how that regression gets
 // reintroduced, so the profile owns the constant and codex.ts imports it.
 export const SANDBOX_WRITABLE_TMP = '/private/tmp';
+
+// The ONE unix-domain socket the seat may open: macOS routes `getaddrinfo` to mDNSResponder over
+// this socket, so the seat cannot resolve its vendor host without it (verified 2026-07-10: with the
+// socket denied, `dns.lookup` returns ENOTFOUND). A BLANKET `(remote unix-socket)` grant would also
+// hand the seat every other local agent socket — an off-proxy exfil channel (codex-f1) — so the
+// grant is path-scoped to exactly this. SBPL `path-literal` matches the RESOLVED path, so it is the
+// `/private/var` form, not the `/var` symlink (the `/var` spelling was verified NOT to match).
+export const MDNS_RESPONDER_SOCKET = '/private/var/run/mDNSResponder';
 
 // Read-allowed system roots. Deny-by-default means everything absent from this list — every
 // credential in $HOME, every other repo on disk — is kernel-unreadable to the seat.
@@ -153,9 +168,10 @@ export function renderCodexSandboxProfile(p: CodexSandboxPaths): string {
 ;;   · /private/var is readable and contains the per-user $TMPDIR, so a secret another process
 ;;     parked in its own temp dir IS readable here. The claim is "no credential in $HOME".
 ;;   · outbound network is DENIED except the one loopback port below — the engine's egress proxy,
-;;     which allows CONNECT only to this vendor's host allowlist. Direct :443 and :53 (the old
-;;     DNS-exfiltration channel) are gone. The seat still sends its own credential to the ALLOWED
-;;     vendor host, and hostname resolution still works via mDNSResponder — neither is closable here.
+;;     which allows CONNECT only to this vendor's host allowlist — plus the single mDNSResponder unix
+;;     socket getaddrinfo needs (path-scoped, NOT a blanket unix-socket grant: codex-f1). Direct :443
+;;     and :53 (the old DNS-exfiltration channel) are gone. The seat still sends its own credential
+;;     to the ALLOWED vendor host, and hostname resolution still works — neither closable here.
 (deny default)
 (import "/System/Library/Sandbox/Profiles/bsd.sb")
 (allow process-fork)
@@ -175,7 +191,7 @@ export function renderCodexSandboxProfile(p: CodexSandboxPaths): string {
 (allow file-read* (subpath ${JSON.stringify(p.worktree)}))
 (allow file-read* (subpath ${JSON.stringify(p.codexHome)}))
 (allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath ${JSON.stringify(SANDBOX_WRITABLE_TMP)}) (subpath "/dev"))
-(allow network-outbound (remote ip "localhost:${p.proxyPort}") (remote unix-socket))
+(allow network-outbound (remote ip "localhost:${p.proxyPort}") (remote unix-socket (path-literal ${JSON.stringify(MDNS_RESPONDER_SOCKET)})))
 (allow network-inbound (local ip "*:*"))
 `;
 }

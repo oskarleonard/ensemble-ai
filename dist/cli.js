@@ -1045,9 +1045,17 @@ import os4 from "os";
 import path4 from "path";
 var CODEX_SANDBOX_PROFILE = {
   id: "ensemble-review-codex+egress-proxy",
-  version: 1
+  // v2 (cross-vendor codex-f1): the network-outbound rule granted `(remote unix-socket)` for ANY
+  // socket — a hole the CONNECT proxy never saw. A prompt-injected seat could reach a local agent
+  // socket (an ssh-agent, a Docker-style API) under a readable root and exfiltrate off-proxy, while
+  // `egress-denials.json` stayed empty and the receipt still claimed host-fenced egress. Verified
+  // live 2026-07-10: under the old rule a sandboxed process wrote to an arbitrary unix socket; under
+  // the narrowed rule that write is EPERM while DNS still resolves. A weaker fence must never verify
+  // as equivalent to this one, so the version bumps.
+  version: 2
 };
 var SANDBOX_WRITABLE_TMP = "/private/tmp";
+var MDNS_RESPONDER_SOCKET = "/private/var/run/mDNSResponder";
 var SYSTEM_READ_ROOTS = [
   "/usr",
   "/bin",
@@ -1096,9 +1104,10 @@ function renderCodexSandboxProfile(p) {
 ;;   \xB7 /private/var is readable and contains the per-user $TMPDIR, so a secret another process
 ;;     parked in its own temp dir IS readable here. The claim is "no credential in $HOME".
 ;;   \xB7 outbound network is DENIED except the one loopback port below \u2014 the engine's egress proxy,
-;;     which allows CONNECT only to this vendor's host allowlist. Direct :443 and :53 (the old
-;;     DNS-exfiltration channel) are gone. The seat still sends its own credential to the ALLOWED
-;;     vendor host, and hostname resolution still works via mDNSResponder \u2014 neither is closable here.
+;;     which allows CONNECT only to this vendor's host allowlist \u2014 plus the single mDNSResponder unix
+;;     socket getaddrinfo needs (path-scoped, NOT a blanket unix-socket grant: codex-f1). Direct :443
+;;     and :53 (the old DNS-exfiltration channel) are gone. The seat still sends its own credential
+;;     to the ALLOWED vendor host, and hostname resolution still works \u2014 neither closable here.
 (deny default)
 (import "/System/Library/Sandbox/Profiles/bsd.sb")
 (allow process-fork)
@@ -1118,7 +1127,7 @@ function renderCodexSandboxProfile(p) {
 (allow file-read* (subpath ${JSON.stringify(p.worktree)}))
 (allow file-read* (subpath ${JSON.stringify(p.codexHome)}))
 (allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath ${JSON.stringify(SANDBOX_WRITABLE_TMP)}) (subpath "/dev"))
-(allow network-outbound (remote ip "localhost:${p.proxyPort}") (remote unix-socket))
+(allow network-outbound (remote ip "localhost:${p.proxyPort}") (remote unix-socket (path-literal ${JSON.stringify(MDNS_RESPONDER_SOCKET)})))
 (allow network-inbound (local ip "*:*"))
 `;
 }

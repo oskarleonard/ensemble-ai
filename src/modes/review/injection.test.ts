@@ -184,8 +184,13 @@ describe('the codex wrapper profile denies every credential outside its own auth
 
   // The profile's own comment is the thing readers trust. Pin the FULL network rule set against
   // it so the two can never drift into an over-claim the rules do not honor.
-  it('grants exactly ONE loopback port — the egress proxy — plus unix sockets and inbound', () => {
-    expect(profile).toContain('(allow network-outbound (remote ip "localhost:54321") (remote unix-socket))');
+  it('grants exactly ONE loopback port — the egress proxy — plus the mDNSResponder socket and inbound', () => {
+    // The unix-socket grant is PATH-SCOPED to mDNSResponder (codex-f1), never a blanket
+    // `(remote unix-socket)` — which was an off-proxy exfil channel.
+    expect(profile).toContain(
+      '(allow network-outbound (remote ip "localhost:54321") (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))'
+    );
+    expect(profile).not.toMatch(/\(remote unix-socket\)/);
     expect(profile).toContain('(allow network-inbound (local ip "*:*"))');
     expect(profile).toMatch(/outbound network is DENIED except the one loopback port/);
     // It must keep admitting what the fence does NOT close, or the comment becomes an over-claim.
