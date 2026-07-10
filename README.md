@@ -329,6 +329,19 @@ The same engine is importable in-process (one engine, no drift):
 import { runReviewMode, isDiffReviewed } from 'ensemble-ai';
 ```
 
+## CI
+
+Every pull request and every push to `main` runs the project's own gate on Node 20, 22, and 24 (the `engines.node` floor through the `.nvmrc` dev pin) — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+Run exactly the same gate locally before you push:
+
+```bash
+npm ci
+npm run check   # typecheck → lint → test → build
+```
+
+The individual steps are also available on their own: `npm run typecheck`, `npm run lint`, `npm run test` (`npm run test:watch` while iterating), and `npm run build`. CI needs no secrets and calls no vendor CLIs — the reviewer seats are mocked in the test suite.
+
 ## License
 
 MIT
