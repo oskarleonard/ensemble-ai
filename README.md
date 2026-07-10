@@ -10,11 +10,12 @@ It's the portable engine behind a cross-vendor *code review* workflow: give it a
 
 | Command | What it does | Key flags |
 | --- | --- | --- |
-| `ensemble-ai review [<pr-url>]` | Self-contained cross-vendor code review — Codex + Grok + a cold Opus as blind peers, then a Claude **gate** grounds each finding (`agree`/`partial`/`false`/`unverified`) + a synthesis. | source: `--pr <N\|url>` · `--staged` · `--working-tree` · `--diff-file <p>` · stdin (default: current branch) · `--reviewers <ids>` · `--no-claude` · gate: `--strict-high` · `--gate-dismissals` · `--gate-model`/`--gate-effort` · `--no-fail-on-high` · **`--post-comment`** (also post to the PR — PR source only) · `--out <dir>` |
-| `ensemble-ai security [<pr-url>]` | `review` under a security-auditor lens + a local dependency-surface flag; findings tagged by class. | identical to `review` (same sources, gate flags, `--post-comment`) |
+| `ensemble-ai review [<pr-url>]` | Self-contained cross-vendor code review — Codex + Grok + a cold Opus as blind peers, then a Claude **gate** grounds each finding (`agree`/`partial`/`false`/`unverified`) + a synthesis. | source: `--pr <N\|url>` · `--staged` · `--working-tree` · `--diff-file <p>` · stdin (default: current branch) · `--reviewers <ids>` · `--no-claude` · gate: `--strict-high` · `--gate-dismissals` · `--gate-model`/`--gate-effort` · `--no-fail-on-high` · **`--stage`** (stage a PENDING review on the PR) · `--post-comment` (deprecated) · `--out <dir>` |
+| `ensemble-ai security [<pr-url>]` | `review` under a security-auditor lens + a local dependency-surface flag; findings tagged by class. | identical to `review` (same sources, gate flags, `--stage`) |
 | `ensemble-ai brainstorm "<topic>"` | Cross-vendor ideation: each voice generates → critiques the others → one synthesizes a ranked, deduped recommendation. | `--file <p>` · `--voices <ids>` · `--synthesizer <id>` · `--timeout <s>` · `--json` |
 | `ensemble-ai consult "<q>"` (alias `ask`) | Cross-vendor Q&A: each voice answers independently → one synthesizes AGREE (confident) vs DIVERGE (look closer) + a bottom line. | `--file <p>` · `--critique` · `--voices <ids>` · `--synthesizer <id>` · `--json` |
-| `ensemble-ai receipt verify\|show` | The content-tied gate primitive: `verify` exits 0 iff the current diff is reviewed & current; `show` pretty-prints a receipt. | `--strict`/`--require-artifacts` · `--trail <dir>` · `--store <dir>` · `--staged` · `--working-tree` · `--reviewers <ids>` |
+| `ensemble-ai receipt verify\|show` | The content-tied gate primitive: `verify` exits 0 iff the current diff is reviewed & current; `show` pretty-prints a receipt. | `--strict`/`--require-artifacts` · `--trail <dir>` · `--store <dir>` · `--staged` · `--working-tree` · `--reviewers <ids>` · **`--repo <dir>`** (ask for worktree evidence) · `--accept-degraded` |
+| `ensemble-ai push-fence --pr <N\|url>` | The **fix tail's** fence: exit 0 iff you own the PR's head ref; exit 5 = REFUSED (fork / no push access) → stage a pending review instead. Never pushes, never routes. | `--pr <N\|url>` · `--cwd <dir>` |
 | `ensemble-ai reviewers` (alias `config`) | Print the **resolved** seats — reviewers (`reviewers.json`) + voices (`voices.json`): id · vendor · model · effort · sandbox + source file. Read-only. | `--json` · `--reviewers-file <p>` · `--voices-file <p>` |
 | `ensemble-ai diff [<pr-url>]` | Cost-preview / debug: the exact packet the reviewers WOULD get (identity + coverage + prompt size) — no vendor called. | same diff sources as `review` · `--profile code\|security` · `--full` · `--json` |
 | **Claude skills** | Slash wrappers: `/ensemble-ai-review` · `/ensemble-ai-security` · `/ensemble-ai-brainstorm` · `/ensemble-ai-consult` (thin) + **`/ensemble-ai-review-fix`** — the pre-PR ritual (simplify → review → fix the gate verdicts → re-review → offer a PR). | installed per config dir via `entrypoints/install.sh` |
@@ -85,23 +86,27 @@ A **gate failure never opens the gate and never trips exit 1** — a spawn error
 
 By default every seat sees the **packet**: the diff, the changed files, and the repo's conventions. That is *diff-local* — a reviewer cannot see that your new helper duplicates one that already lives in an unchanged file. **Worktree evidence mode** fixes that by materializing the PR head as a **detached, read-only worktree** of a repo you already have cloned, and giving qualifying seats read access to the whole project at `headSha`.
 
-> **Status — the engine is in; the CLI flags are not.** Everything below is implemented and tested,
-> and reachable through the **library** surface. The `--repo` and `--accept-degraded` flags shown
-> here are **not yet parsed** by `ensemble-ai review` / `ensemble-ai receipt`: `parseArgs` runs
-> strict, so passing them today prints `Unknown option '--repo'` and exits non-zero. Until that
-> wiring lands, every CLI run is packet-mode and mints a legacy (v1) receipt exactly as before, no
-> seat is spawned against a worktree, and the gate is always packet-fed. This section is the engine
-> contract, not yet a command you can type.
+> **Status — the engine and the VERIFY side are wired; the review-side seat spawn is not.**
+> `receipt verify --repo <dir>` and `--accept-degraded` are parsed and honored today. `review --repo`
+> is parsed and **refuses by name**: no seat is spawned against a worktree yet, so reviewing the
+> packet while reporting whole-project evidence would be exactly the silent downgrade the realized
+> map exists to prevent. Every review run is therefore packet-mode and mints a legacy (v1) receipt,
+> as before.
 
 ```bash
-# NOT YET WIRED — shown as the intended surface, not as working commands:
-#
-#   ensemble-ai review --pr https://github.com/o/r/pull/7 --repo ~/code/r
-#
-#   # a receipt minted under weaker evidence than you asked for FAILS, loudly and by name
-#   ensemble-ai receipt verify --repo ~/code/r                     # → EVIDENCE DEGRADED: codex realized packet…
-#   ensemble-ai receipt verify --repo ~/code/r --accept-degraded   # take it anyway, deliberately
+# WIRED — `--repo` makes verify ask the STRONGER question, and a weaker receipt fails by name:
+ensemble-ai receipt verify --repo ~/code/r                     # → EVIDENCE DEGRADED: codex realized unknown, intended worktree…
+ensemble-ai receipt verify --repo ~/code/r --accept-degraded   # take the weaker evidence anyway, deliberately
+
+# NOT WIRED — refuses with a message naming what is missing, rather than under-delivering quietly:
+ensemble-ai review --pr https://github.com/o/r/pull/7 --repo ~/code/r
 ```
+
+Because no run has ever minted worktree evidence, `verify --repo` fails **every receipt on disk**
+today. That is the contract working, not a bug: a legacy receipt carries no realized map, which
+reads as `unknown` = weaker than `worktree`. When the seat spawn lands, `verify` must also compute
+the **v2** receipt key (which binds the run's sandbox profiles) and pass the v1 key as `legacyKey`;
+`resolveReceipt` already implements that fallback.
 
 **Your checkout is never involved.** The engine fetches `pull/N/head` from the remote's **explicit URL** (never assuming `origin` exposes PR refs), adds a detached worktree, and **asserts `HEAD == headSha` before any seat runs** — a mismatch aborts rather than reviewing wrong-SHA evidence. Materialization is inert by construction: no hooks, no submodule recursion, no LFS smudge (so an in-tree `.lfsconfig` is never honored), tracked files only, no deps installed. It is reaped in a `finally` plus a `git worktree prune` sweeper, and serialized per repo (`git worktree add` writes into the shared `.git`). Pre-flight fails **closed** with a named cause: `wrong-repo` · `no-such-pr` · `network` · `auth` · `not-a-repo` · `disallowed-root` · `sha-mismatch`. An optional `allowedRepoRoots` array in `~/.ensemble-ai/config.json` restricts which repo roots may be materialized at all — consumer policy, never baked into this engine.
 
@@ -124,11 +129,107 @@ The plan per seat (**"wired" = a seat is actually spawned against a worktree tod
 
 Outside macOS the codex seat falls back to the packet.
 
-**Evidence is part of the receipt's identity.** The receipt records the **intended** per-seat evidence map (policy) and the **realized** one (fact) as separate things, plus each worktree seat's sandbox profile id + version — so a degraded mixed run is never receipt-equivalent to a full-worktree run. A worktree seat **must** bind a sandbox profile: "the seat could read the whole project" is only a safety claim together with "under this profile, at this version", so `buildDiffReceipt` refuses to mint a receipt that claims worktree evidence for a seat with no profile identity. A legacy receipt carries no realized map, which reads as `unknown` — exactly as strong as `packet` (the packet is all that existed when it was issued), and strictly weaker than `worktree`. `policyHash` is **versioned**: an all-packet run hashes under the legacy schema, byte-for-byte as before, so turning worktree mode *off* changes no receipt identity and no existing receipt is staled. The verification contract — `computePolicyHashAt` under the receipt's **own** issued version, then a separate realized-vs-intended comparison in which a legacy receipt's missing realized map reads as `unknown` = *weaker* and fails only when worktree evidence is requested (`acceptDegraded` overrides) — is implemented and tested in `isDiffReviewed` / `verifyReceipt`, but **the `receipt verify` command does not yet pass those inputs**, so today it always verifies under v1 and the evidence check is a no-op. An `evidence-manifest.json` joins the trail — the tracked tree at `headSha` with blob SHAs, i.e. the **readable surface** each worktree seat was given. It is advisory and never hashed. (Opaque vendor CLIs do not report their file reads, so it is honestly named: what a seat *could* read, not what it *did*.)
+**Evidence is part of the receipt's identity.** The receipt records the **intended** per-seat evidence map (policy) and the **realized** one (fact) as separate things, plus each worktree seat's sandbox profile id + version — so a degraded mixed run is never receipt-equivalent to a full-worktree run. A worktree seat **must** bind a sandbox profile: "the seat could read the whole project" is only a safety claim together with "under this profile, at this version", so `buildDiffReceipt` refuses to mint a receipt that claims worktree evidence for a seat with no profile identity. A legacy receipt carries no realized map, which reads as `unknown` — exactly as strong as `packet` (the packet is all that existed when it was issued), and strictly weaker than `worktree`. `policyHash` is **versioned**: an all-packet run hashes under the legacy schema, byte-for-byte as before, so turning worktree mode *off* changes no receipt identity and no existing receipt is staled. The verification contract — `computePolicyHashAt` under the receipt's **own** issued version, then a separate realized-vs-intended comparison in which a legacy receipt's missing realized map reads as `unknown` = *weaker* and fails only when worktree evidence is requested (`acceptDegraded` overrides) — is implemented and tested in `isDiffReviewed` / `verifyReceipt`, and **`receipt verify --repo <dir>` now passes those inputs** (passing the repo location IS the request for worktree evidence, spec §8). Without `--repo` the evidence check is a no-op and v1 semantics are untouched. An `evidence-manifest.json` joins the trail — the tracked tree at `headSha` with blob SHAs, i.e. the **readable surface** each worktree seat was given. It is advisory and never hashed. (Opaque vendor CLIs do not report their file reads, so it is honestly named: what a seat *could* read, not what it *did*.)
 
 **The gate reads the same worktree**, which makes it an evidence-bearing actor in its own right. On worktree evidence it may emit a new downgrade cause, **`reference-not-found`** — "I could not locate what this finding references at `headSha`", the hallucinated-reference red flag — alongside the existing `truncated` / `missing`. The gate is **taught** the cause only when its realized evidence is `worktree`, and the host **honors** it only then: a gate that saw a ±25-line window cannot distinguish "does not exist" from "outside my window", so a packet-fed gate is never told the cause exists, and a cause arriving on packet evidence anyway is dropped with a warning. Teaching and honoring are gated on the same fact. Consumers opt in by keying on the cause; old artifacts keep their meaning.
 
 **The Claude producer** in worktree mode runs the built-in `/code-review` methodology (bugs + structural quality — never style or naming nits) with whole-project context, and maps its findings into the same schema Codex and Grok emit. One Claude producer, not two: same-family corroboration is weak signal and pure dedup load.
+
+### Reviewing someone else's PR — `--stage`
+
+`--post-comment` publishes a comment **immediately** under your account. On a foreign pull request
+that is the wrong posture: a robot that posts before you have read it spends your credibility, not
+its own. `--stage` is the replacement, and `--post-comment` is **deprecated** (kept, unchanged, for
+existing consumers).
+
+```bash
+ensemble-ai review --pr https://github.com/o/r/pull/7 --stage
+```
+
+Everything lands as **ONE PENDING review** under your account — GitHub's create-review API with
+`event` omitted. It is author-private until you read it, edit it, and click Submit in GitHub's own
+UI. `event` is **never** sent, so this tool can never Approve or Request-Changes anywhere. A
+zero-bug run **still stages a review**, carrying only the friendly summary body: the posting
+authority is absolute, and nothing appears under your name without your click — not even "LGTM".
+
+**Placement, not deletion.** Nothing verified is dropped; the tiers decide where it lands:
+
+| Tier | Where | Why |
+| --- | --- | --- |
+| Verified bug | inline comment on its line | the main event |
+| Quality finding (structural simplification) | a **collapsed** `<details>` section of the summary | the author reads or ignores it in one gesture; their AI assistant consumes all of it |
+| Gate-verified small replacement | inline ` ```suggestion ` block, **hard-capped at 3** | one-click apply is a gift, not a nag |
+| A verified finding with no in-diff anchor | the summary body | dropping a verified bug is never the conservative choice |
+
+**No model runs in the posting path.** The gate — which already read the diff — assigns each finding
+its `class` (`bug` / `quality`) and may attach a `suggestion`, both validated by the host under the
+same no-new-entity rule the edit-ops obey: a replacement may introduce no identifier, path, or
+number absent from the reviewer's body or its cited hunk. The posting step then reads the stored
+`postableBody` and wraps it. Reviewer text is untrusted, so two markup vectors are neutralized on
+the way out: `<!--` is escaped (a crafted body cannot forge the machine trailer) and a
+reviewer-authored ` ```suggestion ` fence is retagged (only the host may put an apply button on
+code). Per-profile thresholds live in `~/.ensemble-ai/config.json`; the caps do not.
+
+```jsonc
+{ "posting": { "code": { "suggestionCap": 3, "maxSuggestionLines": 6, "inlineSeverityFloor": "low" } } }
+```
+
+**Three hardenings, all fail-closed:**
+
+- **Freshness.** The reviewed `headSha` must still be the PR's live head. A moved head **refuses** —
+  every inline anchor would point at code the author already rewrote.
+- **Stale pending.** GitHub allows one pending review per user per PR. A pending review that is not
+  ours is your own unsubmitted work: we refuse, legibly, and never touch it.
+- **Idempotency.** A pending review that *is* ours (it carries our marker) is **replaced**, so a
+  re-run updates in place instead of stacking duplicate comments. Each finding carries an invisible
+  machine trailer — `{findingId, verdict, severity, anchors, corroborators, fixStatus}` — which is
+  also what lets a consuming agent read the review back as data.
+
+Findings are grouped by **issue, never by tool** (the dedup pass already elected one representative
+per cluster), each comment states its own provenance (`flagged by 2 of 3 reviewers`), and the review
+carries exactly one honest attribution footer.
+
+#### The CLI contract for consumers
+
+With `--stage`, the **last line of stdout is a single JSON object**, whatever the outcome — so a
+thin consumer never parses prose:
+
+```json
+{"counts":{"inline":2,"quality":3,"reviewersRun":3,"suggestions":1,"unanchored":0},
+ "headSha":"…","receipt":{"completed":["codex","grok"],"digest":"…","path":"…"},
+ "stagedReviewUrl":"https://github.com/o/r/pull/7#pullrequestreview-123"}
+```
+
+On a staging failure the object carries `"error"` and `"stagedReviewUrl": null`. **Staging never
+changes the exit code** the review already earned (`2` > `1` > `4` > `0`) — it is a side effect of a
+completed review, never part of the gate contract, exactly like `--post-comment`.
+
+**Two tails, picked by the command you invoke — never by an engine predicate.**
+`--stage` posts and never pushes. The **fix tail** (`/ensemble-ai-review-fix`) fixes findings in
+your session and pushes. Since the stage tail may legitimately run on contributor PRs to repos you
+*do* own, the fix tail is fenced:
+
+```bash
+ensemble-ai push-fence --pr <N|url>   # exit 0 = you own the head ref · exit 5 = REFUSED
+```
+
+It refuses a fork head-ref or a repo you cannot push to, and names `--stage` as the alternative.
+It is a **fence, not a dispatcher**: it never reroutes for you and never pushes anything.
+
+#### Consumer-side wiring (documented here, built there)
+
+- **Hugin dashboard** — one primary PR-page action, *"Review & stage"*: run the full pipeline, show
+  the `stagedReviewUrl`, and put "posts nothing until you submit on GitHub" in the popover. Existing
+  buttons stay à-la-carte. **App-pilot QA is a separate optional step AFTER review**, on the pilot's
+  own deps-worktree (existing plumbing) — a different artifact with a different lifecycle from the
+  review worktree, and it never touches the main checkout. Figma-compare rides that slot.
+- **Munin dashboard** — **no required changes on the do-nothing path.** Its review-button flow (own
+  PRs → dispositions → MERGE-CLEAR) has no post tail, and packet-mode runs keep working untouched.
+  The moment Munin passes a **repo location** it is *requesting* worktree evidence and must check
+  realized-vs-intended on the receipt (`isDiffReviewed` reports `evidence-degraded` and names the
+  seat). New `gate-verdicts.json` fields are additive — dashboard validation must keep scoping by
+  `meta.kind`. The trail schema is now **v3** (`postableClass`, `postableSuggestion`, `resolved`
+  added beside the v2 postable fields); a reader that ignores unknown keys is unaffected.
 
 ### Configuring the seats — `reviewers.json` and `voices.json`
 

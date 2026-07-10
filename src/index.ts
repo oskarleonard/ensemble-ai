@@ -45,6 +45,13 @@ export * from './modes/review/evidence';
 export * from './modes/review/evidence-manifest';
 export * from './modes/review/worktree';
 export * from './modes/review/code-review-seat';
+// ── The foreign tail: posting posture · the staged PENDING review · the push fence ─
+// Exported so a consumer (the Hugin dashboard's "Review & stage" button) drives the SAME
+// placement + staging the CLI does. `--stage` is the thin CLI over exactly these.
+export * from './modes/review/posting-config';
+export * from './modes/review/push-fence';
+export * from './modes/review/stage';
+export * from './modes/review/stage-plan';
 // ── Review PROFILES (code · security) + the security dependency-surface flag ──
 export * from './modes/review/profile';
 export * from './modes/review/dep-surface';

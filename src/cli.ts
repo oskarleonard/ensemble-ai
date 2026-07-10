@@ -2513,9 +2513,11 @@ async function pushFenceCommand(args: string[]): Promise<number> {
   const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
   const gh = ghRunner(cwd);
   const scope = selection.owner && selection.repo ? ['-R', `${selection.owner}/${selection.repo}`] : [];
+  // Exactly the three fields parsePushContext reads. `gh pr view --json` rejects an unknown field
+  // name outright, so an unused extra would break the command, not merely bloat it.
   const view = gh([
     'pr', 'view', String(selection.pr), ...scope,
-    '--json', 'headRefName,headRepositoryOwner,isCrossRepository,baseRepository',
+    '--json', 'headRefName,headRepositoryOwner,isCrossRepository',
   ]);
   if (!view.ok) {
     console.error(`ensemble-ai push-fence: could not read PR #${selection.pr} — ${view.error}`);

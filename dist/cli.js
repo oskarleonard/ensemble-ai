@@ -6777,7 +6777,7 @@ async function pushFenceCommand(args) {
     String(selection.pr),
     ...scope,
     "--json",
-    "headRefName,headRepositoryOwner,isCrossRepository,baseRepository"
+    "headRefName,headRepositoryOwner,isCrossRepository"
   ]);
   if (!view.ok) {
     console.error(`ensemble-ai push-fence: could not read PR #${selection.pr} \u2014 ${view.error}`);
