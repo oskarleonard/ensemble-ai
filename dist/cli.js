@@ -6,6 +6,7 @@ import crypto2 from "crypto";
 import fs21 from "fs";
 import os11 from "os";
 import path17 from "path";
+import { fileURLToPath as fileURLToPath2 } from "url";
 import { parseArgs } from "util";
 
 // src/core/artifacts.ts
@@ -6215,6 +6216,82 @@ function execGit() {
   };
 }
 
+// src/plumbing/pin-check.ts
+function remoteOf(mainRef) {
+  const i = mainRef.indexOf("/");
+  if (i <= 0 || i === mainRef.length - 1) return null;
+  return { remote: mainRef.slice(0, i), branch: mainRef.slice(i + 1) };
+}
+function revParse(git2, cwd, rev) {
+  const r = git2(["rev-parse", "--verify", "--quiet", `${rev}^{commit}`], { cwd });
+  if (!r.ok) return null;
+  const sha = r.text.trim();
+  return sha.length ? sha : null;
+}
+function countRange(git2, cwd, range) {
+  const r = git2(["rev-list", "--count", range], { cwd });
+  if (!r.ok) return null;
+  const n = Number(r.text.trim());
+  return Number.isFinite(n) ? n : null;
+}
+function checkPinDrift(opts) {
+  const { git: git2, repoDir } = opts;
+  const mainRef = opts.mainRef ?? "origin/main";
+  const doFetch = opts.fetch !== false;
+  const pinned = revParse(git2, repoDir, opts.pin ?? "HEAD");
+  if (!pinned) {
+    return {
+      error: opts.pin ? `not a resolvable commit: ${opts.pin}` : `${repoDir} is not a git checkout (no resolvable HEAD) \u2014 pass --repo <ensemble-ai checkout> or --pin <sha>`
+    };
+  }
+  let fetched = false;
+  let note;
+  if (!doFetch) {
+    note = `--no-fetch: compared against the local ${mainRef} (may be stale)`;
+  } else {
+    const remote = remoteOf(mainRef);
+    if (!remote) {
+      note = `"${mainRef}" has no remote to refresh; compared against the local ref`;
+    } else {
+      const f = git2(["fetch", remote.remote, remote.branch], { cwd: repoDir });
+      if (f.ok) fetched = true;
+      else note = `fetch failed (${firstLine2(f.error)}); compared against the last-known local ${mainRef}`;
+    }
+  }
+  const main2 = revParse(git2, repoDir, mainRef);
+  if (!main2) {
+    return {
+      error: `cannot resolve ${mainRef} in ${repoDir}${fetched ? "" : " (fetch skipped/failed)"} \u2014 is its remote configured?`
+    };
+  }
+  const behind = countRange(git2, repoDir, `${pinned}..${main2}`);
+  const ahead = countRange(git2, repoDir, `${main2}..${pinned}`);
+  if (behind === null || ahead === null) {
+    return { error: `could not compute drift between ${short2(pinned)} and ${mainRef} (${short2(main2)})` };
+  }
+  const status = behind === 0 && ahead === 0 ? "current" : ahead === 0 ? "stale" : behind === 0 ? "ahead" : "diverged";
+  return { repoDir, pinned, main: main2, mainRef, behind, ahead, status, fetched, note };
+}
+function short2(sha) {
+  return sha.slice(0, 7);
+}
+function firstLine2(s) {
+  return s.split("\n")[0].trim();
+}
+function plural(n) {
+  return n === 1 ? "" : "s";
+}
+function describePinDrift(d) {
+  const tip = `${short2(d.main)}${d.fetched ? "" : " local"}`;
+  if (d.status === "current")
+    return `current \u2014 pinned ${short2(d.pinned)} is up to date with ${d.mainRef} (${tip}).`;
+  if (d.status === "ahead")
+    return `ahead \u2014 pinned ${short2(d.pinned)} is ${d.ahead} commit${plural(d.ahead)} ahead of ${d.mainRef} (${tip}) (a local/unmerged build).`;
+  if (d.status === "diverged")
+    return `DIVERGED \u2014 pinned ${short2(d.pinned)} is ${d.behind} behind and ${d.ahead} ahead of ${d.mainRef} (${tip}).`;
+  return `STALE \u2014 pinned ${short2(d.pinned)} is ${d.behind} commit${plural(d.behind)} behind ${d.mainRef} (${tip}). Update your pin.`;
+}
+
 // src/modes/review/worktree-run.ts
 function openWorktree(args, deps = {}) {
   const git2 = deps.git ?? execGit();
@@ -8931,6 +9008,89 @@ async function pushFenceCommand(args) {
   console.error(`ensemble-ai push-fence: ${verdict.reason}`);
   return 5;
 }
+var PIN_CHECK_USAGE = `ensemble-ai pin-check \u2014 is your pinned ensemble-ai current with main?
+
+A consumer that installs ensemble-ai from a specific commit keeps running THAT commit
+silently after main advances \u2014 the staleness is invisible. pin-check compares the pinned
+commit against the tip of main and reports the drift, so a consumer's own doctor / health
+check can surface "N commits behind" instead of running stale.
+
+Usage:
+  ensemble-ai pin-check [options]
+
+With no flags it checks the ensemble-ai checkout THIS binary runs from: it fetches the
+remote and compares HEAD against origin/main.
+
+Options:
+  --repo <dir>      the ensemble-ai checkout to check (default: this binary's own checkout)
+  --pin <ref>       the pinned commit/ref to check (default: the checkout's HEAD)
+  --main-ref <ref>  the ref to compare against (default: origin/main)
+  --no-fetch        do not refresh the remote first \u2014 compare against the local ref (offline)
+  --json            machine output: {pinned, main, behind, ahead, status, fetched, note}
+  -h, --help        this help
+
+Exit: 0 = current (or ahead of main); 3 = STALE or DIVERGED; 1 = error. A consumer's doctor
+gates on the exit code, or parses --json for a softer "N behind" surface.`;
+function resolveSelfRepo(git2) {
+  const r = git2(["rev-parse", "--show-toplevel"], {
+    cwd: path17.dirname(fileURLToPath2(import.meta.url))
+  });
+  return r.ok ? r.text.trim() : null;
+}
+async function pinCheckCommand(args) {
+  let values;
+  try {
+    ({ values } = parseArgs({
+      allowPositionals: false,
+      args,
+      options: {
+        help: { short: "h", type: "boolean" },
+        json: { type: "boolean" },
+        "main-ref": { type: "string" },
+        "no-fetch": { type: "boolean" },
+        pin: { type: "string" },
+        repo: { type: "string" }
+      }
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai pin-check: ${e.message}`);
+    console.error(PIN_CHECK_USAGE);
+    return 3;
+  }
+  if (values.help) {
+    console.log(PIN_CHECK_USAGE);
+    return 0;
+  }
+  const git2 = execGit();
+  const repoDir = values.repo ?? resolveSelfRepo(git2);
+  if (!repoDir) {
+    console.error(
+      "ensemble-ai pin-check: could not locate an ensemble-ai git checkout (this binary is not inside one). Pass --repo <dir>."
+    );
+    return 1;
+  }
+  const result = checkPinDrift({
+    repoDir,
+    git: git2,
+    pin: values.pin,
+    mainRef: values["main-ref"],
+    fetch: !values["no-fetch"]
+  });
+  if ("error" in result) {
+    console.error(`ensemble-ai pin-check: ${result.error}`);
+    return 1;
+  }
+  const stale = result.status === "stale" || result.status === "diverged";
+  if (values.json) {
+    console.log(JSON.stringify(result));
+  } else {
+    const line = `ensemble-ai pin-check: ${describePinDrift(result)}`;
+    if (stale) console.error(line);
+    else console.log(line);
+    if (result.note) console.error(`  note: ${result.note}`);
+  }
+  return stale ? 3 : 0;
+}
 async function main(argv) {
   const raw = argv[0];
   if (!raw || raw === "-h" || raw === "--help") {
@@ -8941,6 +9101,7 @@ async function main(argv) {
   if (raw === "push-fence") return pushFenceCommand(argv.slice(1));
   if (raw === "reviewers" || raw === "config") return reviewersCommand(argv.slice(1));
   if (raw === "diff") return diffCommand(argv.slice(1));
+  if (raw === "pin-check") return pinCheckCommand(argv.slice(1));
   const mode = resolveMode(raw);
   if (mode === "review") return reviewCommand(argv.slice(1), "code");
   if (mode === "security") return reviewCommand(argv.slice(1), "security");
