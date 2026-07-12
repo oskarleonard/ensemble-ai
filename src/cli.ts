@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 import { escapesRoot, reviewDir, writeTrailFile } from './core/artifacts';
@@ -85,6 +86,7 @@ import {
 import { formatEvidenceFooter } from './modes/review/seat-evidence';
 import { isPreflightError } from './modes/review/worktree';
 import { execGit } from './modes/review/git-exec';
+import { checkPinDrift, describePinDrift } from './plumbing/pin-check';
 import {
   buildHistoryPacket,
   type HistoryPacket,
@@ -2798,6 +2800,98 @@ async function pushFenceCommand(args: string[]): Promise<number> {
   return 5;
 }
 
+const PIN_CHECK_USAGE = `ensemble-ai pin-check — is your pinned ensemble-ai current with main?
+
+A consumer that installs ensemble-ai from a specific commit keeps running THAT commit
+silently after main advances — the staleness is invisible. pin-check compares the pinned
+commit against the tip of main and reports the drift, so a consumer's own doctor / health
+check can surface "N commits behind" instead of running stale.
+
+Usage:
+  ensemble-ai pin-check [options]
+
+With no flags it checks the ensemble-ai checkout THIS binary runs from: it fetches the
+remote and compares HEAD against origin/main.
+
+Options:
+  --repo <dir>      the ensemble-ai checkout to check (default: this binary's own checkout)
+  --pin <ref>       the pinned commit/ref to check (default: the checkout's HEAD)
+  --main-ref <ref>  the ref to compare against (default: origin/main)
+  --no-fetch        do not refresh the remote first — compare against the local ref (offline)
+  --json            machine output: {pinned, main, behind, ahead, status, fetched, note}
+  -h, --help        this help
+
+Exit: 0 = current (or ahead of main); 3 = STALE or DIVERGED; 1 = error. A consumer's doctor
+gates on the exit code, or parses --json for a softer "N behind" surface.`;
+
+// Locate the ensemble-ai checkout THIS binary runs from, so `pin-check` with no --repo
+// answers "is the ensemble-ai I am current?". Returns null when the binary is not inside a
+// git checkout (e.g. a packed `npm i -g`); the CLI then asks for --repo.
+function resolveSelfRepo(git: ReturnType<typeof execGit>): string | null {
+  const r = git(['rev-parse', '--show-toplevel'], {
+    cwd: path.dirname(fileURLToPath(import.meta.url)),
+  });
+  return r.ok ? r.text.trim() : null;
+}
+
+async function pinCheckCommand(args: string[]): Promise<number> {
+  let values: Record<string, string | boolean | undefined>;
+  try {
+    ({ values } = parseArgs({
+      allowPositionals: false,
+      args,
+      options: {
+        help: { short: 'h', type: 'boolean' },
+        json: { type: 'boolean' },
+        'main-ref': { type: 'string' },
+        'no-fetch': { type: 'boolean' },
+        pin: { type: 'string' },
+        repo: { type: 'string' },
+      },
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai pin-check: ${(e as Error).message}`);
+    console.error(PIN_CHECK_USAGE);
+    return 3;
+  }
+  if (values.help) {
+    console.log(PIN_CHECK_USAGE);
+    return 0;
+  }
+
+  const git = execGit();
+  const repoDir = (values.repo as string | undefined) ?? resolveSelfRepo(git);
+  if (!repoDir) {
+    console.error(
+      'ensemble-ai pin-check: could not locate an ensemble-ai git checkout (this binary is not inside one). Pass --repo <dir>.'
+    );
+    return 1;
+  }
+
+  const result = checkPinDrift({
+    repoDir,
+    git,
+    pin: values.pin as string | undefined,
+    mainRef: values['main-ref'] as string | undefined,
+    fetch: !values['no-fetch'],
+  });
+  if ('error' in result) {
+    console.error(`ensemble-ai pin-check: ${result.error}`);
+    return 1;
+  }
+
+  const stale = result.status === 'stale' || result.status === 'diverged';
+  if (values.json) {
+    console.log(JSON.stringify(result));
+  } else {
+    const line = `ensemble-ai pin-check: ${describePinDrift(result)}`;
+    if (stale) console.error(line);
+    else console.log(line);
+    if (result.note) console.error(`  note: ${result.note}`);
+  }
+  return stale ? 3 : 0;
+}
+
 export async function main(argv: string[]): Promise<number> {
   const raw = argv[0];
   if (!raw || raw === '-h' || raw === '--help') {
@@ -2809,6 +2903,7 @@ export async function main(argv: string[]): Promise<number> {
   if (raw === 'push-fence') return pushFenceCommand(argv.slice(1));
   if (raw === 'reviewers' || raw === 'config') return reviewersCommand(argv.slice(1));
   if (raw === 'diff') return diffCommand(argv.slice(1));
+  if (raw === 'pin-check') return pinCheckCommand(argv.slice(1));
 
   const mode = resolveMode(raw);
   if (mode === 'review') return reviewCommand(argv.slice(1), 'code');
