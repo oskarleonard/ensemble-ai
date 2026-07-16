@@ -8,7 +8,7 @@ import { REVIEWER_IDS, type ReviewerConfig, type ReviewerId } from './types';
 // cross-vendor reviewer, editable by hand or an agent; adding a third vendor
 // later is a new entry, not a code change. Read from a JSON file
 // (env-overridable), falling back to a baked default so the primitive works
-// before the file exists. Default: Codex on gpt-5.5 @ xhigh; Grok on grok-build
+// before the file exists. Default: Codex on gpt-5.5 @ xhigh; Grok on grok-4.5
 // @ high under the deny-by-default `ensemble-review` sandbox.
 export const REVIEWERS_FILE =
   process.env.ENSEMBLE_REVIEWERS_FILE ||
@@ -22,14 +22,17 @@ export const REVIEWER_DEFAULTS: Record<ReviewerId, ReviewerConfig> = {
     model: 'gpt-5.5',
     vendor: 'openai',
   },
-  // Grok (xAI) — the second cross-vendor lens. grok-build is the stronger of the
-  // two CLI-available models; `sandbox` names the OS-enforced read-only profile it
-  // runs under (kernel-blocked writes + secret-read deny — see reviewers/grok.ts).
+  // Grok (xAI) — the second cross-vendor lens. grok-4.5 is the stronger of the
+  // CLI-available models (grok-build was RETIRED upstream ~2026-07: every review
+  // failed at the tail with "unknown model id" until the 2026-07-16 heal — when
+  // a grok review reports failed-reviewer with NO raw output, check `grok models`
+  // first). `sandbox` names the OS-enforced read-only profile it runs under
+  // (kernel-blocked writes + secret-read deny — see reviewers/grok.ts).
   grok: {
     cmd: 'grok',
     effort: 'high',
     id: 'grok',
-    model: 'grok-build',
+    model: 'grok-4.5',
     sandbox: 'ensemble-review',
     vendor: 'xai',
   },

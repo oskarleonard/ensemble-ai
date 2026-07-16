@@ -31,7 +31,7 @@ const cfg = (id: 'codex' | 'grok'): ReviewerConfig =>
         cmd: 'grok',
         effort: 'high',
         id: 'grok',
-        model: 'grok-build',
+        model: 'grok-4.5',
         sandbox: 'ensemble-review',
         vendor: 'xai',
       }
