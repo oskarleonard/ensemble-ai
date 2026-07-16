@@ -7,11 +7,11 @@ import { renderRegistry, type RegistryView } from './registry';
 
 const reviewers: ReviewerConfig[] = [
   { cmd: 'codex', effort: 'xhigh', id: 'codex', model: 'gpt-5.5', vendor: 'openai' },
-  { cmd: 'grok', effort: 'high', id: 'grok', model: 'grok-build', sandbox: 'ensemble-review', vendor: 'xai' },
+  { cmd: 'grok', effort: 'high', id: 'grok', model: 'grok-4.5', sandbox: 'ensemble-review', vendor: 'xai' },
 ];
 const voices: VoiceConfig[] = [
   { cmd: 'codex', effort: 'high', id: 'codex', model: 'gpt-5.5', vendor: 'openai' },
-  { cmd: 'grok', effort: 'high', id: 'grok', model: 'grok-build', sandbox: 'ensemble-review', vendor: 'xai' },
+  { cmd: 'grok', effort: 'high', id: 'grok', model: 'grok-4.5', sandbox: 'ensemble-review', vendor: 'xai' },
   { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' },
 ];
 

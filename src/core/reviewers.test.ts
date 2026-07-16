@@ -31,12 +31,12 @@ describe('parseReviewers', () => {
     expect(parseReviewers({ codex: 'nope' }).codex.model).toBe('gpt-5.5');
   });
 
-  it('includes the baked Grok default (grok-build · high · xai · ensemble-review sandbox)', () => {
+  it('includes the baked Grok default (grok-4.5 · high · xai · ensemble-review sandbox)', () => {
     expect(parseReviewers(null).grok).toEqual({
       cmd: 'grok',
       effort: 'high',
       id: 'grok',
-      model: 'grok-build',
+      model: 'grok-4.5',
       sandbox: 'ensemble-review',
       vendor: 'xai',
     });
@@ -44,7 +44,7 @@ describe('parseReviewers', () => {
 
   it('falls back to the baked Grok default for a malformed grok entry', () => {
     const r = parseReviewers({ grok: { effort: '', model: 123 } });
-    expect(r.grok.model).toBe('grok-build');
+    expect(r.grok.model).toBe('grok-4.5');
     expect(r.grok.effort).toBe('high');
     expect(r.grok.sandbox).toBe('ensemble-review'); // junk can't weaken the sandbox
   });

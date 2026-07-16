@@ -19,7 +19,7 @@ const CONFIG: ReviewerConfig = {
   cmd: 'grok',
   effort: 'high',
   id: 'grok',
-  model: 'grok-build',
+  model: 'grok-4.5',
   sandbox: 'ensemble-review',
   vendor: 'xai',
 };
@@ -75,7 +75,7 @@ describe('buildGrokReviewArgs', () => {
     // the JSON envelope (gives a stopReason terminal signal).
     expect(args[args.indexOf('--output-format') + 1]).toBe('json');
     // the CONFIGURED strong model + effort, not the account default.
-    expect(args[args.indexOf('-m') + 1]).toBe('grok-build');
+    expect(args[args.indexOf('-m') + 1]).toBe('grok-4.5');
     expect(args[args.indexOf('--effort') + 1]).toBe('high');
     // THE boundary: an OS-enforced deny-by-default sandbox profile (never tool-denial).
     expect(args[args.indexOf('--sandbox') + 1]).toBe('ensemble-review');
