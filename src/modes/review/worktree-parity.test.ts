@@ -13,6 +13,8 @@ import {
   materializeWorktreeAsync,
   resolveRepoLocation,
   resolveRepoLocationAsync,
+  stripAgentInstructions,
+  stripAgentInstructionsAsync,
   WORKTREE_LOCK_ERROR,
   type Worktree,
 } from './worktree';
@@ -28,23 +30,38 @@ import {
 
 type Scripted = { error?: string; match: (args: string[]) => boolean; text?: string };
 
+// A logged call carries args AND the cwd/env the runner was handed — the first cut logged
+// args only, which left half the twin contract untestable: an INERT_ENV drift or a HEAD
+// assert run from the wrong cwd would both have stayed green (cross-vendor review of this
+// diff, claude-f1). env is logged as the one load-bearing marker rather than the whole
+// object, so an unrelated process.env difference can't flake the equality.
+type LoggedCall = { args: string[]; cwd: string; lfsSkip: boolean };
+
 // One script, two runners, two logs — the logs must come out equal.
 function scriptedGit(script: Scripted[]) {
-  const run = (args: string[], log: string[][]) => {
-    log.push(args);
+  const run = (
+    args: string[],
+    opts: { cwd?: string; env?: Record<string, string> } | undefined,
+    log: LoggedCall[]
+  ) => {
+    log.push({
+      args,
+      cwd: opts?.cwd ?? '',
+      lfsSkip: opts?.env?.GIT_LFS_SKIP_SMUDGE === '1',
+    });
     const hit = script.find((s) => s.match(args));
     if (!hit) return { ok: true as const, text: '' };
     if (hit.error !== undefined) return { error: hit.error, ok: false as const };
     return { ok: true as const, text: hit.text ?? '' };
   };
-  const syncLog: string[][] = [];
-  const asyncLog: string[][] = [];
-  const sync: GitRun = (args) => run(args, syncLog);
+  const syncLog: LoggedCall[] = [];
+  const asyncLog: LoggedCall[] = [];
+  const sync: GitRun = (args, opts) => run(args, opts, syncLog);
   // A microtask-yielding async runner: awaiting it exercises the real interleave points the
   // async twin introduces, which a resolve-inline stub would hide.
-  const async_: GitRunAsync = async (args) => {
+  const async_: GitRunAsync = async (args, opts) => {
     await Promise.resolve();
-    return run(args, asyncLog);
+    return run(args, opts, asyncLog);
   };
   return { async_, asyncLog, sync, syncLog };
 }
@@ -63,7 +80,7 @@ const LOCATION = {
 
 // Normalize the one legitimately-divergent value (each run mkdtemps its own parent) so the
 // rest of the outcome can be compared byte-for-byte.
-function normalize(v: ReturnType<typeof materializeWorktree>): unknown {
+function normalize(v: Awaited<ReturnType<typeof materializeWorktreeAsync>>): unknown {
   if (v && typeof v === 'object' && 'dir' in v) {
     const w = v as Worktree;
     return { ...w, dir: '<dir>' };
@@ -71,10 +88,13 @@ function normalize(v: ReturnType<typeof materializeWorktree>): unknown {
   return v;
 }
 
-function normalizeArgv(log: string[][]): string[][] {
-  return log.map((args) =>
-    args.map((a) => (a.includes('ensemble-worktree-') ? '<dir>' : a))
-  );
+function normalizeArgv(log: LoggedCall[]): LoggedCall[] {
+  const scrub = (s: string) => (s.includes('ensemble-worktree-') ? '<dir>' : s);
+  return log.map((c) => ({
+    args: c.args.map(scrub),
+    cwd: scrub(c.cwd),
+    lfsSkip: c.lfsSkip,
+  }));
 }
 
 async function runBoth(script: Scripted[], worktreeRoot: string) {
@@ -102,13 +122,25 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
     const { asyncLog, asyncOut, syncLog, syncOut } = await runBoth(script, tmp());
     expect(normalize(syncOut)).toEqual(normalize(asyncOut));
     expect(normalizeArgv(asyncLog)).toEqual(normalizeArgv(syncLog));
-    // The sequence itself, pinned once: common-dir → fetch → add → HEAD assert.
-    const flat = syncLog.map((a) => a.join(' '));
+    // The success outcome pinned CONCRETELY (not just twin-equal — twin-equal alone is
+    // satisfied by both twins failing the same way): a real Worktree at the right SHA.
+    expect(normalize(syncOut)).toEqual({
+      dir: '<dir>',
+      headSha: HEAD_SHA,
+      strippedInstructionFiles: [],
+    });
+    // The sequence itself, pinned once: common-dir → fetch → add → HEAD assert — and the
+    // side-channel halves of the contract: fetch/add run in the repo root with the LFS
+    // kill-switch env; the HEAD assert runs in the WORKTREE, not the repo.
+    const flat = syncLog.map((c) => c.args.join(' '));
     expect(flat).toHaveLength(4);
     expect(flat[0]).toBe('rev-parse --git-common-dir');
     expect(flat[1]).toContain('fetch');
     expect(flat[2]).toContain('worktree add');
     expect(flat[3]).toBe('rev-parse HEAD');
+    expect(syncLog[1]).toMatchObject({ cwd: '/repo', lfsSkip: true });
+    expect(syncLog[2]).toMatchObject({ cwd: '/repo', lfsSkip: true });
+    expect(syncLog[3].cwd).toContain('head');
   });
 
   it('fetch failure: same error kind, and NEITHER twin reaches worktree add', async () => {
@@ -120,20 +152,22 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
     expect(syncOut).toEqual(asyncOut);
     expect(syncOut).toMatchObject({ kind: 'network' });
     for (const log of [syncLog, asyncLog]) {
-      expect(log.some((a) => a.includes('worktree') && a.includes('add'))).toBe(false);
+      expect(log.some((c) => c.args.includes('worktree') && c.args.includes('add'))).toBe(false);
     }
     expect(normalizeArgv(asyncLog)).toEqual(normalizeArgv(syncLog));
   });
 
-  it('add failure: same taxonomy mapping', async () => {
+  it('add failure: same taxonomy mapping AND same argv sequence', async () => {
     const script: Scripted[] = [
       { match: is('rev-parse', '--git-common-dir'), text: '.git' },
       { error: 'fatal: invalid reference: aaaa', match: is('worktree', 'add') },
     ];
-    const { asyncLog, asyncOut, syncOut } = await runBoth(script, tmp());
+    const { asyncLog, asyncOut, syncLog, syncOut } = await runBoth(script, tmp());
     expect(syncOut).toEqual(asyncOut);
     expect(syncOut).toMatchObject({ kind: 'no-such-pr' });
-    expect(normalizeArgv(asyncLog).length).toBeGreaterThan(0);
+    // Full sequence equality — the first cut asserted only non-emptiness here, leaving
+    // the one branch with no cleanup unpinned (grok-f2/claude-f3 on this diff's review).
+    expect(normalizeArgv(asyncLog)).toEqual(normalizeArgv(syncLog));
   });
 
   it('sha-mismatch: both ABORT and both run the full reap sequence', async () => {
@@ -145,7 +179,7 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
     expect(syncOut).toEqual(asyncOut);
     expect(syncOut).toMatchObject({ kind: 'sha-mismatch' });
     for (const log of [syncLog, asyncLog]) {
-      const flat = log.map((a) => a.join(' '));
+      const flat = log.map((c) => c.args.join(' '));
       expect(flat.some((s) => s.includes('worktree remove --force'))).toBe(true);
       expect(flat.some((s) => s.includes('worktree prune'))).toBe(true);
     }
@@ -154,22 +188,75 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
 });
 
 describe('resolveRepoLocation twins', () => {
-  it('same happy path and same wrong-repo refusal', async () => {
+  it('happy path pinned CONCRETELY, plus the same wrong-repo refusal', async () => {
+    // Most-specific matcher FIRST: `is('remote')` also token-matches a `remote get-url`
+    // call, and with script.find() taking the first hit, the original ordering fed
+    // "origin" back as the URL — remoteSlug(null) → wrong-repo for BOTH twins, and the
+    // twin-equality assertion passed on a shared failure (codex-f2/grok-f1 on this diff's
+    // review: a parity test that only compares twins proves nothing about either).
     const script: Scripted[] = [
+      { match: is('remote', 'get-url'), text: 'git@github.com:o/r.git' },
       { match: is('rev-parse', '--show-toplevel'), text: '/repo' },
       { match: is('remote'), text: 'origin' },
-      { match: is('remote', 'get-url'), text: 'git@github.com:o/r.git' },
     ];
     const { async_, asyncLog, sync, syncLog } = scriptedGit(script);
     const argsOk = { prSlug: 'o/r', repoPath: '/repo' };
     const argsWrong = { prSlug: 'x/y', repoPath: '/repo' };
+    const syncOk = resolveRepoLocation(argsOk, { allowedRoots: null, git: sync });
+    // The concrete pin — a REAL RepoLocation, not merely "whatever sync returned":
+    expect(syncOk).toEqual({
+      fetchUrl: 'git@github.com:o/r.git',
+      repoRoot: '/repo',
+      slug: 'o/r',
+    });
     expect(
       await resolveRepoLocationAsync(argsOk, { allowedRoots: null, git: async_ })
-    ).toEqual(resolveRepoLocation(argsOk, { allowedRoots: null, git: sync }));
+    ).toEqual(syncOk);
+    const syncWrong = resolveRepoLocation(argsWrong, { allowedRoots: null, git: sync });
+    expect(syncWrong).toMatchObject({ kind: 'wrong-repo' });
     expect(
       await resolveRepoLocationAsync(argsWrong, { allowedRoots: null, git: async_ })
-    ).toEqual(resolveRepoLocation(argsWrong, { allowedRoots: null, git: sync }));
+    ).toEqual(syncWrong);
     expect(asyncLog).toEqual(syncLog);
+  });
+});
+
+describe('stripAgentInstructions twins', () => {
+  it('remove the same files from the same tree', async () => {
+    const make = () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'strip-parity-'));
+      fs.writeFileSync(path.join(dir, 'CLAUDE.md'), 'x');
+      fs.mkdirSync(path.join(dir, 'pkg'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'pkg', 'AGENTS.md'), 'x');
+      fs.mkdirSync(path.join(dir, '.cursor', 'rules'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.cursor', 'rules', 'a.mdc'), 'x');
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'keep.ts'), 'x');
+      return dir;
+    };
+    const a = make();
+    const b = make();
+    const syncRemoved = stripAgentInstructions(a);
+    const asyncRemoved = await stripAgentInstructionsAsync(b);
+    expect(asyncRemoved).toEqual(syncRemoved);
+    expect(syncRemoved).toEqual(['.cursor/rules', 'CLAUDE.md', 'pkg/AGENTS.md']);
+    for (const dir of [a, b]) {
+      expect(fs.existsSync(path.join(dir, 'src', 'keep.ts'))).toBe(true);
+      expect(fs.existsSync(path.join(dir, 'CLAUDE.md'))).toBe(false);
+    }
+  });
+});
+
+describe('the acquire refuses to mistake a caller bug for contention', () => {
+  it('a nonexistent lock dir throws IMMEDIATELY (both styles), never a full-budget hang', async () => {
+    const missing = path.join(os.tmpdir(), 'no-such-dir-parity', 'x');
+    // If these retried as contention they would take retries×sleep — the assertion is that
+    // they throw the real errno at once (claude-f4: a bare catch made every errno look
+    // like a held lock, a ~10-minute hang at server defaults).
+    expect(() => acquireRepoLock(missing, { retries: 1000, sleepMs: 50 })).toThrow(/ENOENT/);
+    await expect(
+      acquireRepoLockAsync(missing, { retries: 1000, sleepMs: 50 })
+    ).rejects.toThrow(/ENOENT/);
   });
 });
 

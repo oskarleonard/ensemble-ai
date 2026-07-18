@@ -320,6 +320,50 @@ export function stripAgentInstructions(dir: string): string[] {
   return removed.sort();
 }
 
+// Async twin of stripAgentInstructions — same walk, same removal set, same never-throws
+// contract, awaited fs. The sync version's recursive readdirSync walk is tree-sized work
+// (every directory of a large monorepo) and the async materialize path runs on a server's
+// event loop — calling the sync strip there would un-fix the exact freeze the async twins
+// exist to fix (cross-vendor review of this diff, codex-f1/claude-f2: the "never blocks the
+// loop" claim was false on this path as first written).
+export async function stripAgentInstructionsAsync(dir: string): Promise<string[]> {
+  const removed: string[] = [];
+  const remove = async (rel: string): Promise<void> => {
+    try {
+      await fs.promises.rm(path.join(dir, rel), { force: true, recursive: true });
+      removed.push(rel);
+    } catch {
+      /* left in place — it will still appear in the manifest, which is the honest report */
+    }
+  };
+  const walk = async (rel: string): Promise<void> => {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(path.join(dir, rel), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name === '.git') continue; // the worktree's gitdir pointer — not a tree file
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if ((AGENT_INSTRUCTION_NAMES as readonly string[]).includes(e.name)) {
+        await remove(childRel);
+      } else if (e.isDirectory() && e.name === CURSOR_DIR) {
+        try {
+          await fs.promises.access(path.join(dir, childRel, CURSOR_RULES));
+          await remove(`${childRel}/${CURSOR_RULES}`);
+        } catch {
+          /* no rules dir — nothing to strip */
+        }
+      } else if (e.isDirectory()) {
+        await walk(childRel);
+      }
+    }
+  };
+  await walk('');
+  return removed.sort();
+}
+
 // Is `p` the stripped path `s`, or a file underneath it (`.claude/settings.json` under `.claude`)?
 export function isStrippedPath(p: string, stripped: readonly string[]): boolean {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
@@ -359,7 +403,14 @@ function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => vo
     fs.writeSync(fd, token);
     fs.closeSync(fd);
     return () => removeLockIfOwned(lock, token);
-  } catch {
+  } catch (e) {
+    // ONLY EEXIST is contention. A bare catch here turned every other errno — a nonexistent
+    // gitCommonDir (ENOENT), a permissions refusal (EACCES), a read-only fs (EROFS) — into
+    // "someone holds the lock", which the acquire loop then retries for the FULL budget
+    // (~10 min at defaults). On a CLI that was a slow confusing failure; on a server request
+    // path it is a 10-minute hang for a caller bug that should throw in one millisecond.
+    // (Cross-vendor review of this very diff, claude-f4 — confirmed against the hunk.)
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
     try {
       const held = fs.readFileSync(lock, 'utf8').trim();
       const age = Date.now() - fs.statSync(lock).mtimeMs;
@@ -380,6 +431,13 @@ function lockPathAndBudget(gitCommonDir: string, opts: { retries?: number; sleep
   // Wait at least as long as the staleness TTL. A shorter budget could never reach the reclaim
   // branch, so a sibling holding the lock across a legitimately slow `git fetch` (a large repo,
   // a cold object store) would throw as "wedged" while it was merely working.
+  //
+  // THE HOLD-DURATION INVARIANT (protocol-wide, both waiting styles): the sum of in-lock op
+  // timeouts must stay comfortably below staleMs, or a slow-but-alive holder gets its lock
+  // reclaimed mid-materialization. Today: fetch(120s) + add(120s) + metadata ≪ 10 min, with
+  // margin. There is NO mtime heartbeat during a hold — if in-lock work ever grows past that
+  // margin, add one (touch the lock per completed op; protocol-compatible) rather than raising
+  // staleMs, which would also stretch every crash-recovery.
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
   return { lock, retries, sleepMs, staleMs };
 }
@@ -674,7 +732,7 @@ export async function materializeWorktreeAsync(
     const made = {
       dir,
       headSha: args.headSha,
-      strippedInstructionFiles: stripAgentInstructions(dir),
+      strippedInstructionFiles: await stripAgentInstructionsAsync(dir),
     };
     dir = null; // ownership transfers to the caller's try/finally
     return made;
@@ -684,9 +742,12 @@ export async function materializeWorktreeAsync(
   }
 }
 
-// Async twin of reapWorktree — same steps, same best-effort contract, awaited git. A server
-// reaper calling this on its poll loop no longer blocks the loop for the seconds a
-// `worktree remove` of a large tree takes.
+// Async twin of reapWorktree — same steps, same best-effort contract, awaited git AND
+// awaited fs: the fallback cleanup is a recursive rm of a full checkout, which is exactly
+// as tree-sized as the git work — an rmSync here would block the loop for the seconds a
+// large tree takes to delete, on the failure path, which is when the server is already
+// having a bad time (cross-vendor review of this diff, codex-f1 — the first cut shipped
+// rmSync and the "no longer blocks the loop" claim was false).
 export async function reapWorktreeAsync(
   repoRoot: string,
   dir: string,
@@ -698,14 +759,14 @@ export async function reapWorktreeAsync(
     /* best-effort */
   }
   try {
-    fs.rmSync(dir, { force: true, recursive: true });
+    await fs.promises.rm(dir, { force: true, recursive: true });
   } catch {
     /* best-effort */
   }
   try {
     const parent = path.dirname(dir);
     if (path.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
-      fs.rmSync(parent, { force: true, recursive: true });
+      await fs.promises.rm(parent, { force: true, recursive: true });
     }
   } catch {
     /* best-effort */

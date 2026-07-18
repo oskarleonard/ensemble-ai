@@ -3004,7 +3004,8 @@ function tryAcquireOnce(lock, token, staleMs) {
     fs14.writeSync(fd, token);
     fs14.closeSync(fd);
     return () => removeLockIfOwned(lock, token);
-  } catch {
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e;
     try {
       const held = fs14.readFileSync(lock, "utf8").trim();
       const age = Date.now() - fs14.statSync(lock).mtimeMs;

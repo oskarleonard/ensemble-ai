@@ -1984,6 +1984,41 @@ function stripAgentInstructions(dir) {
   walk("");
   return removed.sort();
 }
+async function stripAgentInstructionsAsync(dir) {
+  const removed = [];
+  const remove = async (rel) => {
+    try {
+      await fs12.promises.rm(path10.join(dir, rel), { force: true, recursive: true });
+      removed.push(rel);
+    } catch {
+    }
+  };
+  const walk = async (rel) => {
+    let entries;
+    try {
+      entries = await fs12.promises.readdir(path10.join(dir, rel), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name === ".git") continue;
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (AGENT_INSTRUCTION_NAMES.includes(e.name)) {
+        await remove(childRel);
+      } else if (e.isDirectory() && e.name === CURSOR_DIR) {
+        try {
+          await fs12.promises.access(path10.join(dir, childRel, CURSOR_RULES));
+          await remove(`${childRel}/${CURSOR_RULES}`);
+        } catch {
+        }
+      } else if (e.isDirectory()) {
+        await walk(childRel);
+      }
+    }
+  };
+  await walk("");
+  return removed.sort();
+}
 function isStrippedPath(p, stripped) {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
@@ -2002,7 +2037,8 @@ function tryAcquireOnce(lock, token, staleMs) {
     fs12.writeSync(fd, token);
     fs12.closeSync(fd);
     return () => removeLockIfOwned(lock, token);
-  } catch {
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e;
     try {
       const held = fs12.readFileSync(lock, "utf8").trim();
       const age = Date.now() - fs12.statSync(lock).mtimeMs;
@@ -2204,7 +2240,7 @@ async function materializeWorktreeAsync(args, deps) {
     const made = {
       dir,
       headSha: args.headSha,
-      strippedInstructionFiles: stripAgentInstructions(dir)
+      strippedInstructionFiles: await stripAgentInstructionsAsync(dir)
     };
     dir = null;
     return made;
@@ -2219,13 +2255,13 @@ async function reapWorktreeAsync(repoRoot, dir, deps) {
   } catch {
   }
   try {
-    fs12.rmSync(dir, { force: true, recursive: true });
+    await fs12.promises.rm(dir, { force: true, recursive: true });
   } catch {
   }
   try {
     const parent = path10.dirname(dir);
     if (path10.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
-      fs12.rmSync(parent, { force: true, recursive: true });
+      await fs12.promises.rm(parent, { force: true, recursive: true });
     }
   } catch {
   }
@@ -5191,6 +5227,7 @@ export {
   sha256Hex,
   stageReview,
   stripAgentInstructions,
+  stripAgentInstructionsAsync,
   stripSecurityTag,
   summarizeCoverage,
   titleCase,
