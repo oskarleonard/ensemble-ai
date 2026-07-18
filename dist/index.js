@@ -1840,6 +1840,7 @@ function persistGatePacket(baseDir, runId, input) {
 import { randomUUID } from "crypto";
 import fs12 from "fs";
 import path10 from "path";
+import { setTimeout as sleepAsync } from "timers/promises";
 var WORKTREE_LOCK_ERROR = "could not acquire the worktree lock";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
@@ -1995,31 +1996,53 @@ function removeLockIfOwned(lock, token) {
   } catch {
   }
 }
-function acquireRepoLock(gitCommonDir, opts = {}) {
+function tryAcquireOnce(lock, token, staleMs) {
+  try {
+    const fd = fs12.openSync(lock, fs12.constants.O_CREAT | fs12.constants.O_EXCL | fs12.constants.O_WRONLY, 384);
+    fs12.writeSync(fd, token);
+    fs12.closeSync(fd);
+    return () => removeLockIfOwned(lock, token);
+  } catch {
+    try {
+      const held = fs12.readFileSync(lock, "utf8").trim();
+      const age = Date.now() - fs12.statSync(lock).mtimeMs;
+      if (age > staleMs) removeLockIfOwned(lock, held);
+    } catch {
+    }
+    return null;
+  }
+}
+function lockPathAndBudget(gitCommonDir, opts) {
   const lock = path10.join(gitCommonDir, "ensemble-ai-worktree.lock");
   const sleepMs = opts.sleepMs ?? 500;
   const staleMs = opts.staleMs ?? 10 * 6e4;
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
-  const token = lockToken();
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const fd = fs12.openSync(lock, fs12.constants.O_CREAT | fs12.constants.O_EXCL | fs12.constants.O_WRONLY, 384);
-      fs12.writeSync(fd, token);
-      fs12.closeSync(fd);
-      return () => removeLockIfOwned(lock, token);
-    } catch {
-      try {
-        const held = fs12.readFileSync(lock, "utf8").trim();
-        const age = Date.now() - fs12.statSync(lock).mtimeMs;
-        if (age > staleMs) removeLockIfOwned(lock, held);
-      } catch {
-      }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleepMs);
-    }
-  }
-  throw new Error(
+  return { lock, retries, sleepMs, staleMs };
+}
+function lockWedgedError(lock, retries, sleepMs) {
+  return new Error(
     `ensemble-ai: ${WORKTREE_LOCK_ERROR} at ${lock} after ${retries} attempts (${Math.round(retries * sleepMs / 1e3)}s) \u2014 another review is materializing a worktree in this repo`
   );
+}
+function acquireRepoLock(gitCommonDir, opts = {}) {
+  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const token = lockToken();
+  for (let i = 0; i <= retries; i++) {
+    const release = tryAcquireOnce(lock, token, staleMs);
+    if (release) return release;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleepMs);
+  }
+  throw lockWedgedError(lock, retries, sleepMs);
+}
+async function acquireRepoLockAsync(gitCommonDir, opts = {}) {
+  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const token = lockToken();
+  for (let i = 0; i <= retries; i++) {
+    const release = tryAcquireOnce(lock, token, staleMs);
+    if (release) return release;
+    await sleepAsync(sleepMs);
+  }
+  throw lockWedgedError(lock, retries, sleepMs);
 }
 function materializeWorktree(args, deps) {
   const { location } = args;
@@ -2096,6 +2119,118 @@ function reapWorktree(repoRoot, dir, deps) {
   }
   try {
     deps.git([...INERT_GIT_CONFIG, "worktree", "prune"], { cwd: repoRoot });
+  } catch {
+  }
+}
+async function resolveRepoLocationAsync(args, deps) {
+  const repoPath = path10.resolve(args.repoPath);
+  const top = await deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
+  if (!top.ok) {
+    return {
+      kind: "not-a-repo",
+      message: `--repo ${repoPath} is not a git repository (${top.error.trim() || "rev-parse failed"})`
+    };
+  }
+  const repoRoot = top.text.trim();
+  const allowed = deps.allowedRoots === void 0 ? allowedRootsFromConfig() : deps.allowedRoots;
+  if (!rootAllowed(repoRoot, allowed)) {
+    return {
+      kind: "disallowed-root",
+      message: `${repoRoot} is not under any allowedRepoRoots entry in your ensemble-ai config \u2014 refusing to materialize a worktree outside the roots you allowed`
+    };
+  }
+  const remotes = await deps.git(["remote"], { cwd: repoRoot });
+  const names = remotes.ok ? remotes.text.split("\n").map((s) => s.trim()).filter(Boolean) : [];
+  const want = args.prSlug.toLowerCase();
+  const seen = [];
+  for (const name of names) {
+    const url = await deps.git(["remote", "get-url", name], { cwd: repoRoot });
+    if (!url.ok) continue;
+    const raw = url.text.trim();
+    const slug2 = remoteSlug(raw);
+    if (slug2) seen.push(slug2);
+    if (slug2 === want) return { fetchUrl: raw, repoRoot, slug: want };
+  }
+  return {
+    kind: "wrong-repo",
+    message: `--repo ${repoRoot} does not have a remote pointing at ${args.prSlug} (found: ${seen.length ? seen.join(", ") : "no GitHub remotes"}) \u2014 refusing to fetch a PR into an unrelated repo`
+  };
+}
+async function materializeWorktreeAsync(args, deps) {
+  const { location } = args;
+  const common = await deps.git(["rev-parse", "--git-common-dir"], { cwd: location.repoRoot });
+  if (!common.ok) {
+    return { kind: "not-a-repo", message: `cannot resolve the git dir of ${location.repoRoot}` };
+  }
+  const gitCommonDir = path10.resolve(location.repoRoot, common.text.trim());
+  const release = await (deps.lock ?? acquireRepoLockAsync)(gitCommonDir);
+  let dir = null;
+  try {
+    const fetched = await deps.git(
+      [
+        ...INERT_GIT_CONFIG,
+        "fetch",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--no-write-fetch-head",
+        location.fetchUrl,
+        `pull/${args.pr}/head`
+      ],
+      { cwd: location.repoRoot, env: INERT_ENV }
+    );
+    if (!fetched.ok) {
+      return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
+    }
+    const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
+    dir = path10.join(parent, "head");
+    const added = await deps.git(
+      [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
+      { cwd: location.repoRoot, env: INERT_ENV }
+    );
+    if (!added.ok) {
+      const kind = /invalid reference|not a valid object|unknown revision/i.test(added.error) ? "no-such-pr" : classifyGitError(added.error);
+      return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
+    }
+    const head = await deps.git(["rev-parse", "HEAD"], { cwd: dir });
+    const actual = head.ok ? head.text.trim() : "";
+    if (actual !== args.headSha) {
+      await reapWorktreeAsync(location.repoRoot, dir, deps);
+      dir = null;
+      return {
+        kind: "sha-mismatch",
+        message: `worktree HEAD is ${actual || "(unresolvable)"} but the review is tied to ${args.headSha} \u2014 ABORTING rather than reviewing wrong-SHA evidence`
+      };
+    }
+    const made = {
+      dir,
+      headSha: args.headSha,
+      strippedInstructionFiles: stripAgentInstructions(dir)
+    };
+    dir = null;
+    return made;
+  } finally {
+    if (dir) await reapWorktreeAsync(location.repoRoot, dir, deps);
+    release();
+  }
+}
+async function reapWorktreeAsync(repoRoot, dir, deps) {
+  try {
+    await deps.git([...INERT_GIT_CONFIG, "worktree", "remove", "--force", dir], { cwd: repoRoot });
+  } catch {
+  }
+  try {
+    fs12.rmSync(dir, { force: true, recursive: true });
+  } catch {
+  }
+  try {
+    const parent = path10.dirname(dir);
+    if (path10.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
+      fs12.rmSync(parent, { force: true, recursive: true });
+    }
+  } catch {
+  }
+  try {
+    await deps.git([...INERT_GIT_CONFIG, "worktree", "prune"], { cwd: repoRoot });
   } catch {
   }
 }
@@ -4890,6 +5025,7 @@ export {
   WORKTREE_LOCK_ERROR,
   acquireDiff,
   acquireRepoLock,
+  acquireRepoLockAsync,
   allowedRootsFromConfig,
   applyHolisticPolicy,
   asRecord,
@@ -4969,6 +5105,7 @@ export {
   makeNeutralSeatCwd,
   makeOwnerOnlyTempDir,
   materializeWorktree,
+  materializeWorktreeAsync,
   materializedDiffClause,
   meetsInlineFloor,
   memoryConventionReader,
@@ -4999,6 +5136,7 @@ export {
   readReview,
   readReviewsForRun,
   reapWorktree,
+  reapWorktreeAsync,
   receiptIdentityMatches,
   receiptKeyHash,
   receiptPath,
@@ -5028,6 +5166,7 @@ export {
   resolveReceipt,
   resolveRepoId,
   resolveRepoLocation,
+  resolveRepoLocationAsync,
   resolveReviewSandbox,
   resolveReviewer,
   reviewDir,
