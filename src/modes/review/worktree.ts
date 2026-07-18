@@ -311,6 +311,11 @@ export function stripAgentInstructions(dir: string): string[] {
         if (fs.existsSync(path.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
+        // ALSO walk the rest of .cursor: the tree is untrusted PR content, and an
+        // instruction file planted at `.cursor/CLAUDE.md` used to survive because this
+        // branch returned without recursing (r2 review of the async-twins diff, claude-f4
+        // — pre-existing in this sync walk, fixed in both twins identically).
+        walk(childRel);
       } else if (e.isDirectory()) {
         walk(childRel);
       }
@@ -355,6 +360,9 @@ export async function stripAgentInstructionsAsync(dir: string): Promise<string[]
         } catch {
           /* no rules dir — nothing to strip */
         }
+        // Same recursion as the sync twin (see its comment): a planted
+        // `.cursor/CLAUDE.md` must not survive the strip.
+        await walk(childRel);
       } else if (e.isDirectory()) {
         await walk(childRel);
       }
@@ -400,7 +408,26 @@ function removeLockIfOwned(lock: string, token: string): void {
 function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => void) | null {
   try {
     const fd = fs.openSync(lock, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-    fs.writeSync(fd, token);
+    // The write/close can fail AFTER the exclusive create succeeded (ENOSPC, EIO). Left
+    // alone that leaks the fd and strands a zero-byte lock file no one owns — every later
+    // acquire then reads contention until the staleMs reclaim (~10 min). We created the
+    // file in THIS call, so on failure it is unconditionally ours to remove (r2 review,
+    // grok-f1/claude-f3 — both vendors reconstructed the same mechanism independently).
+    try {
+      fs.writeSync(fd, token);
+    } catch (we) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* the unlink below is the recovery that matters */
+      }
+      try {
+        fs.unlinkSync(lock);
+      } catch {
+        /* worst case: the stale reclaim gets it */
+      }
+      throw we;
+    }
     fs.closeSync(fd);
     return () => removeLockIfOwned(lock, token);
   } catch (e) {
@@ -426,7 +453,10 @@ function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => vo
 
 function lockPathAndBudget(gitCommonDir: string, opts: { retries?: number; sleepMs?: number; staleMs?: number }) {
   const lock = path.join(gitCommonDir, 'ensemble-ai-worktree.lock');
-  const sleepMs = opts.sleepMs ?? 500;
+  // Clamped ≥1: `?? 500` is nullish-only, so an explicit sleepMs of 0 slipped through and
+  // made the derived retry budget `Math.ceil(staleMs / 0) = Infinity` — a loop that can
+  // never reach lockWedgedError, spinning at full CPU in the sync acquire (r2, codex-f1).
+  const sleepMs = Math.max(1, opts.sleepMs ?? 500);
   const staleMs = opts.staleMs ?? 10 * 60_000;
   // Wait at least as long as the staleness TTL. A shorter budget could never reach the reclaim
   // branch, so a sibling holding the lock across a legitimately slow `git fetch` (a large repo,
@@ -478,6 +508,12 @@ export function acquireRepoLock(
 // every other request hostage. Mixed holders interoperate live — an old sync CLI holding the
 // lock makes this waiter retry, and vice versa — because the protocol is the file, not the
 // caller's threading model.
+//
+// NO CANCELLATION IN v1 — do not abandon the returned promise. A caller that Promise.races
+// this and walks away leaves the loop polling; if it later acquires, the lock is held with
+// no releaser until the staleMs reclaim. Bound waiting with `retries`, never with a race
+// (r2 review, claude-f1 — accepted as a documented contract rather than grown into an
+// AbortSignal API no current consumer needs).
 export async function acquireRepoLockAsync(
   gitCommonDir: string,
   opts: { retries?: number; sleepMs?: number; staleMs?: number } = {}

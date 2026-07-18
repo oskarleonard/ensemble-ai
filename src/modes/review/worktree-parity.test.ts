@@ -230,6 +230,10 @@ describe('stripAgentInstructions twins', () => {
       fs.writeFileSync(path.join(dir, 'pkg', 'AGENTS.md'), 'x');
       fs.mkdirSync(path.join(dir, '.cursor', 'rules'), { recursive: true });
       fs.writeFileSync(path.join(dir, '.cursor', 'rules', 'a.mdc'), 'x');
+      // The adversarial plant (r2, claude-f4): an instruction file INSIDE .cursor used to
+      // survive because the walk never recursed past the rules check — the tree is
+      // untrusted PR content, so the strip must reach it.
+      fs.writeFileSync(path.join(dir, '.cursor', 'CLAUDE.md'), 'planted');
       fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
       fs.writeFileSync(path.join(dir, 'src', 'keep.ts'), 'x');
       return dir;
@@ -239,17 +243,29 @@ describe('stripAgentInstructions twins', () => {
     const syncRemoved = stripAgentInstructions(a);
     const asyncRemoved = await stripAgentInstructionsAsync(b);
     expect(asyncRemoved).toEqual(syncRemoved);
-    expect(syncRemoved).toEqual(['.cursor/rules', 'CLAUDE.md', 'pkg/AGENTS.md']);
+    expect(syncRemoved).toEqual([
+      '.cursor/CLAUDE.md',
+      '.cursor/rules',
+      'CLAUDE.md',
+      'pkg/AGENTS.md',
+    ]);
     for (const dir of [a, b]) {
       expect(fs.existsSync(path.join(dir, 'src', 'keep.ts'))).toBe(true);
       expect(fs.existsSync(path.join(dir, 'CLAUDE.md'))).toBe(false);
+      expect(fs.existsSync(path.join(dir, '.cursor', 'CLAUDE.md'))).toBe(false);
     }
   });
 });
 
 describe('the acquire refuses to mistake a caller bug for contention', () => {
   it('a nonexistent lock dir throws IMMEDIATELY (both styles), never a full-budget hang', async () => {
-    const missing = path.join(os.tmpdir(), 'no-such-dir-parity', 'x');
+    // Hermetic: a fresh mkdtemp parent guarantees the child path cannot pre-exist on the
+    // host (r2, codex-f2 — a fixed tmpdir path is host-state the test doesn't own).
+    const missing = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'enoent-parity-')),
+      'definitely-missing',
+      'x'
+    );
     // If these retried as contention they would take retries×sleep — the assertion is that
     // they throw the real errno at once (claude-f4: a bare catch made every errno look
     // like a held lock, a ~10-minute hang at server defaults).

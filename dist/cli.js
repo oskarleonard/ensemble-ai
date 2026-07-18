@@ -2978,6 +2978,7 @@ function stripAgentInstructions(dir) {
         if (fs14.existsSync(path11.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
+        walk(childRel);
       } else if (e.isDirectory()) {
         walk(childRel);
       }
@@ -3001,7 +3002,19 @@ function removeLockIfOwned(lock, token) {
 function tryAcquireOnce(lock, token, staleMs) {
   try {
     const fd = fs14.openSync(lock, fs14.constants.O_CREAT | fs14.constants.O_EXCL | fs14.constants.O_WRONLY, 384);
-    fs14.writeSync(fd, token);
+    try {
+      fs14.writeSync(fd, token);
+    } catch (we) {
+      try {
+        fs14.closeSync(fd);
+      } catch {
+      }
+      try {
+        fs14.unlinkSync(lock);
+      } catch {
+      }
+      throw we;
+    }
     fs14.closeSync(fd);
     return () => removeLockIfOwned(lock, token);
   } catch (e) {
@@ -3017,7 +3030,7 @@ function tryAcquireOnce(lock, token, staleMs) {
 }
 function lockPathAndBudget(gitCommonDir, opts) {
   const lock = path11.join(gitCommonDir, "ensemble-ai-worktree.lock");
-  const sleepMs = opts.sleepMs ?? 500;
+  const sleepMs = Math.max(1, opts.sleepMs ?? 500);
   const staleMs = opts.staleMs ?? 10 * 6e4;
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
   return { lock, retries, sleepMs, staleMs };

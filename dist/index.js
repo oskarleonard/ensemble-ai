@@ -1976,6 +1976,7 @@ function stripAgentInstructions(dir) {
         if (fs12.existsSync(path10.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
+        walk(childRel);
       } else if (e.isDirectory()) {
         walk(childRel);
       }
@@ -2011,6 +2012,7 @@ async function stripAgentInstructionsAsync(dir) {
           await remove(`${childRel}/${CURSOR_RULES}`);
         } catch {
         }
+        await walk(childRel);
       } else if (e.isDirectory()) {
         await walk(childRel);
       }
@@ -2034,7 +2036,19 @@ function removeLockIfOwned(lock, token) {
 function tryAcquireOnce(lock, token, staleMs) {
   try {
     const fd = fs12.openSync(lock, fs12.constants.O_CREAT | fs12.constants.O_EXCL | fs12.constants.O_WRONLY, 384);
-    fs12.writeSync(fd, token);
+    try {
+      fs12.writeSync(fd, token);
+    } catch (we) {
+      try {
+        fs12.closeSync(fd);
+      } catch {
+      }
+      try {
+        fs12.unlinkSync(lock);
+      } catch {
+      }
+      throw we;
+    }
     fs12.closeSync(fd);
     return () => removeLockIfOwned(lock, token);
   } catch (e) {
@@ -2050,7 +2064,7 @@ function tryAcquireOnce(lock, token, staleMs) {
 }
 function lockPathAndBudget(gitCommonDir, opts) {
   const lock = path10.join(gitCommonDir, "ensemble-ai-worktree.lock");
-  const sleepMs = opts.sleepMs ?? 500;
+  const sleepMs = Math.max(1, opts.sleepMs ?? 500);
   const staleMs = opts.staleMs ?? 10 * 6e4;
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
   return { lock, retries, sleepMs, staleMs };
