@@ -242,6 +242,20 @@ const CURSOR_RULES = 'rules';
 // different list than `stripAgentInstructions` actually removes.
 const STRIPPED_INSTRUCTION_PATHS = [...AGENT_INSTRUCTION_NAMES, `${CURSOR_DIR}/${CURSOR_RULES}`];
 
+// CASE-INSENSITIVE name matching for the strip (r3 review, claude-f1 — agree-grounded):
+// macOS and Windows filesystems are case-insensitive by default, so a PR author's
+// `Agents.MD` or `claude.md` is the SAME file the agent CLI would read — but an exact-case
+// `includes(e.name)` walked right past it. Matching lowercased names closes the bypass on
+// the platforms where it exists and costs nothing on case-sensitive Linux (a literal
+// `Agents.MD` there is a different file the CLIs would NOT read — removing it too is the
+// safe direction for untrusted content).
+const AGENT_INSTRUCTION_NAMES_LC = new Set(
+  (AGENT_INSTRUCTION_NAMES as readonly string[]).map((n) => n.toLowerCase())
+);
+const isInstructionName = (name: string): boolean =>
+  AGENT_INSTRUCTION_NAMES_LC.has(name.toLowerCase());
+const isCursorDir = (name: string): boolean => name.toLowerCase() === CURSOR_DIR;
+
 // The untrusted-instruction rule, stated ONCE for every fenced Anthropic seat prompt (the cold
 // producer, the `/code-review` seat, the holistic lens). It is the prose half of the strip below:
 // the fence removes the author's instructions, and this tells the seat why any that survive inside
@@ -305,9 +319,9 @@ export function stripAgentInstructions(dir: string): string[] {
     for (const e of entries) {
       if (e.name === '.git') continue; // the worktree's gitdir pointer — not a tree file
       const childRel = rel ? `${rel}/${e.name}` : e.name;
-      if ((AGENT_INSTRUCTION_NAMES as readonly string[]).includes(e.name)) {
+      if (isInstructionName(e.name)) {
         remove(childRel);
-      } else if (e.isDirectory() && e.name === CURSOR_DIR) {
+      } else if (e.isDirectory() && isCursorDir(e.name)) {
         if (fs.existsSync(path.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
@@ -351,9 +365,9 @@ export async function stripAgentInstructionsAsync(dir: string): Promise<string[]
     for (const e of entries) {
       if (e.name === '.git') continue; // the worktree's gitdir pointer — not a tree file
       const childRel = rel ? `${rel}/${e.name}` : e.name;
-      if ((AGENT_INSTRUCTION_NAMES as readonly string[]).includes(e.name)) {
+      if (isInstructionName(e.name)) {
         await remove(childRel);
-      } else if (e.isDirectory() && e.name === CURSOR_DIR) {
+      } else if (e.isDirectory() && isCursorDir(e.name)) {
         try {
           await fs.promises.access(path.join(dir, childRel, CURSOR_RULES));
           await remove(`${childRel}/${CURSOR_RULES}`);
@@ -408,18 +422,20 @@ function removeLockIfOwned(lock: string, token: string): void {
 function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => void) | null {
   try {
     const fd = fs.openSync(lock, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-    // The write/close can fail AFTER the exclusive create succeeded (ENOSPC, EIO). Left
-    // alone that leaks the fd and strands a zero-byte lock file no one owns — every later
-    // acquire then reads contention until the staleMs reclaim (~10 min). We created the
-    // file in THIS call, so on failure it is unconditionally ours to remove (r2 review,
-    // grok-f1/claude-f3 — both vendors reconstructed the same mechanism independently).
+    // ANY failure after the exclusive create — write OR close — must unlink the lock this
+    // process just made, or it strands a lock file with no releaser and every later acquire
+    // reads contention until the staleMs reclaim (~10 min). The r2 fix guarded only the
+    // write and left the trailing closeSync OUTSIDE the recovery — the same strand class,
+    // one line later; r3's only unanimous finding (codex+grok+claude, grounded verbatim).
+    // The file is unconditionally ours on this path: O_EXCL proved we created it.
     try {
       fs.writeSync(fd, token);
+      fs.closeSync(fd);
     } catch (we) {
       try {
         fs.closeSync(fd);
       } catch {
-        /* the unlink below is the recovery that matters */
+        /* already closed, or close is what failed — the unlink below is the recovery */
       }
       try {
         fs.unlinkSync(lock);
@@ -428,7 +444,6 @@ function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => vo
       }
       throw we;
     }
-    fs.closeSync(fd);
     return () => removeLockIfOwned(lock, token);
   } catch (e) {
     // ONLY EEXIST is contention. A bare catch here turned every other errno — a nonexistent
@@ -487,6 +502,7 @@ export function acquireRepoLock(
   for (let i = 0; i <= retries; i++) {
     const release = tryAcquireOnce(lock, token, staleMs);
     if (release) return release;
+    if (i === retries) break; // the budget is spent — don't sleep just to throw (r3, grok-f2)
     // Synchronous sleep because THIS FUNCTION is synchronous (the CLI path has nothing else to
     // do) — NOT because the exclusion needs it. The lock is the O_EXCL FILE: its held state is
     // indifferent to what the holder's thread does, and a sibling's create fails on the file,
@@ -523,6 +539,7 @@ export async function acquireRepoLockAsync(
   for (let i = 0; i <= retries; i++) {
     const release = tryAcquireOnce(lock, token, staleMs);
     if (release) return release;
+    if (i === retries) break; // the budget is spent — don't sleep just to throw (r3, grok-f2)
     await sleepAsync(sleepMs);
   }
   throw lockWedgedError(lock, retries, sleepMs);

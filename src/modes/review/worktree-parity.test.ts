@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   acquireRepoLock,
@@ -168,6 +168,13 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
     // Full sequence equality — the first cut asserted only non-emptiness here, leaving
     // the one branch with no cleanup unpinned (grok-f2/claude-f3 on this diff's review).
     expect(normalizeArgv(asyncLog)).toEqual(normalizeArgv(syncLog));
+    // And the cleanup pinned CONCRETELY, like the sha-mismatch case (r3, grok-f3): the
+    // finally-reap runs on add-failure too — remove + prune must both appear.
+    for (const log of [syncLog, asyncLog]) {
+      const flat = log.map((c) => c.args.join(' '));
+      expect(flat.some((s) => s.includes('worktree remove --force'))).toBe(true);
+      expect(flat.some((s) => s.includes('worktree prune'))).toBe(true);
+    }
   });
 
   it('sha-mismatch: both ABORT and both run the full reap sequence', async () => {
@@ -234,6 +241,10 @@ describe('stripAgentInstructions twins', () => {
       // survive because the walk never recursed past the rules check — the tree is
       // untrusted PR content, so the strip must reach it.
       fs.writeFileSync(path.join(dir, '.cursor', 'CLAUDE.md'), 'planted');
+      // Case-variant plant (r3, claude-f1): on macOS/Windows this IS the file the agent
+      // CLI would read; exact-case matching walked right past it.
+      fs.mkdirSync(path.join(dir, 'lib'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'lib', 'Agents.MD'), 'planted');
       fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
       fs.writeFileSync(path.join(dir, 'src', 'keep.ts'), 'x');
       return dir;
@@ -247,6 +258,7 @@ describe('stripAgentInstructions twins', () => {
       '.cursor/CLAUDE.md',
       '.cursor/rules',
       'CLAUDE.md',
+      'lib/Agents.MD',
       'pkg/AGENTS.md',
     ]);
     for (const dir of [a, b]) {
@@ -254,6 +266,62 @@ describe('stripAgentInstructions twins', () => {
       expect(fs.existsSync(path.join(dir, 'CLAUDE.md'))).toBe(false);
       expect(fs.existsSync(path.join(dir, '.cursor', 'CLAUDE.md'))).toBe(false);
     }
+  });
+});
+
+describe('a post-create failure never strands the lock (r3: the unanimous finding)', () => {
+  // The r2 fix guarded the write and left the trailing closeSync outside the recovery —
+  // the same strand class one line later, caught independently by all three vendors in r3.
+  // Both failure points are pinned: after EITHER throws, the lock file must be GONE (a
+  // stranded file would wedge every later acquire for the full staleMs).
+  it.each([['writeSync'], ['closeSync']] as const)(
+    'fs.%s failure after O_EXCL create unlinks the just-created lock',
+    async (fn) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'strand-'));
+      const lock = path.join(dir, 'ensemble-ai-worktree.lock');
+      const spy = vi.spyOn(fs, fn).mockImplementationOnce(() => {
+        throw Object.assign(new Error('ENOSPC: fake'), { code: 'ENOSPC' });
+      });
+      try {
+        await expect(
+          acquireRepoLockAsync(dir, { retries: 0, sleepMs: 1 })
+        ).rejects.toThrow('ENOSPC');
+        expect(fs.existsSync(lock)).toBe(false);
+      } finally {
+        spy.mockRestore();
+      }
+      // And the very next acquire succeeds instantly — nothing was stranded.
+      (await acquireRepoLockAsync(dir, { retries: 0, sleepMs: 1 }))();
+    }
+  );
+});
+
+describe('real-lock wiring parity (no injected stub)', () => {
+  it('both twins acquire + RELEASE the real lock around a materialization', async () => {
+    // The other materialize cases inject a no-op lock, so a twin that dropped its lock
+    // wiring entirely would still pass them (r3, claude-f3). Here the scripted git points
+    // git-common-dir at a REAL temp dir and no lock is injected: success requires a real
+    // acquire, and a clean release leaves no lock file behind.
+    const common = fs.mkdtempSync(path.join(os.tmpdir(), 'lockwire-'));
+    const lockFile = path.join(common, 'ensemble-ai-worktree.lock');
+    const script: Scripted[] = [
+      { match: is('rev-parse', '--git-common-dir'), text: common },
+      { match: is('rev-parse', 'HEAD'), text: HEAD_SHA },
+    ];
+    const { async_, sync } = scriptedGit(script);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'parity-'));
+    const syncOut = materializeWorktree(
+      { headSha: HEAD_SHA, location: LOCATION, pr: 7, worktreeRoot: root },
+      { git: sync }
+    );
+    expect(normalize(syncOut)).toMatchObject({ headSha: HEAD_SHA });
+    expect(fs.existsSync(lockFile)).toBe(false); // released, not stranded
+    const asyncOut = await materializeWorktreeAsync(
+      { headSha: HEAD_SHA, location: LOCATION, pr: 7, worktreeRoot: root },
+      { git: async_ }
+    );
+    expect(normalize(asyncOut)).toMatchObject({ headSha: HEAD_SHA });
+    expect(fs.existsSync(lockFile)).toBe(false);
   });
 });
 
