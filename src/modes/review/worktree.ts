@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { setTimeout as sleepAsync } from 'node:timers/promises';
 
 import { makeOwnerOnlyTempDir } from '../../core/artifacts';
 
@@ -241,6 +242,20 @@ const CURSOR_RULES = 'rules';
 // different list than `stripAgentInstructions` actually removes.
 const STRIPPED_INSTRUCTION_PATHS = [...AGENT_INSTRUCTION_NAMES, `${CURSOR_DIR}/${CURSOR_RULES}`];
 
+// CASE-INSENSITIVE name matching for the strip (r3 review, claude-f1 — agree-grounded):
+// macOS and Windows filesystems are case-insensitive by default, so a PR author's
+// `Agents.MD` or `claude.md` is the SAME file the agent CLI would read — but an exact-case
+// `includes(e.name)` walked right past it. Matching lowercased names closes the bypass on
+// the platforms where it exists and costs nothing on case-sensitive Linux (a literal
+// `Agents.MD` there is a different file the CLIs would NOT read — removing it too is the
+// safe direction for untrusted content).
+const AGENT_INSTRUCTION_NAMES_LC = new Set(
+  (AGENT_INSTRUCTION_NAMES as readonly string[]).map((n) => n.toLowerCase())
+);
+const isInstructionName = (name: string): boolean =>
+  AGENT_INSTRUCTION_NAMES_LC.has(name.toLowerCase());
+const isCursorDir = (name: string): boolean => name.toLowerCase() === CURSOR_DIR;
+
 // The untrusted-instruction rule, stated ONCE for every fenced Anthropic seat prompt (the cold
 // producer, the `/code-review` seat, the holistic lens). It is the prose half of the strip below:
 // the fence removes the author's instructions, and this tells the seat why any that survive inside
@@ -304,18 +319,70 @@ export function stripAgentInstructions(dir: string): string[] {
     for (const e of entries) {
       if (e.name === '.git') continue; // the worktree's gitdir pointer — not a tree file
       const childRel = rel ? `${rel}/${e.name}` : e.name;
-      if ((AGENT_INSTRUCTION_NAMES as readonly string[]).includes(e.name)) {
+      if (isInstructionName(e.name)) {
         remove(childRel);
-      } else if (e.isDirectory() && e.name === CURSOR_DIR) {
+      } else if (e.isDirectory() && isCursorDir(e.name)) {
         if (fs.existsSync(path.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
+        // ALSO walk the rest of .cursor: the tree is untrusted PR content, and an
+        // instruction file planted at `.cursor/CLAUDE.md` used to survive because this
+        // branch returned without recursing (r2 review of the async-twins diff, claude-f4
+        // — pre-existing in this sync walk, fixed in both twins identically).
+        walk(childRel);
       } else if (e.isDirectory()) {
         walk(childRel);
       }
     }
   };
   walk('');
+  return removed.sort();
+}
+
+// Async twin of stripAgentInstructions — same walk, same removal set, same never-throws
+// contract, awaited fs. The sync version's recursive readdirSync walk is tree-sized work
+// (every directory of a large monorepo) and the async materialize path runs on a server's
+// event loop — calling the sync strip there would un-fix the exact freeze the async twins
+// exist to fix (cross-vendor review of this diff, codex-f1/claude-f2: the "never blocks the
+// loop" claim was false on this path as first written).
+export async function stripAgentInstructionsAsync(dir: string): Promise<string[]> {
+  const removed: string[] = [];
+  const remove = async (rel: string): Promise<void> => {
+    try {
+      await fs.promises.rm(path.join(dir, rel), { force: true, recursive: true });
+      removed.push(rel);
+    } catch {
+      /* left in place — it will still appear in the manifest, which is the honest report */
+    }
+  };
+  const walk = async (rel: string): Promise<void> => {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(path.join(dir, rel), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name === '.git') continue; // the worktree's gitdir pointer — not a tree file
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (isInstructionName(e.name)) {
+        await remove(childRel);
+      } else if (e.isDirectory() && isCursorDir(e.name)) {
+        try {
+          await fs.promises.access(path.join(dir, childRel, CURSOR_RULES));
+          await remove(`${childRel}/${CURSOR_RULES}`);
+        } catch {
+          /* no rules dir — nothing to strip */
+        }
+        // Same recursion as the sync twin (see its comment): a planted
+        // `.cursor/CLAUDE.md` must not survive the strip.
+        await walk(childRel);
+      } else if (e.isDirectory()) {
+        await walk(childRel);
+      }
+    }
+  };
+  await walk('');
   return removed.sort();
 }
 
@@ -346,42 +413,136 @@ function removeLockIfOwned(lock: string, token: string): void {
   }
 }
 
-export function acquireRepoLock(
-  gitCommonDir: string,
-  opts: { retries?: number; sleepMs?: number; staleMs?: number } = {}
-): () => void {
+// ONE acquisition attempt — the whole protocol lives here, shared by the sync and async
+// acquires so they cannot drift: O_EXCL create with the token, and on failure the
+// observe-stale→reclaim sequence. Every fs op is a sub-millisecond metadata call and stays
+// SYNCHRONOUS on purpose, even under the async acquire: keeping read→stat→unlink un-awaited
+// preserves its in-process atomicity for free (no interleave point between observing a stale
+// holder and reclaiming exactly that holder).
+function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => void) | null {
+  try {
+    const fd = fs.openSync(lock, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+    // ANY failure after the exclusive create — write OR close — must unlink the lock this
+    // process just made, or it strands a lock file with no releaser and every later acquire
+    // reads contention until the staleMs reclaim (~10 min). The r2 fix guarded only the
+    // write and left the trailing closeSync OUTSIDE the recovery — the same strand class,
+    // one line later; r3's only unanimous finding (codex+grok+claude, grounded verbatim).
+    // The file is unconditionally ours on this path: O_EXCL proved we created it.
+    try {
+      fs.writeSync(fd, token);
+      fs.closeSync(fd);
+    } catch (we) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* already closed, or close is what failed — the unlink below is the recovery */
+      }
+      try {
+        fs.unlinkSync(lock);
+      } catch {
+        /* worst case: the stale reclaim gets it */
+      }
+      throw we;
+    }
+    return () => removeLockIfOwned(lock, token);
+  } catch (e) {
+    // ONLY EEXIST is contention. A bare catch here turned every other errno — a nonexistent
+    // gitCommonDir (ENOENT), a permissions refusal (EACCES), a read-only fs (EROFS) — into
+    // "someone holds the lock", which the acquire loop then retries for the FULL budget
+    // (~10 min at defaults). On a CLI that was a slow confusing failure; on a server request
+    // path it is a 10-minute hang for a caller bug that should throw in one millisecond.
+    // (Cross-vendor review of this very diff, claude-f4 — confirmed against the hunk.)
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    try {
+      const held = fs.readFileSync(lock, 'utf8').trim();
+      const age = Date.now() - fs.statSync(lock).mtimeMs;
+      // Reclaim ONLY the exact stale lock we just observed: if the holder released and a third
+      // process took it in between, `held` no longer matches and we leave the new lock alone.
+      if (age > staleMs) removeLockIfOwned(lock, held);
+    } catch {
+      /* raced with the holder — just wait */
+    }
+    return null;
+  }
+}
+
+function lockPathAndBudget(gitCommonDir: string, opts: { retries?: number; sleepMs?: number; staleMs?: number }) {
   const lock = path.join(gitCommonDir, 'ensemble-ai-worktree.lock');
-  const sleepMs = opts.sleepMs ?? 500;
+  // Clamped ≥1: `?? 500` is nullish-only, so an explicit sleepMs of 0 slipped through and
+  // made the derived retry budget `Math.ceil(staleMs / 0) = Infinity` — a loop that can
+  // never reach lockWedgedError, spinning at full CPU in the sync acquire (r2, codex-f1).
+  const sleepMs = Math.max(1, opts.sleepMs ?? 500);
   const staleMs = opts.staleMs ?? 10 * 60_000;
   // Wait at least as long as the staleness TTL. A shorter budget could never reach the reclaim
   // branch, so a sibling holding the lock across a legitimately slow `git fetch` (a large repo,
   // a cold object store) would throw as "wedged" while it was merely working.
+  //
+  // THE HOLD-DURATION INVARIANT (protocol-wide, both waiting styles): the sum of in-lock op
+  // timeouts must stay comfortably below staleMs, or a slow-but-alive holder gets its lock
+  // reclaimed mid-materialization. Today: fetch(120s) + add(120s) + metadata ≪ 10 min, with
+  // margin. There is NO mtime heartbeat during a hold — if in-lock work ever grows past that
+  // margin, add one (touch the lock per completed op; protocol-compatible) rather than raising
+  // staleMs, which would also stretch every crash-recovery.
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
-  const token = lockToken();
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const fd = fs.openSync(lock, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-      fs.writeSync(fd, token);
-      fs.closeSync(fd);
-      return () => removeLockIfOwned(lock, token);
-    } catch {
-      try {
-        const held = fs.readFileSync(lock, 'utf8').trim();
-        const age = Date.now() - fs.statSync(lock).mtimeMs;
-        // Reclaim ONLY the exact stale lock we just observed: if the holder released and a third
-        // process took it in between, `held` no longer matches and we leave the new lock alone.
-        if (age > staleMs) removeLockIfOwned(lock, held);
-      } catch {
-        /* raced with the holder — just wait */
-      }
-      // Synchronous sleep: this runs before any seat spawns, and the lock must be held across
-      // the whole materialization (an async gap would let a sibling interleave a worktree add).
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleepMs);
-    }
-  }
-  throw new Error(
+  return { lock, retries, sleepMs, staleMs };
+}
+
+function lockWedgedError(lock: string, retries: number, sleepMs: number): Error {
+  return new Error(
     `ensemble-ai: ${WORKTREE_LOCK_ERROR} at ${lock} after ${retries} attempts (${Math.round((retries * sleepMs) / 1000)}s) — another review is materializing a worktree in this repo`
   );
+}
+
+export function acquireRepoLock(
+  gitCommonDir: string,
+  opts: { retries?: number; sleepMs?: number; staleMs?: number } = {}
+): () => void {
+  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const token = lockToken();
+  for (let i = 0; i <= retries; i++) {
+    const release = tryAcquireOnce(lock, token, staleMs);
+    if (release) return release;
+    if (i === retries) break; // the budget is spent — don't sleep just to throw (r3, grok-f2)
+    // Synchronous sleep because THIS FUNCTION is synchronous (the CLI path has nothing else to
+    // do) — NOT because the exclusion needs it. The lock is the O_EXCL FILE: its held state is
+    // indifferent to what the holder's thread does, and a sibling's create fails on the file,
+    // not on our call stack — so holding it across an `await` opens no window
+    // (acquireRepoLockAsync below holds this same lock the same way; worktree-parity.test.ts
+    // pins the claim). The previous comment here asserted the opposite ("an async gap would let
+    // a sibling interleave a worktree add") — that was WRONG, and believing it kept a consumer
+    // dashboard's event loop frozen for the length of every large materialization. A comment
+    // asserting a concurrency property belongs in a test, not prose.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleepMs);
+  }
+  throw lockWedgedError(lock, retries, sleepMs);
+}
+
+// The async twin — SAME lock file, SAME token write, SAME staleness rule (all shared via
+// tryAcquireOnce, so the two acquires cannot drift), with the one difference that the
+// between-attempts sleep yields the event loop instead of freezing it. For a SERVER consumer
+// this is the whole point: a request path can wait its turn on the repo lock without taking
+// every other request hostage. Mixed holders interoperate live — an old sync CLI holding the
+// lock makes this waiter retry, and vice versa — because the protocol is the file, not the
+// caller's threading model.
+//
+// NO CANCELLATION IN v1 — do not abandon the returned promise. A caller that Promise.races
+// this and walks away leaves the loop polling; if it later acquires, the lock is held with
+// no releaser until the staleMs reclaim. Bound waiting with `retries`, never with a race
+// (r2 review, claude-f1 — accepted as a documented contract rather than grown into an
+// AbortSignal API no current consumer needs).
+export async function acquireRepoLockAsync(
+  gitCommonDir: string,
+  opts: { retries?: number; sleepMs?: number; staleMs?: number } = {}
+): Promise<() => void> {
+  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const token = lockToken();
+  for (let i = 0; i <= retries; i++) {
+    const release = tryAcquireOnce(lock, token, staleMs);
+    if (release) return release;
+    if (i === retries) break; // the budget is spent — don't sleep just to throw (r3, grok-f2)
+    await sleepAsync(sleepMs);
+  }
+  throw lockWedgedError(lock, retries, sleepMs);
 }
 
 // Fetch the PR head by EXPLICIT url + ref, then add a detached worktree at it, then PROVE the
@@ -492,6 +653,179 @@ export function reapWorktree(repoRoot: string, dir: string, deps: { git: GitRun 
   }
   try {
     deps.git([...INERT_GIT_CONFIG, 'worktree', 'prune'], { cwd: repoRoot });
+  } catch {
+    /* best-effort */
+  }
+}
+
+// ── Async twins ───────────────────────────────────────────────────────────────────────
+//
+// The SAME materialization for a caller that must not block its event loop — a server
+// consumer discovered live (2026-07-17) that the sync path freezes every other request for
+// the length of a large checkout ("Updating files: 100% (760/760)" was the last log line
+// before a ~5-minute total outage). The heavy work always ran in child git processes; the
+// blockage was purely the *Sync spawn wrappers + the busy-wait sleep. These twins swap those
+// for their async forms and change NOTHING else: same step sequence (common-dir → lock →
+// fetch → add → HEAD assert → strip → release), same INERT_GIT_CONFIG/INERT_ENV, same error
+// taxonomy, same lock file via the shared tryAcquireOnce. worktree-parity.test.ts pins the
+// twins to identical git argv sequences and outcomes, so drift between them is a test
+// failure, not a code-review hope. The sync versions remain the CLI path (nothing else to
+// do while materializing) — this is one protocol with two waiting styles, not a fork.
+
+export type GitRunAsync = (
+  args: string[],
+  opts?: { cwd?: string; env?: Record<string, string> }
+) => Promise<{ error: string; ok: false } | { ok: true; text: string }>;
+
+// Async twin of resolveRepoLocation — same proofs (toplevel → allowed root → a remote whose
+// fetch URL IS the PR's repo), awaited git. Twinned so an async consumer runs its whole
+// pre-flight + materialization on ONE runner instead of mixing a sync git for these calls
+// with an async git for the fetch.
+export async function resolveRepoLocationAsync(
+  args: { prSlug: string; repoPath: string },
+  deps: { allowedRoots?: string[] | null; git: GitRunAsync }
+): Promise<PreflightError | RepoLocation> {
+  const repoPath = path.resolve(args.repoPath);
+  const top = await deps.git(['rev-parse', '--show-toplevel'], { cwd: repoPath });
+  if (!top.ok) {
+    return {
+      kind: 'not-a-repo',
+      message: `--repo ${repoPath} is not a git repository (${top.error.trim() || 'rev-parse failed'})`,
+    };
+  }
+  const repoRoot = top.text.trim();
+
+  const allowed =
+    deps.allowedRoots === undefined ? allowedRootsFromConfig() : deps.allowedRoots;
+  if (!rootAllowed(repoRoot, allowed)) {
+    return {
+      kind: 'disallowed-root',
+      message: `${repoRoot} is not under any allowedRepoRoots entry in your ensemble-ai config — refusing to materialize a worktree outside the roots you allowed`,
+    };
+  }
+
+  const remotes = await deps.git(['remote'], { cwd: repoRoot });
+  const names = remotes.ok ? remotes.text.split('\n').map((s) => s.trim()).filter(Boolean) : [];
+  const want = args.prSlug.toLowerCase();
+  const seen: string[] = [];
+  for (const name of names) {
+    const url = await deps.git(['remote', 'get-url', name], { cwd: repoRoot });
+    if (!url.ok) continue;
+    const raw = url.text.trim();
+    const slug = remoteSlug(raw);
+    if (slug) seen.push(slug);
+    if (slug === want) return { fetchUrl: raw, repoRoot, slug: want };
+  }
+  return {
+    kind: 'wrong-repo',
+    message: `--repo ${repoRoot} does not have a remote pointing at ${args.prSlug} (found: ${seen.length ? seen.join(', ') : 'no GitHub remotes'}) — refusing to fetch a PR into an unrelated repo`,
+  };
+}
+
+// Async twin of materializeWorktree. The lock is HELD ACROSS the awaits — that is safe by
+// construction (the lock is a file; a sibling's O_EXCL create fails regardless of what this
+// thread is doing) and it is exactly the md#179 discipline: going async moves the WAITING off
+// the loop, never the fetch+add outside the lock. `release()` stays lexically in the
+// `finally`; a refactor that stores it for "later" would create the orphaned-lock class that
+// async holds get (wrongly) blamed for.
+export async function materializeWorktreeAsync(
+  args: { headSha: string; location: RepoLocation; pr: number; worktreeRoot?: string },
+  deps: {
+    git: GitRunAsync;
+    lock?: (gitCommonDir: string) => Promise<() => void> | (() => void);
+  }
+): Promise<PreflightError | Worktree> {
+  const { location } = args;
+  const common = await deps.git(['rev-parse', '--git-common-dir'], { cwd: location.repoRoot });
+  if (!common.ok) {
+    return { kind: 'not-a-repo', message: `cannot resolve the git dir of ${location.repoRoot}` };
+  }
+  const gitCommonDir = path.resolve(location.repoRoot, common.text.trim());
+  const release = await (deps.lock ?? acquireRepoLockAsync)(gitCommonDir);
+  let dir: string | null = null;
+  try {
+    const fetched = await deps.git(
+      [
+        ...INERT_GIT_CONFIG,
+        'fetch',
+        '--no-tags',
+        '--no-recurse-submodules',
+        '--no-write-fetch-head',
+        location.fetchUrl,
+        `pull/${args.pr}/head`,
+      ],
+      { cwd: location.repoRoot, env: INERT_ENV }
+    );
+    if (!fetched.ok) {
+      return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
+    }
+    // Materialize by SHA, not FETCH_HEAD — same reasoning as the sync twin above.
+    const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
+    dir = path.join(parent, 'head');
+    const added = await deps.git(
+      [...INERT_GIT_CONFIG, 'worktree', 'add', '--detach', dir, args.headSha],
+      { cwd: location.repoRoot, env: INERT_ENV }
+    );
+    if (!added.ok) {
+      const kind = /invalid reference|not a valid object|unknown revision/i.test(added.error)
+        ? 'no-such-pr'
+        : classifyGitError(added.error);
+      return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
+    }
+    const head = await deps.git(['rev-parse', 'HEAD'], { cwd: dir });
+    const actual = head.ok ? head.text.trim() : '';
+    if (actual !== args.headSha) {
+      await reapWorktreeAsync(location.repoRoot, dir, deps);
+      dir = null;
+      return {
+        kind: 'sha-mismatch',
+        message: `worktree HEAD is ${actual || '(unresolvable)'} but the review is tied to ${args.headSha} — ABORTING rather than reviewing wrong-SHA evidence`,
+      };
+    }
+    const made = {
+      dir,
+      headSha: args.headSha,
+      strippedInstructionFiles: await stripAgentInstructionsAsync(dir),
+    };
+    dir = null; // ownership transfers to the caller's try/finally
+    return made;
+  } finally {
+    if (dir) await reapWorktreeAsync(location.repoRoot, dir, deps);
+    release();
+  }
+}
+
+// Async twin of reapWorktree — same steps, same best-effort contract, awaited git AND
+// awaited fs: the fallback cleanup is a recursive rm of a full checkout, which is exactly
+// as tree-sized as the git work — an rmSync here would block the loop for the seconds a
+// large tree takes to delete, on the failure path, which is when the server is already
+// having a bad time (cross-vendor review of this diff, codex-f1 — the first cut shipped
+// rmSync and the "no longer blocks the loop" claim was false).
+export async function reapWorktreeAsync(
+  repoRoot: string,
+  dir: string,
+  deps: { git: GitRunAsync }
+): Promise<void> {
+  try {
+    await deps.git([...INERT_GIT_CONFIG, 'worktree', 'remove', '--force', dir], { cwd: repoRoot });
+  } catch {
+    /* best-effort */
+  }
+  try {
+    await fs.promises.rm(dir, { force: true, recursive: true });
+  } catch {
+    /* best-effort */
+  }
+  try {
+    const parent = path.dirname(dir);
+    if (path.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
+      await fs.promises.rm(parent, { force: true, recursive: true });
+    }
+  } catch {
+    /* best-effort */
+  }
+  try {
+    await deps.git([...INERT_GIT_CONFIG, 'worktree', 'prune'], { cwd: repoRoot });
   } catch {
     /* best-effort */
   }
