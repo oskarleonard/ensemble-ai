@@ -1260,15 +1260,22 @@ function egressHostsFor(id) {
 }
 
 // src/reviewers/egress-seat.ts
+function seatDenialPrinter(id, write) {
+  const printed = /* @__PURE__ */ new Set();
+  return (d) => {
+    const key = `${d.host}:${d.port}`;
+    if (printed.has(key)) return;
+    printed.add(key);
+    write(
+      `\u26A0 ensemble-ai egress fence: DENIED ${id} \u2192 ${d.method} ${key} \u2014 ${d.reason} (repeat denials for this host are counted, not printed)
+`
+    );
+  };
+}
 function startSeatEgressProxy(id) {
   return startEgressProxy({
     allowHosts: egressHostsFor(id),
-    onDenial: (d) => {
-      process.stderr.write(
-        `\u26A0 ensemble-ai egress fence: DENIED ${id} \u2192 ${d.method} ${d.host}:${d.port} \u2014 ${d.reason}
-`
-      );
-    }
+    onDenial: seatDenialPrinter(id, (line) => process.stderr.write(line))
   });
 }
 function egressStartFailure(id, err) {
@@ -3448,6 +3455,19 @@ ${UNTRUSTED_INSTRUCTIONS_CLAUSE}
 
 Anchor every finding at file:line as it exists at ${args.headSha}.`;
 }
+function formatEgressDenialCounts(denials, maxHosts = 6) {
+  const counts = /* @__PURE__ */ new Map();
+  for (const d of denials) {
+    const key = `${d.host}:${d.port}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const ordered = [...counts.entries()].sort(
+    (a, b) => b[1] - a[1] || a[0].localeCompare(b[0])
+  );
+  const shown = ordered.slice(0, maxHosts).map(([host, n]) => `${host} \xD7${n}`);
+  const hidden = ordered.length - shown.length;
+  return `${denials.length} connection(s) DENIED \u2014 ${shown.join(" \xB7 ")}${hidden > 0 ? ` \xB7 +${hidden} more host(s) (see egress-denials.json)` : ""}`;
+}
 
 // src/modes/review/seat-run.ts
 async function adapterOnce(adapter, prompt, reviewer, opts) {
@@ -3723,7 +3743,7 @@ async function runReviewMode(opts) {
     egressDenials.push(...seat.egressDenials);
   }
   if (egressDenials.length > 0) {
-    log(`  \xB7 \u26A0 egress fence: ${egressDenials.length} connection(s) DENIED`);
+    log(`  \xB7 \u26A0 egress fence: ${formatEgressDenialCounts(egressDenials)}`);
     try {
       writeTrailFile(opts.out, opts.runId, "egress-denials.json", JSON.stringify(egressDenials, null, 2));
     } catch {

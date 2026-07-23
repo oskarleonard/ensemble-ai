@@ -9,6 +9,7 @@ import { GROK_SANDBOX_PROFILE } from '../../reviewers/grok';
 
 import { CLAUDE_CAPABILITY_FENCE } from './claude';
 import {
+  formatEgressDenialCounts,
   formatEvidenceFooter,
   intendedEvidenceFor,
   qualifyCodexSeat,
@@ -197,5 +198,39 @@ describe('the evidence footer — a degraded run never reads as a full-worktree 
 
   it('a packet-mode run has no evidence line at all', () => {
     expect(formatEvidenceFooter({})).toBe('');
+  });
+});
+
+// The live run-log rollup: per-host counts replace the old one-line-per-connection wall (a
+// retry storm against one host is one fact, not four hundred lines).
+describe('formatEgressDenialCounts — the run-log rollup', () => {
+  const d = (host: string, n: number) =>
+    Array.from({ length: n }, () => ({
+      host,
+      method: 'CONNECT',
+      port: 443,
+      reason: 'not allowlisted',
+    }));
+
+  it('counts per host, biggest first, total up front', () => {
+    const line = formatEgressDenialCounts([...d('grok.com', 195), ...d('api.mixpanel.com', 198)]);
+    expect(line).toBe(
+      '393 connection(s) DENIED — api.mixpanel.com:443 ×198 · grok.com:443 ×195'
+    );
+  });
+
+  it('hosts past the cap are counted, never silently dropped', () => {
+    const many = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'].flatMap((h, i) => d(`${h}.example`, i + 1));
+    const line = formatEgressDenialCounts(many, 6);
+    expect(line).toContain('+2 more host(s)');
+    expect(line).toContain('egress-denials.json');
+    // The two smallest counts are the hidden ones — the biggest stay named.
+    expect(line).toContain('h.example:443 ×8');
+    expect(line).not.toContain('a.example');
+  });
+
+  it('ties break on host name so the line is deterministic', () => {
+    const line = formatEgressDenialCounts([...d('b.example', 2), ...d('a.example', 2)]);
+    expect(line).toBe('4 connection(s) DENIED — a.example:443 ×2 · b.example:443 ×2');
   });
 });
