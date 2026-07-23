@@ -13,6 +13,7 @@ import type { VoiceRunResult } from '../brainstorm/voices';
 import { persistGatePacket } from './gate-hunks';
 import type { VoiceReview } from './synthesis';
 import {
+  CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS,
   claudeLayerHasHigh,
   loadVoiceReviewsFromTrail,
   renderClaudeLayer,
@@ -481,5 +482,53 @@ describe('roster · claude in REVIEWER_IDS never leaks into the CLI core', () =>
   it("a claude-only request still fails closed (no cross-vendor core)", () => {
     const r = resolveReviewRoster(['claude'], false);
     expect('error' in r && r.error).toMatch(/at least one cross-vendor/);
+  });
+});
+
+// The producer's watchdog: a worktree /code-review pass gets the 25-min budget; packet mode
+// and an explicit caller value stay untouched (run 2026-07-23-17-00-50 died at the shared
+// 12-min default with zero output while every other seat finished).
+describe('runClaudeReviewLayer — worktree producer timeout default', () => {
+  async function producerTimeoutFor(opts: { timeoutMs?: number; worktree?: string }): Promise<number | undefined> {
+    const base = tmpTrail();
+    const runId = 'timeout-probe';
+    seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    const seen: Array<number | undefined> = [];
+    const run = async (
+      prompt: string,
+      _c: VoiceConfig,
+      o?: { timeoutMs?: number }
+    ): Promise<VoiceRunResult> => {
+      if (prompt.includes('VERIFIED GATE')) return okRun(GATE);
+      seen.push(o?.timeoutMs);
+      return okRun(CLAUDE_REVIEW);
+    };
+    await runClaudeReviewLayer({
+      baseDir: base,
+      claudeConfig: CFG,
+      coreReviews: [stored('codex'), stored('grok')],
+      expectedHeadSha: HEAD,
+      includeClaudeReviewer: true,
+      reviewPrompt: 'REVIEW PROMPT PAYLOAD',
+      run,
+      runId,
+      ...(opts.worktree ? { worktree: opts.worktree } : {}),
+      ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    });
+    return seen[0];
+  }
+
+  it('worktree + no explicit timeout ⇒ the 25-min producer watchdog', async () => {
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-wt-'));
+    expect(await producerTimeoutFor({ worktree: wt })).toBe(CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS);
+  });
+
+  it('packet mode keeps the shared default (undefined ⇒ REVIEW_TIMEOUT_MS at the spawn layer)', async () => {
+    expect(await producerTimeoutFor({})).toBeUndefined();
+  });
+
+  it('an explicit caller timeout beats the worktree default', async () => {
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-wt-'));
+    expect(await producerTimeoutFor({ timeoutMs: 123_000, worktree: wt })).toBe(123_000);
   });
 });
