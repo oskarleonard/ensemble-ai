@@ -5848,6 +5848,7 @@ function loadVoiceReviewsFromTrail(baseDir, runId) {
   if (holistic) out.push(holistic);
   return out;
 }
+var CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 15e5;
 async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log, worktree, historyPacket) {
   let res;
   try {
@@ -5913,7 +5914,8 @@ async function runClaudeReviewLayer(opts) {
       producerPrompt,
       opts.claudeConfig,
       run,
-      opts.timeoutMs,
+      // A worktree producer gets the bigger watchdog UNLESS the caller set one explicitly.
+      opts.timeoutMs ?? (opts.worktree ? CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS : void 0),
       log,
       opts.worktree,
       opts.historyPacket

@@ -163,6 +163,15 @@ type ClaudeRunner = (
 
 // ── The cold Opus reviewer ──────────────────────────────────────────────────────────
 
+// The whole-project /code-review pass outgrows the shared REVIEW_TIMEOUT_MS: that 12-min
+// watchdog is sized for the diff-packet seats (a vendor CLI reading ONE pinned packet),
+// and it killed the first real worktree producer at exactly 12:00 with zero output while
+// codex/grok/holistic/gate all finished (run 2026-07-23-17-00-50). 25 min bounds an
+// opus @ max /code-review of a full repo without racing a consumer's overall fire cap
+// (hugin's full-review cap moved 35 → 60 min in the same change). Packet-mode producers
+// keep the shared default — a cold diff read fits 12 min.
+export const CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 1_500_000; // 25 min
+
 async function runClaudeReviewer(
   reviewPrompt: string,
   config: VoiceConfig,
@@ -376,7 +385,8 @@ export async function runClaudeReviewLayer(
       producerPrompt,
       opts.claudeConfig,
       run,
-      opts.timeoutMs,
+      // A worktree producer gets the bigger watchdog UNLESS the caller set one explicitly.
+      opts.timeoutMs ?? (opts.worktree ? CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS : undefined),
       log,
       opts.worktree,
       opts.historyPacket
