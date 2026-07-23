@@ -1283,7 +1283,7 @@ function egressStartFailure(id, err) {
 }
 
 // src/reviewers/codex.ts
-var REVIEW_TIMEOUT_MS = 72e4;
+var REVIEW_TIMEOUT_MS = 9e5;
 function buildCodexReviewArgs(config, outFile, prompt) {
   return [
     "exec",

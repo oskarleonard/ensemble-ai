@@ -21,7 +21,11 @@ import { egressStartFailure, startSeatEgressProxy } from './egress-seat';
 // A code review at xhigh reasoning is far slower than a chat turn — give the
 // reviewer real time, but ALWAYS under a watchdog. The lived 40-min 0%-CPU wedge
 // on open stdin proved the timeout is mandatory, not optional.
-export const REVIEW_TIMEOUT_MS = 720_000; // 12 min
+// Shared watchdog for the diff-packet seats (a vendor CLI reading ONE pinned packet).
+// Observed: grok used 7 of the old 12 min on lisk-web#759 — a bigger diff would have
+// pinched. 15 min keeps ≥2× margin; the worktree Anthropic seats carry their own
+// bigger budgets (self-contained.ts).
+export const REVIEW_TIMEOUT_MS = 900_000; // 15 min
 
 export interface CodexReviewResult {
   // Every connection the run's egress proxy REFUSED (codex-f3). Absent on a packet-mode run, which

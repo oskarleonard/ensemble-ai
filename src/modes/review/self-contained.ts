@@ -163,14 +163,19 @@ type ClaudeRunner = (
 
 // ── The cold Opus reviewer ──────────────────────────────────────────────────────────
 
-// The whole-project /code-review pass outgrows the shared REVIEW_TIMEOUT_MS: that 12-min
-// watchdog is sized for the diff-packet seats (a vendor CLI reading ONE pinned packet),
-// and it killed the first real worktree producer at exactly 12:00 with zero output while
-// codex/grok/holistic/gate all finished (run 2026-07-23-17-00-50). 25 min bounds an
-// opus @ max /code-review of a full repo without racing a consumer's overall fire cap
-// (hugin's full-review cap moved 35 → 60 min in the same change). Packet-mode producers
-// keep the shared default — a cold diff read fits 12 min.
-export const CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 1_500_000; // 25 min
+// Anthropic-seat watchdogs for a WORKTREE (full-context) run. A watchdog exists to reclaim
+// a WEDGED seat — a hung spawn would silently eat the whole fire slot — never to police
+// honest work: run 2026-07-23-17-00-50 proved an undersized one IS the failure (the
+// producer died at the shared 12-min diff-packet default with zero output while every
+// other seat finished; a full cross-vendor pass legitimately runs toward an hour on a
+// real repo). Sizing: the producer is the whole-project /code-review fan-out (observed
+// >12 min truncated → 40 min budget); gate + holistic are single focused passes
+// (observed 3–8 min → 15 min ≈ 2–5× margin). Packet-mode seats keep the shared
+// REVIEW_TIMEOUT_MS. Consumers cap the whole fire OUTSIDE these (hugin: 90 min —
+// concurrent core ≤15 + producer 40 + holistic 15 + gate 15 ≈ 85 worst case).
+export const CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 2_400_000; // 40 min
+export const HOLISTIC_WORKTREE_TIMEOUT_MS = 900_000; // 15 min
+export const GATE_WORKTREE_TIMEOUT_MS = 900_000; // 15 min
 
 async function runClaudeReviewer(
   reviewPrompt: string,
@@ -455,7 +460,9 @@ export async function runClaudeReviewLayer(
       ...(opts.historyPacket ? { historyPacket: opts.historyPacket } : {}),
       log,
       run,
-      timeoutMs: opts.timeoutMs,
+      // The lens only runs WITH worktree evidence (resolveHolisticPlan), so the
+      // worktree-sized default applies whenever the caller didn't set one.
+      timeoutMs: opts.timeoutMs ?? HOLISTIC_WORKTREE_TIMEOUT_MS,
       worktree: plan.worktree,
     });
     holisticReview = review;
@@ -505,7 +512,9 @@ export async function runClaudeReviewLayer(
     reviews: voiceReviews,
     run,
     runId: opts.runId,
-    timeoutMs: opts.timeoutMs,
+    // A worktree gate verifies against the tree (evidence-bearing) — give it the
+    // worktree-sized watchdog; packet mode keeps the shared default.
+    timeoutMs: opts.timeoutMs ?? (opts.worktree ? GATE_WORKTREE_TIMEOUT_MS : undefined),
     // The gate reads the same worktree the seats did (spec §5) — its own spawn cwd.
     ...(opts.worktree ? { worktree: opts.worktree } : {}),
   });
