@@ -1234,15 +1234,22 @@ function egressHostsFor(id) {
 }
 
 // src/reviewers/egress-seat.ts
+function seatDenialPrinter(id, write) {
+  const printed = /* @__PURE__ */ new Set();
+  return (d) => {
+    const key = `${d.host}:${d.port}`;
+    if (printed.has(key)) return;
+    printed.add(key);
+    write(
+      `\u26A0 ensemble-ai egress fence: DENIED ${id} \u2192 ${d.method} ${key} \u2014 ${d.reason} (repeat denials for this host are counted, not printed)
+`
+    );
+  };
+}
 function startSeatEgressProxy(id) {
   return startEgressProxy({
     allowHosts: egressHostsFor(id),
-    onDenial: (d) => {
-      process.stderr.write(
-        `\u26A0 ensemble-ai egress fence: DENIED ${id} \u2192 ${d.method} ${d.host}:${d.port} \u2014 ${d.reason}
-`
-      );
-    }
+    onDenial: seatDenialPrinter(id, (line) => process.stderr.write(line))
   });
 }
 function egressStartFailure(id, err) {
@@ -5426,6 +5433,19 @@ function formatEgressDenials(denials) {
   const hosts = [...new Set(denials.map((d) => d.host))].sort();
   return `egress fence: ${denials.length} connection(s) DENIED to ${hosts.length} host(s) outside the vendor allowlist \u2014 ${hosts.join(", ")}. A seat reached for a host it is not permitted to reach; review the run's egress-denials.json.`;
 }
+function formatEgressDenialCounts(denials, maxHosts = 6) {
+  const counts = /* @__PURE__ */ new Map();
+  for (const d of denials) {
+    const key = `${d.host}:${d.port}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const ordered = [...counts.entries()].sort(
+    (a, b) => b[1] - a[1] || a[0].localeCompare(b[0])
+  );
+  const shown = ordered.slice(0, maxHosts).map(([host, n]) => `${host} \xD7${n}`);
+  const hidden = ordered.length - shown.length;
+  return `${denials.length} connection(s) DENIED \u2014 ${shown.join(" \xB7 ")}${hidden > 0 ? ` \xB7 +${hidden} more host(s) (see egress-denials.json)` : ""}`;
+}
 
 // src/modes/review/seat-run.ts
 async function adapterOnce(adapter, prompt, reviewer, opts) {
@@ -5701,7 +5721,7 @@ async function runReviewMode(opts) {
     egressDenials.push(...seat.egressDenials);
   }
   if (egressDenials.length > 0) {
-    log(`  \xB7 \u26A0 egress fence: ${egressDenials.length} connection(s) DENIED`);
+    log(`  \xB7 \u26A0 egress fence: ${formatEgressDenialCounts(egressDenials)}`);
     try {
       writeTrailFile(opts.out, opts.runId, "egress-denials.json", JSON.stringify(egressDenials, null, 2));
     } catch {
@@ -6138,19 +6158,68 @@ function resolveGateSeat(raw, flags, warn) {
     modelSource
   };
 }
-function loadGateSeat(file = VOICES_FILE, flags = {}, warn = () => {
-}) {
-  let raw = {};
+function readVoicesRaw(file, warn, seatLabel, fallbackNote) {
   try {
-    raw = JSON.parse(fs20.readFileSync(file, "utf8"));
+    return JSON.parse(fs20.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(
-        `gate seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the claude voice / built-in default`
+        `${seatLabel}: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 ${fallbackNote}`
       );
-    raw = {};
+    return {};
   }
-  return resolveGateSeat(raw, flags, warn);
+}
+function loadGateSeat(file = VOICES_FILE, flags = {}, warn = () => {
+}) {
+  return resolveGateSeat(
+    readVoicesRaw(file, warn, "gate seat", "using the claude voice / built-in default"),
+    flags,
+    warn
+  );
+}
+var CLAUDE_REVIEWER_SEAT_DEFAULTS = { effort: "max", model: "opus" };
+function resolveClaudeReviewerSeat(raw, flags, warn) {
+  const root = plainObject(raw) ?? {};
+  const claude = plainObject(root.claude);
+  const isKnownEffort = (v) => CLAUDE_EFFORTS2.has(v);
+  const flagEffort = nonEmptyStr3(flags.effort);
+  const effortFlagOk = flagEffort !== null && isKnownEffort(flagEffort);
+  if (flagEffort && !effortFlagOk)
+    warn(
+      `claude seat: --claude-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 ignored`
+    );
+  const pick = (key, flag, accept, baked) => {
+    if (flag) return { source: "flag", value: flag };
+    const fromFile = claude ? nonEmptyStr3(claude[key]) : null;
+    if (claude && key in claude && fromFile === null)
+      warn(
+        `claude seat: \`${key}\` must be a non-empty string \u2014 using the built-in ${baked}`
+      );
+    if (fromFile !== null && fromFile !== "default") {
+      if (accept(fromFile)) return { source: "file", value: fromFile };
+      warn(
+        `claude seat: \`${key}\` "${fromFile}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 using the built-in ${baked}`
+      );
+    }
+    return { source: "default", value: baked };
+  };
+  const model = pick("model", nonEmptyStr3(flags.model), () => true, CLAUDE_REVIEWER_SEAT_DEFAULTS.model);
+  const effort = pick("effort", effortFlagOk ? flagEffort : null, isKnownEffort, CLAUDE_REVIEWER_SEAT_DEFAULTS.effort);
+  return {
+    // Identity (cmd/id/vendor) from the one canonical claude voice, like the gate — only
+    // model/effort are configurable; the capability fence is not.
+    config: { ...VOICE_DEFAULTS.claude, effort: effort.value, model: model.value },
+    effortSource: effort.source,
+    modelSource: model.source
+  };
+}
+function loadClaudeReviewerSeat(file = VOICES_FILE, flags = {}, warn = () => {
+}) {
+  return resolveClaudeReviewerSeat(
+    readVoicesRaw(file, warn, "claude seat", `using the built-in ${CLAUDE_REVIEWER_SEAT_DEFAULTS.model} @ ${CLAUDE_REVIEWER_SEAT_DEFAULTS.effort}`),
+    flags,
+    warn
+  );
 }
 
 // src/modes/review/evidence-manifest.ts
@@ -7162,6 +7231,11 @@ Options:
                         overrides the provenance default (use for untrusted diffs / CI)
   --gate-dismissals     opt a FOREIGN diff (--pr/URL/stdin/--diff-file) INTO the gate's
                         dismiss-only authority (LOCAL diffs already have it on by default)
+  --claude-model <m>    model for the claude REVIEWER (producer) seat \u2014 overrides the voices.json
+                        \`claude\` entry; built-in default: opus. NEVER the interactive CLI's saved
+                        default \u2014 a headless seat must not inherit a \`/model\` switch
+  --claude-effort <e>   effort for the claude REVIEWER seat (low|medium|high|xhigh|max) \u2014
+                        overrides the file; built-in default: max
   --gate-model <m>      model for the GATE (synthesis) seat \u2014 overrides the voices.json
                         \`gate\` entry; the gate is always claude -p (keep it \u2265 your strongest
                         reviewer, else it mostly returns unverified \u2014 the toothless mode)
@@ -7265,6 +7339,12 @@ function capture(cmd, cmdArgs, cwd) {
       cwd,
       encoding: "utf8",
       maxBuffer: 256 * 1024 * 1024,
+      // stdin closed so `gh` can never sit on an interactive prompt; stderr 'pipe' rather
+      // than the sync-exec default, which ALSO mirrors the child's stderr onto ours — every
+      // expected-miss conventions probe used to print its own `gh: Not Found (HTTP 404)`
+      // line into the run log (~60 per URL-PR run). The text still lands in err.stderr
+      // below, so every failure path reports what broke; nothing is mirrored blind.
+      stdio: ["ignore", "pipe", "pipe"],
       // Bound the call so a wedged `gh` (auth prompt, network hang) can't hang the
       // gate forever — fail with a clear error instead.
       timeout: 12e4
@@ -7297,6 +7377,15 @@ function resolveTrailBase(gitRoot, localRepoTrail) {
 function ghConventionReader(repoSlug, ref, cwd) {
   const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
   const encRef = encodeURIComponent(ref);
+  const warned = /* @__PURE__ */ new Set();
+  const warnUnlessExpectedMiss = (error) => {
+    if (/\bHTTP 404\b/.test(error)) return;
+    const nl = error.indexOf("\n");
+    const first = nl === -1 ? error : error.slice(0, nl);
+    if (warned.has(first)) return;
+    warned.add(first);
+    console.error(`\xB7 conventions probe (gh): ${first}`);
+  };
   return {
     async read(rel, maxBytes) {
       const cap4 = capture(
@@ -7309,7 +7398,11 @@ function ghConventionReader(repoSlug, ref, cwd) {
         ],
         cwd
       );
-      if (!cap4.ok || !cap4.text.trim()) return null;
+      if (!cap4.ok) {
+        warnUnlessExpectedMiss(cap4.error);
+        return null;
+      }
+      if (!cap4.text.trim()) return null;
       try {
         const decoded = Buffer.from(cap4.text.replace(/\s/g, ""), "base64").toString("utf8");
         if (maxBytes !== void 0 && Buffer.byteLength(decoded, "utf8") > maxBytes) {
@@ -7326,7 +7419,10 @@ function ghConventionReader(repoSlug, ref, cwd) {
         ["api", `repos/${repoSlug}/contents/${encPath(dirRel)}?ref=${encRef}`, "--jq", ".[].path"],
         cwd
       );
-      if (!cap4.ok) return [];
+      if (!cap4.ok) {
+        warnUnlessExpectedMiss(cap4.error);
+        return [];
+      }
       return cap4.text.split("\n").map((s) => s.trim()).filter((s) => s.endsWith(".md"));
     }
   };
@@ -7686,6 +7782,8 @@ async function reviewCommand(args, profile = "code") {
         "allow-sensitive": { type: "boolean" },
         base: { type: "string" },
         ceiling: { type: "string" },
+        "claude-effort": { type: "string" },
+        "claude-model": { type: "string" },
         conventions: { type: "string" },
         cwd: { type: "string" },
         "diff-file": { type: "string" },
@@ -7846,7 +7944,14 @@ async function runReviewPipeline(input) {
   let gateSeat = null;
   const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
   if (claudeLayerExpected && result.prompt) {
-    const voiceConfigs = loadVoices();
+    const claudeSeat = loadClaudeReviewerSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values["claude-effort"] === "string" ? values["claude-effort"] : void 0,
+        model: typeof values["claude-model"] === "string" ? values["claude-model"] : void 0
+      },
+      (m) => console.error(`\xB7 ${m}`)
+    );
     gateSeat = loadGateSeat(
       VOICES_FILE,
       {
@@ -7883,7 +7988,7 @@ async function runReviewPipeline(input) {
       claudeLayer = await runClaudeReviewLayer({
         baseDir: out,
         baseSha: layerBaseSha,
-        claudeConfig: voiceConfigs.claude,
+        claudeConfig: claudeSeat.config,
         // The conventions this run actually gathered — the docs a holistic finding may cite to
         // lift its MED severity cap (the gate re-reads the citation out of the tree regardless).
         conventionPaths: result.conventionManifest?.files.filter((f) => f.included).map((f) => f.path),

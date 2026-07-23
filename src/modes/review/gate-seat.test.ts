@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
 import { buildClaudeReviewArgs } from './claude';
-import { resolveGateSeat, type GateSeatFlags } from './gate-seat';
+import {
+  CLAUDE_REVIEWER_SEAT_DEFAULTS,
+  type GateSeatFlags,
+  resolveClaudeReviewerSeat,
+  resolveGateSeat,
+} from './gate-seat';
 
 // Collect warnings so a test can assert both the resolved seat AND that the fall-back was LOUD.
 function resolve(raw: unknown, flags: GateSeatFlags = {}) {
@@ -193,5 +198,70 @@ describe('loadGateSeat — file-failure loudness + the default sentinel (dogfood
     expect(seat.effortSource).toBe('file');
     expect(seat.config.model).toBe('default');
     expect(seat.modelSource).toBe('default');
+  });
+});
+
+// The claude REVIEWER seat: unlike the gate, its chain NEVER ends at the 'default' sentinel —
+// a headless seat must not inherit the operator's interactive CLI default (the 2026-07-23 fire
+// inherited a fresh `/model` switch to Fable 5 and the leg died on its cap).
+describe('resolveClaudeReviewerSeat — headless seat never rides the CLI default', () => {
+  function resolveClaude(raw: unknown, flags: GateSeatFlags = {}) {
+    const warnings: string[] = [];
+    const seat = resolveClaudeReviewerSeat(raw, flags, (m) => warnings.push(m));
+    return { seat, warnings };
+  }
+
+  it('no config ⇒ the BAKED opus @ max, and the argv PINS the model', () => {
+    const { seat, warnings } = resolveClaude({});
+    expect(warnings).toEqual([]);
+    expect(seat.config.model).toBe(CLAUDE_REVIEWER_SEAT_DEFAULTS.model);
+    expect(seat.config.effort).toBe(CLAUDE_REVIEWER_SEAT_DEFAULTS.effort);
+    expect(seat.modelSource).toBe('default');
+    const argv = buildClaudeReviewArgs('P', seat.config);
+    expect(argv).toContain('--model');
+    expect(argv).toContain('opus');
+    expect(argv).toContain('--effort');
+    expect(argv).toContain('max');
+  });
+
+  it("an explicit 'default' in the file falls through to the BAKED opus — never to no-flag", () => {
+    const { seat, warnings } = resolveClaude({ claude: { effort: 'default', model: 'default' } });
+    expect(warnings).toEqual([]);
+    expect(seat.config.model).toBe('opus');
+    expect(seat.modelSource).toBe('default');
+    expect(buildClaudeReviewArgs('P', seat.config)).toContain('--model');
+  });
+
+  it('the voices.json `claude` entry overrides the baked default', () => {
+    const { seat } = resolveClaude({ claude: { effort: 'high', model: 'sonnet' } });
+    expect(seat.config.model).toBe('sonnet');
+    expect(seat.modelSource).toBe('file');
+    expect(seat.config.effort).toBe('high');
+    expect(seat.effortSource).toBe('file');
+  });
+
+  it('--claude-model/--claude-effort beat the file', () => {
+    const { seat } = resolveClaude(
+      { claude: { effort: 'high', model: 'sonnet' } },
+      { effort: 'xhigh', model: 'opus' },
+    );
+    expect(seat.config.model).toBe('opus');
+    expect(seat.modelSource).toBe('flag');
+    expect(seat.config.effort).toBe('xhigh');
+    expect(seat.effortSource).toBe('flag');
+  });
+
+  it('an unknown --claude-effort is ignored + warned; the chain continues', () => {
+    const { seat, warnings } = resolveClaude({}, { effort: 'ultra' });
+    expect(warnings.some((w) => w.includes('--claude-effort "ultra"'))).toBe(true);
+    expect(seat.config.effort).toBe('max');
+    expect(seat.effortSource).toBe('default');
+  });
+
+  it('a junk file effort warns and falls back to the baked value — never resolves as file', () => {
+    const { seat, warnings } = resolveClaude({ claude: { effort: 'turbo' } });
+    expect(warnings.some((w) => w.includes('"turbo"'))).toBe(true);
+    expect(seat.config.effort).toBe('max');
+    expect(seat.effortSource).toBe('default');
   });
 });

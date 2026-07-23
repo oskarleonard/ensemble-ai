@@ -43,6 +43,7 @@ import {
   defaultReceiptStore,
 } from './receipt';
 import {
+  formatEgressDenialCounts,
   intendedEvidenceFor,
   qualifyHarnessSeat,
   SEAT_QUALIFIERS,
@@ -391,7 +392,7 @@ export async function runReviewMode(
   // trail carries the evidence a footer line can only summarize. Best-effort, like every other trail
   // write — the denial already reached stderr the instant it happened, and the footer restates it.
   if (egressDenials.length > 0) {
-    log(`  · ⚠ egress fence: ${egressDenials.length} connection(s) DENIED`);
+    log(`  · ⚠ egress fence: ${formatEgressDenialCounts(egressDenials)}`);
     try {
       writeTrailFile(opts.out, opts.runId, 'egress-denials.json', JSON.stringify(egressDenials, null, 2));
     } catch {

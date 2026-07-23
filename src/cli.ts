@@ -28,7 +28,7 @@ import {
   type StoredReview,
 } from './core/types';
 import { runBrainstormMode } from './modes/brainstorm';
-import { listVoices, loadVoices, VOICES_FILE } from './modes/brainstorm/voices';
+import { listVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
   type BrainstormResult,
   isVoiceId,
@@ -57,7 +57,7 @@ import {
   renderHighGate,
   resolveHighGate,
 } from './modes/review/gate';
-import { type GateSeat, loadGateSeat } from './modes/review/gate-seat';
+import { type GateSeat, loadClaudeReviewerSeat, loadGateSeat } from './modes/review/gate-seat';
 import { loadHolisticSeat } from './modes/review/holistic';
 import {
   acquireDiff,
@@ -207,6 +207,11 @@ Options:
                         overrides the provenance default (use for untrusted diffs / CI)
   --gate-dismissals     opt a FOREIGN diff (--pr/URL/stdin/--diff-file) INTO the gate's
                         dismiss-only authority (LOCAL diffs already have it on by default)
+  --claude-model <m>    model for the claude REVIEWER (producer) seat — overrides the voices.json
+                        \`claude\` entry; built-in default: opus. NEVER the interactive CLI's saved
+                        default — a headless seat must not inherit a \`/model\` switch
+  --claude-effort <e>   effort for the claude REVIEWER seat (low|medium|high|xhigh|max) —
+                        overrides the file; built-in default: max
   --gate-model <m>      model for the GATE (synthesis) seat — overrides the voices.json
                         \`gate\` entry; the gate is always claude -p (keep it ≥ your strongest
                         reviewer, else it mostly returns unverified — the toothless mode)
@@ -337,6 +342,12 @@ function capture(
       cwd,
       encoding: 'utf8',
       maxBuffer: 256 * 1024 * 1024,
+      // stdin closed so `gh` can never sit on an interactive prompt; stderr 'pipe' rather
+      // than the sync-exec default, which ALSO mirrors the child's stderr onto ours — every
+      // expected-miss conventions probe used to print its own `gh: Not Found (HTTP 404)`
+      // line into the run log (~60 per URL-PR run). The text still lands in err.stderr
+      // below, so every failure path reports what broke; nothing is mirrored blind.
+      stdio: ['ignore', 'pipe', 'pipe'],
       // Bound the call so a wedged `gh` (auth prompt, network hang) can't hang the
       // gate forever — fail with a clear error instead.
       timeout: 120_000,
@@ -396,6 +407,20 @@ function ghConventionReader(
   const encPath = (p: string): string =>
     p.split('/').map(encodeURIComponent).join('/');
   const encRef = encodeURIComponent(ref);
+  // A probe MISS is the normal case (the gatherer walks candidate paths that mostly don't
+  // exist) and stays silent — capture() no longer mirrors gh's stderr. Anything NON-404
+  // (auth expiry, rate limit, network) surfaces ONCE per distinct message: this reader
+  // degrades to null/[] by design, so a broken gh would otherwise read as "0/N gathered"
+  // with no visible cause.
+  const warned = new Set<string>();
+  const warnUnlessExpectedMiss = (error: string): void => {
+    if (/\bHTTP 404\b/.test(error)) return;
+    const nl = error.indexOf('\n');
+    const first = nl === -1 ? error : error.slice(0, nl);
+    if (warned.has(first)) return;
+    warned.add(first);
+    console.error(`· conventions probe (gh): ${first}`);
+  };
   return {
     async read(rel, maxBytes) {
       // `.type=="file"` guard: the contents API returns an ARRAY for a directory (and an
@@ -411,7 +436,11 @@ function ghConventionReader(
         ],
         cwd
       );
-      if (!cap.ok || !cap.text.trim()) return null;
+      if (!cap.ok) {
+        warnUnlessExpectedMiss(cap.error);
+        return null;
+      }
+      if (!cap.text.trim()) return null;
       try {
         const decoded = Buffer.from(cap.text.replace(/\s/g, ''), 'base64').toString('utf8');
         if (maxBytes !== undefined && Buffer.byteLength(decoded, 'utf8') > maxBytes) {
@@ -432,7 +461,10 @@ function ghConventionReader(
         ['api', `repos/${repoSlug}/contents/${encPath(dirRel)}?ref=${encRef}`, '--jq', '.[].path'],
         cwd
       );
-      if (!cap.ok) return [];
+      if (!cap.ok) {
+        warnUnlessExpectedMiss(cap.error);
+        return [];
+      }
       return cap.text
         .split('\n')
         .map((s) => s.trim())
@@ -1012,6 +1044,8 @@ async function reviewCommand(
         'allow-sensitive': { type: 'boolean' },
         base: { type: 'string' },
         ceiling: { type: 'string' },
+        'claude-effort': { type: 'string' },
+        'claude-model': { type: 'string' },
         conventions: { type: 'string' },
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
@@ -1309,7 +1343,18 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // has nothing to gate.
   const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
   if (claudeLayerExpected && result.prompt) {
-    const voiceConfigs = loadVoices();
+    // The claude REVIEWER seat resolves like the gate below: `--claude-model`/`--claude-effort`
+    // → the voices.json `claude` entry → the built-in opus @ max. gate-seat.ts owns the chain
+    // and the WHY: a headless seat must never inherit the interactive CLI's saved default (the
+    // 2026-07-23 fire inherited a fresh `/model` switch to Fable 5 and the leg died on its cap).
+    const claudeSeat = loadClaudeReviewerSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values['claude-effort'] === 'string' ? values['claude-effort'] : undefined,
+        model: typeof values['claude-model'] === 'string' ? values['claude-model'] : undefined,
+      },
+      (m) => console.error(`· ${m}`)
+    );
     // The GATE (synthesis) seat resolves INDEPENDENTLY of the `claude` reviewer voice: the
     // voices.json `gate` entry → the `claude` entry (model/effort only) → the built-in Opus
     // default, with `--gate-model`/`--gate-effort` overriding the file. A `cmd` on the gate seat
@@ -1368,7 +1413,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       claudeLayer = await runClaudeReviewLayer({
         baseDir: out,
         baseSha: layerBaseSha,
-        claudeConfig: voiceConfigs.claude,
+        claudeConfig: claudeSeat.config,
         // The conventions this run actually gathered — the docs a holistic finding may cite to
         // lift its MED severity cap (the gate re-reads the citation out of the tree regardless).
         conventionPaths: result.conventionManifest?.files.filter((f) => f.included).map((f) => f.path),

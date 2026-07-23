@@ -151,3 +151,50 @@ describe('URL PR conventions are read at the BASE ref, never the PR head', () =>
     expect(ghUrls().some((u) => u.includes(HEAD))).toBe(false);
   });
 });
+
+// A probe MISS is the gatherer's normal case (candidate paths mostly don't exist) — it must be
+// SILENT (the old mirrored `gh: Not Found (HTTP 404)` printed ~60 lines per URL-PR run). A
+// NON-404 failure (auth expiry, rate limit) must stay LOUD exactly once per distinct message:
+// the reader degrades to null/[] by design, so a broken gh would otherwise read as "0/N
+// gathered" with no visible cause.
+describe('URL PR conventions probes — misses silent, real gh failures loud ONCE', () => {
+  const ghErr = (stderr: string): Error => Object.assign(new Error('gh failed'), { stderr });
+
+  const probeLines = (): string[] =>
+    vi
+      .mocked(console.error)
+      .mock.calls.map((c) => String(c[0]))
+      .filter((s) => s.includes('conventions probe'));
+
+  it('404 misses print nothing', async () => {
+    resolveShas = true;
+    expect(await main(['review', 'https://github.com/o/r/pull/7'])).toBe(0);
+    const reader = mockRun.mock.calls[0][0].conventionReader;
+    expect(reader).toBeTruthy();
+
+    mockExec.mockImplementation((() => {
+      throw ghErr('gh: Not Found (HTTP 404)');
+    }) as unknown as typeof execFileSync);
+    expect(await reader?.read('AGENTS.md')).toBeNull();
+    expect(await reader?.read('docs/NOPE.md')).toBeNull();
+    expect(await reader?.list('docs')).toEqual([]);
+    expect(probeLines()).toEqual([]);
+  });
+
+  it('a non-404 failure surfaces once per distinct message, deduped across probes', async () => {
+    resolveShas = true;
+    expect(await main(['review', 'https://github.com/o/r/pull/7'])).toBe(0);
+    const reader = mockRun.mock.calls[0][0].conventionReader;
+
+    mockExec.mockImplementation((() => {
+      throw ghErr('gh: HTTP 401 — bad credentials');
+    }) as unknown as typeof execFileSync);
+    expect(await reader?.read('CLAUDE.md')).toBeNull();
+    expect(await reader?.read('AGENTS.md')).toBeNull();
+    expect(await reader?.list('docs')).toEqual([]);
+
+    const lines = probeLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('bad credentials');
+  });
+});

@@ -209,3 +209,27 @@ export function formatEgressDenials(denials: readonly EgressDenial[]): string {
   const hosts = [...new Set(denials.map((d) => d.host))].sort();
   return `egress fence: ${denials.length} connection(s) DENIED to ${hosts.length} host(s) outside the vendor allowlist — ${hosts.join(', ')}. A seat reached for a host it is not permitted to reach; review the run's egress-denials.json.`;
 }
+
+// PURE: the live run-log rollup — per-host:port counts, biggest first. The per-connection
+// prints used to BE this rollup (~400 identical lines on one retry storm, run
+// 2026-07-23-15-36-50); now seatDenialPrinter emits one line per distinct host and this line
+// carries the counts. Hosts past the cap are counted, never silently dropped —
+// egress-denials.json still holds every connection.
+export function formatEgressDenialCounts(
+  denials: readonly EgressDenial[],
+  maxHosts = 6
+): string {
+  const counts = new Map<string, number>();
+  for (const d of denials) {
+    const key = `${d.host}:${d.port}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const ordered = [...counts.entries()].sort(
+    (a, b) => b[1] - a[1] || a[0].localeCompare(b[0])
+  );
+  const shown = ordered.slice(0, maxHosts).map(([host, n]) => `${host} ×${n}`);
+  const hidden = ordered.length - shown.length;
+  return `${denials.length} connection(s) DENIED — ${shown.join(' · ')}${
+    hidden > 0 ? ` · +${hidden} more host(s) (see egress-denials.json)` : ''
+  }`;
+}

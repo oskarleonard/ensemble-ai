@@ -149,6 +149,26 @@ export function resolveGateSeat(
   };
 }
 
+// Read a voices.json for one seat resolver. A missing file is the normal zero-config case —
+// silent. Any OTHER failure (unreadable, malformed JSON) silently resetting the seat would
+// violate the junk-config-is-loud posture, so it warns before falling back.
+function readVoicesRaw(
+  file: string,
+  warn: (m: string) => void,
+  seatLabel: string,
+  fallbackNote: string
+): unknown {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT')
+      warn(
+        `${seatLabel}: could not read \`${file}\` (${(e as Error).message.split('\n')[0]}) — ${fallbackNote}`,
+      );
+    return {};
+  }
+}
+
 // Read + resolve the gate seat from a voices.json file (default ~/.ensemble-ai/voices.json). A
 // missing / unreadable / invalid file → an empty raw → the built-in default seat (never throws).
 export function loadGateSeat(
@@ -156,18 +176,88 @@ export function loadGateSeat(
   flags: GateSeatFlags = {},
   warn: (m: string) => void = () => {},
 ): GateSeat {
-  let raw: unknown = {};
-  try {
-    raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (e) {
-    // A missing file is the normal zero-config case — silent. Any OTHER failure (unreadable,
-    // malformed JSON) silently resetting the seat would violate the junk-config-is-loud posture,
-    // so it warns before falling back.
-    if ((e as NodeJS.ErrnoException).code !== 'ENOENT')
+  return resolveGateSeat(
+    readVoicesRaw(file, warn, 'gate seat', 'using the claude voice / built-in default'),
+    flags,
+    warn
+  );
+}
+
+// ── The claude REVIEWER (producer) seat ───────────────────────────────────────────────────────
+// Chain: `--claude-model`/`--claude-effort` → the voices.json `claude` entry → opus @ max BAKED.
+// Unlike the gate, this chain deliberately NEVER ends at the 'default' sentinel (= no --model →
+// whatever the operator's saved interactive CLI default happens to be): the seat runs headless
+// and unattended, so riding the interactive default is not a model choice, it is an accident.
+// Run 2026-07-23-15-36-50 fired minutes after a `/model` switch to Fable 5 — the seat inherited
+// it, burned the Fable quota, and failed the leg ("You've reached your Fable 5 limit" was the
+// whole review). The registry seat (core/reviewers.ts) always SAID opus @ max; this resolver
+// makes the review layer honor it. An operator who wants a different model states it: flag or
+// file. Reuses GateSeat's shape — both are a resolved claude-binary seat (model/effort + sources).
+export const CLAUDE_REVIEWER_SEAT_DEFAULTS = { effort: 'max', model: 'opus' } as const;
+
+export function resolveClaudeReviewerSeat(
+  raw: unknown,
+  flags: GateSeatFlags,
+  warn: (m: string) => void
+): GateSeat {
+  const root = plainObject(raw) ?? {};
+  const claude = plainObject(root.claude);
+  const isKnownEffort = (v: string): boolean => CLAUDE_EFFORTS.has(v);
+
+  // Same flag pre-validation the gate applies: an unknown --claude-effort is ignored + warned,
+  // then the chain continues (flag/file symmetry — never resolve a value the spawn would drop).
+  const flagEffort = nonEmptyStr(flags.effort);
+  const effortFlagOk = flagEffort !== null && isKnownEffort(flagEffort);
+  if (flagEffort && !effortFlagOk)
+    warn(
+      `claude seat: --claude-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — ignored`,
+    );
+
+  const pick = (
+    key: 'effort' | 'model',
+    flag: string | null,
+    accept: (v: string) => boolean,
+    baked: string
+  ): { source: SeatSource; value: string } => {
+    if (flag) return { source: 'flag', value: flag };
+    const fromFile = claude ? nonEmptyStr(claude[key]) : null;
+    if (claude && key in claude && fromFile === null)
       warn(
-        `gate seat: could not read \`${file}\` (${(e as Error).message.split('\n')[0]}) — using the claude voice / built-in default`,
+        `claude seat: \`${key}\` must be a non-empty string — using the built-in ${baked}`,
       );
-    raw = {};
-  }
-  return resolveGateSeat(raw, flags, warn);
+    // 'default' is the documented "no explicit value at this link" sentinel — for THIS seat it
+    // falls through to the baked value, never to the interactive CLI default (header comment).
+    if (fromFile !== null && fromFile !== 'default') {
+      if (accept(fromFile)) return { source: 'file', value: fromFile };
+      warn(
+        `claude seat: \`${key}\` "${fromFile}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — using the built-in ${baked}`,
+      );
+    }
+    return { source: 'default', value: baked };
+  };
+
+  const model = pick('model', nonEmptyStr(flags.model), () => true, CLAUDE_REVIEWER_SEAT_DEFAULTS.model);
+  const effort = pick('effort', effortFlagOk ? flagEffort : null, isKnownEffort, CLAUDE_REVIEWER_SEAT_DEFAULTS.effort);
+
+  return {
+    // Identity (cmd/id/vendor) from the one canonical claude voice, like the gate — only
+    // model/effort are configurable; the capability fence is not.
+    config: { ...VOICE_DEFAULTS.claude, effort: effort.value, model: model.value },
+    effortSource: effort.source,
+    modelSource: model.source,
+  };
+}
+
+// Read + resolve the claude REVIEWER seat from a voices.json file. Same never-throws contract
+// as loadGateSeat.
+export function loadClaudeReviewerSeat(
+  file: string = VOICES_FILE,
+  flags: GateSeatFlags = {},
+  warn: (m: string) => void = () => {},
+): GateSeat {
+  return resolveClaudeReviewerSeat(
+    readVoicesRaw(file, warn, 'claude seat', `using the built-in ${CLAUDE_REVIEWER_SEAT_DEFAULTS.model} @ ${CLAUDE_REVIEWER_SEAT_DEFAULTS.effort}`),
+    flags,
+    warn
+  );
 }
