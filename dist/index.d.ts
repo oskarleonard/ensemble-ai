@@ -245,7 +245,7 @@ interface EgressDenial {
     reason: string;
 }
 
-declare const REVIEW_TIMEOUT_MS = 720000;
+declare const REVIEW_TIMEOUT_MS = 900000;
 interface CodexReviewResult {
     egressDenials?: readonly EgressDenial[];
     ok: boolean;

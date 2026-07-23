@@ -1257,7 +1257,7 @@ function egressStartFailure(id, err) {
 }
 
 // src/reviewers/codex.ts
-var REVIEW_TIMEOUT_MS = 72e4;
+var REVIEW_TIMEOUT_MS = 9e5;
 function buildCodexReviewArgs(config, outFile, prompt) {
   return [
     "exec",
@@ -5848,7 +5848,9 @@ function loadVoiceReviewsFromTrail(baseDir, runId) {
   if (holistic) out.push(holistic);
   return out;
 }
-var CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 15e5;
+var CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 24e5;
+var HOLISTIC_WORKTREE_TIMEOUT_MS = 9e5;
+var GATE_WORKTREE_TIMEOUT_MS = 9e5;
 async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log, worktree, historyPacket) {
   let res;
   try {
@@ -5969,7 +5971,9 @@ async function runClaudeReviewLayer(opts) {
       ...opts.historyPacket ? { historyPacket: opts.historyPacket } : {},
       log,
       run,
-      timeoutMs: opts.timeoutMs,
+      // The lens only runs WITH worktree evidence (resolveHolisticPlan), so the
+      // worktree-sized default applies whenever the caller didn't set one.
+      timeoutMs: opts.timeoutMs ?? HOLISTIC_WORKTREE_TIMEOUT_MS,
       worktree: plan.worktree
     });
     holisticReview = review;
@@ -6007,7 +6011,9 @@ async function runClaudeReviewLayer(opts) {
     reviews: voiceReviews,
     run,
     runId: opts.runId,
-    timeoutMs: opts.timeoutMs,
+    // A worktree gate verifies against the tree (evidence-bearing) — give it the
+    // worktree-sized watchdog; packet mode keeps the shared default.
+    timeoutMs: opts.timeoutMs ?? (opts.worktree ? GATE_WORKTREE_TIMEOUT_MS : void 0),
     // The gate reads the same worktree the seats did (spec §5) — its own spawn cwd.
     ...opts.worktree ? { worktree: opts.worktree } : {}
   });

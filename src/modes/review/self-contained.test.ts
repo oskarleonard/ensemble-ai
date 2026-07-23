@@ -14,6 +14,8 @@ import { persistGatePacket } from './gate-hunks';
 import type { VoiceReview } from './synthesis';
 import {
   CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS,
+  GATE_WORKTREE_TIMEOUT_MS,
+  HOLISTIC_WORKTREE_TIMEOUT_MS,
   claudeLayerHasHigh,
   loadVoiceReviewsFromTrail,
   renderClaudeLayer,
@@ -530,5 +532,43 @@ describe('runClaudeReviewLayer — worktree producer timeout default', () => {
   it('an explicit caller timeout beats the worktree default', async () => {
     const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-wt-'));
     expect(await producerTimeoutFor({ timeoutMs: 123_000, worktree: wt })).toBe(123_000);
+  });
+
+  it('worktree run: holistic and the gate get their own generous watchdogs too', async () => {
+    const base = tmpTrail();
+    const runId = 'timeout-probe-2';
+    seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-wt-'));
+    const nonGate: Array<number | undefined> = [];
+    let gateTimeout: number | undefined;
+    const run = async (
+      prompt: string,
+      _c: VoiceConfig,
+      o?: { timeoutMs?: number }
+    ): Promise<VoiceRunResult> => {
+      if (prompt.includes('VERIFIED GATE')) {
+        gateTimeout = o?.timeoutMs;
+        return okRun(GATE);
+      }
+      nonGate.push(o?.timeoutMs);
+      return okRun(CLAUDE_REVIEW);
+    };
+    await runClaudeReviewLayer({
+      baseDir: base,
+      claudeConfig: CFG,
+      coreReviews: [stored('codex'), stored('grok')],
+      expectedHeadSha: HEAD,
+      holistic: { baseSha: 'BASESHA1', config: CFG },
+      includeClaudeReviewer: true,
+      pinnedDiff: GATE_DIFF,
+      reviewPrompt: 'REVIEW PROMPT PAYLOAD',
+      run,
+      runId,
+      worktree: wt,
+    });
+    // Spawn order: producer → holistic → gate.
+    expect(nonGate[0]).toBe(CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS);
+    expect(nonGate[1]).toBe(HOLISTIC_WORKTREE_TIMEOUT_MS);
+    expect(gateTimeout).toBe(GATE_WORKTREE_TIMEOUT_MS);
   });
 });
