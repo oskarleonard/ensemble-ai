@@ -3,9 +3,9 @@
 // src/cli.ts
 import { execFileSync as execFileSync4 } from "child_process";
 import crypto2 from "crypto";
-import fs21 from "fs";
+import fs22 from "fs";
 import os11 from "os";
-import path17 from "path";
+import path18 from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 import { parseArgs } from "util";
 
@@ -2558,9 +2558,9 @@ var GENERATED_PATTERNS = [
   /\.(js|css)\.map$/,
   /\.snap$/
 ];
-function classifyFileKind(path18, isBinary) {
+function classifyFileKind(path19, isBinary) {
   if (isBinary) return "binary";
-  return GENERATED_PATTERNS.some((re) => re.test(path18)) ? "generated" : "source";
+  return GENERATED_PATTERNS.some((re) => re.test(path19)) ? "generated" : "source";
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -2578,7 +2578,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path18 = pathOfSection(section2);
+    const path19 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -2589,8 +2589,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path18, isBinary),
-      path: path18,
+      kind: classifyFileKind(path19, isBinary),
+      path: path19,
       raw: section2,
       removed
     };
@@ -2747,6 +2747,10 @@ function persistGatePacket(baseDir, runId, input) {
     schemaVersion: GATE_PACKET_SCHEMA_VERSION
   };
   writeTrailFile(baseDir, runId, "packet.gate.json", JSON.stringify(packet, null, 2));
+}
+function readGatePacketHeadSha(baseDir, runId) {
+  const raw = readTrailJson(baseDir, runId, "packet.gate.json");
+  return raw && typeof raw.headSha === "string" && raw.headSha.trim() && raw.schemaVersion === GATE_PACKET_SCHEMA_VERSION ? raw.headSha : null;
 }
 function readGatePacket(baseDir, runId, expectedHeadSha) {
   const file = path10.join(reviewDir(baseDir, runId), "packet.gate.json");
@@ -6230,6 +6234,89 @@ function loadClaudeReviewerSeat(file = VOICES_FILE, flags = {}, warn = () => {
   );
 }
 
+// src/modes/review/regate.ts
+import fs21 from "fs";
+import path16 from "path";
+function readConventionPathsFromTrail(baseDir, runId) {
+  try {
+    const raw = JSON.parse(
+      fs21.readFileSync(path16.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
+    );
+    const paths = (raw.files ?? []).filter((f) => f.included === true && typeof f.path === "string").map((f) => f.path);
+    return paths.length > 0 ? paths : void 0;
+  } catch {
+    return void 0;
+  }
+}
+async function runRegate(opts) {
+  const log = opts.log ?? (() => {
+  });
+  const headSha = readGatePacketHeadSha(opts.baseDir, opts.runId);
+  if (!headSha) {
+    throw new Error(
+      `run ${opts.runId} has no usable packet.gate.json under ${opts.baseDir} \u2014 nothing to ground a regate against`
+    );
+  }
+  const reviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
+  if (reviews.length === 0) {
+    throw new Error(
+      `run ${opts.runId} has no persisted reviews in its trail \u2014 nothing to regate`
+    );
+  }
+  log(
+    `regate: ${reviews.length} persisted reviewer voice(s) rehydrated \xB7 head ${headSha.slice(0, 12)} \xB7 ${opts.worktree ? "worktree evidence" : "packet evidence"}`
+  );
+  const gate = await runGate({
+    baseDir: opts.baseDir,
+    config: opts.gateConfig,
+    expectedHeadSha: headSha,
+    ...opts.worktree ? {
+      gateEvidence: "worktree",
+      holistic: {
+        conventionPaths: opts.conventionPaths,
+        readAtHead: worktreeReader(opts.worktree)
+      }
+    } : {},
+    log,
+    reviews,
+    run: opts.run ?? runClaudeReviewVoice,
+    runId: opts.runId,
+    // Same watchdog policy as the layer: the worktree gate carries the heavy-pass budget.
+    timeoutMs: opts.timeoutMs ?? (opts.worktree ? GATE_WORKTREE_TIMEOUT_MS : void 0),
+    ...opts.worktree ? { worktree: opts.worktree } : {}
+  });
+  try {
+    const p = path16.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
+    const existing = fs21.existsSync(p) ? JSON.parse(fs21.readFileSync(p, "utf8")) : {};
+    writeTrailFile(
+      opts.baseDir,
+      opts.runId,
+      "claude-synthesis.json",
+      JSON.stringify(
+        {
+          ...existing,
+          gateSpawned: gate.gateSpawned,
+          gateTrailWritten: gate.gateTrailWritten,
+          gateVerdicts: gate.verdicts,
+          regatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          synthesis: gate.synthesis
+        },
+        null,
+        2
+      )
+    );
+  } catch (e) {
+    log(`regate: claude-synthesis.json could not be updated (${e.message})`);
+  }
+  return {
+    headSha,
+    ok: !gate.synthesis.degraded,
+    reviews: reviews.length,
+    synthesis: gate.synthesis,
+    verdicts: gate.verdicts
+  };
+}
+
 // src/modes/review/evidence-manifest.ts
 var EVIDENCE_MANIFEST_SCHEMA_VERSION = 1;
 var EVIDENCE_MANIFEST_FILE = "evidence-manifest.json";
@@ -6268,11 +6355,11 @@ function writeEvidenceManifest(baseDir, runId, manifest) {
 
 // src/modes/review/git-exec.ts
 import { execFileSync as execFileSync3 } from "child_process";
-import path16 from "path";
+import path17 from "path";
 function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
   const cmd = configured?.trim();
   if (!cmd) return "ssh -o BatchMode=yes";
-  const bin = path16.basename(cmd.split(/\s+/)[0]);
+  const bin = path17.basename(cmd.split(/\s+/)[0]);
   return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
 }
 function effectiveSshCommand(cwd, cache) {
@@ -7191,6 +7278,9 @@ Modes:
 Plumbing (no reviewer runs \u2014 inspect the engine):
   receipt      verify | show a content-tied diff receipt (the pre-PR gate primitive):
                \`receipt verify\` exits 0 iff the current diff is reviewed & current.
+  regate       re-run ONLY the synthesis gate over an existing run's trail \u2014 heals a
+               run whose gate died (all-unverified fail-close) without re-billing any
+               reviewer. \`regate --help\` for the contract.
   reviewers    (alias: config) list the configured cross-vendor registry (read-only).
   diff         show the assembled review packet that WOULD be sent \u2014 cost-preview/debug.
 
@@ -7314,28 +7404,28 @@ function genRunId() {
 }
 function clearReusedRunTrail(baseDir, trailDir) {
   try {
-    if (fs21.lstatSync(trailDir).isSymbolicLink()) return;
+    if (fs22.lstatSync(trailDir).isSymbolicLink()) return;
   } catch {
     return;
   }
   let realBase;
   let realTarget;
   try {
-    realBase = fs21.realpathSync(baseDir);
-    realTarget = fs21.realpathSync(trailDir);
+    realBase = fs22.realpathSync(baseDir);
+    realTarget = fs22.realpathSync(trailDir);
   } catch {
     return;
   }
-  const rel = path17.relative(realBase, realTarget);
+  const rel = path18.relative(realBase, realTarget);
   if (!rel || escapesRoot(rel)) {
     return;
   }
-  fs21.rmSync(realTarget, { force: true, recursive: true });
+  fs22.rmSync(realTarget, { force: true, recursive: true });
 }
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
   try {
-    const s = fs21.readFileSync(0, "utf8");
+    const s = fs22.readFileSync(0, "utf8");
     return s.trim() ? s : void 0;
   } catch {
     return void 0;
@@ -7378,9 +7468,9 @@ function gitToplevel(cwd) {
 }
 function resolveTrailBase(gitRoot, localRepoTrail) {
   if (gitRoot && localRepoTrail) {
-    return path17.join(gitRoot, ".ensemble-ai", "reviews");
+    return path18.join(gitRoot, ".ensemble-ai", "reviews");
   }
-  return path17.join(os11.tmpdir(), "ensemble-ai", "reviews");
+  return path18.join(os11.tmpdir(), "ensemble-ai", "reviews");
 }
 function ghConventionReader(repoSlug, ref, cwd) {
   const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
@@ -7507,7 +7597,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "diff-file": {
       let text;
       try {
-        text = fs21.readFileSync(String(selection.diffFile), "utf8");
+        text = fs22.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
@@ -7825,7 +7915,7 @@ async function reviewCommand(args, profile = "code") {
     console.log(usage);
     return 0;
   }
-  const cwd = values.cwd ? path17.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path18.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
   const postComment = Boolean(values["post-comment"]);
@@ -7898,7 +7988,7 @@ async function runReviewPipeline(input) {
   }
   const reviewers = requestedReviewers === void 0 ? void 0 : roster.core;
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-  const out = typeof values.out === "string" ? path17.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+  const out = typeof values.out === "string" ? path18.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
   clearReusedRunTrail(out, trailDir);
   const ceiling = positiveCeiling(
@@ -8117,7 +8207,7 @@ async function runReviewPipeline(input) {
     const first = result.reviews[0];
     const pinnedReviewerId = first.reviewerId ?? first.reviewer.vendor;
     console.log(
-      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path17.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
+      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path18.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
   }
   if (claudeLayer) {
@@ -8349,19 +8439,19 @@ async function brainstormCommand(args) {
     console.error(BRAINSTORM_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path17.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path18.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path17.resolve(cwd, values.file);
+    const filePath = path18.resolve(cwd, values.file);
     try {
-      const bytes = fs21.statSync(filePath).size;
+      const bytes = fs22.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs21.readFileSync(filePath, "utf8");
+      fileContext = fs22.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${e.message}`
@@ -8554,19 +8644,19 @@ async function consultCommand(args) {
     console.error(CONSULT_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path17.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path18.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path17.resolve(cwd, values.file);
+    const filePath = path18.resolve(cwd, values.file);
     try {
-      const bytes = fs21.statSync(filePath).size;
+      const bytes = fs22.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs21.readFileSync(filePath, "utf8");
+      fileContext = fs22.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai consult: cannot read --file ${values.file}: ${e.message}`
@@ -8748,11 +8838,11 @@ async function receiptCommand(args) {
     console.log(RECEIPT_USAGE);
     return 0;
   }
-  const receiptPathArg = typeof positionals[0] === "string" ? path17.resolve(positionals[0]) : void 0;
+  const receiptPathArg = typeof positionals[0] === "string" ? path18.resolve(positionals[0]) : void 0;
   const readReceiptFile = (p) => {
     let raw;
     try {
-      raw = fs21.readFileSync(p, "utf8");
+      raw = fs22.readFileSync(p, "utf8");
     } catch (e) {
       return { error: `cannot read receipt ${p}: ${e.message}` };
     }
@@ -8793,8 +8883,8 @@ async function receiptCommand(args) {
     console.error(`ensemble-ai receipt ${sub}: choose at most one of --repo / --cwd (both name the repo to verify)`);
     return 3;
   }
-  const repoLocation = typeof values.repo === "string" ? path17.resolve(values.repo) : void 0;
-  const cwd = repoLocation ?? (values.cwd ? path17.resolve(String(values.cwd)) : process.cwd());
+  const repoLocation = typeof values.repo === "string" ? path18.resolve(values.repo) : void 0;
+  const cwd = repoLocation ?? (values.cwd ? path18.resolve(String(values.cwd)) : process.cwd());
   const intendedEvidence = repoLocation ? Object.fromEntries(required.map((id) => [id, "worktree"])) : void 0;
   const acceptDegraded = Boolean(values["accept-degraded"]);
   if (acceptDegraded && !intendedEvidence) {
@@ -8833,7 +8923,7 @@ async function receiptCommand(args) {
     }),
     repo: acquired.repoId
   };
-  const store = values.store ? path17.resolve(String(values.store)) : defaultReceiptStore();
+  const store = values.store ? path18.resolve(String(values.store)) : defaultReceiptStore();
   if (sub === "show") {
     const receipt = readReceipt(store, key);
     if (!receipt) {
@@ -8869,7 +8959,7 @@ async function receiptCommand(args) {
     // with isDiffReviewed so a digest-only drift still reports `stale`.
     readReceipt: receiptPathArg ? (k) => explicit && receiptIdentityMatches(explicit, k) ? explicit : null : (k) => readReceipt(store, k),
     strict: Boolean(values.strict || values["require-artifacts"]),
-    trailDir: typeof values.trail === "string" ? path17.resolve(values.trail) : void 0
+    trailDir: typeof values.trail === "string" ? path18.resolve(values.trail) : void 0
   };
   const state = verifyReceipt({ coverage: acquired.coverage, key, required }, verifyDeps);
   console.log(formatVerify(state, key));
@@ -8917,8 +9007,8 @@ async function reviewersCommand(args) {
     console.log(REVIEWERS_USAGE);
     return 0;
   }
-  const reviewersFile = typeof values["reviewers-file"] === "string" ? path17.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
-  const voicesFile = typeof values["voices-file"] === "string" ? path17.resolve(values["voices-file"]) : VOICES_FILE;
+  const reviewersFile = typeof values["reviewers-file"] === "string" ? path18.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
+  const voicesFile = typeof values["voices-file"] === "string" ? path18.resolve(values["voices-file"]) : VOICES_FILE;
   const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`\xB7 ${m}`));
   const view = {
     gate: {
@@ -8929,10 +9019,10 @@ async function reviewersCommand(args) {
     },
     reviewers: listReviewers(reviewersFile),
     reviewersFile,
-    reviewersFileExists: fs21.existsSync(reviewersFile),
+    reviewersFileExists: fs22.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
     voicesFile,
-    voicesFileExists: fs21.existsSync(voicesFile)
+    voicesFileExists: fs22.existsSync(voicesFile)
   };
   if (values.json) console.log(JSON.stringify(view, null, 2));
   else console.log(renderRegistry(view));
@@ -9022,7 +9112,7 @@ async function diffCommand(args) {
     "diff"
   );
   if (typeof ceiling === "object") return ceiling.code;
-  const cwd = values.cwd ? path17.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path18.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
   let acquired;
@@ -9124,7 +9214,7 @@ async function pushFenceCommand(args) {
     );
     return 3;
   }
-  const cwd = values.cwd ? path17.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path18.resolve(String(values.cwd)) : process.cwd();
   const gh = ghRunner(cwd);
   const scope = selection.owner && selection.repo ? ["-R", `${selection.owner}/${selection.repo}`] : [];
   const view = gh([
@@ -9182,7 +9272,7 @@ Exit: 0 = current (or ahead of main); 3 = STALE or DIVERGED; 1 = error. A consum
 gates on the exit code, or parses --json for a softer "N behind" surface.`;
 function resolveSelfRepo(git2) {
   const r = git2(["rev-parse", "--show-toplevel"], {
-    cwd: path17.dirname(fileURLToPath2(import.meta.url))
+    cwd: path18.dirname(fileURLToPath2(import.meta.url))
   });
   return r.ok ? r.text.trim() : null;
 }
@@ -9240,6 +9330,129 @@ async function pinCheckCommand(args) {
   }
   return stale ? 3 : 0;
 }
+var REGATE_USAGE = `ensemble-ai regate \u2014 re-run ONLY the synthesis gate over an existing run's trail.
+
+A gate that died (timeout, quota) fail-closed every verdict to "unverified" while the
+expensive reviewer work \u2014 codex, grok, the cold producer, the holistic lens \u2014 sat complete
+on disk. regate rehydrates the persisted reviews + pinned packet from <out>/<run-id>/,
+re-spawns the ONE gate seat, and rewrites gate-verdicts.json + claude-synthesis.json in
+place. No reviewer re-runs, no vendor re-billing; a dashboard rendering those trail files
+heals retroactively.
+
+Usage:
+  ensemble-ai regate [<pr-url>] --out <dir> --run-id <id> [--repo <path>]
+                     [--gate-model <m>] [--gate-effort <e>]
+
+  <pr-url>          the SAME GitHub PR URL the original review took \u2014 required only with
+                    --repo (the worktree re-materialization fetches pull/<N>/head)
+  --out <dir>       the trail base the original run wrote (its <run-id>/ dir lives here)
+  --run-id <id>     the original run's id
+  --repo <path>     local clone of the PR's repo \u2014 re-materializes the head read-only so
+                    the gate is evidence-bearing (reference-not-found + holistic two-site
+                    verification). Unavailable/failed \u2192 LOUD fallback to packet evidence.
+  --gate-model <m>  gate seat pin \u2014 same resolution chain as review (flag \u2192 voices.json
+  --gate-effort <e> \`gate\` entry \u2192 the claude voice \u2192 built-in default)
+
+Exit: 0 = gate completed (verdicts updated) \xB7 1 = gate failed again (still fail-closed) \xB7
+3 = usage / missing trail.
+`;
+async function regateCommand(args) {
+  let values;
+  let positionals;
+  try {
+    ({ positionals, values } = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        "gate-effort": { type: "string" },
+        "gate-model": { type: "string" },
+        help: { short: "h", type: "boolean" },
+        out: { type: "string" },
+        repo: { type: "string" },
+        "run-id": { type: "string" }
+      }
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai regate: ${e.message}`);
+    return 3;
+  }
+  if (values.help) {
+    console.log(REGATE_USAGE);
+    return 0;
+  }
+  const out = typeof values.out === "string" ? values.out.trim() : "";
+  const runId = typeof values["run-id"] === "string" ? values["run-id"].trim() : "";
+  if (!out || !runId) {
+    console.error("ensemble-ai regate: --out and --run-id are required\n");
+    console.error(REGATE_USAGE);
+    return 3;
+  }
+  const headSha = readGatePacketHeadSha(out, runId);
+  if (!headSha) {
+    console.error(
+      `ensemble-ai regate: run ${runId} has no usable packet.gate.json under ${out} \u2014 was this run made by \`review --out\`?`
+    );
+    return 3;
+  }
+  const gateSeat = loadGateSeat(
+    VOICES_FILE,
+    {
+      effort: typeof values["gate-effort"] === "string" ? values["gate-effort"] : void 0,
+      model: typeof values["gate-model"] === "string" ? values["gate-model"] : void 0
+    },
+    (m) => console.error(`\xB7 ${m}`)
+  );
+  let session = null;
+  const repoFlag = typeof values.repo === "string" ? values.repo.trim() : "";
+  if (repoFlag) {
+    const url = positionals[0]?.trim() ?? "";
+    const ref = url ? parsePrUrl(url) : null;
+    if (!ref) {
+      console.error(
+        "ensemble-ai regate: --repo needs the original PR URL as the positional (the head is re-fetched as pull/<N>/head)"
+      );
+      return 3;
+    }
+    console.error(`\xB7 re-materializing the PR head as a read-only worktree of ${repoFlag}\u2026`);
+    const made = openWorktree({
+      baseSha: null,
+      headSha,
+      pr: ref.pr,
+      prSlug: `${ref.owner}/${ref.repo}`,
+      repoPath: repoFlag
+    });
+    if (isPreflightError(made)) {
+      console.error(
+        `\xB7 \u26A0 worktree unavailable (${made.kind}: ${made.message}) \u2014 regating on PACKET evidence (reference-not-found + holistic verification OFF)`
+      );
+    } else {
+      session = made;
+    }
+  }
+  try {
+    const res = await runRegate({
+      baseDir: out,
+      conventionPaths: readConventionPathsFromTrail(out, runId),
+      gateConfig: gateSeat.config,
+      log: (m) => console.error(`\xB7 ${m}`),
+      runId,
+      ...session ? { worktree: session.dir } : {}
+    });
+    console.log(
+      renderGateVerdicts(res.verdicts, { scrub: scrubControl, trailWritten: true }).join("\n")
+    );
+    console.log(
+      res.ok ? `
+regate: gate completed over ${res.reviews} voice(s) \u2014 verdicts updated in ${out}/${runId}/` : "\nregate: the gate FAILED AGAIN \u2014 verdicts remain fail-closed unverified (see stderr for the cause)"
+    );
+    return res.ok ? 0 : 1;
+  } catch (e) {
+    console.error(`ensemble-ai regate: ${e.message}`);
+    return 3;
+  } finally {
+    session?.reap();
+  }
+}
 async function main(argv) {
   const raw = argv[0];
   if (!raw || raw === "-h" || raw === "--help") {
@@ -9251,6 +9464,7 @@ async function main(argv) {
   if (raw === "reviewers" || raw === "config") return reviewersCommand(argv.slice(1));
   if (raw === "diff") return diffCommand(argv.slice(1));
   if (raw === "pin-check") return pinCheckCommand(argv.slice(1));
+  if (raw === "regate") return regateCommand(argv.slice(1));
   const mode = resolveMode(raw);
   if (mode === "review") return reviewCommand(argv.slice(1), "code");
   if (mode === "security") return reviewCommand(argv.slice(1), "security");

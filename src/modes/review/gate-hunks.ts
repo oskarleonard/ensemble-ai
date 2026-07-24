@@ -62,6 +62,19 @@ export type GatePacketRead =
 // (a stale or swapped packet). Any failure is a packet-fail the gate turns into
 // all-`unverified` — never a silent read of the wrong bytes. Reading the persisted artifact
 // (not re-deriving from the tree) is the whole TOCTOU-safety guarantee.
+// The packet's OWN pinned headSha — for a caller (regate) that must re-materialize the
+// head WITHOUT re-acquiring the diff. Returns null for a missing/corrupt/mismatched-schema
+// packet; the caller then fails closed (there is nothing to ground a regate against).
+export function readGatePacketHeadSha(baseDir: string, runId: string): string | null {
+  const raw = readTrailJson<Partial<GatePacket>>(baseDir, runId, 'packet.gate.json');
+  return raw &&
+    typeof raw.headSha === 'string' &&
+    raw.headSha.trim() &&
+    raw.schemaVersion === GATE_PACKET_SCHEMA_VERSION
+    ? raw.headSha
+    : null;
+}
+
 export function readGatePacket(
   baseDir: string,
   runId: string,
