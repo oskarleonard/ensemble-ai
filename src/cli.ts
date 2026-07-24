@@ -54,10 +54,13 @@ import {
   type GateAuthorityInputs,
   gateAuthorityLabel,
   gateDispositionSummary,
+  renderGateVerdicts,
   renderHighGate,
   resolveHighGate,
 } from './modes/review/gate';
+import { readGatePacketHeadSha } from './modes/review/gate-hunks';
 import { type GateSeat, loadClaudeReviewerSeat, loadGateSeat } from './modes/review/gate-seat';
+import { readConventionPathsFromTrail, runRegate } from './modes/review/regate';
 import { loadHolisticSeat } from './modes/review/holistic';
 import {
   acquireDiff,
@@ -109,6 +112,7 @@ import {
   type DiffSourceSelection,
   hasExplicitSource,
   isDiffSourceError,
+  parsePrUrl,
   selectDiffSource,
 } from './modes/review/source';
 import {
@@ -158,6 +162,9 @@ Modes:
 Plumbing (no reviewer runs — inspect the engine):
   receipt      verify | show a content-tied diff receipt (the pre-PR gate primitive):
                \`receipt verify\` exits 0 iff the current diff is reviewed & current.
+  regate       re-run ONLY the synthesis gate over an existing run's trail — heals a
+               run whose gate died (all-unverified fail-close) without re-billing any
+               reviewer. \`regate --help\` for the contract.
   reviewers    (alias: config) list the configured cross-vendor registry (read-only).
   diff         show the assembled review packet that WOULD be sent — cost-preview/debug.
 
@@ -2937,6 +2944,142 @@ async function pinCheckCommand(args: string[]): Promise<number> {
   return stale ? 3 : 0;
 }
 
+const REGATE_USAGE = `ensemble-ai regate — re-run ONLY the synthesis gate over an existing run's trail.
+
+A gate that died (timeout, quota) fail-closed every verdict to "unverified" while the
+expensive reviewer work — codex, grok, the cold producer, the holistic lens — sat complete
+on disk. regate rehydrates the persisted reviews + pinned packet from <out>/<run-id>/,
+re-spawns the ONE gate seat, and rewrites gate-verdicts.json + claude-synthesis.json in
+place. No reviewer re-runs, no vendor re-billing; a dashboard rendering those trail files
+heals retroactively.
+
+Usage:
+  ensemble-ai regate [<pr-url>] --out <dir> --run-id <id> [--repo <path>]
+                     [--gate-model <m>] [--gate-effort <e>]
+
+  <pr-url>          the SAME GitHub PR URL the original review took — required only with
+                    --repo (the worktree re-materialization fetches pull/<N>/head)
+  --out <dir>       the trail base the original run wrote (its <run-id>/ dir lives here)
+  --run-id <id>     the original run's id
+  --repo <path>     local clone of the PR's repo — re-materializes the head read-only so
+                    the gate is evidence-bearing (reference-not-found + holistic two-site
+                    verification). Unavailable/failed → LOUD fallback to packet evidence.
+  --gate-model <m>  gate seat pin — same resolution chain as review (flag → voices.json
+  --gate-effort <e> \`gate\` entry → the claude voice → built-in default)
+
+Exit: 0 = gate completed (verdicts updated) · 1 = gate failed again (still fail-closed) ·
+3 = usage / missing trail.
+`;
+
+// regate: heal a run whose gate died without re-running any reviewer. The trail is the
+// contract (the gate reads reviews + packet from disk by design), so this command is a
+// thin wrapper: resolve the seat, optionally re-materialize the head, call runRegate.
+async function regateCommand(args: string[]): Promise<number> {
+  let values: Record<string, string | boolean | undefined>;
+  let positionals: string[];
+  try {
+    ({ positionals, values } = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        'gate-effort': { type: 'string' },
+        'gate-model': { type: 'string' },
+        help: { short: 'h', type: 'boolean' },
+        out: { type: 'string' },
+        repo: { type: 'string' },
+        'run-id': { type: 'string' },
+      },
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai regate: ${(e as Error).message}`);
+    return 3;
+  }
+  if (values.help) {
+    console.log(REGATE_USAGE);
+    return 0;
+  }
+  const out = typeof values.out === 'string' ? values.out.trim() : '';
+  const runId = typeof values['run-id'] === 'string' ? values['run-id'].trim() : '';
+  if (!out || !runId) {
+    console.error('ensemble-ai regate: --out and --run-id are required\n');
+    console.error(REGATE_USAGE);
+    return 3;
+  }
+
+  // Fail closed BEFORE any spawn: no pinned packet ⇒ nothing to ground against.
+  const headSha = readGatePacketHeadSha(out, runId);
+  if (!headSha) {
+    console.error(
+      `ensemble-ai regate: run ${runId} has no usable packet.gate.json under ${out} — was this run made by \`review --out\`?`
+    );
+    return 3;
+  }
+
+  const gateSeat = loadGateSeat(
+    VOICES_FILE,
+    {
+      effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+      model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+    },
+    (m) => console.error(`· ${m}`)
+  );
+
+  // Worktree evidence is opt-in and best-effort: a refused/failed materialization
+  // degrades LOUDLY to packet grounding — a regate is never lost to a worktree problem.
+  let session: WorktreeSession | null = null;
+  const repoFlag = typeof values.repo === 'string' ? values.repo.trim() : '';
+  if (repoFlag) {
+    const url = positionals[0]?.trim() ?? '';
+    const ref = url ? parsePrUrl(url) : null;
+    if (!ref) {
+      console.error(
+        'ensemble-ai regate: --repo needs the original PR URL as the positional (the head is re-fetched as pull/<N>/head)'
+      );
+      return 3;
+    }
+    console.error(`· re-materializing the PR head as a read-only worktree of ${repoFlag}…`);
+    const made = openWorktree({
+      baseSha: null,
+      headSha,
+      pr: ref.pr,
+      prSlug: `${ref.owner}/${ref.repo}`,
+      repoPath: repoFlag,
+    });
+    if (isPreflightError(made)) {
+      console.error(
+        `· ⚠ worktree unavailable (${made.kind}: ${made.message}) — regating on PACKET evidence (reference-not-found + holistic verification OFF)`
+      );
+    } else {
+      session = made;
+    }
+  }
+
+  try {
+    const res = await runRegate({
+      baseDir: out,
+      conventionPaths: readConventionPathsFromTrail(out, runId),
+      gateConfig: gateSeat.config,
+      log: (m) => console.error(`· ${m}`),
+      runId,
+      ...(session ? { worktree: session.dir } : {}),
+    });
+    console.log(
+      renderGateVerdicts(res.verdicts, { scrub: clean, trailWritten: true }).join('\n')
+    );
+    console.log(
+      res.ok
+        ? `\nregate: gate completed over ${res.reviews} voice(s) — verdicts updated in ${out}/${runId}/`
+        : '\nregate: the gate FAILED AGAIN — verdicts remain fail-closed unverified (see stderr for the cause)'
+    );
+    return res.ok ? 0 : 1;
+  } catch (e) {
+    console.error(`ensemble-ai regate: ${(e as Error).message}`);
+    return 3;
+  } finally {
+    session?.reap();
+  }
+}
+
 export async function main(argv: string[]): Promise<number> {
   const raw = argv[0];
   if (!raw || raw === '-h' || raw === '--help') {
@@ -2949,6 +3092,7 @@ export async function main(argv: string[]): Promise<number> {
   if (raw === 'reviewers' || raw === 'config') return reviewersCommand(argv.slice(1));
   if (raw === 'diff') return diffCommand(argv.slice(1));
   if (raw === 'pin-check') return pinCheckCommand(argv.slice(1));
+  if (raw === 'regate') return regateCommand(argv.slice(1));
 
   const mode = resolveMode(raw);
   if (mode === 'review') return reviewCommand(argv.slice(1), 'code');
