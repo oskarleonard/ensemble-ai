@@ -5850,7 +5850,7 @@ function loadVoiceReviewsFromTrail(baseDir, runId) {
 }
 var CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 24e5;
 var HOLISTIC_WORKTREE_TIMEOUT_MS = 9e5;
-var GATE_WORKTREE_TIMEOUT_MS = 9e5;
+var GATE_WORKTREE_TIMEOUT_MS = 24e5;
 async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log, worktree, historyPacket) {
   let res;
   try {
