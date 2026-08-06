@@ -327,7 +327,7 @@ describe('exit-4 gate authority — provenance-scoped dismiss-only (DC4)', () =>
       postableBody: null, postableClass: null, postableFix: null, postableStatus: 'not-postable',
       postableSuggestion: null, rescoredSeverity: null, resolved: true,
       rawVerdict: 'false', reason: 'refuted', reviewer: over.findingId.split('#')[0],
-      severity: 'high', title: 't', ...over,
+      severity: 'high', title: 't', tldr: null, ...over,
     };
   }
   function layerWith(gateVerdicts: GateVerdictRecord[], gateTrailWritten = true): void {
@@ -495,6 +495,7 @@ describe('receipt reflects the FULL expected roster (not just the codex/grok cor
         line: 1, postableBody: null, postableClass: null, postableFix: null, postableStatus: 'not-postable',
         postableSuggestion: null, resolved: true,
         rawVerdict: 'false', reason: 'r', rescoredSeverity: null, reviewer: 'codex', severity: 'high', title: 't',
+        tldr: null,
       }],
       modelLabel: 'opus', synthesis,
     });

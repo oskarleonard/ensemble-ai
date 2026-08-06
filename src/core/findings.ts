@@ -27,7 +27,10 @@ Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
 Rules: cite a concrete file in every finding's "evidence" (an uncited finding is
 discounted). "severity" = the impact IF the finding is real; "confidence" = how
 sure you are it is real. If the change looks correct, return an empty "findings"
-array with a "summary" that says so. Do not invent issues to fill the list.`;
+array with a "summary" that says so. Do not invent issues to fill the list. You
+see one diff, not the project's tracker: never assert a change is out-of-scope or
+unsanctioned — state the code-level consequence and, at most, note the commit
+boundary.`;
 
 export interface ParsedReview {
   findings: ReviewFinding[];

@@ -22,6 +22,7 @@ function rec(over: Partial<GateVerdictRecord> & { findingId: string }): GateVerd
     reviewer: over.findingId.split('#')[0],
     severity: 'medium',
     title: 't',
+    tldr: null,
     ...over,
   };
 }

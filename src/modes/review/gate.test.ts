@@ -252,8 +252,81 @@ describe('reconcileGateVerdicts — postable text (A+)', () => {
     expect(u).toMatchObject({ effectiveVerdict: 'unverified', postableBody: null, postableStatus: 'not-postable' });
   });
 
-  it('the durable trail schema is bumped to v4 (postable + placement + anchorSide fields added)', () => {
-    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(4);
+  it('the durable trail schema is bumped to v5 (postable + placement + anchorSide + tldr added)', () => {
+    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(5);
+  });
+});
+
+// ── The gate-generated TLDR (trail v5) ─────────────────────────────────────────────────
+//
+// A LABELED, ADDITIVE plain-English summary produced by the SAME seat that grounded the finding,
+// so it ships inside the verified trail. Three properties carry the whole feature: a CONFIRMED
+// verdict carries it, an unconfirmed one never does, and a model that simply forgets it must not
+// cost the verdict (the finding is the product; the summary is a convenience on top of it).
+describe('reconcileGateVerdicts — the gate-generated TLDR (trail v5)', () => {
+  const TLDR =
+    "If accounts are still loading the balance check silently skips, so you can press Next with an amount over your balance. Let's gate Next on accounts being fully loaded.";
+  const body = 'The pool leaks a connection because release() is never called, and it always crashes.';
+
+  it('an agree carries the gate TLDR onto the record', () => {
+    const r = reconcileGateVerdicts(
+      [gf()],
+      parseGateEnvelope(envelope([{ findingId: 'codex#1', reason: 'ok', tldr: TLDR, verdict: 'agree' }]))
+    ).records[0];
+    expect(r.tldr).toBe(TLDR);
+  });
+
+  it('a partial carries one too — it summarizes the NARROWED claim', () => {
+    const r = reconcileGateVerdicts(
+      [gf({ body })],
+      parseGateEnvelope(
+        envelope([
+          { findingId: 'codex#1', ops: [{ op: 'strike', quote: ', and it always crashes' }], reason: 'overstated', tldr: TLDR, verdict: 'partial' },
+        ])
+      )
+    ).records[0];
+    expect(r).toMatchObject({ effectiveVerdict: 'partial', postableStatus: 'postable', tldr: TLDR });
+  });
+
+  it('an over-long TLDR is CAPPED at 280 chars (marked), never allowed through whole', () => {
+    const r = reconcileGateVerdicts(
+      [gf()],
+      parseGateEnvelope(envelope([{ findingId: 'codex#1', reason: 'ok', tldr: 'x'.repeat(400), verdict: 'agree' }]))
+    ).records[0];
+    expect(r.tldr).toHaveLength(280);
+    expect(r.tldr?.endsWith('…')).toBe(true);
+  });
+
+  it('a MISSING tldr is null — it NEVER costs the verdict (an old-shape reply still posts)', () => {
+    const r = reconcileGateVerdicts(
+      [gf({ body })],
+      parseGateEnvelope(envelope([{ findingId: 'codex#1', reason: 'ok', verdict: 'agree' }]))
+    ).records[0];
+    expect(r.tldr).toBeNull();
+    expect(r).toMatchObject({ effectiveVerdict: 'agree', postableBody: body, postableStatus: 'postable' });
+  });
+
+  it('a `false` gets NO tldr even when the model sent one (nothing confirmed to summarize)', () => {
+    const r = reconcileGateVerdicts(
+      [gf()],
+      parseGateEnvelope(envelope([{ citation: ANCHOR, findingId: 'codex#1', reason: 'refuted', tldr: TLDR, verdict: 'false' }]))
+    ).records[0];
+    expect(r).toMatchObject({ effectiveVerdict: 'false', tldr: null });
+  });
+
+  it('a HOST-DOWNGRADED verdict gets none either — the summary follows the EFFECTIVE verdict', () => {
+    // A truncated finding's `false` is forced to unverified(truncated); its TLDR must not survive
+    // the downgrade, or a dismissed claim would still hand a host a confident one-liner to post.
+    const r = reconcileGateVerdicts(
+      [gf({ truncated: true })],
+      parseGateEnvelope(envelope([{ citation: ANCHOR, findingId: 'codex#1', reason: 'refuted', tldr: TLDR, verdict: 'false' }]))
+    ).records[0];
+    expect(r).toMatchObject({ downgradeReason: 'truncated', effectiveVerdict: 'unverified', tldr: null });
+  });
+
+  it('a WHOLE-envelope failure leaves every record without one', () => {
+    const r = reconcileGateVerdicts([gf()], { failure: 'gate-failed' }).records[0];
+    expect(r.tldr).toBeNull();
   });
 });
 

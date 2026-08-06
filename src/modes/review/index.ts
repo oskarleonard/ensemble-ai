@@ -105,6 +105,11 @@ export interface ReviewModeOptions {
   // Mode label for a pre-supplied diffText (e.g. a `gh pr diff` capture → 'pr').
   diffMode?: DiffMode;
   diffText?: string;
+  // The author's STATED INTENT for this change — on the `--pr` path, the PR's title + body. It
+  // fills the packet's `directive` slot (bounded by PACKET_BUDGETS.objective) so a reviewer can
+  // read a deliberate change as deliberate instead of guessing at scope from the diff alone.
+  // Absent ⇒ the section is simply not rendered (its absence is not notable, unlike the diff's).
+  directive?: string;
   // Override the headSha for a pre-supplied diffText (a URL PR's resolved head SHA,
   // so the receipt is content-tied to the exact PR head). See AcquireDiffOpts.
   headShaOverride?: string;
@@ -288,6 +293,7 @@ export async function runReviewMode(
     agentsMd,
     authorSummary: opts.authorSummary,
     diff: acquired.diff,
+    directive: opts.directive,
     objective:
       opts.objective ??
       (profile === 'security' ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE),

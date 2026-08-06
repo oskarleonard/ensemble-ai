@@ -130,7 +130,9 @@ Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
   },
   "verdicts": [
     { "findingId": "codex#1", "verdict": "agree", "reason": "<one line>", "fixStatus": "keep",
-      "class": "bug", "suggestion": { "replacement": "<the corrected line(s), verbatim code>" } },
+      "class": "bug",
+      "tldr": "<1-2 plain sentences: what the person using the product hits, then the fix as Let's …>",
+      "suggestion": { "replacement": "<the corrected line(s), verbatim code>" } },
     { "findingId": "codex#3", "verdict": "partial", "reason": "<what was overstated>",
       "ops": [
         { "op": "strike", "quote": "<EXACT substring of codex#3's body to remove>", "why": "<ungrounded>" },
@@ -159,6 +161,14 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   or security DEFECT — it earns an inline comment. "quality" = a structural simplification (dead
   branch, narrower scope, a reinvented utility) — real, but it rides a collapsed summary section,
   never inline prose. Default when you omit it: "bug".
+- "tldr" (REQUIRED on agree AND partial — send it on NO other verdict): 1-2 sentences, at most 280
+  characters, in plain conversational English someone who has not read the code would follow — no
+  file paths, no identifiers, no jargon. Say what the PERSON USING the product hits, then the
+  suggested fix phrased as "Let's …". Example: "If accounts are still loading the balance check
+  silently skips, so you can press Next with an amount way over balance. Let's gate Next on accounts
+  being fully loaded, or fail closed when the balance is unknown." It is an ADDITIVE summary the
+  host posts on its own labeled line — it never replaces or rewords the finding's grounded text, so
+  put nothing in it you have not grounded. On a "partial" it summarizes the NARROWED claim.
 - "suggestion" (optional, agree + fixStatus "keep" ONLY): the corrected code for the finding's own
   cited line, as a ONE-CLICK replacement. Send it only when the fix is small, obvious, and you have
   verified it against the hunk. The replacement may introduce NO identifier, path, or number absent

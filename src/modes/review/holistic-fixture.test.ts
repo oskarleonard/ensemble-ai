@@ -54,6 +54,7 @@ function holisticRecord(file: string, line: number, severity: 'high' | 'medium' 
     reviewer: HOLISTIC_SEAT_ID,
     severity,
     title: 'reinvented pattern',
+    tldr: null,
   };
 }
 
