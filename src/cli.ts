@@ -920,6 +920,37 @@ function ghPostRunner(cwd: string): PostRunner {
   };
 }
 
+// The PR's OWN description — title + body — for the packet's `directive` slot: the author's stated
+// intent, which a diff alone never carries. Without it a reviewer must infer scope from the code
+// and can end up asserting a deliberate change is unsanctioned; with it the intent is text the
+// reviewer can read. Best-effort by design: this is CONTEXT, never evidence, so a gh failure
+// degrades to no directive (loudly, at the call site) and never blocks the review. An empty body is
+// fine — the title alone is a directive. Bounded by PACKET_BUDGETS.objective downstream.
+function fetchPrDirective(
+  target: PostTarget,
+  cwd: string
+): { directive: string } | { error: string } {
+  const res = ghRunner(cwd)([
+    'pr',
+    'view',
+    String(target.pr),
+    ...(target.repoSlug ? ['-R', target.repoSlug] : []),
+    '--json',
+    'title,body',
+  ]);
+  if (!res.ok) return { error: res.error };
+  let parsed: { body?: unknown; title?: unknown };
+  try {
+    parsed = JSON.parse(res.text) as { body?: unknown; title?: unknown };
+  } catch {
+    return { error: 'gh returned an unparseable JSON payload' };
+  }
+  const title = typeof parsed.title === 'string' ? parsed.title.trim() : '';
+  const body = typeof parsed.body === 'string' ? parsed.body.trim() : '';
+  const directive = `${title}\n\n${body}`.trim();
+  return directive ? { directive } : { error: 'the PR carries no title or description' };
+}
+
 // The cwd repo's `owner/repo`, resolved the way `gh` itself would. `''` ⇒ not a GitHub repo, or gh
 // failed; every caller treats that as "could not resolve" and refuses.
 function repoSlugFromCwd(gh: GhRunner): string {
@@ -1279,6 +1310,21 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // even though it never spawns them. `--no-claude` runs neither.
   const peerSeats: EvidenceSeat[] = roster.claude ? [...HARNESS_SEATS] : [];
 
+  // The packet's `directive` slot, filled on the PR path only (a working-tree/staged/stdin diff has
+  // no stated intent to fetch). One extra `gh pr view` — best-effort: on failure the reviewers just
+  // see the diff without the author's intent, which is the pre-existing behavior, so it degrades
+  // rather than blocks. LOUD either way (the conventions-skip line above is the same posture): a
+  // silently missing directive would be indistinguishable from a PR with no description.
+  let directive: string | undefined;
+  if (source.postTarget) {
+    const fetched = fetchPrDirective(source.postTarget, cwd);
+    if ('directive' in fetched) directive = fetched.directive;
+    else
+      console.error(
+        `· directive: PR #${source.postTarget.pr} description unavailable (${fetched.error}) — reviewing the diff WITHOUT the author's stated intent`
+      );
+  }
+
   let result: ReviewModeResult;
   try {
     result = await runReviewMode({
@@ -1290,6 +1336,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       cwd,
       diffMode: source.diffMode,
       diffText: source.diffText,
+      directive,
       headShaOverride: source.headShaOverride,
       noConventions,
       onProgress: (m) => console.error(`· ${m}`),

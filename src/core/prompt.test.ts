@@ -44,3 +44,16 @@ describe('renderReviewPrompt — security profile', () => {
     expect(p).toContain('const a = 1;');
   });
 });
+
+// A reviewer sees ONE diff, never the project's tracker — so "this change is out of scope" is a
+// guess about a ticket it cannot read, dressed as a finding. The rule rides the SHARED findings
+// contract, so every profile (and every vendor seat rendering from it) carries it.
+describe('the findings contract forbids scope / sanction claims', () => {
+  it('tells the reviewer to state the code-level consequence instead — in BOTH profiles', () => {
+    for (const p of [renderReviewPrompt(packet), renderReviewPrompt(packet, 'security')]) {
+      expect(p).toContain("see one diff, not the project's tracker");
+      expect(p).toMatch(/never assert a change is out-of-scope or\s+unsanctioned/);
+      expect(p).toMatch(/note the commit\s+boundary/);
+    }
+  });
+});

@@ -51,6 +51,25 @@ function titleText(s: string): string {
   return [...defuseUntrusted(scrubControl(s))].slice(0, 200).join('');
 }
 
+// The gate's plain-English TLDR rendered as one line of markdown flow — the same treatment a title
+// gets. It is model-written text like every other field here, and these records arrive off a
+// durable trail artifact (or a hand-built one, via the exported library API), so nothing guarantees
+// it passed through the gate's own 280-char cap: re-cap it by CODE POINT so a cut never leaves a
+// lone surrogate behind.
+const TLDR_RENDER_CAP = 280;
+function tldrText(s: string): string {
+  return [...defuseUntrusted(scrubControl(s))].slice(0, TLDR_RENDER_CAP).join('');
+}
+
+// The LABELED TLDR line. One format, emitted identically by every posting path here and by the
+// dashboard, so a finding reads the same wherever it lands. It is ADDITIVE — it sits alongside the
+// gate's grounded text and never replaces or rewords it — which is what keeps the no-AI-rewrite rule
+// on postable text intact. Absent / empty / whitespace-only ⇒ NO line (never an empty label).
+function tldrLine(r: GateVerdictRecord): string | null {
+  const t = r.tldr ? tldrText(r.tldr) : '';
+  return t ? `**TLDR:** ${t}` : null;
+}
+
 // A model-controlled path rendered as a `code span`. Two things must go: a backtick would CLOSE the
 // span and hand the rest to the markdown renderer, and a `<!--` would then open a forged
 // `<!-- ensemble-ai:finding … -->` trailer. Defuse first (so the opener is escaped even if the
@@ -234,8 +253,8 @@ function corroborationLine(r: GateVerdictRecord, reviewersRun: number): string {
 }
 
 // One inline review comment: the gate's grounded text, an optional verified one-click fix, the
-// corroboration line, and the machine trailer. The body is the gate's `postableBody` — no model
-// touches it here.
+// corroboration line, the gate's labeled TLDR, and the machine trailer. The body is the gate's
+// `postableBody` — no model touches it here.
 export function renderInlineComment(placed: PlacedFinding, reviewersRun: number): string {
   const { record: r, suggestion } = placed;
   const out = [
@@ -246,7 +265,13 @@ export function renderInlineComment(placed: PlacedFinding, reviewersRun: number)
   if (suggestion) {
     out.push('', '```suggestion', suggestion.replacement, '```');
   }
-  out.push('', corroborationLine(r, reviewersRun), findingTrailer(r));
+  out.push('', corroborationLine(r, reviewersRun));
+  // The TLDR is the LAST thing a reader sees, immediately before the invisible trailer. A record
+  // without one renders byte-identically to before the field existed (old trails, and any gate that
+  // omitted it, must not shift a single byte of the posted comment).
+  const tldr = tldrLine(r);
+  if (tldr) out.push('', tldr);
+  out.push(findingTrailer(r));
   return out.join('\n');
 }
 
@@ -263,12 +288,13 @@ function collapsed(summary: string, records: GateVerdictRecord[], reviewersRun: 
       '',
       defuseUntrusted(r.postableBody ?? ''),
       '',
-      corroborationLine(r, reviewersRun),
-      findingTrailer(r),
-      '',
-      '---',
-      ''
+      corroborationLine(r, reviewersRun)
     );
+    // Same labeled line, same position (last before the trailer) as an inline comment — a quality
+    // or unanchored finding is not a lesser finding, it just lands in the collapsed section.
+    const tldr = tldrLine(r);
+    if (tldr) out.push('', tldr);
+    out.push(findingTrailer(r), '', '---', '');
   }
   out.push('</details>');
   return out;

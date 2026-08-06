@@ -82,6 +82,7 @@ function record(over: Partial<GateVerdictRecord> = {}): GateVerdictRecord {
     reviewer: HOLISTIC_SEAT_ID,
     severity: 'high',
     title: 'reinvented currency formatter',
+    tldr: null,
     ...over,
   };
 }
@@ -293,6 +294,16 @@ describe('applyHolisticPolicy — the three guardrails, mechanized', () => {
     expect(out.reason).toContain('must quote BOTH sites');
   });
 
+  it('a policy downgrade strips the tldr — the summary follows the EFFECTIVE verdict', () => {
+    const [out] = applyHolisticPolicy(
+      [record({ tldr: "Let's reuse the shared formatter." })],
+      entry({ sites: [DIFF_SITE] }),
+      DEPS
+    );
+    expect(out.effectiveVerdict).toBe('unverified');
+    expect(out.tldr).toBeNull();
+  });
+
   it('BOTH SITES: a hallucinated pattern home ⇒ unverified (reference-not-found)', () => {
     const ghost = { ...PATTERN_SITE, quote: 'export function formatMoneyAmount(cents: number): string {' };
     const [out] = applyHolisticPolicy([record()], entry({ sites: [DIFF_SITE, ghost] }), DEPS);
@@ -347,6 +358,16 @@ describe('applyHolisticPolicy — the three guardrails, mechanized', () => {
     expect(out.postableStatus).toBe('not-postable');
     expect(out.postableBody).toBeNull();
     expect(out.postableNote).toContain('agree-only');
+  });
+
+  it('AGREE-ONLY: the unpostable partial also loses its tldr — no ready-to-paste summary survives a refusal', () => {
+    const [out] = applyHolisticPolicy(
+      [record({ effectiveVerdict: 'partial', postableBody: 'narrowed', postableStatus: 'postable', tldr: "Let's fix it." })],
+      entry(BOTH_SITES),
+      DEPS
+    );
+    expect(out.effectiveVerdict).toBe('partial');
+    expect(out.tldr).toBeNull();
   });
 
   it('MED CAP: a HIGH with no conventions citation is capped, and says where from', () => {

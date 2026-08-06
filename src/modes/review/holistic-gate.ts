@@ -309,8 +309,11 @@ export function capHolisticSeverity(r: GateVerdictRecord): GateVerdictRecord {
   };
 }
 
+// tldr is stripped with the posting authority: the TLDR follows the EFFECTIVE verdict for
+// downgrades (gate.ts pins that invariant), and a confirmed-but-unpostable record must not
+// carry a ready-to-paste summary a consumer could ship after the host refused the text.
 const notPostable = (note: string) =>
-  ({ postableBody: null, postableFix: null, postableNote: note, postableStatus: 'not-postable' as const, rescoredSeverity: null });
+  ({ postableBody: null, postableFix: null, postableNote: note, postableStatus: 'not-postable' as const, rescoredSeverity: null, tldr: null });
 
 const downgrade = (
   r: GateVerdictRecord,

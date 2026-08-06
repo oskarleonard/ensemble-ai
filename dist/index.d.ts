@@ -1,7 +1,7 @@
 import { R as ReviewerId, a as ReviewerConfig, b as ReviewFinding, c as ReviewPacket, T as TerminalState, S as StoredReview, d as Severity } from './types-eYT8NZq_.js';
 export { C as CONFIDENCES, e as CORE_REVIEWER_IDS, f as Confidence, g as CoreReviewerId, E as Evidence, M as ManifestEntry, P as PacketSection, h as REVIEWER_IDS, i as SEVERITIES, j as TERMINAL_STATES, k as isCoreReviewerId, l as isReviewerId, p as parseReviewerIds, t as titleCase } from './types-eYT8NZq_.js';
-import { R as ReviewProfile } from './contracts-s64OeJWb.js';
-export { D as DIFF_SECTION_TITLE, a as DIFF_USEFUL_FLOOR, F as FINDINGS_INSTRUCTIONS, P as PACKET_BUDGETS, b as PacketInput, c as ParsedReview, d as REVIEW_PROFILES, S as SECURITY_CLASSES, e as SECURITY_OBJECTIVE, f as SEVERITY_LABEL, g as SEVERITY_ORDER, h as SecurityClass, T as TRUNCATION_MARKER_RE, i as assembleCodePacket, j as classifySecurityFinding, k as evidenceRef, l as extractJsonBlock, m as isReviewProfile, o as oneOf, p as parseFindings, r as renderReviewPrompt, n as reviewerVisibleDiff, s as section, q as securityClassLabel, t as segmentsWithoutTruncationSplices, u as stripSecurityTag } from './contracts-s64OeJWb.js';
+import { R as ReviewProfile } from './contracts-rn1CSvMA.js';
+export { D as DIFF_SECTION_TITLE, a as DIFF_USEFUL_FLOOR, F as FINDINGS_INSTRUCTIONS, P as PACKET_BUDGETS, b as PacketInput, c as ParsedReview, d as REVIEW_PROFILES, S as SECURITY_CLASSES, e as SECURITY_OBJECTIVE, f as SEVERITY_LABEL, g as SEVERITY_ORDER, h as SecurityClass, T as TRUNCATION_MARKER_RE, i as assembleCodePacket, j as classifySecurityFinding, k as evidenceRef, l as extractJsonBlock, m as isReviewProfile, o as oneOf, p as parseFindings, r as renderReviewPrompt, n as reviewerVisibleDiff, s as section, q as securityClassLabel, t as segmentsWithoutTruncationSplices, u as stripSecurityTag } from './contracts-rn1CSvMA.js';
 
 interface ConventionReader {
     read(relPath: string, maxBytes?: number): Promise<string | null>;
@@ -579,6 +579,7 @@ interface GateVerdictRecord {
     reviewer: string;
     severity: Severity;
     title: string;
+    tldr: string | null;
 }
 interface GateDispositionSummary {
     dismissedHighIds: string[];
@@ -830,6 +831,7 @@ interface ReviewModeOptions {
     cwd: string;
     diffMode?: DiffMode;
     diffText?: string;
+    directive?: string;
     headShaOverride?: string;
     noConventions?: boolean;
     objective?: string;

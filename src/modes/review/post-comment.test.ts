@@ -73,6 +73,7 @@ function gateRecord(over: Partial<GateVerdictRecord> = {}): GateVerdictRecord {
     reviewer: 'codex',
     severity: 'high',
     title: 'Unbounded read',
+    tldr: null,
     ...over,
   };
 }
