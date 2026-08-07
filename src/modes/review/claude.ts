@@ -335,6 +335,20 @@ export async function runClaudeReviewVoice(
           timedOut: false,
         };
       }
+      if (!timedOut && stream?.found && stream.isError) {
+        // A completed stream whose result is an ERROR that retry did not (or may
+        // not) cover — auth failure, permanent 4xx, an exhausted transient. Name
+        // it; handing the error text to the findings parser would re-mask it as
+        // "no parseable JSON" downstream.
+        const status = stream.apiErrorStatus;
+        return {
+          failWhy: `reviewer returned an error result${status ? ` (API status ${status})` : ''}`,
+          ok: false,
+          raw: null,
+          stderrTail: (stream.text ?? '').trim().slice(0, 300) || stderrTail,
+          timedOut: false,
+        };
+      }
       if (timedOut && timedOutReason === 'inactivity') {
         // The liveness watchdog fired: the seat went SILENT (wedged), it was not
         // slow — say so, because "timed out" invites raising budgets that were
@@ -348,9 +362,10 @@ export async function runClaudeReviewVoice(
         };
       }
       const retryNote = retried > 0 ? `[retried ${retried}x on transient API error] ` : '';
+      const reply = text && text.trim() ? text : null;
       return {
-        ok: text !== null && text !== '' && !timedOut && !(stream?.found && stream.isError),
-        raw: text,
+        ok: reply !== null && !timedOut,
+        raw: reply,
         stderrTail: retryNote ? `${retryNote}${stderrTail ?? ''}` : stderrTail,
         timedOut,
       };

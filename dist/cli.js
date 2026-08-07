@@ -3619,6 +3619,16 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
           timedOut: false
         };
       }
+      if (!timedOut && stream?.found && stream.isError) {
+        const status = stream.apiErrorStatus;
+        return {
+          failWhy: `reviewer returned an error result${status ? ` (API status ${status})` : ""}`,
+          ok: false,
+          raw: null,
+          stderrTail: (stream.text ?? "").trim().slice(0, 300) || stderrTail,
+          timedOut: false
+        };
+      }
       if (timedOut && timedOutReason === "inactivity") {
         return {
           failWhy: `stalled: no stream output for ${Math.round(inactivityTimeoutMs / 6e4)} min (wedged seat reclaimed)`,
@@ -3629,9 +3639,10 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
         };
       }
       const retryNote = retried > 0 ? `[retried ${retried}x on transient API error] ` : "";
+      const reply = text && text.trim() ? text : null;
       return {
-        ok: text !== null && text !== "" && !timedOut && !(stream?.found && stream.isError),
-        raw: text,
+        ok: reply !== null && !timedOut,
+        raw: reply,
         stderrTail: retryNote ? `${retryNote}${stderrTail ?? ""}` : stderrTail,
         timedOut
       };

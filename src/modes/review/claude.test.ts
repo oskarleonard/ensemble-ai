@@ -183,3 +183,17 @@ describe('runClaudeReviewVoice — stream-json integration', () => {
     expect(res.failWhy).toContain('stalled: no stream output for 10 min');
   });
 });
+
+describe('runClaudeReviewVoice — non-transient error results are named, never re-masked', () => {
+  it('a permanent error result fails with failWhy carrying the status', async () => {
+    const errStream = JSON.stringify({
+      api_error_status: 401, is_error: true, result: 'API Error: 401 Unauthorized', type: 'result',
+    });
+    const exec: ReviewerExec = () => Promise.resolve({ raw: errStream, stderrTail: '', timedOut: false });
+    const res = await runClaudeReviewVoice('p', CFG(), {}, { exec, retryDelaysMs: [0, 0] });
+    expect(res.ok).toBe(false);
+    expect(res.raw).toBeNull();
+    expect(res.failWhy).toContain('error result (API status 401)');
+    expect(res.stderrTail).toContain('401 Unauthorized');
+  });
+});
