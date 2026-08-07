@@ -109,6 +109,15 @@ export interface ReviewerExecOpts {
   onSpawn?: (kill: () => void) => void;
   /** The -o tempfile the reply is read from, then unlinked. Required for 'outfile'. */
   outFile?: string;
+  /**
+   * LIVENESS watchdog (stdout capture only): kill the group after this long with
+   * NO data on stdout/stderr. A streaming CLI (claude `--output-format stream-json`)
+   * emits an event every few seconds while it works, so silence this long means a
+   * wedged seat — while honest long work never trips it. This is the watchdog doing
+   * its actual job (reclaim wedges, never police honest work); `timeoutMs` then
+   * degrades to a pure runaway backstop.
+   */
+  inactivityTimeoutMs?: number;
   /** Cap the retained stderr tail (a noise channel) at this many chars. */
   stderrLimit: number;
   /** Watchdog timeout; on expiry the whole process GROUP is SIGTERM→SIGKILLed. */
@@ -120,6 +129,8 @@ export interface ReviewerExecResult {
   raw: string | null;
   stderrTail: string;
   timedOut: boolean;
+  /** Which watchdog fired: the absolute backstop or the liveness (inactivity) one. */
+  timedOutReason?: 'absolute' | 'inactivity';
 }
 
 // The shared reviewer spawn contract, owned in ONE place and CALLED (not copied)
@@ -161,17 +172,36 @@ export function runReviewerExec(
     );
     onSpawn?.(killer.kill);
     let timedOut = false;
+    let timedOutReason: 'absolute' | 'inactivity' | undefined;
     const killTimer = setTimeout(() => {
       timedOut = true;
+      timedOutReason = 'absolute';
       killer.kill();
     }, timeoutMs);
+    // The liveness watchdog: a rolling timer reset by every stdout/stderr chunk.
+    // Only armed when the caller opted in (a streaming CLI); expiry means the seat
+    // went silent — wedged — and is reclaimed just like an absolute timeout.
+    const inactivityMs = opts.inactivityTimeoutMs;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const armIdle = () => {
+      if (!inactivityMs || capture !== 'stdout') return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        timedOut = true;
+        timedOutReason = 'inactivity';
+        killer.kill();
+      }, inactivityMs);
+    };
+    armIdle();
     let stderrTail = '';
     child.stderr?.on('data', (chunk: Buffer) => {
+      armIdle();
       stderrTail = (stderrTail + chunk.toString('utf8')).slice(-stderrLimit);
     });
     let stdoutBuf = '';
     if (capture === 'stdout') {
       child.stdout?.on('data', (chunk: Buffer) => {
+        armIdle();
         stdoutBuf += chunk.toString('utf8');
       });
     }
@@ -182,6 +212,7 @@ export function runReviewerExec(
       settled = true;
       clearTimeout(killTimer);
       clearTimeout(backstop);
+      if (idleTimer) clearTimeout(idleTimer);
       if (exitDrain) clearTimeout(exitDrain);
       killer.clear();
       let raw: string | null = null;
@@ -197,7 +228,7 @@ export function runReviewerExec(
           // no -o file → the reviewer produced nothing (capacity / wedge / kill)
         }
       }
-      resolve({ raw, stderrTail, timedOut });
+      resolve({ raw, stderrTail, timedOut, ...(timedOutReason ? { timedOutReason } : {}) });
     };
     const backstop = setTimeout(settle, timeoutMs + KILL_GRACE_MS + 5_000);
     // outfile capture (codex): the reply is the -o file, complete on disk by `exit`

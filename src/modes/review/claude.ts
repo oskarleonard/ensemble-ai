@@ -117,10 +117,14 @@ export interface ClaudeSeatFence {
   readRoot?: string;
 }
 
-// PURE: the claude CLI args for a review/synthesis voice. `-p <prompt>` (headless, single-shot,
-// reply to STDOUT) + `--output-format text` (a plain reply; we parse the embedded ```json block
-// ourselves, exactly like codex/grok — symmetry IS robustness) + the capability fence documented at
-// the top of this file. Honors the voice config's model/effort so a CONFIGURED Claude model runs.
+// PURE: the claude CLI args for a review/synthesis voice. `-p <prompt>` (headless, single-shot)
+// + `--output-format stream-json --verbose`: the CLI emits one JSON event per line WHILE it works
+// (probed 2026-08-07: `thinking_tokens` heartbeats tick every few seconds even inside a single
+// long turn), which is the LIVENESS signal the inactivity watchdog needs — plain text mode prints
+// nothing until the end, so a fixed deadline was the only (work-killing) option. The final reply
+// is the `type:"result"` event's `result` field (extractStreamResult); the embedded ```json
+// findings block is then parsed from it exactly as before. Capability fence documented at the top
+// of this file. Honors the voice config's model/effort so a CONFIGURED Claude model runs.
 //
 // `--disallowedTools` is variadic, so it goes LAST — nothing may follow it. `--add-dir` is variadic
 // too, so it is always followed immediately by `--strict-mcp-config`.
@@ -139,7 +143,7 @@ export function buildClaudeReviewArgs(
       `ensemble-ai: refusing to fence a Claude seat whose read root (${fence.readRoot}) is inside the home directory (${homeDir}) — the home-read deny would also deny the worktree. Point TMPDIR outside $HOME.`
     );
   }
-  const args = ['-p', prompt, '--output-format', 'text', '--permission-mode', 'plan'];
+  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--permission-mode', 'plan'];
   if (fence.readRoot) args.push('--add-dir', fence.readRoot);
   args.push('--strict-mcp-config');
   if (config?.model && config.model !== 'default')
@@ -169,12 +173,61 @@ export function isTransientApiErrorReply(raw: string): boolean {
   return /\bAPI Error:\s*(?:429|5\d\d)\b/i.test(trimmed) || /\boverloaded\b/i.test(trimmed);
 }
 
+// Retryable transport statuses: rate limit + server-side (the CLI surfaces them on the
+// result event's api_error_status when the stream completes with is_error).
+export function isRetryableApiStatus(status: number | null): boolean {
+  return status === 429 || (typeof status === 'number' && status >= 500 && status <= 599);
+}
+
 // Fast-fail retry schedule for transient API errors: a 529/429 returns in seconds, so a
 // couple of spaced retries are nearly free next to the review they rescue. An attempt
 // that ran longer than TRANSIENT_FAST_FAIL_MS did real work and is never retried — the
 // retry exists for the seat that died on arrival, not to double-spend a long run.
 export const TRANSIENT_RETRY_DELAYS_MS = [15_000, 45_000] as const;
 export const TRANSIENT_FAST_FAIL_MS = 120_000;
+
+// The LIVENESS bar: with stream-json a working seat emits an event every few seconds
+// (thinking heartbeats included), so ten silent minutes means a wedged seat, not slow
+// honest work. This is what actually reclaims wedges now; the absolute per-seat budgets
+// are pure runaway backstops sized far past any observed honest run.
+export const CLAUDE_INACTIVITY_TIMEOUT_MS = 600_000; // 10 min of total silence
+
+// The stream's final `type:"result"` event, when one exists. `found:false` means the
+// stream never completed (killed mid-run) or the reply was not stream-json at all —
+// callers fall back to treating the raw output as plain text, which keeps the old
+// text-mode contract working end-to-end.
+export interface StreamResultEvent {
+  apiErrorStatus: number | null;
+  found: boolean;
+  isError: boolean;
+  text: string | null;
+}
+
+// PURE: pull the last `type:"result"` event out of a stream-json stdout. Defensive per
+// line — non-JSON lines (a stray warning, a truncated tail) are skipped, never fatal.
+export function extractStreamResult(stdout: string): StreamResultEvent {
+  let found: StreamResultEvent = { apiErrorStatus: null, found: false, isError: false, text: null };
+  for (const line of stdout.split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('{')) continue;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    if (!obj || typeof obj !== 'object') continue;
+    const o = obj as Record<string, unknown>;
+    if (o.type !== 'result') continue;
+    found = {
+      apiErrorStatus: typeof o.api_error_status === 'number' ? o.api_error_status : null,
+      found: true,
+      isError: o.is_error === true,
+      text: typeof o.result === 'string' ? o.result : null,
+    };
+  }
+  return found;
+}
 
 // The exec seam runClaudeReviewVoice drives — injectable so the retry loop is testable
 // without spawning anything (same injection pattern as ClaudeRunner in self-contained).
@@ -184,6 +237,7 @@ export type ReviewerExec = typeof runReviewerExec;
 export interface ClaudeVoiceSeams {
   exec?: ReviewerExec;
   fastFailMs?: number;
+  inactivityTimeoutMs?: number;
   retryDelaysMs?: readonly number[];
 }
 
@@ -207,6 +261,7 @@ export async function runClaudeReviewVoice(
   const exec = seams.exec ?? runReviewerExec;
   const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
   const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
+  const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   // Built BEFORE the neutral cwd exists, so an unfenceable read root throws without leaking a dir.
   const args = buildClaudeReviewArgs(
@@ -235,21 +290,31 @@ export async function runClaudeReviewVoice(
     let retried = 0;
     for (;;) {
       const startedAt = Date.now();
-      const { raw, stderrTail, timedOut } = await exec({
+      const { raw, stderrTail, timedOut, timedOutReason } = await exec({
         args,
         bin: resolveClaudeBin(),
         capture: 'stdout',
         cwd,
+        inactivityTimeoutMs,
         onSpawn: opts.onSpawn,
         stderrLimit: 2000,
         timeoutMs,
       });
       const elapsedMs = Date.now() - startedAt;
+      // The reply is a stream: the real text lives in the final result event. A raw
+      // with no result event (killed mid-run, or a plain-text reply from an older
+      // CLI) falls back to being treated as the text itself — the old contract.
+      const stream = typeof raw === 'string' ? extractStreamResult(raw) : null;
+      const text = stream?.found ? stream.text : raw;
       const transient =
         !timedOut &&
         typeof raw === 'string' &&
-        isTransientApiErrorReply(raw) &&
-        elapsedMs < fastFailMs;
+        elapsedMs < fastFailMs &&
+        (stream?.found
+          ? stream.isError &&
+            (isRetryableApiStatus(stream.apiErrorStatus) ||
+              isTransientApiErrorReply(stream.text ?? ''))
+          : isTransientApiErrorReply(raw));
       if (transient && retried < retryDelaysMs.length) {
         await sleep(retryDelaysMs[retried]);
         retried += 1;
@@ -257,22 +322,35 @@ export async function runClaudeReviewVoice(
       }
       if (transient) {
         // Retries exhausted and the seat never produced a review — only API-error
-        // lines. Report the REAL cause instead of letting the findings parser
+        // replies. Report the REAL cause instead of letting the findings parser
         // downstream mislabel it "no parseable JSON" (which is what masked the
         // 2026-08-05 529s). raw is withheld so no caller mistakes the error line
-        // for a reply; the line itself is preserved on stderrTail for the trail.
+        // for a reply; the error itself is preserved on stderrTail for the trail.
+        const errorLine = (stream?.found ? (stream.text ?? '') : (raw ?? '')).trim();
         return {
           failWhy: `persistent transient API error after ${retried + 1} attempts`,
           ok: false,
           raw: null,
-          stderrTail: raw.trim().slice(0, 300),
+          stderrTail: errorLine.slice(0, 300),
           timedOut: false,
+        };
+      }
+      if (timedOut && timedOutReason === 'inactivity') {
+        // The liveness watchdog fired: the seat went SILENT (wedged), it was not
+        // slow — say so, because "timed out" invites raising budgets that were
+        // never the problem.
+        return {
+          failWhy: `stalled: no stream output for ${Math.round(inactivityTimeoutMs / 60_000)} min (wedged seat reclaimed)`,
+          ok: false,
+          raw: null,
+          stderrTail,
+          timedOut: true,
         };
       }
       const retryNote = retried > 0 ? `[retried ${retried}x on transient API error] ` : '';
       return {
-        ok: raw !== null && !timedOut,
-        raw,
+        ok: text !== null && text !== '' && !timedOut && !(stream?.found && stream.isError),
+        raw: text,
         stderrTail: retryNote ? `${retryNote}${stderrTail ?? ''}` : stderrTail,
         timedOut,
       };

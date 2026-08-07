@@ -5,6 +5,7 @@ import type { VoiceConfig } from '../brainstorm/types';
 import {
   buildClaudeReviewArgs,
   CLAUDE_REVIEW_DENIED_TOOLS,
+  extractStreamResult,
   isTransientApiErrorReply,
   type ReviewerExec,
   runClaudeReviewVoice,
@@ -17,7 +18,7 @@ const CFG = (over: Partial<VoiceConfig> = {}): VoiceConfig => ({
 describe('buildClaudeReviewArgs — the capability fence (pinned as data)', () => {
   it('always headless, plain output, plan-mode + the execution/egress deny-list', () => {
     const args = buildClaudeReviewArgs('THE PROMPT', CFG());
-    expect(args.slice(0, 4)).toEqual(['-p', 'THE PROMPT', '--output-format', 'text']);
+    expect(args.slice(0, 5)).toEqual(['-p', 'THE PROMPT', '--output-format', 'stream-json', '--verbose']);
     // Plan mode alone is NOT a fence — it still executes Bash. Removing the tools is.
     expect(args).toContain('--permission-mode');
     expect(args[args.indexOf('--permission-mode') + 1]).toBe('plan');
@@ -114,5 +115,71 @@ describe('runClaudeReviewVoice — transient API error retry', () => {
     expect(calls).toHaveLength(1);
     expect(res.timedOut).toBe(true);
     expect(res.ok).toBe(false);
+  });
+});
+
+describe('extractStreamResult — the stream-json result event', () => {
+  const RESULT = JSON.stringify({
+    is_error: false, result: '```json\n{"findings": [], "summary": "clean"}\n```',
+    subtype: 'success', type: 'result',
+  });
+  const HEARTBEAT = JSON.stringify({ subtype: 'thinking_tokens', type: 'system' });
+
+  it('finds the last result event among heartbeats and junk lines', () => {
+    const out = extractStreamResult([HEARTBEAT, 'not json', HEARTBEAT, RESULT].join('\n'));
+    expect(out.found).toBe(true);
+    expect(out.isError).toBe(false);
+    expect(out.text).toContain('"findings"');
+  });
+
+  it('carries the error fields of an error-shaped result', () => {
+    const err = JSON.stringify({
+      api_error_status: 529, is_error: true, result: 'API Error: 529 Overloaded', type: 'result',
+    });
+    const out = extractStreamResult([HEARTBEAT, err].join('\n'));
+    expect(out).toEqual({ apiErrorStatus: 529, found: true, isError: true, text: 'API Error: 529 Overloaded' });
+  });
+
+  it('a stream with NO result event (killed mid-run) reports found:false', () => {
+    const out = extractStreamResult([HEARTBEAT, HEARTBEAT].join('\n'));
+    expect(out.found).toBe(false);
+  });
+});
+
+describe('runClaudeReviewVoice — stream-json integration', () => {
+  const GOOD_STREAM = [
+    JSON.stringify({ subtype: 'init', type: 'system' }),
+    JSON.stringify({ is_error: false, result: 'FINAL REVIEW TEXT', subtype: 'success', type: 'result' }),
+  ].join('\n');
+
+  it('returns the result event text as raw, not the stream transcript', async () => {
+    const exec: ReviewerExec = () => Promise.resolve({ raw: GOOD_STREAM, stderrTail: '', timedOut: false });
+    const res = await runClaudeReviewVoice('p', CFG(), {}, { exec, retryDelaysMs: [0, 0] });
+    expect(res.ok).toBe(true);
+    expect(res.raw).toBe('FINAL REVIEW TEXT');
+  });
+
+  it('retries a fast error-shaped result event (529 via api_error_status)', async () => {
+    const errStream = JSON.stringify({ api_error_status: 529, is_error: true, result: 'boom', type: 'result' });
+    const calls: unknown[] = [];
+    const exec: ReviewerExec = () => {
+      calls.push(1);
+      return Promise.resolve({
+        raw: calls.length < 3 ? errStream : GOOD_STREAM, stderrTail: '', timedOut: false,
+      });
+    };
+    const res = await runClaudeReviewVoice('p', CFG(), {}, { exec, retryDelaysMs: [0, 0] });
+    expect(calls).toHaveLength(3);
+    expect(res.ok).toBe(true);
+    expect(res.raw).toBe('FINAL REVIEW TEXT');
+  });
+
+  it('an inactivity kill reports a STALL, never a generic timeout', async () => {
+    const exec: ReviewerExec = () =>
+      Promise.resolve({ raw: null, stderrTail: '', timedOut: true, timedOutReason: 'inactivity' });
+    const res = await runClaudeReviewVoice('p', CFG(), {}, { exec, retryDelaysMs: [0, 0] });
+    expect(res.ok).toBe(false);
+    expect(res.timedOut).toBe(true);
+    expect(res.failWhy).toContain('stalled: no stream output for 10 min');
   });
 });

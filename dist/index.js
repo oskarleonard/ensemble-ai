@@ -916,17 +916,33 @@ function runReviewerExec(opts) {
     );
     onSpawn?.(killer.kill);
     let timedOut = false;
+    let timedOutReason;
     const killTimer = setTimeout(() => {
       timedOut = true;
+      timedOutReason = "absolute";
       killer.kill();
     }, timeoutMs);
+    const inactivityMs = opts.inactivityTimeoutMs;
+    let idleTimer = null;
+    const armIdle = () => {
+      if (!inactivityMs || capture !== "stdout") return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        timedOut = true;
+        timedOutReason = "inactivity";
+        killer.kill();
+      }, inactivityMs);
+    };
+    armIdle();
     let stderrTail = "";
     child.stderr?.on("data", (chunk) => {
+      armIdle();
       stderrTail = (stderrTail + chunk.toString("utf8")).slice(-stderrLimit);
     });
     let stdoutBuf = "";
     if (capture === "stdout") {
       child.stdout?.on("data", (chunk) => {
+        armIdle();
         stdoutBuf += chunk.toString("utf8");
       });
     }
@@ -937,6 +953,7 @@ function runReviewerExec(opts) {
       settled = true;
       clearTimeout(killTimer);
       clearTimeout(backstop);
+      if (idleTimer) clearTimeout(idleTimer);
       if (exitDrain) clearTimeout(exitDrain);
       killer.clear();
       let raw = null;
@@ -951,7 +968,7 @@ function runReviewerExec(opts) {
         } catch {
         }
       }
-      resolve({ raw, stderrTail, timedOut });
+      resolve({ raw, stderrTail, timedOut, ...timedOutReason ? { timedOutReason } : {} });
     };
     const backstop = setTimeout(settle, timeoutMs + KILL_GRACE_MS + 5e3);
     child.on(
@@ -2369,7 +2386,7 @@ function buildClaudeReviewArgs(prompt, config, fence = {}) {
       `ensemble-ai: refusing to fence a Claude seat whose read root (${fence.readRoot}) is inside the home directory (${homeDir}) \u2014 the home-read deny would also deny the worktree. Point TMPDIR outside $HOME.`
     );
   }
-  const args = ["-p", prompt, "--output-format", "text", "--permission-mode", "plan"];
+  const args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "plan"];
   if (fence.readRoot) args.push("--add-dir", fence.readRoot);
   args.push("--strict-mcp-config");
   if (config?.model && config.model !== "default")
@@ -2387,13 +2404,41 @@ function isTransientApiErrorReply(raw) {
   if (!trimmed || trimmed.length > 1500) return false;
   return /\bAPI Error:\s*(?:429|5\d\d)\b/i.test(trimmed) || /\boverloaded\b/i.test(trimmed);
 }
+function isRetryableApiStatus(status) {
+  return status === 429 || typeof status === "number" && status >= 500 && status <= 599;
+}
 var TRANSIENT_RETRY_DELAYS_MS = [15e3, 45e3];
 var TRANSIENT_FAST_FAIL_MS = 12e4;
+var CLAUDE_INACTIVITY_TIMEOUT_MS = 6e5;
+function extractStreamResult(stdout) {
+  let found = { apiErrorStatus: null, found: false, isError: false, text: null };
+  for (const line of stdout.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("{")) continue;
+    let obj;
+    try {
+      obj = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    if (!obj || typeof obj !== "object") continue;
+    const o = obj;
+    if (o.type !== "result") continue;
+    found = {
+      apiErrorStatus: typeof o.api_error_status === "number" ? o.api_error_status : null,
+      found: true,
+      isError: o.is_error === true,
+      text: typeof o.result === "string" ? o.result : null
+    };
+  }
+  return found;
+}
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
   const exec = seams.exec ?? runReviewerExec;
   const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
   const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
+  const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const args = buildClaudeReviewArgs(
     prompt,
@@ -2411,35 +2456,48 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
     let retried = 0;
     for (; ; ) {
       const startedAt = Date.now();
-      const { raw, stderrTail, timedOut } = await exec({
+      const { raw, stderrTail, timedOut, timedOutReason } = await exec({
         args,
         bin: resolveClaudeBin(),
         capture: "stdout",
         cwd,
+        inactivityTimeoutMs,
         onSpawn: opts.onSpawn,
         stderrLimit: 2e3,
         timeoutMs
       });
       const elapsedMs = Date.now() - startedAt;
-      const transient = !timedOut && typeof raw === "string" && isTransientApiErrorReply(raw) && elapsedMs < fastFailMs;
+      const stream = typeof raw === "string" ? extractStreamResult(raw) : null;
+      const text = stream?.found ? stream.text : raw;
+      const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
       if (transient && retried < retryDelaysMs.length) {
         await sleep(retryDelaysMs[retried]);
         retried += 1;
         continue;
       }
       if (transient) {
+        const errorLine = (stream?.found ? stream.text ?? "" : raw ?? "").trim();
         return {
           failWhy: `persistent transient API error after ${retried + 1} attempts`,
           ok: false,
           raw: null,
-          stderrTail: raw.trim().slice(0, 300),
+          stderrTail: errorLine.slice(0, 300),
           timedOut: false
+        };
+      }
+      if (timedOut && timedOutReason === "inactivity") {
+        return {
+          failWhy: `stalled: no stream output for ${Math.round(inactivityTimeoutMs / 6e4)} min (wedged seat reclaimed)`,
+          ok: false,
+          raw: null,
+          stderrTail,
+          timedOut: true
         };
       }
       const retryNote = retried > 0 ? `[retried ${retried}x on transient API error] ` : "";
       return {
-        ok: raw !== null && !timedOut,
-        raw,
+        ok: text !== null && text !== "" && !timedOut && !(stream?.found && stream.isError),
+        raw: text,
         stderrTail: retryNote ? `${retryNote}${stderrTail ?? ""}` : stderrTail,
         timedOut
       };
@@ -5093,6 +5151,7 @@ export {
   AGENT_INSTRUCTION_NAMES,
   CLAUDE_CAPABILITY_FENCE,
   CLAUDE_EFFORTS2 as CLAUDE_EFFORTS,
+  CLAUDE_INACTIVITY_TIMEOUT_MS,
   CLAUDE_READ_TOOLS,
   CLAUDE_REVIEW_DENIED_TOOLS,
   CODEX_SANDBOX_PROFILE,
@@ -5195,6 +5254,7 @@ export {
   extractGrokText,
   extractJsonBlock,
   extractRefs,
+  extractStreamResult,
   fallbackSynthesis,
   findQuoteSpan,
   findQuoteSpans,
@@ -5217,6 +5277,7 @@ export {
   isMode,
   isPolicyVersion,
   isPreflightError,
+  isRetryableApiStatus,
   isReviewProfile,
   isReviewerId,
   isStrippedPath,
