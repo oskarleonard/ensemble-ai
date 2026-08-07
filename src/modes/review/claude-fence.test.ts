@@ -39,7 +39,7 @@ describe('the capability fence — what the seat CANNOT do (spec §2, probed 202
   it('removes execution and egress from EVERY seat, packet or worktree', () => {
     // The whole point: `--permission-mode plan` still EXECUTES Bash. Removing the tool is the fence.
     expect([...CLAUDE_REVIEW_DENIED_TOOLS]).toEqual([
-      'Bash', 'WebFetch', 'WebSearch', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
+      'Bash', 'Agent', 'Task', 'WebFetch', 'WebSearch', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
     ]);
     for (const seat of [{}, { readRoot: WORKTREE }]) {
       const args = buildClaudeReviewArgs('P', CFG(), { homeDir: HOME, ...seat });
@@ -89,8 +89,8 @@ describe('the capability fence — what the seat CANNOT do (spec §2, probed 202
     ).not.toThrow();
   });
 
-  it('names itself `claude-capability-fence` v1 — receipts state what actually fenced the seat', () => {
-    expect(CLAUDE_CAPABILITY_FENCE).toEqual({ id: 'claude-capability-fence', version: 1 });
+  it('names itself `claude-capability-fence` v2 — receipts state what actually fenced the seat (v2 = Agent/Task denied)', () => {
+    expect(CLAUDE_CAPABILITY_FENCE).toEqual({ id: 'claude-capability-fence', version: 2 });
   });
 });
 

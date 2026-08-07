@@ -37,7 +37,7 @@ describe('buildClaudeReviewArgs — the capability fence (pinned as data)', () =
     expect(args).toContain('--disallowedTools');
     for (const t of CLAUDE_REVIEW_DENIED_TOOLS) expect(args).toContain(t);
     expect([...CLAUDE_REVIEW_DENIED_TOOLS]).toEqual([
-      'Bash', 'WebFetch', 'WebSearch', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
+      'Bash', 'Agent', 'Task', 'WebFetch', 'WebSearch', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
     ]);
   });
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { CODE_REVIEW_SKILL, renderCodeReviewSeatPrompt } from './code-review-seat';
+import { COLD_PEER_ROLE, renderCodeReviewSeatPrompt } from './code-review-seat';
 
 const args = {
   baseSha: 'b'.repeat(40),
@@ -15,8 +15,10 @@ const args = {
 describe('the one Claude producer — /code-review methodology seat', () => {
   const prompt = renderCodeReviewSeatPrompt(args);
 
-  it('LEADS with the built-in skill so the CLI expands it (plan A, not a vendored prompt)', () => {
-    expect(prompt.startsWith(CODE_REVIEW_SKILL)).toBe(true);
+  it('LEADS with the cold-peer role and NEVER a slash command — a leading /skill would invoke the multi-agent pipeline and multiply subscription burn ~15x', () => {
+    expect(prompt.startsWith(COLD_PEER_ROLE)).toBe(true);
+    expect(prompt.startsWith('/')).toBe(false);
+    expect(prompt).toContain('Do NOT delegate to subagents');
   });
 
   it('names the worktree and the EXACT diff command — a detached HEAD has no diff of its own', () => {

@@ -3491,11 +3491,18 @@ function writeHistoryPacket(cwd, files) {
 // src/modes/review/claude.ts
 var CLAUDE_CAPABILITY_FENCE = {
   id: "claude-capability-fence",
-  version: 1
+  version: 2
 };
 var CLAUDE_EFFORTS2 = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
 var CLAUDE_REVIEW_DENIED_TOOLS = [
   "Bash",
+  // The fan-out channel: a subagent is a fresh full-context conversation at the seat's own
+  // model/effort — at opus@max a skill- or model-initiated fan-out multiplies the operator's
+  // subscription burn ~15x (lived: run 2026-08-07-17-16-13 ate ~77% of a Max 5x window). The
+  // seat is a cold SINGLE-PASS peer; both tool names are denied ('Task' is the older name —
+  // a fence names the tool before it comes back). Fence version bumped: 1 → 2.
+  "Agent",
+  "Task",
   "WebFetch",
   "WebSearch",
   "Write",
@@ -5907,14 +5914,14 @@ async function runReviewMode(opts) {
 }
 
 // src/modes/review/code-review-seat.ts
-var CODE_REVIEW_SKILL = "/code-review";
+var COLD_PEER_ROLE = "You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.";
 var QUALITY_LENS = `Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits \u2014 they are noise on someone else's pull request.`;
 var SCHEMA_BLOCK2 = `{"summary":"<one sentence>","findings":[{"title":"<short>","body":"<what is wrong, why, and the fix>","severity":"high|medium|low","confidence":"high|medium|low","evidence":{"file":"<repo-relative path>","line":<number>}}]}`;
 function renderCodeReviewSeatPrompt(args) {
   const history = args.history ? `
 
 ${HISTORY_PACKET_CLAUSE}` : "";
-  return `${CODE_REVIEW_SKILL}
+  return `${COLD_PEER_ROLE}
 
 You are reviewing someone else's pull request, read-only. You may not edit, stage, or push anything.
 You have NO shell and NO network: there is no Bash tool, so do not try to run \`git\` or any command.
@@ -6056,7 +6063,7 @@ async function runClaudeReviewLayer(opts) {
   let claudeSpawned = false;
   if (opts.includeClaudeReviewer) {
     log(
-      opts.worktree ? `  \xB7 claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (/code-review)\u2026` : `  \xB7 claude (anthropic/${modelLabel}) reviewing the diff (cold)\u2026`
+      opts.worktree ? `  \xB7 claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (cold single-pass peer)\u2026` : `  \xB7 claude (anthropic/${modelLabel}) reviewing the diff (cold)\u2026`
     );
     const { review, raw, spawned } = await runClaudeReviewer(
       producerPrompt,

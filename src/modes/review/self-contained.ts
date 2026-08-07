@@ -393,7 +393,7 @@ export async function runClaudeReviewLayer(
   if (opts.includeClaudeReviewer) {
     log(
       opts.worktree
-        ? `  · claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (/code-review)…`
+        ? `  · claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (cold single-pass peer)…`
         : `  · claude (anthropic/${modelLabel}) reviewing the diff (cold)…`
     );
     const { review, raw, spawned } = await runClaudeReviewer(
