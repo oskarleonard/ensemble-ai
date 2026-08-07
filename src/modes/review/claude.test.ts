@@ -1,4 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+
+// The voice runner resolves the claude bin BEFORE handing off to the injected
+// exec seam; on CI there is no login zsh (resolveBin's PATH probe) and no real
+// claude. The env override short-circuits resolution to an existing binary the
+// stubbed exec never actually spawns.
+beforeAll(() => {
+  vi.stubEnv('CLAUDE_BIN', '/bin/echo');
+});
+afterAll(() => {
+  vi.unstubAllEnvs();
+});
 
 import type { VoiceConfig } from '../brainstorm/types';
 
