@@ -5915,6 +5915,20 @@ async function runReviewMode(opts) {
 
 // src/modes/review/code-review-seat.ts
 var COLD_PEER_ROLE = "You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.";
+var OPERATOR_REVIEW_METHOD = `## How to review (in this order)
+
+1. Walk the diff hunk by hunk. For every touched function, read enough surrounding code \u2014
+   its callers, its callees, the rest of the file \u2014 to judge the change in context, not in
+   isolation.
+2. Hunt FUNCTIONAL BUGS first: correctness defects, broken edge cases, regressions of
+   behavior the diff did not intend to change, authorization gaps, contract drift (API
+   shapes, DB writes, event payloads), and state/concurrency hazards.
+3. Then the simplify lens: a utility that already exists and was reinvented, a simpler
+   function shape, dead or unreachable branches, scope that silently narrowed or widened.
+4. SELF-CHECK every candidate finding before reporting it: re-read the code at the PR head
+   and ask "does this actually make sense \u2014 what concrete input or state makes it fail?"
+   Drop anything you cannot ground at file:line. Downgrade confidence on anything that
+   depends on an assumption you could not verify in the tree.`;
 var QUALITY_LENS = `Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits \u2014 they are noise on someone else's pull request.`;
 var SCHEMA_BLOCK2 = `{"summary":"<one sentence>","findings":[{"title":"<short>","body":"<what is wrong, why, and the fix>","severity":"high|medium|low","confidence":"high|medium|low","evidence":{"file":"<repo-relative path>","line":<number>}}]}`;
 function renderCodeReviewSeatPrompt(args) {
@@ -5932,6 +5946,8 @@ cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from)
 ${materializedDiffClause(args)}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}
+
+${OPERATOR_REVIEW_METHOD}
 
 ${QUALITY_LENS}
 
