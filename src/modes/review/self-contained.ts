@@ -168,17 +168,24 @@ type ClaudeRunner = (
 // honest work: run 2026-07-23-17-00-50 proved an undersized one IS the failure (the
 // producer died at the shared 12-min diff-packet default with zero output while every
 // other seat finished; a full cross-vendor pass legitimately runs toward an hour on a
-// real repo). Sizing: the producer is the whole-project /code-review fan-out (observed
-// >12 min truncated → 40 min). The GATE's load scales with findings × diff — 15 min fit a
-// 3-finding/6-file gate but killed a 21-finding/37-file one at exactly 15:00 with zero
-// output (run 2026-07-24-00-36-03, every verdict fail-closed) — so it carries the same
-// heavy-pass budget as the producer. Holistic is one focused pass (observed 3–8 min →
-// 15 min ≈ 2–5× margin). Packet-mode seats keep the shared REVIEW_TIMEOUT_MS. Consumers
-// cap the whole fire OUTSIDE these (hugin: 120 min — concurrent core ≤15 + producer 40 +
-// holistic 15 + gate 40 ≈ 110 worst case).
-export const CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 2_400_000; // 40 min
-export const HOLISTIC_WORKTREE_TIMEOUT_MS = 900_000; // 15 min
-export const GATE_WORKTREE_TIMEOUT_MS = 2_400_000; // 40 min
+// real repo). A second undersizing proved the same lesson at 40 min: run
+// 2026-08-07-12-42-06 (lisk-backend#683) had the opus@max producer working a large Go
+// repo past 40:00 — the watchdog converted ~40 minutes of nearly-done review into zero
+// output, the exact waste it exists to prevent. Since 2026-08-07 the WEDGE-RECLAIM job
+// belongs to the LIVENESS watchdog (CLAUDE_INACTIVITY_TIMEOUT_MS: the stream-json seat
+// heartbeats every few seconds; ten silent minutes = wedged), so these absolute values
+// are pure RUNAWAY BACKSTOPS — sized far past every observed honest run (operator has
+// seen 75–85 min seats on other repos), because killing honest work loses everything
+// already paid for. Producer: whole-project cold review → 180 min. GATE: load scales
+// with findings × diff (a 21-finding gate outgrew 15 min on run 2026-07-24-00-36-03,
+// every verdict fail-closed) → 120 min. Holistic: one focused pass (observed 3–8 min)
+// → 30 min. Packet-mode seats keep the shared REVIEW_TIMEOUT_MS. Consumers cap the
+// whole fire OUTSIDE these (hugin: 360 min — concurrent core ≤15 + producer 180 +
+// holistic 30 + gate 120 + synthesis ≈ 345 worst case, reached only if every seat
+// stays honestly busy to its backstop).
+export const CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 10_800_000; // 180 min runaway backstop
+export const HOLISTIC_WORKTREE_TIMEOUT_MS = 1_800_000; // 30 min runaway backstop
+export const GATE_WORKTREE_TIMEOUT_MS = 7_200_000; // 120 min runaway backstop
 
 async function runClaudeReviewer(
   reviewPrompt: string,
@@ -212,7 +219,7 @@ async function runClaudeReviewer(
     };
   }
   if (!res.raw || res.timedOut) {
-    const why = res.timedOut ? 'timed out' : 'produced no output';
+    const why = res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output');
     log(`  · claude: ${why}`);
     return { raw: res.raw ?? null, review: { findings: [], ok: false, summary: `claude ${why}`, voiceId: 'claude' }, spawned: true };
   }

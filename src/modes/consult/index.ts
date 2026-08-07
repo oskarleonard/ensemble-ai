@@ -71,7 +71,7 @@ async function runAnswer(
     return { answer: '', error: (e as Error).message, keyPoints: [], ok: false, raw: null, summary: '', voiceId };
   }
   if (!res.raw || res.timedOut) {
-    const error = res.timedOut ? 'timed out' : 'produced no output';
+    const error = (res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output'));
     log(`  · ${voiceId}: ${error}`);
     return { answer: '', error, keyPoints: [], ok: false, raw: res.raw, summary: '', timedOut: res.timedOut, voiceId };
   }
@@ -113,7 +113,7 @@ async function runCritique(
     return { error: (e as Error).message, notes: [], ok: false, raw: null, summary: '', voiceId };
   }
   if (!res.raw || res.timedOut) {
-    const error = res.timedOut ? 'timed out' : 'produced no output';
+    const error = (res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output'));
     return { error, notes: [], ok: false, raw: res.raw, summary: '', timedOut: res.timedOut, voiceId };
   }
   const parsed = parseCritique(res.raw);

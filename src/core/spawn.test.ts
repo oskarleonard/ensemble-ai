@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { killTree, makeEscalatingKill } from './spawn';
+import { killTree, makeEscalatingKill, runReviewerExec } from './spawn';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -70,5 +70,46 @@ describe('killTree', () => {
     killTree(child, 'SIGKILL', signalGroup);
     expect(signalGroup).toHaveBeenCalled();
     expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+  });
+});
+
+describe('runReviewerExec — liveness (inactivity) watchdog', () => {
+  it('reclaims a silent seat with timedOutReason inactivity, fast', async () => {
+    const res = await runReviewerExec({
+      args: ['-c', 'sleep 5'],
+      bin: '/bin/sh',
+      capture: 'stdout',
+      inactivityTimeoutMs: 200,
+      stderrLimit: 500,
+      timeoutMs: 20_000,
+    });
+    expect(res.timedOut).toBe(true);
+    expect(res.timedOutReason).toBe('inactivity');
+  });
+
+  it('a seat that keeps emitting never trips the liveness bar', async () => {
+    const res = await runReviewerExec({
+      args: ['-c', 'for i in 1 2 3 4; do echo beat$i; sleep 0.15; done'],
+      bin: '/bin/sh',
+      capture: 'stdout',
+      inactivityTimeoutMs: 400,
+      stderrLimit: 500,
+      timeoutMs: 20_000,
+    });
+    expect(res.timedOut).toBe(false);
+    expect(res.raw).toContain('beat4');
+  });
+
+  it('the absolute backstop still reports absolute', async () => {
+    const res = await runReviewerExec({
+      args: ['-c', 'while true; do echo beat; sleep 0.05; done'],
+      bin: '/bin/sh',
+      capture: 'stdout',
+      inactivityTimeoutMs: 1_000,
+      stderrLimit: 500,
+      timeoutMs: 400,
+    });
+    expect(res.timedOut).toBe(true);
+    expect(res.timedOutReason).toBe('absolute');
   });
 });
