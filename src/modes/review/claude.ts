@@ -173,6 +173,17 @@ export function isTransientApiErrorReply(raw: string): boolean {
   return /\bAPI Error:\s*(?:429|5\d\d)\b/i.test(trimmed) || /\boverloaded\b/i.test(trimmed);
 }
 
+// A reply that is the OPERATOR'S subscription usage limit, not a review: the CLI prints
+// one short line ("You've hit your session limit · resets 5:10pm (Europe/Stockholm)")
+// and exits. Observed verbatim on run 2026-08-07-14-53-49 (65 bytes), where it was
+// mislabeled "no parseable JSON block". NOT retryable — a 5-hour window does not clear
+// in 45 seconds — so it must be NAMED, never retried and never fed to the parser.
+export function isUsageLimitReply(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 300) return false;
+  return /\b(session|usage|weekly) limit\b/i.test(trimmed) && /\b(reset|hit|reached)\b/i.test(trimmed);
+}
+
 // Retryable transport statuses: rate limit + server-side (the CLI surfaces them on the
 // result event's api_error_status when the stream completes with is_error).
 export function isRetryableApiStatus(status: number | null): boolean {
@@ -332,6 +343,18 @@ export async function runClaudeReviewVoice(
           ok: false,
           raw: null,
           stderrTail: errorLine.slice(0, 300),
+          timedOut: false,
+        };
+      }
+      const limitText = typeof text === 'string' && isUsageLimitReply(text) ? text.trim() : null;
+      if (!timedOut && limitText) {
+        // The operator's own subscription window is exhausted. Fail loud and named —
+        // the reply carries the reset time, which is exactly what the operator needs.
+        return {
+          failWhy: `operator usage limit reached — ${limitText.slice(0, 160)}`,
+          ok: false,
+          raw: null,
+          stderrTail: limitText.slice(0, 300),
           timedOut: false,
         };
       }

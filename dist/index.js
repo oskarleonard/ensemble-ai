@@ -2404,6 +2404,11 @@ function isTransientApiErrorReply(raw) {
   if (!trimmed || trimmed.length > 1500) return false;
   return /\bAPI Error:\s*(?:429|5\d\d)\b/i.test(trimmed) || /\boverloaded\b/i.test(trimmed);
 }
+function isUsageLimitReply(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 300) return false;
+  return /\b(session|usage|weekly) limit\b/i.test(trimmed) && /\b(reset|hit|reached)\b/i.test(trimmed);
+}
 function isRetryableApiStatus(status) {
   return status === 429 || typeof status === "number" && status >= 500 && status <= 599;
 }
@@ -2482,6 +2487,16 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
           ok: false,
           raw: null,
           stderrTail: errorLine.slice(0, 300),
+          timedOut: false
+        };
+      }
+      const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
+      if (!timedOut && limitText) {
+        return {
+          failWhy: `operator usage limit reached \u2014 ${limitText.slice(0, 160)}`,
+          ok: false,
+          raw: null,
+          stderrTail: limitText.slice(0, 300),
           timedOut: false
         };
       }
@@ -5294,6 +5309,7 @@ export {
   isStrippedPath,
   isTransientApiErrorReply,
   isUnsafeReadRoot,
+  isUsageLimitReply,
   isVoiceId,
   keyOf,
   killTree,

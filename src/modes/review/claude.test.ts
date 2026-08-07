@@ -18,6 +18,7 @@ import {
   CLAUDE_REVIEW_DENIED_TOOLS,
   extractStreamResult,
   isTransientApiErrorReply,
+  isUsageLimitReply,
   type ReviewerExec,
   runClaudeReviewVoice,
 } from './claude';
@@ -206,5 +207,24 @@ describe('runClaudeReviewVoice — non-transient error results are named, never 
     expect(res.raw).toBeNull();
     expect(res.failWhy).toContain('error result (API status 401)');
     expect(res.stderrTail).toContain('401 Unauthorized');
+  });
+});
+
+describe('runClaudeReviewVoice — operator usage limit is named, never retried or parsed', () => {
+  it('matches the observed session-limit line and carries the reset time in failWhy', async () => {
+    const LIMIT = "You've hit your session limit · resets 5:10pm (Europe/Stockholm)";
+    expect(isUsageLimitReply(LIMIT)).toBe(true);
+    expect(isUsageLimitReply('a long review that mentions a session limit somewhere ' + 'x'.repeat(300))).toBe(false);
+    const calls: unknown[] = [];
+    const exec: ReviewerExec = () => {
+      calls.push(1);
+      return Promise.resolve({ raw: LIMIT, stderrTail: '', timedOut: false });
+    };
+    const res = await runClaudeReviewVoice('p', CFG(), {}, { exec, retryDelaysMs: [0, 0] });
+    expect(calls).toHaveLength(1);
+    expect(res.ok).toBe(false);
+    expect(res.raw).toBeNull();
+    expect(res.failWhy).toContain('operator usage limit reached');
+    expect(res.failWhy).toContain('resets 5:10pm');
   });
 });
