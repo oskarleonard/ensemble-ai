@@ -2382,7 +2382,18 @@ function buildClaudeReviewArgs(prompt, config, fence = {}) {
 function makeNeutralSeatCwd() {
   return makeOwnerOnlyTempDir("ensemble-seat-cwd-");
 }
-async function runClaudeReviewVoice(prompt, config, opts = {}) {
+function isTransientApiErrorReply(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 1500) return false;
+  return /\bAPI Error:\s*(?:429|5\d\d)\b/i.test(trimmed) || /\boverloaded\b/i.test(trimmed);
+}
+var TRANSIENT_RETRY_DELAYS_MS = [15e3, 45e3];
+var TRANSIENT_FAST_FAIL_MS = 12e4;
+var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
+  const exec = seams.exec ?? runReviewerExec;
+  const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
+  const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const args = buildClaudeReviewArgs(
     prompt,
@@ -2397,16 +2408,42 @@ async function runClaudeReviewVoice(prompt, config, opts = {}) {
       } catch {
       }
     }
-    const { raw, stderrTail, timedOut } = await runReviewerExec({
-      args,
-      bin: resolveClaudeBin(),
-      capture: "stdout",
-      cwd,
-      onSpawn: opts.onSpawn,
-      stderrLimit: 2e3,
-      timeoutMs
-    });
-    return { ok: raw !== null && !timedOut, raw, stderrTail, timedOut };
+    let retried = 0;
+    for (; ; ) {
+      const startedAt = Date.now();
+      const { raw, stderrTail, timedOut } = await exec({
+        args,
+        bin: resolveClaudeBin(),
+        capture: "stdout",
+        cwd,
+        onSpawn: opts.onSpawn,
+        stderrLimit: 2e3,
+        timeoutMs
+      });
+      const elapsedMs = Date.now() - startedAt;
+      const transient = !timedOut && typeof raw === "string" && isTransientApiErrorReply(raw) && elapsedMs < fastFailMs;
+      if (transient && retried < retryDelaysMs.length) {
+        await sleep(retryDelaysMs[retried]);
+        retried += 1;
+        continue;
+      }
+      if (transient) {
+        return {
+          failWhy: `persistent transient API error after ${retried + 1} attempts`,
+          ok: false,
+          raw: null,
+          stderrTail: raw.trim().slice(0, 300),
+          timedOut: false
+        };
+      }
+      const retryNote = retried > 0 ? `[retried ${retried}x on transient API error] ` : "";
+      return {
+        ok: raw !== null && !timedOut,
+        raw,
+        stderrTail: retryNote ? `${retryNote}${stderrTail ?? ""}` : stderrTail,
+        timedOut
+      };
+    }
   } finally {
     try {
       fs14.rmSync(cwd, { force: true, recursive: true });
@@ -2867,7 +2904,7 @@ async function runHolisticLens(opts) {
     return fail(`the holistic lens did not run: ${e.message}`);
   }
   if (!res.raw || res.timedOut) {
-    const why = res.timedOut ? "timed out" : "produced no output";
+    const why = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
     log(`  \xB7 holistic: ${why}`);
     return { ...fail(`the holistic lens ${why}`), raw: res.raw ?? null };
   }
@@ -4495,7 +4532,7 @@ async function runGenerate(voiceId, adapters, configs, prompt, timeoutMs, log) {
     return { error: e.message, ideas: [], ok: false, raw: null, summary: "", voiceId };
   }
   if (!res.raw || res.timedOut) {
-    const error = res.timedOut ? "timed out" : "produced no output";
+    const error = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
     log(`  \xB7 ${voiceId}: ${error}`);
     return { error, ideas: [], ok: false, raw: res.raw, summary: "", timedOut: res.timedOut, voiceId };
   }
@@ -4526,7 +4563,7 @@ async function runCritique(voiceId, adapters, configs, topic, allIdeas, fileCont
     return { critiques: [], error: e.message, extensions: [], ok: false, raw: null, summary: "", voiceId };
   }
   if (!res.raw || res.timedOut) {
-    const error = res.timedOut ? "timed out" : "produced no output";
+    const error = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
     return { critiques: [], error, extensions: [], ok: false, raw: res.raw, summary: "", timedOut: res.timedOut, voiceId };
   }
   const parsed = parseCritique(res.raw);
@@ -4895,7 +4932,7 @@ async function runAnswer(voiceId, adapters, configs, prompt, timeoutMs, log) {
     return { answer: "", error: e.message, keyPoints: [], ok: false, raw: null, summary: "", voiceId };
   }
   if (!res.raw || res.timedOut) {
-    const error = res.timedOut ? "timed out" : "produced no output";
+    const error = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
     log(`  \xB7 ${voiceId}: ${error}`);
     return { answer: "", error, keyPoints: [], ok: false, raw: res.raw, summary: "", timedOut: res.timedOut, voiceId };
   }
@@ -4926,7 +4963,7 @@ async function runCritique2(voiceId, adapters, configs, question, answers, fileC
     return { error: e.message, notes: [], ok: false, raw: null, summary: "", voiceId };
   }
   if (!res.raw || res.timedOut) {
-    const error = res.timedOut ? "timed out" : "produced no output";
+    const error = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
     return { error, notes: [], ok: false, raw: res.raw, summary: "", timedOut: res.timedOut, voiceId };
   }
   const parsed = parseCritique2(res.raw);
@@ -5107,6 +5144,8 @@ export {
   STAGE_MARKER,
   SUGGESTION_HARD_CAP,
   TERMINAL_STATES,
+  TRANSIENT_FAST_FAIL_MS,
+  TRANSIENT_RETRY_DELAYS_MS,
   TRUNCATION_MARKER_RE,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
   VOICES_FILE,
@@ -5181,6 +5220,7 @@ export {
   isReviewProfile,
   isReviewerId,
   isStrippedPath,
+  isTransientApiErrorReply,
   isUnsafeReadRoot,
   isVoiceId,
   keyOf,

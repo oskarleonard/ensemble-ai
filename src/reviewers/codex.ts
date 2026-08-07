@@ -33,6 +33,10 @@ export interface CodexReviewResult {
   // outside its vendor allowlist — which, under a prompt-injectable shell, is the signal the fence
   // exists to catch. LOUD by contract: stderr at denial time, the run artifact, the posted footer.
   egressDenials?: readonly EgressDenial[];
+  // Set when the seat failed for a reason the {raw, timedOut} pair cannot express —
+  // today: a persistent transient API error (529/429) that exhausted its retries.
+  // Callers prefer this over the generic timed-out/no-output wording when present.
+  failWhy?: string;
   ok: boolean;
   raw: string | null; // the reviewer's full reply (read from the -o file)
   stderrTail: string;

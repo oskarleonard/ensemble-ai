@@ -267,7 +267,7 @@ export async function runHolisticLens(
     return fail(`the holistic lens did not run: ${(e as Error).message}`);
   }
   if (!res.raw || res.timedOut) {
-    const why = res.timedOut ? 'timed out' : 'produced no output';
+    const why = (res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output'));
     log(`  · holistic: ${why}`);
     return { ...fail(`the holistic lens ${why}`), raw: res.raw ?? null };
   }

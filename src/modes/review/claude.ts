@@ -156,14 +156,57 @@ export function makeNeutralSeatCwd(): string {
   return makeOwnerOnlyTempDir('ensemble-seat-cwd-');
 }
 
+// A reply that is an API-layer ERROR, not a review: the CLI prints the transport error
+// ("API Error: 529 Overloaded", 429 rate limit, other 5xx) to stdout and exits within
+// seconds, having consumed no tokens and produced no review. Observed verbatim on runs
+// 2026-08-05-11-46-48 and 2026-08-05-13-09-19 (the raw reply was exactly the one 529
+// line) — which the parser then honestly reported as "no parseable JSON block", masking
+// the real cause. The predicate is deliberately narrow: SHORT replies only, so a real
+// review that merely quotes an error string can never be classed as transient.
+export function isTransientApiErrorReply(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 1500) return false;
+  return /\bAPI Error:\s*(?:429|5\d\d)\b/i.test(trimmed) || /\boverloaded\b/i.test(trimmed);
+}
+
+// Fast-fail retry schedule for transient API errors: a 529/429 returns in seconds, so a
+// couple of spaced retries are nearly free next to the review they rescue. An attempt
+// that ran longer than TRANSIENT_FAST_FAIL_MS did real work and is never retried — the
+// retry exists for the seat that died on arrival, not to double-spend a long run.
+export const TRANSIENT_RETRY_DELAYS_MS = [15_000, 45_000] as const;
+export const TRANSIENT_FAST_FAIL_MS = 120_000;
+
+// The exec seam runClaudeReviewVoice drives — injectable so the retry loop is testable
+// without spawning anything (same injection pattern as ClaudeRunner in self-contained).
+export type ReviewerExec = typeof runReviewerExec;
+
+// Test seams for the retry loop: the exec and the waits. Production callers pass nothing.
+export interface ClaudeVoiceSeams {
+  exec?: ReviewerExec;
+  fastFailMs?: number;
+  retryDelaysMs?: readonly number[];
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 // Invoke Claude headless over the review/synthesis prompt via the shared group-kill
 // watchdog spawn, in stdout-capture mode. Returns the uniform {ok, raw, stderrTail,
 // timedOut} so the orchestrator treats claude like every other voice.
+//
+// TRANSIENT-ERROR RETRY: an attempt whose reply is an API-layer error (529 overloaded,
+// 429, 5xx) AND that fast-failed (under TRANSIENT_FAST_FAIL_MS) is retried after a
+// short wait, up to TRANSIENT_RETRY_DELAYS_MS.length extra attempts. Anything else —
+// a timeout, a long attempt, a real reply — is returned as-is. The retry is surfaced
+// on stderrTail so the trail records that the seat needed it.
 export async function runClaudeReviewVoice(
   prompt: string,
   config: VoiceConfig,
-  opts: RunReviewOpts = {}
+  opts: RunReviewOpts = {},
+  seams: ClaudeVoiceSeams = {}
 ): Promise<VoiceRunResult> {
+  const exec = seams.exec ?? runReviewerExec;
+  const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
+  const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   // Built BEFORE the neutral cwd exists, so an unfenceable read root throws without leaking a dir.
   const args = buildClaudeReviewArgs(
@@ -189,16 +232,51 @@ export async function runClaudeReviewVoice(
         /* best-effort — the seat reviews without history rather than not at all */
       }
     }
-    const { raw, stderrTail, timedOut } = await runReviewerExec({
-      args,
-      bin: resolveClaudeBin(),
-      capture: 'stdout',
-      cwd,
-      onSpawn: opts.onSpawn,
-      stderrLimit: 2000,
-      timeoutMs,
-    });
-    return { ok: raw !== null && !timedOut, raw, stderrTail, timedOut };
+    let retried = 0;
+    for (;;) {
+      const startedAt = Date.now();
+      const { raw, stderrTail, timedOut } = await exec({
+        args,
+        bin: resolveClaudeBin(),
+        capture: 'stdout',
+        cwd,
+        onSpawn: opts.onSpawn,
+        stderrLimit: 2000,
+        timeoutMs,
+      });
+      const elapsedMs = Date.now() - startedAt;
+      const transient =
+        !timedOut &&
+        typeof raw === 'string' &&
+        isTransientApiErrorReply(raw) &&
+        elapsedMs < fastFailMs;
+      if (transient && retried < retryDelaysMs.length) {
+        await sleep(retryDelaysMs[retried]);
+        retried += 1;
+        continue;
+      }
+      if (transient) {
+        // Retries exhausted and the seat never produced a review — only API-error
+        // lines. Report the REAL cause instead of letting the findings parser
+        // downstream mislabel it "no parseable JSON" (which is what masked the
+        // 2026-08-05 529s). raw is withheld so no caller mistakes the error line
+        // for a reply; the line itself is preserved on stderrTail for the trail.
+        return {
+          failWhy: `persistent transient API error after ${retried + 1} attempts`,
+          ok: false,
+          raw: null,
+          stderrTail: raw.trim().slice(0, 300),
+          timedOut: false,
+        };
+      }
+      const retryNote = retried > 0 ? `[retried ${retried}x on transient API error] ` : '';
+      return {
+        ok: raw !== null && !timedOut,
+        raw,
+        stderrTail: retryNote ? `${retryNote}${stderrTail ?? ''}` : stderrTail,
+        timedOut,
+      };
+    }
   } finally {
     try {
       fs.rmSync(cwd, { force: true, recursive: true });
