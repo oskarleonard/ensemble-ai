@@ -21,6 +21,16 @@ describe('the one Claude producer — /code-review methodology seat', () => {
     expect(prompt).toContain('Do NOT delegate to subagents');
   });
 
+  it('the native /code-review skill is BANNED from ensemble seats — the prompt never mentions it', () => {
+    expect(prompt).not.toContain('/code-review');
+  });
+
+  it('carries the operator review method: functional bugs first, simplify lens, grounded self-check', () => {
+    expect(prompt).toContain('Hunt FUNCTIONAL BUGS first');
+    expect(prompt).toContain('the simplify lens');
+    expect(prompt).toContain('SELF-CHECK every candidate finding');
+  });
+
   it('names the worktree and the EXACT diff command — a detached HEAD has no diff of its own', () => {
     expect(prompt).toContain('/tmp/wt');
     expect(prompt).toContain(`git diff ${args.baseSha}...${args.headSha}`);

@@ -37,6 +37,27 @@ import {
 export const COLD_PEER_ROLE =
   'You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.';
 
+// The operator's manual review method, encoded (2026-08-07). This is what he does when he
+// reviews a PR by hand — the flow the native /code-review skill replaced at ~15x the cost,
+// which is why that skill is BANNED from ensemble seats (operator decision: it eats the
+// subscription window; if he ever wants it he prompts it manually, outside the ensemble).
+// Ordering is deliberate: functional bugs are the reason reviews exist; the simplify lens
+// is second; the self-check is what separates a finding from a guess.
+export const OPERATOR_REVIEW_METHOD = `## How to review (in this order)
+
+1. Walk the diff hunk by hunk. For every touched function, read enough surrounding code —
+   its callers, its callees, the rest of the file — to judge the change in context, not in
+   isolation.
+2. Hunt FUNCTIONAL BUGS first: correctness defects, broken edge cases, regressions of
+   behavior the diff did not intend to change, authorization gaps, contract drift (API
+   shapes, DB writes, event payloads), and state/concurrency hazards.
+3. Then the simplify lens: a utility that already exists and was reinvented, a simpler
+   function shape, dead or unreachable branches, scope that silently narrowed or widened.
+4. SELF-CHECK every candidate finding before reporting it: re-read the code at the PR head
+   and ask "does this actually make sense — what concrete input or state makes it fail?"
+   Drop anything you cannot ground at file:line. Downgrade confidence on anything that
+   depends on an assumption you could not verify in the tree.`;
+
 // Quality-lens calibration (Oskar): structural simplification only. Never style/naming/format.
 export const QUALITY_LENS = `Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits — they are noise on someone else's pull request.`;
 
@@ -77,6 +98,8 @@ cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from)
 ${materializedDiffClause(args)}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}
+
+${OPERATOR_REVIEW_METHOD}
 
 ${QUALITY_LENS}
 
