@@ -264,9 +264,10 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, gate 
       return calls.find((c) => c.round === 'review')?.prompt ?? '';
     };
 
-    it('`code` takes the /code-review skill over the whole project, diff materialized', async () => {
+    it('`code` takes the cold single-pass peer prompt over the whole project, diff materialized', async () => {
       const prompt = await producerPromptFor('code');
-      expect(prompt).toContain('/code-review');
+      expect(prompt).toContain('cold peer reviewer: ONE single-conversation review pass');
+      expect(prompt.startsWith('/')).toBe(false);
       expect(prompt).toContain('/tmp/some-worktree');
       expect(prompt).toContain('PINNED DIFF BODY');
       // It is TOLD the range, but never asked to compute it — it has no shell.

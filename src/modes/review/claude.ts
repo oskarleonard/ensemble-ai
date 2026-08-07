@@ -58,7 +58,7 @@ import { UNTRUSTED_INSTRUCTIONS_CLAUSE } from './worktree';
 // never verify as equivalent to one minted under a tighter one.
 export const CLAUDE_CAPABILITY_FENCE: SandboxProfileRef = {
   id: 'claude-capability-fence',
-  version: 1,
+  version: 2,
 };
 
 // Claude's `--effort` accepts these levels; anything else ('default' sentinel included)
@@ -76,6 +76,13 @@ export const CLAUDE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
 // deliberately: the deny-list is a fence, and a fence names the tool BEFORE it comes back.
 export const CLAUDE_REVIEW_DENIED_TOOLS = [
   'Bash',
+  // The fan-out channel: a subagent is a fresh full-context conversation at the seat's own
+  // model/effort — at opus@max a skill- or model-initiated fan-out multiplies the operator's
+  // subscription burn ~15x (lived: run 2026-08-07-17-16-13 ate ~77% of a Max 5x window). The
+  // seat is a cold SINGLE-PASS peer; both tool names are denied ('Task' is the older name —
+  // a fence names the tool before it comes back). Fence version bumped: 1 → 2.
+  'Agent',
+  'Task',
   'WebFetch',
   'WebSearch',
   'Write',

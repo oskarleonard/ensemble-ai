@@ -163,7 +163,7 @@ describe('review --repo: a QUALIFIED seat is spawned against the worktree', () =
   // A worktree seat's evidence is only meaningful bound to the fence that bounded it, so the receipt
   // must NAME that fence. `claude-plan-mode-deny-writes` was an honest name for a belt that did not
   // meet spec §2; a receipt minted under the real fence must say `claude-capability-fence`.
-  it('binds the Anthropic seats to `claude-capability-fence` v1 in the receipt', async () => {
+  it('binds the Anthropic seats to `claude-capability-fence` v2 in the receipt', async () => {
     const { adapters } = stubAdapters();
     const result = await runReviewMode(
       runOpts({
@@ -176,7 +176,7 @@ describe('review --repo: a QUALIFIED seat is spawned against the worktree', () =
     for (const seat of ['claude', 'gate'] as const) {
       expect(result.receiptCandidate?.sandboxProfiles?.[seat]).toEqual({
         id: 'claude-capability-fence',
-        version: 1,
+        version: 2,
       });
     }
     // grok keeps its own id — the fence is per-seat, never a global claim. Its READS are OS-enforced

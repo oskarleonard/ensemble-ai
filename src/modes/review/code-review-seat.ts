@@ -25,7 +25,17 @@ import {
 // The seat is a PRODUCER, not the gate. /simplify and /review are NOT producers in the post
 // tail (§3): /simplify's distinct value is APPLYING fixes, which is off the table on a foreign
 // PR, and /review is subsumed by the worktree + materialized diff.
-export const CODE_REVIEW_SKILL = '/code-review';
+// HISTORY: this seat used to open its prompt with the literal `/code-review` slash command —
+// which, under `claude -p`, INVOKES the skill: a multi-agent pipeline that fans out finder and
+// verifier subagents, each a fresh full-context conversation at the seat's own model/effort.
+// On lisk-backend#683 (run 2026-08-07-17-16-13) one such producer consumed ~77% of a Max 5x
+// subscription window, where the operator's interactive single-conversation review of the same
+// PR costs ~5%. The ensemble already IS the multi-voice verification (codex + grok + the gate),
+// so the skill's internal fan-out bought redundant depth at ~15x the price. The seat is now what
+// its docs always claimed: a COLD SINGLE-PASS peer — one conversation, direct Read/Grep/Glob,
+// the fence's Agent/Task deny (claude.ts) making the no-fan-out shape structural.
+export const COLD_PEER_ROLE =
+  'You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.';
 
 // Quality-lens calibration (Oskar): structural simplification only. Never style/naming/format.
 export const QUALITY_LENS = `Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits — they are noise on someone else's pull request.`;
@@ -56,7 +66,7 @@ export interface CodeReviewSeatPromptArgs {
 // so a unit test pins the exact shape.
 export function renderCodeReviewSeatPrompt(args: CodeReviewSeatPromptArgs): string {
   const history = args.history ? `\n\n${HISTORY_PACKET_CLAUSE}` : '';
-  return `${CODE_REVIEW_SKILL}
+  return `${COLD_PEER_ROLE}
 
 You are reviewing someone else's pull request, read-only. You may not edit, stage, or push anything.
 You have NO shell and NO network: there is no Bash tool, so do not try to run \`git\` or any command.
