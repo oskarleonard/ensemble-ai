@@ -3334,7 +3334,11 @@ DIFF>>>
      not settle for an in-process handler test \u2014 BOOT THE REAL API AND DRIVE IT OVER THE WIRE.
      Bring up the service's own dependencies and serve the API on a SCRATCH high port with the
      repo's own tooling, in its local / dev-tooling mode (mock auth + a seeded test account, so no
-     real Clerk/Privy is needed), then \`curl\` the affected routes with a mock-auth bearer. Assert
+     real Clerk/Privy is needed), then \`curl\` the affected routes with a mock-auth bearer.
+     ALWAYS boot LOCALLY from this worktree \u2014 NEVER point at a shared/dev/staging API for the routes
+     under test. This PR's code and schema are not on any shared environment until it merges, so a
+     shared API would answer with the OLD behavior (or a 404) and hand you a false "held". The local
+     boot of the change itself is the only thing that can exercise it. Assert
      THREE things, not one: the HTTP status, the response shape, AND the persisted state \u2014 query the
      database or check the emitted event, because a 200 that wrote nothing (or wrote the wrong row)
      is still a defect. A real boot catches what an in-process test structurally cannot: the
