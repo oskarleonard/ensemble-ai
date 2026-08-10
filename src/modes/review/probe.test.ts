@@ -53,8 +53,17 @@ describe('the prober prompt — run the change, receipts or it did not happen', 
       expect(prompt).toContain(s);
     }
     expect(prompt).toMatch(/NEVER run `git commit`,\s*`git push`/i);
-    expect(prompt).toContain('containers, databases, or processes you did not start');
-    expect(prompt).toContain('RESTORE the tree');
+    expect(prompt).toContain('containers, databases, servers, or processes you did not start');
+    expect(prompt).toMatch(/stop every server\/process and remove every container you started/);
+  });
+
+  it('the endpoint leg is a real-boot E2E (curl + assert persisted state), warranted like a pilot leg', () => {
+    expect(prompt).toContain('BOOT THE REAL API AND DRIVE IT OVER THE WIRE');
+    expect(prompt).toContain('SCRATCH high port');
+    expect(prompt).toMatch(/HTTP status, the response shape, AND the persisted state/);
+    expect(prompt).toContain('e2e leg not warranted');
+    // the local-mode signing boundary is stated so the seat never fakes a fund-moving step
+    expect(prompt).toContain('LOCAL-MODE BOUNDARY');
   });
 
   it('pins the reply schema, and a missing directive degrades honestly', () => {

@@ -3298,10 +3298,12 @@ at ${args.worktree}. You have a shell (Bash) and file tools. The checkout is dis
 files and temporary code edits are fine \u2014 but:
 - NEVER run \`git commit\`, \`git push\`, or anything that touches a deployed environment or leaves
   this machine.
-- NEVER touch containers, databases, or processes you did not start: the operator's own dev stack
-  may be running on the default ports. Scratch containers on non-default ports only.
-- After a mutation probe, RESTORE the tree (\`git checkout -- <file>\`); before finishing, remove
-  every container and process you started.
+- NEVER touch containers, databases, servers, or processes you did not start, and NEVER bind a
+  default/well-known port (the operator's own dev stack \u2014 API, DB, queues \u2014 may be live on them).
+  Scratch containers and a scratch HIGH port only; discover the repo's port override rather than
+  reusing the default.
+- Before finishing: stop every server/process and remove every container you started, and
+  \`git checkout -- <file>\` after any mutation or boot-config edit. Leave the machine as you found it.
 
 ## The change under probe
 
@@ -3327,12 +3329,31 @@ DIFF>>>
    - TEST EFFECTIVENESS (mutation-lite): for a load-bearing new behavior, revert its implementing
      hunk, run the tests that claim to cover it, and verify they FAIL; then restore the tree. A
      suite that stays green with the behavior deleted is a \`broke\` probe on the tests.
-   - ENDPOINTS: when nothing cheaper decides it, boot the service with its own tooling (docker
-     dependencies, seed data) and hit the touched endpoints \u2014 assert status, response shape, and
-     persisted state.
-2. Prefer the SMALLEST decisive experiment; the repo's own docs and Makefile name the commands.
-   Time-box each probe \u2014 when the setup fights you, run a smaller experiment rather than burning
-   the budget on a perfect one.
+   - ENDPOINTS \u2014 THE STRONGEST SIGNAL, the backend analog of an app-pilot E2E run. When the diff
+     touches the HTTP surface, auth/middleware, routing, request/response shapes, or event flow, do
+     not settle for an in-process handler test \u2014 BOOT THE REAL API AND DRIVE IT OVER THE WIRE.
+     Bring up the service's own dependencies and serve the API on a SCRATCH high port with the
+     repo's own tooling, in its local / dev-tooling mode (mock auth + a seeded test account, so no
+     real Clerk/Privy is needed), then \`curl\` the affected routes with a mock-auth bearer. Assert
+     THREE things, not one: the HTTP status, the response shape, AND the persisted state \u2014 query the
+     database or check the emitted event, because a 200 that wrote nothing (or wrote the wrong row)
+     is still a defect. A real boot catches what an in-process test structurally cannot: the
+     middleware chain (auth, rate-limit, the region/origin gates), OpenAPI param binding and
+     serialization at the wire, route registration, and cross-service + event-bus wiring under a
+     real process.
+     WARRANT IT like a spanning-flow leg (capability granted is not obligation): run the boot ONLY
+     when the change actually touches that surface. If it does not, write "e2e leg not warranted:
+     <reason>" in the summary and skip it \u2014 an unused leg is fine, a padded one is not. If the boot
+     genuinely cannot be brought up inside the time budget, that probe is \`blocked\`, said plainly \u2014
+     never report a held/broke you did not drive over the wire.
+     LOCAL-MODE BOUNDARY: mock auth stubs the wallet/passkey layer (real signing is a no-op), so a
+     fund-MOVING step that requires a genuine signature cannot be driven locally. Probe the
+     request \u2192 validation \u2192 authorization \u2192 persistence \u2192 event chain up to that line, and mark the
+     signing step itself \`blocked\` with the reason rather than faking it.
+2. Prefer the SMALLEST decisive experiment \u2014 EXCEPT the endpoint leg above, where a real boot is
+   the point and worth its minutes when the surface warrants it. The repo's own docs and Makefile
+   name the commands. Time-box each probe \u2014 when setup fights you, fall back to a smaller
+   experiment or mark it blocked rather than burning the whole budget on one.
 3. Outcome per probe \u2014 about the CODE, not the hypothesis:
    - held    = the code behaved as the PR intends. Receipt required.
    - broke   = the code misbehaved \u2014 a real defect: severity + file:line + the receipt.
