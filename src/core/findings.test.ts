@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { extractJsonBlock, parseFindings } from './findings';
+import { extractJsonBlock, parseFindings, stripTrailingCommas } from './findings';
 
 const ok = {
   findings: [
@@ -27,6 +27,28 @@ describe('extractJsonBlock', () => {
 
   it('returns null when there is no JSON at all', () => {
     expect(extractJsonBlock('just prose, no json')).toBeNull();
+  });
+
+  // Regression: run 2026-08-10-20-10-54 — ONE trailing comma in an otherwise-perfect 17KB gate
+  // envelope fail-closed 15 verdicts to unverified. The strict pass stays first; the stripped
+  // retry only runs when strict parsing failed on every candidate.
+  it('tolerates trailing commas in objects and arrays (the classic model quirk)', () => {
+    const raw = '```json\n{\n  "synthesis": {\n    "bottomLine": "fix then merge",\n  },\n  "verdicts": [\n    { "findingId": "codex#1", "verdict": "agree", },\n  ],\n}\n```';
+    expect(extractJsonBlock(raw)).toEqual({
+      synthesis: { bottomLine: 'fix then merge' },
+      verdicts: [{ findingId: 'codex#1', verdict: 'agree' }],
+    });
+  });
+
+  it('never strips a ",}" that lives INSIDE a string (incl. behind escaped quotes)', () => {
+    const tricky = { note: 'a literal ,} and ,] stay: "quoted,}" end', ok: true };
+    const raw = '```json\n' + JSON.stringify(tricky).replace('"ok":true}', '"ok":true,}') + '\n```';
+    expect(extractJsonBlock(raw)).toEqual(tricky);
+  });
+
+  it('stripTrailingCommas handles escape sequences without flipping string state', () => {
+    expect(stripTrailingCommas('{"a":"backslash \\\\",}')).toBe('{"a":"backslash \\\\"}');
+    expect(stripTrailingCommas('{"a":"quote \\" then ,}",}')).toBe('{"a":"quote \\" then ,}"}');
   });
 });
 
