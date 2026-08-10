@@ -280,6 +280,10 @@ export type ProbeRunner = (
 export interface RunProbeOptions {
   baseDir: string;
   config: VoiceConfig;
+  // The PR head the worktree is detached at — persisted into probe-report.json so a poster can
+  // refuse to anchor receipts from commit A onto a PR whose head moved to B (the same
+  // stale-anchor protection the review's freshReviewedHead gives its findings).
+  headSha?: string;
   log?: (m: string) => void;
   prompt: string;
   // Injectable prober runner (default: the shared unfenced exec voice).
@@ -332,7 +336,11 @@ export async function runProbe(opts: RunProbeOptions): Promise<ProbeRunResult> {
       opts.baseDir,
       opts.runId,
       'probe-report.json',
-      JSON.stringify({ report: parsed.report, runId: opts.runId }, null, 2)
+      JSON.stringify(
+        { ...(opts.headSha ? { headSha: opts.headSha } : {}), report: parsed.report, runId: opts.runId },
+        null,
+        2
+      )
     );
   } catch (e) {
     log(`  · probe: probe-report.json FAILED to write (${(e as Error).message}) — continuing`);

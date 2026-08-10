@@ -3500,7 +3500,11 @@ async function runProbe(opts) {
       opts.baseDir,
       opts.runId,
       "probe-report.json",
-      JSON.stringify({ report: parsed.report, runId: opts.runId }, null, 2)
+      JSON.stringify(
+        { ...opts.headSha ? { headSha: opts.headSha } : {}, report: parsed.report, runId: opts.runId },
+        null,
+        2
+      )
     );
   } catch (e) {
     log(`  \xB7 probe: probe-report.json FAILED to write (${e.message}) \u2014 continuing`);
@@ -10649,6 +10653,7 @@ async function probeCommand(rest) {
     const res = await runProbe({
       baseDir: out,
       config: seat.config,
+      headSha: acquired.headSha,
       log: (m) => console.error(m),
       prompt,
       runId,
