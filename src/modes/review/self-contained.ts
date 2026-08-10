@@ -30,9 +30,11 @@ import { claudeWorktreePromptSuffix, runClaudeReviewVoice } from './claude';
 import { renderCodeReviewSeatPrompt } from './code-review-seat';
 import {
   type GateVerdictRecord,
+  type SettlementRecord,
   renderGateVerdicts,
   runGate,
 } from './gate';
+import { renderSettlements, runSettler, selectSettleTargets, type SettlerRunner } from './settler';
 import {
   HOLISTIC_SEAT_ID,
   type HolisticPlan,
@@ -294,6 +296,15 @@ export interface ClaudeLayerOptions {
   runId: string;
   // Injectable claude runner (default: the real headless `claude -p` voice).
   run?: ClaudeRunner;
+  // THE EXECUTION SETTLER (settler.ts) — DEFAULT ON (`settle: false` opts out). It fires only when
+  // the gate tagged at least one finding `execution-decidable:` AND this run has a worktree to
+  // execute in; a tagged finding with no worktree is a LOUD skip. Settlements are advisory
+  // receipts — they never change verdicts, posting, or the exit gate.
+  settle?: boolean;
+  // The settler seat's model/effort. Omitted ⇒ inherits `claudeConfig` (the producer seat).
+  settlerConfig?: VoiceConfig;
+  // Injectable settler runner (default: the real headless unfenced spawn in the worktree).
+  settlerRun?: SettlerRunner;
   timeoutMs?: number;
   // The detached read-only worktree of the PR head, when this run HAS worktree evidence. Its
   // presence makes the GATE worktree-fed (spec §5: "the gate reads the same worktree") and is the
@@ -331,6 +342,13 @@ export interface ClaudeLayerResult {
   // stdout block so the output never hardcodes "opus" when a different Claude model is
   // configured. `opus` is the design default (when the voice config leaves the model unset).
   modelLabel: string;
+  // The execution settler's receipts — null/absent when the stage did not fire (no tagged
+  // findings, opted out, or no worktree). OPTIONAL: consumer contract, additive like the lens.
+  settlements?: SettlementRecord[] | null;
+  // Why the settler did NOT run when it had targets. Null/absent ⇒ it ran, or had nothing to do.
+  settlerSkipped?: string | null;
+  // Whether the settler seat's spawn was attempted and returned (mirrors claudeSpawned).
+  settlerSpawned?: boolean;
   synthesis: ReviewSynthesis;
 }
 
@@ -528,15 +546,51 @@ export async function runClaudeReviewLayer(
     // The gate reads the same worktree the seats did (spec §5) — its own spawn cwd.
     ...(opts.worktree ? { worktree: opts.worktree } : {}),
   });
+
+  // THE EXECUTION SETTLER (settler.ts): pick up every finding the gate tagged
+  // `execution-decidable:` and settle it by RUNNING the experiment in the worktree. DEFAULT ON;
+  // fires only when there are targets. A tagged finding with no worktree is a LOUD skip — the
+  // whole point of the tag is that reading cannot settle it, so silently leaving it "unverified"
+  // would repeat the miss this stage exists to close. Settlements attach onto the verdict records
+  // (trail schema v6) and never change a verdict.
+  let gateVerdicts = gate.verdicts;
+  let settlements: SettlementRecord[] | null = null;
+  let settlerSkipped: string | null = null;
+  let settlerSpawned = false;
+  const settleTargets = opts.settle === false ? [] : selectSettleTargets(gate.verdicts);
+  if (settleTargets.length > 0) {
+    if (!opts.worktree) {
+      settlerSkipped = `${settleTargets.length} execution-decidable finding(s), but this run has no worktree to execute in — run with worktree evidence (--repo) to settle them`;
+      log(`  · settler: SKIPPED — ${settlerSkipped}`);
+    } else {
+      const settled = await runSettler({
+        baseDir: opts.baseDir,
+        config: opts.settlerConfig ?? opts.claudeConfig,
+        headSha: opts.expectedHeadSha,
+        log,
+        records: gate.verdicts,
+        ...(opts.settlerRun ? { run: opts.settlerRun } : {}),
+        runId: opts.runId,
+        worktree: opts.worktree,
+      });
+      gateVerdicts = settled.records;
+      settlements = settled.settlements;
+      settlerSpawned = settled.spawned;
+    }
+  }
+
   return {
     claudeReview,
     claudeSpawned,
     gateSpawned: gate.gateSpawned,
     gateTrailWritten: gate.gateTrailWritten,
-    gateVerdicts: gate.verdicts,
+    gateVerdicts,
     holisticReview,
     holisticSkipped: plan.run ? null : plan.skipReason,
     modelLabel,
+    settlements,
+    settlerSkipped,
+    settlerSpawned,
     synthesis: gate.synthesis,
   };
 }
@@ -620,5 +674,14 @@ export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
   // The grounded per-finding verdict TAGS + the gate summary line + the trail marker — the
   // gate's teeth, rendered inline (Phase 1: informational; exit is unchanged).
   out.push(...renderGateVerdicts(result.gateVerdicts, { scrub, trailWritten: result.gateTrailWritten }));
+
+  // The settler's receipts — the execution verdicts for what the gate could only tag. A skip is
+  // rendered LOUDLY: an execution-decidable finding nobody ran is exactly the state this stage
+  // exists to make visible.
+  if (result.settlements && result.settlements.length > 0) {
+    out.push(...renderSettlements(result.settlements, scrub));
+  } else if (result.settlerSkipped) {
+    out.push('', '  ── settler — SKIPPED ──', `     ${scrub(result.settlerSkipped)}`);
+  }
   return out;
 }

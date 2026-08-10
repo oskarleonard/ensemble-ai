@@ -207,6 +207,12 @@ Options:
                         WHOLE project (reinvented patterns, convention drift, simplifiable
                         design). Default OFF. REQUIRES worktree evidence — with none it does
                         not run and says so; it never reviews on the packet.
+  --no-settle           skip the EXECUTION SETTLER. Default ON: when the gate tags a finding
+                        "execution-decidable:" and the run has worktree evidence, one UNFENCED
+                        Anthropic seat runs the deciding experiment in the worktree (scratch
+                        DBs/containers, the repo's own tooling) and attaches command+output
+                        receipts. Advisory: verdicts, posting, and the HIGH gate are unchanged.
+                        The seat RUNS the PR's code — trusted-PR workflows only.
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
@@ -1095,6 +1101,7 @@ async function reviewCommand(
         'no-claude': { type: 'boolean' },
         'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
+        'no-settle': { type: 'boolean' },
         out: { type: 'string' },
         'post-comment': { type: 'boolean' },
         pr: { type: 'string' },
@@ -1498,6 +1505,9 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         profile,
         reviewPrompt: result.prompt,
         runId,
+        // THE EXECUTION SETTLER — default ON (`--no-settle` opts out). Inert unless the gate
+        // tags a finding `execution-decidable:` AND the run has worktree evidence.
+        settle: !values['no-settle'],
         // The Claude producer + the gate read the SAME worktree the core seats did (spec §3, §5).
         ...(worktree ? { worktree: worktree.dir } : {}),
       });

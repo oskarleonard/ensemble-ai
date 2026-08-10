@@ -252,8 +252,8 @@ describe('reconcileGateVerdicts — postable text (A+)', () => {
     expect(u).toMatchObject({ effectiveVerdict: 'unverified', postableBody: null, postableStatus: 'not-postable' });
   });
 
-  it('the durable trail schema is bumped to v5 (postable + placement + anchorSide + tldr added)', () => {
-    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(5);
+  it('the durable trail schema is bumped to v6 (settlement added — postable/placement/anchorSide/tldr came in v2–v5)', () => {
+    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(6);
   });
 });
 

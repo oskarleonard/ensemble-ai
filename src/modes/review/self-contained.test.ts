@@ -573,3 +573,116 @@ describe('runClaudeReviewLayer — worktree producer timeout default', () => {
     expect(gateTimeout).toBe(GATE_WORKTREE_TIMEOUT_MS);
   });
 });
+
+// ── The execution settler in the layer — default ON, worktree-gated, loud skip ─────────
+
+describe('the execution settler stage — gate-tagged findings settled by running', () => {
+  const GATE_TAGGED = JSON.stringify({
+    schemaVersion: 1,
+    synthesis: { agreements: [], bottomLine: 'settle first', disagreements: [] },
+    verdicts: [
+      { findingId: 'codex#1', reason: 'execution-decidable: only a scratch-DB replay decides this', verdict: 'unverified' },
+      { findingId: 'grok#1', reason: 'overstated', verdict: 'partial' },
+      { findingId: 'claude#1', reason: 'could not ground', verdict: 'unverified' },
+    ],
+  });
+  const SETTLED =
+    '```json\n' +
+    JSON.stringify({
+      settlements: [
+        { command: 'docker run --rm postgres:16 …', findingId: 'codex#1', outcome: 'confirmed', reason: 'replay failed exactly as claimed', receipt: 'pq: functions in index predicate must be marked IMMUTABLE' },
+      ],
+    }) +
+    '\n```';
+
+  const layerOpts = (base: string, runId: string, run: (p: string) => Promise<VoiceRunResult>) => ({
+    baseDir: base,
+    claudeConfig: CFG,
+    coreReviews: [stored('codex'), stored('grok')],
+    expectedHeadSha: HEAD,
+    includeClaudeReviewer: true,
+    reviewPrompt: 'REVIEW PROMPT PAYLOAD',
+    run,
+    runId,
+  });
+
+  it('runs on a tagged finding with worktree evidence: receipts attach to the records AND the trail', async () => {
+    const base = tmpTrail();
+    const runId = 'settle-on';
+    seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    const { run } = makeRunner({ onGate: () => okRun(GATE_TAGGED) });
+    const settlerPrompts: string[] = [];
+    const res = await runClaudeReviewLayer({
+      ...layerOpts(base, runId, run),
+      settlerRun: async (prompt) => {
+        settlerPrompts.push(prompt);
+        return okRun(SETTLED);
+      },
+      worktree: '/tmp/wt-settle',
+    });
+    // only the TAGGED finding entered the settler (claude#1's plain unverified did not)
+    expect(settlerPrompts).toHaveLength(1);
+    expect(settlerPrompts[0]).toContain('codex#1');
+    expect(settlerPrompts[0]).not.toContain('claude#1');
+    expect(res.settlerSpawned).toBe(true);
+    expect(res.settlerSkipped).toBeNull();
+    expect(res.settlements?.map((s) => `${s.findingId}:${s.outcome}`)).toEqual(['codex#1:confirmed']);
+    // attached to the record; the reading-verdict is UNCHANGED (advisory receipts)
+    const settled = res.gateVerdicts.find((v) => v.findingId === 'codex#1');
+    expect(settled?.settlement?.receipt).toContain('IMMUTABLE');
+    expect(settled?.effectiveVerdict).toBe('unverified');
+    // the durable trail was rewritten with the settlement riding the record
+    const trail = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'gate-verdicts.json'), 'utf8'));
+    expect(trail.verdicts.find((v: { findingId: string }) => v.findingId === 'codex#1').settlement.outcome).toBe('confirmed');
+    // and the stdout render carries the receipts block
+    const out = renderClaudeLayer(res).join('\n');
+    expect(out).toContain('settled by RUNNING them');
+    expect(out).toContain('[confirmed] codex#1');
+  });
+
+  it('a tagged finding with NO worktree is a LOUD skip, never a silent unverified', async () => {
+    const base = tmpTrail();
+    const runId = 'settle-skip';
+    seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    const { run } = makeRunner({ onGate: () => okRun(GATE_TAGGED) });
+    const res = await runClaudeReviewLayer({
+      ...layerOpts(base, runId, run),
+      settlerRun: async () => {
+        throw new Error('must not spawn without a worktree');
+      },
+    });
+    expect(res.settlements).toBeNull();
+    expect(res.settlerSkipped).toContain('no worktree');
+    expect(renderClaudeLayer(res).join('\n')).toContain('settler — SKIPPED');
+  });
+
+  it('`settle: false` opts out even with tags + worktree; no tags means no stage at all', async () => {
+    const base = tmpTrail();
+    const runId = 'settle-off';
+    seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    const { run } = makeRunner({ onGate: () => okRun(GATE_TAGGED) });
+    const off = await runClaudeReviewLayer({
+      ...layerOpts(base, runId, run),
+      settle: false,
+      settlerRun: async () => {
+        throw new Error('must not spawn under settle: false');
+      },
+      worktree: '/tmp/wt-settle',
+    });
+    expect(off.settlements).toBeNull();
+    expect(off.settlerSkipped).toBeNull();
+
+    const base2 = tmpTrail();
+    seedCoreTrail(base2, 'no-tags', [stored('codex'), stored('grok')]);
+    const { run: run2 } = makeRunner(); // default gate envelope — no execution-decidable reasons
+    const quiet = await runClaudeReviewLayer({
+      ...layerOpts(base2, 'no-tags', run2),
+      settlerRun: async () => {
+        throw new Error('must not spawn with no tagged finding');
+      },
+      worktree: '/tmp/wt-settle',
+    });
+    expect(quiet.settlements).toBeNull();
+    expect(quiet.settlerSkipped).toBeNull();
+  });
+});
