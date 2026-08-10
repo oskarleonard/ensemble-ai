@@ -31,6 +31,18 @@ describe('the one Claude producer — /code-review methodology seat', () => {
     expect(prompt).toContain('SELF-CHECK every candidate finding');
   });
 
+  it('runs the four miss-class hunts a human reviewer proved seats skip (lisk-backend#683)', () => {
+    expect(prompt).toContain('NEW GUARD, EVERY ROUTE');
+    expect(prompt).toContain('CALLER CENSUS');
+    expect(prompt).toContain('TEST EFFECTIVENESS');
+    expect(prompt).toContain('DECLARED-SET COMPLETENESS');
+  });
+
+  it('forbids arguing away execution-decidable findings — report them and name the settling command', () => {
+    expect(prompt).toContain('execution-decidable');
+    expect(prompt).toMatch(/name\s+the exact command that would settle it/);
+  });
+
   it('names the worktree and the EXACT diff command — a detached HEAD has no diff of its own', () => {
     expect(prompt).toContain('/tmp/wt');
     expect(prompt).toContain(`git diff ${args.baseSha}...${args.headSha}`);
