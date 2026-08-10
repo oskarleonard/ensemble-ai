@@ -568,6 +568,15 @@ type GateVerdict = (typeof GATE_VERDICTS)[number];
 declare const DOWNGRADE_REASONS: readonly ["truncated", "invalid-citation", "duplicate", "missing", "bad-enum", "packet-fail", "gate-failed", "unknown-schema", "trail-write-failed", "reference-not-found"];
 type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
 type AnchorSide = 'new' | 'old' | null;
+declare const SETTLEMENT_OUTCOMES: readonly ["confirmed", "refuted", "inconclusive"];
+type SettlementOutcome = (typeof SETTLEMENT_OUTCOMES)[number];
+interface SettlementRecord {
+    command: string;
+    findingId: string;
+    outcome: SettlementOutcome;
+    reason: string;
+    receipt: string;
+}
 interface GateVerdictRecord {
     anchorSide: AnchorSide;
     citation?: string;
@@ -587,6 +596,7 @@ interface GateVerdictRecord {
     rawVerdict: string | null;
     reason: string;
     rescoredSeverity: Severity | null;
+    settlement?: SettlementRecord;
     resolved: boolean;
     reviewer: string;
     severity: Severity;
@@ -909,7 +919,7 @@ declare function buildEvidenceManifest(args: {
 declare function writeEvidenceManifest(baseDir: string, runId: string, manifest: EvidenceManifest): boolean;
 
 declare const COLD_PEER_ROLE = "You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.";
-declare const OPERATOR_REVIEW_METHOD = "## How to review (in this order)\n\n1. Walk the diff hunk by hunk. For every touched function, read enough surrounding code \u2014\n   its callers, its callees, the rest of the file \u2014 to judge the change in context, not in\n   isolation.\n2. Hunt FUNCTIONAL BUGS first: correctness defects, broken edge cases, regressions of\n   behavior the diff did not intend to change, authorization gaps, contract drift (API\n   shapes, DB writes, event payloads), and state/concurrency hazards.\n3. Then the simplify lens: a utility that already exists and was reinvented, a simpler\n   function shape, dead or unreachable branches, scope that silently narrowed or widened.\n4. SELF-CHECK every candidate finding before reporting it: re-read the code at the PR head\n   and ask \"does this actually make sense \u2014 what concrete input or state makes it fail?\"\n   Drop anything you cannot ground at file:line. Downgrade confidence on anything that\n   depends on an assumption you could not verify in the tree.";
+declare const OPERATOR_REVIEW_METHOD = "## How to review (in this order)\n\n1. Walk the diff hunk by hunk. For every touched function, read enough surrounding code \u2014\n   its callers, its callees, the rest of the file \u2014 to judge the change in context, not in\n   isolation.\n2. Hunt FUNCTIONAL BUGS first: correctness defects, broken edge cases, regressions of\n   behavior the diff did not intend to change, authorization gaps, contract drift (API\n   shapes, DB writes, event payloads), and state/concurrency hazards.\n   Four hunts reviews are known to skip \u2014 run each explicitly:\n   - NEW GUARD, EVERY ROUTE: when the diff adds a guard or invariant check, enumerate EVERY\n     code path that reaches the protected operation (grep the entry points, count the call\n     sites) and verify each path passes through it. A guard on two of four routes is a\n     finding, and the call-site enumeration is its proof.\n   - CALLER CENSUS: for every function the diff touches, count its non-test callers. Zero\n     production callers is dead code \u2014 a guard or fix added there protects nothing.\n   - TEST EFFECTIVENESS: for each new behavior, name the test that FAILS if the behavior is\n     reverted. A fixture that never sets the new field makes every assertion on it vacuous\n     (zero-value == zero-value still passes with the feature deleted).\n   - DECLARED-SET COMPLETENESS: when the diff declares an enumerable set (a comment listing\n     the N methods a rule covers, a routing matrix, a doc table), verify every element is\n     handled and tested \u2014 defects hide in the unsampled remainder.\n3. Then the simplify lens: a utility that already exists and was reinvented, a simpler\n   function shape, dead or unreachable branches, scope that silently narrowed or widened.\n4. SELF-CHECK every candidate finding before reporting it: re-read the code at the PR head\n   and ask \"does this actually make sense \u2014 what concrete input or state makes it fail?\"\n   Drop anything you cannot ground at file:line. Downgrade confidence on anything that\n   depends on an assumption you could not verify in the tree. EXCEPTION \u2014 execution-decidable\n   claims: when a finding turns on runtime behavior you cannot run here (would this DDL\n   apply, does this compile, would that test fail), do NOT talk yourself out of it by arguing\n   how the runtime probably behaves. Report it, ground what the reading supports, and name\n   the exact command that would settle it.";
 declare const QUALITY_LENS = "Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits \u2014 they are noise on someone else's pull request.";
 interface CodeReviewSeatPromptArgs {
     baseSha: string;

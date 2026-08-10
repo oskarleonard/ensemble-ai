@@ -3960,12 +3960,29 @@ var OPERATOR_REVIEW_METHOD = `## How to review (in this order)
 2. Hunt FUNCTIONAL BUGS first: correctness defects, broken edge cases, regressions of
    behavior the diff did not intend to change, authorization gaps, contract drift (API
    shapes, DB writes, event payloads), and state/concurrency hazards.
+   Four hunts reviews are known to skip \u2014 run each explicitly:
+   - NEW GUARD, EVERY ROUTE: when the diff adds a guard or invariant check, enumerate EVERY
+     code path that reaches the protected operation (grep the entry points, count the call
+     sites) and verify each path passes through it. A guard on two of four routes is a
+     finding, and the call-site enumeration is its proof.
+   - CALLER CENSUS: for every function the diff touches, count its non-test callers. Zero
+     production callers is dead code \u2014 a guard or fix added there protects nothing.
+   - TEST EFFECTIVENESS: for each new behavior, name the test that FAILS if the behavior is
+     reverted. A fixture that never sets the new field makes every assertion on it vacuous
+     (zero-value == zero-value still passes with the feature deleted).
+   - DECLARED-SET COMPLETENESS: when the diff declares an enumerable set (a comment listing
+     the N methods a rule covers, a routing matrix, a doc table), verify every element is
+     handled and tested \u2014 defects hide in the unsampled remainder.
 3. Then the simplify lens: a utility that already exists and was reinvented, a simpler
    function shape, dead or unreachable branches, scope that silently narrowed or widened.
 4. SELF-CHECK every candidate finding before reporting it: re-read the code at the PR head
    and ask "does this actually make sense \u2014 what concrete input or state makes it fail?"
    Drop anything you cannot ground at file:line. Downgrade confidence on anything that
-   depends on an assumption you could not verify in the tree.`;
+   depends on an assumption you could not verify in the tree. EXCEPTION \u2014 execution-decidable
+   claims: when a finding turns on runtime behavior you cannot run here (would this DDL
+   apply, does this compile, would that test fail), do NOT talk yourself out of it by arguing
+   how the runtime probably behaves. Report it, ground what the reading supports, and name
+   the exact command that would settle it.`;
 var QUALITY_LENS = `Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits \u2014 they are noise on someone else's pull request.`;
 var SCHEMA_BLOCK2 = `{"summary":"<one sentence>","findings":[{"title":"<short>","body":"<what is wrong, why, and the fix>","severity":"high|medium|low","confidence":"high|medium|low","evidence":{"file":"<repo-relative path>","line":<number>}}]}`;
 function renderCodeReviewSeatPrompt(args) {

@@ -115,7 +115,11 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // and a regate REWRITES the file from a fresh gate run rather than loading the old one — so every
 // bump is a CONSUMER contract: a host reading gate-verdicts.json must accept 4 and 5 alike (and
 // treat an absent `tldr` as null), never equality-check against the current constant.
-export const GATE_TRAIL_SCHEMA_VERSION = 5;
+// v6: adds `settlement` — the EXECUTION SETTLER's verdict-by-running for a finding the gate tagged
+// `execution-decidable:` (settler.ts). Additive like v5; absent on every record the settler did not
+// touch, and on every run where it did not fire. NOTE: a regate rewrites this trail from a fresh
+// gate run, so settlements are dropped by a regate (the settler runs in the full pipeline only).
+export const GATE_TRAIL_SCHEMA_VERSION = 6;
 
 const REASON_CAP = 700;
 const CITATION_CAP = 500;
@@ -420,6 +424,22 @@ export function parseGateEnvelope(raw: string): EnvelopeFailure | ParsedGateEnve
 
 // ── Host-owned reconciliation → the durable records ───────────────────────────────────
 
+// The EXECUTION SETTLER's verdict for one finding — a verdict-by-RUNNING, never by reading
+// (settler.ts owns the seat; this type lives here because GateVerdictRecord carries it and the
+// settler already imports the record type — the reverse import would be a cycle).
+export const SETTLEMENT_OUTCOMES = ['confirmed', 'refuted', 'inconclusive'] as const;
+export type SettlementOutcome = (typeof SETTLEMENT_OUTCOMES)[number];
+export interface SettlementRecord {
+  // The decisive command, verbatim — enough for a human to re-run the experiment.
+  command: string;
+  findingId: string;
+  outcome: SettlementOutcome;
+  // One line: what the experiment showed (or why none was possible, on inconclusive).
+  reason: string;
+  // The trimmed DECISIVE output lines the verdict rests on.
+  receipt: string;
+}
+
 export interface GateVerdictRecord {
   // The line space `line` resolved in (see AnchorSide). Only `new` may be anchored as an inline
   // RIGHT comment; `old` names a deleted line, which GitHub rejects on the RIGHT.
@@ -448,6 +468,12 @@ export interface GateVerdictRecord {
   rawVerdict: string | null; // exactly what the model returned (may be an invalid enum), null if none
   reason: string;
   rescoredSeverity: Severity | null; // gate's down-scored severity for a partial; null ⇒ unchanged
+  // The execution settler's verdict-by-running (trail schema v6). Present ONLY on a finding the
+  // gate tagged `execution-decidable:` that the settler then ran an experiment for. ADDITIVE and
+  // ADVISORY: it never alters effectiveVerdict, posting, or the HIGH exit gate — the receipts are
+  // for the operator, who decides. (A refuted HIGH therefore still gates; dismissal authority
+  // stays citation-based.)
+  settlement?: SettlementRecord;
   // Did this finding's cite RESOLVE to a hunk of the reviewed diff? The posting path needs it: a
   // GitHub review comment on a line outside the diff is a 422 that fails the whole staged review,
   // so only a resolved cite may be anchored inline.
