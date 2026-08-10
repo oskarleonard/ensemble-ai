@@ -563,8 +563,16 @@ export async function runClaudeReviewLayer(
       settlerSkipped = `${settleTargets.length} execution-decidable finding(s), but this run has no worktree to execute in — run with worktree evidence (--repo) to settle them`;
       log(`  · settler: SKIPPED — ${settlerSkipped}`);
     } else {
+      // The verdict records carry the claim's disposition, not its prose — resolve each
+      // finding's reviewer body off the loaded voice reviews (same `voiceId#n` id scheme the
+      // gate's flattenFindings mints) so the settler reads the full claim it is testing.
+      const bodyById = new Map<string, string>();
+      for (const v of voiceReviews) {
+        v.findings.forEach((f, i) => bodyById.set(`${v.voiceId}#${i + 1}`, f.body));
+      }
       const settled = await runSettler({
         baseDir: opts.baseDir,
+        bodyById,
         config: opts.settlerConfig ?? opts.claudeConfig,
         headSha: opts.expectedHeadSha,
         log,

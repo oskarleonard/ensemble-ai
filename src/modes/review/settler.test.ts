@@ -104,13 +104,18 @@ describe('the settler argv — unfenced where the review seats are fenced, and t
 });
 
 describe('the settler prompt — experiments with receipts, never verdicts by prose', () => {
-  const prompt = renderSettlerPrompt([rec()], { headSha: 'HEAD1', worktree: '/tmp/wt-1' });
+  const prompt = renderSettlerPrompt([rec()], {
+    bodyById: new Map([['codex#1', 'the cast predicate calls enum_out, which is STABLE']]),
+    headSha: 'HEAD1',
+    worktree: '/tmp/wt-1',
+  });
 
-  it('names the worktree, the head SHA, and each finding with the gate reason', () => {
+  it('names the worktree, the head SHA, and each finding with its body and the gate reason', () => {
     expect(prompt).toContain('/tmp/wt-1');
     expect(prompt).toContain('HEAD1');
     expect(prompt).toContain('codex#1');
     expect(prompt).toContain('migration predicate cannot execute');
+    expect(prompt).toContain('the cast predicate calls enum_out, which is STABLE');
     expect(prompt).toContain('gate reason: execution-decidable:');
   });
 

@@ -118,17 +118,21 @@ export function buildClaudeSettlerArgs(prompt: string, config?: VoiceConfig): st
 const SETTLEMENT_SCHEMA_BLOCK = `{"settlements":[{"findingId":"codex#1","outcome":"confirmed|refuted|inconclusive","command":"<the decisive command>","receipt":"<trimmed decisive output>","reason":"<one line>"}]}`;
 
 // PURE: the settler prompt. Encoded as data so a unit test pins the exact contract (house rule).
+// `bodyById` carries each finding's reviewer body — the verdict record deliberately does not
+// (the gate trail stores the claim's disposition, not its prose), so the layer resolves the
+// bodies off the loaded voice reviews and hands them in.
 export function renderSettlerPrompt(
   targets: GateVerdictRecord[],
-  args: { headSha: string; worktree: string }
+  args: { bodyById?: ReadonlyMap<string, string>; headSha: string; worktree: string }
 ): string {
   const findings = targets
     .map((t) => {
       const where = `${t.file}${t.line !== null ? `:${t.line}` : ''}`;
+      const body = args.bodyById?.get(t.findingId) ?? '';
       return `### ${t.findingId} · [${t.severity}] ${where}
 ${t.title}
 
-${t.body ?? ''}
+${body}
 
 gate reason: ${t.reason}`;
     })
@@ -370,6 +374,8 @@ export type SettlerRunner = (
 
 export interface RunSettlerOptions {
   baseDir: string;
+  // Reviewer body per findingId (see renderSettlerPrompt) — absent bodies degrade to title-only.
+  bodyById?: ReadonlyMap<string, string>;
   config: VoiceConfig;
   headSha: string;
   log?: (m: string) => void;
@@ -414,7 +420,11 @@ export async function runSettler(opts: RunSettlerOptions): Promise<SettlerResult
     `  · settler: ${targets.length} execution-decidable finding(s) — running the experiment(s) in the worktree…`
   );
 
-  const prompt = renderSettlerPrompt(targets, { headSha: opts.headSha, worktree: opts.worktree });
+  const prompt = renderSettlerPrompt(targets, {
+    ...(opts.bodyById ? { bodyById: opts.bodyById } : {}),
+    headSha: opts.headSha,
+    worktree: opts.worktree,
+  });
   let res: VoiceRunResult | null = null;
   let spawned = true;
   try {
