@@ -3321,6 +3321,7 @@ async function probeCommand(rest: string[]): Promise<number> {
     const res = await runProbe({
       baseDir: out,
       config: seat.config,
+      headSha: acquired.headSha,
       log: (m) => console.error(m),
       prompt,
       runId,
