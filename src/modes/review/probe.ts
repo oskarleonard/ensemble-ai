@@ -39,6 +39,10 @@ export interface ProbeGate {
   reason: string;
   // The contract line that refutes the finding (required to honor a `refuted`); null otherwise.
   citation?: { file: string; line: number | null } | null;
+  // Plain-English impact + fix direction for a CONFIRMED defect — the gate writes it (it is the
+  // seat that confirmed the finding), so a poster ships it verbatim without a second model pass.
+  // Present only on confirmed; absent on refuted/inconclusive.
+  tldr?: string;
 }
 
 export interface ProbeRecord {
@@ -366,6 +370,7 @@ export function renderProbeReport(report: ProbeReport, scrub: (s: string) => str
         : '';
       const mark = p.gate.verdict === 'refuted' ? 'REFUTED (cleared)' : p.gate.verdict.toUpperCase();
       out.push(`         gate: ${mark}${cite} — ${scrub(p.gate.reason).slice(0, 200)}`);
+      if (p.gate.tldr) out.push(`         TLDR: ${scrub(p.gate.tldr).slice(0, 280)}`);
     }
   }
   const c = probeCounts(report.probes);

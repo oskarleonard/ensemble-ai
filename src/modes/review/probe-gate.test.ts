@@ -60,18 +60,20 @@ describe('parse — host-owned, and a citation-less refutation cannot clear a br
   const known = new Set(['p1', 'p2']);
   const block = (verdicts: unknown) => '```json\n' + JSON.stringify({ verdicts }) + '\n```';
 
-  it('parses a grounded refutation and a confirmation', () => {
+  it('parses a grounded refutation and a confirmation; tldr rides a confirmed only', () => {
     const { verdicts, warnings } = parseProbeGateVerdicts(
       block([
-        { citation: { file: 'workspace.go', line: 268 }, id: 'p1', reason: 'accountsCount predicts the kind-blind leave guard', verdict: 'refuted' },
-        { id: 'p2', reason: 'real auth gap', verdict: 'confirmed' },
+        { citation: { file: 'workspace.go', line: 268 }, id: 'p1', reason: 'accountsCount predicts the kind-blind leave guard', tldr: 'ignored on refuted', verdict: 'refuted' },
+        { id: 'p2', reason: 'real auth gap', tldr: 'A viewer can move funds; gate the write on signer role.', verdict: 'confirmed' },
       ]),
       known,
     );
     expect(warnings).toEqual([]);
     expect(verdicts.get('p1')).toMatchObject({ verdict: 'refuted' });
     expect(verdicts.get('p1')?.citation?.line).toBe(268);
+    expect(verdicts.get('p1')?.tldr).toBeUndefined(); // tldr is dropped on a non-confirmed verdict
     expect(verdicts.get('p2')?.verdict).toBe('confirmed');
+    expect(verdicts.get('p2')?.tldr).toContain('gate the write on signer role');
   });
 
   it('downgrades a refuted-without-citation to inconclusive (loudly) — it must not clear a broke', () => {

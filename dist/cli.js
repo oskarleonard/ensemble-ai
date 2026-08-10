@@ -3493,6 +3493,7 @@ function renderProbeReport(report, scrub) {
       const cite = p.gate.citation?.file ? ` \xB7 ${scrub(p.gate.citation.file)}${p.gate.citation.line !== null ? `:${p.gate.citation.line}` : ""}` : "";
       const mark = p.gate.verdict === "refuted" ? "REFUTED (cleared)" : p.gate.verdict.toUpperCase();
       out.push(`         gate: ${mark}${cite} \u2014 ${scrub(p.gate.reason).slice(0, 200)}`);
+      if (p.gate.tldr) out.push(`         TLDR: ${scrub(p.gate.tldr).slice(0, 280)}`);
     }
   }
   const c = probeCounts(report.probes);
@@ -3521,7 +3522,8 @@ function capStr2(s, n) {
 function selectGateTargets(report) {
   return report.probes.filter((p) => p.outcome === "broke");
 }
-var GATE_SCHEMA_BLOCK = `{"verdicts":[{"id":"p1","verdict":"confirmed|refuted|inconclusive","reason":"<one line>","citation":{"file":"<repo-relative path>","line":<number>}}]}`;
+var GATE_SCHEMA_BLOCK = `{"verdicts":[{"id":"p1","verdict":"confirmed|refuted|inconclusive","reason":"<one line>","citation":{"file":"<repo-relative path>","line":<number>},"tldr":"<confirmed only: plain-English impact + fix, <=280 chars>"}]}`;
+var TLDR_CAP = 280;
 function renderProbeGatePrompt(targets, args) {
   const findings = targets.map((p) => {
     const where = p.evidence?.file ? `${p.evidence.file}${p.evidence.line != null ? `:${p.evidence.line}` : ""}` : "(no anchor)";
@@ -3546,7 +3548,9 @@ The project at the PR head is checked out at ${args.worktree} \u2014 read it. Fo
    - refuted     = the behavior is CORRECT/intended. You MUST cite the contract line that makes it
      so (file:line of the doc comment / invariant / mirrored guard). No citation \u21D2 not a refutation.
    - confirmed   = the defect is real: the behavior contradicts the code's own stated contract, or
-     is a genuine correctness/authorization/data error with no contract that sanctions it.
+     is a genuine correctness/authorization/data error with no contract that sanctions it. On a
+     confirmed, also write \`tldr\`: one plain-English line (<=280 chars) \u2014 what breaks for a
+     user/operator and the fix direction, no jargon.
    - inconclusive = you cannot decide from the tree (say why). Treated as STILL STANDING, not
      cleared \u2014 only a grounded refutation clears a broke.
 You have a shell and may re-run a cheap confirming experiment in the worktree if a reading does not
@@ -3600,7 +3604,8 @@ function parseProbeGateVerdicts(raw, knownIds) {
       verdict = "inconclusive";
       reason = reason ? `${reason} [no citation \u2014 not cleared]` : "refuted without a citation";
     }
-    out.set(id, { citation, reason, verdict });
+    const tldr = verdict === "confirmed" ? capStr2(v.tldr, TLDR_CAP) : "";
+    out.set(id, { citation, reason, verdict, ...tldr ? { tldr } : {} });
   }
   return { verdicts: out, warnings };
 }
@@ -5246,7 +5251,7 @@ var GATE_ENVELOPE_SCHEMA_VERSION = 1;
 var GATE_TRAIL_SCHEMA_VERSION = 6;
 var REASON_CAP2 = 700;
 var CITATION_CAP = 500;
-var TLDR_CAP = 280;
+var TLDR_CAP2 = 280;
 function capStr3(s, n) {
   const t = typeof s === "string" ? s.trim() : "";
   return t.length > n ? `${t.slice(0, n - 1).trimEnd()}\u2026` : t;
@@ -5370,7 +5375,7 @@ function parseVerdicts(v) {
     const suggestion = parseSuggestion(e.suggestion);
     const sites = parseHolisticSites(e.sites);
     const conventionCitation = parseConventionCitation(e.conventionCitation);
-    const tldr = capStr3(e.tldr, TLDR_CAP);
+    const tldr = capStr3(e.tldr, TLDR_CAP2);
     out.push({
       citation: typeof e.citation === "string" ? capStr3(e.citation, CITATION_CAP) : void 0,
       findingId,
