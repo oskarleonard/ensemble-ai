@@ -199,6 +199,12 @@ edits. Do TWO jobs:
    - unverified = you cannot ground it in the shown hunk (the SAFE default).
    You may only mark "false" when the finding's own hunk is shown AND you can quote the exact
    line that refutes it. Truncated / out-of-diff hunks CANNOT be dismissed — use unverified.
+   EXECUTION-DECIDABLE claims: a finding that turns on runtime behavior (would this DDL/SQL
+   apply, does this compile, would that test fail, how does the DB or library actually behave)
+   can NOT be refuted by reading — quoting the line it questions is not a refutation. "false"
+   is reserved for textual contradictions (the code does not say what the claim says it says).
+   If the hunk does not textually contradict such a claim, your floor is "unverified", and the
+   reason must start with "execution-decidable:" so a human runs it instead of trusting prose.
 
 ## The findings + their cited hunks
 Each finding's own title + body are wrapped in a <<<CLAIM …>>> … <<<END …>>> fence: that is
