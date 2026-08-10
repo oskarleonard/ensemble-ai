@@ -28,11 +28,27 @@ export type ProbeOutcome = (typeof PROBE_OUTCOMES)[number];
 export const PROBE_KINDS = ['guard', 'migration', 'mutation', 'endpoint', 'test', 'build', 'other'] as const;
 export type ProbeKind = (typeof PROBE_KINDS)[number];
 
+// The adversarial gate's adjudication of a `broke` finding (probe-gate.ts). A probe's receipt can
+// be TRUE while its CONCLUSION is wrong — the observed behavior is actually correct per the code's
+// contract (the accountsCount case: count ≠ list was real, but the count is the leave-guard
+// predictor, so the difference is intended). The gate refutes each broke against the contract; a
+// broke is CLEARED only by a grounded refutation, mirroring the review gate's citation rule.
+export type ProbeGateVerdict = 'confirmed' | 'refuted' | 'inconclusive';
+export interface ProbeGate {
+  verdict: ProbeGateVerdict;
+  reason: string;
+  // The contract line that refutes the finding (required to honor a `refuted`); null otherwise.
+  citation?: { file: string; line: number | null } | null;
+}
+
 export interface ProbeRecord {
   command: string;
   // Where the probed behavior lives. Required on `broke` (a defect needs an anchor); best-effort
   // otherwise.
   evidence: { file: string; line: number | null } | null;
+  // The gate's verdict — present only on a `broke` the gate adjudicated. Absent ⇒ not gated
+  // (held/blocked, or a run with no broke findings). See ProbeGate.
+  gate?: ProbeGate;
   hypothesis: string;
   id: string;
   kind: ProbeKind;
@@ -40,6 +56,14 @@ export interface ProbeRecord {
   receipt: string;
   // Meaningful on `broke` only (how bad is the demonstrated defect); null otherwise.
   severity: Severity | null;
+}
+
+// A broke finding still counts as a live defect UNLESS the gate refuted it with a citation. A
+// confirmed, inconclusive, or un-gated broke all stand (fail toward caution — a broke is cleared
+// only by a grounded refutation, never by silence). This is the one predicate the exit gate and
+// the poster both key off, so "what still counts" can't drift between them.
+export function brokeStands(p: ProbeRecord): boolean {
+  return p.outcome === 'broke' && p.gate?.verdict !== 'refuted';
 }
 
 export interface ProbeReport {
@@ -334,10 +358,23 @@ export function renderProbeReport(report: ProbeReport, scrub: (s: string) => str
         out.push(`         ${scrub(line).slice(0, 200)}`);
       }
     }
+    // The gate's adjudication, when this broke was gated — a refuted one is struck through in prose
+    // (it no longer counts) with the contract that cleared it; confirmed/inconclusive stand.
+    if (p.gate) {
+      const cite = p.gate.citation?.file
+        ? ` · ${scrub(p.gate.citation.file)}${p.gate.citation.line !== null ? `:${p.gate.citation.line}` : ''}`
+        : '';
+      const mark = p.gate.verdict === 'refuted' ? 'REFUTED (cleared)' : p.gate.verdict.toUpperCase();
+      out.push(`         gate: ${mark}${cite} — ${scrub(p.gate.reason).slice(0, 200)}`);
+    }
   }
   const c = probeCounts(report.probes);
+  const stands = report.probes.filter(brokeStands).length;
+  const refuted = (c.broke ?? 0) - stands;
   out.push('');
-  out.push(`  prober — ${c.held} held · ${c.broke} broke · ${c.blocked} blocked`);
+  out.push(
+    `  prober — ${c.held} held · ${c.broke} broke${refuted > 0 ? ` (${stands} stand · ${refuted} gate-refuted)` : ''} · ${c.blocked} blocked`,
+  );
   return out;
 }
 
@@ -346,6 +383,7 @@ export function renderProbeReport(report: ProbeReport, scrub: (s: string) => str
 // produced no usable report is exit 1 — a failed run, never a clean one. Pure.
 export function resolveProbeExit(report: ProbeReport | null, noFailOnBroke: boolean): number {
   if (!report) return 1;
-  if (!noFailOnBroke && report.probes.some((p) => p.outcome === 'broke')) return 4;
+  // Only a broke that STANDS (not gate-refuted) forces exit 4 — a refuted broke is cleared.
+  if (!noFailOnBroke && report.probes.some(brokeStands)) return 4;
   return 0;
 }

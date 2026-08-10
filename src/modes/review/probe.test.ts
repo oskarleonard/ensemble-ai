@@ -158,6 +158,18 @@ describe('exit semantics — broke gates, blocked does not, no report is a faile
     expect(resolveProbeExit(report(['broke']), true)).toBe(0);
   });
 
+  it('a gate-refuted broke is cleared (no exit 4); confirmed/inconclusive/un-gated still gate', () => {
+    const withGate = (verdict: 'confirmed' | 'refuted' | 'inconclusive'): ProbeReport => {
+      const r = report(['broke']);
+      r.probes[0].gate = { citation: { file: 'x.go', line: 1 }, reason: 'r', verdict };
+      return r;
+    };
+    expect(resolveProbeExit(withGate('refuted'), false)).toBe(0); // cleared
+    expect(resolveProbeExit(withGate('confirmed'), false)).toBe(4);
+    expect(resolveProbeExit(withGate('inconclusive'), false)).toBe(4); // only a refutation clears
+    expect(resolveProbeExit(report(['broke']), false)).toBe(4); // un-gated broke still stands
+  });
+
   it('counts + render carry the receipts and the verdict line', () => {
     const r = report(['held', 'broke', 'blocked']);
     expect(probeCounts(r.probes)).toEqual({ blocked: 1, broke: 1, held: 1 });

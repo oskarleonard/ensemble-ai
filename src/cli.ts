@@ -35,6 +35,7 @@ import {
   resolveProbeExit,
   runProbe,
 } from './modes/review/probe';
+import { runProbeGate } from './modes/review/probe-gate';
 import {
   type BrainstormResult,
   isVoiceId,
@@ -3161,6 +3162,11 @@ pipeline's execution settler, and the backend analog of an app-pilot run. TRUSTE
 seat runs the PR's code (the own-team trust model: the same as checking the branch out and running
 the tests yourself).
 
+Any \`broke\` finding is then handed to a SEPARATE adversarial GATE seat, which tries to refute it
+against the code's contract (doc comments, invariants, the guard it mirrors). A broke is cleared
+only by a grounded refutation with a citation — so a true-receipt-but-wrong-conclusion defect (the
+observed behavior is actually intended) is dropped here, not left for you to catch by hand.
+
 Usage:
   ensemble-ai probe <pr-url> --repo <local-clone> [options]
 
@@ -3177,8 +3183,9 @@ Options:
   --cwd <dir>           working directory for gh/git (default: process cwd)
   -h, --help            this help
 
-Exit: 0 = probed, nothing broke · 4 = at least one broke probe (an execution-proven defect) ·
-1 = the prober produced no usable report · 3 = usage/preflight error.`;
+Exit: 0 = probed, nothing broke stands · 4 = at least one broke STANDS after the gate (an
+execution-proven defect the gate could not refute) · 1 = the prober produced no usable report ·
+3 = usage/preflight error.`;
 
 async function probeCommand(rest: string[]): Promise<number> {
   let values: Record<string, string | boolean | undefined>;
@@ -3300,11 +3307,24 @@ async function probeCommand(rest: string[]): Promise<number> {
       console.error(`trail: ${trailDir}`);
       return 1;
     }
-    console.log(renderProbeReport(res.report, clean).join('\n'));
+    // THE PROBE GATE: a fresh adversarial seat refutes each `broke` against the code's contract, so
+    // a plausible-but-wrong defect (a true receipt, a false conclusion) is cleared HERE instead of
+    // reaching the operator raw. Fires only when there is a broke to adjudicate.
+    let report = res.report;
+    const gate = await runProbeGate({
+      baseDir: out,
+      config: seat.config,
+      log: (m) => console.error(m),
+      report,
+      runId,
+      worktree: worktree.dir,
+    });
+    report = gate.report;
+    console.log(renderProbeReport(report, clean).join('\n'));
     console.log(`\ntrail: ${trailDir}`);
-    const exit = resolveProbeExit(res.report, Boolean(values['no-fail-on-broke']));
+    const exit = resolveProbeExit(report, Boolean(values['no-fail-on-broke']));
     if (exit === 4) {
-      console.log('probe: at least one probe BROKE — an execution-proven defect (exit 4; --no-fail-on-broke to opt out)');
+      console.log('probe: at least one broke finding STANDS after the gate — an execution-proven defect (exit 4; --no-fail-on-broke to opt out)');
     }
     return exit;
   } finally {
