@@ -66,6 +66,12 @@ describe('the prober prompt — run the change, receipts or it did not happen', 
     expect(prompt).toContain('LOCAL-MODE BOUNDARY');
   });
 
+  it('mandates a LOCAL boot — never a shared/dev API, whose routes lack the unmerged change', () => {
+    expect(prompt).toContain('ALWAYS boot LOCALLY from this worktree');
+    expect(prompt).toMatch(/NEVER point at a shared\/dev\/staging API/);
+    expect(prompt).toMatch(/not on any shared environment until it merges/);
+  });
+
   it('pins the reply schema, and a missing directive degrades honestly', () => {
     expect(prompt).toContain('"probes"');
     expect(prompt).toContain('held|broke|blocked');
