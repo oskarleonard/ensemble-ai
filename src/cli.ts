@@ -30,6 +30,12 @@ import {
 import { runBrainstormMode } from './modes/brainstorm';
 import { listVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
+  renderProbePrompt,
+  renderProbeReport,
+  resolveProbeExit,
+  runProbe,
+} from './modes/review/probe';
+import {
   type BrainstormResult,
   isVoiceId,
   parseVoiceIds,
@@ -142,7 +148,9 @@ import {
   verifyReceipt,
 } from './plumbing/verify';
 
-const USAGE = `ensemble-ai — convene multiple AI models on a task, read-only.
+const USAGE = `ensemble-ai — convene multiple AI models on a task. Read-only, with one
+named exception: \`probe\` (and the review pipeline's settler stage) EXECUTES the PR's code
+in a disposable worktree — trusted PRs only.
 
 Usage:
   ensemble-ai <mode> [options]
@@ -152,6 +160,10 @@ Modes:
   security     Cross-vendor SECURITY audit of a code diff (implemented) —
                the review engine with a security-auditor lens + a local
                dependency-surface flag; findings tagged by security class.
+  probe        Check a backend PR by RUNNING it (implemented) — one execution seat
+               probes the diff's behaviors for real (guards, migrations, test
+               effectiveness, endpoints) and reports held/broke/blocked with
+               command+output receipts. \`probe --help\` for the contract.
   brainstorm   Cross-vendor ideation on a TOPIC (implemented) — each voice
                generates ideas independently, critiques the others, then one
                synthesizes a ranked, de-duplicated recommendation.
@@ -3137,6 +3149,169 @@ async function regateCommand(args: string[]): Promise<number> {
   }
 }
 
+// ── The probe command (the execution prober — modes/review/probe.ts) ───────────────────
+
+const PROBE_USAGE = `ensemble-ai probe — check a backend PR by RUNNING it (the execution prober).
+
+ONE unfenced Anthropic seat gets a disposable worktree of the PR head, forms hypotheses from the
+diff (guards, migrations, test effectiveness via mutation-lite reverts, endpoints), executes each
+with the repo's own tooling (scratch containers/DBs only, never anything it did not start), and
+reports held/broke/blocked with command+output receipts. The proactive sibling of the review
+pipeline's execution settler, and the backend analog of an app-pilot run. TRUSTED PRs ONLY — the
+seat runs the PR's code (the own-team trust model: the same as checking the branch out and running
+the tests yourself).
+
+Usage:
+  ensemble-ai probe <pr-url> --repo <local-clone> [options]
+
+Requirements (both mandatory — a probe that cannot execute is not a probe; no packet fallback):
+  <pr-url>              full GitHub PR URL (binds base+head SHAs via the compare API)
+  --repo <path>         local clone of the PR's repo (the worktree is materialized from it)
+
+Options:
+  --claude-model <m>    the prober seat's model (default: voices.json claude entry, else opus)
+  --claude-effort <e>   the prober seat's effort (low|medium|high|xhigh|max)
+  --no-fail-on-broke    do NOT exit 4 when a probe demonstrates a defect
+  --out <dir>           trail base dir (default: a temp dir; probe-report.json + probe.raw.md + probe.md)
+  --run-id <id>         trail run id (default: minted)
+  --cwd <dir>           working directory for gh/git (default: process cwd)
+  -h, --help            this help
+
+Exit: 0 = probed, nothing broke · 4 = at least one broke probe (an execution-proven defect) ·
+1 = the prober produced no usable report · 3 = usage/preflight error.`;
+
+async function probeCommand(rest: string[]): Promise<number> {
+  let values: Record<string, string | boolean | undefined>;
+  let positionals: string[];
+  try {
+    ({ positionals, values } = parseArgs({
+      allowPositionals: true,
+      args: rest,
+      options: {
+        'claude-effort': { type: 'string' },
+        'claude-model': { type: 'string' },
+        cwd: { type: 'string' },
+        help: { short: 'h', type: 'boolean' },
+        'no-fail-on-broke': { type: 'boolean' },
+        out: { type: 'string' },
+        pr: { type: 'string' },
+        repo: { type: 'string' },
+        'run-id': { type: 'string' },
+      },
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai probe: ${(e as Error).message}`);
+    return 3;
+  }
+  if (values.help) {
+    console.log(PROBE_USAGE);
+    return 0;
+  }
+  const cwd = typeof values.cwd === 'string' ? values.cwd : process.cwd();
+
+  const source = resolveDiffSourceForCommand(values, positionals, 'probe', cwd);
+  if ('code' in source) return source.code;
+
+  // BOTH preconditions are hard: the prober's whole identity is executing the PR head, so a
+  // source that cannot materialize a worktree (no compare-API SHAs, no local clone) is refused
+  // upfront — never silently downgraded to a read-only pass.
+  const repoFlag = typeof values.repo === 'string' ? values.repo : null;
+  if (!repoFlag || !(source.postTarget?.repoSlug && source.headShaOverride && source.prBaseSha)) {
+    console.error(
+      'ensemble-ai probe: needs BOTH a full PR URL (https://github.com/<owner>/<repo>/pull/<N> — ' +
+        'it binds the base+head SHAs via the compare API) and --repo <local-clone>. The prober ' +
+        'RUNS the PR head, so worktree evidence is mandatory — there is no packet fallback.'
+    );
+    return 3;
+  }
+
+  // The prober seat resolves exactly like the review producer: flags → voices.json `claude`
+  // entry → the built-in opus @ max (gate-seat.ts owns the chain and the why).
+  const seat = loadClaudeReviewerSeat(
+    VOICES_FILE,
+    {
+      effort: typeof values['claude-effort'] === 'string' ? values['claude-effort'] : undefined,
+      model: typeof values['claude-model'] === 'string' ? values['claude-model'] : undefined,
+    },
+    (m) => console.error(`· ${m}`)
+  );
+
+  console.error(`· materializing the PR head as a disposable worktree of ${repoFlag}…`);
+  const opened = openWorktree({
+    baseSha: source.prBaseSha,
+    headSha: source.headShaOverride,
+    pr: source.postTarget.pr,
+    prSlug: source.postTarget.repoSlug,
+    repoPath: repoFlag,
+  });
+  if (isPreflightError(opened)) {
+    console.error(`ensemble-ai probe: --repo pre-flight failed [${opened.kind}] — ${opened.message}`);
+    return 3;
+  }
+  const worktree = opened;
+  try {
+    let acquired: AcquiredDiff;
+    try {
+      acquired = acquireDiff({
+        cwd,
+        ...(source.diffMode ? { diffMode: source.diffMode } : {}),
+        ...(source.diffText !== undefined ? { diffText: source.diffText } : {}),
+        headShaOverride: source.headShaOverride,
+      });
+    } catch (e) {
+      console.error(`ensemble-ai probe: ${(e as Error).message}`);
+      return 3;
+    }
+
+    // The PR's stated intent — context for hypothesis formation, never evidence. Best-effort.
+    const directiveRes = fetchPrDirective(source.postTarget, cwd);
+    if ('error' in directiveRes) {
+      console.error(`· probe: PR title/body unavailable (${directiveRes.error}) — probing from the diff alone`);
+    }
+    const directive = 'directive' in directiveRes ? directiveRes.directive : null;
+
+    const runId = typeof values['run-id'] === 'string' ? values['run-id'] : genRunId();
+    const out =
+      typeof values.out === 'string'
+        ? path.resolve(values.out)
+        : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+    const trailDir = reviewDir(out, runId);
+
+    const prompt = renderProbePrompt({
+      baseSha: source.prBaseSha,
+      diff: acquired.diff,
+      directive,
+      headSha: acquired.headSha,
+      worktree: worktree.dir,
+    });
+    console.error(
+      `· prober (anthropic/${seat.config.model} @ ${seat.config.effort}) probing ${source.postTarget.repoSlug}#${source.postTarget.pr} by running it (worktree ${worktree.dir})…`
+    );
+    const res = await runProbe({
+      baseDir: out,
+      config: seat.config,
+      log: (m) => console.error(m),
+      prompt,
+      runId,
+      worktree: worktree.dir,
+    });
+    if (!res.report) {
+      console.error(`ensemble-ai probe: ${res.failWhy ?? 'the prober produced no usable report'}`);
+      console.error(`trail: ${trailDir}`);
+      return 1;
+    }
+    console.log(renderProbeReport(res.report, clean).join('\n'));
+    console.log(`\ntrail: ${trailDir}`);
+    const exit = resolveProbeExit(res.report, Boolean(values['no-fail-on-broke']));
+    if (exit === 4) {
+      console.log('probe: at least one probe BROKE — an execution-proven defect (exit 4; --no-fail-on-broke to opt out)');
+    }
+    return exit;
+  } finally {
+    worktree.reap();
+  }
+}
+
 export async function main(argv: string[]): Promise<number> {
   const raw = argv[0];
   if (!raw || raw === '-h' || raw === '--help') {
@@ -3150,6 +3325,8 @@ export async function main(argv: string[]): Promise<number> {
   if (raw === 'diff') return diffCommand(argv.slice(1));
   if (raw === 'pin-check') return pinCheckCommand(argv.slice(1));
   if (raw === 'regate') return regateCommand(argv.slice(1));
+  // The execution prober — NOT in the read-only mode registry on purpose: it runs the PR's code.
+  if (raw === 'probe') return probeCommand(argv.slice(1));
 
   const mode = resolveMode(raw);
   if (mode === 'review') return reviewCommand(argv.slice(1), 'code');
