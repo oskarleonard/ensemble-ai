@@ -119,7 +119,9 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // `execution-decidable:` (settler.ts). Additive like v5; absent on every record the settler did not
 // touch, and on every run where it did not fire. NOTE: a regate rewrites this trail from a fresh
 // gate run, so settlements are dropped by a regate (the settler runs in the full pipeline only).
-export const GATE_TRAIL_SCHEMA_VERSION = 6;
+// v7: adds `verifyRequested` — the gate's opt-in ask to upgrade a CONFIRMED finding to an executed
+// receipt (honored by the settler under --verify-confirmed). Additive, same contract as v5/v6.
+export const GATE_TRAIL_SCHEMA_VERSION = 7;
 
 const REASON_CAP = 700;
 const CITATION_CAP = 500;
@@ -350,6 +352,9 @@ export interface RawVerdictEntry {
   // ≤280 chars; host-capped. Absent ⇒ the model omitted it, which never invalidates the verdict.
   tldr?: string;
   verdict: unknown;
+  // Optional gate request: upgrade this CONFIRMED finding to an executed receipt (the settler
+  // runs it under --verify-confirmed). Only the literal 'run' is honored.
+  verify?: string;
 }
 
 export interface ParsedGateEnvelope {
@@ -398,6 +403,7 @@ function parseVerdicts(v: unknown): RawVerdictEntry[] {
       ...(conventionCitation ? { conventionCitation } : {}),
       ...(sites ? { sites } : {}),
       ...(tldr ? { tldr } : {}),
+      ...(e.verify === 'run' ? { verify: 'run' } : {}),
     });
   }
   return out;
@@ -474,6 +480,9 @@ export interface GateVerdictRecord {
   // for the operator, who decides. (A refuted HIGH therefore still gates; dismissal authority
   // stays citation-based.)
   settlement?: SettlementRecord;
+  // Trail v7 (additive like v5/v6): the gate asked for this CONFIRMED finding to be upgraded to
+  // an executed receipt. Honored by the settler only under --verify-confirmed (cost knob).
+  verifyRequested?: boolean;
   // Did this finding's cite RESOLVE to a hunk of the reviewed diff? The posting path needs it: a
   // GitHub review comment on a line outside the diff is a 422 that fails the whole staged review,
   // so only a resolved cite may be anchored inline.
@@ -631,7 +640,19 @@ export function reconcileGateVerdicts(
       );
     }
     // agree / partial / unverified pass through — not dismissals, so truncation does not force them.
-    return { ...base, citation, downgradeReason: null, effectiveVerdict: e.verdict, rawVerdict, reason: e.reason };
+    return {
+      ...base,
+      citation,
+      downgradeReason: null,
+      effectiveVerdict: e.verdict,
+      rawVerdict,
+      reason: e.reason,
+      // verify-by-run rides only a CONFIRMED verdict — a hedge on unverified is what the
+      // execution-decidable tag is for, and honoring it here would blur the two channels.
+      ...(e.verify === 'run' && (e.verdict === 'agree' || e.verdict === 'partial')
+        ? { verifyRequested: true }
+        : {}),
+    };
   });
 
   // Postable-text pass: agree/partial derive their exact PR text (verbatim / narrowed) from the

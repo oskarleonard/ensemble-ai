@@ -147,6 +147,13 @@ DIFF>>>
      harness, or a booted service.
    - MIGRATIONS: replay the affected service's full migration history on a scratch database of the
      production major.
+   - PROVISIONING PARITY (least privilege): when the diff adds a schema, table, or other database
+     object, apply the repo's role-provisioning registry (e.g. db/provisioning/*.sql) to the
+     scratch database and run the migrations/boot/queries AS THE RUNTIME ROLES the deployed
+     binaries use — NEVER as the scratch owner. Owners bypass grants entirely, so a missing GRANT
+     block is structurally invisible when running as owner: an owner-run "held" on a new schema is
+     NOT evidence the deployed roles can touch it. If the registry has no block for the new object,
+     that is a \`broke\` in its own right.
    - TEST EFFECTIVENESS (mutation-lite): for a load-bearing new behavior, revert its implementing
      hunk, run the tests that claim to cover it, and verify they FAIL; then restore the tree. A
      suite that stays green with the behavior deleted is a \`broke\` probe on the tests.

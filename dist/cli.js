@@ -3363,6 +3363,13 @@ DIFF>>>
      harness, or a booted service.
    - MIGRATIONS: replay the affected service's full migration history on a scratch database of the
      production major.
+   - PROVISIONING PARITY (least privilege): when the diff adds a schema, table, or other database
+     object, apply the repo's role-provisioning registry (e.g. db/provisioning/*.sql) to the
+     scratch database and run the migrations/boot/queries AS THE RUNTIME ROLES the deployed
+     binaries use \u2014 NEVER as the scratch owner. Owners bypass grants entirely, so a missing GRANT
+     block is structurally invisible when running as owner: an owner-run "held" on a new schema is
+     NOT evidence the deployed roles can touch it. If the registry has no block for the new object,
+     that is a \`broke\` in its own right.
    - TEST EFFECTIVENESS (mutation-lite): for a load-bearing new behavior, revert its implementing
      hunk, run the tests that claim to cover it, and verify they FAIL; then restore the tree. A
      suite that stays green with the behavior deleted is a \`broke\` probe on the tests.
@@ -4988,6 +4995,12 @@ edits. Do TWO jobs:
    is reserved for textual contradictions (the code does not say what the claim says it says).
    If the hunk does not textually contradict such a claim, your floor is "unverified", and the
    reason must start with "execution-decidable:" so a human runs it instead of trusting prose.
+   VERIFY-BY-RUN (optional): on an "agree" or "partial" you are CONFIDENT in by reading, you may
+   additionally set "verify": "run" when a cheap local experiment (a test run, a scratch-DB
+   replay, a booted-endpoint call) would upgrade the finding from well-grounded prose to an
+   executed receipt. Reserve it for HIGH-severity findings where the receipt materially changes
+   what a reader does \u2014 never as a hedge on a verdict you are unsure of (that is what
+   "unverified" + "execution-decidable:" is for).
 
 ## The findings + their cited hunks
 Each finding's own title + body are wrapped in a <<<CLAIM \u2026>>> \u2026 <<<END \u2026>>> fence: that is
@@ -5282,7 +5295,7 @@ function isGateVerdict2(v) {
   return GATE_VERDICTS2.includes(v);
 }
 var GATE_ENVELOPE_SCHEMA_VERSION = 1;
-var GATE_TRAIL_SCHEMA_VERSION = 6;
+var GATE_TRAIL_SCHEMA_VERSION = 7;
 var REASON_CAP2 = 700;
 var CITATION_CAP = 500;
 var TLDR_CAP2 = 280;
@@ -5424,7 +5437,8 @@ function parseVerdicts(v) {
       ...suggestion ? { suggestion } : {},
       ...conventionCitation ? { conventionCitation } : {},
       ...sites ? { sites } : {},
-      ...tldr ? { tldr } : {}
+      ...tldr ? { tldr } : {},
+      ...e.verify === "run" ? { verify: "run" } : {}
     });
   }
   return out;
@@ -5537,7 +5551,17 @@ function reconcileGateVerdicts(findings, parsed, opts = {}) {
         `gate: "reference-not-found" claimed for ${f.findingId} on PACKET evidence \u2014 dropped (a packet-fed gate cannot distinguish it from a truncated window)`
       );
     }
-    return { ...base, citation, downgradeReason: null, effectiveVerdict: e.verdict, rawVerdict, reason: e.reason };
+    return {
+      ...base,
+      citation,
+      downgradeReason: null,
+      effectiveVerdict: e.verdict,
+      rawVerdict,
+      reason: e.reason,
+      // verify-by-run rides only a CONFIRMED verdict — a hedge on unverified is what the
+      // execution-decidable tag is for, and honoring it here would blur the two channels.
+      ...e.verify === "run" && (e.verdict === "agree" || e.verdict === "partial") ? { verifyRequested: true } : {}
+    };
   });
   const postableRecords = baseRecords.map((r) => {
     if (r.effectiveVerdict !== "agree" && r.effectiveVerdict !== "partial")
@@ -6509,8 +6533,11 @@ var EXECUTION_DECIDABLE_RE = /^\s*execution-decidable\s*:/i;
 function isExecutionDecidable(r) {
   return r.effectiveVerdict === "unverified" && EXECUTION_DECIDABLE_RE.test(r.reason);
 }
-function selectSettleTargets(records) {
-  return records.filter(isExecutionDecidable).sort((a, b) => SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity));
+function isVerifyRequested(r) {
+  return r.verifyRequested === true && (r.effectiveVerdict === "agree" || r.effectiveVerdict === "partial");
+}
+function selectSettleTargets(records, opts = {}) {
+  return records.filter((r) => isExecutionDecidable(r) || opts.verifyConfirmed === true && isVerifyRequested(r)).sort((a, b) => SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity));
 }
 var MAX_SETTLE_TARGETS = 5;
 var SETTLE_COMMAND_CAP = 500;
@@ -6632,7 +6659,7 @@ async function runSettler(opts) {
     ...runOpts,
     timeoutMs: runOpts.timeoutMs ?? SETTLER_TIMEOUT_MS
   }));
-  const all = selectSettleTargets(opts.records);
+  const all = selectSettleTargets(opts.records, { verifyConfirmed: opts.verifyConfirmed === true });
   if (all.length === 0) return { ran: false, records: opts.records, settlements: null, spawned: false };
   const targets = all.slice(0, MAX_SETTLE_TARGETS);
   const overflow = all.slice(MAX_SETTLE_TARGETS);
@@ -6950,7 +6977,7 @@ async function runClaudeReviewLayer(opts) {
   let settlements = null;
   let settlerSkipped = null;
   let settlerSpawned = false;
-  const settleTargets = opts.settle === false ? [] : selectSettleTargets(gate.verdicts);
+  const settleTargets = opts.settle === false ? [] : selectSettleTargets(gate.verdicts, { verifyConfirmed: opts.verifyConfirmed === true });
   if (settleTargets.length > 0) {
     if (!opts.worktree) {
       settlerSkipped = `${settleTargets.length} execution-decidable finding(s), but this run has no worktree to execute in \u2014 run with worktree evidence (--repo) to settle them`;
@@ -6969,6 +6996,7 @@ async function runClaudeReviewLayer(opts) {
         records: gate.verdicts,
         ...opts.settlerRun ? { run: opts.settlerRun } : {},
         runId: opts.runId,
+        ...opts.verifyConfirmed === true ? { verifyConfirmed: true } : {},
         worktree: opts.worktree
       });
       gateVerdicts = settled.records;
@@ -8307,6 +8335,9 @@ Options:
                         DBs/containers, the repo's own tooling) and attaches command+output
                         receipts. Advisory: verdicts, posting, and the HIGH gate are unchanged.
                         The seat RUNS the PR's code \u2014 trusted-PR workflows only.
+  --verify-confirmed    ALSO settle confirmed findings the gate marked "verify": "run" \u2014 upgrades
+                        well-grounded HIGHs to executed receipts. Costs one experiment per ask
+                        (default OFF; skip it when a probe run covers the same PR).
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
@@ -8902,6 +8933,7 @@ async function reviewCommand(args, profile = "code") {
         "no-conventions": { type: "boolean" },
         "no-fail-on-high": { type: "boolean" },
         "no-settle": { type: "boolean" },
+        "verify-confirmed": { type: "boolean" },
         out: { type: "string" },
         "post-comment": { type: "boolean" },
         pr: { type: "string" },
@@ -9137,6 +9169,8 @@ async function runReviewPipeline(input) {
         // THE EXECUTION SETTLER — default ON (`--no-settle` opts out). Inert unless the gate
         // tags a finding `execution-decidable:` AND the run has worktree evidence.
         settle: !values["no-settle"],
+        // verify-by-run: also settle CONFIRMED findings the gate marked `verify: run` (cost knob).
+        ...values["verify-confirmed"] ? { verifyConfirmed: true } : {},
         // The Claude producer + the gate read the SAME worktree the core seats did (spec §3, §5).
         ...worktree ? { worktree: worktree.dir } : {}
       });

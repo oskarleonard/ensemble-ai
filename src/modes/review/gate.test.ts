@@ -252,8 +252,25 @@ describe('reconcileGateVerdicts — postable text (A+)', () => {
     expect(u).toMatchObject({ effectiveVerdict: 'unverified', postableBody: null, postableStatus: 'not-postable' });
   });
 
-  it('the durable trail schema is bumped to v6 (settlement added — postable/placement/anchorSide/tldr came in v2–v5)', () => {
-    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(6);
+  it('the durable trail schema is bumped to v7 (verifyRequested; settlement was v6, postable/placement/anchorSide/tldr v2–v5)', () => {
+    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(7);
+  });
+
+  it('verify:"run" rides ONLY a confirmed verdict onto the record (a hedge on unverified is dropped)', () => {
+    const { records } = reconcileGateVerdicts(
+      [gf({ findingId: 'codex#1' }), gf({ findingId: 'codex#2' })],
+      {
+        agreements: [],
+        bottomLine: '',
+        disagreements: [],
+        verdicts: [
+          { findingId: 'codex#1', reason: 'real', verdict: 'agree', verify: 'run' },
+          { findingId: 'codex#2', reason: 'execution-decidable: run it', verdict: 'unverified', verify: 'run' },
+        ],
+      }
+    );
+    expect(records.find((r) => r.findingId === 'codex#1')?.verifyRequested).toBe(true);
+    expect(records.find((r) => r.findingId === 'codex#2')?.verifyRequested).toBeUndefined();
   });
 });
 

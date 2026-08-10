@@ -597,6 +597,7 @@ interface GateVerdictRecord {
     reason: string;
     rescoredSeverity: Severity | null;
     settlement?: SettlementRecord;
+    verifyRequested?: boolean;
     resolved: boolean;
     reviewer: string;
     severity: Severity;

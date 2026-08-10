@@ -41,11 +41,24 @@ export function isExecutionDecidable(r: GateVerdictRecord): boolean {
   return r.effectiveVerdict === 'unverified' && EXECUTION_DECIDABLE_RE.test(r.reason);
 }
 
+// A CONFIRMED finding the gate asked to upgrade to an executed receipt (verify-by-run, trail v7).
+// Honored only under the cost knob — most confirmed findings are already well-grounded by reading,
+// and each experiment costs minutes.
+export function isVerifyRequested(r: GateVerdictRecord): boolean {
+  return (
+    r.verifyRequested === true &&
+    (r.effectiveVerdict === 'agree' || r.effectiveVerdict === 'partial')
+  );
+}
+
 // The settle set, severity-ordered (HIGH first — if the target cap bites, the exit-relevant
-// findings settle first).
-export function selectSettleTargets(records: GateVerdictRecord[]): GateVerdictRecord[] {
+// findings settle first). `verifyConfirmed` additionally admits the gate's verify-by-run asks.
+export function selectSettleTargets(
+  records: GateVerdictRecord[],
+  opts: { verifyConfirmed?: boolean } = {}
+): GateVerdictRecord[] {
   return records
-    .filter(isExecutionDecidable)
+    .filter((r) => isExecutionDecidable(r) || (opts.verifyConfirmed === true && isVerifyRequested(r)))
     .sort((a, b) => SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity));
 }
 
@@ -233,6 +246,8 @@ export interface RunSettlerOptions {
   run?: SettlerRunner;
   runId: string;
   timeoutMs?: number;
+  // Also settle the gate's verify-by-run asks on CONFIRMED findings (cost knob, default off).
+  verifyConfirmed?: boolean;
   worktree: string;
 }
 
@@ -262,7 +277,7 @@ export async function runSettler(opts: RunSettlerOptions): Promise<SettlerResult
         ...runOpts,
         timeoutMs: runOpts.timeoutMs ?? SETTLER_TIMEOUT_MS,
       }));
-  const all = selectSettleTargets(opts.records);
+  const all = selectSettleTargets(opts.records, { verifyConfirmed: opts.verifyConfirmed === true });
   if (all.length === 0) return { ran: false, records: opts.records, settlements: null, spawned: false };
 
   const targets = all.slice(0, MAX_SETTLE_TARGETS);

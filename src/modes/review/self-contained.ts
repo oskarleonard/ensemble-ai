@@ -301,6 +301,9 @@ export interface ClaudeLayerOptions {
   // execute in; a tagged finding with no worktree is a LOUD skip. Settlements are advisory
   // receipts — they never change verdicts, posting, or the exit gate.
   settle?: boolean;
+  // verify-by-run (trail v7): also settle CONFIRMED findings the gate marked `verify: run` —
+  // upgrades well-grounded HIGHs to executed receipts. Cost knob, default off.
+  verifyConfirmed?: boolean;
   // The settler seat's model/effort. Omitted ⇒ inherits `claudeConfig` (the producer seat).
   settlerConfig?: VoiceConfig;
   // Injectable settler runner (default: the real headless unfenced spawn in the worktree).
@@ -557,7 +560,10 @@ export async function runClaudeReviewLayer(
   let settlements: SettlementRecord[] | null = null;
   let settlerSkipped: string | null = null;
   let settlerSpawned = false;
-  const settleTargets = opts.settle === false ? [] : selectSettleTargets(gate.verdicts);
+  const settleTargets =
+    opts.settle === false
+      ? []
+      : selectSettleTargets(gate.verdicts, { verifyConfirmed: opts.verifyConfirmed === true });
   if (settleTargets.length > 0) {
     if (!opts.worktree) {
       settlerSkipped = `${settleTargets.length} execution-decidable finding(s), but this run has no worktree to execute in — run with worktree evidence (--repo) to settle them`;
@@ -579,6 +585,7 @@ export async function runClaudeReviewLayer(
         records: gate.verdicts,
         ...(opts.settlerRun ? { run: opts.settlerRun } : {}),
         runId: opts.runId,
+        ...(opts.verifyConfirmed === true ? { verifyConfirmed: true } : {}),
         worktree: opts.worktree,
       });
       gateVerdicts = settled.records;

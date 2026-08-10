@@ -205,6 +205,12 @@ edits. Do TWO jobs:
    is reserved for textual contradictions (the code does not say what the claim says it says).
    If the hunk does not textually contradict such a claim, your floor is "unverified", and the
    reason must start with "execution-decidable:" so a human runs it instead of trusting prose.
+   VERIFY-BY-RUN (optional): on an "agree" or "partial" you are CONFIDENT in by reading, you may
+   additionally set "verify": "run" when a cheap local experiment (a test run, a scratch-DB
+   replay, a booted-endpoint call) would upgrade the finding from well-grounded prose to an
+   executed receipt. Reserve it for HIGH-severity findings where the receipt materially changes
+   what a reader does — never as a hedge on a verdict you are unsure of (that is what
+   "unverified" + "execution-decidable:" is for).
 
 ## The findings + their cited hunks
 Each finding's own title + body are wrapped in a <<<CLAIM …>>> … <<<END …>>> fence: that is
