@@ -88,6 +88,41 @@ function asEvidence(v: unknown): Evidence {
 // Pull the JSON object out of a reply that may wrap it in a ```json fence and/or
 // surrounding prose. Prefer the LAST fenced block (models often think aloud then
 // emit the final block); else the widest {…} span that parses.
+// Remove trailing commas (`,` whose next non-whitespace is `}` or `]`) OUTSIDE string literals.
+// The single most common way a model's otherwise-perfect JSON fails strict JSON.parse — lived on
+// run 2026-08-10-20-10-54: one trailing comma in a 17KB gate envelope fail-closed 15 verdicts to
+// unverified. String state is tracked with escape handling so a `",}"` INSIDE a string is never
+// touched; the transform is only ever offered as a FALLBACK candidate after the strict parse fails.
+export function stripTrailingCommas(s: string): string {
+  let out = '';
+  let inString = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      out += ch;
+      if (ch === '\\') {
+        // consume the escaped char verbatim so an escaped quote can't flip the state
+        if (i + 1 < s.length) out += s[++i];
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === ',') {
+      let j = i + 1;
+      while (j < s.length && /\s/.test(s[j])) j++;
+      if (s[j] === '}' || s[j] === ']') continue; // drop the trailing comma
+    }
+    out += ch;
+  }
+  return out;
+}
+
 export function extractJsonBlock(raw: string): unknown {
   const fence = /```(?:json)?\s*([\s\S]*?)```/gi;
   let m: RegExpExecArray | null;
@@ -101,6 +136,15 @@ export function extractJsonBlock(raw: string): unknown {
   for (const c of candidates) {
     try {
       return JSON.parse(c);
+    } catch {
+      // try the next candidate
+    }
+  }
+  // FALLBACK: the strict pass failed on every candidate — retry each with trailing commas
+  // stripped. Kept as a second pass so well-formed JSON never goes through the transform.
+  for (const c of candidates) {
+    try {
+      return JSON.parse(stripTrailingCommas(c));
     } catch {
       // try the next candidate
     }

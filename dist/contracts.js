@@ -62,6 +62,34 @@ function asEvidence(v) {
     line: typeof e.line === "number" && Number.isInteger(e.line) && e.line > 0 ? e.line : void 0
   };
 }
+function stripTrailingCommas(s) {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      out += ch;
+      if (ch === "\\") {
+        if (i + 1 < s.length) out += s[++i];
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < s.length && /\s/.test(s[j])) j++;
+      if (s[j] === "}" || s[j] === "]") continue;
+    }
+    out += ch;
+  }
+  return out;
+}
 function extractJsonBlock(raw) {
   const fence = /```(?:json)?\s*([\s\S]*?)```/gi;
   let m;
@@ -75,6 +103,12 @@ function extractJsonBlock(raw) {
   for (const c of candidates) {
     try {
       return JSON.parse(c);
+    } catch {
+    }
+  }
+  for (const c of candidates) {
+    try {
+      return JSON.parse(stripTrailingCommas(c));
     } catch {
     }
   }
@@ -386,5 +420,6 @@ export {
   reviewerVisibleDiff,
   section,
   segmentsWithoutTruncationSplices,
+  stripTrailingCommas,
   titleCase
 };
