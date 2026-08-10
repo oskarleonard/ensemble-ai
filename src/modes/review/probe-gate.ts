@@ -49,7 +49,8 @@ export function selectGateTargets(report: ProbeReport): ProbeRecord[] {
 
 // ── The prompt ──────────────────────────────────────────────────────────────────────────
 
-const GATE_SCHEMA_BLOCK = `{"verdicts":[{"id":"p1","verdict":"confirmed|refuted|inconclusive","reason":"<one line>","citation":{"file":"<repo-relative path>","line":<number>}}]}`;
+const GATE_SCHEMA_BLOCK = `{"verdicts":[{"id":"p1","verdict":"confirmed|refuted|inconclusive","reason":"<one line>","citation":{"file":"<repo-relative path>","line":<number>},"tldr":"<confirmed only: plain-English impact + fix, <=280 chars>"}]}`;
+const TLDR_CAP = 280;
 
 export function renderProbeGatePrompt(
   targets: ProbeRecord[],
@@ -82,7 +83,9 @@ The project at the PR head is checked out at ${args.worktree} — read it. For e
    - refuted     = the behavior is CORRECT/intended. You MUST cite the contract line that makes it
      so (file:line of the doc comment / invariant / mirrored guard). No citation ⇒ not a refutation.
    - confirmed   = the defect is real: the behavior contradicts the code's own stated contract, or
-     is a genuine correctness/authorization/data error with no contract that sanctions it.
+     is a genuine correctness/authorization/data error with no contract that sanctions it. On a
+     confirmed, also write \`tldr\`: one plain-English line (<=280 chars) — what breaks for a
+     user/operator and the fix direction, no jargon.
    - inconclusive = you cannot decide from the tree (say why). Treated as STILL STANDING, not
      cleared — only a grounded refutation clears a broke.
 You have a shell and may re-run a cheap confirming experiment in the worktree if a reading does not
@@ -153,7 +156,10 @@ export function parseProbeGateVerdicts(
       verdict = 'inconclusive';
       reason = reason ? `${reason} [no citation — not cleared]` : 'refuted without a citation';
     }
-    out.set(id, { citation, reason, verdict });
+    // The plain-English impact line is meaningful ONLY on a confirmed defect; drop it elsewhere so a
+    // downgraded/refuted verdict never carries a stray "here's what breaks" line.
+    const tldr = verdict === 'confirmed' ? capStr(v.tldr, TLDR_CAP) : '';
+    out.set(id, { citation, reason, verdict, ...(tldr ? { tldr } : {}) });
   }
   return { verdicts: out, warnings };
 }
