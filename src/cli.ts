@@ -3177,7 +3177,11 @@ Requirements (both mandatory — a probe that cannot execute is not a probe; no 
 Options:
   --claude-model <m>    the prober seat's model (default: voices.json claude entry, else opus)
   --claude-effort <e>   the prober seat's effort (low|medium|high|xhigh|max)
-  --no-fail-on-broke    do NOT exit 4 when a probe demonstrates a defect
+  --gate-model <m>      the GATE seat's model — the seat that refutes each broke. Resolves
+                        independently of the prober (voices.json gate entry, else the built-in
+                        default), so the gate can be a DIFFERENT model for cross-model adjudication
+  --gate-effort <e>     the gate seat's effort (low|medium|high|xhigh|max)
+  --no-fail-on-broke    do NOT exit 4 when a broke finding stands after the gate
   --out <dir>           trail base dir (default: a temp dir; probe-report.json + probe.raw.md + probe.md)
   --run-id <id>         trail run id (default: minted)
   --cwd <dir>           working directory for gh/git (default: process cwd)
@@ -3198,6 +3202,8 @@ async function probeCommand(rest: string[]): Promise<number> {
         'claude-effort': { type: 'string' },
         'claude-model': { type: 'string' },
         cwd: { type: 'string' },
+        'gate-effort': { type: 'string' },
+        'gate-model': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
         'no-fail-on-broke': { type: 'boolean' },
         out: { type: 'string' },
@@ -3239,6 +3245,18 @@ async function probeCommand(rest: string[]): Promise<number> {
     {
       effort: typeof values['claude-effort'] === 'string' ? values['claude-effort'] : undefined,
       model: typeof values['claude-model'] === 'string' ? values['claude-model'] : undefined,
+    },
+    (m) => console.error(`· ${m}`)
+  );
+  // The GATE seat resolves INDEPENDENTLY of the prober (same chain as the review pipeline's gate):
+  // `--gate-model`/`--gate-effort` → the voices.json `gate` entry → the built-in default. Independent
+  // selection is the whole point — the gate that refutes a defect should be able to be a DIFFERENT
+  // model than the one that found it, for real cross-model adjudication.
+  const gateSeat = loadGateSeat(
+    VOICES_FILE,
+    {
+      effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+      model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
     },
     (m) => console.error(`· ${m}`)
   );
@@ -3292,7 +3310,7 @@ async function probeCommand(rest: string[]): Promise<number> {
       worktree: worktree.dir,
     });
     console.error(
-      `· prober (anthropic/${seat.config.model} @ ${seat.config.effort}) probing ${source.postTarget.repoSlug}#${source.postTarget.pr} by running it (worktree ${worktree.dir})…`
+      `· prober (anthropic/${seat.config.model} @ ${seat.config.effort}), gate (anthropic/${gateSeat.config.model} @ ${gateSeat.config.effort}) — probing ${source.postTarget.repoSlug}#${source.postTarget.pr} by running it (worktree ${worktree.dir})…`
     );
     const res = await runProbe({
       baseDir: out,
@@ -3313,7 +3331,7 @@ async function probeCommand(rest: string[]): Promise<number> {
     let report = res.report;
     const gate = await runProbeGate({
       baseDir: out,
-      config: seat.config,
+      config: gateSeat.config,
       log: (m) => console.error(m),
       report,
       runId,

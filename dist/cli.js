@@ -10461,7 +10461,11 @@ Requirements (both mandatory \u2014 a probe that cannot execute is not a probe; 
 Options:
   --claude-model <m>    the prober seat's model (default: voices.json claude entry, else opus)
   --claude-effort <e>   the prober seat's effort (low|medium|high|xhigh|max)
-  --no-fail-on-broke    do NOT exit 4 when a probe demonstrates a defect
+  --gate-model <m>      the GATE seat's model \u2014 the seat that refutes each broke. Resolves
+                        independently of the prober (voices.json gate entry, else the built-in
+                        default), so the gate can be a DIFFERENT model for cross-model adjudication
+  --gate-effort <e>     the gate seat's effort (low|medium|high|xhigh|max)
+  --no-fail-on-broke    do NOT exit 4 when a broke finding stands after the gate
   --out <dir>           trail base dir (default: a temp dir; probe-report.json + probe.raw.md + probe.md)
   --run-id <id>         trail run id (default: minted)
   --cwd <dir>           working directory for gh/git (default: process cwd)
@@ -10481,6 +10485,8 @@ async function probeCommand(rest) {
         "claude-effort": { type: "string" },
         "claude-model": { type: "string" },
         cwd: { type: "string" },
+        "gate-effort": { type: "string" },
+        "gate-model": { type: "string" },
         help: { short: "h", type: "boolean" },
         "no-fail-on-broke": { type: "boolean" },
         out: { type: "string" },
@@ -10512,6 +10518,14 @@ async function probeCommand(rest) {
     {
       effort: typeof values["claude-effort"] === "string" ? values["claude-effort"] : void 0,
       model: typeof values["claude-model"] === "string" ? values["claude-model"] : void 0
+    },
+    (m) => console.error(`\xB7 ${m}`)
+  );
+  const gateSeat = loadGateSeat(
+    VOICES_FILE,
+    {
+      effort: typeof values["gate-effort"] === "string" ? values["gate-effort"] : void 0,
+      model: typeof values["gate-model"] === "string" ? values["gate-model"] : void 0
     },
     (m) => console.error(`\xB7 ${m}`)
   );
@@ -10557,7 +10571,7 @@ async function probeCommand(rest) {
       worktree: worktree.dir
     });
     console.error(
-      `\xB7 prober (anthropic/${seat.config.model} @ ${seat.config.effort}) probing ${source.postTarget.repoSlug}#${source.postTarget.pr} by running it (worktree ${worktree.dir})\u2026`
+      `\xB7 prober (anthropic/${seat.config.model} @ ${seat.config.effort}), gate (anthropic/${gateSeat.config.model} @ ${gateSeat.config.effort}) \u2014 probing ${source.postTarget.repoSlug}#${source.postTarget.pr} by running it (worktree ${worktree.dir})\u2026`
     );
     const res = await runProbe({
       baseDir: out,
@@ -10575,7 +10589,7 @@ async function probeCommand(rest) {
     let report = res.report;
     const gate = await runProbeGate({
       baseDir: out,
-      config: seat.config,
+      config: gateSeat.config,
       log: (m) => console.error(m),
       report,
       runId,
