@@ -71,6 +71,18 @@ describe('settle-target selection — the gate tag is the contract', () => {
     ]);
     expect(targets.map((t) => t.findingId)).toEqual(['b#1', 'c#1', 'a#1']);
   });
+
+  it('verify-by-run (trail v7): confirmed asks are admitted ONLY under the cost knob', () => {
+    const records = [
+      rec(), // execution-decidable unverified — always a target
+      rec({ effectiveVerdict: 'agree', findingId: 'v#1', reason: 'real', verifyRequested: true }),
+      rec({ effectiveVerdict: 'agree', findingId: 'v#2', reason: 'real' }), // confirmed, no ask
+      // an ask on a non-confirmed verdict is ignored — that channel is execution-decidable's
+      rec({ findingId: 'v#3', reason: 'could not ground', verifyRequested: true }),
+    ];
+    expect(selectSettleTargets(records).map((t) => t.findingId)).toEqual(['codex#1']);
+    expect(selectSettleTargets(records, { verifyConfirmed: true }).map((t) => t.findingId)).toEqual(['codex#1', 'v#1']);
+  });
 });
 
 describe('the settler prompt — experiments with receipts, never verdicts by prose', () => {
@@ -171,7 +183,7 @@ describe('runSettler — the stage end-to-end (injected runner)', () => {
     expect(res.settlements).toBeNull();
   });
 
-  it('happy path: settles, attaches, and persists settlements.json + a v6 verdict trail rewrite', async () => {
+  it('happy path: settles, attaches, and persists settlements.json + a rewritten verdict trail', async () => {
     const base = tmp();
     const records = [rec(), rec({ effectiveVerdict: 'partial', findingId: 'grok#1', reason: 'overstated' })];
     const prompts: string[] = [];
@@ -200,7 +212,7 @@ describe('runSettler — the stage end-to-end (injected runner)', () => {
     expect(fs.existsSync(path.join(dir, 'settlements.json'))).toBe(true);
     expect(fs.existsSync(path.join(dir, 'settler.raw.md'))).toBe(true);
     const trail = JSON.parse(fs.readFileSync(path.join(dir, 'gate-verdicts.json'), 'utf8')) as GateVerdictsTrail;
-    expect(trail.schemaVersion).toBe(6);
+    expect(trail.schemaVersion).toBe(7);
     expect(trail.verdicts.find((v) => v.findingId === 'codex#1')?.settlement?.receipt).toContain('IMMUTABLE');
   });
 

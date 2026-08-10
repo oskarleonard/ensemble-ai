@@ -48,10 +48,14 @@ describe('the prober prompt — run the change, receipts or it did not happen', 
     expect(prompt).toContain('Reading is not probing');
   });
 
-  it('pins the four probe families and the accident guards', () => {
-    for (const s of ['GUARDS', 'MIGRATIONS', 'TEST EFFECTIVENESS (mutation-lite)', 'ENDPOINTS']) {
+  it('pins the probe families and the accident guards', () => {
+    for (const s of ['GUARDS', 'MIGRATIONS', 'PROVISIONING PARITY (least privilege)', 'TEST EFFECTIVENESS (mutation-lite)', 'ENDPOINTS']) {
       expect(prompt).toContain(s);
     }
+    // The owner-privilege blind spot (lived: a missing GRANT block was invisible because the
+    // scratch DB ran as owner) — the hunt must say WHY owner runs prove nothing about grants.
+    expect(prompt).toContain('AS THE RUNTIME ROLES');
+    expect(prompt).toContain('Owners bypass grants');
     expect(prompt).toMatch(/NEVER run `git commit`,\s*`git push`/i);
     expect(prompt).toContain('containers, databases, servers, or processes you did not start');
     expect(prompt).toMatch(/stop every server\/process and remove every container you started/);

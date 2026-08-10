@@ -226,6 +226,9 @@ Options:
                         DBs/containers, the repo's own tooling) and attaches command+output
                         receipts. Advisory: verdicts, posting, and the HIGH gate are unchanged.
                         The seat RUNS the PR's code — trusted-PR workflows only.
+  --verify-confirmed    ALSO settle confirmed findings the gate marked "verify": "run" — upgrades
+                        well-grounded HIGHs to executed receipts. Costs one experiment per ask
+                        (default OFF; skip it when a probe run covers the same PR).
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
@@ -1115,6 +1118,7 @@ async function reviewCommand(
         'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
         'no-settle': { type: 'boolean' },
+        'verify-confirmed': { type: 'boolean' },
         out: { type: 'string' },
         'post-comment': { type: 'boolean' },
         pr: { type: 'string' },
@@ -1521,6 +1525,8 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         // THE EXECUTION SETTLER — default ON (`--no-settle` opts out). Inert unless the gate
         // tags a finding `execution-decidable:` AND the run has worktree evidence.
         settle: !values['no-settle'],
+        // verify-by-run: also settle CONFIRMED findings the gate marked `verify: run` (cost knob).
+        ...(values['verify-confirmed'] ? { verifyConfirmed: true } : {}),
         // The Claude producer + the gate read the SAME worktree the core seats did (spec §3, §5).
         ...(worktree ? { worktree: worktree.dir } : {}),
       });
