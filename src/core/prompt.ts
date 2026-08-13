@@ -12,6 +12,16 @@ const CODE_ASK = [
   'choices IN THE DIFF. Be concrete and cite file + line. Do not nitpick style',
   'the conventions already allow. Prefer a few high-signal findings over many',
   'weak ones — false positives waste the arbiter’s time.',
+  '',
+  'TWIN-SURFACE PARITY: when the diff adds a surface that MIRRORS an existing one',
+  '(alias routes, a twin API vocabulary, a parallel variant of an existing',
+  'endpoint/handler/command set), enumerate the mirrored surface’s operations and',
+  'behaviors as visible in the embedded context, diff the two, and flag any',
+  'operation, guard, error contract, or test the original has that the new surface',
+  'lacks WITHOUT a stated justification. An absence is a finding: cite where the',
+  'original defines what the twin is missing, and say what breaks or is blocked by',
+  'the gap. Diff-only review misses these by construction — the absence is not in',
+  'the diff, so look for it deliberately.',
 ].join('\n');
 
 // The `security` profile ask: an adversarial security-auditor framing. Same strict

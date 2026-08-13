@@ -121,7 +121,12 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // gate run, so settlements are dropped by a regate (the settler runs in the full pipeline only).
 // v7: adds `verifyRequested` — the gate's opt-in ask to upgrade a CONFIRMED finding to an executed
 // receipt (honored by the settler under --verify-confirmed). Additive, same contract as v5/v6.
-export const GATE_TRAIL_SCHEMA_VERSION = 7;
+// v8: adds `duplicateOf` / `duplicates` — the gate's mechanized cross-reviewer duplicate pointer
+// and the host-threaded echoes it produces. Additive like v5/v6/v7: absent everywhere the gate
+// sent no pointer. Exists because prose dedup ("same defect as X, post it once there") silently
+// sheds the duplicate's framing — proven on a real run where the duplicate held the ONE sentence
+// naming the dangerous direction of a half-open guard, and triage read only the survivor.
+export const GATE_TRAIL_SCHEMA_VERSION = 8;
 
 const REASON_CAP = 700;
 const CITATION_CAP = 500;
@@ -333,6 +338,10 @@ export interface RawVerdictEntry {
   // the host honors it solely on worktree evidence (see reconcileGateVerdicts).
   cause?: string;
   citation?: string;
+  // Honored on `unverified` only: this finding describes the SAME defect as another reviewer's
+  // finding (typically because this one's hunk is unavailable while the other's is shown). The
+  // host validates the pointer and threads this finding's claim onto the primary's record.
+  duplicateOf?: string;
   // Where this finding may land on a foreign PR: `bug` (inline) or `quality` (collapsed section).
   // Absent / unrecognized ⇒ the host defaults to `bug`.
   class?: PostableClass;
@@ -396,6 +405,9 @@ function parseVerdicts(v: unknown): RawVerdictEntry[] {
       // conditional so an old-shape (no-ops) entry parses to the exact prior shape
       ...(ops.length ? { ops } : {}),
       ...(typeof e.cause === 'string' && e.cause.trim() ? { cause: e.cause.trim() } : {}),
+      ...(typeof e.duplicateOf === 'string' && e.duplicateOf.trim()
+        ? { duplicateOf: e.duplicateOf.trim() }
+        : {}),
       ...(postableClass ? { class: postableClass } : {}),
       ...(fixStatus ? { fixStatus } : {}),
       ...(rescoredSeverity ? { rescoredSeverity } : {}),
@@ -446,6 +458,19 @@ export interface SettlementRecord {
   receipt: string;
 }
 
+// A duplicate finding's claim, threaded onto its primary (trail v8). Carries the duplicate's
+// host-owned attribution plus its UNTRUSTED reviewer text — triage/trail context ONLY, never
+// posted. Exists so the posted survivor cannot silently shed a sharper framing: two reviewers
+// describing one defect routinely emphasize different halves of it, and the half that names the
+// dangerous direction may live in the finding the gate deferred.
+export interface DuplicateEcho {
+  claim: string; // the duplicate's reviewer body, capped — data for the human, never PR text
+  findingId: string;
+  reviewer: string;
+  severity: Severity;
+  title: string;
+}
+
 export interface GateVerdictRecord {
   // The line space `line` resolved in (see AnchorSide). Only `new` may be anchored as an inline
   // RIGHT comment; `old` names a deleted line, which GitHub rejects on the RIGHT.
@@ -453,6 +478,12 @@ export interface GateVerdictRecord {
   citation?: string;
   cluster?: ClusterInfo; // cross-reviewer cluster (postable records only); absent ⇒ singleton / not clustered
   downgradeReason: DowngradeReason | null;
+  // Trail v8 (additive): set on an UNVERIFIED record the gate pointed at another reviewer's
+  // finding as the same defect. Host-validated: the id exists and differs from this record's.
+  duplicateOf?: string;
+  // Trail v8 (additive): the claims of every finding the gate marked a duplicate of THIS one,
+  // sorted by findingId. Read by trail consumers and triage; the posting path never touches it.
+  duplicates?: DuplicateEcho[];
   effectiveVerdict: GateVerdict;
   file: string;
   findingId: string;
@@ -639,6 +670,24 @@ export function reconcileGateVerdicts(
         `gate: "reference-not-found" claimed for ${f.findingId} on PACKET evidence — dropped (a packet-fed gate cannot distinguish it from a truncated window)`
       );
     }
+    // `duplicateOf` is honored on UNVERIFIED only — a defect the gate itself confirmed is not a
+    // deferral — and only when the pointer names a DIFFERENT, known finding. An invalid pointer
+    // degrades to a plain unverified with a warning: threading to a nonexistent primary would
+    // fabricate provenance.
+    let duplicateOf: string | undefined;
+    if (typeof e.duplicateOf === 'string') {
+      if (e.verdict === 'unverified' && known.has(e.duplicateOf) && e.duplicateOf !== f.findingId) {
+        duplicateOf = e.duplicateOf;
+      } else {
+        warnings.push(
+          `gate: "duplicateOf" on ${f.findingId} dropped — ${
+            e.verdict !== 'unverified'
+              ? 'only an unverified verdict may defer to a duplicate'
+              : `"${e.duplicateOf}" is not a different, known findingId`
+          }`
+        );
+      }
+    }
     // agree / partial / unverified pass through — not dismissals, so truncation does not force them.
     return {
       ...base,
@@ -647,6 +696,7 @@ export function reconcileGateVerdicts(
       effectiveVerdict: e.verdict,
       rawVerdict,
       reason: e.reason,
+      ...(duplicateOf ? { duplicateOf } : {}),
       // verify-by-run rides only a CONFIRMED verdict — a hedge on unverified is what the
       // execution-decidable tag is for, and honoring it here would blur the two channels.
       ...(e.verify === 'run' && (e.verdict === 'agree' || e.verdict === 'partial')
@@ -703,7 +753,44 @@ export function reconcileGateVerdicts(
         opts.holistic ?? null
       )
     : postableRecords;
-  return { records, warnings };
+  return { records: threadDuplicateEchoes(records, findingById), warnings };
+}
+
+// The duplicate's threaded claim is trail/triage context, so it gets the same generous bound as
+// the gate's own view of a body — enough that the sharper sentence is never the one cut.
+const DUPLICATE_CLAIM_CAP = 1500;
+
+// Thread each duplicate's claim onto the record it points at (trail v8), so a triager reading
+// the primary sees the UNION of framings, not only the survivor's. Deterministic (echoes sorted
+// by findingId); chains are NOT resolved — an echo lands exactly on the finding the gate named,
+// even if that finding is itself a duplicate. No-op (same array identity) when the gate sent no
+// pointers, so the default path is byte-identical to pre-v8.
+function threadDuplicateEchoes(
+  records: GateVerdictRecord[],
+  findingById: Map<string, GateFinding>
+): GateVerdictRecord[] {
+  const echoesByPrimary = new Map<string, DuplicateEcho[]>();
+  for (const r of records) {
+    if (!r.duplicateOf) continue;
+    const f = findingById.get(r.findingId);
+    if (!f) continue;
+    const list = echoesByPrimary.get(r.duplicateOf) ?? [];
+    list.push({
+      claim: capStr(f.body, DUPLICATE_CLAIM_CAP),
+      findingId: r.findingId,
+      reviewer: r.reviewer,
+      severity: r.severity,
+      title: r.title,
+    });
+    echoesByPrimary.set(r.duplicateOf, list);
+  }
+  if (echoesByPrimary.size === 0) return records;
+  for (const list of echoesByPrimary.values())
+    list.sort((a, b) => (a.findingId < b.findingId ? -1 : 1));
+  return records.map((r) => {
+    const duplicates = echoesByPrimary.get(r.findingId);
+    return duplicates ? { ...r, duplicates } : r;
+  });
 }
 
 // The dismissals the exit gate MAY honor (Phase 2 consumes this; Phase 1 only records +
@@ -921,6 +1008,14 @@ export function renderGateVerdicts(
       out.push(
         `     [${r.effectiveVerdict}] ${r.findingId} [${r.severity}] ${where}  ${s(r.title).slice(0, 120)}${reason}${dg}${lens}`
       );
+      // A duplicate's threaded claim renders UNDER its primary — the whole point of trail v8 is
+      // that a triager reading this line never has to open the duplicate's raw findings file to
+      // see the framing the survivor's body lacks.
+      for (const d of r.duplicates ?? []) {
+        out.push(
+          `        ↳ duplicate ${d.findingId} (${d.reviewer}, ${d.severity}) adds: ${s(d.claim).slice(0, 200)}`
+        );
+      }
     }
   }
   const c = verdictCounts(records);

@@ -252,8 +252,68 @@ describe('reconcileGateVerdicts — postable text (A+)', () => {
     expect(u).toMatchObject({ effectiveVerdict: 'unverified', postableBody: null, postableStatus: 'not-postable' });
   });
 
-  it('the durable trail schema is bumped to v7 (verifyRequested; settlement was v6, postable/placement/anchorSide/tldr v2–v5)', () => {
-    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(7);
+  it('the durable trail schema is bumped to v8 (duplicateOf/duplicates; verifyRequested was v7, settlement v6, postable/placement/anchorSide/tldr v2–v5)', () => {
+    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(8);
+  });
+
+  describe('duplicateOf → threaded duplicate echoes (trail v8)', () => {
+    // Two reviewers, one defect: grok#1 confirmed with the benign framing shown, codex#4
+    // unverified (hunk unavailable) but carrying the sentence that names the dangerous
+    // direction. The proven failure mode is that dedup-by-prose sheds codex#4's framing;
+    // the pointer must thread it onto the primary instead.
+    const twoFindings = [
+      gf({ findingId: 'grok#1', reviewer: 'grok', body: 'destination guard rejects portfolio destinations' }),
+      gf({
+        findingId: 'codex#4',
+        reviewer: 'codex',
+        body: 'portfolio-to-account transfers PASS this guard',
+        resolved: false,
+      }),
+    ];
+
+    it('threads the duplicate claim onto the primary and marks the duplicate', () => {
+      const { records, warnings } = reconcileGateVerdicts(twoFindings, {
+        agreements: [],
+        bottomLine: '',
+        disagreements: [],
+        verdicts: [
+          { findingId: 'grok#1', reason: 'grounded', verdict: 'agree' },
+          { findingId: 'codex#4', duplicateOf: 'grok#1', reason: 'same defect as grok#1; adds the passing direction', verdict: 'unverified' },
+        ],
+      });
+      expect(warnings).toEqual([]);
+      const primary = records.find((r) => r.findingId === 'grok#1')!;
+      const dup = records.find((r) => r.findingId === 'codex#4')!;
+      expect(dup.duplicateOf).toBe('grok#1');
+      expect(dup.effectiveVerdict).toBe('unverified');
+      expect(primary.duplicates).toHaveLength(1);
+      expect(primary.duplicates![0]).toMatchObject({
+        findingId: 'codex#4',
+        reviewer: 'codex',
+        claim: 'portfolio-to-account transfers PASS this guard',
+      });
+      // The threaded claim never touches what posts: the primary's postable body is verbatim.
+      expect(primary.postableBody).toBe('destination guard rejects portfolio destinations');
+    });
+
+    it('drops the pointer with a warning on a confirmed verdict or an unknown/self id', () => {
+      const { records, warnings } = reconcileGateVerdicts(twoFindings, {
+        agreements: [],
+        bottomLine: '',
+        disagreements: [],
+        verdicts: [
+          { duplicateOf: 'codex#4', findingId: 'grok#1', reason: 'grounded', verdict: 'agree' },
+          { duplicateOf: 'nosuch#9', findingId: 'codex#4', reason: 'same defect', verdict: 'unverified' },
+        ],
+      });
+      expect(warnings).toHaveLength(2);
+      expect(warnings[0]).toContain('only an unverified verdict may defer');
+      expect(warnings[1]).toContain('not a different, known findingId');
+      for (const r of records) {
+        expect(r.duplicateOf).toBeUndefined();
+        expect(r.duplicates).toBeUndefined();
+      }
+    });
   });
 
   it('verify:"run" rides ONLY a confirmed verdict onto the record (a hedge on unverified is dropped)', () => {

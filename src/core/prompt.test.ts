@@ -21,6 +21,16 @@ describe('renderReviewPrompt — code profile (default)', () => {
     // no security-only framing leaks into the code profile
     expect(p).not.toContain('SECURITY AUDIT');
   });
+
+  it('asks for the twin-surface parity sweep (absences are findings)', () => {
+    // Diff-only reviewers structurally miss what a mirrored surface LACKS (proven
+    // on a real run: a portfolio alias of an account API shipped without the
+    // detail endpoint and no reviewer flagged it) — so the ask must name the
+    // sweep explicitly.
+    const p = renderReviewPrompt(packet);
+    expect(p).toContain('TWIN-SURFACE PARITY');
+    expect(p).toContain('An absence is a finding');
+  });
 });
 
 describe('renderReviewPrompt — security profile', () => {

@@ -173,7 +173,13 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   cited line, as a ONE-CLICK replacement. Send it only when the fix is small, obvious, and you have
   verified it against the hunk. The replacement may introduce NO identifier, path, or number absent
   from the body or the hunk (same rule as "ops"), and it replaces exactly the cited line. When in
-  doubt, omit it: a wrong one-click suggestion is worse than no suggestion.${
+  doubt, omit it: a wrong one-click suggestion is worse than no suggestion.
+- "duplicateOf" (optional, unverified ONLY): when this finding describes the SAME defect as another
+  listed finding you are confirming (typically: this one's hunk is unavailable while the other's is
+  shown), set it to that findingId instead of merely saying so in prose. Your "reason" must still
+  state what THIS finding claims that the primary's body does NOT — the host threads that claim onto
+  the primary for the human, so a sharper framing (e.g. one reviewer names the direction that FAILS,
+  the other names the direction that wrongly PASSES) is never lost to dedup.${
     gateEvidence === 'worktree' ? REFERENCE_NOT_FOUND_CLAUSE : ''
   }${hasHolistic ? holisticClause : ''}`;
 

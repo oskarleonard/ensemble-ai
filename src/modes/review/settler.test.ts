@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { reviewDir } from '../../core/artifacts';
 import type { VoiceConfig } from '../brainstorm/types';
 
-import type { GateVerdictRecord, GateVerdictsTrail } from './gate';
+import { GATE_TRAIL_SCHEMA_VERSION, type GateVerdictRecord, type GateVerdictsTrail } from './gate';
 import {
   attachSettlements,
   completeSettlements,
@@ -212,7 +212,7 @@ describe('runSettler — the stage end-to-end (injected runner)', () => {
     expect(fs.existsSync(path.join(dir, 'settlements.json'))).toBe(true);
     expect(fs.existsSync(path.join(dir, 'settler.raw.md'))).toBe(true);
     const trail = JSON.parse(fs.readFileSync(path.join(dir, 'gate-verdicts.json'), 'utf8')) as GateVerdictsTrail;
-    expect(trail.schemaVersion).toBe(7);
+    expect(trail.schemaVersion).toBe(GATE_TRAIL_SCHEMA_VERSION);
     expect(trail.verdicts.find((v) => v.findingId === 'codex#1')?.settlement?.receipt).toContain('IMMUTABLE');
   });
 
