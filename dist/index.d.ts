@@ -577,11 +577,20 @@ interface SettlementRecord {
     reason: string;
     receipt: string;
 }
+interface DuplicateEcho {
+    claim: string;
+    findingId: string;
+    reviewer: string;
+    severity: Severity;
+    title: string;
+}
 interface GateVerdictRecord {
     anchorSide: AnchorSide;
     citation?: string;
     cluster?: ClusterInfo;
     downgradeReason: DowngradeReason | null;
+    duplicateOf?: string;
+    duplicates?: DuplicateEcho[];
     effectiveVerdict: GateVerdict;
     file: string;
     findingId: string;

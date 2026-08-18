@@ -22,6 +22,18 @@ const CODE_ASK = [
   'original defines what the twin is missing, and say what breaks or is blocked by',
   'the gap. Diff-only review misses these by construction — the absence is not in',
   'the diff, so look for it deliberately.',
+  '',
+  'VISIBILITY↔ADDRESSABILITY PARITY: when the diff changes WHO can see the rows a',
+  'list/collection endpoint returns (scoping, reachability, filters, redaction) or',
+  'changes an authorization check, walk the LEAST-privileged caller that can now',
+  'see each row and verify that same caller can also act on the row the way',
+  'consumers address it — detail fetch, update, delete, deep link — through every',
+  'reference the row carries. A row a caller can list but cannot address, or can',
+  'address only through a reference that caller cannot read, is a finding even',
+  'when each endpoint is correct in isolation: name the caller role, the reference',
+  'used, and the request that fails. If the diff (or its description) claims',
+  'consumers need no change, test that claim against the least-privileged caller,',
+  'not the author/owner perspective.',
 ].join('\n');
 
 // The `security` profile ask: an adversarial security-auditor framing. Same strict
