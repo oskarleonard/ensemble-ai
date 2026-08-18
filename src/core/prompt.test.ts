@@ -31,6 +31,20 @@ describe('renderReviewPrompt — code profile (default)', () => {
     expect(p).toContain('TWIN-SURFACE PARITY');
     expect(p).toContain('An absence is a finding');
   });
+
+  it('asks for the visibility↔addressability parity sweep (least-privileged caller)', () => {
+    // A diff that widens what a list returns can be correct endpoint-by-endpoint
+    // and still break consumers that address rows through a reference the newly
+    // included caller cannot read (proven on a real miss: internal transfers
+    // surfaced on the receiving account's list while clients fetched details via
+    // the source account — every non-admin member got a 403 error screen, and the
+    // PR's own text claimed no client change was needed). The ask must force the
+    // least-privileged-caller walk explicitly — author/owner testing passes by
+    // construction.
+    const p = renderReviewPrompt(packet);
+    expect(p).toContain('VISIBILITY↔ADDRESSABILITY PARITY');
+    expect(p).toContain('LEAST-privileged caller');
+  });
 });
 
 describe('renderReviewPrompt — security profile', () => {

@@ -372,7 +372,29 @@ var CODE_ASK = [
   "Find correctness bugs, security issues, broken conventions, and risky",
   "choices IN THE DIFF. Be concrete and cite file + line. Do not nitpick style",
   "the conventions already allow. Prefer a few high-signal findings over many",
-  "weak ones \u2014 false positives waste the arbiter\u2019s time."
+  "weak ones \u2014 false positives waste the arbiter\u2019s time.",
+  "",
+  "TWIN-SURFACE PARITY: when the diff adds a surface that MIRRORS an existing one",
+  "(alias routes, a twin API vocabulary, a parallel variant of an existing",
+  "endpoint/handler/command set), enumerate the mirrored surface\u2019s operations and",
+  "behaviors as visible in the embedded context, diff the two, and flag any",
+  "operation, guard, error contract, or test the original has that the new surface",
+  "lacks WITHOUT a stated justification. An absence is a finding: cite where the",
+  "original defines what the twin is missing, and say what breaks or is blocked by",
+  "the gap. Diff-only review misses these by construction \u2014 the absence is not in",
+  "the diff, so look for it deliberately.",
+  "",
+  "VISIBILITY\u2194ADDRESSABILITY PARITY: when the diff changes WHO can see the rows a",
+  "list/collection endpoint returns (scoping, reachability, filters, redaction) or",
+  "changes an authorization check, walk the LEAST-privileged caller that can now",
+  "see each row and verify that same caller can also act on the row the way",
+  "consumers address it \u2014 detail fetch, update, delete, deep link \u2014 through every",
+  "reference the row carries. A row a caller can list but cannot address, or can",
+  "address only through a reference that caller cannot read, is a finding even",
+  "when each endpoint is correct in isolation: name the caller role, the reference",
+  "used, and the request that fails. If the diff (or its description) claims",
+  "consumers need no change, test that claim against the least-privileged caller,",
+  "not the author/owner perspective."
 ].join("\n");
 function securityAsk() {
   const classes = SECURITY_CLASSES.filter((c) => c.id !== "other").map((c) => `  - [${c.id}] ${c.label}`).join("\n");

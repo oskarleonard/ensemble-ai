@@ -4177,7 +4177,29 @@ var CODE_ASK = [
   "Find correctness bugs, security issues, broken conventions, and risky",
   "choices IN THE DIFF. Be concrete and cite file + line. Do not nitpick style",
   "the conventions already allow. Prefer a few high-signal findings over many",
-  "weak ones \u2014 false positives waste the arbiter\u2019s time."
+  "weak ones \u2014 false positives waste the arbiter\u2019s time.",
+  "",
+  "TWIN-SURFACE PARITY: when the diff adds a surface that MIRRORS an existing one",
+  "(alias routes, a twin API vocabulary, a parallel variant of an existing",
+  "endpoint/handler/command set), enumerate the mirrored surface\u2019s operations and",
+  "behaviors as visible in the embedded context, diff the two, and flag any",
+  "operation, guard, error contract, or test the original has that the new surface",
+  "lacks WITHOUT a stated justification. An absence is a finding: cite where the",
+  "original defines what the twin is missing, and say what breaks or is blocked by",
+  "the gap. Diff-only review misses these by construction \u2014 the absence is not in",
+  "the diff, so look for it deliberately.",
+  "",
+  "VISIBILITY\u2194ADDRESSABILITY PARITY: when the diff changes WHO can see the rows a",
+  "list/collection endpoint returns (scoping, reachability, filters, redaction) or",
+  "changes an authorization check, walk the LEAST-privileged caller that can now",
+  "see each row and verify that same caller can also act on the row the way",
+  "consumers address it \u2014 detail fetch, update, delete, deep link \u2014 through every",
+  "reference the row carries. A row a caller can list but cannot address, or can",
+  "address only through a reference that caller cannot read, is a finding even",
+  "when each endpoint is correct in isolation: name the caller role, the reference",
+  "used, and the request that fails. If the diff (or its description) claims",
+  "consumers need no change, test that claim against the least-privileged caller,",
+  "not the author/owner perspective."
 ].join("\n");
 function securityAsk() {
   const classes = SECURITY_CLASSES.filter((c) => c.id !== "other").map((c) => `  - [${c.id}] ${c.label}`).join("\n");
@@ -4976,7 +4998,13 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   cited line, as a ONE-CLICK replacement. Send it only when the fix is small, obvious, and you have
   verified it against the hunk. The replacement may introduce NO identifier, path, or number absent
   from the body or the hunk (same rule as "ops"), and it replaces exactly the cited line. When in
-  doubt, omit it: a wrong one-click suggestion is worse than no suggestion.${gateEvidence === "worktree" ? REFERENCE_NOT_FOUND_CLAUSE : ""}${hasHolistic ? holisticClause : ""}`;
+  doubt, omit it: a wrong one-click suggestion is worse than no suggestion.
+- "duplicateOf" (optional, unverified ONLY): when this finding describes the SAME defect as another
+  listed finding you are confirming (typically: this one's hunk is unavailable while the other's is
+  shown), set it to that findingId instead of merely saying so in prose. Your "reason" must still
+  state what THIS finding claims that the primary's body does NOT \u2014 the host threads that claim onto
+  the primary for the human, so a sharper framing (e.g. one reviewer names the direction that FAILS,
+  the other names the direction that wrongly PASSES) is never lost to dedup.${gateEvidence === "worktree" ? REFERENCE_NOT_FOUND_CLAUSE : ""}${hasHolistic ? holisticClause : ""}`;
 function renderGatePrompt(findings, injections, gateEvidence = "packet") {
   return `You are the VERIFIED GATE for a multi-model CODE REVIEW. Several AI reviewers each
 reviewed the SAME diff INDEPENDENTLY. You are given, per finding, the reviewer's claim AND the
@@ -5299,7 +5327,7 @@ function isGateVerdict2(v) {
   return GATE_VERDICTS2.includes(v);
 }
 var GATE_ENVELOPE_SCHEMA_VERSION = 1;
-var GATE_TRAIL_SCHEMA_VERSION = 7;
+var GATE_TRAIL_SCHEMA_VERSION = 8;
 var REASON_CAP2 = 700;
 var CITATION_CAP = 500;
 var TLDR_CAP2 = 280;
@@ -5435,6 +5463,7 @@ function parseVerdicts(v) {
       // conditional so an old-shape (no-ops) entry parses to the exact prior shape
       ...ops.length ? { ops } : {},
       ...typeof e.cause === "string" && e.cause.trim() ? { cause: e.cause.trim() } : {},
+      ...typeof e.duplicateOf === "string" && e.duplicateOf.trim() ? { duplicateOf: e.duplicateOf.trim() } : {},
       ...postableClass ? { class: postableClass } : {},
       ...fixStatus ? { fixStatus } : {},
       ...rescoredSeverity ? { rescoredSeverity } : {},
@@ -5555,6 +5584,16 @@ function reconcileGateVerdicts(findings, parsed, opts = {}) {
         `gate: "reference-not-found" claimed for ${f.findingId} on PACKET evidence \u2014 dropped (a packet-fed gate cannot distinguish it from a truncated window)`
       );
     }
+    let duplicateOf;
+    if (typeof e.duplicateOf === "string") {
+      if (e.verdict === "unverified" && known.has(e.duplicateOf) && e.duplicateOf !== f.findingId) {
+        duplicateOf = e.duplicateOf;
+      } else {
+        warnings.push(
+          `gate: "duplicateOf" on ${f.findingId} dropped \u2014 ${e.verdict !== "unverified" ? "only an unverified verdict may defer to a duplicate" : `"${e.duplicateOf}" is not a different, known findingId`}`
+        );
+      }
+    }
     return {
       ...base,
       citation,
@@ -5562,6 +5601,7 @@ function reconcileGateVerdicts(findings, parsed, opts = {}) {
       effectiveVerdict: e.verdict,
       rawVerdict,
       reason: e.reason,
+      ...duplicateOf ? { duplicateOf } : {},
       // verify-by-run rides only a CONFIRMED verdict — a hedge on unverified is what the
       // execution-decidable tag is for, and honoring it here would blur the two channels.
       ...e.verify === "run" && (e.verdict === "agree" || e.verdict === "partial") ? { verifyRequested: true } : {}
@@ -5594,7 +5634,32 @@ function reconcileGateVerdicts(findings, parsed, opts = {}) {
     ),
     opts.holistic ?? null
   ) : postableRecords;
-  return { records, warnings };
+  return { records: threadDuplicateEchoes(records, findingById), warnings };
+}
+var DUPLICATE_CLAIM_CAP = 1500;
+function threadDuplicateEchoes(records, findingById) {
+  const echoesByPrimary = /* @__PURE__ */ new Map();
+  for (const r of records) {
+    if (!r.duplicateOf) continue;
+    const f = findingById.get(r.findingId);
+    if (!f) continue;
+    const list = echoesByPrimary.get(r.duplicateOf) ?? [];
+    list.push({
+      claim: capStr3(f.body, DUPLICATE_CLAIM_CAP),
+      findingId: r.findingId,
+      reviewer: r.reviewer,
+      severity: r.severity,
+      title: r.title
+    });
+    echoesByPrimary.set(r.duplicateOf, list);
+  }
+  if (echoesByPrimary.size === 0) return records;
+  for (const list of echoesByPrimary.values())
+    list.sort((a, b) => a.findingId < b.findingId ? -1 : 1);
+  return records.map((r) => {
+    const duplicates = echoesByPrimary.get(r.findingId);
+    return duplicates ? { ...r, duplicates } : r;
+  });
 }
 function honoredHighDismissals(records, trailWritten) {
   if (!trailWritten) return [];
@@ -5698,6 +5763,11 @@ function renderGateVerdicts(records, opts) {
       out.push(
         `     [${r.effectiveVerdict}] ${r.findingId} [${r.severity}] ${where}  ${s(r.title).slice(0, 120)}${reason}${dg}${lens}`
       );
+      for (const d of r.duplicates ?? []) {
+        out.push(
+          `        \u21B3 duplicate ${d.findingId} (${d.reviewer}, ${d.severity}) adds: ${s(d.claim).slice(0, 200)}`
+        );
+      }
     }
   }
   const c = verdictCounts(records);
