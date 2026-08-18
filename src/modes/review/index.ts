@@ -123,6 +123,9 @@ export interface ReviewModeOptions {
   // thin variation — the engine, coverage, spawn, parse, and receipt are unchanged.
   profile?: ReviewProfile;
   receiptStore?: string;
+  // Override the repo identity (a URL PR's repoIdFromSlug) — the subject repo of a
+  // URL-PR review is not the cwd's repo. See AcquireDiffOpts.
+  repoIdOverride?: string;
   reviewers?: ReviewerId[];
   reviewersFile?: string;
   runId: string;
@@ -231,6 +234,7 @@ export async function runReviewMode(
     diffMode: opts.diffMode,
     diffText: opts.diffText,
     headShaOverride: opts.headShaOverride,
+    repoIdOverride: opts.repoIdOverride,
     staged: opts.staged,
     workingTree: opts.workingTree,
   });

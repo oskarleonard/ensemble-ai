@@ -243,6 +243,16 @@ export function resolveRepoId(cwd: string): string | null {
   return gitOrNull(cwd, ['rev-parse', '--show-toplevel']);
 }
 
+// The repo identity of a URL-PR source: the canonical https URL for its owner/repo
+// slug — the SAME normal form resolveRepoId derives from a github remote. A URL PR
+// reviews a DIFFERENT repo than the cwd, so deriving identity from the cwd would key
+// the receipt/packet/report to whatever repo the process happens to run from (e.g. a
+// dashboard firing reviews from its own data dir) — and a later `receipt verify` run
+// inside the actual checkout would resolve the REAL repo id and never find the receipt.
+export function repoIdFromSlug(repoSlug: string): string {
+  return `https://github.com/${repoSlug}`;
+}
+
 // Resolve the base the SAME way `gh pr create` will: an explicit `--base`, else
 // the repo's default branch (origin/HEAD), else a local `main`/`master`. Returns
 // null when none resolves — the caller FAILS CLOSED (an unresolvable base means
@@ -294,6 +304,9 @@ export interface AcquireDiffOpts {
   // URL PR, where the CLI resolves the PR head SHA (`gh pr view --json headRefOid`)
   // so the receipt is content-tied to the exact PR head instead of a generic label.
   headShaOverride?: string;
+  // Override the repo identity — used for a URL PR (repoIdFromSlug), whose subject
+  // repo is NOT the cwd's. Absent → resolveRepoId(cwd), unchanged.
+  repoIdOverride?: string;
   // Review staged changes (`git diff --cached`) vs HEAD.
   staged?: boolean;
   // Review uncommitted tracked changes vs HEAD instead of base...HEAD.
@@ -305,7 +318,7 @@ export interface AcquireDiffOpts {
 // (fail-closed) — never silently reviews the wrong range.
 export function acquireDiff(opts: AcquireDiffOpts): AcquiredDiff {
   const ceiling = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
-  const repoId = resolveRepoId(opts.cwd);
+  const repoId = opts.repoIdOverride ?? resolveRepoId(opts.cwd);
 
   let mode: DiffMode;
   let rawDiff: string;
