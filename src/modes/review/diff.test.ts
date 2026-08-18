@@ -1,11 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  acquireDiff,
   canonicalizeDiff,
   classifyFileKind,
   computeCoverage,
   diffDigest,
   parseDiffFiles,
+  repoIdFromSlug,
 } from './diff';
 
 const SRC = `diff --git a/src/a.ts b/src/a.ts
@@ -123,5 +128,40 @@ describe('canonicalizeDiff + diffDigest', () => {
   it('is a sha256:-prefixed digest, distinct for distinct content', () => {
     expect(diffDigest(SRC)).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(diffDigest(SRC)).not.toBe(diffDigest(LOCKFILE));
+  });
+});
+
+describe('repoIdFromSlug', () => {
+  it('produces the same normal form resolveRepoId derives from a github remote', () => {
+    // resolveRepoId normalizes `git@github.com:o/r.git` → `https://github.com/o/r`;
+    // the slug form must land on the identical string or the receipt key splits.
+    expect(repoIdFromSlug('o/r')).toBe('https://github.com/o/r');
+  });
+});
+
+describe('acquireDiff — repo identity', () => {
+  // A non-repo cwd, standing in for a caller that fires a URL-PR review from an
+  // unrelated directory (a dashboard's data dir, /tmp, CI scratch space).
+  let cwd: string;
+  beforeEach(() => {
+    cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-diff-repoid-'));
+  });
+  afterEach(() => {
+    fs.rmSync(cwd, { force: true, recursive: true });
+  });
+
+  it('repoIdOverride keys the identity to the reviewed repo, not the cwd', () => {
+    const acquired = acquireDiff({
+      cwd,
+      diffMode: 'pr',
+      diffText: SRC,
+      repoIdOverride: repoIdFromSlug('LiskHQ/lisk-web'),
+    });
+    expect(acquired.repoId).toBe('https://github.com/LiskHQ/lisk-web');
+  });
+
+  it('without an override, falls back to the cwd-derived identity (null in a non-repo)', () => {
+    const acquired = acquireDiff({ cwd, diffMode: 'pr', diffText: SRC });
+    expect(acquired.repoId).toBeNull();
   });
 });

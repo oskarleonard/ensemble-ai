@@ -76,6 +76,7 @@ import {
   DEFAULT_COVERAGE_CEILING,
   type DiffMode,
   omittedLine,
+  repoIdFromSlug,
 } from './modes/review/diff';
 import {
   type EvidenceClass,
@@ -1367,6 +1368,9 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       out,
       peerSeats,
       profile,
+      repoIdOverride: source.postTarget?.repoSlug
+        ? repoIdFromSlug(source.postTarget.repoSlug)
+        : undefined,
       reviewers,
       runId,
       sandbox: typeof values.sandbox === 'string' ? values.sandbox : undefined,
@@ -2788,6 +2792,9 @@ async function diffCommand(args: string[]): Promise<number> {
       diffMode: source.diffMode,
       diffText: source.diffText,
       headShaOverride: source.headShaOverride,
+      repoIdOverride: source.postTarget?.repoSlug
+        ? repoIdFromSlug(source.postTarget.repoSlug)
+        : undefined,
       staged: source.staged,
       workingTree: source.workingTree,
     });
@@ -3288,6 +3295,7 @@ async function probeCommand(rest: string[]): Promise<number> {
         ...(source.diffMode ? { diffMode: source.diffMode } : {}),
         ...(source.diffText !== undefined ? { diffText: source.diffText } : {}),
         headShaOverride: source.headShaOverride,
+        repoIdOverride: repoIdFromSlug(source.postTarget.repoSlug as string),
       });
     } catch (e) {
       console.error(`ensemble-ai probe: ${(e as Error).message}`);
