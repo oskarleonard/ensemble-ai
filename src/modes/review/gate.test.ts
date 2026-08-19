@@ -638,6 +638,72 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
     expect(res.verdicts.every((v) => v.effectiveVerdict === 'unverified')).toBe(true);
   });
 
+  // Losing the gate costs the WHOLE run (every finding drops to unverified); a second gate costs
+  // one seat. The 2026-08-19 lisk-backend#738 gate returned nothing after 13 min and a regate over
+  // the byte-identical packet landed 4 agree / 2 partial / 0 unverified — the failure was transient.
+  it('re-spawns ONCE when the seat returns empty, and the retry\'s verdicts stand', async () => {
+    const { base, runId } = seed();
+    const logged: string[] = [];
+    let calls = 0;
+    const res = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, log: (m) => logged.push(m), reviews, runId,
+      run: async (): Promise<VoiceRunResult> => {
+        calls += 1;
+        return calls === 1
+          ? { ok: false, raw: null, stderrTail: '', timedOut: false }
+          : okRun(goodEnvelope);
+      },
+    });
+    expect(calls).toBe(2);
+    expect(logged.join('\n')).toContain('re-spawning once');
+    expect(res.verdicts.every((v) => v.downgradeReason === 'gate-failed')).toBe(false);
+    expect(verdictCounts(res.verdicts).unverified).toBeLessThan(res.verdicts.length);
+  });
+
+  it('does NOT re-spawn what a retry cannot fix: usage limit, timeout, spawn throw', async () => {
+    const cases: [string, () => Promise<VoiceRunResult>][] = [
+      // the window is closed until its reset time — a retry burns wall clock for nothing
+      ['usage limit', async () => ({ failWhy: 'operator usage limit reached — resets 5pm', ok: false, raw: null, stderrTail: '', timedOut: false })],
+      // it was working and too slow; a re-spawn just spends the budget twice
+      ['timeout', async () => ({ ok: false, raw: null, stderrTail: '', timedOut: true })],
+    ];
+    for (const [label, run] of cases) {
+      const { base, runId } = seed();
+      let calls = 0;
+      const res = await runGate({
+        baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews, runId,
+        run: async (...a: Parameters<typeof run>) => { calls += 1; return run(...a); },
+      });
+      expect(calls, label).toBe(1);
+      expect(res.verdicts.every((v) => v.effectiveVerdict === 'unverified'), label).toBe(true);
+    }
+    // a spawn that THREW never produced a seat — a different fault, and gateSpawned stays false
+    const { base, runId } = seed();
+    let throws = 0;
+    const res = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews, runId,
+      run: async () => { throws += 1; throw new Error('boom'); },
+    });
+    expect(throws).toBe(1);
+    expect(res.gateSpawned).toBe(false);
+  });
+
+  it('falls back exactly as before when BOTH attempts come back empty', async () => {
+    const { base, runId } = seed();
+    let calls = 0;
+    const res = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews, runId,
+      run: async (): Promise<VoiceRunResult> => {
+        calls += 1;
+        return { failWhy: 'reviewer returned an error result (API status 529)', ok: false, raw: null, stderrTail: '', timedOut: false };
+      },
+    });
+    expect(calls).toBe(2);
+    expect(res.synthesis.degraded).toBe(true);
+    expect(res.verdicts.every((v) => v.effectiveVerdict === 'unverified' && v.downgradeReason === 'gate-failed')).toBe(true);
+    expect(res.synthesis.error).toContain('API status 529');
+  });
+
   // The reply is the only record of how the gate reasoned about each finding. probe-gate has
   // persisted its transcript since it shipped; the review gate persisted nothing, so a run whose
   // verdicts looked wrong could not be re-read.

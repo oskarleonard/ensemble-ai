@@ -3071,6 +3071,10 @@ function isUsageLimitReply(raw) {
 function isRetryableApiStatus(status) {
   return status === 429 || typeof status === "number" && status >= 500 && status <= 599;
 }
+var USAGE_LIMIT_FAIL_PREFIX = "operator usage limit reached";
+function isUsageLimitFailure(failWhy) {
+  return failWhy?.startsWith(USAGE_LIMIT_FAIL_PREFIX) ?? false;
+}
 var TRANSIENT_RETRY_DELAYS_MS = [15e3, 45e3];
 var TRANSIENT_FAST_FAIL_MS = 12e4;
 var CLAUDE_INACTIVITY_TIMEOUT_MS = 6e5;
@@ -3152,7 +3156,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
       if (!timedOut && limitText) {
         return {
-          failWhy: `operator usage limit reached \u2014 ${limitText.slice(0, 160)}`,
+          failWhy: `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${limitText.slice(0, 160)}`,
           ok: false,
           raw: null,
           stderrTail: limitText.slice(0, 300),
@@ -5837,20 +5841,31 @@ async function runGate(opts) {
   }
   const prompt = renderGatePrompt(findings, injections, opts.gateEvidence ?? "packet");
   log("Gate: grounding findings against the pinned diff hunks \u2014 verdict tags\u2026");
-  let res;
-  try {
-    res = await opts.run(prompt, opts.config, {
-      timeoutMs: opts.timeoutMs,
-      ...opts.worktree ? { worktree: opts.worktree } : {}
-    });
-  } catch (e) {
+  const spawn2 = async () => {
+    try {
+      return await opts.run(prompt, opts.config, {
+        timeoutMs: opts.timeoutMs,
+        ...opts.worktree ? { worktree: opts.worktree } : {}
+      });
+    } catch (e) {
+      return { threw: e };
+    }
+  };
+  let attempt = await spawn2();
+  if (!("threw" in attempt) && !attempt.raw && !attempt.timedOut && !isUsageLimitFailure(attempt.failWhy)) {
+    log(`  \xB7 gate returned nothing (${attempt.failWhy ?? "no output"}) \u2014 re-spawning once before falling back`);
+    const second = await spawn2();
+    if (!("threw" in second)) attempt = second;
+  }
+  if ("threw" in attempt) {
     return bail(
-      `  \xB7 gate failed (${e.message}) \u2014 deterministic fallback + all unverified`,
-      e.message,
+      `  \xB7 gate failed (${attempt.threw.message}) \u2014 deterministic fallback + all unverified`,
+      attempt.threw.message,
       "gate-failed",
       false
     );
   }
+  const res = attempt;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? "gate timed out" : "gate produced no output");
     const tail = res.stderrTail?.trim();

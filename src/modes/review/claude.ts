@@ -201,6 +201,15 @@ export function isRetryableApiStatus(status: number | null): boolean {
 // couple of spaced retries are nearly free next to the review they rescue. An attempt
 // that ran longer than TRANSIENT_FAST_FAIL_MS did real work and is never retried — the
 // retry exists for the seat that died on arrival, not to double-spend a long run.
+// The one seat failure a re-spawn can never fix: the operator's own subscription window is
+// closed until the reset time the reply carries. Callers that retry an empty seat check this
+// so they burn nothing against a window that is already spent.
+export const USAGE_LIMIT_FAIL_PREFIX = 'operator usage limit reached';
+
+export function isUsageLimitFailure(failWhy: string | undefined): boolean {
+  return failWhy?.startsWith(USAGE_LIMIT_FAIL_PREFIX) ?? false;
+}
+
 export const TRANSIENT_RETRY_DELAYS_MS = [15_000, 45_000] as const;
 export const TRANSIENT_FAST_FAIL_MS = 120_000;
 
@@ -358,7 +367,7 @@ export async function runClaudeReviewVoice(
         // The operator's own subscription window is exhausted. Fail loud and named —
         // the reply carries the reset time, which is exactly what the operator needs.
         return {
-          failWhy: `operator usage limit reached — ${limitText.slice(0, 160)}`,
+          failWhy: `${USAGE_LIMIT_FAIL_PREFIX} — ${limitText.slice(0, 160)}`,
           ok: false,
           raw: null,
           stderrTail: limitText.slice(0, 300),

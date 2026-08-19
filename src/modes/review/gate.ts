@@ -5,6 +5,7 @@ import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 import { type RunReviewOpts } from '../../reviewers/codex';
 
+import { isUsageLimitFailure } from './claude';
 import type { EvidenceClass } from './evidence';
 import { type ClusterInfo, clusterPostable } from './gate-dedup';
 import { renderGatePrompt } from './gate-prompt';
@@ -1188,21 +1189,48 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // or the cause is either unreachable (never taught) or unsound (taught to a packet-fed gate).
   const prompt = renderGatePrompt(findings, injections, opts.gateEvidence ?? 'packet');
   log('Gate: grounding findings against the pinned diff hunks — verdict tags…');
-  let res: VoiceRunResult;
-  try {
-    res = await opts.run(prompt, opts.config, {
-      timeoutMs: opts.timeoutMs,
-      ...(opts.worktree ? { worktree: opts.worktree } : {}),
-    });
-  } catch (e) {
+  const spawn = async (): Promise<VoiceRunResult | { threw: Error }> => {
+    try {
+      return await opts.run(prompt, opts.config, {
+        timeoutMs: opts.timeoutMs,
+        ...(opts.worktree ? { worktree: opts.worktree } : {}),
+      });
+    } catch (e) {
+      return { threw: e as Error };
+    }
+  };
+  let attempt = await spawn();
+  // ONE re-spawn on a seat that came back empty without timing out. Losing the gate costs the
+  // whole run — every reviewer's findings drop to unverified, and the operator is left grounding
+  // them by hand — while a second gate costs one seat. Evidence that this is worth paying: the
+  // 2026-08-19 lisk-backend#738 gate returned nothing after 13 minutes, and a `regate` over the
+  // byte-identical packet with the same model landed 4 agree / 2 partial / 0 unverified.
+  // Deliberately NOT retried: a spawn that threw (no seat ever existed — a different fault), a
+  // timeout (it was working and too slow; a re-spawn just spends the budget twice), and an
+  // operator usage limit (the window is closed until its reset time, so a retry burns nothing but
+  // wall clock).
+  if (
+    !('threw' in attempt) &&
+    !attempt.raw &&
+    !attempt.timedOut &&
+    !isUsageLimitFailure(attempt.failWhy)
+  ) {
+    log(`  · gate returned nothing (${attempt.failWhy ?? 'no output'}) — re-spawning once before falling back`);
+    const second = await spawn();
+    // A throw on the RETRY keeps the first attempt's named failure: it is the more informative of
+    // the two, and reporting the retry's spawn error would bury why the gate was retried at all.
+    if (!('threw' in second)) attempt = second;
+  }
+  if ('threw' in attempt) {
     // The spawn itself threw — no seat ever existed, so it read nothing (gateSpawned: false).
     return bail(
-      `  · gate failed (${(e as Error).message}) — deterministic fallback + all unverified`,
-      (e as Error).message,
+      `  · gate failed (${attempt.threw.message}) — deterministic fallback + all unverified`,
+      attempt.threw.message,
       'gate-failed',
       false
     );
   }
+  const res: VoiceRunResult = attempt;
   if (!res.raw || res.timedOut) {
     // The RUNNER already named the cause — a persistent transient API error, an operator usage
     // limit, an error result, a wedged seat reclaimed by the liveness watchdog. Collapsing all of
