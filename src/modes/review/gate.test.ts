@@ -528,10 +528,28 @@ describe('renderGateVerdicts — tags, counts, teeth notice, trail marker', () =
     expect(verdictCounts(records)).toEqual({ agree: 1, false: 1, partial: 0, unverified: 0 });
   });
 
-  it('emits the "teeth did not engage" notice when findings exist but zero verdicts landed', () => {
-    const records = reconcileGateVerdicts([gf()], { failure: 'gate-failed' }).records;
+  // A gate that never returned is not a weak gate. Telling the operator to raise the model sends
+  // them to tune a seat that never got to reason (the run that prompted this split was already
+  // opus@max); the recovery for a failed envelope is re-running the gate.
+  it('names a whole-envelope failure as "never returned" + points at regate, not at the model', () => {
+    for (const failure of ['gate-failed', 'packet-fail', 'unknown-schema'] as const) {
+      const records = reconcileGateVerdicts([gf()], { failure }).records;
+      const text = renderGateVerdicts(records, { scrub, trailWritten: true }).join('\n');
+      expect(text, failure).toContain('the gate never returned verdicts');
+      expect(text, failure).toContain('regate');
+      expect(text, failure).not.toContain('stronger gate model');
+    }
+  });
+
+  it('keeps the "teeth did not engage" model hint when the gate RAN and grounded nothing', () => {
+    // per-finding downgrade (`missing`), not a whole-envelope failure: the seat replied, it just
+    // returned no verdict for this finding — that IS the capability-floor signal.
+    const parsed = parseGateEnvelope(envelope([]));
+    if ('failure' in parsed) throw new Error('fixture envelope must parse');
+    const records = reconcileGateVerdicts([gf()], parsed).records;
     const text = renderGateVerdicts(records, { scrub, trailWritten: true }).join('\n');
     expect(text).toContain('gate teeth did not engage');
+    expect(text).not.toContain('the gate never returned verdicts');
   });
 
   it('renders a LOUD trail-failed marker (dismissals not honored)', () => {
@@ -586,6 +604,53 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
       expect(res.synthesis.degraded).toBe(true);
       expect(res.verdicts.every((v) => v.effectiveVerdict === 'unverified' && v.downgradeReason === 'gate-failed')).toBe(true);
       expect(res.gateTrailWritten).toBe(true); // the unverified trail STILL writes (audit)
+    }
+  });
+
+  // The runner names WHY a seat came back empty (persistent transient API error, operator usage
+  // limit, an error result, a wedged seat reclaimed by the watchdog). Until 2026-08-19 the gate
+  // collapsed all of them to "gate produced no output", which is how a real dead run (MONEY-618's
+  // review) left no way to tell a retryable 529 from a wedged seat.
+  it('carries the runner failWhy + stderr tail into the log and the synthesis error', async () => {
+    const { base, runId } = seed();
+    const logged: string[] = [];
+    const res = await runGate({
+      baseDir: base,
+      config: CFG,
+      expectedHeadSha: HEAD,
+      log: (m) => logged.push(m),
+      reviews,
+      run: async (): Promise<VoiceRunResult> => ({
+        failWhy: 'persistent transient API error after 3 attempts',
+        ok: false,
+        raw: null,
+        stderrTail: 'API Error: 529 overloaded_error',
+        timedOut: false,
+      }),
+      runId,
+    });
+    const line = logged.join('\n');
+    expect(line).toContain('persistent transient API error after 3 attempts');
+    expect(line).toContain('529 overloaded_error');
+    expect(res.synthesis.error).toContain('persistent transient API error after 3 attempts');
+    expect(res.synthesis.error).toContain('529 overloaded_error');
+    // still fail-closed: the named cause changes the DIAGNOSIS, never the verdicts
+    expect(res.verdicts.every((v) => v.effectiveVerdict === 'unverified')).toBe(true);
+  });
+
+  // The reply is the only record of how the gate reasoned about each finding. probe-gate has
+  // persisted its transcript since it shipped; the review gate persisted nothing, so a run whose
+  // verdicts looked wrong could not be re-read.
+  it('persists the gate transcript — on a clean run AND on an unparseable envelope', async () => {
+    for (const [reply, label] of [
+      [goodEnvelope, 'clean'],
+      ['not json', 'unparseable'],
+    ] as const) {
+      const { base, runId } = seed();
+      await runGate({ baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews, run: async () => okRun(reply), runId });
+      const raw = path.join(reviewDir(base, runId), 'gate.raw.md');
+      expect(fs.existsSync(raw), label).toBe(true);
+      expect(fs.readFileSync(raw, 'utf8'), label).toContain(label === 'clean' ? 'codex#1' : 'not json');
     }
   });
 

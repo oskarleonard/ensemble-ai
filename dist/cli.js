@@ -2202,6 +2202,9 @@ function resolveRepoId(cwd) {
   }
   return gitOrNull(cwd, ["rev-parse", "--show-toplevel"]);
 }
+function repoIdFromSlug(repoSlug) {
+  return `https://github.com/${repoSlug}`;
+}
 function resolveBase(cwd, explicit) {
   if (explicit) return explicit;
   const originHead = gitOrNull(cwd, [
@@ -2218,7 +2221,7 @@ function resolveBase(cwd, explicit) {
 }
 function acquireDiff(opts) {
   const ceiling = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
-  const repoId = resolveRepoId(opts.cwd);
+  const repoId = opts.repoIdOverride ?? resolveRepoId(opts.cwd);
   let mode;
   let rawDiff;
   let baseRef = null;
@@ -5326,6 +5329,11 @@ var GATE_VERDICTS2 = ["agree", "partial", "false", "unverified"];
 function isGateVerdict2(v) {
   return GATE_VERDICTS2.includes(v);
 }
+var WHOLE_ENVELOPE_DOWNGRADES = /* @__PURE__ */ new Set([
+  "gate-failed",
+  "packet-fail",
+  "unknown-schema"
+]);
 var GATE_ENVELOPE_SCHEMA_VERSION = 1;
 var GATE_TRAIL_SCHEMA_VERSION = 8;
 var REASON_CAP2 = 700;
@@ -5775,7 +5783,10 @@ function renderGateVerdicts(records, opts) {
     `  gate \u2014 ${c.agree} agree \xB7 ${c.partial} partial \xB7 ${c.false} false (dismissed) \xB7 ${c.unverified} unverified`
   );
   if (records.length > 0 && c.agree + c.partial + c.false === 0) {
-    out.push("  gate teeth did not engage \u2014 consider a stronger gate model");
+    const envelopeFailure = records.every((r) => r.downgradeReason === records[0].downgradeReason) && WHOLE_ENVELOPE_DOWNGRADES.has(records[0].downgradeReason);
+    out.push(
+      envelopeFailure ? "  the gate never returned verdicts \u2014 nothing here was ground-checked; re-run the gate (`regate`) before trusting or dismissing any finding" : "  gate teeth did not engage \u2014 consider a stronger gate model"
+    );
   }
   if (records.some((r) => r.holistic)) {
     out.push(
@@ -5841,12 +5852,18 @@ async function runGate(opts) {
     );
   }
   if (!res.raw || res.timedOut) {
+    const why = res.failWhy ?? (res.timedOut ? "gate timed out" : "gate produced no output");
+    const tail = res.stderrTail?.trim();
     return bail(
-      "  \xB7 gate produced no usable output \u2014 deterministic fallback + all unverified",
-      res.timedOut ? "gate timed out" : "gate produced no output",
+      `  \xB7 ${why} \u2014 deterministic fallback + all unverified${tail ? ` [${tail.slice(0, 200)}]` : ""}`,
+      tail ? `${why} \u2014 ${tail.slice(0, 200)}` : why,
       "gate-failed",
       true
     );
+  }
+  try {
+    writeTrailFile(opts.baseDir, opts.runId, "gate.raw.md", res.raw);
+  } catch {
   }
   const parsed = parseGateEnvelope(res.raw);
   if ("failure" in parsed) {
@@ -6386,6 +6403,7 @@ async function runReviewMode(opts) {
     diffMode: opts.diffMode,
     diffText: opts.diffText,
     headShaOverride: opts.headShaOverride,
+    repoIdOverride: opts.repoIdOverride,
     staged: opts.staged,
     workingTree: opts.workingTree
   });
@@ -9140,6 +9158,7 @@ async function runReviewPipeline(input) {
       out,
       peerSeats,
       profile,
+      repoIdOverride: source.postTarget?.repoSlug ? repoIdFromSlug(source.postTarget.repoSlug) : void 0,
       reviewers,
       runId,
       sandbox: typeof values.sandbox === "string" ? values.sandbox : void 0,
@@ -10254,6 +10273,7 @@ async function diffCommand(args) {
       diffMode: source.diffMode,
       diffText: source.diffText,
       headShaOverride: source.headShaOverride,
+      repoIdOverride: source.postTarget?.repoSlug ? repoIdFromSlug(source.postTarget.repoSlug) : void 0,
       staged: source.staged,
       workingTree: source.workingTree
     });
@@ -10696,7 +10716,8 @@ async function probeCommand(rest) {
         cwd,
         ...source.diffMode ? { diffMode: source.diffMode } : {},
         ...source.diffText !== void 0 ? { diffText: source.diffText } : {},
-        headShaOverride: source.headShaOverride
+        headShaOverride: source.headShaOverride,
+        repoIdOverride: repoIdFromSlug(source.postTarget.repoSlug)
       });
     } catch (e) {
       console.error(`ensemble-ai probe: ${e.message}`);

@@ -1837,6 +1837,9 @@ function resolveRepoId(cwd) {
   }
   return gitOrNull(cwd, ["rev-parse", "--show-toplevel"]);
 }
+function repoIdFromSlug(repoSlug) {
+  return `https://github.com/${repoSlug}`;
+}
 function resolveBase(cwd, explicit) {
   if (explicit) return explicit;
   const originHead = gitOrNull(cwd, [
@@ -1853,7 +1856,7 @@ function resolveBase(cwd, explicit) {
 }
 function acquireDiff(opts) {
   const ceiling = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
-  const repoId = resolveRepoId(opts.cwd);
+  const repoId = opts.repoIdOverride ?? resolveRepoId(opts.cwd);
   let mode;
   let rawDiff;
   let baseRef = null;
@@ -3816,6 +3819,7 @@ async function runReviewMode(opts) {
     diffMode: opts.diffMode,
     diffText: opts.diffText,
     headShaOverride: opts.headShaOverride,
+    repoIdOverride: opts.repoIdOverride,
     staged: opts.staged,
     workingTree: opts.workingTree
   });
@@ -5468,6 +5472,7 @@ export {
   renderReviewPrompt,
   renderSummaryBody,
   renderSynthesisPrompt,
+  repoIdFromSlug,
   resolveBase,
   resolveBin,
   resolveClaudeBin,

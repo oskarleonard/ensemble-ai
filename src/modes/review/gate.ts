@@ -95,6 +95,17 @@ export const DOWNGRADE_REASONS = [
 ] as const;
 export type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
 
+// The reasons that kill the WHOLE envelope rather than one finding's verdict: the gate either
+// never returned a usable reply, or returned one under semantics the host does not recognize, or
+// the pinned packet it would have grounded against was unusable. Every record carries the same one
+// when it happens, which is what lets the renderer tell "the gate never ran" from "the gate ran and
+// grounded nothing".
+const WHOLE_ENVELOPE_DOWNGRADES = new Set<DowngradeReason>([
+  'gate-failed',
+  'packet-fail',
+  'unknown-schema',
+]);
+
 // The composite envelope schema the gate prompt pins + the model must echo. A missing /
 // different value fails the whole envelope closed (all-`unverified`) — the host never
 // interprets verdicts under semantics it doesn't recognize.
@@ -1024,8 +1035,21 @@ export function renderGateVerdicts(
   );
   // The gate is toothless when findings exist but nothing was groundable — a capability-floor
   // signal (a weak gate model mostly yields unverified). Deterministic, from the counts.
+  //
+  // But a gate that NEVER RETURNED is not a weak gate, and telling the operator to raise the model
+  // sends them to tune a seat that did not get to reason at all (the run that prompted this was
+  // already opus@max). A whole-envelope failure marks EVERY record with the same host reason, so
+  // the two cases are separable from the records alone — re-running the gate is what recovers a
+  // failed one, and only the toothless case is about the model.
   if (records.length > 0 && c.agree + c.partial + c.false === 0) {
-    out.push('  gate teeth did not engage — consider a stronger gate model');
+    const envelopeFailure =
+      records.every((r) => r.downgradeReason === records[0].downgradeReason) &&
+      WHOLE_ENVELOPE_DOWNGRADES.has(records[0].downgradeReason as DowngradeReason);
+    out.push(
+      envelopeFailure
+        ? '  the gate never returned verdicts — nothing here was ground-checked; re-run the gate (`regate`) before trusting or dismissing any finding'
+        : '  gate teeth did not engage — consider a stronger gate model'
+    );
   }
   // Say the honest thing about the lens wherever its findings are shown (spec §4): one seat, no
   // corroboration signal, and silence proves nothing about the architecture.
@@ -1180,12 +1204,30 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     );
   }
   if (!res.raw || res.timedOut) {
+    // The RUNNER already named the cause — a persistent transient API error, an operator usage
+    // limit, an error result, a wedged seat reclaimed by the liveness watchdog. Collapsing all of
+    // those into "produced no output" (what this said until 2026-08-19) leaves the operator with a
+    // dead run and no way to tell a retryable 529 from a wedged seat, and the reply is not
+    // persisted anywhere either. Prefer failWhy, and carry the stderr tail into the log + the
+    // synthesis error so the trail keeps the evidence. Same precedent as probe-gate.
+    const why = res.failWhy ?? (res.timedOut ? 'gate timed out' : 'gate produced no output');
+    const tail = res.stderrTail?.trim();
     return bail(
-      '  · gate produced no usable output — deterministic fallback + all unverified',
-      res.timedOut ? 'gate timed out' : 'gate produced no output',
+      `  · ${why} — deterministic fallback + all unverified${tail ? ` [${tail.slice(0, 200)}]` : ''}`,
+      tail ? `${why} — ${tail.slice(0, 200)}` : why,
       'gate-failed',
       true
     );
+  }
+
+  // The gate's reply is the only record of how it reasoned about every finding, and a run whose
+  // verdicts look wrong is un-diagnosable without it. Persist BEFORE parsing so an unparseable
+  // envelope — the case that most needs reading — is kept too. Best-effort: losing the transcript
+  // must never cost the verdicts it describes.
+  try {
+    writeTrailFile(opts.baseDir, opts.runId, 'gate.raw.md', res.raw);
+  } catch {
+    /* best-effort — the verdicts below do not depend on the transcript landing */
   }
 
   const parsed = parseGateEnvelope(res.raw);
