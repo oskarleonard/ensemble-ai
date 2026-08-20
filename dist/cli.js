@@ -5333,11 +5333,12 @@ var GATE_VERDICTS2 = ["agree", "partial", "false", "unverified"];
 function isGateVerdict2(v) {
   return GATE_VERDICTS2.includes(v);
 }
-var WHOLE_ENVELOPE_DOWNGRADES = /* @__PURE__ */ new Set([
-  "gate-failed",
-  "packet-fail",
-  "unknown-schema"
-]);
+var WHOLE_ENVELOPE_ADVICE = {
+  "gate-failed": "  the gate never returned usable output \u2014 nothing here was ground-checked; re-run it (`regate`) before trusting or dismissing any finding",
+  "packet-fail": "  the pinned packet was unusable, so nothing could be ground-checked \u2014 a `regate` reads that same packet and fails the same way; re-run the REVIEW to pin a fresh one",
+  "unknown-schema": "  the gate replied under an envelope schema this engine does not recognize \u2014 nothing was ground-checked; a `regate` may recover a one-off, otherwise the engine and the gate prompt have drifted apart"
+};
+var TOOTHLESS_GATE_ADVICE = "  gate teeth did not engage \u2014 consider a stronger gate model";
 var GATE_ENVELOPE_SCHEMA_VERSION = 1;
 var GATE_TRAIL_SCHEMA_VERSION = 8;
 var REASON_CAP2 = 700;
@@ -5787,10 +5788,8 @@ function renderGateVerdicts(records, opts) {
     `  gate \u2014 ${c.agree} agree \xB7 ${c.partial} partial \xB7 ${c.false} false (dismissed) \xB7 ${c.unverified} unverified`
   );
   if (records.length > 0 && c.agree + c.partial + c.false === 0) {
-    const envelopeFailure = records.every((r) => r.downgradeReason === records[0].downgradeReason) && WHOLE_ENVELOPE_DOWNGRADES.has(records[0].downgradeReason);
-    out.push(
-      envelopeFailure ? "  the gate never returned verdicts \u2014 nothing here was ground-checked; re-run the gate (`regate`) before trusting or dismissing any finding" : "  gate teeth did not engage \u2014 consider a stronger gate model"
-    );
+    const shared = records.every((r) => r.downgradeReason === records[0].downgradeReason) ? records[0].downgradeReason : void 0;
+    out.push(WHOLE_ENVELOPE_ADVICE[shared] ?? TOOTHLESS_GATE_ADVICE);
   }
   if (records.some((r) => r.holistic)) {
     out.push(
@@ -5852,8 +5851,10 @@ async function runGate(opts) {
     }
   };
   let attempt = await spawn2();
+  let firstEmptyWhy = null;
   if (!("threw" in attempt) && !attempt.raw && !attempt.timedOut && !isUsageLimitFailure(attempt.failWhy)) {
-    log(`  \xB7 gate returned nothing (${attempt.failWhy ?? "no output"}) \u2014 re-spawning once before falling back`);
+    firstEmptyWhy = attempt.failWhy ?? "gate produced no output";
+    log(`  \xB7 gate returned nothing (${firstEmptyWhy}) \u2014 re-spawning once before falling back`);
     const second = await spawn2();
     if (!("threw" in second)) attempt = second;
   }
@@ -5867,7 +5868,8 @@ async function runGate(opts) {
   }
   const res = attempt;
   if (!res.raw || res.timedOut) {
-    const why = res.failWhy ?? (res.timedOut ? "gate timed out" : "gate produced no output");
+    const last = res.failWhy ?? (res.timedOut ? "gate timed out" : "gate produced no output");
+    const why = firstEmptyWhy && firstEmptyWhy !== last ? `${last} (first attempt: ${firstEmptyWhy})` : last;
     const tail = res.stderrTail?.trim();
     return bail(
       `  \xB7 ${why} \u2014 deterministic fallback + all unverified${tail ? ` [${tail.slice(0, 200)}]` : ""}`,

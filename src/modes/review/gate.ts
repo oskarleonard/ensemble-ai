@@ -96,16 +96,24 @@ export const DOWNGRADE_REASONS = [
 ] as const;
 export type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
 
-// The reasons that kill the WHOLE envelope rather than one finding's verdict: the gate either
-// never returned a usable reply, or returned one under semantics the host does not recognize, or
-// the pinned packet it would have grounded against was unusable. Every record carries the same one
-// when it happens, which is what lets the renderer tell "the gate never ran" from "the gate ran and
-// grounded nothing".
-const WHOLE_ENVELOPE_DOWNGRADES = new Set<DowngradeReason>([
-  'gate-failed',
-  'packet-fail',
-  'unknown-schema',
-]);
+// What to tell an operator staring at an all-unverified run, per whole-envelope failure. These
+// kill every verdict at once (rather than one finding's), so every record carries the same reason —
+// which is what lets the renderer say something true instead of the capability-floor line below.
+// They do NOT share a recovery, and getting that wrong wastes the operator's next move: a `regate`
+// re-reads the SAME persisted packet, so it recovers a gate that came back empty and re-fails
+// identically on a packet that was unusable.
+const WHOLE_ENVELOPE_ADVICE: Partial<Record<DowngradeReason, string>> = {
+  'gate-failed':
+    '  the gate never returned usable output — nothing here was ground-checked; re-run it (`regate`) before trusting or dismissing any finding',
+  'packet-fail':
+    '  the pinned packet was unusable, so nothing could be ground-checked — a `regate` reads that same packet and fails the same way; re-run the REVIEW to pin a fresh one',
+  'unknown-schema':
+    '  the gate replied under an envelope schema this engine does not recognize — nothing was ground-checked; a `regate` may recover a one-off, otherwise the engine and the gate prompt have drifted apart',
+};
+
+// The capability-floor signal this line was originally written for: the gate DID reason, and could
+// still ground nothing (a weak gate model mostly yields unverified).
+const TOOTHLESS_GATE_ADVICE = '  gate teeth did not engage — consider a stronger gate model';
 
 // The composite envelope schema the gate prompt pins + the model must echo. A missing /
 // different value fails the whole envelope closed (all-`unverified`) — the host never
@@ -1037,20 +1045,16 @@ export function renderGateVerdicts(
   // The gate is toothless when findings exist but nothing was groundable — a capability-floor
   // signal (a weak gate model mostly yields unverified). Deterministic, from the counts.
   //
-  // But a gate that NEVER RETURNED is not a weak gate, and telling the operator to raise the model
-  // sends them to tune a seat that did not get to reason at all (the run that prompted this was
-  // already opus@max). A whole-envelope failure marks EVERY record with the same host reason, so
-  // the two cases are separable from the records alone — re-running the gate is what recovers a
-  // failed one, and only the toothless case is about the model.
+  // But a gate that never got to reason is not a weak gate, and telling the operator to raise the
+  // model sends them to tune a seat that never ran (the run that prompted this was already
+  // opus@max). A whole-envelope failure marks EVERY record with the same host reason, so the cases
+  // are separable from the records alone — and they do NOT share a recovery, which is why each says
+  // its own thing rather than sharing one "re-run it" line.
   if (records.length > 0 && c.agree + c.partial + c.false === 0) {
-    const envelopeFailure =
-      records.every((r) => r.downgradeReason === records[0].downgradeReason) &&
-      WHOLE_ENVELOPE_DOWNGRADES.has(records[0].downgradeReason as DowngradeReason);
-    out.push(
-      envelopeFailure
-        ? '  the gate never returned verdicts — nothing here was ground-checked; re-run the gate (`regate`) before trusting or dismissing any finding'
-        : '  gate teeth did not engage — consider a stronger gate model'
-    );
+    const shared = records.every((r) => r.downgradeReason === records[0].downgradeReason)
+      ? records[0].downgradeReason
+      : undefined;
+    out.push(WHOLE_ENVELOPE_ADVICE[shared as DowngradeReason] ?? TOOTHLESS_GATE_ADVICE);
   }
   // Say the honest thing about the lens wherever its findings are shown (spec §4): one seat, no
   // corroboration signal, and silence proves nothing about the architecture.
@@ -1200,6 +1204,10 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     }
   };
   let attempt = await spawn();
+  // The first attempt's named cause, kept because the SECOND can be the less informative of the
+  // two: a bare empty reply after a named 529 would otherwise erase the 529 — the exact
+  // information loss the rest of this change exists to stop.
+  let firstEmptyWhy: string | null = null;
   // ONE re-spawn on a seat that came back empty without timing out. Losing the gate costs the
   // whole run — every reviewer's findings drop to unverified, and the operator is left grounding
   // them by hand — while a second gate costs one seat. Evidence that this is worth paying: the
@@ -1215,7 +1223,8 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     !attempt.timedOut &&
     !isUsageLimitFailure(attempt.failWhy)
   ) {
-    log(`  · gate returned nothing (${attempt.failWhy ?? 'no output'}) — re-spawning once before falling back`);
+    firstEmptyWhy = attempt.failWhy ?? 'gate produced no output';
+    log(`  · gate returned nothing (${firstEmptyWhy}) — re-spawning once before falling back`);
     const second = await spawn();
     // A throw on the RETRY keeps the first attempt's named failure: it is the more informative of
     // the two, and reporting the retry's spawn error would bury why the gate was retried at all.
@@ -1238,7 +1247,11 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     // dead run and no way to tell a retryable 529 from a wedged seat, and the reply is not
     // persisted anywhere either. Prefer failWhy, and carry the stderr tail into the log + the
     // synthesis error so the trail keeps the evidence. Same precedent as probe-gate.
-    const why = res.failWhy ?? (res.timedOut ? 'gate timed out' : 'gate produced no output');
+    const last = res.failWhy ?? (res.timedOut ? 'gate timed out' : 'gate produced no output');
+    // Both attempts down: report both causes, since they can differ and the earlier one is often
+    // the specific one.
+    const why =
+      firstEmptyWhy && firstEmptyWhy !== last ? `${last} (first attempt: ${firstEmptyWhy})` : last;
     const tail = res.stderrTail?.trim();
     return bail(
       `  · ${why} — deterministic fallback + all unverified${tail ? ` [${tail.slice(0, 200)}]` : ''}`,

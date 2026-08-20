@@ -530,15 +530,27 @@ describe('renderGateVerdicts — tags, counts, teeth notice, trail marker', () =
 
   // A gate that never returned is not a weak gate. Telling the operator to raise the model sends
   // them to tune a seat that never got to reason (the run that prompted this split was already
-  // opus@max); the recovery for a failed envelope is re-running the gate.
-  it('names a whole-envelope failure as "never returned" + points at regate, not at the model', () => {
-    for (const failure of ['gate-failed', 'packet-fail', 'unknown-schema'] as const) {
-      const records = reconcileGateVerdicts([gf()], { failure }).records;
+  // opus@max). And the three envelope failures do not share a recovery — a regate re-reads the
+  // SAME persisted packet, so recommending it after a packet-fail sends the operator to repeat a
+  // failure verbatim.
+  it('gives each whole-envelope failure its own recovery, and never the model hint', () => {
+    const expected = {
+      'gate-failed': /never returned usable output.*regate/s,
+      'packet-fail': /fails the same way; re-run the REVIEW/s,
+      'unknown-schema': /schema this engine does not recognize/s,
+    } as const;
+    for (const [failure, pattern] of Object.entries(expected)) {
+      const records = reconcileGateVerdicts([gf()], { failure: failure as 'gate-failed' }).records;
       const text = renderGateVerdicts(records, { scrub, trailWritten: true }).join('\n');
-      expect(text, failure).toContain('the gate never returned verdicts');
-      expect(text, failure).toContain('regate');
+      expect(text, failure).toMatch(pattern);
       expect(text, failure).not.toContain('stronger gate model');
     }
+    // the one that must NOT send the operator to re-run the gate
+    const packetFail = renderGateVerdicts(
+      reconcileGateVerdicts([gf()], { failure: 'packet-fail' }).records,
+      { scrub, trailWritten: true }
+    ).join('\n');
+    expect(packetFail).not.toMatch(/re-run it \(`regate`\)/);
   });
 
   it('keeps the "teeth did not engage" model hint when the gate RAN and grounded nothing', () => {
@@ -686,6 +698,24 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
     });
     expect(throws).toBe(1);
     expect(res.gateSpawned).toBe(false);
+  });
+
+  // The retry can REPLACE a named cause with a vaguer one: a bare empty reply after a named 529
+  // would erase the 529 — the exact information loss this whole change exists to stop.
+  it('keeps BOTH causes when the retry fails differently from the first attempt', async () => {
+    const { base, runId } = seed();
+    let calls = 0;
+    const res = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews, runId,
+      run: async (): Promise<VoiceRunResult> => {
+        calls += 1;
+        return calls === 1
+          ? { failWhy: 'reviewer returned an error result (API status 529)', ok: false, raw: null, stderrTail: '', timedOut: false }
+          : { ok: false, raw: null, stderrTail: '', timedOut: false }; // vaguer: no failWhy at all
+      },
+    });
+    expect(res.synthesis.error).toContain('API status 529');
+    expect(res.synthesis.error).toContain('gate produced no output');
   });
 
   it('falls back exactly as before when BOTH attempts come back empty', async () => {
