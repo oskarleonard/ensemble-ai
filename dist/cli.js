@@ -2202,6 +2202,9 @@ function resolveRepoId(cwd) {
   }
   return gitOrNull(cwd, ["rev-parse", "--show-toplevel"]);
 }
+function repoIdFromSlug(repoSlug) {
+  return `https://github.com/${repoSlug}`;
+}
 function resolveBase(cwd, explicit) {
   if (explicit) return explicit;
   const originHead = gitOrNull(cwd, [
@@ -2218,7 +2221,7 @@ function resolveBase(cwd, explicit) {
 }
 function acquireDiff(opts) {
   const ceiling = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
-  const repoId = resolveRepoId(opts.cwd);
+  const repoId = opts.repoIdOverride ?? resolveRepoId(opts.cwd);
   let mode;
   let rawDiff;
   let baseRef = null;
@@ -3068,6 +3071,10 @@ function isUsageLimitReply(raw) {
 function isRetryableApiStatus(status) {
   return status === 429 || typeof status === "number" && status >= 500 && status <= 599;
 }
+var USAGE_LIMIT_FAIL_PREFIX = "operator usage limit reached";
+function isUsageLimitFailure(failWhy) {
+  return failWhy?.startsWith(USAGE_LIMIT_FAIL_PREFIX) ?? false;
+}
 var TRANSIENT_RETRY_DELAYS_MS = [15e3, 45e3];
 var TRANSIENT_FAST_FAIL_MS = 12e4;
 var CLAUDE_INACTIVITY_TIMEOUT_MS = 6e5;
@@ -3149,7 +3156,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
       if (!timedOut && limitText) {
         return {
-          failWhy: `operator usage limit reached \u2014 ${limitText.slice(0, 160)}`,
+          failWhy: `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${limitText.slice(0, 160)}`,
           ok: false,
           raw: null,
           stderrTail: limitText.slice(0, 300),
@@ -5326,6 +5333,12 @@ var GATE_VERDICTS2 = ["agree", "partial", "false", "unverified"];
 function isGateVerdict2(v) {
   return GATE_VERDICTS2.includes(v);
 }
+var WHOLE_ENVELOPE_ADVICE = {
+  "gate-failed": "  the gate never returned usable output \u2014 nothing here was ground-checked; re-run it (`regate`) before trusting or dismissing any finding",
+  "packet-fail": "  the pinned packet was unusable, so nothing could be ground-checked \u2014 a `regate` reads that same packet and fails the same way; re-run the REVIEW to pin a fresh one",
+  "unknown-schema": "  the gate replied under an envelope schema this engine does not recognize \u2014 nothing was ground-checked; a `regate` may recover a one-off, otherwise the engine and the gate prompt have drifted apart"
+};
+var TOOTHLESS_GATE_ADVICE = "  gate teeth did not engage \u2014 consider a stronger gate model";
 var GATE_ENVELOPE_SCHEMA_VERSION = 1;
 var GATE_TRAIL_SCHEMA_VERSION = 8;
 var REASON_CAP2 = 700;
@@ -5775,7 +5788,8 @@ function renderGateVerdicts(records, opts) {
     `  gate \u2014 ${c.agree} agree \xB7 ${c.partial} partial \xB7 ${c.false} false (dismissed) \xB7 ${c.unverified} unverified`
   );
   if (records.length > 0 && c.agree + c.partial + c.false === 0) {
-    out.push("  gate teeth did not engage \u2014 consider a stronger gate model");
+    const shared = records.every((r) => r.downgradeReason === records[0].downgradeReason) ? records[0].downgradeReason : void 0;
+    out.push(WHOLE_ENVELOPE_ADVICE[shared] ?? TOOTHLESS_GATE_ADVICE);
   }
   if (records.some((r) => r.holistic)) {
     out.push(
@@ -5826,27 +5840,47 @@ async function runGate(opts) {
   }
   const prompt = renderGatePrompt(findings, injections, opts.gateEvidence ?? "packet");
   log("Gate: grounding findings against the pinned diff hunks \u2014 verdict tags\u2026");
-  let res;
-  try {
-    res = await opts.run(prompt, opts.config, {
-      timeoutMs: opts.timeoutMs,
-      ...opts.worktree ? { worktree: opts.worktree } : {}
-    });
-  } catch (e) {
+  const spawn2 = async () => {
+    try {
+      return await opts.run(prompt, opts.config, {
+        timeoutMs: opts.timeoutMs,
+        ...opts.worktree ? { worktree: opts.worktree } : {}
+      });
+    } catch (e) {
+      return { threw: e };
+    }
+  };
+  let attempt = await spawn2();
+  let firstEmptyWhy = null;
+  if (!("threw" in attempt) && !attempt.raw && !attempt.timedOut && !isUsageLimitFailure(attempt.failWhy)) {
+    firstEmptyWhy = attempt.failWhy ?? "gate produced no output";
+    log(`  \xB7 gate returned nothing (${firstEmptyWhy}) \u2014 re-spawning once before falling back`);
+    const second = await spawn2();
+    if (!("threw" in second)) attempt = second;
+  }
+  if ("threw" in attempt) {
     return bail(
-      `  \xB7 gate failed (${e.message}) \u2014 deterministic fallback + all unverified`,
-      e.message,
+      `  \xB7 gate failed (${attempt.threw.message}) \u2014 deterministic fallback + all unverified`,
+      attempt.threw.message,
       "gate-failed",
       false
     );
   }
+  const res = attempt;
   if (!res.raw || res.timedOut) {
+    const last = res.failWhy ?? (res.timedOut ? "gate timed out" : "gate produced no output");
+    const why = firstEmptyWhy && firstEmptyWhy !== last ? `${last} (first attempt: ${firstEmptyWhy})` : last;
+    const tail = res.stderrTail?.trim();
     return bail(
-      "  \xB7 gate produced no usable output \u2014 deterministic fallback + all unverified",
-      res.timedOut ? "gate timed out" : "gate produced no output",
+      `  \xB7 ${why} \u2014 deterministic fallback + all unverified${tail ? ` [${tail.slice(0, 200)}]` : ""}`,
+      tail ? `${why} \u2014 ${tail.slice(0, 200)}` : why,
       "gate-failed",
       true
     );
+  }
+  try {
+    writeTrailFile(opts.baseDir, opts.runId, "gate.raw.md", res.raw);
+  } catch {
   }
   const parsed = parseGateEnvelope(res.raw);
   if ("failure" in parsed) {
@@ -6386,6 +6420,7 @@ async function runReviewMode(opts) {
     diffMode: opts.diffMode,
     diffText: opts.diffText,
     headShaOverride: opts.headShaOverride,
+    repoIdOverride: opts.repoIdOverride,
     staged: opts.staged,
     workingTree: opts.workingTree
   });
@@ -9140,6 +9175,7 @@ async function runReviewPipeline(input) {
       out,
       peerSeats,
       profile,
+      repoIdOverride: source.postTarget?.repoSlug ? repoIdFromSlug(source.postTarget.repoSlug) : void 0,
       reviewers,
       runId,
       sandbox: typeof values.sandbox === "string" ? values.sandbox : void 0,
@@ -10254,6 +10290,7 @@ async function diffCommand(args) {
       diffMode: source.diffMode,
       diffText: source.diffText,
       headShaOverride: source.headShaOverride,
+      repoIdOverride: source.postTarget?.repoSlug ? repoIdFromSlug(source.postTarget.repoSlug) : void 0,
       staged: source.staged,
       workingTree: source.workingTree
     });
@@ -10696,7 +10733,8 @@ async function probeCommand(rest) {
         cwd,
         ...source.diffMode ? { diffMode: source.diffMode } : {},
         ...source.diffText !== void 0 ? { diffText: source.diffText } : {},
-        headShaOverride: source.headShaOverride
+        headShaOverride: source.headShaOverride,
+        repoIdOverride: repoIdFromSlug(source.postTarget.repoSlug)
       });
     } catch (e) {
       console.error(`ensemble-ai probe: ${e.message}`);

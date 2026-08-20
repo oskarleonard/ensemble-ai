@@ -5,6 +5,7 @@ import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 import { type RunReviewOpts } from '../../reviewers/codex';
 
+import { isUsageLimitFailure } from './claude';
 import type { EvidenceClass } from './evidence';
 import { type ClusterInfo, clusterPostable } from './gate-dedup';
 import { renderGatePrompt } from './gate-prompt';
@@ -94,6 +95,25 @@ export const DOWNGRADE_REASONS = [
   'reference-not-found',
 ] as const;
 export type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
+
+// What to tell an operator staring at an all-unverified run, per whole-envelope failure. These
+// kill every verdict at once (rather than one finding's), so every record carries the same reason —
+// which is what lets the renderer say something true instead of the capability-floor line below.
+// They do NOT share a recovery, and getting that wrong wastes the operator's next move: a `regate`
+// re-reads the SAME persisted packet, so it recovers a gate that came back empty and re-fails
+// identically on a packet that was unusable.
+const WHOLE_ENVELOPE_ADVICE: Partial<Record<DowngradeReason, string>> = {
+  'gate-failed':
+    '  the gate never returned usable output — nothing here was ground-checked; re-run it (`regate`) before trusting or dismissing any finding',
+  'packet-fail':
+    '  the pinned packet was unusable, so nothing could be ground-checked — a `regate` reads that same packet and fails the same way; re-run the REVIEW to pin a fresh one',
+  'unknown-schema':
+    '  the gate replied under an envelope schema this engine does not recognize — nothing was ground-checked; a `regate` may recover a one-off, otherwise the engine and the gate prompt have drifted apart',
+};
+
+// The capability-floor signal this line was originally written for: the gate DID reason, and could
+// still ground nothing (a weak gate model mostly yields unverified).
+const TOOTHLESS_GATE_ADVICE = '  gate teeth did not engage — consider a stronger gate model';
 
 // The composite envelope schema the gate prompt pins + the model must echo. A missing /
 // different value fails the whole envelope closed (all-`unverified`) — the host never
@@ -1024,8 +1044,17 @@ export function renderGateVerdicts(
   );
   // The gate is toothless when findings exist but nothing was groundable — a capability-floor
   // signal (a weak gate model mostly yields unverified). Deterministic, from the counts.
+  //
+  // But a gate that never got to reason is not a weak gate, and telling the operator to raise the
+  // model sends them to tune a seat that never ran (the run that prompted this was already
+  // opus@max). A whole-envelope failure marks EVERY record with the same host reason, so the cases
+  // are separable from the records alone — and they do NOT share a recovery, which is why each says
+  // its own thing rather than sharing one "re-run it" line.
   if (records.length > 0 && c.agree + c.partial + c.false === 0) {
-    out.push('  gate teeth did not engage — consider a stronger gate model');
+    const shared = records.every((r) => r.downgradeReason === records[0].downgradeReason)
+      ? records[0].downgradeReason
+      : undefined;
+    out.push(WHOLE_ENVELOPE_ADVICE[shared as DowngradeReason] ?? TOOTHLESS_GATE_ADVICE);
   }
   // Say the honest thing about the lens wherever its findings are shown (spec §4): one seat, no
   // corroboration signal, and silence proves nothing about the architecture.
@@ -1164,28 +1193,82 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // or the cause is either unreachable (never taught) or unsound (taught to a packet-fed gate).
   const prompt = renderGatePrompt(findings, injections, opts.gateEvidence ?? 'packet');
   log('Gate: grounding findings against the pinned diff hunks — verdict tags…');
-  let res: VoiceRunResult;
-  try {
-    res = await opts.run(prompt, opts.config, {
-      timeoutMs: opts.timeoutMs,
-      ...(opts.worktree ? { worktree: opts.worktree } : {}),
-    });
-  } catch (e) {
+  const spawn = async (): Promise<VoiceRunResult | { threw: Error }> => {
+    try {
+      return await opts.run(prompt, opts.config, {
+        timeoutMs: opts.timeoutMs,
+        ...(opts.worktree ? { worktree: opts.worktree } : {}),
+      });
+    } catch (e) {
+      return { threw: e as Error };
+    }
+  };
+  let attempt = await spawn();
+  // The first attempt's named cause, kept because the SECOND can be the less informative of the
+  // two: a bare empty reply after a named 529 would otherwise erase the 529 — the exact
+  // information loss the rest of this change exists to stop.
+  let firstEmptyWhy: string | null = null;
+  // ONE re-spawn on a seat that came back empty without timing out. Losing the gate costs the
+  // whole run — every reviewer's findings drop to unverified, and the operator is left grounding
+  // them by hand — while a second gate costs one seat. Evidence that this is worth paying: the
+  // 2026-08-19 lisk-backend#738 gate returned nothing after 13 minutes, and a `regate` over the
+  // byte-identical packet with the same model landed 4 agree / 2 partial / 0 unverified.
+  // Deliberately NOT retried: a spawn that threw (no seat ever existed — a different fault), a
+  // timeout (it was working and too slow; a re-spawn just spends the budget twice), and an
+  // operator usage limit (the window is closed until its reset time, so a retry burns nothing but
+  // wall clock).
+  if (
+    !('threw' in attempt) &&
+    !attempt.raw &&
+    !attempt.timedOut &&
+    !isUsageLimitFailure(attempt.failWhy)
+  ) {
+    firstEmptyWhy = attempt.failWhy ?? 'gate produced no output';
+    log(`  · gate returned nothing (${firstEmptyWhy}) — re-spawning once before falling back`);
+    const second = await spawn();
+    // A throw on the RETRY keeps the first attempt's named failure: it is the more informative of
+    // the two, and reporting the retry's spawn error would bury why the gate was retried at all.
+    if (!('threw' in second)) attempt = second;
+  }
+  if ('threw' in attempt) {
     // The spawn itself threw — no seat ever existed, so it read nothing (gateSpawned: false).
     return bail(
-      `  · gate failed (${(e as Error).message}) — deterministic fallback + all unverified`,
-      (e as Error).message,
+      `  · gate failed (${attempt.threw.message}) — deterministic fallback + all unverified`,
+      attempt.threw.message,
       'gate-failed',
       false
     );
   }
+  const res: VoiceRunResult = attempt;
   if (!res.raw || res.timedOut) {
+    // The RUNNER already named the cause — a persistent transient API error, an operator usage
+    // limit, an error result, a wedged seat reclaimed by the liveness watchdog. Collapsing all of
+    // those into "produced no output" (what this said until 2026-08-19) leaves the operator with a
+    // dead run and no way to tell a retryable 529 from a wedged seat, and the reply is not
+    // persisted anywhere either. Prefer failWhy, and carry the stderr tail into the log + the
+    // synthesis error so the trail keeps the evidence. Same precedent as probe-gate.
+    const last = res.failWhy ?? (res.timedOut ? 'gate timed out' : 'gate produced no output');
+    // Both attempts down: report both causes, since they can differ and the earlier one is often
+    // the specific one.
+    const why =
+      firstEmptyWhy && firstEmptyWhy !== last ? `${last} (first attempt: ${firstEmptyWhy})` : last;
+    const tail = res.stderrTail?.trim();
     return bail(
-      '  · gate produced no usable output — deterministic fallback + all unverified',
-      res.timedOut ? 'gate timed out' : 'gate produced no output',
+      `  · ${why} — deterministic fallback + all unverified${tail ? ` [${tail.slice(0, 200)}]` : ''}`,
+      tail ? `${why} — ${tail.slice(0, 200)}` : why,
       'gate-failed',
       true
     );
+  }
+
+  // The gate's reply is the only record of how it reasoned about every finding, and a run whose
+  // verdicts look wrong is un-diagnosable without it. Persist BEFORE parsing so an unparseable
+  // envelope — the case that most needs reading — is kept too. Best-effort: losing the transcript
+  // must never cost the verdicts it describes.
+  try {
+    writeTrailFile(opts.baseDir, opts.runId, 'gate.raw.md', res.raw);
+  } catch {
+    /* best-effort — the verdicts below do not depend on the transcript landing */
   }
 
   const parsed = parseGateEnvelope(res.raw);

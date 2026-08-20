@@ -1837,6 +1837,9 @@ function resolveRepoId(cwd) {
   }
   return gitOrNull(cwd, ["rev-parse", "--show-toplevel"]);
 }
+function repoIdFromSlug(repoSlug) {
+  return `https://github.com/${repoSlug}`;
+}
 function resolveBase(cwd, explicit) {
   if (explicit) return explicit;
   const originHead = gitOrNull(cwd, [
@@ -1853,7 +1856,7 @@ function resolveBase(cwd, explicit) {
 }
 function acquireDiff(opts) {
   const ceiling = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
-  const repoId = resolveRepoId(opts.cwd);
+  const repoId = opts.repoIdOverride ?? resolveRepoId(opts.cwd);
   let mode;
   let rawDiff;
   let baseRef = null;
@@ -2475,6 +2478,10 @@ function isUsageLimitReply(raw) {
 function isRetryableApiStatus(status) {
   return status === 429 || typeof status === "number" && status >= 500 && status <= 599;
 }
+var USAGE_LIMIT_FAIL_PREFIX = "operator usage limit reached";
+function isUsageLimitFailure(failWhy) {
+  return failWhy?.startsWith(USAGE_LIMIT_FAIL_PREFIX) ?? false;
+}
 var TRANSIENT_RETRY_DELAYS_MS = [15e3, 45e3];
 var TRANSIENT_FAST_FAIL_MS = 12e4;
 var CLAUDE_INACTIVITY_TIMEOUT_MS = 6e5;
@@ -2556,7 +2563,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
       if (!timedOut && limitText) {
         return {
-          failWhy: `operator usage limit reached \u2014 ${limitText.slice(0, 160)}`,
+          failWhy: `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${limitText.slice(0, 160)}`,
           ok: false,
           raw: null,
           stderrTail: limitText.slice(0, 300),
@@ -3816,6 +3823,7 @@ async function runReviewMode(opts) {
     diffMode: opts.diffMode,
     diffText: opts.diffText,
     headShaOverride: opts.headShaOverride,
+    repoIdOverride: opts.repoIdOverride,
     staged: opts.staged,
     workingTree: opts.workingTree
   });
@@ -5330,6 +5338,7 @@ export {
   TRANSIENT_RETRY_DELAYS_MS,
   TRUNCATION_MARKER_RE,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
+  USAGE_LIMIT_FAIL_PREFIX,
   VOICES_FILE,
   VOICE_ADAPTERS,
   VOICE_DEFAULTS,
@@ -5406,6 +5415,7 @@ export {
   isStrippedPath,
   isTransientApiErrorReply,
   isUnsafeReadRoot,
+  isUsageLimitFailure,
   isUsageLimitReply,
   isVoiceId,
   keyOf,
@@ -5468,6 +5478,7 @@ export {
   renderReviewPrompt,
   renderSummaryBody,
   renderSynthesisPrompt,
+  repoIdFromSlug,
   resolveBase,
   resolveBin,
   resolveClaudeBin,

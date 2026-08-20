@@ -528,10 +528,40 @@ describe('renderGateVerdicts — tags, counts, teeth notice, trail marker', () =
     expect(verdictCounts(records)).toEqual({ agree: 1, false: 1, partial: 0, unverified: 0 });
   });
 
-  it('emits the "teeth did not engage" notice when findings exist but zero verdicts landed', () => {
-    const records = reconcileGateVerdicts([gf()], { failure: 'gate-failed' }).records;
+  // A gate that never returned is not a weak gate. Telling the operator to raise the model sends
+  // them to tune a seat that never got to reason (the run that prompted this split was already
+  // opus@max). And the three envelope failures do not share a recovery — a regate re-reads the
+  // SAME persisted packet, so recommending it after a packet-fail sends the operator to repeat a
+  // failure verbatim.
+  it('gives each whole-envelope failure its own recovery, and never the model hint', () => {
+    const expected = {
+      'gate-failed': /never returned usable output.*regate/s,
+      'packet-fail': /fails the same way; re-run the REVIEW/s,
+      'unknown-schema': /schema this engine does not recognize/s,
+    } as const;
+    for (const [failure, pattern] of Object.entries(expected)) {
+      const records = reconcileGateVerdicts([gf()], { failure: failure as 'gate-failed' }).records;
+      const text = renderGateVerdicts(records, { scrub, trailWritten: true }).join('\n');
+      expect(text, failure).toMatch(pattern);
+      expect(text, failure).not.toContain('stronger gate model');
+    }
+    // the one that must NOT send the operator to re-run the gate
+    const packetFail = renderGateVerdicts(
+      reconcileGateVerdicts([gf()], { failure: 'packet-fail' }).records,
+      { scrub, trailWritten: true }
+    ).join('\n');
+    expect(packetFail).not.toMatch(/re-run it \(`regate`\)/);
+  });
+
+  it('keeps the "teeth did not engage" model hint when the gate RAN and grounded nothing', () => {
+    // per-finding downgrade (`missing`), not a whole-envelope failure: the seat replied, it just
+    // returned no verdict for this finding — that IS the capability-floor signal.
+    const parsed = parseGateEnvelope(envelope([]));
+    if ('failure' in parsed) throw new Error('fixture envelope must parse');
+    const records = reconcileGateVerdicts([gf()], parsed).records;
     const text = renderGateVerdicts(records, { scrub, trailWritten: true }).join('\n');
     expect(text).toContain('gate teeth did not engage');
+    expect(text).not.toContain('the gate never returned verdicts');
   });
 
   it('renders a LOUD trail-failed marker (dismissals not honored)', () => {
@@ -586,6 +616,137 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
       expect(res.synthesis.degraded).toBe(true);
       expect(res.verdicts.every((v) => v.effectiveVerdict === 'unverified' && v.downgradeReason === 'gate-failed')).toBe(true);
       expect(res.gateTrailWritten).toBe(true); // the unverified trail STILL writes (audit)
+    }
+  });
+
+  // The runner names WHY a seat came back empty (persistent transient API error, operator usage
+  // limit, an error result, a wedged seat reclaimed by the watchdog). Until 2026-08-19 the gate
+  // collapsed all of them to "gate produced no output", which is how a real dead run (MONEY-618's
+  // review) left no way to tell a retryable 529 from a wedged seat.
+  it('carries the runner failWhy + stderr tail into the log and the synthesis error', async () => {
+    const { base, runId } = seed();
+    const logged: string[] = [];
+    const res = await runGate({
+      baseDir: base,
+      config: CFG,
+      expectedHeadSha: HEAD,
+      log: (m) => logged.push(m),
+      reviews,
+      run: async (): Promise<VoiceRunResult> => ({
+        failWhy: 'persistent transient API error after 3 attempts',
+        ok: false,
+        raw: null,
+        stderrTail: 'API Error: 529 overloaded_error',
+        timedOut: false,
+      }),
+      runId,
+    });
+    const line = logged.join('\n');
+    expect(line).toContain('persistent transient API error after 3 attempts');
+    expect(line).toContain('529 overloaded_error');
+    expect(res.synthesis.error).toContain('persistent transient API error after 3 attempts');
+    expect(res.synthesis.error).toContain('529 overloaded_error');
+    // still fail-closed: the named cause changes the DIAGNOSIS, never the verdicts
+    expect(res.verdicts.every((v) => v.effectiveVerdict === 'unverified')).toBe(true);
+  });
+
+  // Losing the gate costs the WHOLE run (every finding drops to unverified); a second gate costs
+  // one seat. The 2026-08-19 lisk-backend#738 gate returned nothing after 13 min and a regate over
+  // the byte-identical packet landed 4 agree / 2 partial / 0 unverified — the failure was transient.
+  it('re-spawns ONCE when the seat returns empty, and the retry\'s verdicts stand', async () => {
+    const { base, runId } = seed();
+    const logged: string[] = [];
+    let calls = 0;
+    const res = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, log: (m) => logged.push(m), reviews, runId,
+      run: async (): Promise<VoiceRunResult> => {
+        calls += 1;
+        return calls === 1
+          ? { ok: false, raw: null, stderrTail: '', timedOut: false }
+          : okRun(goodEnvelope);
+      },
+    });
+    expect(calls).toBe(2);
+    expect(logged.join('\n')).toContain('re-spawning once');
+    expect(res.verdicts.every((v) => v.downgradeReason === 'gate-failed')).toBe(false);
+    expect(verdictCounts(res.verdicts).unverified).toBeLessThan(res.verdicts.length);
+  });
+
+  it('does NOT re-spawn what a retry cannot fix: usage limit, timeout, spawn throw', async () => {
+    const cases: [string, () => Promise<VoiceRunResult>][] = [
+      // the window is closed until its reset time — a retry burns wall clock for nothing
+      ['usage limit', async () => ({ failWhy: 'operator usage limit reached — resets 5pm', ok: false, raw: null, stderrTail: '', timedOut: false })],
+      // it was working and too slow; a re-spawn just spends the budget twice
+      ['timeout', async () => ({ ok: false, raw: null, stderrTail: '', timedOut: true })],
+    ];
+    for (const [label, run] of cases) {
+      const { base, runId } = seed();
+      let calls = 0;
+      const res = await runGate({
+        baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews, runId,
+        run: async (...a: Parameters<typeof run>) => { calls += 1; return run(...a); },
+      });
+      expect(calls, label).toBe(1);
+      expect(res.verdicts.every((v) => v.effectiveVerdict === 'unverified'), label).toBe(true);
+    }
+    // a spawn that THREW never produced a seat — a different fault, and gateSpawned stays false
+    const { base, runId } = seed();
+    let throws = 0;
+    const res = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews, runId,
+      run: async () => { throws += 1; throw new Error('boom'); },
+    });
+    expect(throws).toBe(1);
+    expect(res.gateSpawned).toBe(false);
+  });
+
+  // The retry can REPLACE a named cause with a vaguer one: a bare empty reply after a named 529
+  // would erase the 529 — the exact information loss this whole change exists to stop.
+  it('keeps BOTH causes when the retry fails differently from the first attempt', async () => {
+    const { base, runId } = seed();
+    let calls = 0;
+    const res = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews, runId,
+      run: async (): Promise<VoiceRunResult> => {
+        calls += 1;
+        return calls === 1
+          ? { failWhy: 'reviewer returned an error result (API status 529)', ok: false, raw: null, stderrTail: '', timedOut: false }
+          : { ok: false, raw: null, stderrTail: '', timedOut: false }; // vaguer: no failWhy at all
+      },
+    });
+    expect(res.synthesis.error).toContain('API status 529');
+    expect(res.synthesis.error).toContain('gate produced no output');
+  });
+
+  it('falls back exactly as before when BOTH attempts come back empty', async () => {
+    const { base, runId } = seed();
+    let calls = 0;
+    const res = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews, runId,
+      run: async (): Promise<VoiceRunResult> => {
+        calls += 1;
+        return { failWhy: 'reviewer returned an error result (API status 529)', ok: false, raw: null, stderrTail: '', timedOut: false };
+      },
+    });
+    expect(calls).toBe(2);
+    expect(res.synthesis.degraded).toBe(true);
+    expect(res.verdicts.every((v) => v.effectiveVerdict === 'unverified' && v.downgradeReason === 'gate-failed')).toBe(true);
+    expect(res.synthesis.error).toContain('API status 529');
+  });
+
+  // The reply is the only record of how the gate reasoned about each finding. probe-gate has
+  // persisted its transcript since it shipped; the review gate persisted nothing, so a run whose
+  // verdicts looked wrong could not be re-read.
+  it('persists the gate transcript — on a clean run AND on an unparseable envelope', async () => {
+    for (const [reply, label] of [
+      [goodEnvelope, 'clean'],
+      ['not json', 'unparseable'],
+    ] as const) {
+      const { base, runId } = seed();
+      await runGate({ baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews, run: async () => okRun(reply), runId });
+      const raw = path.join(reviewDir(base, runId), 'gate.raw.md');
+      expect(fs.existsSync(raw), label).toBe(true);
+      expect(fs.readFileSync(raw, 'utf8'), label).toContain(label === 'clean' ? 'codex#1' : 'not json');
     }
   });
 
