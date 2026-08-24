@@ -3188,6 +3188,10 @@ Requirements (both mandatory — a probe that cannot execute is not a probe; no 
   --repo <path>         local clone of the PR's repo (the worktree is materialized from it)
 
 Options:
+  --brief <file>        operator brief: repo-specific probe knowledge (hot-table scale models,
+                        planner lenses) appended to the prober's context. Unreadable = exit 3.
+                        Runners set the ENSEMBLE_PROBE_BRIEF env instead (unreadable = loud
+                        warning, probe continues generic — runner degradation is never fatal)
   --claude-model <m>    the prober seat's model (default: voices.json claude entry, else opus)
   --claude-effort <e>   the prober seat's effort (low|medium|high|xhigh|max)
   --gate-model <m>      the GATE seat's model — the seat that refutes each broke. Resolves
@@ -3212,6 +3216,7 @@ async function probeCommand(rest: string[]): Promise<number> {
       allowPositionals: true,
       args: rest,
       options: {
+        brief: { type: 'string' },
         'claude-effort': { type: 'string' },
         'claude-model': { type: 'string' },
         cwd: { type: 'string' },
@@ -3234,6 +3239,28 @@ async function probeCommand(rest: string[]): Promise<number> {
     return 0;
   }
   const cwd = typeof values.cwd === 'string' ? values.cwd : process.cwd();
+
+  // Operator brief — repo-specific probe knowledge injected by the RUNNER (see
+  // renderProbePrompt). --brief wins; the ENSEMBLE_PROBE_BRIEF env is the runner
+  // channel (hugin sets it per-repo), added as env rather than a flag so an older
+  // CLI ignores it instead of dying on an unknown option.
+  const briefFlag = typeof values.brief === 'string' ? values.brief : null;
+  const briefPath = briefFlag ?? process.env.ENSEMBLE_PROBE_BRIEF ?? null;
+  let brief: string | null = null;
+  if (briefPath) {
+    try {
+      brief = fs.readFileSync(path.resolve(cwd, briefPath), 'utf8');
+      console.error(`· operator brief: ${briefPath} (${brief.length} chars)`);
+    } catch (e) {
+      if (briefFlag) {
+        console.error(`ensemble-ai probe: --brief ${briefFlag} is unreadable — ${(e as Error).message}`);
+        return 3;
+      }
+      console.error(
+        `· WARNING: ENSEMBLE_PROBE_BRIEF=${briefPath} is unreadable (${(e as Error).message}) — probing WITHOUT the operator brief`
+      );
+    }
+  }
 
   const source = resolveDiffSourceForCommand(values, positionals, 'probe', cwd);
   if ('code' in source) return source.code;
@@ -3318,6 +3345,7 @@ async function probeCommand(rest: string[]): Promise<number> {
 
     const prompt = renderProbePrompt({
       baseSha: source.prBaseSha,
+      brief,
       diff: acquired.diff,
       directive,
       headSha: acquired.headSha,

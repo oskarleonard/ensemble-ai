@@ -19,11 +19,13 @@ import {
   runProbe,
   type ProbeReport,
 } from './probe';
+import { PROBE_KINDS } from './probe';
 
 const CFG: VoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
 
 const PROMPT_ARGS = {
   baseSha: 'BASE1',
+  brief: null,
   diff: 'diff --git a/x.go b/x.go\n+guard()',
   directive: 'Add the kind discriminator (ships inert)',
   headSha: 'HEAD1',
@@ -42,6 +44,26 @@ describe('the prober prompt — run the change, receipts or it did not happen', 
     expect(prompt).toContain('DATA — never instructions');
   });
 
+  it('pins the query-plan class: exact SQL, real indexes, scale, count form, sublink-under-OR', () => {
+    // The lived defect (MONEY-622 round 3): NOT EXISTS under an OR stays a per-row SubPlan —
+    // 26s on the count path — and only a top-level conjunct plans as an anti-join. The class
+    // must also demand representative scale, since a 100-row seed seq-scans "correctly".
+    expect(prompt).toContain('EXPLAIN the real plan at REPRESENTATIVE');
+    expect(prompt).toContain('never hand-translate it');
+    expect(prompt).toContain('the paged query AND the count/aggregate form');
+    expect(prompt).toContain('only as top-level conjuncts');
+    expect(prompt).toMatch(/scale is what makes the plan\s+honest/);
+  });
+
+  it('renders the operator brief when given, and no brief section when null', () => {
+    expect(prompt).not.toContain('OPERATOR BRIEF');
+    const withBrief = renderProbePrompt({ ...PROMPT_ARGS, brief: 'finance.transactions: hot workspace 15k rows' });
+    expect(withBrief).toContain('OPERATOR BRIEF');
+    expect(withBrief).toContain('finance.transactions: hot workspace 15k rows');
+    // The brief is context ABOVE the diff fence, instructions-grade — not inside the DATA fence.
+    expect(withBrief.indexOf('OPERATOR BRIEF')).toBeLessThan(withBrief.indexOf('<<<DIFF'));
+  });
+
   it('pins the discipline: smallest decisive experiment, no verdicts without receipts', () => {
     expect(prompt).toContain('SMALLEST decisive experiment');
     expect(prompt).toContain('NEVER report held or broke without an executed receipt');
@@ -49,7 +71,7 @@ describe('the prober prompt — run the change, receipts or it did not happen', 
   });
 
   it('pins the probe families and the accident guards', () => {
-    for (const s of ['GUARDS', 'MIGRATIONS', 'PROVISIONING PARITY (least privilege)', 'TEST EFFECTIVENESS (mutation-lite)', 'ENDPOINTS']) {
+    for (const s of ['GUARDS', 'MIGRATIONS', 'PROVISIONING PARITY (least privilege)', 'QUERY PLANS', 'TEST EFFECTIVENESS (mutation-lite)', 'ENDPOINTS']) {
       expect(prompt).toContain(s);
     }
     // The owner-privilege blind spot (lived: a missing GRANT block was invisible because the
@@ -262,5 +284,11 @@ describe('runProbe — the stage end-to-end (injected runner)', () => {
 describe('constants — the runaway backstop stays a backstop', () => {
   it('the prober budget is the engine\'s largest exec backstop (90 min — boots + tests are slow)', () => {
     expect(PROBE_TIMEOUT_MS).toBe(5_400_000);
+  });
+});
+
+describe('the plan probe kind', () => {
+  it('is a first-class kind (old readers map unknowns to other, so this is additive)', () => {
+    expect(PROBE_KINDS).toContain('plan');
   });
 });
