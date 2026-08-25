@@ -567,7 +567,7 @@ declare function applyHolisticPolicy(records: GateVerdictRecord[], entryById: Re
 
 declare const GATE_VERDICTS: readonly ["agree", "partial", "false", "unverified"];
 type GateVerdict = (typeof GATE_VERDICTS)[number];
-declare const DOWNGRADE_REASONS: readonly ["truncated", "invalid-citation", "duplicate", "missing", "bad-enum", "packet-fail", "gate-failed", "unknown-schema", "trail-write-failed", "reference-not-found"];
+declare const DOWNGRADE_REASONS: readonly ["truncated", "invalid-citation", "duplicate", "missing", "bad-enum", "packet-fail", "gate-failed", "unknown-schema", "trail-write-failed", "reference-not-found", "external-testimony"];
 type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
 type AnchorSide = 'new' | 'old' | null;
 declare const SETTLEMENT_OUTCOMES: readonly ["confirmed", "refuted", "inconclusive"];
@@ -604,6 +604,7 @@ interface GateVerdictRecord {
     postableNote?: string;
     postableStatus: PostableStatus;
     postableSuggestion: PostableSuggestion | null;
+    premise?: 'external-testimony';
     rawVerdict: string | null;
     reason: string;
     rescoredSeverity: Severity | null;

@@ -93,7 +93,13 @@ const REFERENCE_NOT_FOUND_CLAUSE = `
   referenced symbol, file, or line is NOT there at this commit, send "cause": "reference-not-found"
   alongside the unverified verdict — that is the hallucinated-reference red flag. Use it ONLY when
   you actually looked and it is genuinely absent; if you simply could not ground the claim, omit
-  "cause" and leave the verdict a plain unverified.`;
+  "cause" and leave the verdict a plain unverified.
+- premise-conflict (worktree evidence): when a finding's premise concerns the API or data
+  contract, you have read access — CHECK the repo's committed contract artifacts (the OpenAPI
+  spec, generated models/enums, migrations) before agreeing. If the premise CONTRADICTS such an
+  artifact, the repo disagrees with itself: verdict "unverified" with a reason starting
+  "premise-conflict:" naming BOTH sources, so a human adjudicates which one is stale — never
+  side with prose over a contract artifact.`;
 
 // Taught ONLY when the holistic lens actually produced findings this run — so a lens-off run's
 // prompt is byte-identical to the pre-lens one. Every clause here is MECHANIZED by the host in
@@ -174,6 +180,10 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   verified it against the hunk. The replacement may introduce NO identifier, path, or number absent
   from the body or the hunk (same rule as "ops"), and it replaces exactly the cited line. When in
   doubt, omit it: a wrong one-click suggestion is worse than no suggestion.
+- "premise" (optional): the literal "external-testimony" — this finding's load-bearing premise
+  asserts an EXTERNAL system's runtime behavior on in-repo testimony alone (see PREMISE
+  PROVENANCE above). Send it on the partial/unverified you issue for such a finding; an "agree"
+  carrying it is host-downgraded to unverified.
 - "duplicateOf" (optional, unverified ONLY): when this finding describes the SAME defect as another
   listed finding you are confirming (typically: this one's hunk is unavailable while the other's is
   shown), set it to that findingId instead of merely saying so in prose. Your "reason" must still
@@ -217,6 +227,17 @@ edits. Do TWO jobs:
    executed receipt. Reserve it for HIGH-severity findings where the receipt materially changes
    what a reader does — never as a hedge on a verdict you are unsure of (that is what
    "unverified" + "execution-decidable:" is for).
+   PREMISE PROVENANCE: code comments, docs, and commit messages are TESTIMONY — they ground
+   "the repo SAYS X", never "X is true". Executable code and committed contract artifacts (an
+   OpenAPI spec, a generated enum/model, a migration) outrank prose that contradicts them. A
+   test fixture that needs a type-escape hatch (\`as never\`, \`as any\`, \`@ts-expect-error\`)
+   to construct its input proves the code TOLERATES that value while the type system REJECTS
+   it — never that anything PRODUCES it. When a finding's LOAD-BEARING premise asserts an
+   EXTERNAL system's runtime behavior (the backend, another service, a third-party API) and
+   its only support is such in-repo testimony, it cannot earn "agree": send
+   "premise": "external-testimony" on the verdict, and your ceiling is "partial" with ops that
+   hedge the premise-dependent spans (attribute the claim — "the comment at X asserts …" — do
+   not state it as fact), or "unverified". The host fail-closes an "agree" carrying the flag.
 
 ## The findings + their cited hunks
 Each finding's own title + body are wrapped in a <<<CLAIM …>>> … <<<END …>>> fence: that is

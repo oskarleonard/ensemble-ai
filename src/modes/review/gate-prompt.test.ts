@@ -163,3 +163,25 @@ describe('renderGatePrompt — the reference-not-found cause is taught ONLY on w
     expect(prompt).toMatch(/ONLY when\s+you actually looked/);
   });
 });
+
+// PREMISE PROVENANCE: testimony-vs-fact is a WEIGHING rule, so it is taught on every evidence
+// class (a comment is quotable inside a hunk or a finding body either way). The contract-artifact
+// CONFLICT check, by contrast, requires opening files the packet does not carry — taught, like
+// reference-not-found, only where the gate can actually perform it.
+describe('renderGatePrompt — premise provenance doctrine + the external-testimony field', () => {
+  const reviews = [review('codex', [f({ title: 'a finding' })])];
+  const { findings, injections } = prepareGateFindings(reviews, parsePacketHunks(DIFF));
+
+  it('teaches testimony-vs-fact, the type-escape-fixture rule, and the premise field unconditionally', () => {
+    const prompt = renderGatePrompt(findings, injections, 'packet');
+    expect(prompt).toContain('PREMISE PROVENANCE');
+    expect(prompt).toContain('"premise": "external-testimony"');
+    expect(prompt).toContain('as never');
+    expect(prompt).toMatch(/TESTIMONY/);
+  });
+
+  it('teaches the contract-artifact conflict check ONLY on worktree evidence', () => {
+    expect(renderGatePrompt(findings, injections, 'worktree')).toContain('premise-conflict:');
+    expect(renderGatePrompt(findings, injections, 'packet')).not.toContain('premise-conflict');
+  });
+});

@@ -93,6 +93,14 @@ export const DOWNGRADE_REASONS = [
   // gate sees ±25-line hunks, so it structurally cannot tell "this does not exist" from
   // `truncated`, and asserting the stronger cause on weaker evidence would be a lie.
   'reference-not-found',
+  // ADDITIVE (premise provenance, 2026-08-25): the gate sent "agree" while ALSO flagging the
+  // finding's load-bearing premise as an EXTERNAL system's runtime behavior supported only by
+  // in-repo TESTIMONY (a comment / doc / type-escape test fixture). A confirmed-as-fact verdict
+  // cannot rest on testimony — the agree fails closed to unverified so the claim never posts as
+  // fact. Proven on a live run: a stale repo comment ("the backend emits free-text labels")
+  // corroborated by an `as never` fixture led the gate to confirm a finding the backend's own
+  // contract (a closed DB/API enum) refutes.
+  'external-testimony',
 ] as const;
 export type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
 
@@ -146,7 +154,14 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // sent no pointer. Exists because prose dedup ("same defect as X, post it once there") silently
 // sheds the duplicate's framing — proven on a real run where the duplicate held the ONE sentence
 // naming the dangerous direction of a half-open guard, and triage read only the survivor.
-export const GATE_TRAIL_SCHEMA_VERSION = 8;
+// v9: adds `premise` — the gate's premise-provenance flag ('external-testimony'): the finding's
+// load-bearing premise asserts an external system's runtime behavior and its only support is
+// in-repo testimony (comments/docs/type-escape fixtures). Additive like v5-v8: absent everywhere
+// the gate sent no flag. An "agree" carrying it is host-downgraded to unverified under
+// downgradeReason 'external-testimony' so testimony never posts as fact; on partial/unverified it
+// is advisory — trail consumers should render the weaker premise class (e.g. an amber chip)
+// instead of presenting the claim as ground truth.
+export const GATE_TRAIL_SCHEMA_VERSION = 9;
 
 const REASON_CAP = 700;
 const CITATION_CAP = 500;
@@ -377,6 +392,11 @@ export interface RawVerdictEntry {
   // A gate-verified small replacement for the finding's own cited line (agree + fixStatus keep).
   suggestion?: PostableSuggestion;
   sites?: HolisticSite[]; // holistic only — the reinvention in the diff + the pattern's home
+  // Premise-provenance flag: the finding's load-bearing premise is an EXTERNAL-system runtime
+  // claim whose only support is in-repo testimony (a comment / doc / type-escape fixture). Only
+  // the literal 'external-testimony' is honored. Carried on partial/unverified; an "agree"
+  // bearing it is host-downgraded (see reconcileGateVerdicts).
+  premise?: string;
   // The plain-English, user-visible summary of a CONFIRMED finding (agree/partial). Asked for at
   // ≤280 chars; host-capped. Absent ⇒ the model omitted it, which never invalidates the verdict.
   tldr?: string;
@@ -436,6 +456,9 @@ function parseVerdicts(v: unknown): RawVerdictEntry[] {
       ...(sites ? { sites } : {}),
       ...(tldr ? { tldr } : {}),
       ...(e.verify === 'run' ? { verify: 'run' } : {}),
+      // Only the literal value is honored — an unrecognized premise class parses to absent, so a
+      // creative model cannot mint new provenance semantics the host has never reasoned about.
+      ...(e.premise === 'external-testimony' ? { premise: 'external-testimony' } : {}),
     });
   }
   return out;
@@ -522,6 +545,12 @@ export interface GateVerdictRecord {
   // A gate-verified one-click replacement for `line`; null ⇒ none. The per-review CAP is applied
   // by the posting path (consumer config), not here.
   postableSuggestion: PostableSuggestion | null;
+  // Trail v9 (additive): the gate's premise-provenance flag. Present when the finding's
+  // load-bearing premise is an external-system runtime claim resting on in-repo testimony alone.
+  // On what the gate sent as "agree" the host has already fail-closed the verdict (see
+  // downgradeReason 'external-testimony'); on partial/unverified it is advisory — consumers
+  // should surface the weaker premise class rather than presenting the claim as fact.
+  premise?: 'external-testimony';
   rawVerdict: string | null; // exactly what the model returned (may be an invalid enum), null if none
   reason: string;
   rescoredSeverity: Severity | null; // gate's down-scored severity for a partial; null ⇒ unchanged
@@ -677,6 +706,24 @@ export function reconcileGateVerdicts(
       }
       return { ...base, citation, downgradeReason: null, effectiveVerdict: 'false', rawVerdict, reason: e.reason };
     }
+    // PREMISE PROVENANCE (trail v9): "agree" asserts every material claim is grounded FACT, but
+    // the gate itself flagged the load-bearing premise as in-repo TESTIMONY about an external
+    // system — a contradiction the host resolves fail-closed, mirroring invalid-citation: the
+    // verdict drops to unverified under its own machine-readable reason and never posts. On
+    // partial/unverified the flag rides along as data (carried below); on a validated "false" it
+    // is meaningless — the finding is dismissed regardless — so the false branch above ignores it.
+    const premise = e.premise === 'external-testimony' ? ('external-testimony' as const) : undefined;
+    if (premise && e.verdict === 'agree') {
+      return {
+        ...base,
+        citation,
+        downgradeReason: 'external-testimony',
+        effectiveVerdict: 'unverified',
+        premise,
+        rawVerdict,
+        reason: e.reason || 'confirmed on in-repo testimony about an external system — fail-closed to unverified',
+      };
+    }
     // `unverified` + an explicit `reference-not-found` cause: the gate says the thing this
     // finding POINTS AT does not exist at headSha. Honored ONLY on worktree evidence (gate-r3
     // pin 1). On a packet-fed gate the claim is unsound — the gate saw a ±25-line window, so
@@ -684,7 +731,7 @@ export function reconcileGateVerdicts(
     // unverified with a warning, never laundered into the stronger cause.
     if (e.verdict === 'unverified' && e.cause === 'reference-not-found') {
       if (gateEvidence === 'worktree') {
-        return { ...base, citation, downgradeReason: 'reference-not-found', effectiveVerdict: 'unverified', rawVerdict, reason: e.reason || 'the gate could not locate what this finding references at headSha' };
+        return { ...base, citation, downgradeReason: 'reference-not-found', effectiveVerdict: 'unverified', rawVerdict, reason: e.reason || 'the gate could not locate what this finding references at headSha', ...(premise ? { premise } : {}) };
       }
       warnings.push(
         `gate: "reference-not-found" claimed for ${f.findingId} on PACKET evidence — dropped (a packet-fed gate cannot distinguish it from a truncated window)`
@@ -717,6 +764,7 @@ export function reconcileGateVerdicts(
       rawVerdict,
       reason: e.reason,
       ...(duplicateOf ? { duplicateOf } : {}),
+      ...(premise ? { premise } : {}),
       // verify-by-run rides only a CONFIRMED verdict — a hedge on unverified is what the
       // execution-decidable tag is for, and honoring it here would blur the two channels.
       ...(e.verify === 'run' && (e.verdict === 'agree' || e.verdict === 'partial')
