@@ -393,7 +393,22 @@ export function probeCounts(probes: ProbeRecord[]): Record<ProbeOutcome, number>
 // lines, and the counts. A `broke` names its severity and anchor inline.
 export function renderProbeReport(report: ProbeReport, scrub: (s: string) => string): string[] {
   const out: string[] = ['', '  ── prober — the change, checked by RUNNING it ──'];
-  if (report.summary) out.push(`     ${scrub(report.summary).slice(0, 400)}`);
+  if (report.summary) {
+    // The prose summary is written by the PROBER, before the gate adjudicates its brokes — it can
+    // assert a defect the gate then refutes, and rendering it bare lets the stale claim read as
+    // the record (lived: a gate-refuted index finding still headlined a run's summary). The
+    // per-probe gate lines below are the adjudicated truth; when any broke was refuted, say so
+    // ABOVE the prose. Pre-gate renders have no gate fields, so their output is unchanged.
+    const refutedCount = report.probes.filter(
+      (p) => p.outcome === 'broke' && p.gate?.verdict === 'refuted'
+    ).length;
+    if (refutedCount > 0) {
+      out.push(
+        `     [pre-gate summary — ${refutedCount} of its defect claim(s) were REFUTED by the gate; the per-probe verdicts below are the record]`
+      );
+    }
+    out.push(`     ${scrub(report.summary).slice(0, 400)}`);
+  }
   for (const p of report.probes) {
     const sev = p.outcome === 'broke' && p.severity ? ` [${p.severity}]` : '';
     const where = p.evidence ? ` · ${scrub(p.evidence.file)}${p.evidence.line !== null ? `:${p.evidence.line}` : ''}` : '';

@@ -204,6 +204,20 @@ describe('exit semantics — broke gates, blocked does not, no report is a faile
     expect(out).toContain('[broke] [high] p1');
     expect(out).toContain('1 held · 1 broke · 1 blocked');
   });
+
+  // The prose summary is authored by the prober BEFORE the gate adjudicates, so it can assert a
+  // defect the gate then refutes — the render must say so above the prose, or the stale claim
+  // reads as the record (lived on a posted run summary).
+  it('annotates the prose summary when a broke was gate-refuted; pre-gate render is unchanged', () => {
+    const r = report(['broke']);
+    r.summary = 'one probe, one demonstrated defect';
+    const pre = renderProbeReport(r, (s) => s).join('\n');
+    expect(pre).not.toContain('pre-gate summary');
+    r.probes[0].gate = { citation: { file: 'x.go', line: 1 }, reason: 'the contract intends this', verdict: 'refuted' };
+    const post = renderProbeReport(r, (s) => s).join('\n');
+    expect(post).toContain('[pre-gate summary — 1 of its defect claim(s) were REFUTED by the gate');
+    expect(post).toContain('one probe, one demonstrated defect');
+  });
 });
 
 describe('runProbe — the stage end-to-end (injected runner)', () => {

@@ -144,6 +144,29 @@ describe('runProbeGate — the stage end-to-end (injected runner)', () => {
     expect(trail.report.probes[0].gate.citation.line).toBe(268);
   });
 
+  it('carries headSha through the rewrite and re-renders probe.md with the verdicts', async () => {
+    const base = tmp();
+    const reply = '```json\n' + JSON.stringify({ verdicts: [{ citation: { file: 'x.go', line: 1 }, id: 'p1', reason: 'intended by contract', verdict: 'refuted' }] }) + '\n```';
+    const out = await runProbeGate({
+      baseDir: base,
+      config: CFG,
+      headSha: 'HEADX',
+      report: report([probe()]),
+      run: async () => ({ ok: true, raw: reply, stderrTail: '', timedOut: false }),
+      runId: 'g9',
+      worktree: '/tmp/wt',
+    });
+    expect(out.report.probes[0].gate?.verdict).toBe('refuted');
+    // headSha survives the rewrite — dropping it regressed the stale-anchor protection.
+    const trail = JSON.parse(fs.readFileSync(path.join(reviewDir(base, 'g9'), 'probe-report.json'), 'utf8'));
+    expect(trail.headSha).toBe('HEADX');
+    // probe.md is re-rendered post-gate: it carries the verdict line + the summary annotation
+    // (runProbe's pre-gate write had neither).
+    const md = fs.readFileSync(path.join(reviewDir(base, 'g9'), 'probe.md'), 'utf8');
+    expect(md).toContain('REFUTED (cleared)');
+    expect(md).toContain('pre-gate summary');
+  });
+
   it('a failed gate leaves the broke STANDING as inconclusive (fail toward caution)', async () => {
     const out = await runProbeGate({
       baseDir: tmp(),
