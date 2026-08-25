@@ -3589,7 +3589,17 @@ function probeCounts(probes) {
 }
 function renderProbeReport(report, scrub) {
   const out = ["", "  \u2500\u2500 prober \u2014 the change, checked by RUNNING it \u2500\u2500"];
-  if (report.summary) out.push(`     ${scrub(report.summary).slice(0, 400)}`);
+  if (report.summary) {
+    const refutedCount = report.probes.filter(
+      (p) => p.outcome === "broke" && p.gate?.verdict === "refuted"
+    ).length;
+    if (refutedCount > 0) {
+      out.push(
+        `     [pre-gate summary \u2014 ${refutedCount} of its defect claim(s) were REFUTED by the gate; the per-probe verdicts below are the record]`
+      );
+    }
+    out.push(`     ${scrub(report.summary).slice(0, 400)}`);
+  }
   for (const p of report.probes) {
     const sev = p.outcome === "broke" && p.severity ? ` [${p.severity}]` : "";
     const where = p.evidence ? ` \xB7 ${scrub(p.evidence.file)}${p.evidence.line !== null ? `:${p.evidence.line}` : ""}` : "";
@@ -3769,10 +3779,18 @@ async function runProbeGate(opts) {
       opts.baseDir,
       opts.runId,
       "probe-report.json",
-      JSON.stringify({ report, runId: opts.runId }, null, 2)
+      JSON.stringify(
+        { ...opts.headSha ? { headSha: opts.headSha } : {}, report, runId: opts.runId },
+        null,
+        2
+      )
     );
   } catch (e) {
     log(`  \xB7 probe-gate: probe-report.json rewrite FAILED (${e.message}) \u2014 verdicts are in stdout only`);
+  }
+  try {
+    writeTrailFile(opts.baseDir, opts.runId, "probe.md", renderProbeReport(report, (s) => s).join("\n"));
+  } catch {
   }
   return { ran: true, report, spawned };
 }
@@ -10896,6 +10914,7 @@ async function probeCommand(rest) {
     const gate = await runProbeGate({
       baseDir: out,
       config: gateSeat.config,
+      headSha: acquired.headSha,
       log: (m) => console.error(m),
       report,
       runId,

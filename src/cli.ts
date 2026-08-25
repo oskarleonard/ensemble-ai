@@ -3375,6 +3375,7 @@ async function probeCommand(rest: string[]): Promise<number> {
     const gate = await runProbeGate({
       baseDir: out,
       config: gateSeat.config,
+      headSha: acquired.headSha,
       log: (m) => console.error(m),
       report,
       runId,

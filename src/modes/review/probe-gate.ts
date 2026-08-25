@@ -9,6 +9,7 @@ import {
   type ProbeGateVerdict,
   type ProbeRecord,
   type ProbeReport,
+  renderProbeReport,
 } from './probe';
 
 // THE PROBE GATE (2026-08-10) — the adversarial verifier for the execution prober, the reason a
@@ -191,6 +192,10 @@ export type ProbeGateRunner = (
 export interface RunProbeGateOptions {
   baseDir: string;
   config: VoiceConfig;
+  // The PR head runProbe persisted into probe-report.json. The gate's rewrite of that file must
+  // carry it forward — omitting it here silently dropped the stale-anchor protection the field
+  // exists for (a poster could no longer refuse receipts from a moved head).
+  headSha?: string;
   log?: (m: string) => void;
   report: ProbeReport;
   run?: ProbeGateRunner;
@@ -257,10 +262,21 @@ export async function runProbeGate(opts: RunProbeGateOptions): Promise<ProbeGate
       opts.baseDir,
       opts.runId,
       'probe-report.json',
-      JSON.stringify({ report, runId: opts.runId }, null, 2),
+      JSON.stringify(
+        { ...(opts.headSha ? { headSha: opts.headSha } : {}), report, runId: opts.runId },
+        null,
+        2
+      ),
     );
   } catch (e) {
     log(`  · probe-gate: probe-report.json rewrite FAILED (${(e as Error).message}) — verdicts are in stdout only`);
+  }
+  // Re-render probe.md too: runProbe wrote it pre-gate, so without this rewrite the durable
+  // markdown never carries the verdicts (or the summary's pre-gate annotation) that stdout shows.
+  try {
+    writeTrailFile(opts.baseDir, opts.runId, 'probe.md', renderProbeReport(report, (s) => s).join('\n'));
+  } catch {
+    /* best-effort — probe-report.json above is the durable artifact */
   }
   return { ran: true, report, spawned };
 }
