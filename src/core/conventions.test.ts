@@ -114,11 +114,12 @@ describe('A2 · monorepo walk-up + fallback + prose-ref', () => {
 // A3 — over-cap NAMED truncated in the manifest.
 describe('A3 · over-cap files are NAMED, never silently dropped', () => {
   it('caps total size and names the truncated + omitted files', async () => {
-    const big = 'x'.repeat(5_000);
+    // DISTINCT contents — byte-identical files dedupe (see the duplicate-content suite below),
+    // which would let everything fit and defeat this test's premise.
     const reader = memoryConventionReader({
       'CLAUDE.md': '@AGENTS.md\n@ai-spec/DISCOVERIES.md',
-      'AGENTS.md': big,
-      'ai-spec/DISCOVERIES.md': big,
+      'AGENTS.md': 'x'.repeat(5_000),
+      'ai-spec/DISCOVERIES.md': 'y'.repeat(5_000),
     });
     const { text, manifest } = await gatherConventions(reader, ['a.ts'], {
       capBytes: 6_000,
@@ -134,6 +135,40 @@ describe('A3 · over-cap files are NAMED, never silently dropped', () => {
     expect(manifest.files.map((f) => f.path)).toEqual(
       expect.arrayContaining(['CLAUDE.md', 'AGENTS.md', 'ai-spec/DISCOVERIES.md'])
     );
+  });
+
+  it('FAIR SHARE: a giant file discovered first no longer starves a later mandatory doc', async () => {
+    // The live incident this pins: CLAUDE.md links a ~180KB DISCOVERIES.md one line before a
+    // 26KB LEARNINGS.md the repo calls mandatory. The old first-come allocation gave the giant
+    // the whole remaining budget and omitted LEARNINGS entirely; water-filling takes the small
+    // file WHOLE and head-truncates the giant into its own share.
+    const reader = memoryConventionReader({
+      'CLAUDE.md': 'see spec/DISCOVERIES.md then see spec/LEARNINGS.md',
+      'spec/DISCOVERIES.md': 'd'.repeat(50_000),
+      'spec/LEARNINGS.md': 'l'.repeat(3_000),
+    });
+    const { text, manifest } = await gatherConventions(reader, ['a.ts'], { capBytes: 10_000 });
+    const byPath = Object.fromEntries(manifest.files.map((f) => [f.path, f]));
+    expect(byPath['spec/LEARNINGS.md']).toMatchObject({ included: true, truncated: false });
+    expect(byPath['spec/DISCOVERIES.md']).toMatchObject({ included: true, truncated: true, reason: 'over-cap' });
+    expect(text).toContain('l'.repeat(3_000)); // the mandatory doc arrives WHOLE
+    expect(manifest.totalBytes).toBeLessThanOrEqual(10_000);
+  });
+
+  it('DUPLICATE CONTENT: an AGENTS.md symlink/copy of CLAUDE.md spends the budget once, named', async () => {
+    const shared = 'the one true conventions prose '.repeat(100); // ~3.1KB
+    const reader = memoryConventionReader({
+      'CLAUDE.md': shared,
+      'AGENTS.md': shared,
+      'CONTRIBUTING.md': 'c'.repeat(500),
+    });
+    const { text, manifest } = await gatherConventions(reader, ['a.ts'], { capBytes: 5_000 });
+    const byPath = Object.fromEntries(manifest.files.map((f) => [f.path, f]));
+    expect(byPath['CLAUDE.md']).toMatchObject({ included: true, truncated: false });
+    expect(byPath['AGENTS.md']).toMatchObject({ included: false, reason: 'duplicate', duplicateOf: 'CLAUDE.md' });
+    expect(byPath['CONTRIBUTING.md']).toMatchObject({ included: true });
+    // the shared prose appears exactly once in the packet
+    expect(text.indexOf(shared)).toBe(text.lastIndexOf(shared));
   });
 
   it('--no-conventions is modeled as an empty gather by the caller (no reader call)', async () => {

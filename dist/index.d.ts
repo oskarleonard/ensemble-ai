@@ -17,7 +17,8 @@ interface ConventionFileEntry {
     bytes: number;
     included: boolean;
     truncated: boolean;
-    reason?: 'over-cap' | 'max-files';
+    reason?: 'over-cap' | 'max-files' | 'duplicate';
+    duplicateOf?: string;
 }
 interface ConventionManifest {
     capBytes: number;

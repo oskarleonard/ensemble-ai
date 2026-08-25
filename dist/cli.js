@@ -273,8 +273,8 @@ async function gatherConventions(reader, changedPaths, config = {}) {
     }
   }
   const files = [];
-  const chunks = [];
-  let used = 0;
+  const candidates = [];
+  const byContent = /* @__PURE__ */ new Map();
   let visited = 0;
   while (queue.length > 0) {
     const rel = queue.shift();
@@ -290,37 +290,74 @@ async function gatherConventions(reader, changedPaths, config = {}) {
     visited++;
     const dir = dirOf(rel);
     for (const ref of extractRefs(content)) enqueue(resolveInRepo(dir, ref));
-    const remaining = capBytes - used;
-    const header = fileHeader(rel);
-    const headerBytes = Buffer.byteLength(header, "utf8");
-    if (remaining <= headerBytes) {
-      files.push({ path: rel, bytes, included: false, truncated: false, reason: "over-cap" });
+    const original = byContent.get(content);
+    if (original !== void 0) {
+      files.push({ path: rel, bytes, included: false, truncated: false, reason: "duplicate", duplicateOf: original });
       continue;
     }
-    if (headerBytes + bytes <= remaining) {
-      chunks.push(header + content);
-      used += headerBytes + bytes;
-      files.push(
-        readTruncated ? { path: rel, bytes, included: true, truncated: true, reason: "over-cap" } : { path: rel, bytes, included: true, truncated: false }
-      );
-    } else {
-      const noticeFor = (n) => `
+    byContent.set(content, rel);
+    candidates.push({ bytes, content, readTruncated, rel });
+  }
+  const noticeFor = (n) => `
 
 \u2026[${n} bytes truncated \u2014 over the ${capBytes}-byte conventions cap]\u2026
 `;
-      const noticeReserve = Buffer.byteLength(noticeFor(bytes), "utf8");
-      const contentBudget = remaining - headerBytes - noticeReserve;
-      if (contentBudget <= 0) {
-        files.push({ path: rel, bytes, included: false, truncated: false, reason: "over-cap" });
-        continue;
-      }
-      const head = sliceBytes(content, contentBudget);
-      const headBytes = Buffer.byteLength(head, "utf8");
-      const notice = noticeFor(bytes - headBytes);
-      chunks.push(`${header}${head}${notice}`);
-      used += headerBytes + headBytes + Buffer.byteLength(notice, "utf8");
-      files.push({ path: rel, bytes, included: true, truncated: true, reason: "over-cap" });
+  const costed = candidates.map((c) => {
+    const header = fileHeader(c.rel);
+    return { ...c, header, headerBytes: Buffer.byteLength(header, "utf8") };
+  });
+  const allocation = /* @__PURE__ */ new Map();
+  let remaining = capBytes;
+  let active = [...costed];
+  for (; ; ) {
+    if (active.length === 0) break;
+    const share = Math.floor(remaining / active.length);
+    const fits = active.filter((c) => c.headerBytes + c.bytes <= share);
+    if (fits.length === 0) break;
+    for (const c of fits) {
+      allocation.set(c.rel, -1);
+      remaining -= c.headerBytes + c.bytes;
     }
+    active = active.filter((c) => !allocation.has(c.rel));
+  }
+  while (active.length > 0) {
+    const share = Math.floor(remaining / active.length);
+    const unframeable = active.filter(
+      (c) => share - c.headerBytes - Buffer.byteLength(noticeFor(c.bytes), "utf8") <= 0
+    );
+    if (unframeable.length > 0) {
+      active = active.filter((c) => !unframeable.includes(c));
+      continue;
+    }
+    for (const c of active) {
+      const contentBudget = share - c.headerBytes - Buffer.byteLength(noticeFor(c.bytes), "utf8");
+      allocation.set(c.rel, contentBudget);
+      remaining -= share;
+    }
+    break;
+  }
+  const chunks = [];
+  let used = 0;
+  for (const c of costed) {
+    const alloc = allocation.get(c.rel);
+    if (alloc === void 0) {
+      files.push({ path: c.rel, bytes: c.bytes, included: false, truncated: false, reason: "over-cap" });
+      continue;
+    }
+    if (alloc === -1) {
+      chunks.push(c.header + c.content);
+      used += c.headerBytes + c.bytes;
+      files.push(
+        c.readTruncated ? { path: c.rel, bytes: c.bytes, included: true, truncated: true, reason: "over-cap" } : { path: c.rel, bytes: c.bytes, included: true, truncated: false }
+      );
+      continue;
+    }
+    const head = sliceBytes(c.content, alloc);
+    const headBytes = Buffer.byteLength(head, "utf8");
+    const notice = noticeFor(c.bytes - headBytes);
+    chunks.push(`${c.header}${head}${notice}`);
+    used += c.headerBytes + headBytes + Buffer.byteLength(notice, "utf8");
+    files.push({ path: c.rel, bytes: c.bytes, included: true, truncated: true, reason: "over-cap" });
   }
   return {
     text: chunks.join("").replace(/^\n+/, ""),
