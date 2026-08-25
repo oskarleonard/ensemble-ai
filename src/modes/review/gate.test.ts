@@ -252,8 +252,8 @@ describe('reconcileGateVerdicts — postable text (A+)', () => {
     expect(u).toMatchObject({ effectiveVerdict: 'unverified', postableBody: null, postableStatus: 'not-postable' });
   });
 
-  it('the durable trail schema is bumped to v8 (duplicateOf/duplicates; verifyRequested was v7, settlement v6, postable/placement/anchorSide/tldr v2–v5)', () => {
-    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(8);
+  it('the durable trail schema is bumped to v9 (premise; duplicateOf/duplicates was v8, verifyRequested v7, settlement v6, postable/placement/anchorSide/tldr v2–v5)', () => {
+    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(9);
   });
 
   describe('duplicateOf → threaded duplicate echoes (trail v8)', () => {
@@ -920,6 +920,54 @@ describe('gateDispositionSummary — receipt disposition payload (DC7)', () => {
       trailWritten: true,
       verdictCounts: { agree: 1, false: 1, partial: 0, unverified: 0 },
     });
+  });
+});
+
+// ── Premise provenance — the external-testimony flag (trail v9) ─────────────────────────
+describe('premise provenance — external-testimony (trail v9)', () => {
+  it('parses only the literal value; unrecognized premise classes parse to absent', () => {
+    const p = parseGateEnvelope(envelope([
+      { findingId: 'codex#1', premise: 'external-testimony', reason: 'r', verdict: 'partial' },
+      { findingId: 'grok#1', premise: 'vibes', reason: 'r', verdict: 'partial' },
+    ]));
+    if ('failure' in p) throw new Error('unexpected parse failure');
+    expect(p.verdicts[0].premise).toBe('external-testimony');
+    expect(p.verdicts[1].premise).toBeUndefined();
+  });
+
+  it('fail-closes an "agree" carrying the flag: unverified(external-testimony), never postable', () => {
+    const { records } = reconcileGateVerdicts([gf()], parseGateEnvelope(envelope([
+      { findingId: 'codex#1', premise: 'external-testimony', reason: 'rests on a repo comment about the backend', verdict: 'agree' },
+    ])));
+    expect(records[0]).toMatchObject({
+      downgradeReason: 'external-testimony',
+      effectiveVerdict: 'unverified',
+      postableStatus: 'not-postable',
+      premise: 'external-testimony',
+      rawVerdict: 'agree',
+      tldr: null,
+    });
+  });
+
+  it('carries the flag on partial/unverified without altering the verdict', () => {
+    const { records } = reconcileGateVerdicts(
+      [gf({ findingId: 'codex#1' }), gf({ findingId: 'grok#1', reviewer: 'grok' })],
+      parseGateEnvelope(envelope([
+        { findingId: 'codex#1', premise: 'external-testimony', reason: 'r', verdict: 'partial' },
+        { findingId: 'grok#1', premise: 'external-testimony', reason: 'r', verdict: 'unverified' },
+      ]))
+    );
+    const byId = Object.fromEntries(records.map((r) => [r.findingId, r]));
+    expect(byId['codex#1']).toMatchObject({ downgradeReason: null, effectiveVerdict: 'partial', premise: 'external-testimony' });
+    expect(byId['grok#1']).toMatchObject({ downgradeReason: null, effectiveVerdict: 'unverified', premise: 'external-testimony' });
+  });
+
+  it('a validated "false" ignores the flag — the dismissal stands and the record carries no premise', () => {
+    const { records } = reconcileGateVerdicts([gf()], parseGateEnvelope(envelope([
+      { citation: ANCHOR, findingId: 'codex#1', premise: 'external-testimony', reason: 'r', verdict: 'false' },
+    ])));
+    expect(records[0].effectiveVerdict).toBe('false');
+    expect(records[0].premise).toBeUndefined();
   });
 });
 
