@@ -40,7 +40,9 @@ export interface ConventionFileEntry {
   bytes: number; // file size as read (bounded by the read cap — see ConventionReader.read)
   included: boolean; // its content is in `text` (fully or head-truncated)
   truncated: boolean; // head-only, because it crossed the cap
-  reason?: 'over-cap' | 'max-files'; // why it was truncated/omitted (cap · file-count ceiling)
+  // why it was truncated/omitted: cap · file-count ceiling · byte-identical to an earlier file
+  reason?: 'over-cap' | 'max-files' | 'duplicate';
+  duplicateOf?: string; // reason 'duplicate' only: the earlier path whose content this repeats
 }
 
 export interface ConventionManifest {
@@ -178,9 +180,25 @@ export async function gatherConventions(
     }
   }
 
+  // ── Phase 1 · DISCOVERY ────────────────────────────────────────────────────────────
+  // Walk the doc web and hold every reachable file (bounded reads), deciding NOTHING about
+  // budget yet. Splitting discovery from allocation is the fix for the starvation bug this
+  // replaced: the old single pass spent the budget in DISCOVERY order, so one giant file
+  // found early (a 180KB DISCOVERIES.md) consumed everything and a mandatory doc found one
+  // link later (LEARNINGS.md) was omitted whole — which file got read was a lottery over
+  // where in CLAUDE.md its link happened to sit.
+  interface Candidate {
+    rel: string;
+    content: string;
+    bytes: number;
+    readTruncated: boolean;
+  }
   const files: ConventionFileEntry[] = [];
-  const chunks: string[] = [];
-  let used = 0;
+  const candidates: Candidate[] = [];
+  // Byte-identical content → ONE candidate. Repos routinely ship AGENTS.md as a symlink to
+  // (or copy of) CLAUDE.md; reading both spent the budget twice on the same prose. The
+  // duplicate is NAMED in the manifest (honesty rule), never silently dropped.
+  const byContent = new Map<string, string>(); // content → first rel
   // maxFiles bounds distinct REAL (existing) files visited — NOT speculative seed
   // candidates. Entry-file / common-doc seeds are enqueued for every touched dir before
   // we know they exist; counting those misses against the ceiling would let a deep tree
@@ -210,53 +228,111 @@ export async function gatherConventions(
     }
     visited++;
     // Discover transitive refs BEFORE cap decisions (an over-cap file can still link
-    // to a small important one; the `seen` dedupe bounds any cycle).
+    // to a small important one; the `seen` dedupe bounds any cycle). Duplicates too:
+    // their RELATIVE refs resolve against their own dir, which may reach files the
+    // original's dir does not.
     const dir = dirOf(rel);
     for (const ref of extractRefs(content)) enqueue(resolveInRepo(dir, ref));
 
-    // The emitted `text` carries the per-file framing (a header, and for a truncated
-    // file a notice) — count THAT toward the cap too, so the flattened text actually
-    // honors capBytes rather than overshooting by the sum of every header.
-    const remaining = capBytes - used;
-    const header = fileHeader(rel);
-    const headerBytes = Buffer.byteLength(header, 'utf8');
-    if (remaining <= headerBytes) {
-      // Not even room for the header → NAMED as omitted, never silently dropped.
-      files.push({ path: rel, bytes, included: false, truncated: false, reason: 'over-cap' });
+    const original = byContent.get(content);
+    if (original !== undefined) {
+      files.push({ path: rel, bytes, included: false, truncated: false, reason: 'duplicate', duplicateOf: original });
       continue;
     }
-    if (headerBytes + bytes <= remaining) {
-      chunks.push(header + content);
-      used += headerBytes + bytes;
-      // A read-truncated file that still fit `remaining` is a HEAD, not the whole file —
-      // record it truncated (never silently "complete"), same honesty rule as over-cap.
-      files.push(
-        readTruncated
-          ? { path: rel, bytes, included: true, truncated: true, reason: 'over-cap' }
-          : { path: rel, bytes, included: true, truncated: false }
-      );
-    } else {
-      // Reserve room for the header + the truncation notice within `remaining` so the
-      // total never exceeds the cap. noticeFor(bytes) upper-bounds the notice's digit
-      // count (the real notice has ≤ as many digits) → `used` stays ≤ capBytes.
-      const noticeFor = (n: number): string =>
-        `\n\n…[${n} bytes truncated — over the ${capBytes}-byte conventions cap]…\n`;
-      const noticeReserve = Buffer.byteLength(noticeFor(bytes), 'utf8');
-      const contentBudget = remaining - headerBytes - noticeReserve;
-      if (contentBudget <= 0) {
-        // No room for header + notice (+ content) → NAMED as omitted, never silent.
-        files.push({ path: rel, bytes, included: false, truncated: false, reason: 'over-cap' });
-        continue;
-      }
-      const head = sliceBytes(content, contentBudget);
-      const headBytes = Buffer.byteLength(head, 'utf8');
-      const notice = noticeFor(bytes - headBytes);
-      chunks.push(`${header}${head}${notice}`);
-      used += headerBytes + headBytes + Buffer.byteLength(notice, 'utf8');
-      files.push({ path: rel, bytes, included: true, truncated: true, reason: 'over-cap' });
-    }
+    byContent.set(content, rel);
+    candidates.push({ bytes, content, readTruncated, rel });
   }
 
+  // ── Phase 2 · FAIR-SHARE ALLOCATION (water-filling) ───────────────────────────────
+  // Every candidate competes for an equal share of capBytes; a file smaller than the
+  // current share is taken WHOLE and its unused share redistributes to the rest, until
+  // only over-share files remain — those split what is left evenly as head-truncations.
+  // Deterministic, order-independent: no file's fate depends on where its link sat.
+  // The emitted `text` carries per-file framing (a header, and for a truncated file a
+  // notice) — each file's allocation must cover its framing too, so the flattened text
+  // honors capBytes rather than overshooting by the sum of every header.
+  const noticeFor = (n: number): string =>
+    `\n\n…[${n} bytes truncated — over the ${capBytes}-byte conventions cap]…\n`;
+  interface Costed extends Candidate {
+    header: string;
+    headerBytes: number;
+  }
+  const costed: Costed[] = candidates.map((c) => {
+    const header = fileHeader(c.rel);
+    return { ...c, header, headerBytes: Buffer.byteLength(header, 'utf8') };
+  });
+  // rel → whole-content marker (-1) | sliced content budget | absent = omitted (over-cap)
+  const allocation = new Map<string, number>();
+  let remaining = capBytes;
+  let active = [...costed];
+  // Take-whole rounds: each pass recomputes the equal share and admits every file whose
+  // ENTIRE held content (+ header) fits it. Terminates: a pass either admits ≥1 file or
+  // breaks.
+  for (;;) {
+    if (active.length === 0) break;
+    const share = Math.floor(remaining / active.length);
+    const fits = active.filter((c) => c.headerBytes + c.bytes <= share);
+    if (fits.length === 0) break;
+    for (const c of fits) {
+      allocation.set(c.rel, -1);
+      remaining -= c.headerBytes + c.bytes;
+    }
+    active = active.filter((c) => !allocation.has(c.rel));
+  }
+  // Truncation rounds: the survivors are all bigger than the equal share, so each gets a
+  // head sliced to its share (minus header + notice reserve — noticeFor(bytes) upper-bounds
+  // the real notice's digit count, keeping the total ≤ capBytes). A share too small to even
+  // frame a file omits it (NAMED over-cap) and its share redistributes to the rest.
+  // Terminates: a pass either omits ≥1 file or allocates all and exits.
+  while (active.length > 0) {
+    const share = Math.floor(remaining / active.length);
+    const unframeable = active.filter(
+      (c) => share - c.headerBytes - Buffer.byteLength(noticeFor(c.bytes), 'utf8') <= 0
+    );
+    if (unframeable.length > 0) {
+      active = active.filter((c) => !unframeable.includes(c));
+      continue; // omitted — allocation has no entry for them
+    }
+    for (const c of active) {
+      const contentBudget = share - c.headerBytes - Buffer.byteLength(noticeFor(c.bytes), 'utf8');
+      allocation.set(c.rel, contentBudget);
+      remaining -= share;
+    }
+    break;
+  }
+
+  // ── Phase 3 · EMISSION — in discovery order, so the packet reads seeds-first ───────
+  const chunks: string[] = [];
+  let used = 0;
+  for (const c of costed) {
+    const alloc = allocation.get(c.rel);
+    if (alloc === undefined) {
+      // No allocation could frame it → NAMED as omitted, never silently dropped.
+      files.push({ path: c.rel, bytes: c.bytes, included: false, truncated: false, reason: 'over-cap' });
+      continue;
+    }
+    if (alloc === -1) {
+      chunks.push(c.header + c.content);
+      used += c.headerBytes + c.bytes;
+      // A read-truncated file taken "whole" is still only a HEAD of the on-disk file —
+      // record it truncated (never silently "complete"), same honesty rule as over-cap.
+      files.push(
+        c.readTruncated
+          ? { path: c.rel, bytes: c.bytes, included: true, truncated: true, reason: 'over-cap' }
+          : { path: c.rel, bytes: c.bytes, included: true, truncated: false }
+      );
+      continue;
+    }
+    const head = sliceBytes(c.content, alloc);
+    const headBytes = Buffer.byteLength(head, 'utf8');
+    const notice = noticeFor(c.bytes - headBytes);
+    chunks.push(`${c.header}${head}${notice}`);
+    used += c.headerBytes + headBytes + Buffer.byteLength(notice, 'utf8');
+    files.push({ path: c.rel, bytes: c.bytes, included: true, truncated: true, reason: 'over-cap' });
+  }
+
+  // Manifest order = discovery order for candidates; max-files / duplicate entries were
+  // pushed at discovery time, so sort by path-stability is unnecessary — consumers key by path.
   return {
     text: chunks.join('').replace(/^\n+/, ''),
     manifest: { capBytes, files, totalBytes: used },
