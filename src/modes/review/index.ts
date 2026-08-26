@@ -372,7 +372,9 @@ export async function runReviewMode(
       // A failed seat names its cause on the outcome line: a consumer that reads only the log
       // tail (hugin distills a dead run's failure text from it) otherwise sees a state and no why.
       const cause =
-        seat.review.terminalState === 'reviewed' ? '' : ` — ${seat.review.summary.slice(0, 200)}`;
+        seat.review.terminalState === 'reviewed'
+          ? ''
+          : ` — ${seat.review.summary.replace(/\s+/g, ' ').slice(0, 200)}`;
       log(
         `  · ${id}: ${seat.review.terminalState} — ${seat.review.findings.length} finding(s) · evidence ${seat.realized}${cause}`
       );

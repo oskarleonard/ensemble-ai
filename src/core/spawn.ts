@@ -232,7 +232,11 @@ export function runReviewerExec(
     } else if (streamStdout) {
       child.stdout?.on('data', (chunk: Buffer) => {
         armIdle();
-        streamTail = (streamTail + chunk.toString('utf8')).slice(-streamLimit);
+        streamTail += chunk.toString('utf8');
+        // Trim at twice the cap, not on every chunk: an hour-long seat emits thousands of
+        // events, and re-copying a 1 MB tail per event is avoidable churn. The bound the
+        // caller sees is enforced once, at settle.
+        if (streamTail.length > streamLimit * 2) streamTail = streamTail.slice(-streamLimit);
       });
     }
     let settled = false;
@@ -261,7 +265,7 @@ export function runReviewerExec(
       resolve({
         raw,
         stderrTail,
-        ...(streamStdout ? { streamTail } : {}),
+        ...(streamStdout ? { streamTail: streamTail.slice(-streamLimit) } : {}),
         timedOut,
         ...(timedOutReason ? { timedOutReason } : {}),
       });
