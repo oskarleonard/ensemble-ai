@@ -41,7 +41,13 @@ function stubAdapter(replies: CodexReviewResult[]): {
 
 const reviewed = (): CodexReviewResult => ({ ok: true, raw: REVIEW, stderrTail: '', timedOut: false });
 const empty = (why = 'killed'): CodexReviewResult => ({ ok: false, raw: null, stderrTail: why, timedOut: false });
-const timedOut = (): CodexReviewResult => ({ ok: false, raw: null, stderrTail: '', timedOut: true });
+const timedOut = (extra: Partial<CodexReviewResult> = {}): CodexReviewResult => ({
+  ok: false,
+  raw: null,
+  stderrTail: '',
+  timedOut: true,
+  ...extra,
+});
 
 let out: string;
 beforeEach(() => {
@@ -204,5 +210,61 @@ describe('the packet path is untouched', () => {
     });
     expect(seat.review.terminalState).toBe('failed-reviewer');
     expect(seat.review.summary).toContain('codex binary not found');
+  });
+});
+
+// The trail must say WHY a seat ended, not only that it did: run 2026-08-26-10-45-52 left
+// "timed out" behind and the watchdog identity had to be reconstructed from artifact mtimes.
+describe('a seat persists its run diagnostics and progress stream beside the reply', () => {
+  const worktreeSeat = (adapter: ReturnType<typeof stubAdapter>['adapter']) =>
+    runCoreSeat({
+      ...base,
+      adapter,
+      out,
+      qualification: { profile: GROK_SANDBOX_PROFILE, qualified: true, reason: null },
+      retryOnPacket: RETRIES_ON_PACKET.grok,
+      reviewer: GROK,
+      worktree: '/tmp/wt',
+    });
+
+  it('an absolute-watchdog timeout names the backstop and records the watchdog + stderr tail', async () => {
+    const { adapter } = stubAdapter([timedOut({ stderrTail: 'last stderr line', timedOutReason: 'absolute' })]);
+    const seat = await worktreeSeat(adapter);
+    expect(seat.review.terminalState).toBe('failed-reviewer');
+    expect(seat.review.summary).toContain('timed out before completing');
+    expect(seat.review.summary).toContain('absolute watchdog');
+    expect(seat.review.summary).toMatch(/after \d+ min/);
+    expect(seat.review.diagnostics?.timedOutReason).toBe('absolute');
+    expect(seat.review.diagnostics?.stderrTail).toBe('last stderr line');
+    expect(seat.review.diagnostics?.elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(Date.parse(seat.review.diagnostics?.endedAt ?? '')).toBeGreaterThanOrEqual(
+      Date.parse(seat.review.diagnostics?.startedAt ?? '')
+    );
+  });
+
+  it("a liveness reclaim keeps the adapter's own wording (the seat went silent, it was not slow)", async () => {
+    const { adapter } = stubAdapter([
+      timedOut({ failWhy: 'stalled: no --json output for 15 min (wedged seat reclaimed)', timedOutReason: 'inactivity' }),
+    ]);
+    const seat = await worktreeSeat(adapter);
+    expect(seat.review.summary).toBe('stalled: no --json output for 15 min (wedged seat reclaimed)');
+    expect(seat.review.diagnostics?.timedOutReason).toBe('inactivity');
+    expect(seat.review.diagnostics?.failWhy).toContain('stalled');
+  });
+
+  it('the progress stream lands as <id>-stream.jsonl in the trail, and a reviewed seat still records timing', async () => {
+    const { adapter } = stubAdapter([{ ...reviewed(), stream: '{"type":"turn.started"}\n{"type":"turn.completed"}\n' }]);
+    const seat = await worktreeSeat(adapter);
+    expect(seat.review.terminalState).toBe('reviewed');
+    const stream = fs.readFileSync(path.join(reviewDir(out, base.runId), 'grok-stream.jsonl'), 'utf8');
+    expect(stream).toContain('turn.completed');
+    expect(seat.review.diagnostics?.elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(seat.review.diagnostics?.timedOutReason).toBeUndefined();
+  });
+
+  it('a seat with no stream writes no stream file', async () => {
+    const { adapter } = stubAdapter([reviewed()]);
+    await worktreeSeat(adapter);
+    expect(fs.existsSync(path.join(reviewDir(out, base.runId), 'grok-stream.jsonl'))).toBe(false);
   });
 });

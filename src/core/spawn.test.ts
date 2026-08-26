@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { killTree, makeEscalatingKill, runReviewerExec } from './spawn';
@@ -111,5 +114,75 @@ describe('runReviewerExec — liveness (inactivity) watchdog', () => {
     });
     expect(res.timedOut).toBe(true);
     expect(res.timedOutReason).toBe('absolute');
+  });
+});
+
+// An outfile seat that ALSO streams progress on stdout (codex `--json` + `-o`): the stream drives
+// the liveness watchdog and is kept as a bounded diagnostic tail; the reply still comes from -o.
+describe('runReviewerExec — stream liveness beside an outfile reply', () => {
+  const outFile = () =>
+    path.join(os.tmpdir(), `spawn-stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`);
+
+  it('events keep the seat alive, the reply still comes from -o, and the stream tail is returned', async () => {
+    const out = outFile();
+    const res = await runReviewerExec({
+      args: ['-c', `for i in 1 2 3 4; do echo "{\\"beat\\":$i}"; sleep 0.15; done; echo REPLY > "${out}"`],
+      bin: '/bin/sh',
+      inactivityTimeoutMs: 400,
+      outFile: out,
+      stderrLimit: 500,
+      streamStdout: true,
+      timeoutMs: 20_000,
+    });
+    expect(res.timedOut).toBe(false);
+    expect(res.raw).toBe('REPLY');
+    expect(res.streamTail).toContain('{"beat":4}');
+    expect(fs.existsSync(out)).toBe(false); // the -o file is consumed, as on the plain outfile path
+  });
+
+  it('a silent streaming seat is reclaimed by the liveness watchdog, not the absolute one', async () => {
+    const res = await runReviewerExec({
+      args: ['-c', 'sleep 5'],
+      bin: '/bin/sh',
+      inactivityTimeoutMs: 200,
+      outFile: outFile(),
+      stderrLimit: 500,
+      streamStdout: true,
+      timeoutMs: 20_000,
+    });
+    expect(res.timedOut).toBe(true);
+    expect(res.timedOutReason).toBe('inactivity');
+    expect(res.raw).toBeNull();
+  });
+
+  it('without streamStdout an outfile seat is silent by construction, so the liveness bar is NOT armed', async () => {
+    const out = outFile();
+    const res = await runReviewerExec({
+      args: ['-c', `sleep 0.5; echo REPLY > "${out}"`],
+      bin: '/bin/sh',
+      inactivityTimeoutMs: 100, // shorter than the run — would reclaim it if armed
+      outFile: out,
+      stderrLimit: 500,
+      timeoutMs: 20_000,
+    });
+    expect(res.timedOut).toBe(false);
+    expect(res.raw).toBe('REPLY');
+    expect(res.streamTail).toBeUndefined();
+  });
+
+  it('the stream tail is bounded by streamLimit (a chatty seat cannot grow the parent heap)', async () => {
+    const out = outFile();
+    const res = await runReviewerExec({
+      args: ['-c', `for i in $(seq 1 200); do echo "event-$i-xxxxxxxxxxxxxxxxxxxx"; done; echo REPLY > "${out}"`],
+      bin: '/bin/sh',
+      outFile: out,
+      stderrLimit: 500,
+      streamLimit: 120,
+      streamStdout: true,
+      timeoutMs: 20_000,
+    });
+    expect(res.raw).toBe('REPLY');
+    expect(res.streamTail?.length).toBeLessThanOrEqual(120);
+    expect(res.streamTail).toContain('event-200');
   });
 });

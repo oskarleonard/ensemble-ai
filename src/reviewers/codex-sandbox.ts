@@ -5,6 +5,8 @@ import path from 'node:path';
 import { makeOwnerOnlyTempDir } from '../core/artifacts';
 import type { SandboxProfileRef } from '../modes/review/evidence';
 
+import { CODEX_SOURCE_FENCE_ARGS } from './codex-fence';
+
 // THE CODEX WRAPPER PROFILE — an ensemble-OWNED external sandbox that gives the codex seat the
 // worktree without giving it the disk (spec §2).
 //
@@ -271,13 +273,16 @@ export function wrapWithSandbox(
   return { args: ['-f', profileFile, bin, ...args], bin: '/usr/bin/sandbox-exec' };
 }
 
-// PURE: the codex argv for a WORKTREE-mode review. Differs from the packet argv: the internal
-// sandbox is off (the external profile governs — nested Seatbelt does not compose), the cwd is the
-// worktree (so codex's file tools reach the project), and it carries NONE of the packet FENCE flags
-// (`--ignore-user-config` + `--strict-config` + the `otel.*` overrides) — on the worktree path the egress proxy + kernel
-// sandbox already deny the same operator-MCP/telemetry hosts at the network layer, so the packet's
-// source-level fence is that path's substitute for them, not a second copy. `-o <file>` still
-// carries the reply, as in packet mode.
+// PURE: the codex argv for a WORKTREE-mode review. Differs from the packet argv in what the
+// EXTERNAL profile takes over: the internal sandbox is off (nested Seatbelt does not compose) and
+// the cwd is the worktree (so codex's file tools reach the project). It carries the packet's
+// source-level FENCE too (CODEX_SOURCE_FENCE_ARGS). The egress proxy + kernel sandbox already DENY
+// the operator-MCP/telemetry hosts at the network layer — but a denied host is not a skipped one:
+// run 2026-08-26-10-45-52 showed the worktree seat still booting the operator's
+// `mcp.supabase.com` server out of ~/.codex/config.toml and spending its start-up on three
+// refused CONNECTs before reviewing anything. Never loading that config removes the attempt; the
+// proxy stays as the backstop for everything else. `--json` streams progress on stdout for the
+// liveness watchdog; `-o <file>` still carries the reply, as in packet mode.
 export function buildCodexWorktreeArgs(
   config: { effort: string; model: string },
   outFile: string,
@@ -287,6 +292,8 @@ export function buildCodexWorktreeArgs(
     'exec',
     '--skip-git-repo-check',
     '--ephemeral',
+    '--json',
+    ...CODEX_SOURCE_FENCE_ARGS,
     '--color',
     'never',
     '--dangerously-bypass-approvals-and-sandbox',

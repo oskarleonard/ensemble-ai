@@ -4,6 +4,7 @@ import type { assembleCodePacket } from '../../core/packet';
 import type {
   ReviewerConfig,
   ReviewerId,
+  SeatDiagnostics,
   StoredReview,
   TerminalState,
 } from '../../core/types';
@@ -57,6 +58,13 @@ export interface RunCoreSeatArgs {
   worktreePrompt?: string;
 }
 
+// Wall-clock of one adapter attempt, persisted with the seat's artifact: the trail's answer to
+// "how long did it actually run" — which a timeout summary alone cannot give.
+interface SeatTiming {
+  endedAt: number;
+  startedAt: number;
+}
+
 // Invoke the adapter once, isolating a per-seat failure (a CLI binary that can't be resolved
 // throws) into a recorded failure rather than a rejected fan-out.
 async function adapterOnce(
@@ -64,12 +72,45 @@ async function adapterOnce(
   prompt: string,
   reviewer: ReviewerConfig,
   opts: RunReviewOpts
-): Promise<CodexReviewResult> {
+): Promise<{ result: CodexReviewResult; timing: SeatTiming }> {
+  const startedAt = Date.now();
   try {
-    return await adapter(prompt, reviewer, opts);
+    const result = await adapter(prompt, reviewer, opts);
+    return { result, timing: { endedAt: Date.now(), startedAt } };
   } catch (e) {
-    return { ok: false, raw: null, stderrTail: (e as Error).message, timedOut: false };
+    return {
+      result: { ok: false, raw: null, stderrTail: (e as Error).message, timedOut: false },
+      timing: { endedAt: Date.now(), startedAt },
+    };
   }
+}
+
+// A timeout summary names WHICH watchdog fired and how long the seat ran: the absolute backstop
+// means it was still producing when cut (give it budget), the liveness one means it went silent
+// (it wedged). Run 2026-08-26-10-45-52 left only "timed out" behind, and the difference had to be
+// reconstructed from artifact mtimes. The adapter's own wording wins when it has one.
+function timedOutSummary(result: CodexReviewResult, timing: SeatTiming): string {
+  if (result.failWhy) return result.failWhy;
+  const minutes = Math.round((timing.endedAt - timing.startedAt) / 60_000);
+  const watchdog =
+    result.timedOutReason === 'inactivity'
+      ? 'the liveness watchdog reclaimed a silent seat'
+      : 'the absolute watchdog cut it while still running';
+  return `The reviewer timed out before completing (${watchdog} after ${minutes} min) — its output is incomplete and not trusted.`;
+}
+
+// The seat's run FACTS for the trail, written for every attempt. The stderr tail is the noise
+// channel bounded by the adapter (2000 chars) — kept here rather than dropped, because on a
+// timeout it is the only text the seat left behind.
+function seatDiagnostics(result: CodexReviewResult, timing: SeatTiming): SeatDiagnostics {
+  return {
+    elapsedMs: timing.endedAt - timing.startedAt,
+    endedAt: new Date(timing.endedAt).toISOString(),
+    ...(result.failWhy ? { failWhy: result.failWhy } : {}),
+    startedAt: new Date(timing.startedAt).toISOString(),
+    stderrTail: result.stderrTail.trim().slice(-2000),
+    ...(result.timedOutReason ? { timedOutReason: result.timedOutReason } : {}),
+  };
 }
 
 // Parse + persist one attempt's reply as this seat's trail artifact. A watchdog timeout or a parse
@@ -79,7 +120,8 @@ async function adapterOnce(
 function persistAttempt(
   args: RunCoreSeatArgs,
   prompt: string,
-  result: CodexReviewResult
+  result: CodexReviewResult,
+  timing: SeatTiming
 ): StoredReview {
   const parsed = result.raw ? parseFindings(result.raw) : null;
   const terminalState: TerminalState =
@@ -87,16 +129,19 @@ function persistAttempt(
   // A seat that produced NOTHING says why (its stderr tail) — under a sandbox wrapper that is the
   // difference between "the model had nothing to say" and "the profile killed the process".
   const summary = result.timedOut
-    ? 'The reviewer timed out before completing — its output is incomplete and not trusted.'
+    ? timedOutSummary(result, timing)
     : parsed?.summary ||
+      result.failWhy ||
       `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || 'no output'}`;
   return persistReview(args.out, {
+    diagnostics: seatDiagnostics(result, timing),
     findings: parsed?.findings ?? [],
     packet: args.packet,
     prompt,
     raw: result.raw,
     reviewer: args.reviewer,
     runId: args.runId,
+    ...(result.stream ? { stream: result.stream } : {}),
     summary,
     terminalState,
   });
@@ -133,19 +178,24 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   if (!wt || !args.qualification?.qualified || !args.worktreePrompt) {
     const unqualified = wt ? (args.qualification?.reason ?? null) : null;
     if (unqualified) log(`  · ⚠ ${unqualified}`);
-    const result = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
+    const { result, timing } = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
     return {
       // A packet seat runs unfenced by design — it has no worktree, so no proxy and no denials.
       egressDenials: [],
       fallbackReason: unqualified,
       realized: 'packet',
-      review: persistAttempt(args, args.packetPrompt, result),
+      review: persistAttempt(args, args.packetPrompt, result, timing),
     };
   }
 
   // WORKTREE MODE — the seat runs in the tree, under the profile its qualification named.
-  const first = await adapterOnce(args.adapter, args.worktreePrompt, reviewer, { worktree: wt });
-  const review = persistAttempt(args, args.worktreePrompt, first);
+  const { result: first, timing: firstTiming } = await adapterOnce(
+    args.adapter,
+    args.worktreePrompt,
+    reviewer,
+    { worktree: wt }
+  );
+  const review = persistAttempt(args, args.worktreePrompt, first, firstTiming);
   const egressDenials = first.egressDenials ?? [];
   if (review.terminalState === 'reviewed') {
     return { egressDenials, fallbackReason: null, realized: 'worktree', review };
@@ -163,14 +213,19 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   const why = first.stderrTail.trim().slice(0, 300) || 'no output';
   const reason = `${reviewer.id}: the worktree seat produced no usable review under its \`${args.qualification.profile.id}\` sandbox (${why}) — FELL BACK to the diff-only packet. This seat reviewed less than it would have in-project.`;
   log(`  · ⚠ ${reason}`);
-  const second = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
+  const { result: second, timing: secondTiming } = await adapterOnce(
+    args.adapter,
+    args.packetPrompt,
+    reviewer,
+    {}
+  );
   return {
     // The FAILED worktree attempt's denials still count: a seat that reached for a forbidden host
     // and then fell back must not launder that away with a clean packet re-run.
     egressDenials,
     fallbackReason: reason,
     realized: 'packet',
-    review: persistAttempt(args, args.packetPrompt, second),
+    review: persistAttempt(args, args.packetPrompt, second, secondTiming),
   };
 }
 

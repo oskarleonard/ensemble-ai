@@ -106,6 +106,28 @@ describe('buildCodexWorktreeArgs — codex INTERNAL sandbox off, external profil
     expect(args[args.indexOf('-m') + 1]).toBe('gpt-5.5');
     expect(args).toContain('model_reasoning_effort="high"');
   });
+
+  // The proxy DENIES the operator's MCP host, but a denied host is not a skipped one: without the
+  // source fence the worktree seat still boots ~/.codex/config.toml's servers and burns its
+  // start-up on refused CONNECTs (run 2026-08-26-10-45-52: three to mcp.supabase.com).
+  it('carries the same source fence as the packet argv, so the two cannot drift', () => {
+    expect(args).toContain('--ignore-user-config');
+    expect(args).toContain('--strict-config');
+    for (const kv of [
+      'otel.exporter="none"',
+      'otel.metrics_exporter="none"',
+      'otel.trace_exporter="none"',
+      'otel.log_user_prompt=false',
+    ]) {
+      expect(args).toContain(kv);
+      expect(args[args.indexOf(kv) - 1]).toBe('-c');
+    }
+  });
+
+  it('streams progress on stdout (--json) for the liveness watchdog; the reply stays on -o', () => {
+    expect(args).toContain('--json');
+    expect(args[args.indexOf('-o') + 1]).toBe('/tmp/o.md');
+  });
 });
 
 describe('writeCodexSandboxProfile — the temp dir is the caller\'s to reap, not a leak', () => {

@@ -110,24 +110,51 @@ export interface ReviewerExecOpts {
   /** The -o tempfile the reply is read from, then unlinked. Required for 'outfile'. */
   outFile?: string;
   /**
-   * LIVENESS watchdog (stdout capture only): kill the group after this long with
-   * NO data on stdout/stderr. A streaming CLI (claude `--output-format stream-json`)
-   * emits an event every few seconds while it works, so silence this long means a
-   * wedged seat — while honest long work never trips it. This is the watchdog doing
-   * its actual job (reclaim wedges, never police honest work); `timeoutMs` then
-   * degrades to a pure runaway backstop.
+   * LIVENESS watchdog (only while stdout is piped — `capture: 'stdout'` or `streamStdout`):
+   * kill the group after this long with NO data on stdout/stderr. A streaming CLI (claude
+   * `--output-format stream-json`, codex `--json`) emits an event every few seconds while it
+   * works, so silence this long means a wedged seat — while honest long work never trips it.
+   * This is the watchdog doing its actual job (reclaim wedges, never police honest work);
+   * `timeoutMs` then degrades to a pure runaway backstop. Ignored when stdout is not piped:
+   * an outfile-only seat is silent by construction, and arming it there would reclaim
+   * every honest run.
    */
   inactivityTimeoutMs?: number;
   /** Cap the retained stderr tail (a noise channel) at this many chars. */
   stderrLimit: number;
+  /** Cap the retained stream tail (see `streamStdout`) at this many chars. */
+  streamLimit?: number;
+  /**
+   * Pipe stdout for LIVENESS while the reply still comes from the `-o` file. For a CLI that
+   * emits a machine-readable progress stream beside its final-message file (codex `--json` +
+   * `-o`): every event resets the inactivity watchdog, and a bounded tail of the stream comes
+   * back as `streamTail`, so a seat the watchdog reclaims leaves a record of what it was doing
+   * instead of only "it timed out". Meaningless under `capture: 'stdout'`, where stdout is the
+   * reply and already drives liveness.
+   */
+  streamStdout?: boolean;
   /** Watchdog timeout; on expiry the whole process GROUP is SIGTERM→SIGKILLed. */
   timeoutMs: number;
+}
+
+// The retained stream tail is a diagnostic, not the reply: big enough to show the last stretch
+// of tool calls and reasoning before a kill, bounded so a chatty hour-long seat cannot grow the
+// parent's heap without limit.
+const STREAM_TAIL_LIMIT = 1_000_000;
+
+// Cut the tail on a LINE boundary: it is persisted as newline-delimited JSON, and a cut made on a
+// char boundary would hand a line-oriented reader a partial first object.
+function boundedStreamTail(tail: string, limit: number): string {
+  if (tail.length <= limit) return tail;
+  return tail.slice(-limit).replace(/^[^\n]*\n/, '');
 }
 
 export interface ReviewerExecResult {
   /** The reply (the -o file, or accumulated stdout) — or null if none produced. */
   raw: string | null;
   stderrTail: string;
+  /** The bounded tail of the progress stream (`streamStdout` only). */
+  streamTail?: string;
   timedOut: boolean;
   /** Which watchdog fired: the absolute backstop or the liveness (inactivity) one. */
   timedOutReason?: 'absolute' | 'inactivity';
@@ -148,32 +175,41 @@ export interface ReviewerExecResult {
 //   codex stdout is empty and the exit code LIES ("at capacity" exits 0 with no
 //   file), so success = a non-empty reply, never the exit code.
 //
-// VENDOR-NEUTRAL: codex reads its reply from an `-o` tempfile (stdout ignored);
-// grok prints its reply to STDOUT and has no outfile. `capture` flips that one
-// axis — everything else (the detached group, the escalating group-kill, the
-// settle-on-exit + absolute backstop) is shared so the two paths can't drift.
+// VENDOR-NEUTRAL: codex reads its reply from an `-o` tempfile (its stdout, when
+// piped at all, is a progress stream for liveness); grok prints its reply to
+// STDOUT and has no outfile. `capture` flips that one axis — everything else (the
+// detached group, the escalating group-kill, the settle-on-exit + absolute
+// backstop) is shared so the two paths can't drift.
 export function runReviewerExec(
   opts: ReviewerExecOpts
 ): Promise<ReviewerExecResult> {
   const { bin, args, outFile, timeoutMs, stderrLimit, onSpawn } = opts;
   const capture = opts.capture ?? 'outfile';
+  const streamStdout = capture !== 'stdout' && opts.streamStdout === true;
+  const pipeStdout = capture === 'stdout' || streamStdout;
+  const streamLimit = opts.streamLimit ?? STREAM_TAIL_LIMIT;
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
       cwd: opts.cwd ?? os.tmpdir(),
       detached: true,
       ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
-      // stdout is piped ONLY when we read the reply from it (grok); codex keeps
-      // it 'ignore' (its reply is the -o file) exactly as the proven path did.
-      stdio: ['ignore', capture === 'stdout' ? 'pipe' : 'ignore', 'pipe'],
+      // stdout is piped when we read the reply from it (grok) or stream it for
+      // liveness (codex `--json`); an outfile-only seat keeps it 'ignore'.
+      stdio: ['ignore', pipeStdout ? 'pipe' : 'ignore', 'pipe'],
     });
     const killer = makeEscalatingKill(
       { kill: (sig) => killTree(child, sig) },
       KILL_GRACE_MS
     );
     onSpawn?.(killer.kill);
+    let settled = false;
     let timedOut = false;
     let timedOutReason: 'absolute' | 'inactivity' | undefined;
+    // The FIRST watchdog to fire owns the verdict. Both timers stay live until the child
+    // actually exits (up to KILL_GRACE_MS after the SIGTERM), so the second one firing inside
+    // that window must not relabel an absolute cut as "stalled", or the reverse.
     const killTimer = setTimeout(() => {
+      if (timedOut) return;
       timedOut = true;
       timedOutReason = 'absolute';
       killer.kill();
@@ -184,9 +220,13 @@ export function runReviewerExec(
     const inactivityMs = opts.inactivityTimeoutMs;
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
     const armIdle = () => {
-      if (!inactivityMs || capture !== 'stdout') return;
+      // Never re-arm after settle: an orphan in the group can keep the pipes open and emit
+      // after `exit`, and a fresh idle timer would hold the event loop for a full interval
+      // and then signal a pgid that may already be recycled.
+      if (settled || !inactivityMs || !pipeStdout) return;
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
+        if (timedOut) return;
         timedOut = true;
         timedOutReason = 'inactivity';
         killer.kill();
@@ -199,13 +239,22 @@ export function runReviewerExec(
       stderrTail = (stderrTail + chunk.toString('utf8')).slice(-stderrLimit);
     });
     let stdoutBuf = '';
+    let streamTail = '';
     if (capture === 'stdout') {
       child.stdout?.on('data', (chunk: Buffer) => {
         armIdle();
         stdoutBuf += chunk.toString('utf8');
       });
+    } else if (streamStdout) {
+      child.stdout?.on('data', (chunk: Buffer) => {
+        armIdle();
+        streamTail += chunk.toString('utf8');
+        // Trim at twice the cap, not on every chunk: an hour-long seat emits thousands of
+        // events, and re-copying a 1 MB tail per event is avoidable churn. The bound the
+        // caller sees is enforced once, at settle.
+        if (streamTail.length > streamLimit * 2) streamTail = streamTail.slice(-streamLimit);
+      });
     }
-    let settled = false;
     let exitDrain: ReturnType<typeof setTimeout> | null = null;
     const settle = () => {
       if (settled) return; // exit AND close both fire on a clean run — settle once
@@ -228,17 +277,24 @@ export function runReviewerExec(
           // no -o file → the reviewer produced nothing (capacity / wedge / kill)
         }
       }
-      resolve({ raw, stderrTail, timedOut, ...(timedOutReason ? { timedOutReason } : {}) });
+      resolve({
+        raw,
+        stderrTail,
+        ...(streamStdout ? { streamTail: boundedStreamTail(streamTail, streamLimit) } : {}),
+        timedOut,
+        ...(timedOutReason ? { timedOutReason } : {}),
+      });
     };
     const backstop = setTimeout(settle, timeoutMs + KILL_GRACE_MS + 5_000);
     // outfile capture (codex): the reply is the -o file, complete on disk by `exit`
-    // — settle immediately. stdout capture (grok): the reply IS stdout, and Node can
-    // fire `exit` before the pipe delivers its last chunk (`close` is the post-drain
-    // event) — so defer `exit` briefly for `close`/the final data, falling back via
-    // EXIT_DRAIN_GRACE_MS if a held-open pipe never closes.
+    // — settle immediately. Whenever stdout is piped — the reply IS stdout (grok), or
+    // it streams progress (codex `--json`) — Node can fire `exit` before the pipe
+    // delivers its last chunk (`close` is the post-drain event), so defer `exit`
+    // briefly for `close`/the final data, falling back via EXIT_DRAIN_GRACE_MS if a
+    // held-open pipe never closes.
     child.on(
       'exit',
-      capture === 'stdout'
+      pipeStdout
         ? () => {
             exitDrain = setTimeout(settle, EXIT_DRAIN_GRACE_MS);
           }

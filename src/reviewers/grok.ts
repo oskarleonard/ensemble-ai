@@ -15,6 +15,15 @@ import {
 } from './codex';
 import { egressStartFailure, startSeatEgressProxy } from './egress-seat';
 
+// A worktree grok seat holds a shell in the PR head and legitimately outruns the packet budget,
+// but unlike codex it has NO liveness signal yet — `-p --output-format json` prints its envelope
+// at the end, so a wedged seat and a working one look the same until the absolute watchdog
+// fires. A bigger budget is therefore also a bigger wedge cost, which is why this is 30 min and
+// not codex's 60 (CORE_WORKTREE_REVIEW_TIMEOUT_MS rests on the `--json` watchdog): double the
+// packet budget for the bigger full-review packet, while a wedge still dies in 30. Raise it to
+// codex's figure once grok exposes a progress stream to arm `inactivityTimeoutMs` on.
+export const GROK_WORKTREE_REVIEW_TIMEOUT_MS = 1_800_000; // 30 min runaway backstop
+
 // The Grok (xAI) review adapter — the second cross-vendor lens beside Codex. It
 // mirrors codex.ts but for the THREE ways grok's CLI differs (verified live
 // 2026-06-29, grok v0.2.73):
@@ -255,7 +264,8 @@ export async function runGrokReview(
   config: ReviewerConfig,
   opts: RunReviewOpts = {}
 ): Promise<CodexReviewResult> {
-  const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
+  const timeoutMs =
+    opts.timeoutMs ?? (opts.worktree ? GROK_WORKTREE_REVIEW_TIMEOUT_MS : REVIEW_TIMEOUT_MS);
   // Pin the boundary to a proven read-only profile (provisioning the resolved one,
   // which is exactly what buildGrokReviewArgs will pass to --sandbox).
   const sandbox = resolveReviewSandbox(config.sandbox);

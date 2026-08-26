@@ -85,6 +85,9 @@ describe('buildCodexReviewArgs', () => {
     expect(args.at(-1)).toBe('PROMPT');
     // no stdin flag — stdin is closed via the spawn stdio, not an arg.
     expect(args.join(' ')).not.toMatch(/stdin/i);
+    // stdout is the `--json` progress stream (liveness + the trail's record of a reclaimed seat);
+    // the reply stays on -o — the split the CLI reference pairs the two flags for.
+    expect(args).toContain('--json');
   });
 
   // PACKET FENCE (packet-f1): a packet seat has neither the worktree's kernel sandbox nor its egress
@@ -355,5 +358,9 @@ describe('runCodexReview — worktree evidence runs under the external sandbox w
     // the packet argv also carries the source fence (buildCodexReviewArgs) — assert it reaches spawn.
     expect(args).toContain('--ignore-user-config');
     expect(args).toContain('--strict-config');
+    // …and streams progress: stdout is PIPED for the liveness watchdog (it was 'ignore' before
+    // `--json`), while stdin stays closed.
+    expect(args).toContain('--json');
+    expect(lastStdio).toEqual(['ignore', 'pipe', 'pipe']);
   });
 });

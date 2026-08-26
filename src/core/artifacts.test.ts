@@ -84,6 +84,57 @@ describe('per-reviewer artifacts', () => {
     expect(fs.existsSync(path.join(baseDir, runId, 'review.grok.json'))).toBe(true);
   });
 
+  it('persists diagnostics on the index and the progress stream as its own file', () => {
+    const runId = 'run-diag';
+    const stored = persistReview(baseDir, {
+      diagnostics: {
+        elapsedMs: 902_000,
+        endedAt: '2026-08-26T09:02:28.000Z',
+        startedAt: '2026-08-26T08:47:26.000Z',
+        stderrTail: 'Reading additional input from stdin...',
+        timedOutReason: 'absolute',
+      },
+      findings: [],
+      packet: packet(),
+      prompt: 'p',
+      raw: null,
+      reviewer: cfg('codex'),
+      runId,
+      stream: '{"type":"thread.started"}\n',
+      summary: 'timed out',
+      terminalState: 'failed-reviewer',
+    });
+    expect(stored.diagnostics?.timedOutReason).toBe('absolute');
+    const onDisk = JSON.parse(fs.readFileSync(path.join(baseDir, runId, 'review.codex.json'), 'utf8'));
+    expect(onDisk.diagnostics.elapsedMs).toBe(902_000);
+    // the stream is bulk, not a fact: its own file, never folded into the index
+    expect(onDisk.stream).toBeUndefined();
+    expect(fs.readFileSync(path.join(baseDir, runId, 'codex-stream.jsonl'), 'utf8')).toContain('thread.started');
+  });
+
+  it('a re-run that produced no reply or stream removes the previous attempt\'s files', () => {
+    const runId = 'run-rerun';
+    const attempt = (raw: string | null, stream?: string) =>
+      persistReview(baseDir, {
+        findings: [],
+        packet: packet(),
+        prompt: 'p',
+        raw,
+        reviewer: cfg('codex'),
+        runId,
+        ...(stream ? { stream } : {}),
+        summary: 's',
+        terminalState: 'failed-reviewer',
+      });
+    attempt('worktree reply', '{"type":"turn.started"}\n');
+    expect(fs.existsSync(path.join(baseDir, runId, 'codex-review.raw.md'))).toBe(true);
+    expect(fs.existsSync(path.join(baseDir, runId, 'codex-stream.jsonl'))).toBe(true);
+    // the packet fallback produced nothing: the trail must describe THAT attempt, not the first
+    attempt(null);
+    expect(fs.existsSync(path.join(baseDir, runId, 'codex-review.raw.md'))).toBe(false);
+    expect(fs.existsSync(path.join(baseDir, runId, 'codex-stream.jsonl'))).toBe(false);
+  });
+
   it('backfills reviewerId from a legacy bare review.json (pre-fan-out run)', () => {
     const runId = 'legacy-1';
     const dir = path.join(baseDir, runId);

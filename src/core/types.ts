@@ -142,6 +142,10 @@ export interface ManifestEntry {
 // `reviewerId` is optional only for back-compat reads of pre-fan-out artifacts;
 // new writes always set it.
 export interface StoredReview {
+  // How the seat ended, beyond its terminal state: wall-clock, which watchdog fired, the stderr
+  // tail. Written for every seat so a timeout is diagnosable from the trail instead of reading
+  // only "it timed out". Absent on artifacts written before it existed.
+  diagnostics?: SeatDiagnostics;
   findings: ReviewFinding[];
   packet: { complete: boolean; manifest: ManifestEntry[] };
   reviewer: { effort: string; model: string; vendor: string };
@@ -149,4 +153,17 @@ export interface StoredReview {
   runId: string;
   summary: string;
   terminalState: TerminalState;
+}
+
+// The FACTS of one seat's run that the reply alone cannot carry. `stderrTail` is bounded (a noise
+// channel); `timedOutReason` says which watchdog reclaimed the seat — the absolute backstop (it was
+// still working) or the liveness one (it went silent) — which is the difference between "give it
+// more time" and "it wedged". A seat that produced a reply still records its wall-clock.
+export interface SeatDiagnostics {
+  elapsedMs: number;
+  endedAt: string;
+  failWhy?: string;
+  startedAt: string;
+  stderrTail: string;
+  timedOutReason?: 'absolute' | 'inactivity';
 }
