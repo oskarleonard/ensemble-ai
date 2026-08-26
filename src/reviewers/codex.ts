@@ -28,14 +28,16 @@ import { egressStartFailure, startSeatEgressProxy } from './egress-seat';
 // bigger budgets (self-contained.ts).
 export const REVIEW_TIMEOUT_MS = 900_000; // 15 min
 
-// A WORKTREE core seat (codex / grok holding a shell in the PR head) is a different job
-// from the packet read above: it runs the repo's own tooling and greps the tree, and at
-// xhigh reasoning it legitimately outruns 15 min — run 2026-08-26-10-45-52
-// (lisk-backend#763) killed codex at 15:02 with every other seat finishing honestly
-// around it, the same lesson the Anthropic seats had already paid twice
-// (self-contained.ts). Since the liveness watchdog below reclaims a WEDGED codex seat,
-// this absolute value is a pure runaway backstop: sized past honest work, because a
-// killed honest seat loses everything already paid for.
+// A WORKTREE codex seat (a shell in the PR head) is a different job from the packet read
+// above: it runs the repo's own tooling and greps the tree, and at xhigh reasoning it
+// legitimately outruns 15 min — run 2026-08-26-10-45-52 (lisk-backend#763) killed codex
+// at 15:02 with every other seat finishing honestly around it, the same lesson the
+// Anthropic seats had already paid twice (self-contained.ts). Since the liveness watchdog
+// below reclaims a WEDGED codex seat, this absolute value is a pure runaway backstop:
+// sized past honest work, because a killed honest seat loses everything already paid
+// for. It is codex's figure, not a shared core one: a seat without a liveness signal
+// (grok, GROK_WORKTREE_REVIEW_TIMEOUT_MS) must pay for a wedge at its full budget and so
+// earns a smaller one.
 export const CORE_WORKTREE_REVIEW_TIMEOUT_MS = 3_600_000; // 60 min runaway backstop
 
 // codex `--json` emits an event per item (a command run, a reasoning step, a message)

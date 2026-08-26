@@ -83,7 +83,11 @@ export function makeOwnerOnlyTempDir(prefix: string, root: string = os.tmpdir())
   return dir;
 }
 
-function writeAtomic(root: string, dir: string, name: string, content: string): void {
+// Resolve (creating if needed) the run dir a trail file may be written to or removed from,
+// refusing a symlinked leaf and any resolution outside the trail root. Shared by every
+// write AND the stale-artifact removal, so a removal can never be talked into deleting a
+// file the write guard would have refused to create.
+function resolveTrailDir(root: string, dir: string): string {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   // Recursive mkdir treats a pre-planted symlink-to-dir as "already exists" and does NOT
   // error, and realpathSync would then FOLLOW it. lstat the trail root leaf AND the run
@@ -115,6 +119,18 @@ function writeAtomic(root: string, dir: string, name: string, content: string): 
       `ensemble-ai: refusing to write outside the trail root: ${realDir} is not under ${realRoot}`
     );
   }
+  return realDir;
+}
+
+// Remove a per-attempt artifact a re-run did not produce, so the trail never carries a file
+// from an attempt that did not count beside the index of one that did. A symlink at the target
+// is unlinked, never followed.
+function removeStale(root: string, dir: string, name: string): void {
+  fs.rmSync(path.join(resolveTrailDir(root, dir), name), { force: true });
+}
+
+function writeAtomic(root: string, dir: string, name: string, content: string): void {
+  const realDir = resolveTrailDir(root, dir);
   const target = path.join(realDir, name);
   const tmp = `${target}.tmp`;
   // O_NOFOLLOW: refuse if `tmp` is a symlink. O_EXCL: refuse a pre-existing tmp (a
@@ -226,8 +242,13 @@ export function persistReview(
   const id = input.reviewer.id;
   writeAtomic(baseDir, dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
   writeAtomic(baseDir, dir, `prompt.${id}.md`, input.prompt);
+  // The reply and the stream are per-ATTEMPT: a packet re-run after a failed worktree attempt
+  // rewrites the index, so an artifact the re-run did not produce is removed rather than left
+  // beside an index it does not belong to.
   if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review.raw.md`, input.raw);
+  else removeStale(baseDir, dir, `${id}-review.raw.md`);
   if (input.stream) writeAtomic(baseDir, dir, `${id}-stream.jsonl`, input.stream);
+  else removeStale(baseDir, dir, `${id}-stream.jsonl`);
   writeAtomic(
     baseDir,
     dir,

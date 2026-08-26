@@ -43,15 +43,42 @@ const GENERATED_PATTERNS: RegExp[] = [
   // schema that is itself in the diff, so a reviewer reading it adds nothing — while its bulk
   // competes with the real source for the coverage ceiling. Run 2026-08-26-10-45-52 spent its
   // budget on `gen/ent/*` sections while omitting the hand-written files the findings were about.
-  /(^|\/)(gen|generated|__generated__)\//,
+  // Only UNAMBIGUOUS name shapes belong here: a `generated` omission never disqualifies a receipt,
+  // so a pattern that can match a hand-written file un-reviews it silently. A bare `gen/`
+  // directory is deliberately absent — Go repos keep generator SOURCES there too (`cmd/gen/`,
+  // `tools/gen/templates/`) — and its output is caught by the header fingerprint below instead.
+  /(^|\/)(generated|__generated__)\//,
   /\.gen\.[a-z]+$/,
   /\.pb\.go$/,
   /[._]generated\.[a-z]+$/,
 ];
 
-export function classifyFileKind(path: string, isBinary: boolean): FileKind {
+// A generator's own fingerprint on the file's FIRST line: Go's canonical
+// `// Code generated … DO NOT EDIT.`, the `@generated` convention, or any "DO NOT EDIT".
+const GENERATED_FIRST_LINE = /Code generated .*DO NOT EDIT|@generated\b|DO NOT EDIT/;
+
+// True when the diff section shows the NEW file's first line and it carries a generator
+// fingerprint. Read only from a hunk that starts at line 1 (`@@ -a,b +1,n @@` — a new file or a
+// top-of-file edit): a mid-file hunk of a generated file shows no header and stays `source`,
+// which fails CLOSED (it costs budget, it never un-reviews a hand-written file); and a
+// hand-written file that merely mentions the marker further down (a generator's template) is
+// not caught.
+export function hasGeneratedHeader(section: string): boolean {
+  const lines = section.split('\n');
+  const at = lines.findIndex((l) => /^@@ -\d+(?:,\d+)? \+1(?:,\d+)? @@/.test(l));
+  if (at < 0) return false;
+  for (const l of lines.slice(at + 1, at + 4)) {
+    if (l.startsWith('-')) continue; // a removed line is not in the new file
+    if (l.startsWith('@@')) break;
+    return GENERATED_FIRST_LINE.test(l);
+  }
+  return false;
+}
+
+export function classifyFileKind(path: string, isBinary: boolean, section = ''): FileKind {
   if (isBinary) return 'binary';
-  return GENERATED_PATTERNS.some((re) => re.test(path)) ? 'generated' : 'source';
+  if (GENERATED_PATTERNS.some((re) => re.test(path))) return 'generated';
+  return section && hasGeneratedHeader(section) ? 'generated' : 'source';
 }
 
 // Test files, for the admission ORDER in computeCoverage (never for omission: a test is source,
@@ -119,7 +146,7 @@ export function parseDiffFiles(raw: string): FileDiff[] {
       added,
       bytes: Buffer.byteLength(section, 'utf8'),
       isBinary,
-      kind: classifyFileKind(path, isBinary),
+      kind: classifyFileKind(path, isBinary, section),
       path,
       raw: section,
       removed,

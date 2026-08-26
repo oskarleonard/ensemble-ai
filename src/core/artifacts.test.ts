@@ -112,6 +112,29 @@ describe('per-reviewer artifacts', () => {
     expect(fs.readFileSync(path.join(baseDir, runId, 'codex-stream.jsonl'), 'utf8')).toContain('thread.started');
   });
 
+  it('a re-run that produced no reply or stream removes the previous attempt\'s files', () => {
+    const runId = 'run-rerun';
+    const attempt = (raw: string | null, stream?: string) =>
+      persistReview(baseDir, {
+        findings: [],
+        packet: packet(),
+        prompt: 'p',
+        raw,
+        reviewer: cfg('codex'),
+        runId,
+        ...(stream ? { stream } : {}),
+        summary: 's',
+        terminalState: 'failed-reviewer',
+      });
+    attempt('worktree reply', '{"type":"turn.started"}\n');
+    expect(fs.existsSync(path.join(baseDir, runId, 'codex-review.raw.md'))).toBe(true);
+    expect(fs.existsSync(path.join(baseDir, runId, 'codex-stream.jsonl'))).toBe(true);
+    // the packet fallback produced nothing: the trail must describe THAT attempt, not the first
+    attempt(null);
+    expect(fs.existsSync(path.join(baseDir, runId, 'codex-review.raw.md'))).toBe(false);
+    expect(fs.existsSync(path.join(baseDir, runId, 'codex-stream.jsonl'))).toBe(false);
+  });
+
   it('backfills reviewerId from a legacy bare review.json (pre-fan-out run)', () => {
     const runId = 'legacy-1';
     const dir = path.join(baseDir, runId);

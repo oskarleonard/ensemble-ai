@@ -142,6 +142,13 @@ export interface ReviewerExecOpts {
 // parent's heap without limit.
 const STREAM_TAIL_LIMIT = 1_000_000;
 
+// Cut the tail on a LINE boundary: it is persisted as newline-delimited JSON, and a cut made on a
+// char boundary would hand a line-oriented reader a partial first object.
+function boundedStreamTail(tail: string, limit: number): string {
+  if (tail.length <= limit) return tail;
+  return tail.slice(-limit).replace(/^[^\n]*\n/, '');
+}
+
 export interface ReviewerExecResult {
   /** The reply (the -o file, or accumulated stdout) — or null if none produced. */
   raw: string | null;
@@ -195,9 +202,14 @@ export function runReviewerExec(
       KILL_GRACE_MS
     );
     onSpawn?.(killer.kill);
+    let settled = false;
     let timedOut = false;
     let timedOutReason: 'absolute' | 'inactivity' | undefined;
+    // The FIRST watchdog to fire owns the verdict. Both timers stay live until the child
+    // actually exits (up to KILL_GRACE_MS after the SIGTERM), so the second one firing inside
+    // that window must not relabel an absolute cut as "stalled", or the reverse.
     const killTimer = setTimeout(() => {
+      if (timedOut) return;
       timedOut = true;
       timedOutReason = 'absolute';
       killer.kill();
@@ -208,9 +220,13 @@ export function runReviewerExec(
     const inactivityMs = opts.inactivityTimeoutMs;
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
     const armIdle = () => {
-      if (!inactivityMs || !pipeStdout) return;
+      // Never re-arm after settle: an orphan in the group can keep the pipes open and emit
+      // after `exit`, and a fresh idle timer would hold the event loop for a full interval
+      // and then signal a pgid that may already be recycled.
+      if (settled || !inactivityMs || !pipeStdout) return;
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
+        if (timedOut) return;
         timedOut = true;
         timedOutReason = 'inactivity';
         killer.kill();
@@ -239,7 +255,6 @@ export function runReviewerExec(
         if (streamTail.length > streamLimit * 2) streamTail = streamTail.slice(-streamLimit);
       });
     }
-    let settled = false;
     let exitDrain: ReturnType<typeof setTimeout> | null = null;
     const settle = () => {
       if (settled) return; // exit AND close both fire on a clean run — settle once
@@ -265,7 +280,7 @@ export function runReviewerExec(
       resolve({
         raw,
         stderrTail,
-        ...(streamStdout ? { streamTail: streamTail.slice(-streamLimit) } : {}),
+        ...(streamStdout ? { streamTail: boundedStreamTail(streamTail, streamLimit) } : {}),
         timedOut,
         ...(timedOutReason ? { timedOutReason } : {}),
       });
