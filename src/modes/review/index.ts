@@ -294,6 +294,7 @@ export async function runReviewMode(
   }
 
   const packet = assembleCodePacket({
+    agentsBudget: conventionManifest?.capBytes,
     agentsMd,
     authorSummary: opts.authorSummary,
     diff: acquired.diff,

@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -5,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   type ConventionReader,
+  extractDirRefs,
   extractRefs,
   fsConventionReader,
   gatherConventions,
@@ -320,5 +322,267 @@ describe('read-truncation honesty (MED conventions.ts:189)', () => {
     const { manifest } = await gatherConventions(reader, ['src/x.ts'], { capBytes: 4000 });
     const entry = manifest.files.find((f) => f.path === 'AGENTS.md');
     expect(entry).toMatchObject({ included: true, truncated: false });
+  });
+});
+
+// ── Tiers: the budget is filled MANDATORY → NAMED → SWEPT, so a rule the repo asked
+// reviewers to apply can never lose its share to a runbook that happened to be linked.
+describe('tiers · rules dirs and entry files are MANDATORY and fill the budget first', () => {
+  it('sweeps .claude/rules/*.md as mandatory even when CLAUDE.md names only the directory', async () => {
+    const reader = memoryConventionReader({
+      'CLAUDE.md': 'Project review criteria are in `.claude/rules/` — apply them.',
+      '.claude/rules/architecture.md': 'a'.repeat(1_000),
+      '.claude/rules/testing.md': 't'.repeat(1_000),
+    });
+    const { manifest } = await gatherConventions(reader, ['pkg/x.go']);
+    const byPath = Object.fromEntries(manifest.files.map((f) => [f.path, f]));
+    expect(byPath['.claude/rules/architecture.md']).toMatchObject({ included: true, tier: 0 });
+    expect(byPath['.claude/rules/testing.md']).toMatchObject({ included: true, tier: 0 });
+    expect(byPath['CLAUDE.md']).toMatchObject({ included: true, tier: 0 });
+  });
+
+  it('a big linked runbook cannot squeeze the rules: MANDATORY takes its share first', async () => {
+    // The live shape of run 2026-08-26-10-45-52: CLAUDE.md links a 12 KB on-call runbook;
+    // under pure fair-share it took budget the rules never got.
+    const reader = memoryConventionReader({
+      'CLAUDE.md': 'see docs/runbook.md for on-call',
+      '.claude/rules/a.md': 'a'.repeat(3_000),
+      '.claude/rules/b.md': 'b'.repeat(3_000),
+      'docs/runbook.md': 'r'.repeat(6_000),
+    });
+    const { manifest, text } = await gatherConventions(reader, ['x.go'], { capBytes: 8_000 });
+    const byPath = Object.fromEntries(manifest.files.map((f) => [f.path, f]));
+    expect(byPath['.claude/rules/a.md']).toMatchObject({ included: true, truncated: false, tier: 0 });
+    expect(byPath['.claude/rules/b.md']).toMatchObject({ included: true, truncated: false, tier: 0 });
+    // the runbook gets only what the rules left — truncated or omitted, but NAMED
+    expect(byPath['docs/runbook.md'].tier).toBe(1);
+    expect(byPath['docs/runbook.md'].included && !byPath['docs/runbook.md'].truncated).toBe(false);
+    expect(manifest.totalBytes).toBeLessThanOrEqual(8_000);
+    // and the packet reads the rules BEFORE the runbook
+    expect(text.indexOf('===== .claude/rules/a.md')).toBeLessThan(text.indexOf('===== docs/runbook.md') === -1 ? Infinity : text.indexOf('===== docs/runbook.md'));
+  });
+
+  it('an @-include of an entry file is mandatory even when a docs/ sweep found it first as swept', async () => {
+    // Seeds enqueue the docs/ sweep (tier 2) BEFORE CLAUDE.md is read and found to
+    // @-include the same file; the stronger claim must win, and the include's own
+    // named links must be re-tiered beneath it.
+    const reader = memoryConventionReader({
+      'CLAUDE.md': 'read this\n@docs/architecture.md',
+      'docs/architecture.md': 'see docs/deep.md\n' + 'x'.repeat(500),
+      'docs/deep.md': 'deep',
+    });
+    const { manifest } = await gatherConventions(reader, ['x.go']);
+    const byPath = Object.fromEntries(manifest.files.map((f) => [f.path, f]));
+    expect(byPath['docs/architecture.md'].tier).toBe(0);
+    expect(byPath['docs/deep.md'].tier).toBe(1); // named by a tier-0 file
+  });
+
+  it('explicit --conventions paths are mandatory', async () => {
+    const reader = memoryConventionReader({
+      'CLAUDE.md': 'root',
+      'docs/house-style.md': 'h'.repeat(100),
+    });
+    const { manifest } = await gatherConventions(reader, ['x.go'], { conventions: ['docs/house-style.md'] });
+    expect(manifest.files.find((f) => f.path === 'docs/house-style.md')?.tier).toBe(0);
+  });
+
+  it('a swept doc nobody names is SWEPT; a file it links stays swept', async () => {
+    const reader = memoryConventionReader({
+      'CLAUDE.md': 'root',
+      'docs/random.md': 'see docs/other.md',
+      'docs/other.md': 'o',
+    });
+    const { manifest } = await gatherConventions(reader, ['x.go']);
+    const byPath = Object.fromEntries(manifest.files.map((f) => [f.path, f]));
+    expect(byPath['docs/random.md'].tier).toBe(2);
+    expect(byPath['docs/other.md'].tier).toBe(2);
+  });
+});
+
+describe('discovery · backticked paths and directories', () => {
+  it('a backticked path in a table cell is followed (the mobile repo names its mandatory doc that way)', async () => {
+    const reader = memoryConventionReader({
+      'CLAUDE.md': '| `spec-ai/LEARNINGS.md` | mandatory before every task |',
+      'spec-ai/LEARNINGS.md': 'learnings',
+    });
+    const { manifest } = await gatherConventions(reader, ['x.ts']);
+    expect(manifest.files.find((f) => f.path === 'spec-ai/LEARNINGS.md')).toMatchObject({ included: true, tier: 1 });
+  });
+
+  it('a backticked directory names every *.md directly inside it', async () => {
+    const reader = memoryConventionReader({
+      'CLAUDE.md': 'The guides live in `guides/`.',
+      'guides/one.md': '1',
+      'guides/two.md': '2',
+      'guides/nested/three.md': '3', // one level only, like every other sweep
+    });
+    const { manifest } = await gatherConventions(reader, ['x.ts']);
+    const paths = included(manifest);
+    expect(paths).toContain('guides/one.md');
+    expect(paths).toContain('guides/two.md');
+    expect(paths).not.toContain('guides/nested/three.md');
+  });
+
+  it('a backticked ref that resolves outside the repo, or to nothing, is ignored', async () => {
+    const reader = memoryConventionReader({ 'CLAUDE.md': 'see `../escape.md` and `missing.md` and `~/brain/x.md`' });
+    const { manifest } = await gatherConventions(reader, ['x.ts']);
+    expect(manifest.files.map((f) => f.path)).toEqual(['CLAUDE.md']);
+  });
+
+  it('extractDirRefs needs the trailing slash — a bare word is not a directory', () => {
+    expect(extractDirRefs('in `.claude/rules/` and `docs` and `src/lib/`')).toEqual(['.claude/rules/', 'src/lib/']);
+  });
+});
+
+describe('READMEs never rise above SWEPT unless pinned', () => {
+  it('a README named by a rule stays swept; an explicitly configured one is mandatory', async () => {
+    const reader = memoryConventionReader({
+      'CLAUDE.md': 'see docs/diagrams/README.md and see scripts/pilot/README.md',
+      'docs/diagrams/README.md': 'g'.repeat(100),
+      'scripts/pilot/README.md': 'p'.repeat(100),
+    });
+    const { manifest } = await gatherConventions(reader, ['x.go'], { conventions: ['scripts/pilot/README.md'] });
+    const byPath = Object.fromEntries(manifest.files.map((f) => [f.path, f]));
+    expect(byPath['docs/diagrams/README.md'].tier).toBe(2);
+    expect(byPath['scripts/pilot/README.md'].tier).toBe(0);
+  });
+});
+
+describe('allocation · a whole small doc beats a useless head of every doc', () => {
+  it('admits the smallest docs whole when the equal share fits none', async () => {
+    // A 14 KB remainder over one 13 KB doc and six 1.7 KB docs: equal share ≈ 2 KB fits
+    // nothing; the six small docs must arrive whole, the big one takes what is left.
+    const files: Record<string, string> = { 'CLAUDE.md': 'root' };
+    // distinct contents — byte-identical files dedupe into one candidate
+    for (let i = 0; i < 6; i++) files[`docs/s${i}.md`] = `${i}`.repeat(1_700);
+    files['docs/big.md'] = 'b'.repeat(13_000);
+    const { manifest } = await gatherConventions(memoryConventionReader(files), ['x.go'], {
+      capBytes: 14_000 + 'root'.length + 20,
+    });
+    const byPath = Object.fromEntries(manifest.files.map((f) => [f.path, f]));
+    for (let i = 0; i < 6; i++) {
+      expect(byPath[`docs/s${i}.md`], `s${i}`).toMatchObject({ included: true, truncated: false });
+    }
+    expect(byPath['docs/big.md'].included && !byPath['docs/big.md'].truncated).toBe(false);
+    expect(manifest.totalBytes).toBeLessThanOrEqual(14_000 + 'root'.length + 20);
+  });
+});
+
+describe('fs reader · a gitignored file is never a convention', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-gitignore-'));
+    execFileSync('git', ['init', '-q'], { cwd: dir });
+    fs.writeFileSync(path.join(dir, '.gitignore'), '_localnotes/\n');
+    fs.writeFileSync(path.join(dir, 'CLAUDE.md'), 'see `_localnotes/token.md` and `docs/real.md`');
+    fs.mkdirSync(path.join(dir, '_localnotes'));
+    fs.writeFileSync(path.join(dir, '_localnotes/token.md'), 'SENTRY_AUTH_TOKEN=abc');
+    fs.mkdirSync(path.join(dir, 'docs'));
+    fs.writeFileSync(path.join(dir, 'docs/real.md'), 'real');
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { force: true, recursive: true });
+  });
+
+  it('a linked ignored file reads as absent, and an ignored dir lists as empty', async () => {
+    const reader = fsConventionReader(dir);
+    expect(await reader.read('_localnotes/token.md')).toBeNull();
+    expect(await reader.list('_localnotes')).toEqual([]);
+    expect(await reader.read('docs/real.md')).toBe('real');
+    const { manifest, text } = await gatherConventions(reader, ['a.ts']);
+    expect(manifest.files.map((f) => f.path)).not.toContain('_localnotes/token.md');
+    expect(text).not.toContain('SENTRY_AUTH_TOKEN');
+    expect(included(manifest)).toContain('docs/real.md');
+  });
+
+  it('outside a git repo everything still reads', async () => {
+    const plain = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-nogit-'));
+    try {
+      fs.writeFileSync(path.join(plain, 'CLAUDE.md'), 'root');
+      expect(await fsConventionReader(plain).read('CLAUDE.md')).toBe('root');
+    } finally {
+      fs.rmSync(plain, { force: true, recursive: true });
+    }
+  });
+});
+
+describe('file ceiling · spent on the strongest tiers first, and every real file left behind is named', () => {
+  it('a tier-0 include is read before seventy swept docs, and the unread docs are named max-files', async () => {
+    const files: Record<string, string> = { 'CLAUDE.md': '@guides/mandatory.md' };
+    files['guides/mandatory.md'] = 'the mandatory doc';
+    for (let i = 0; i < 70; i++) files[`docs/d${String(i).padStart(2, '0')}.md`] = `doc ${i}`;
+    const { manifest } = await gatherConventions(memoryConventionReader(files), ['a.ts'], { maxFiles: 10 });
+    const byPath = Object.fromEntries(manifest.files.map((f) => [f.path, f]));
+    expect(byPath['guides/mandatory.md']).toMatchObject({ included: true, tier: 0 });
+    // 72 real files exist; every one is in the manifest — read, or named max-files
+    expect(manifest.files).toHaveLength(72);
+    expect(manifest.files.filter((f) => f.reason === 'max-files')).toHaveLength(72 - 10);
+  });
+});
+
+describe('twins · a duplicate keeps the strongest tier of any copy', () => {
+  it("a swept copy read first is allocated at the @-included original's tier", async () => {
+    const shared = 'the rules '.repeat(300); // ~3 KB, byte-identical in both files
+    const reader = memoryConventionReader({
+      'CLAUDE.md': '@guides/rules.md',
+      'CONTRIBUTING.md': shared, // a COMMON_DOCS seed: read before the BFS reaches the include
+      'guides/rules.md': shared,
+      'docs/big.md': 'b'.repeat(2_500),
+    });
+    const { manifest } = await gatherConventions(reader, ['a.ts'], { capBytes: 3_400 });
+    const byPath = Object.fromEntries(manifest.files.map((f) => [f.path, f]));
+    const survivor = byPath['CONTRIBUTING.md'].reason === 'duplicate' ? 'guides/rules.md' : 'CONTRIBUTING.md';
+    expect(byPath[survivor]).toMatchObject({ included: true, truncated: false, tier: 0 });
+    expect(byPath['docs/big.md'].included && !byPath['docs/big.md'].truncated).toBe(false);
+  });
+});
+
+describe('discovery · a dot-dir path from a nested doc is tried repo-relative', () => {
+  it('`.hidden/notes.md` named inside docs/ resolves from the root', async () => {
+    const reader = memoryConventionReader({
+      'CLAUDE.md': '@docs/architecture.md',
+      'docs/architecture.md': 'see `.hidden/notes.md`',
+      '.hidden/notes.md': 'n',
+    });
+    const { manifest } = await gatherConventions(reader, ['a.ts']);
+    expect(included(manifest)).toContain('.hidden/notes.md');
+  });
+});
+
+describe('READMEs · an @-included README keeps its carrier\'s tier', () => {
+  it('CLAUDE.md that is just `@README.md` still gets the README as mandatory', async () => {
+    const reader = memoryConventionReader({ 'CLAUDE.md': '@README.md', 'README.md': 'the conventions' });
+    const { manifest } = await gatherConventions(reader, ['a.ts']);
+    expect(manifest.files.find((f) => f.path === 'README.md')?.tier).toBe(0);
+  });
+});
+
+describe('allocation · a mandatory tier that frames nothing at the equal share still gets one head', () => {
+  it('the budget does not leak past tier 0 to a tier-1 file', async () => {
+    const reader = memoryConventionReader({
+      'CLAUDE.md': 'see docs/tiny.md',
+      '.claude/rules/a.md': 'a'.repeat(2_000),
+      '.claude/rules/b.md': 'b'.repeat(2_000),
+      '.claude/rules/c.md': 'c'.repeat(2_000),
+      'docs/tiny.md': 'tiny',
+    });
+    const { manifest } = await gatherConventions(reader, ['a.ts'], { capBytes: 400 });
+    const byPath = Object.fromEntries(manifest.files.map((f) => [f.path, f]));
+    const tier0Included = manifest.files.filter((f) => f.tier === 0 && f.included);
+    expect(tier0Included.length).toBeGreaterThan(0);
+    expect(byPath['docs/tiny.md'].included).toBe(false);
+    expect(manifest.totalBytes).toBeLessThanOrEqual(400);
+  });
+});
+
+describe('fs reader · the read buffer is sized to the file, not the cap', () => {
+  it('a huge maxBytes still reads a small file', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-bigcap-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'CLAUDE.md'), 'small');
+      expect(await fsConventionReader(dir).read('CLAUDE.md', 64 * 1024 * 1024)).toBe('small');
+    } finally {
+      fs.rmSync(dir, { force: true, recursive: true });
+    }
   });
 });

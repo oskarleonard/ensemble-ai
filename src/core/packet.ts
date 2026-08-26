@@ -9,6 +9,11 @@ import type { PacketSection, ReviewPacket } from './types';
 // certify code the reviewer never saw. (A diff still over this budget is truncated
 // and the receipt is then disqualified — see buildDiffReceipt's diffTruncated.)
 export const PACKET_BUDGETS = {
+  // The FLOOR for the conventions section. When the conventions were GATHERED under a byte
+  // cap (core/conventions.ts), the section budget is that cap instead (PacketInput.agentsBudget):
+  // the gatherer already bounded the text and wrote a manifest saying which files the reviewers
+  // see, and re-truncating here made that manifest a lie — every run before this handed the
+  // seats ~12 KB of an 80 KB gather while `conventions.json` reported the rules as included.
   agents: 12_000,
   constraints: 4_000,
   diff: 200_000,
@@ -24,6 +29,10 @@ export const PACKET_BUDGETS = {
 export const DIFF_USEFUL_FLOOR = 200;
 
 export interface PacketInput {
+  // The byte cap the conventions in `agentsMd` were gathered under. Lifts the conventions
+  // section budget to it (never below PACKET_BUDGETS.agents), so the gathered text ships
+  // whole and its manifest stays true. A UTF-8 byte cap is always ≥ the char count.
+  agentsBudget?: number;
   agentsMd?: string; // the repo's AGENTS.md (conventions / footguns)
   authorSummary?: string; // the author's own summary of what the change does/why
   constraints?: string; // known constraints the change must respect
@@ -182,7 +191,7 @@ export function assembleCodePacket(input: PacketInput): ReviewPacket {
       'Repo conventions (AGENTS.md)',
       'house rules + known footguns the change must respect',
       input.agentsMd ?? '',
-      PACKET_BUDGETS.agents
+      Math.max(PACKET_BUDGETS.agents, input.agentsBudget ?? 0)
     )
   );
   if (input.constraints) {
