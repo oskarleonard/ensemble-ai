@@ -4368,7 +4368,14 @@ var OPERATOR_REVIEW_METHOD = `## How to review (in this order)
    claims: when a finding turns on runtime behavior you cannot run here (would this DDL
    apply, does this compile, would that test fail), do NOT talk yourself out of it by arguing
    how the runtime probably behaves. Report it, ground what the reading supports, and name
-   the exact command that would settle it.`;
+   the exact command that would settle it.
+   - CLAIM VS PRACTICE: a finding that leans on something the tree only DESCRIBES \u2014 a comment
+     saying an index is "pre-created out of band", a docstring naming a step ops runs first, a
+     paragraph repeated across sibling files \u2014 is grounded only if that practice exists in the
+     repo's operational files: scripts, runbooks, CI/deploy config, Makefile targets. Sibling
+     files repeating a paragraph prove a convention was copied, not that anyone performs it.
+     When the practice is absent, do not build on the claim: the finding is the inconsistency
+     itself \u2014 say which is true, the comment or the deploy path.`;
 var QUALITY_LENS = `Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits \u2014 they are noise on someone else's pull request.`;
 var SCHEMA_BLOCK2 = `{"summary":"<one sentence>","findings":[{"title":"<short>","body":"<what is wrong, why, and the fix>","severity":"high|medium|low","confidence":"high|medium|low","evidence":{"file":"<repo-relative path>","line":<number>}}]}`;
 function renderCodeReviewSeatPrompt(args) {

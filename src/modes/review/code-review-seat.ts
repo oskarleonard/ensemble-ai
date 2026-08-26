@@ -51,6 +51,12 @@ export const COLD_PEER_ROLE =
 // four hunts are now explicit steps, and the self-check carries the execution-decidable rule:
 // the worst miss (an enum-cast index predicate no PostgreSQL accepts) had been RAISED earlier
 // and argued away instead of run.
+//
+// Extended 2026-08-26 after lisk-backend#736: a finding rested on "the documented escape hatch" —
+// a paragraph two sibling migrations carried about pre-creating an index out of band — which no
+// script, runbook, or deploy step performs. The maintainer rejected it; the finding worth posting
+// was the gap between the comment and the practice. The self-check now grounds a claimed practice
+// in the repo's operational files, never in sibling comments.
 export const OPERATOR_REVIEW_METHOD = `## How to review (in this order)
 
 1. Walk the diff hunk by hunk. For every touched function, read enough surrounding code —
@@ -81,7 +87,14 @@ export const OPERATOR_REVIEW_METHOD = `## How to review (in this order)
    claims: when a finding turns on runtime behavior you cannot run here (would this DDL
    apply, does this compile, would that test fail), do NOT talk yourself out of it by arguing
    how the runtime probably behaves. Report it, ground what the reading supports, and name
-   the exact command that would settle it.`;
+   the exact command that would settle it.
+   - CLAIM VS PRACTICE: a finding that leans on something the tree only DESCRIBES — a comment
+     saying an index is "pre-created out of band", a docstring naming a step ops runs first, a
+     paragraph repeated across sibling files — is grounded only if that practice exists in the
+     repo's operational files: scripts, runbooks, CI/deploy config, Makefile targets. Sibling
+     files repeating a paragraph prove a convention was copied, not that anyone performs it.
+     When the practice is absent, do not build on the claim: the finding is the inconsistency
+     itself — say which is true, the comment or the deploy path.`;
 
 // Quality-lens calibration (Oskar): structural simplification only. Never style/naming/format.
 export const QUALITY_LENS = `Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits — they are noise on someone else's pull request.`;
