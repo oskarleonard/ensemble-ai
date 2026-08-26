@@ -26,9 +26,11 @@ export interface PacketPreview {
 export function buildPacketPreview(
   acquired: AcquiredDiff,
   profile: ReviewProfile,
-  agentsMd?: string
+  agentsMd?: string,
+  agentsBudget?: number
 ): PacketPreview {
   const packet = assembleCodePacket({
+    agentsBudget,
     agentsMd,
     diff: acquired.diff,
     objective: profile === 'security' ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE,
@@ -47,14 +49,21 @@ export function renderConventionManifest(m: ConventionManifest): string[] {
   out.push(
     `  conventions:  ${inc}/${m.files.length} file(s) gathered, ${m.totalBytes} bytes (cap ${m.capBytes})`
   );
+  const tierLabel = ['mandatory', 'named', 'swept'];
   for (const f of m.files) {
     const flag = f.included ? (f.truncated ? '~' : '✓') : '·';
+    // Name the actual reason: a duplicate or a file-ceiling omission is not "over cap".
     const tag = f.truncated
       ? ' (truncated — over cap)'
-      : !f.included
-        ? ' (omitted — over cap)'
-        : '';
-    out.push(`    ${flag} ${f.path} (${f.bytes} bytes)${tag}`);
+      : f.reason === 'duplicate'
+        ? ` (duplicate of ${f.duplicateOf ?? '?'})`
+        : f.reason === 'max-files'
+          ? ' (omitted — file ceiling)'
+          : !f.included
+            ? ' (omitted — over cap)'
+            : '';
+    const tier = f.tier === undefined ? '' : ` [${tierLabel[f.tier]}]`;
+    out.push(`    ${flag} ${f.path} (${f.bytes} bytes)${tier}${tag}`);
   }
   return out;
 }

@@ -47,7 +47,7 @@ function makeOwnerOnlyTempDir(prefix, root = os.tmpdir()) {
   fs.chmodSync(dir, 448);
   return dir;
 }
-function writeAtomic(root, dir, name, content) {
+function resolveTrailDir(root, dir) {
   fs.mkdirSync(dir, { recursive: true, mode: 448 });
   for (const p of [root, dir]) {
     let st;
@@ -73,6 +73,13 @@ function writeAtomic(root, dir, name, content) {
       `ensemble-ai: refusing to write outside the trail root: ${realDir} is not under ${realRoot}`
     );
   }
+  return realDir;
+}
+function removeStale(root, dir, name) {
+  fs.rmSync(path.join(resolveTrailDir(root, dir), name), { force: true });
+}
+function writeAtomic(root, dir, name, content) {
+  const realDir = resolveTrailDir(root, dir);
   const target = path.join(realDir, name);
   const tmp = `${target}.tmp`;
   try {
@@ -131,6 +138,9 @@ function persistReview(baseDir, input) {
   writeAtomic(baseDir, dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
   writeAtomic(baseDir, dir, `prompt.${id}.md`, input.prompt);
   if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review.raw.md`, input.raw);
+  else removeStale(baseDir, dir, `${id}-review.raw.md`);
+  if (input.stream) writeAtomic(baseDir, dir, `${id}-stream.jsonl`, input.stream);
+  else removeStale(baseDir, dir, `${id}-stream.jsonl`);
   writeAtomic(
     baseDir,
     dir,
@@ -138,6 +148,7 @@ function persistReview(baseDir, input) {
     JSON.stringify(input.findings, null, 2)
   );
   const stored = {
+    ...input.diagnostics ? { diagnostics: input.diagnostics } : {},
     findings: input.findings,
     packet: {
       complete: input.packet.complete,
@@ -1075,26 +1086,36 @@ function killTree(child, signal, signalGroup = (pid, sig) => process.kill(-pid, 
   } catch {
   }
 }
+var STREAM_TAIL_LIMIT = 1e6;
+function boundedStreamTail(tail, limit) {
+  if (tail.length <= limit) return tail;
+  return tail.slice(-limit).replace(/^[^\n]*\n/, "");
+}
 function runReviewerExec(opts) {
   const { bin, args, outFile, timeoutMs, stderrLimit, onSpawn } = opts;
   const capture2 = opts.capture ?? "outfile";
+  const streamStdout = capture2 !== "stdout" && opts.streamStdout === true;
+  const pipeStdout = capture2 === "stdout" || streamStdout;
+  const streamLimit = opts.streamLimit ?? STREAM_TAIL_LIMIT;
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
       cwd: opts.cwd ?? os3.tmpdir(),
       detached: true,
       ...opts.env ? { env: { ...process.env, ...opts.env } } : {},
-      // stdout is piped ONLY when we read the reply from it (grok); codex keeps
-      // it 'ignore' (its reply is the -o file) exactly as the proven path did.
-      stdio: ["ignore", capture2 === "stdout" ? "pipe" : "ignore", "pipe"]
+      // stdout is piped when we read the reply from it (grok) or stream it for
+      // liveness (codex `--json`); an outfile-only seat keeps it 'ignore'.
+      stdio: ["ignore", pipeStdout ? "pipe" : "ignore", "pipe"]
     });
     const killer = makeEscalatingKill(
       { kill: (sig) => killTree(child, sig) },
       KILL_GRACE_MS
     );
     onSpawn?.(killer.kill);
+    let settled = false;
     let timedOut = false;
     let timedOutReason;
     const killTimer = setTimeout(() => {
+      if (timedOut) return;
       timedOut = true;
       timedOutReason = "absolute";
       killer.kill();
@@ -1102,9 +1123,10 @@ function runReviewerExec(opts) {
     const inactivityMs = opts.inactivityTimeoutMs;
     let idleTimer = null;
     const armIdle = () => {
-      if (!inactivityMs || capture2 !== "stdout") return;
+      if (settled || !inactivityMs || !pipeStdout) return;
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
+        if (timedOut) return;
         timedOut = true;
         timedOutReason = "inactivity";
         killer.kill();
@@ -1117,13 +1139,19 @@ function runReviewerExec(opts) {
       stderrTail = (stderrTail + chunk.toString("utf8")).slice(-stderrLimit);
     });
     let stdoutBuf = "";
+    let streamTail = "";
     if (capture2 === "stdout") {
       child.stdout?.on("data", (chunk) => {
         armIdle();
         stdoutBuf += chunk.toString("utf8");
       });
+    } else if (streamStdout) {
+      child.stdout?.on("data", (chunk) => {
+        armIdle();
+        streamTail += chunk.toString("utf8");
+        if (streamTail.length > streamLimit * 2) streamTail = streamTail.slice(-streamLimit);
+      });
     }
-    let settled = false;
     let exitDrain = null;
     const settle = () => {
       if (settled) return;
@@ -1145,12 +1173,18 @@ function runReviewerExec(opts) {
         } catch {
         }
       }
-      resolve({ raw, stderrTail, timedOut, ...timedOutReason ? { timedOutReason } : {} });
+      resolve({
+        raw,
+        stderrTail,
+        ...streamStdout ? { streamTail: boundedStreamTail(streamTail, streamLimit) } : {},
+        timedOut,
+        ...timedOutReason ? { timedOutReason } : {}
+      });
     };
     const backstop = setTimeout(settle, timeoutMs + KILL_GRACE_MS + 5e3);
     child.on(
       "exit",
-      capture2 === "stdout" ? () => {
+      pipeStdout ? () => {
         exitDrain = setTimeout(settle, EXIT_DRAIN_GRACE_MS);
       } : settle
     );
@@ -1158,6 +1192,26 @@ function runReviewerExec(opts) {
     child.on("error", settle);
   });
 }
+
+// src/reviewers/codex-fence.ts
+var CODEX_SOURCE_FENCE_ARGS = [
+  // Load none of the operator's ~/.codex/config.toml — above all its [mcp_servers]. Auth still
+  // uses $CODEX_HOME; the model/effort arrive via -m/-c (an override layer), not that file.
+  "--ignore-user-config",
+  // FAIL CLOSED on config drift: reject any `-c` key this codex version does not recognize, so a
+  // renamed/typo'd otel.* key hard-fails the review instead of silently using the default exporter.
+  "--strict-config",
+  // Every OpenTelemetry exporter OFF (metrics defaults to `statsig`, so ignoring the file is not
+  // enough), and never ship the prompt — which carries the untrusted diff — to a telemetry backend.
+  "-c",
+  'otel.exporter="none"',
+  "-c",
+  'otel.metrics_exporter="none"',
+  "-c",
+  'otel.trace_exporter="none"',
+  "-c",
+  "otel.log_user_prompt=false"
+];
 
 // src/reviewers/codex-sandbox.ts
 import fs7 from "fs";
@@ -1294,6 +1348,8 @@ function buildCodexWorktreeArgs(config, outFile, prompt) {
     "exec",
     "--skip-git-repo-check",
     "--ephemeral",
+    "--json",
+    ...CODEX_SOURCE_FENCE_ARGS,
     "--color",
     "never",
     "--dangerously-bypass-approvals-and-sandbox",
@@ -1349,27 +1405,15 @@ function egressStartFailure(id, err) {
 
 // src/reviewers/codex.ts
 var REVIEW_TIMEOUT_MS = 9e5;
+var CORE_WORKTREE_REVIEW_TIMEOUT_MS = 36e5;
+var CODEX_INACTIVITY_TIMEOUT_MS = 9e5;
 function buildCodexReviewArgs(config, outFile, prompt) {
   return [
     "exec",
     "--skip-git-repo-check",
     "--ephemeral",
-    // Load none of the operator's ~/.codex/config.toml — above all its [mcp_servers]. Auth still
-    // uses $CODEX_HOME; the model/effort below arrive via -m/-c (an override layer), not that file.
-    "--ignore-user-config",
-    // FAIL CLOSED on config drift: reject any `-c` key this codex version does not recognize, so a
-    // renamed/typo'd otel.* key hard-fails the review instead of silently using the default exporter.
-    "--strict-config",
-    // Every OpenTelemetry exporter OFF (metrics defaults to `statsig`, so ignoring the file is not
-    // enough), and never ship the prompt — which carries the untrusted diff — to a telemetry backend.
-    "-c",
-    'otel.exporter="none"',
-    "-c",
-    'otel.metrics_exporter="none"',
-    "-c",
-    'otel.trace_exporter="none"',
-    "-c",
-    "otel.log_user_prompt=false",
+    "--json",
+    ...CODEX_SOURCE_FENCE_ARGS,
     "--color",
     "never",
     "-s",
@@ -1403,6 +1447,20 @@ function worktreeReplyFile() {
 }
 function refuseWorktree(message) {
   return Promise.resolve({ ok: false, raw: null, stderrTail: message, timedOut: false });
+}
+function toCodexResult(res) {
+  const stalled = res.timedOut && res.timedOutReason === "inactivity";
+  return {
+    ...stalled ? {
+      failWhy: `stalled: no --json output for ${Math.round(CODEX_INACTIVITY_TIMEOUT_MS / 6e4)} min (wedged seat reclaimed)`
+    } : {},
+    ok: res.raw !== null,
+    raw: res.raw,
+    stderrTail: res.stderrTail,
+    ...res.streamTail ? { stream: res.streamTail } : {},
+    timedOut: res.timedOut,
+    ...res.timedOutReason ? { timedOutReason: res.timedOutReason } : {}
+  };
 }
 async function runCodexWorktreeReview(prompt, config, worktree, opts) {
   if (!codexSandboxSupported()) {
@@ -1450,17 +1508,16 @@ async function runCodexWorktreeReview(prompt, config, worktree, opts) {
       cwd: worktree,
       // The seat's ONLY route off the machine. Its Seatbelt profile denies every other outbound.
       env: proxyEnv(proxy.url),
+      inactivityTimeoutMs: CODEX_INACTIVITY_TIMEOUT_MS,
       onSpawn: opts.onSpawn,
       outFile: reply.file,
       stderrLimit: 2e3,
-      timeoutMs: opts.timeoutMs ?? REVIEW_TIMEOUT_MS
-    }).then(({ raw, stderrTail, timedOut }) => ({
+      streamStdout: true,
+      timeoutMs: opts.timeoutMs ?? CORE_WORKTREE_REVIEW_TIMEOUT_MS
+    }).then((res) => ({
       // Snapshot the denials before cleanup: they are what the artifact and the footer report.
       egressDenials: [...proxy.denials],
-      ok: raw !== null,
-      raw,
-      stderrTail,
-      timedOut
+      ...toCodexResult(res)
     })).finally(cleanup);
   } catch (e) {
     cleanup();
@@ -1474,22 +1531,20 @@ function runCodexReview(prompt, config, opts = {}) {
   return runReviewerExec({
     bin: resolveCodexBin(),
     args: buildCodexReviewArgs(config, outFile, prompt),
+    inactivityTimeoutMs: CODEX_INACTIVITY_TIMEOUT_MS,
     outFile,
     timeoutMs,
     stderrLimit: 2e3,
+    streamStdout: true,
     onSpawn: opts.onSpawn
-  }).then(({ raw, stderrTail, timedOut }) => ({
-    ok: raw !== null,
-    raw,
-    stderrTail,
-    timedOut
-  }));
+  }).then(toCodexResult);
 }
 
 // src/reviewers/grok.ts
 import fs9 from "fs";
 import os6 from "os";
 import path6 from "path";
+var GROK_WORKTREE_REVIEW_TIMEOUT_MS = 18e5;
 var GROK_BIN_CANDIDATES = [path6.join(os6.homedir(), ".grok", "bin", "grok")];
 function resolveGrokBin() {
   return resolveBin("grok", {
@@ -1586,7 +1641,7 @@ function extractGrokText(stdout) {
   return trimmed || null;
 }
 async function runGrokReview(prompt, config, opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
+  const timeoutMs = opts.timeoutMs ?? (opts.worktree ? GROK_WORKTREE_REVIEW_TIMEOUT_MS : REVIEW_TIMEOUT_MS);
   const sandbox = resolveReviewSandbox(config.sandbox);
   const worktreeCwd = opts.worktree;
   if (worktreeCwd && sandbox !== GROK_CLI_SANDBOX) {
@@ -2128,11 +2183,48 @@ var GENERATED_PATTERNS = [
   /(^|\/)\.next\//,
   /\.min\.(js|css)$/,
   /\.(js|css)\.map$/,
-  /\.snap$/
+  /\.snap$/,
+  // Generator OUTPUT (ORM clients, API bindings, protobuf, GraphQL types): regenerated from a
+  // schema that is itself in the diff, so a reviewer reading it adds nothing — while its bulk
+  // competes with the real source for the coverage ceiling. Run 2026-08-26-10-45-52 spent its
+  // budget on `gen/ent/*` sections while omitting the hand-written files the findings were about.
+  // Only UNAMBIGUOUS name shapes belong here: a `generated` omission never disqualifies a receipt,
+  // so a pattern that can match a hand-written file un-reviews it silently. A bare `gen/`
+  // directory is deliberately absent — Go repos keep generator SOURCES there too (`cmd/gen/`,
+  // `tools/gen/templates/`) — and its output is caught by the header fingerprint below instead.
+  /(^|\/)(generated|__generated__)\//,
+  /\.gen\.[a-z]+$/,
+  /\.pb\.go$/,
+  /[._]generated\.[a-z]+$/
 ];
-function classifyFileKind(path19, isBinary) {
+var GENERATED_FIRST_LINE = /Code generated .*DO NOT EDIT|@generated\b|DO NOT EDIT/;
+function hasGeneratedHeader(section2) {
+  const lines = section2.split("\n");
+  const at = lines.findIndex((l) => /^@@ -\d+(?:,\d+)? \+1(?:,\d+)? @@/.test(l));
+  if (at < 0) return false;
+  for (const l of lines.slice(at + 1, at + 4)) {
+    if (l.startsWith("-")) continue;
+    if (l.startsWith("@@")) break;
+    return GENERATED_FIRST_LINE.test(l);
+  }
+  return false;
+}
+function classifyFileKind(path19, isBinary, section2 = "") {
   if (isBinary) return "binary";
-  return GENERATED_PATTERNS.some((re) => re.test(path19)) ? "generated" : "source";
+  if (GENERATED_PATTERNS.some((re) => re.test(path19))) return "generated";
+  return section2 && hasGeneratedHeader(section2) ? "generated" : "source";
+}
+var TEST_PATTERNS = [
+  /(^|\/)(test|tests|__tests__|spec|specs|testdata|__snapshots__)\//,
+  /_test\.(go|py|rs|rb|ex|exs)$/,
+  /\.(test|spec)\.[cm]?[jt]sx?$/,
+  /(^|\/)test_[^/]+\.py$/,
+  /_spec\.rb$/,
+  /Tests?\.(java|kt|swift|cs|scala)$/,
+  /\.bats$/
+];
+function isTestPath(path19) {
+  return TEST_PATTERNS.some((re) => re.test(path19));
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -2161,7 +2253,7 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path19, isBinary),
+      kind: classifyFileKind(path19, isBinary, section2),
       path: path19,
       raw: section2,
       removed
@@ -2175,9 +2267,16 @@ function omittedLine(o) {
   return `omitted: ${o.path} (${o.reason ?? "omitted"}/${o.kind})`;
 }
 function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
+  const source = files.filter((f) => f.kind === "source");
+  const admitted = /* @__PURE__ */ new Set();
+  let includedBytes = 0;
+  for (const f of [...source.filter((f2) => !isTestPath(f2.path)), ...source.filter((f2) => isTestPath(f2.path))]) {
+    if (includedBytes + f.bytes > ceilingBytes && includedBytes > 0) continue;
+    admitted.add(f);
+    includedBytes += f.bytes;
+  }
   const entries = [];
   const includedSections = [];
-  let includedBytes = 0;
   for (const f of files) {
     const base = {
       added: f.added,
@@ -2194,13 +2293,12 @@ function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
       entries.push({ ...base, included: false, omitReason: "generated" });
       continue;
     }
-    if (includedBytes + f.bytes > ceilingBytes && includedBytes > 0) {
+    if (!admitted.has(f)) {
       entries.push({ ...base, included: false, omitReason: "over-limit" });
       continue;
     }
     entries.push({ ...base, included: true });
     includedSections.push(f.raw);
-    includedBytes += f.bytes;
   }
   const coverage = {
     files: entries,
@@ -6377,23 +6475,46 @@ function formatEgressDenialCounts(denials, maxHosts = 6) {
 
 // src/modes/review/seat-run.ts
 async function adapterOnce(adapter, prompt, reviewer, opts) {
+  const startedAt = Date.now();
   try {
-    return await adapter(prompt, reviewer, opts);
+    const result = await adapter(prompt, reviewer, opts);
+    return { result, timing: { endedAt: Date.now(), startedAt } };
   } catch (e) {
-    return { ok: false, raw: null, stderrTail: e.message, timedOut: false };
+    return {
+      result: { ok: false, raw: null, stderrTail: e.message, timedOut: false },
+      timing: { endedAt: Date.now(), startedAt }
+    };
   }
 }
-function persistAttempt(args, prompt, result) {
+function timedOutSummary(result, timing) {
+  if (result.failWhy) return result.failWhy;
+  const minutes = Math.round((timing.endedAt - timing.startedAt) / 6e4);
+  const watchdog = result.timedOutReason === "inactivity" ? "the liveness watchdog reclaimed a silent seat" : "the absolute watchdog cut it while still running";
+  return `The reviewer timed out before completing (${watchdog} after ${minutes} min) \u2014 its output is incomplete and not trusted.`;
+}
+function seatDiagnostics(result, timing) {
+  return {
+    elapsedMs: timing.endedAt - timing.startedAt,
+    endedAt: new Date(timing.endedAt).toISOString(),
+    ...result.failWhy ? { failWhy: result.failWhy } : {},
+    startedAt: new Date(timing.startedAt).toISOString(),
+    stderrTail: result.stderrTail.trim().slice(-2e3),
+    ...result.timedOutReason ? { timedOutReason: result.timedOutReason } : {}
+  };
+}
+function persistAttempt(args, prompt, result, timing) {
   const parsed = result.raw ? parseFindings(result.raw) : null;
   const terminalState = parsed && !parsed.parseError && !result.timedOut ? "reviewed" : "failed-reviewer";
-  const summary = result.timedOut ? "The reviewer timed out before completing \u2014 its output is incomplete and not trusted." : parsed?.summary || `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || "no output"}`;
+  const summary = result.timedOut ? timedOutSummary(result, timing) : parsed?.summary || result.failWhy || `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || "no output"}`;
   return persistReview(args.out, {
+    diagnostics: seatDiagnostics(result, timing),
     findings: parsed?.findings ?? [],
     packet: args.packet,
     prompt,
     raw: result.raw,
     reviewer: args.reviewer,
     runId: args.runId,
+    ...result.stream ? { stream: result.stream } : {},
     summary,
     terminalState
   });
@@ -6421,17 +6542,22 @@ async function runCoreSeat(args) {
   if (!wt || !args.qualification?.qualified || !args.worktreePrompt) {
     const unqualified = wt ? args.qualification?.reason ?? null : null;
     if (unqualified) log(`  \xB7 \u26A0 ${unqualified}`);
-    const result = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
+    const { result, timing } = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
     return {
       // A packet seat runs unfenced by design — it has no worktree, so no proxy and no denials.
       egressDenials: [],
       fallbackReason: unqualified,
       realized: "packet",
-      review: persistAttempt(args, args.packetPrompt, result)
+      review: persistAttempt(args, args.packetPrompt, result, timing)
     };
   }
-  const first = await adapterOnce(args.adapter, args.worktreePrompt, reviewer, { worktree: wt });
-  const review = persistAttempt(args, args.worktreePrompt, first);
+  const { result: first, timing: firstTiming } = await adapterOnce(
+    args.adapter,
+    args.worktreePrompt,
+    reviewer,
+    { worktree: wt }
+  );
+  const review = persistAttempt(args, args.worktreePrompt, first, firstTiming);
   const egressDenials = first.egressDenials ?? [];
   if (review.terminalState === "reviewed") {
     return { egressDenials, fallbackReason: null, realized: "worktree", review };
@@ -6442,14 +6568,19 @@ async function runCoreSeat(args) {
   const why = first.stderrTail.trim().slice(0, 300) || "no output";
   const reason = `${reviewer.id}: the worktree seat produced no usable review under its \`${args.qualification.profile.id}\` sandbox (${why}) \u2014 FELL BACK to the diff-only packet. This seat reviewed less than it would have in-project.`;
   log(`  \xB7 \u26A0 ${reason}`);
-  const second = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
+  const { result: second, timing: secondTiming } = await adapterOnce(
+    args.adapter,
+    args.packetPrompt,
+    reviewer,
+    {}
+  );
   return {
     // The FAILED worktree attempt's denials still count: a seat that reached for a forbidden host
     // and then fell back must not launder that away with a clean packet re-run.
     egressDenials,
     fallbackReason: reason,
     realized: "packet",
-    review: persistAttempt(args, args.packetPrompt, second)
+    review: persistAttempt(args, args.packetPrompt, second, secondTiming)
   };
 }
 var RETRIES_ON_PACKET = {
@@ -6630,8 +6761,9 @@ async function runReviewMode(opts) {
         runId: opts.runId,
         ...wt ? { worktree: wt.dir, worktreePrompt } : {}
       });
+      const cause = seat.review.terminalState === "reviewed" ? "" : ` \u2014 ${seat.review.summary.replace(/\s+/g, " ").slice(0, 200)}`;
       log(
-        `  \xB7 ${id}: ${seat.review.terminalState} \u2014 ${seat.review.findings.length} finding(s) \xB7 evidence ${seat.realized}`
+        `  \xB7 ${id}: ${seat.review.terminalState} \u2014 ${seat.review.findings.length} finding(s) \xB7 evidence ${seat.realized}${cause}`
       );
       return [id, seat];
     })

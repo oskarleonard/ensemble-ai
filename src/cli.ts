@@ -266,6 +266,7 @@ Options:
   --sandbox <profile>   reviewer sandbox profile override (deny-by-default only)
   --allow-sensitive     review even if the diff carries secrets/sensitive paths
   --ceiling <bytes>     coverage byte ceiling (default 200000)
+  --convention-cap <bytes>  conventions byte cap (default 150000; a full review wants more)
   --cwd <dir>           repo working dir (default: cwd)
   --run-id <id>         trail/receipt run id (default: generated)
   -h, --help            this help
@@ -1106,6 +1107,7 @@ async function reviewCommand(
         base: { type: 'string' },
         ceiling: { type: 'string' },
         'claude-effort': { type: 'string' },
+        'convention-cap': { type: 'string' },
         'claude-model': { type: 'string' },
         conventions: { type: 'string' },
         cwd: { type: 'string' },
@@ -1328,6 +1330,12 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   );
   if (typeof ceiling === 'object') return ceiling.code;
   const ceilingBytes = ceiling;
+  const conventionCap = positiveCeiling(
+    typeof values['convention-cap'] === 'string' ? values['convention-cap'] : undefined,
+    cmd,
+    '--convention-cap'
+  );
+  if (typeof conventionCap === 'object') return conventionCap.code;
 
   // The Anthropic seats this command runs AFTER the core: the `claude` producer (default-on) and
   // the `gate`. They are part of the run's evidence INTENT — the gate is an evidence-bearing actor
@@ -1356,6 +1364,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       allowSensitive: Boolean(values['allow-sensitive']),
       base: typeof values.base === 'string' ? values.base : undefined,
       ceilingBytes,
+      conventionCapBytes: conventionCap,
       conventionPaths,
       conventionReader,
       cwd,
@@ -2350,14 +2359,19 @@ function parseConventionPaths(
   return list.length ? list : undefined;
 }
 
+// A byte budget flag: a positive INTEGER no larger than any reader could sensibly hold —
+// a fractional cap degrades to 1-byte reads and a cap past the allocator's limit made
+// every file read fail silently ("0/0 files gathered").
+const MAX_BYTES_FLAG = 64 * 1024 * 1024;
 function positiveCeiling(
   raw: string | undefined,
-  cmd: string
+  cmd: string,
+  flag = '--ceiling'
 ): number | undefined | { code: number } {
   if (raw === undefined) return undefined;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) {
-    console.error(`ensemble-ai ${cmd}: --ceiling must be a positive number`);
+  if (!Number.isInteger(n) || n <= 0 || n > MAX_BYTES_FLAG) {
+    console.error(`ensemble-ai ${cmd}: ${flag} must be a positive integer of bytes (at most ${MAX_BYTES_FLAG})`);
     return { code: 3 };
   }
   return n;
@@ -2718,6 +2732,7 @@ Options:
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --ceiling <bytes>     coverage byte ceiling (default 200000)
+  --convention-cap <bytes>  conventions byte cap (default 150000)
   --full                print the ENTIRE rendered prompt (the literal payload)
   --json                print { packet, prompt } as JSON
   --cwd <dir>           repo working dir (default: cwd)
@@ -2733,6 +2748,7 @@ async function diffCommand(args: string[]): Promise<number> {
       options: {
         base: { type: 'string' },
         ceiling: { type: 'string' },
+        'convention-cap': { type: 'string' },
         conventions: { type: 'string' },
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
@@ -2778,6 +2794,12 @@ async function diffCommand(args: string[]): Promise<number> {
     'diff'
   );
   if (typeof ceiling === 'object') return ceiling.code;
+  const conventionCap = positiveCeiling(
+    typeof values['convention-cap'] === 'string' ? values['convention-cap'] : undefined,
+    'diff',
+    '--convention-cap'
+  );
+  if (typeof conventionCap === 'object') return conventionCap.code;
   const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
 
   const source = resolveDiffSourceForCommand(values, positionals, 'diff', cwd);
@@ -2818,6 +2840,7 @@ async function diffCommand(args: string[]): Promise<number> {
         .map((f) => f.path)
         .filter((p) => p && p !== 'unknown');
       const gathered = await gatherConventions(reader, changed, {
+        capBytes: conventionCap,
         conventions: parseConventionPaths(values.conventions),
       });
       if (gathered.text.trim()) agentsMd = gathered.text;
@@ -2825,7 +2848,7 @@ async function diffCommand(args: string[]): Promise<number> {
     }
   }
 
-  const preview = buildPacketPreview(acquired, profile, agentsMd);
+  const preview = buildPacketPreview(acquired, profile, agentsMd, conventions?.capBytes);
   if (values.json) {
     console.log(
       JSON.stringify(

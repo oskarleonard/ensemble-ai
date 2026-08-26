@@ -146,3 +146,28 @@ describe('reviewerVisibleDiff + segmentsWithoutTruncationSplices (binding fix #1
     expect(joined).not.toContain('partialTailResume');
   });
 });
+
+describe('the conventions section follows the gather cap', () => {
+  const big = `===== .claude/rules/a.md =====\n${'a'.repeat(30_000)}\n===== .claude/rules/z.md =====\n${'z'.repeat(30_000)}`;
+  const base = { diff: 'diff --git a/x b/x\n+'.padEnd(400, 'x'), objective: 'o', pr: 1, repo: 'r' };
+
+  it('without a gather cap the 12k floor still applies', () => {
+    const p = assembleCodePacket({ ...base, agentsMd: big });
+    const s = p.sections.find((x) => x.title.startsWith('Repo conventions'));
+    expect(s?.truncated).toBe(true);
+    expect(s?.body).not.toContain('===== .claude/rules/z.md'); // the tail rule was cut
+  });
+
+  it('with the gather cap the gathered text ships WHOLE, so the manifest stays true', () => {
+    const p = assembleCodePacket({ ...base, agentsBudget: 150_000, agentsMd: big });
+    const s = p.sections.find((x) => x.title.startsWith('Repo conventions'));
+    expect(s?.truncated).toBe(false);
+    expect(s?.body).toContain('===== .claude/rules/a.md');
+    expect(s?.body).toContain('===== .claude/rules/z.md');
+  });
+
+  it('a cap below the floor never LOWERS the budget', () => {
+    const p = assembleCodePacket({ ...base, agentsBudget: 100, agentsMd: 'c'.repeat(5_000) });
+    expect(p.sections.find((x) => x.title.startsWith('Repo conventions'))?.truncated).toBe(false);
+  });
+});
