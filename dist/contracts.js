@@ -154,6 +154,11 @@ function parseFindings(raw) {
 
 // src/core/packet.ts
 var PACKET_BUDGETS = {
+  // The FLOOR for the conventions section. When the conventions were GATHERED under a byte
+  // cap (core/conventions.ts), the section budget is that cap instead (PacketInput.agentsBudget):
+  // the gatherer already bounded the text and wrote a manifest saying which files the reviewers
+  // see, and re-truncating here made that manifest a lie — every run before this handed the
+  // seats ~12 KB of an 80 KB gather while `conventions.json` reported the rules as included.
   agents: 12e3,
   constraints: 4e3,
   diff: 2e5,
@@ -247,7 +252,7 @@ function assembleCodePacket(input) {
       "Repo conventions (AGENTS.md)",
       "house rules + known footguns the change must respect",
       input.agentsMd ?? "",
-      PACKET_BUDGETS.agents
+      Math.max(PACKET_BUDGETS.agents, input.agentsBudget ?? 0)
     )
   );
   if (input.constraints) {

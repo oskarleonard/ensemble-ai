@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/cli.ts
-import { execFileSync as execFileSync4 } from "child_process";
+import { execFileSync as execFileSync5 } from "child_process";
 import crypto2 from "crypto";
 import fs22 from "fs";
 import os11 from "os";
@@ -196,14 +196,17 @@ function readReviewsForRun(baseDir, runId) {
 }
 
 // src/core/conventions.ts
+import { execFileSync } from "child_process";
 import fs2 from "fs";
 import path2 from "path";
-var DEFAULT_CAP_BYTES = 8e4;
+var DEFAULT_CAP_BYTES = 15e4;
 var CAP_PROBE_MARGIN = 8;
 var DEFAULT_MAX_FILES = 60;
 var ENTRY_FILES = ["CLAUDE.md", "AGENTS.md"];
+var ENTRY_LIKE_FILES = [".github/copilot-instructions.md"];
+var RULES_DIRS = [".claude/rules", ".cursor/rules", ".github/instructions"];
 var COMMON_DOCS = ["CONTRIBUTING.md", "ARCHITECTURE.md", "TECH_DESIGN.md"];
-var SWEEP_DIRS = ["docs", "ai-spec"];
+var SWEEP_DIRS = ["docs", "ai-spec", "spec-ai"];
 function resolveInRepo(fromDir, ref) {
   const first = ref.trim().split(/[#?\s]/)[0];
   if (!first) return null;
@@ -231,13 +234,23 @@ function ancestorDirs(relPath) {
   }
   return dirs;
 }
-function extractRefs(content) {
+function extractIncludes(content) {
   const refs = /* @__PURE__ */ new Set();
   for (const m of content.matchAll(/(?:^|\s)@([^\s)]+\.md)/gm)) refs.add(m[1]);
+  return [...refs];
+}
+function extractRefs(content) {
+  const refs = new Set(extractIncludes(content));
   for (const m of content.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) refs.add(m[1]);
   for (const m of content.matchAll(/\b(?:see|read|per|in)\s+`?([\w./-]+\.md)`?/gi)) {
     refs.add(m[1]);
   }
+  for (const m of content.matchAll(/`([\w./-]+\.md)`/g)) refs.add(m[1]);
+  return [...refs];
+}
+function extractDirRefs(content) {
+  const refs = /* @__PURE__ */ new Set();
+  for (const m of content.matchAll(/`([\w./-]+\/)`/g)) refs.add(m[1]);
   return [...refs];
 }
 function sliceBytes(s, maxBytes) {
@@ -251,6 +264,13 @@ function fileHeader(rel) {
 ===== ${rel} =====
 `;
 }
+function tierOfRef(parent, kind) {
+  if (kind === "include") return parent;
+  return parent === 0 ? 1 : 2;
+}
+function isReadme(rel) {
+  return /(^|\/)README\.md$/i.test(rel);
+}
 async function gatherConventions(reader, changedPaths, config = {}) {
   const capBytes = config.capBytes ?? DEFAULT_CAP_BYTES;
   const maxFiles = config.maxFiles ?? DEFAULT_MAX_FILES;
@@ -263,103 +283,215 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   const orderedDirs = [...dirs].sort(
     (a, b) => a.length - b.length || (a < b ? -1 : 1)
   );
-  const seen = /* @__PURE__ */ new Set();
+  const tierOf = /* @__PURE__ */ new Map();
   const queue = [];
-  const enqueue = (rel) => {
+  const explicit = /* @__PURE__ */ new Set();
+  for (const c of config.conventions ?? []) {
+    const rel = resolveInRepo("", c);
+    if (rel) explicit.add(rel);
+  }
+  const clampTier = (rel, tier, clamp) => clamp && isReadme(rel) && !explicit.has(rel) ? 2 : tier;
+  const enqueue = (rel, claimed, clamp = true) => {
     if (!rel || !rel.endsWith(".md")) return;
-    if (seen.has(rel)) return;
-    seen.add(rel);
-    queue.push(rel);
+    const tier = clampTier(rel, claimed, clamp);
+    const prev = tierOf.get(rel);
+    if (prev === void 0) {
+      tierOf.set(rel, tier);
+      queue.push(rel);
+    } else if (tier < prev) {
+      tierOf.set(rel, tier);
+    }
+  };
+  const listMemo = /* @__PURE__ */ new Map();
+  const list = (dirRel) => {
+    let p = listMemo.get(dirRel);
+    if (!p) {
+      p = reader.list(dirRel);
+      listMemo.set(dirRel, p);
+    }
+    return p;
+  };
+  const dequeue = () => {
+    let best = 0;
+    for (let i = 1; i < queue.length; i++) {
+      if ((tierOf.get(queue[i]) ?? 2) < (tierOf.get(queue[best]) ?? 2)) best = i;
+    }
+    return queue.splice(best, 1)[0];
   };
   for (const d of orderedDirs) {
-    for (const f of ENTRY_FILES) enqueue(joinDir(d, f));
+    for (const f of [...ENTRY_FILES, ...ENTRY_LIKE_FILES]) enqueue(joinDir(d, f), 0);
+    for (const rulesDir of RULES_DIRS) {
+      for (const item of await list(joinDir(d, rulesDir))) {
+        enqueue(resolveInRepo("", item), 0, false);
+      }
+    }
   }
-  for (const c of config.conventions ?? []) enqueue(resolveInRepo("", c));
+  for (const rel of explicit) enqueue(rel, 0, false);
   for (const d of orderedDirs) {
-    for (const f of COMMON_DOCS) enqueue(joinDir(d, f));
+    for (const f of COMMON_DOCS) enqueue(joinDir(d, f), 2);
     for (const sweepDir of SWEEP_DIRS) {
-      for (const item of await reader.list(joinDir(d, sweepDir))) {
-        enqueue(resolveInRepo("", item));
+      for (const item of await list(joinDir(d, sweepDir))) {
+        enqueue(resolveInRepo("", item), 2);
       }
     }
   }
   const files = [];
   const candidates = [];
+  const edges = /* @__PURE__ */ new Map();
   const byContent = /* @__PURE__ */ new Map();
+  const twins = /* @__PURE__ */ new Map();
   let visited = 0;
   while (queue.length > 0) {
-    const rel = queue.shift();
+    const rel = dequeue();
     const probe = await reader.read(rel, capBytes + CAP_PROBE_MARGIN);
     if (probe === null) continue;
     const readTruncated = Buffer.byteLength(probe, "utf8") > capBytes;
     const content = readTruncated ? sliceBytes(probe, capBytes) : probe;
     const bytes = Buffer.byteLength(content, "utf8");
+    const tier = tierOf.get(rel);
     if (visited >= maxFiles) {
-      files.push({ path: rel, bytes, included: false, truncated: false, reason: "max-files" });
+      files.push({ path: rel, bytes, included: false, truncated: false, reason: "max-files", tier });
+      while (queue.length > 0) {
+        const left = dequeue();
+        const exists = await reader.read(left, 1);
+        if (exists === null) continue;
+        files.push({
+          path: left,
+          bytes: 0,
+          included: false,
+          truncated: false,
+          reason: "max-files",
+          tier: tierOf.get(left)
+        });
+      }
       break;
     }
     visited++;
     const dir = dirOf(rel);
-    for (const ref of extractRefs(content)) enqueue(resolveInRepo(dir, ref));
+    const includes = new Set(extractIncludes(content));
+    const edge = { includes: [], named: [] };
+    const explicitlyRelative = (ref) => /^\.\.?\//.test(ref);
+    const resolutions = (ref) => {
+      const local = resolveInRepo(dir, ref);
+      const out = local ? [local] : [];
+      if (dir !== "" && !explicitlyRelative(ref)) {
+        const fromRoot = resolveInRepo("", ref);
+        if (fromRoot && fromRoot !== local) out.push(fromRoot);
+      }
+      return out;
+    };
+    for (const ref of extractRefs(content)) {
+      const kind = includes.has(ref) ? "include" : "named";
+      for (const target of kind === "include" ? [resolveInRepo(dir, ref)] : resolutions(ref)) {
+        if (!target || !target.endsWith(".md")) continue;
+        edge[kind === "include" ? "includes" : "named"].push(target);
+        enqueue(target, tierOfRef(tier, kind), kind !== "include");
+      }
+    }
+    for (const ref of extractDirRefs(content)) {
+      const targetDir = explicitlyRelative(ref) ? resolveInRepo(dir, ref) : resolveInRepo("", ref);
+      if (targetDir === null) continue;
+      const listDir = targetDir.replace(/\/+$/, "");
+      if (listDir === "") continue;
+      for (const item of await list(listDir)) {
+        const target = resolveInRepo("", item);
+        if (!target) continue;
+        edge.named.push(target);
+        enqueue(target, tierOfRef(tier, "named"));
+      }
+    }
+    edges.set(rel, edge);
     const original = byContent.get(content);
     if (original !== void 0) {
-      files.push({ path: rel, bytes, included: false, truncated: false, reason: "duplicate", duplicateOf: original });
+      files.push({ path: rel, bytes, included: false, truncated: false, reason: "duplicate", duplicateOf: original, tier });
+      twins.set(original, [...twins.get(original) ?? [], rel]);
       continue;
     }
     byContent.set(content, rel);
     candidates.push({ bytes, content, readTruncated, rel });
   }
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const [parent, edge] of edges) {
+      const pt = tierOf.get(parent);
+      const lower = (child, claimed, clamp) => {
+        const t = clampTier(child, claimed, clamp);
+        const cur = tierOf.get(child);
+        if (cur !== void 0 && t < cur) {
+          tierOf.set(child, t);
+          changed = true;
+        }
+      };
+      for (const c of edge.includes) lower(c, tierOfRef(pt, "include"), false);
+      for (const c of edge.named) lower(c, tierOfRef(pt, "named"), true);
+    }
+  }
+  const tierOfRel = (rel) => {
+    let t = tierOf.get(rel) ?? 2;
+    for (const twin of twins.get(rel) ?? []) t = Math.min(t, tierOf.get(twin) ?? 2);
+    return t;
+  };
+  for (const f of files) f.tier = tierOfRel(f.path);
   const noticeFor = (n) => `
 
 \u2026[${n} bytes truncated \u2014 over the ${capBytes}-byte conventions cap]\u2026
 `;
   const costed = candidates.map((c) => {
     const header = fileHeader(c.rel);
-    return { ...c, header, headerBytes: Buffer.byteLength(header, "utf8") };
+    return { ...c, header, headerBytes: Buffer.byteLength(header, "utf8"), tier: tierOfRel(c.rel) };
   });
   const allocation = /* @__PURE__ */ new Map();
   let remaining = capBytes;
-  let active = [...costed];
-  for (; ; ) {
-    if (active.length === 0) break;
-    const share = Math.floor(remaining / active.length);
-    const fits = active.filter((c) => c.headerBytes + c.bytes <= share);
-    if (fits.length === 0) break;
-    for (const c of fits) {
-      allocation.set(c.rel, -1);
-      remaining -= c.headerBytes + c.bytes;
+  for (const tier of [0, 1, 2]) {
+    let active = costed.filter((c) => c.tier === tier);
+    for (; ; ) {
+      if (active.length === 0) break;
+      const share = Math.floor(remaining / active.length);
+      let fits = active.filter((c) => c.headerBytes + c.bytes <= share);
+      if (fits.length === 0) {
+        const smallest = active.reduce(
+          (a, b) => b.headerBytes + b.bytes < a.headerBytes + a.bytes ? b : a
+        );
+        if (smallest.headerBytes + smallest.bytes <= remaining) fits = [smallest];
+      }
+      if (fits.length === 0) break;
+      for (const c of fits) {
+        allocation.set(c.rel, -1);
+        remaining -= c.headerBytes + c.bytes;
+      }
+      active = active.filter((c) => !allocation.has(c.rel));
     }
-    active = active.filter((c) => !allocation.has(c.rel));
-  }
-  while (active.length > 0) {
-    const share = Math.floor(remaining / active.length);
-    const unframeable = active.filter(
-      (c) => share - c.headerBytes - Buffer.byteLength(noticeFor(c.bytes), "utf8") <= 0
-    );
-    if (unframeable.length > 0) {
-      active = active.filter((c) => !unframeable.includes(c));
-      continue;
+    while (active.length > 0) {
+      const share = Math.floor(remaining / active.length);
+      const unframeable = active.filter(
+        (c) => share - c.headerBytes - Buffer.byteLength(noticeFor(c.bytes), "utf8") <= 0
+      );
+      if (unframeable.length > 0) {
+        active = unframeable.length === active.length && active.length > 1 ? [active.reduce((a, b) => b.headerBytes + b.bytes < a.headerBytes + a.bytes ? b : a)] : active.filter((c) => !unframeable.includes(c));
+        continue;
+      }
+      for (const c of active) {
+        const contentBudget = share - c.headerBytes - Buffer.byteLength(noticeFor(c.bytes), "utf8");
+        allocation.set(c.rel, contentBudget);
+        remaining -= share;
+      }
+      break;
     }
-    for (const c of active) {
-      const contentBudget = share - c.headerBytes - Buffer.byteLength(noticeFor(c.bytes), "utf8");
-      allocation.set(c.rel, contentBudget);
-      remaining -= share;
-    }
-    break;
   }
   const chunks = [];
   let used = 0;
-  for (const c of costed) {
+  const ordered = [...costed].sort((a, b) => a.tier - b.tier);
+  for (const c of ordered) {
     const alloc = allocation.get(c.rel);
     if (alloc === void 0) {
-      files.push({ path: c.rel, bytes: c.bytes, included: false, truncated: false, reason: "over-cap" });
+      files.push({ path: c.rel, bytes: c.bytes, included: false, truncated: false, reason: "over-cap", tier: c.tier });
       continue;
     }
     if (alloc === -1) {
       chunks.push(c.header + c.content);
       used += c.headerBytes + c.bytes;
       files.push(
-        c.readTruncated ? { path: c.rel, bytes: c.bytes, included: true, truncated: true, reason: "over-cap" } : { path: c.rel, bytes: c.bytes, included: true, truncated: false }
+        c.readTruncated ? { path: c.rel, bytes: c.bytes, included: true, truncated: true, reason: "over-cap", tier: c.tier } : { path: c.rel, bytes: c.bytes, included: true, truncated: false, tier: c.tier }
       );
       continue;
     }
@@ -368,7 +500,7 @@ async function gatherConventions(reader, changedPaths, config = {}) {
     const notice = noticeFor(c.bytes - headBytes);
     chunks.push(`${c.header}${head}${notice}`);
     used += c.headerBytes + headBytes + Buffer.byteLength(notice, "utf8");
-    files.push({ path: c.rel, bytes: c.bytes, included: true, truncated: true, reason: "over-cap" });
+    files.push({ path: c.rel, bytes: c.bytes, included: true, truncated: true, reason: "over-cap", tier: c.tier });
   }
   return {
     text: chunks.join("").replace(/^\n+/, ""),
@@ -397,17 +529,32 @@ function fsConventionReader(repoRoot) {
     if (realBack.startsWith("..") || path2.isAbsolute(realBack)) return null;
     return real;
   };
+  const ignoreCache = /* @__PURE__ */ new Map();
+  const isIgnored = (rel) => {
+    const cached = ignoreCache.get(rel);
+    if (cached !== void 0) return cached;
+    let ignored = false;
+    try {
+      execFileSync("git", ["-C", root, "check-ignore", "-q", "--", rel], { stdio: "ignore" });
+      ignored = true;
+    } catch {
+      ignored = false;
+    }
+    ignoreCache.set(rel, ignored);
+    return ignored;
+  };
   return {
     async read(rel, maxBytes) {
       const abs = within(rel);
-      if (!abs) return null;
+      if (!abs || isIgnored(rel)) return null;
       try {
         if (!fs2.statSync(abs).isFile()) return null;
         if (maxBytes === void 0) return fs2.readFileSync(abs, "utf8");
         const fd = fs2.openSync(abs, "r");
         try {
-          const buf = Buffer.alloc(maxBytes);
-          const n = fs2.readSync(fd, buf, 0, maxBytes, 0);
+          const want = Math.min(maxBytes, fs2.fstatSync(fd).size);
+          const buf = Buffer.alloc(want);
+          const n = fs2.readSync(fd, buf, 0, want, 0);
           return buf.subarray(0, n).toString("utf8").replace(/�$/, "");
         } finally {
           fs2.closeSync(fd);
@@ -418,9 +565,9 @@ function fsConventionReader(repoRoot) {
     },
     async list(dirRel) {
       const abs = within(dirRel);
-      if (!abs) return [];
+      if (!abs || isIgnored(dirRel)) return [];
       try {
-        return fs2.readdirSync(abs).filter((n) => n.endsWith(".md")).map((n) => joinDir(dirRel, n));
+        return fs2.readdirSync(abs).filter((n) => n.endsWith(".md")).map((n) => joinDir(dirRel, n)).filter((rel) => !isIgnored(rel));
       } catch {
         return [];
       }
@@ -1029,7 +1176,7 @@ import fs6 from "fs";
 import os3 from "os";
 
 // src/core/bin.ts
-import { execFileSync } from "child_process";
+import { execFileSync as execFileSync2 } from "child_process";
 import fs5 from "fs";
 var binCache = /* @__PURE__ */ new Map();
 function resolveBin(name, opts = {}) {
@@ -1045,7 +1192,7 @@ function resolveBin(name, opts = {}) {
       return c;
     }
   }
-  const found = execFileSync("/bin/zsh", ["-ic", `whence -p ${name}`], {
+  const found = execFileSync2("/bin/zsh", ["-ic", `whence -p ${name}`], {
     encoding: "utf8"
   }).trim().split("\n").pop();
   if (!found) throw new Error(`${name} binary not found`);
@@ -1994,6 +2141,11 @@ import path10 from "path";
 
 // src/core/packet.ts
 var PACKET_BUDGETS = {
+  // The FLOOR for the conventions section. When the conventions were GATHERED under a byte
+  // cap (core/conventions.ts), the section budget is that cap instead (PacketInput.agentsBudget):
+  // the gatherer already bounded the text and wrote a manifest saying which files the reviewers
+  // see, and re-truncating here made that manifest a lie — every run before this handed the
+  // seats ~12 KB of an 80 KB gather while `conventions.json` reported the rules as included.
   agents: 12e3,
   constraints: 4e3,
   diff: 2e5,
@@ -2087,7 +2239,7 @@ function assembleCodePacket(input) {
       "Repo conventions (AGENTS.md)",
       "house rules + known footguns the change must respect",
       input.agentsMd ?? "",
-      PACKET_BUDGETS.agents
+      Math.max(PACKET_BUDGETS.agents, input.agentsBudget ?? 0)
     )
   );
   if (input.constraints) {
@@ -2159,7 +2311,7 @@ function isFinding(v) {
 }
 
 // src/modes/review/diff.ts
-import { execFileSync as execFileSync2 } from "child_process";
+import { execFileSync as execFileSync3 } from "child_process";
 
 // src/core/hash.ts
 import crypto from "crypto";
@@ -2317,7 +2469,7 @@ function diffDigest(raw) {
   return `sha256:${sha256Hex(canonicalizeDiff(raw))}`;
 }
 function git(cwd, args, opts) {
-  return execFileSync2("git", args, {
+  return execFileSync3("git", args, {
     cwd,
     encoding: "utf8",
     stdio: opts?.quiet ? ["ignore", "pipe", "ignore"] : ["pipe", "pipe", "inherit"]
@@ -6709,6 +6861,7 @@ async function runReviewMode(opts) {
     );
   }
   const packet = assembleCodePacket({
+    agentsBudget: conventionManifest?.capBytes,
     agentsMd,
     authorSummary: opts.authorSummary,
     diff: acquired.diff,
@@ -7701,7 +7854,7 @@ function writeEvidenceManifest(baseDir, runId, manifest) {
 }
 
 // src/modes/review/git-exec.ts
-import { execFileSync as execFileSync3 } from "child_process";
+import { execFileSync as execFileSync4 } from "child_process";
 import path17 from "path";
 function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
   const cmd = configured?.trim();
@@ -7715,7 +7868,7 @@ function effectiveSshCommand(cwd, cache) {
   let value = process.env.GIT_SSH_COMMAND?.trim() || void 0;
   if (!value) {
     try {
-      value = execFileSync3("git", ["config", "--get", "core.sshCommand"], {
+      value = execFileSync4("git", ["config", "--get", "core.sshCommand"], {
         cwd,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"]
@@ -7743,7 +7896,7 @@ function execGit() {
   const sshByCwd = /* @__PURE__ */ new Map();
   return (args, opts) => {
     try {
-      const text = execFileSync3("git", args, {
+      const text = execFileSync4("git", args, {
         cwd: opts?.cwd,
         encoding: "utf8",
         env: {
@@ -8430,8 +8583,9 @@ function stageReview(payload, target, deps) {
 }
 
 // src/plumbing/diff-preview.ts
-function buildPacketPreview(acquired, profile, agentsMd) {
+function buildPacketPreview(acquired, profile, agentsMd, agentsBudget) {
   const packet = assembleCodePacket({
+    agentsBudget,
     agentsMd,
     diff: acquired.diff,
     objective: profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE,
@@ -8446,10 +8600,12 @@ function renderConventionManifest(m) {
   out.push(
     `  conventions:  ${inc}/${m.files.length} file(s) gathered, ${m.totalBytes} bytes (cap ${m.capBytes})`
   );
+  const tierLabel = ["mandatory", "named", "swept"];
   for (const f of m.files) {
     const flag = f.included ? f.truncated ? "~" : "\u2713" : "\xB7";
-    const tag = f.truncated ? " (truncated \u2014 over cap)" : !f.included ? " (omitted \u2014 over cap)" : "";
-    out.push(`    ${flag} ${f.path} (${f.bytes} bytes)${tag}`);
+    const tag = f.truncated ? " (truncated \u2014 over cap)" : f.reason === "duplicate" ? ` (duplicate of ${f.duplicateOf ?? "?"})` : f.reason === "max-files" ? " (omitted \u2014 file ceiling)" : !f.included ? " (omitted \u2014 over cap)" : "";
+    const tier = f.tier === void 0 ? "" : ` [${tierLabel[f.tier]}]`;
+    out.push(`    ${flag} ${f.path} (${f.bytes} bytes)${tier}${tag}`);
   }
   return out;
 }
@@ -8730,6 +8886,7 @@ Options:
   --sandbox <profile>   reviewer sandbox profile override (deny-by-default only)
   --allow-sensitive     review even if the diff carries secrets/sensitive paths
   --ceiling <bytes>     coverage byte ceiling (default 200000)
+  --convention-cap <bytes>  conventions byte cap (default 150000; a full review wants more)
   --cwd <dir>           repo working dir (default: cwd)
   --run-id <id>         trail/receipt run id (default: generated)
   -h, --help            this help
@@ -8805,7 +8962,7 @@ function readStdinIfPiped() {
 }
 function capture(cmd, cmdArgs, cwd) {
   try {
-    const text = execFileSync4(cmd, cmdArgs, {
+    const text = execFileSync5(cmd, cmdArgs, {
       cwd,
       encoding: "utf8",
       maxBuffer: 256 * 1024 * 1024,
@@ -8828,7 +8985,7 @@ function capture(cmd, cmdArgs, cwd) {
 }
 function gitToplevel(cwd) {
   try {
-    const top = execFileSync4("git", ["rev-parse", "--show-toplevel"], {
+    const top = execFileSync5("git", ["rev-parse", "--show-toplevel"], {
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"]
@@ -9153,7 +9310,7 @@ function resolveDiffSourceForCommand(values, positionals, cmd, cwd) {
 function ghRunner(cwd) {
   return (args, input) => {
     try {
-      const text = execFileSync4("gh", args, {
+      const text = execFileSync5("gh", args, {
         cwd,
         encoding: "utf8",
         maxBuffer: 16 * 1024 * 1024,
@@ -9276,6 +9433,7 @@ async function reviewCommand(args, profile = "code") {
         base: { type: "string" },
         ceiling: { type: "string" },
         "claude-effort": { type: "string" },
+        "convention-cap": { type: "string" },
         "claude-model": { type: "string" },
         conventions: { type: "string" },
         cwd: { type: "string" },
@@ -9394,6 +9552,12 @@ async function runReviewPipeline(input) {
   );
   if (typeof ceiling === "object") return ceiling.code;
   const ceilingBytes = ceiling;
+  const conventionCap = positiveCeiling(
+    typeof values["convention-cap"] === "string" ? values["convention-cap"] : void 0,
+    cmd,
+    "--convention-cap"
+  );
+  if (typeof conventionCap === "object") return conventionCap.code;
   const peerSeats = roster.claude ? [...HARNESS_SEATS] : [];
   let directive;
   if (source.postTarget) {
@@ -9410,6 +9574,7 @@ async function runReviewPipeline(input) {
       allowSensitive: Boolean(values["allow-sensitive"]),
       base: typeof values.base === "string" ? values.base : void 0,
       ceilingBytes,
+      conventionCapBytes: conventionCap,
       conventionPaths,
       conventionReader,
       cwd,
@@ -10159,11 +10324,12 @@ function parseConventionPaths(raw) {
   const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
   return list.length ? list : void 0;
 }
-function positiveCeiling(raw, cmd) {
+var MAX_BYTES_FLAG = 64 * 1024 * 1024;
+function positiveCeiling(raw, cmd, flag = "--ceiling") {
   if (raw === void 0) return void 0;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) {
-    console.error(`ensemble-ai ${cmd}: --ceiling must be a positive number`);
+  if (!Number.isInteger(n) || n <= 0 || n > MAX_BYTES_FLAG) {
+    console.error(`ensemble-ai ${cmd}: ${flag} must be a positive integer of bytes (at most ${MAX_BYTES_FLAG})`);
     return { code: 3 };
   }
   return n;
@@ -10467,6 +10633,7 @@ Options:
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
   --ceiling <bytes>     coverage byte ceiling (default 200000)
+  --convention-cap <bytes>  conventions byte cap (default 150000)
   --full                print the ENTIRE rendered prompt (the literal payload)
   --json                print { packet, prompt } as JSON
   --cwd <dir>           repo working dir (default: cwd)
@@ -10481,6 +10648,7 @@ async function diffCommand(args) {
       options: {
         base: { type: "string" },
         ceiling: { type: "string" },
+        "convention-cap": { type: "string" },
         conventions: { type: "string" },
         cwd: { type: "string" },
         "diff-file": { type: "string" },
@@ -10525,6 +10693,12 @@ async function diffCommand(args) {
     "diff"
   );
   if (typeof ceiling === "object") return ceiling.code;
+  const conventionCap = positiveCeiling(
+    typeof values["convention-cap"] === "string" ? values["convention-cap"] : void 0,
+    "diff",
+    "--convention-cap"
+  );
+  if (typeof conventionCap === "object") return conventionCap.code;
   const cwd = values.cwd ? path18.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
@@ -10552,13 +10726,14 @@ async function diffCommand(args) {
     if (reader) {
       const changed = acquired.files.map((f) => f.path).filter((p) => p && p !== "unknown");
       const gathered = await gatherConventions(reader, changed, {
+        capBytes: conventionCap,
         conventions: parseConventionPaths(values.conventions)
       });
       if (gathered.text.trim()) agentsMd = gathered.text;
       conventions = gathered.manifest;
     }
   }
-  const preview = buildPacketPreview(acquired, profile, agentsMd);
+  const preview = buildPacketPreview(acquired, profile, agentsMd, conventions?.capBytes);
   if (values.json) {
     console.log(
       JSON.stringify(
