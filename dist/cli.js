@@ -5437,9 +5437,13 @@ function isEntityLike(tok) {
   if (tok.length >= 2 && tok === tok.toUpperCase() && /[A-Z]/.test(tok)) return true;
   return false;
 }
+var EDGE_PUNCTUATION_RE = /^[./-]+|[./-]+$/g;
 function entityTokens(s) {
   const out = /* @__PURE__ */ new Set();
-  for (const tok of s.match(/[A-Za-z0-9_$./-]{2,}/g) ?? []) if (isEntityLike(tok)) out.add(tok);
+  for (const raw of s.match(/[A-Za-z0-9_$./-]{2,}/g) ?? []) {
+    const tok = raw.replace(EDGE_PUNCTUATION_RE, "");
+    if (tok.length >= 2 && isEntityLike(tok)) out.add(tok);
+  }
   return out;
 }
 function tidy(s) {

@@ -89,9 +89,21 @@ function isEntityLike(tok: string): boolean {
   return false;
 }
 
+// The scan class admits `.`, `/` and `-` because they are INTERIOR to paths and members
+// (`foo.bar`, `docs/x.md`, `kebab-case`). At a token's EDGE they are prose punctuation — the
+// period closing a sentence, a dash or slash the scan glued on — and must come off before
+// classification, or every narrowing that ends a sentence on a new word ("… is inert.") is
+// rejected as inventing the entity `inert.`, and a symbol the body only uses at a sentence end
+// (`localStorage.`) is unavailable mid-sentence. Both sides pass through here — the body/hunk
+// allow-list and the replacement — so a symbol is judged the same way wherever it sits.
+const EDGE_PUNCTUATION_RE = /^[./-]+|[./-]+$/g;
+
 function entityTokens(s: string): Set<string> {
   const out = new Set<string>();
-  for (const tok of s.match(/[A-Za-z0-9_$./-]{2,}/g) ?? []) if (isEntityLike(tok)) out.add(tok);
+  for (const raw of s.match(/[A-Za-z0-9_$./-]{2,}/g) ?? []) {
+    const tok = raw.replace(EDGE_PUNCTUATION_RE, '');
+    if (tok.length >= 2 && isEntityLike(tok)) out.add(tok);
+  }
   return out;
 }
 

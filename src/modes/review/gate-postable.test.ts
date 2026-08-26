@@ -53,6 +53,35 @@ describe('derivePostable — partial narrows the body via ops', () => {
     expect(r.postableFix).toBe('strike');
   });
 
+  it('a replacement may end a sentence on a plain word — the period is punctuation, not a member access (lisk-web#873: "Expired.")', () => {
+    const r = derivePostable({
+      body: BODY, fixStatus: undefined, hunkCode: HUNK, rescoredSeverity: undefined, severity: 'high', verdict: 'partial',
+      // "unencrypted." is a new PROSE word; its trailing period used to make it read as `unencrypted.` — an entity.
+      ops: [{ op: 'replace', quote: 'with no encryption, and it is stored indefinitely across all sessions.', with: 'and the payload is unencrypted.' }],
+    });
+    expect(r.postableStatus).toBe('postable');
+    expect(r.postableBody).toBe('The KYB draft is written to localStorage via JSON.stringify and the payload is unencrypted.');
+  });
+
+  it('edge stripping keeps INTERIOR markers: a new dotted symbol is still rejected, even at a sentence end', () => {
+    const r = derivePostable({
+      body: BODY, fixStatus: undefined, hunkCode: HUNK, rescoredSeverity: undefined, severity: 'high', verdict: 'partial',
+      ops: [{ op: 'replace', quote: 'with no encryption', with: 'with no encryption via crypto.subtle.' }],
+    });
+    expect(r.postableStatus).toBe('escalated');
+    expect(r.postableNote).toContain('"crypto.subtle"'); // named without the sentence period it was glued to
+  });
+
+  it('symmetry: a symbol the body uses only at a sentence end is still available mid-sentence', () => {
+    const body = 'Drafts are kept unencrypted in localStorage.';
+    const r = derivePostable({
+      body, fixStatus: undefined, hunkCode: [], rescoredSeverity: undefined, severity: 'medium', verdict: 'partial',
+      ops: [{ op: 'replace', quote: 'kept unencrypted in localStorage.', with: 'kept in localStorage without encryption.' }],
+    });
+    expect(r.postableStatus).toBe('postable');
+    expect(r.postableBody).toBe('Drafts are kept in localStorage without encryption.');
+  });
+
   it('partial with NO ops ⇒ escalated (posting verbatim would re-inject the overstatement)', () => {
     const r = derivePostable({ body: BODY, fixStatus: undefined, hunkCode: HUNK, ops: [], rescoredSeverity: undefined, severity: 'high', verdict: 'partial' });
     expect(r.postableStatus).toBe('escalated');
