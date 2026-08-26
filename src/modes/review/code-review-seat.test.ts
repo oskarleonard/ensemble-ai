@@ -38,6 +38,12 @@ describe('the one Claude producer — /code-review methodology seat', () => {
     expect(prompt).toContain('DECLARED-SET COMPLETENESS');
   });
 
+  it('grounds a claimed operational practice in scripts/runbooks, never in sibling comments (lisk-backend#736)', () => {
+    expect(prompt).toContain('CLAIM VS PRACTICE');
+    expect(prompt).toMatch(/scripts, runbooks, CI\/deploy config/);
+    expect(prompt).toMatch(/prove a convention was copied, not that anyone performs it/);
+  });
+
   it('forbids arguing away execution-decidable findings — report them and name the settling command', () => {
     expect(prompt).toContain('execution-decidable');
     expect(prompt).toMatch(/name\s+the exact command that would settle it/);

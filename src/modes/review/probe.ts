@@ -113,6 +113,12 @@ export interface ProbePromptArgs {
 }
 
 // PURE: the prober prompt. Encoded as data so a unit test pins the exact contract (house rule).
+//
+// Extended 2026-08-26 after lisk-backend#736: the prober set a `lock_timeout` the app never
+// configures so a concurrent INSERT died under an in-transaction CREATE INDEX, and the finding
+// shipped "canceling statement due to lock timeout" as its receipt. The real behaviour was a
+// ~ms wait. The MIGRATIONS bullet now pins the app's own session settings and forbids
+// manufacturing the failure.
 export function renderProbePrompt(args: ProbePromptArgs): string {
   const range = args.baseSha ? `base ${args.baseSha} → head ${args.headSha}` : `head ${args.headSha}`;
   return `You are the EXECUTION PROBER for a backend pull request — the stage that checks the change
@@ -157,7 +163,11 @@ DIFF>>>
      an input that must PASS, and run both for real — a test you write, the repo's own test
      harness, or a booted service.
    - MIGRATIONS: replay the affected service's full migration history on a scratch database of the
-     production major.
+     production major, under the app's REAL session settings: read what the migrate script and the
+     deployed binaries actually set (lock_timeout, statement_timeout, transaction mode) and mirror
+     it. NEVER add a timeout or a failure condition the app does not configure so that a probe
+     breaks — a lock is reported as the DURATION concurrent writers waited at the scale you
+     seeded, and a cancellation you manufactured is not a receipt.
    - PROVISIONING PARITY (least privilege): when the diff adds a schema, table, or other database
      object, apply the repo's role-provisioning registry (e.g. db/provisioning/*.sql) to the
      scratch database and run the migrations/boot/queries AS THE RUNTIME ROLES the deployed

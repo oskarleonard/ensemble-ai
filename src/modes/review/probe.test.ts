@@ -70,6 +70,12 @@ describe('the prober prompt — run the change, receipts or it did not happen', 
     expect(prompt).toContain('Reading is not probing');
   });
 
+  it("replays migrations under the app's own session settings — never a manufactured timeout (lisk-backend#736)", () => {
+    expect(prompt).toContain("under the app's REAL session settings");
+    expect(prompt).toMatch(/NEVER add a timeout or a failure condition the app does not configure/);
+    expect(prompt).toMatch(/a cancellation you manufactured is not a receipt/);
+  });
+
   it('pins the probe families and the accident guards', () => {
     for (const s of ['GUARDS', 'MIGRATIONS', 'PROVISIONING PARITY (least privilege)', 'QUERY PLANS', 'TEST EFFECTIVENESS (mutation-lite)', 'ENDPOINTS']) {
       expect(prompt).toContain(s);
