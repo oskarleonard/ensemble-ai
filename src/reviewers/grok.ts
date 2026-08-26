@@ -10,6 +10,7 @@ import type { SandboxProfileRef } from '../modes/review/evidence';
 
 import {
   type CodexReviewResult,
+  CORE_WORKTREE_REVIEW_TIMEOUT_MS,
   REVIEW_TIMEOUT_MS,
   type RunReviewOpts,
 } from './codex';
@@ -255,7 +256,10 @@ export async function runGrokReview(
   config: ReviewerConfig,
   opts: RunReviewOpts = {}
 ): Promise<CodexReviewResult> {
-  const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
+  // A worktree seat holds a shell in the PR head and legitimately outruns the packet budget —
+  // the same split the codex seat makes (CORE_WORKTREE_REVIEW_TIMEOUT_MS).
+  const timeoutMs =
+    opts.timeoutMs ?? (opts.worktree ? CORE_WORKTREE_REVIEW_TIMEOUT_MS : REVIEW_TIMEOUT_MS);
   // Pin the boundary to a proven read-only profile (provisioning the resolved one,
   // which is exactly what buildGrokReviewArgs will pass to --sandbox).
   const sandbox = resolveReviewSandbox(config.sandbox);

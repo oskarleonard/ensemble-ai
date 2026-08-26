@@ -39,11 +39,36 @@ const GENERATED_PATTERNS: RegExp[] = [
   /\.min\.(js|css)$/,
   /\.(js|css)\.map$/,
   /\.snap$/,
+  // Generator OUTPUT (ORM clients, API bindings, protobuf, GraphQL types): regenerated from a
+  // schema that is itself in the diff, so a reviewer reading it adds nothing — while its bulk
+  // competes with the real source for the coverage ceiling. Run 2026-08-26-10-45-52 spent its
+  // budget on `gen/ent/*` sections while omitting the hand-written files the findings were about.
+  /(^|\/)(gen|generated|__generated__)\//,
+  /\.gen\.[a-z]+$/,
+  /\.pb\.go$/,
+  /[._]generated\.[a-z]+$/,
 ];
 
 export function classifyFileKind(path: string, isBinary: boolean): FileKind {
   if (isBinary) return 'binary';
   return GENERATED_PATTERNS.some((re) => re.test(path)) ? 'generated' : 'source';
+}
+
+// Test files, for the admission ORDER in computeCoverage (never for omission: a test is source,
+// and an omitted one still disqualifies a receipt). Path-shape heuristics for the ecosystems this
+// engine reviews; a miss only costs a file its priority, never its NAMED disposition.
+const TEST_PATTERNS: RegExp[] = [
+  /(^|\/)(test|tests|__tests__|spec|specs|testdata|__snapshots__)\//,
+  /_test\.(go|py|rs|rb|ex|exs)$/,
+  /\.(test|spec)\.[cm]?[jt]sx?$/,
+  /(^|\/)test_[^/]+\.py$/,
+  /_spec\.rb$/,
+  /Tests?\.(java|kt|swift|cs|scala)$/,
+  /\.bats$/,
+];
+
+export function isTestPath(path: string): boolean {
+  return TEST_PATTERNS.some((re) => re.test(path));
 }
 
 export interface FileDiff {
@@ -148,17 +173,33 @@ export function omittedLine(o: {
 
 // Decide which file diffs the reviewer actually sees, bounded by a byte ceiling,
 // and record EVERY file's disposition. Binary + generated files are omitted by
-// kind; remaining (source) files are included in order until the ceiling, after
-// which they're omitted as 'over-limit' — NAMED, never silently dropped. The
-// included sections are concatenated into the diff the packet carries (so the
-// reviewer sees exactly what coverage says, with no mid-file truncation).
+// kind; source files are admitted until the ceiling — non-test source FIRST, then
+// tests — after which the rest are omitted as 'over-limit', NAMED, never silently
+// dropped. Source before tests because the budget is finite and a reviewer that
+// sees a change but not its test can still judge it, while one that sees the test
+// but not the change cannot: run 2026-08-26-10-45-52 spent its ceiling in path
+// order, omitted `intent.go` and `catalog.go` while including their test files,
+// and the gate had to mark every finding on those files "unverified — out of
+// diff". The entries keep DIFF order regardless, so coverage listings and receipts
+// read as before; only which files fit changes. The included sections are
+// concatenated into the diff the packet carries (so the reviewer sees exactly what
+// coverage says, with no mid-file truncation).
 export function computeCoverage(
   files: FileDiff[],
   ceilingBytes: number = DEFAULT_COVERAGE_CEILING
 ): { coverage: Coverage; includedDiff: string } {
+  const source = files.filter((f) => f.kind === 'source');
+  const admitted = new Set<FileDiff>();
+  let includedBytes = 0;
+  for (const f of [...source.filter((f) => !isTestPath(f.path)), ...source.filter((f) => isTestPath(f.path))]) {
+    // The first admitted file always fits, even alone over the ceiling — a review of
+    // nothing is worse than a review of one large file.
+    if (includedBytes + f.bytes > ceilingBytes && includedBytes > 0) continue;
+    admitted.add(f);
+    includedBytes += f.bytes;
+  }
   const entries: CoverageFileEntry[] = [];
   const includedSections: string[] = [];
-  let includedBytes = 0;
   for (const f of files) {
     const base = {
       added: f.added,
@@ -175,13 +216,12 @@ export function computeCoverage(
       entries.push({ ...base, included: false, omitReason: 'generated' });
       continue;
     }
-    if (includedBytes + f.bytes > ceilingBytes && includedBytes > 0) {
+    if (!admitted.has(f)) {
       entries.push({ ...base, included: false, omitReason: 'over-limit' });
       continue;
     }
     entries.push({ ...base, included: true });
     includedSections.push(f.raw);
-    includedBytes += f.bytes;
   }
   const coverage: Coverage = {
     files: entries,

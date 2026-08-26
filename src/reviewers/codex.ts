@@ -5,9 +5,10 @@ import path from 'node:path';
 import { makeOwnerOnlyTempDir } from '../core/artifacts';
 import type { HistoryPacketFile } from '../modes/review/history-packet';
 import { type EgressDenial, type EgressProxy, proxyEnv } from '../core/egress-proxy';
-import { resolveCodexBin, runReviewerExec } from '../core/spawn';
+import { resolveCodexBin, type ReviewerExecResult, runReviewerExec } from '../core/spawn';
 import type { ReviewerConfig } from '../core/types';
 
+import { CODEX_SOURCE_FENCE_ARGS } from './codex-fence';
 import {
   buildCodexWorktreeArgs,
   codexSandboxSupported,
@@ -27,6 +28,25 @@ import { egressStartFailure, startSeatEgressProxy } from './egress-seat';
 // bigger budgets (self-contained.ts).
 export const REVIEW_TIMEOUT_MS = 900_000; // 15 min
 
+// A WORKTREE core seat (codex / grok holding a shell in the PR head) is a different job
+// from the packet read above: it runs the repo's own tooling and greps the tree, and at
+// xhigh reasoning it legitimately outruns 15 min — run 2026-08-26-10-45-52
+// (lisk-backend#763) killed codex at 15:02 with every other seat finishing honestly
+// around it, the same lesson the Anthropic seats had already paid twice
+// (self-contained.ts). Since the liveness watchdog below reclaims a WEDGED codex seat,
+// this absolute value is a pure runaway backstop: sized past honest work, because a
+// killed honest seat loses everything already paid for.
+export const CORE_WORKTREE_REVIEW_TIMEOUT_MS = 3_600_000; // 60 min runaway backstop
+
+// codex `--json` emits an event per item (a command run, a reasoning step, a message)
+// while it works, so silence this long means a wedged seat, not a slow one. Sized at the
+// OLD absolute budget rather than the Anthropic seats' 10 min: a codex reasoning item at
+// xhigh surfaces only when it completes, so one long step is one silent stretch — and a
+// seat silent for the whole of what used to be its entire budget was never going to
+// finish honestly. Honest work is therefore never worse off than before this watchdog
+// existed, and a wedge still dies in 15 min instead of 60.
+export const CODEX_INACTIVITY_TIMEOUT_MS = 900_000;
+
 export interface CodexReviewResult {
   // Every connection the run's egress proxy REFUSED (codex-f3). Absent on a packet-mode run, which
   // has no proxy. Empty on a clean worktree run. Non-empty means this seat tried to reach a host
@@ -40,7 +60,13 @@ export interface CodexReviewResult {
   ok: boolean;
   raw: string | null; // the reviewer's full reply (read from the -o file)
   stderrTail: string;
+  // The bounded tail of codex's `--json` progress stream — what the seat was doing last.
+  // Persisted beside the reply so a reclaimed seat is diagnosable from the trail.
+  stream?: string;
   timedOut: boolean;
+  // Which watchdog reclaimed the seat: `absolute` (still working when the runaway backstop
+  // cut it — give it budget) or `inactivity` (it went silent — it wedged).
+  timedOutReason?: 'absolute' | 'inactivity';
 }
 
 // PURE: the exact codex CLI args for a PACKET-mode codex seat. Despite the name, this is the packet
@@ -51,13 +77,18 @@ export interface CodexReviewResult {
 // work) · `-m <model>` + `-c model_reasoning_effort=<effort>` (the CONFIGURED
 // strong model, not the account default — a review wants the best) ·
 // `--skip-git-repo-check` (we run from tmpdir; the diff is IN the prompt, not
-// the cwd) · `-o <file>` (codex's reply comes from there — stdout is empty and
-// the exit code lies) · `--ephemeral` + `--color never`. stdin is closed at the
-// spawn (stdio), not via an arg — see runCodexReview.
+// the cwd) · `-o <file>` (codex's reply comes from there — the exit code lies) ·
+// `--json` (stdout becomes a newline-delimited event stream, one line per item as
+// the seat works: it feeds the liveness watchdog, and its tail is kept as the trail's
+// record of what a reclaimed seat was doing; the reply stays on the -o file, which
+// the CLI reference pairs with `--json` for exactly this split) · `--ephemeral` +
+// `--color never`. stdin is closed at the spawn (stdio), not via an arg — see
+// runCodexReview.
 //
 // PACKET FENCE (packet-f1, 2026-07-10) — a packet seat has no worktree, so it has neither the
 // kernel sandbox nor the egress proxy the worktree path fences with. Two flags close the two holes
-// that left, both proved live:
+// that left, both proved live (the argv itself is CODEX_SOURCE_FENCE_ARGS, shared with the
+// worktree builder so the two cannot drift):
 //
 //   `--ignore-user-config` — load NONE of the operator's ~/.codex/config.toml, above all its
 //     `[mcp_servers]`. A review reads its prompt; it needs no MCP. An operator MCP server is an
@@ -105,22 +136,8 @@ export function buildCodexReviewArgs(
     'exec',
     '--skip-git-repo-check',
     '--ephemeral',
-    // Load none of the operator's ~/.codex/config.toml — above all its [mcp_servers]. Auth still
-    // uses $CODEX_HOME; the model/effort below arrive via -m/-c (an override layer), not that file.
-    '--ignore-user-config',
-    // FAIL CLOSED on config drift: reject any `-c` key this codex version does not recognize, so a
-    // renamed/typo'd otel.* key hard-fails the review instead of silently using the default exporter.
-    '--strict-config',
-    // Every OpenTelemetry exporter OFF (metrics defaults to `statsig`, so ignoring the file is not
-    // enough), and never ship the prompt — which carries the untrusted diff — to a telemetry backend.
-    '-c',
-    'otel.exporter="none"',
-    '-c',
-    'otel.metrics_exporter="none"',
-    '-c',
-    'otel.trace_exporter="none"',
-    '-c',
-    'otel.log_user_prompt=false',
+    '--json',
+    ...CODEX_SOURCE_FENCE_ARGS,
     '--color',
     'never',
     '-s',
@@ -194,6 +211,27 @@ function worktreeReplyFile(): { cleanup: () => void; file: string } {
 
 function refuseWorktree(message: string): Promise<CodexReviewResult> {
   return Promise.resolve({ ok: false, raw: null, stderrTail: message, timedOut: false });
+}
+
+// Fold a spawn result into the seat shape. A liveness reclaim names itself (failWhy) so the trail
+// says "it went silent", never the generic "timed out" that would hide the difference from an
+// honest seat the absolute backstop cut; the stream tail and the watchdog identity ride along
+// for the same reason.
+function toCodexResult(res: ReviewerExecResult): CodexReviewResult {
+  const stalled = res.timedOut && res.timedOutReason === 'inactivity';
+  return {
+    ...(stalled
+      ? {
+          failWhy: `stalled: no --json output for ${Math.round(CODEX_INACTIVITY_TIMEOUT_MS / 60_000)} min (wedged seat reclaimed)`,
+        }
+      : {}),
+    ok: res.raw !== null,
+    raw: res.raw,
+    stderrTail: res.stderrTail,
+    ...(res.streamTail ? { stream: res.streamTail } : {}),
+    timedOut: res.timedOut,
+    ...(res.timedOutReason ? { timedOutReason: res.timedOutReason } : {}),
+  };
 }
 
 // WORKTREE EVIDENCE (§2) — codex under the ensemble-OWNED external Seatbelt wrapper: its INTERNAL
@@ -270,18 +308,17 @@ async function runCodexWorktreeReview(
       cwd: worktree,
       // The seat's ONLY route off the machine. Its Seatbelt profile denies every other outbound.
       env: proxyEnv(proxy.url),
+      inactivityTimeoutMs: CODEX_INACTIVITY_TIMEOUT_MS,
       onSpawn: opts.onSpawn,
       outFile: reply.file,
       stderrLimit: 2000,
-      timeoutMs: opts.timeoutMs ?? REVIEW_TIMEOUT_MS,
+      streamStdout: true,
+      timeoutMs: opts.timeoutMs ?? CORE_WORKTREE_REVIEW_TIMEOUT_MS,
     })
-      .then(({ raw, stderrTail, timedOut }) => ({
+      .then((res) => ({
         // Snapshot the denials before cleanup: they are what the artifact and the footer report.
         egressDenials: [...proxy.denials],
-        ok: raw !== null,
-        raw,
-        stderrTail,
-        timedOut,
+        ...toCodexResult(res),
       }))
       .finally(cleanup);
   } catch (e) {
@@ -293,9 +330,10 @@ async function runCodexWorktreeReview(
 // Invoke the reviewer (Codex) READ-ONLY with the embedded packet prompt, over the
 // shared runReviewerExec spawn contract (group-aware watchdog, settle-on-`exit`,
 // an absolute backstop — so a wedged rmcp grandchild can never hang the request;
-// lived: the 40-min 0%-CPU wedge). Parameterized for a review: the configured
-// strong model/effort and a long (12-min) timeout. The reply is read from the -o
-// file. On Codex's separate quota, never a shared pool.
+// lived: the 40-min 0%-CPU wedge — plus the `--json` liveness watchdog, which
+// reclaims a silent seat long before that backstop). Parameterized for a review:
+// the configured strong model/effort and the packet timeout. The reply is read
+// from the -o file. On Codex's separate quota, never a shared pool.
 export function runCodexReview(
   prompt: string,
   config: ReviewerConfig,
@@ -307,14 +345,11 @@ export function runCodexReview(
   return runReviewerExec({
     bin: resolveCodexBin(),
     args: buildCodexReviewArgs(config, outFile, prompt),
+    inactivityTimeoutMs: CODEX_INACTIVITY_TIMEOUT_MS,
     outFile,
     timeoutMs,
     stderrLimit: 2000,
+    streamStdout: true,
     onSpawn: opts.onSpawn,
-  }).then(({ raw, stderrTail, timedOut }) => ({
-    ok: raw !== null,
-    raw,
-    stderrTail,
-    timedOut,
-  }));
+  }).then(toCodexResult);
 }

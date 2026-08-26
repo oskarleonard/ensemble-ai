@@ -9,6 +9,7 @@ import {
   classifyFileKind,
   computeCoverage,
   diffDigest,
+  isTestPath,
   parseDiffFiles,
   repoIdFromSlug,
 } from './diff';
@@ -70,6 +71,24 @@ describe('classifyFileKind', () => {
     expect(classifyFileKind('app.min.js', false)).toBe('generated');
   });
 
+  it('classifies generator OUTPUT as generated (gen/, *.gen.*, *.pb.go, *_generated.*) — its schema stays source', () => {
+    for (const p of [
+      'pkg/gen/api/api.gen.go',
+      'pkg/services/notification/gen/ent/notification/notification.go',
+      'proto/foo.pb.go',
+      'src/__generated__/schema.ts',
+      'lib/generated/client.ts',
+      'app/types.generated.ts',
+      'app/types_generated.py',
+    ]) {
+      expect(classifyFileKind(p, false), p).toBe('generated');
+    }
+    // The schema that DRIVES a generator is hand-written and must be reviewed.
+    expect(classifyFileKind('pkg/services/actor/ent/schema/accounts.go', false)).toBe('source');
+    // `gen` only as a whole path segment — never as a substring of a real directory name.
+    expect(classifyFileKind('src/general/index.ts', false)).toBe('source');
+  });
+
   it('classifies ordinary code as source', () => {
     expect(classifyFileKind('src/a.ts', false)).toBe('source');
     expect(classifyFileKind('lib/util.py', false)).toBe('source');
@@ -114,6 +133,58 @@ describe('computeCoverage', () => {
   it('always includes the first file even if it alone exceeds the ceiling (never drops everything)', () => {
     const { coverage } = computeCoverage(parseDiffFiles(SRC), 1);
     expect(coverage.includedFiles).toBe(1);
+  });
+
+  const TEST_FILE = `diff --git a/src/a.test.ts b/src/a.test.ts
+@@ -1,1 +1,1 @@
++${'t'.repeat(150)}
+`;
+  const SOURCE_FILE = `diff --git a/src/b.ts b/src/b.ts
+@@ -1,1 +1,1 @@
++${'s'.repeat(150)}
+`;
+
+  it('admits non-test source before tests when the ceiling binds, keeping entries in diff order', () => {
+    // The test file comes FIRST in diff order; a path-order budget would admit it and omit the change.
+    const files = parseDiffFiles(TEST_FILE + SOURCE_FILE);
+    const { coverage, includedDiff } = computeCoverage(files, 200);
+    expect(coverage.files.map((f) => f.path)).toEqual(['src/a.test.ts', 'src/b.ts']);
+    expect(coverage.files.find((f) => f.path === 'src/b.ts')?.included).toBe(true);
+    const test = coverage.files.find((f) => f.path === 'src/a.test.ts');
+    expect(test?.included).toBe(false);
+    expect(test?.omitReason).toBe('over-limit');
+    expect(test?.kind).toBe('source'); // a test is still source — its omission still disqualifies
+    expect(includedDiff).toContain('src/b.ts');
+    expect(includedDiff).not.toContain('src/a.test.ts');
+  });
+
+  it('tests fill whatever budget the source leaves, in diff order', () => {
+    const files = parseDiffFiles(TEST_FILE + SOURCE_FILE);
+    const { coverage, includedDiff } = computeCoverage(files, 10_000);
+    expect(coverage.includedFiles).toBe(2);
+    expect(includedDiff.indexOf('src/a.test.ts')).toBeLessThan(includedDiff.indexOf('src/b.ts'));
+  });
+});
+
+describe('isTestPath', () => {
+  it('recognizes the common test-file shapes', () => {
+    for (const p of [
+      'pkg/services/finance/dto_test.go',
+      'src/core/spawn.test.ts',
+      'src/lib/fire.spec.tsx',
+      'tests/integration/api.py',
+      'app/__tests__/home.test.tsx',
+      'scripts/tests/migrate.bats',
+      'src/test_models.py',
+    ]) {
+      expect(isTestPath(p), p).toBe(true);
+    }
+  });
+
+  it('leaves ordinary source alone', () => {
+    for (const p of ['pkg/services/finance/dto.go', 'src/core/spawn.ts', 'src/contest/index.ts']) {
+      expect(isTestPath(p), p).toBe(false);
+    }
   });
 });
 

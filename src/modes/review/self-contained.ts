@@ -181,9 +181,11 @@ type ClaudeRunner = (
 // already paid for. Producer: whole-project cold review → 180 min. GATE: load scales
 // with findings × diff (a 21-finding gate outgrew 15 min on run 2026-07-24-00-36-03,
 // every verdict fail-closed) → 120 min. Holistic: one focused pass (observed 3–8 min)
-// → 30 min. Packet-mode seats keep the shared REVIEW_TIMEOUT_MS. Consumers cap the
-// whole fire OUTSIDE these (hugin: 360 min — concurrent core ≤15 + producer 180 +
-// holistic 30 + gate 120 + synthesis ≈ 345 worst case, reached only if every seat
+// → 30 min. Packet-mode seats keep the shared REVIEW_TIMEOUT_MS; a WORKTREE core seat
+// (codex / grok) gets CORE_WORKTREE_REVIEW_TIMEOUT_MS (reviewers/codex.ts) for the same
+// reason, behind its own liveness watchdog. Consumers cap the whole fire OUTSIDE these
+// (hugin: 420 min — the core seats run BEFORE the producer, so worst case is core 60 +
+// producer 180 + holistic 30 + gate 120 + synthesis ≈ 390, reached only if every seat
 // stays honestly busy to its backstop).
 export const CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 10_800_000; // 180 min runaway backstop
 export const HOLISTIC_WORKTREE_TIMEOUT_MS = 1_800_000; // 30 min runaway backstop

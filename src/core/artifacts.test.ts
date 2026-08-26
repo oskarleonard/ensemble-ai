@@ -84,6 +84,34 @@ describe('per-reviewer artifacts', () => {
     expect(fs.existsSync(path.join(baseDir, runId, 'review.grok.json'))).toBe(true);
   });
 
+  it('persists diagnostics on the index and the progress stream as its own file', () => {
+    const runId = 'run-diag';
+    const stored = persistReview(baseDir, {
+      diagnostics: {
+        elapsedMs: 902_000,
+        endedAt: '2026-08-26T09:02:28.000Z',
+        startedAt: '2026-08-26T08:47:26.000Z',
+        stderrTail: 'Reading additional input from stdin...',
+        timedOutReason: 'absolute',
+      },
+      findings: [],
+      packet: packet(),
+      prompt: 'p',
+      raw: null,
+      reviewer: cfg('codex'),
+      runId,
+      stream: '{"type":"thread.started"}\n',
+      summary: 'timed out',
+      terminalState: 'failed-reviewer',
+    });
+    expect(stored.diagnostics?.timedOutReason).toBe('absolute');
+    const onDisk = JSON.parse(fs.readFileSync(path.join(baseDir, runId, 'review.codex.json'), 'utf8'));
+    expect(onDisk.diagnostics.elapsedMs).toBe(902_000);
+    // the stream is bulk, not a fact: its own file, never folded into the index
+    expect(onDisk.stream).toBeUndefined();
+    expect(fs.readFileSync(path.join(baseDir, runId, 'codex-stream.jsonl'), 'utf8')).toContain('thread.started');
+  });
+
   it('backfills reviewerId from a legacy bare review.json (pre-fan-out run)', () => {
     const runId = 'legacy-1';
     const dir = path.join(baseDir, runId);

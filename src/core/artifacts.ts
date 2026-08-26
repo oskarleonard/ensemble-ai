@@ -9,6 +9,7 @@ import {
   type ReviewerId,
   type ReviewFinding,
   type ReviewPacket,
+  type SeatDiagnostics,
   type StoredReview,
   type TerminalState,
 } from './types';
@@ -192,12 +193,17 @@ function manifestOf(packet: ReviewPacket): ManifestEntry[] {
 }
 
 export interface PersistReviewInput {
+  diagnostics?: SeatDiagnostics;
   findings: ReviewFinding[];
   packet: ReviewPacket;
   prompt: string;
   raw: string | null;
   reviewer: ReviewerConfig;
   runId: string;
+  // The seat's progress stream (codex `--json` events), when the adapter kept one. Persisted
+  // beside the reply as `<id>-stream.jsonl` so a reclaimed seat leaves a record of what it was
+  // doing; never folded into the StoredReview index (it is bulk, not a fact).
+  stream?: string;
   summary: string;
   terminalState: TerminalState;
 }
@@ -221,6 +227,7 @@ export function persistReview(
   writeAtomic(baseDir, dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
   writeAtomic(baseDir, dir, `prompt.${id}.md`, input.prompt);
   if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review.raw.md`, input.raw);
+  if (input.stream) writeAtomic(baseDir, dir, `${id}-stream.jsonl`, input.stream);
   writeAtomic(
     baseDir,
     dir,
@@ -228,6 +235,7 @@ export function persistReview(
     JSON.stringify(input.findings, null, 2)
   );
   const stored: StoredReview = {
+    ...(input.diagnostics ? { diagnostics: input.diagnostics } : {}),
     findings: input.findings,
     packet: {
       complete: input.packet.complete,
