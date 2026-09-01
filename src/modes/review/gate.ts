@@ -25,8 +25,10 @@ import {
   type PostableOp,
   type PostableStatus,
   type PostableSuggestion,
+  type VerifiedKernel,
   derivePostable,
   parseFixStatus,
+  parseKernel,
   parsePostableClass,
   parsePostableOps,
   parseSeverity,
@@ -161,7 +163,15 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // downgradeReason 'external-testimony' so testimony never posts as fact; on partial/unverified it
 // is advisory — trail consumers should render the weaker premise class (e.g. an amber chip)
 // instead of presenting the claim as ground truth.
-export const GATE_TRAIL_SCHEMA_VERSION = 9;
+// v10: adds `verifiedKernel` — on a PARTIAL, the smallest self-contained fix supported by ONLY
+// the claims the gate verified (the kernel that survives the narrowing), with a coarse effort tag.
+// Additive like v5-v9: absent everywhere the gate sent none, and on every non-partial verdict.
+// OWNER-facing triage data, never PR-postable text — it deliberately survives posting-authority
+// strips (e.g. the holistic agree-only posture), because a factually-downgraded finding whose
+// verified core is a cheap fix is exactly the finding triage otherwise buries (proven on a real
+// run: a partial/low carrying a 15-minute extraction was deferred as a refactor, then re-raised
+// verbatim by a human reviewer).
+export const GATE_TRAIL_SCHEMA_VERSION = 10;
 
 const REASON_CAP = 700;
 const CITATION_CAP = 500;
@@ -391,6 +401,9 @@ export interface RawVerdictEntry {
   rescoredSeverity?: Severity; // gate's down-scored severity (host clamps: never higher)
   // A gate-verified small replacement for the finding's own cited line (agree + fixStatus keep).
   suggestion?: PostableSuggestion;
+  // Trail v10: the smallest fix supported by ONLY the verified claims of a PARTIAL (owner-facing;
+  // never posted). Parsed strictly — malformed/over-cap ⇒ absent.
+  kernel?: VerifiedKernel;
   sites?: HolisticSite[]; // holistic only — the reinvention in the diff + the pattern's home
   // Premise-provenance flag: the finding's load-bearing premise is an EXTERNAL-system runtime
   // claim whose only support is in-repo testimony (a comment / doc / type-escape fixture). Only
@@ -434,6 +447,7 @@ function parseVerdicts(v: unknown): RawVerdictEntry[] {
     const rescoredSeverity = parseSeverity(e.rescoredSeverity);
     const postableClass = parsePostableClass(e.class);
     const suggestion = parseSuggestion(e.suggestion);
+    const kernel = parseKernel(e.kernel);
     const sites = parseHolisticSites(e.sites);
     const conventionCitation = parseConventionCitation(e.conventionCitation);
     const tldr = capStr(e.tldr, TLDR_CAP);
@@ -452,6 +466,7 @@ function parseVerdicts(v: unknown): RawVerdictEntry[] {
       ...(fixStatus ? { fixStatus } : {}),
       ...(rescoredSeverity ? { rescoredSeverity } : {}),
       ...(suggestion ? { suggestion } : {}),
+      ...(kernel ? { kernel } : {}),
       ...(conventionCitation ? { conventionCitation } : {}),
       ...(sites ? { sites } : {}),
       ...(tldr ? { tldr } : {}),
@@ -545,6 +560,11 @@ export interface GateVerdictRecord {
   // A gate-verified one-click replacement for `line`; null ⇒ none. The per-review CAP is applied
   // by the posting path (consumer config), not here.
   postableSuggestion: PostableSuggestion | null;
+  // Trail v10 (additive): on a `partial`, the smallest self-contained fix supported by ONLY the
+  // claims the gate verified — the kernel that survives the narrowing. Advisory + OWNER-facing
+  // (trail consumers / triage dashboards): it never alters posting, severity, or the HIGH exit
+  // gate, and it never crosses to a foreign PR. Absent on every other verdict.
+  verifiedKernel?: VerifiedKernel;
   // Trail v9 (additive): the gate's premise-provenance flag. Present when the finding's
   // load-bearing premise is an external-system runtime claim resting on in-repo testimony alone.
   // On what the gate sent as "agree" the host has already fail-closed the verdict (see
@@ -770,6 +790,9 @@ export function reconcileGateVerdicts(
       ...(e.verify === 'run' && (e.verdict === 'agree' || e.verdict === 'partial')
         ? { verifyRequested: true }
         : {}),
+      // The kernel rides PARTIAL only: an agree posts its whole body (nothing was narrowed away),
+      // and an unverified/false carries no verified claims for a kernel to rest on.
+      ...(e.verdict === 'partial' && e.kernel ? { verifiedKernel: e.kernel } : {}),
     };
   });
 
