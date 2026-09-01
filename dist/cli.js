@@ -8889,10 +8889,12 @@ Options:
                         design). Default OFF. REQUIRES worktree evidence \u2014 with none it does
                         not run and says so; it never reviews on the packet.
   --holistic-model <m>  model for the HOLISTIC lens seat \u2014 overrides the voices.json
-                        \`holistic\` entry; built-in default: opus
+                        \`holistic\` entry; built-in default: opus. Read only when
+                        --holistic is on
   --holistic-effort <e> effort for the HOLISTIC lens seat (low|medium|high|xhigh|max) \u2014
                         overrides the file; built-in default: high (single MED-capped seat,
-                        bounded three-class search \u2014 max bought little over high)
+                        bounded three-class search \u2014 max bought little over high). Read
+                        only when --holistic is on
   --no-settle           skip the EXECUTION SETTLER. Default ON: when the gate tags a finding
                         "execution-decidable:" and the run has worktree evidence, one UNFENCED
                         Anthropic seat runs the deciding experiment in the worktree (scratch
