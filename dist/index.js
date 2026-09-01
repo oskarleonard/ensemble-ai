@@ -3212,11 +3212,11 @@ function listVoices(file = VOICES_FILE) {
 // src/modes/review/holistic.ts
 var HOLISTIC_SEAT_ID = "holistic";
 var HOLISTIC_SEVERITY_CAP = "medium";
-var HOLISTIC_DEFAULTS = { effort: "max", model: "opus" };
+var HOLISTIC_DEFAULTS = { effort: "high", model: "opus" };
 function nonEmptyStr(v) {
   return typeof v === "string" && v.trim() ? v.trim() : null;
 }
-function resolveHolisticSeat(raw, warn = () => {
+function resolveHolisticSeat(raw, flags = {}, warn = () => {
 }) {
   const root = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const entry = root.holistic && typeof root.holistic === "object" && !Array.isArray(root.holistic) ? root.holistic : null;
@@ -3226,19 +3226,28 @@ function resolveHolisticSeat(raw, warn = () => {
   if (entry && "cmd" in entry) {
     warn("holistic seat: `cmd` is ignored \u2014 the lens is always a `claude -p` spawn (read-only plan mode + write-tool deny-list); remove it");
   }
-  const model = entry && nonEmptyStr(entry.model) || HOLISTIC_DEFAULTS.model;
-  const rawEffort = entry ? nonEmptyStr(entry.effort) : null;
+  const model = nonEmptyStr(flags.model) || entry && nonEmptyStr(entry.model) || HOLISTIC_DEFAULTS.model;
+  const flagEffort = nonEmptyStr(flags.effort);
+  if (flagEffort && !CLAUDE_EFFORTS2.has(flagEffort))
+    warn(
+      `holistic seat: --holistic-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 ignored`
+    );
   let effort = HOLISTIC_DEFAULTS.effort;
-  if (rawEffort && rawEffort !== "default") {
-    if (CLAUDE_EFFORTS2.has(rawEffort)) effort = rawEffort;
-    else
-      warn(
-        `holistic seat: \`effort\` "${rawEffort}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 using the built-in default "${HOLISTIC_DEFAULTS.effort}"`
-      );
+  if (flagEffort && CLAUDE_EFFORTS2.has(flagEffort)) {
+    effort = flagEffort;
+  } else {
+    const rawEffort = entry ? nonEmptyStr(entry.effort) : null;
+    if (rawEffort && rawEffort !== "default") {
+      if (CLAUDE_EFFORTS2.has(rawEffort)) effort = rawEffort;
+      else
+        warn(
+          `holistic seat: \`effort\` "${rawEffort}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 using the built-in default "${HOLISTIC_DEFAULTS.effort}"`
+        );
+    }
   }
   return { ...VOICE_DEFAULTS.claude, effort, model };
 }
-function loadHolisticSeat(file = VOICES_FILE, warn = () => {
+function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
 }) {
   let raw = {};
   try {
@@ -3248,7 +3257,7 @@ function loadHolisticSeat(file = VOICES_FILE, warn = () => {
       warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
     raw = {};
   }
-  return resolveHolisticSeat(raw, warn);
+  return resolveHolisticSeat(raw, flags, warn);
 }
 function resolveHolisticPlan(input) {
   if (!input.requested) return { run: false, skipReason: null };

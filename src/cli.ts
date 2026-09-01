@@ -221,6 +221,13 @@ Options:
                         WHOLE project (reinvented patterns, convention drift, simplifiable
                         design). Default OFF. REQUIRES worktree evidence — with none it does
                         not run and says so; it never reviews on the packet.
+  --holistic-model <m>  model for the HOLISTIC lens seat — overrides the voices.json
+                        \`holistic\` entry; built-in default: opus. Read only when
+                        --holistic is on
+  --holistic-effort <e> effort for the HOLISTIC lens seat (low|medium|high|xhigh|max) —
+                        overrides the file; built-in default: high (single MED-capped seat,
+                        bounded three-class search — max bought little over high). Read
+                        only when --holistic is on
   --no-settle           skip the EXECUTION SETTLER. Default ON: when the gate tags a finding
                         "execution-decidable:" and the run has worktree evidence, one UNFENCED
                         Anthropic seat runs the deciding experiment in the worktree (scratch
@@ -1117,6 +1124,8 @@ async function reviewCommand(
         'gate-model': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
         holistic: { type: 'boolean' },
+        'holistic-effort': { type: 'string' },
+        'holistic-model': { type: 'string' },
         'no-claude': { type: 'boolean' },
         'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
@@ -1521,7 +1530,16 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
           ? {
               holistic: {
                 baseSha: layerBaseSha,
-                config: loadHolisticSeat(VOICES_FILE, (m) => console.error(`· ${m}`)),
+                // Same resolution chain as the reviewer/gate seats: flag → voices.json
+                // `holistic` entry → the built-in default (opus @ high).
+                config: loadHolisticSeat(
+                  VOICES_FILE,
+                  {
+                    effort: typeof values['holistic-effort'] === 'string' ? values['holistic-effort'] : undefined,
+                    model: typeof values['holistic-model'] === 'string' ? values['holistic-model'] : undefined,
+                  },
+                  (m) => console.error(`· ${m}`)
+                ),
               },
             }
           : {}),

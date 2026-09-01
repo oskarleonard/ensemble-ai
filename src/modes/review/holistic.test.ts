@@ -18,10 +18,10 @@ const CFG: VoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'o
 const okRun = (raw: string): VoiceRunResult => ({ ok: true, raw, stderrTail: '', timedOut: false });
 
 describe('resolveHolisticSeat — the registry entry', () => {
-  it('defaults to the Anthropic top tier (vendor seat defaults = vendor maximum)', () => {
+  it('defaults to opus @ high (single MED-capped seat — cheaper than the producer bar by design)', () => {
     const seat = resolveHolisticSeat({});
-    expect(seat.model).toBe(HOLISTIC_DEFAULTS.model);
-    expect(seat.effort).toBe(HOLISTIC_DEFAULTS.effort);
+    expect(seat.model).toBe('opus');
+    expect(seat.effort).toBe('high');
     expect(seat.vendor).toBe('anthropic');
     expect(seat.cmd).toBe('claude');
   });
@@ -33,27 +33,42 @@ describe('resolveHolisticSeat — the registry entry', () => {
 
   it('warns and falls back on an unknown effort (junk config never disables a seat)', () => {
     const warn = vi.fn();
-    const seat = resolveHolisticSeat({ holistic: { effort: 'ultra' } }, warn);
+    const seat = resolveHolisticSeat({ holistic: { effort: 'ultra' } }, {}, warn);
     expect(seat.effort).toBe(HOLISTIC_DEFAULTS.effort);
     expect(warn.mock.calls[0][0]).toContain('not a known effort');
   });
 
   it('ignores `cmd` — the lens is always a read-only `claude -p` spawn', () => {
     const warn = vi.fn();
-    const seat = resolveHolisticSeat({ holistic: { cmd: 'rm -rf /' } }, warn);
+    const seat = resolveHolisticSeat({ holistic: { cmd: 'rm -rf /' } }, {}, warn);
     expect(seat.cmd).toBe('claude');
     expect(warn.mock.calls[0][0]).toContain('`cmd` is ignored');
   });
 
   it('a junk `holistic` value warns and yields the default seat', () => {
     const warn = vi.fn();
-    expect(resolveHolisticSeat({ holistic: 'opus' }, warn).model).toBe(HOLISTIC_DEFAULTS.model);
+    expect(resolveHolisticSeat({ holistic: 'opus' }, {}, warn).model).toBe(HOLISTIC_DEFAULTS.model);
     expect(warn).toHaveBeenCalled();
+  });
+
+  it('flags override the file — "reviewer opus, holistic fable" must be expressible per-fire', () => {
+    const seat = resolveHolisticSeat(
+      { holistic: { effort: 'max', model: 'opus' } },
+      { effort: 'high', model: 'fable' }
+    );
+    expect(seat).toMatchObject({ effort: 'high', model: 'fable' });
+  });
+
+  it('an unknown effort FLAG is ignored + warned, then the chain continues at the file link', () => {
+    const warn = vi.fn();
+    const seat = resolveHolisticSeat({ holistic: { effort: 'xhigh' } }, { effort: 'ultra' }, warn);
+    expect(seat.effort).toBe('xhigh');
+    expect(warn.mock.calls[0][0]).toContain('--holistic-effort "ultra"');
   });
 
   it('loadHolisticSeat on a missing file is the silent zero-config case', () => {
     const warn = vi.fn();
-    expect(loadHolisticSeat('/nope/does/not/exist.json', warn).model).toBe(HOLISTIC_DEFAULTS.model);
+    expect(loadHolisticSeat('/nope/does/not/exist.json', {}, warn).model).toBe(HOLISTIC_DEFAULTS.model);
     expect(warn).not.toHaveBeenCalled();
   });
 });
