@@ -312,6 +312,9 @@ export function capHolisticSeverity(r: GateVerdictRecord): GateVerdictRecord {
 // tldr is stripped with the posting authority: the TLDR follows the EFFECTIVE verdict for
 // downgrades (gate.ts pins that invariant), and a confirmed-but-unpostable record must not
 // carry a ready-to-paste summary a consumer could ship after the host refused the text.
+// `verifiedKernel` deliberately SURVIVES this strip: it is owner-facing triage data (never
+// PR-postable text), and the agree-only posting posture is exactly the case where the verified
+// core of a partial would otherwise vanish from every acting surface.
 const notPostable = (note: string) =>
   ({ postableBody: null, postableFix: null, postableNote: note, postableStatus: 'not-postable' as const, rescoredSeverity: null, tldr: null });
 

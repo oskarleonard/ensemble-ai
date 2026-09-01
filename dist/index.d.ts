@@ -472,6 +472,12 @@ type PostableClass = (typeof POSTABLE_CLASSES)[number];
 interface PostableSuggestion {
     replacement: string;
 }
+declare const KERNEL_EFFORTS: readonly ["quick-win", "medium", "refactor"];
+type KernelEffort = (typeof KERNEL_EFFORTS)[number];
+interface VerifiedKernel {
+    effort: KernelEffort;
+    fix: string;
+}
 
 interface VoiceReview {
     findings: ReviewFinding[];
@@ -632,6 +638,7 @@ interface GateVerdictRecord {
     postableNote?: string;
     postableStatus: PostableStatus;
     postableSuggestion: PostableSuggestion | null;
+    verifiedKernel?: VerifiedKernel;
     premise?: 'external-testimony';
     rawVerdict: string | null;
     reason: string;

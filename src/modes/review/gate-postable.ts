@@ -280,6 +280,31 @@ export function parseSuggestion(v: unknown): PostableSuggestion | undefined {
   return { replacement };
 }
 
+// The verified kernel of a PARTIAL verdict: the smallest self-contained fix supported by ONLY
+// the claims the gate verified — what survives the narrowing. Owner-facing (trail/dashboard
+// triage), never posted to a foreign PR, so it carries no entity-token guard; length-capped and
+// enum-strict like every other gate-supplied field. An over-cap or malformed kernel is REJECTED,
+// never repaired — a truncated action is a different action from the one the gate verified.
+export const KERNEL_EFFORTS = ['quick-win', 'medium', 'refactor'] as const;
+export type KernelEffort = (typeof KERNEL_EFFORTS)[number];
+
+export interface VerifiedKernel {
+  effort: KernelEffort;
+  fix: string;
+}
+
+const KERNEL_FIX_CAP = 300;
+
+export function parseKernel(v: unknown): VerifiedKernel | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const e = v as Record<string, unknown>;
+  const fix = typeof e.fix === 'string' ? e.fix.trim() : '';
+  if (!fix || fix.length > KERNEL_FIX_CAP) return undefined;
+  if (typeof e.effort !== 'string' || !(KERNEL_EFFORTS as readonly string[]).includes(e.effort))
+    return undefined;
+  return { effort: e.effort as KernelEffort, fix };
+}
+
 export function parseSeverity(v: unknown): Severity | undefined {
   return typeof v === 'string' && (SEVERITIES as readonly string[]).includes(v) ? (v as Severity) : undefined;
 }

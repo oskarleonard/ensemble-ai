@@ -143,7 +143,8 @@ Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
       "ops": [
         { "op": "strike", "quote": "<EXACT substring of codex#3's body to remove>", "why": "<ungrounded>" },
         { "op": "replace", "quote": "<EXACT substring>", "with": "<narrower wording>", "why": "<narrowed>" }
-      ], "fixStatus": "narrow", "rescoredSeverity": "medium" },
+      ], "fixStatus": "narrow", "rescoredSeverity": "medium",
+      "kernel": { "fix": "<smallest fix the VERIFIED claims alone support>", "effort": "quick-win" } },
     { "findingId": "grok#2", "verdict": "false", "reason": "<why it is wrong>", "citation": "<EXACT line quoted from grok#2's own hunk>" }
   ]
 }
@@ -167,6 +168,12 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   or security DEFECT — it earns an inline comment. "quality" = a structural simplification (dead
   branch, narrower scope, a reinvented utility) — real, but it rides a collapsed summary section,
   never inline prose. Default when you omit it: "bug".
+- "kernel" (optional, partial ONLY): when the claims you VERIFIED — the body minus your ops —
+  already support a small self-contained fix on their own, send {"fix": "<one imperative sentence,
+  at most 300 characters, resting ONLY on verified claims>", "effort": "quick-win" | "medium" |
+  "refactor"}. It is never posted to the PR; it rides the trail so the repo owner's own triage
+  can act on the verified core of a narrowed finding instead of deferring it with the
+  overstatement. Omit it when the verified remainder supports no concrete action.
 - "tldr" (REQUIRED on agree AND partial — send it on NO other verdict): 1-2 sentences, at most 280
   characters, in plain conversational English someone who has not read the code would follow — no
   file paths, no identifiers, no jargon. Say what the PERSON USING the product hits, then the

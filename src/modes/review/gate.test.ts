@@ -238,6 +238,63 @@ describe('reconcileGateVerdicts — postable text (A+)', () => {
     expect(r).toMatchObject({ effectiveVerdict: 'partial', postableBody: null, postableStatus: 'escalated' });
   });
 
+  it('a partial carries its verified kernel (trail v10) — advisory, posting unchanged', () => {
+    const r = reconcileGateVerdicts(
+      [gf({ body, findingId: 'codex#1' })],
+      parseGateEnvelope(
+        envelope([
+          {
+            findingId: 'codex#1',
+            kernel: { effort: 'quick-win', fix: 'call release() in a finally block' },
+            ops: [{ op: 'strike', quote: ', and it always crashes' }],
+            reason: 'overstated',
+            verdict: 'partial',
+          },
+        ])
+      )
+    ).records[0];
+    expect(r.verifiedKernel).toEqual({ effort: 'quick-win', fix: 'call release() in a finally block' });
+    expect(r.postableStatus).toBe('postable');
+    expect(r.postableBody).toBe('The pool leaks a connection because release() is never called.');
+  });
+
+  it('a kernel on an agree is dropped — nothing was narrowed away for it to preserve', () => {
+    const r = reconcileGateVerdicts(
+      [gf({ body, findingId: 'codex#1' })],
+      parseGateEnvelope(
+        envelope([
+          {
+            findingId: 'codex#1',
+            kernel: { effort: 'quick-win', fix: 'call release() in a finally block' },
+            reason: 'ok',
+            verdict: 'agree',
+          },
+        ])
+      )
+    ).records[0];
+    expect(r.effectiveVerdict).toBe('agree');
+    expect(r.verifiedKernel).toBeUndefined();
+  });
+
+  it('a malformed kernel parses to absent without touching the verdict', () => {
+    const r = reconcileGateVerdicts(
+      [gf({ body, findingId: 'codex#1' })],
+      parseGateEnvelope(
+        envelope([
+          {
+            findingId: 'codex#1',
+            kernel: { effort: 'someday', fix: 'x'.repeat(400) },
+            ops: [{ op: 'strike', quote: ', and it always crashes' }],
+            reason: 'overstated',
+            verdict: 'partial',
+          },
+        ])
+      )
+    ).records[0];
+    expect(r.effectiveVerdict).toBe('partial');
+    expect(r.verifiedKernel).toBeUndefined();
+  });
+
   it('false / unverified ⇒ not-postable (null body)', () => {
     const [f, u] = reconcileGateVerdicts(
       [gf({ body, findingId: 'codex#1' }), gf({ body, findingId: 'grok#1' })],
@@ -252,8 +309,8 @@ describe('reconcileGateVerdicts — postable text (A+)', () => {
     expect(u).toMatchObject({ effectiveVerdict: 'unverified', postableBody: null, postableStatus: 'not-postable' });
   });
 
-  it('the durable trail schema is bumped to v9 (premise; duplicateOf/duplicates was v8, verifyRequested v7, settlement v6, postable/placement/anchorSide/tldr v2–v5)', () => {
-    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(9);
+  it('the durable trail schema is bumped to v10 (verifiedKernel; premise was v9, duplicateOf/duplicates v8, verifyRequested v7, settlement v6, postable/placement/anchorSide/tldr v2–v5)', () => {
+    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(10);
   });
 
   describe('duplicateOf → threaded duplicate echoes (trail v8)', () => {

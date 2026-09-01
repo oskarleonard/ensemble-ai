@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { derivePostable, parseFixStatus, parsePostableOps, parseSeverity } from './gate-postable';
+import { derivePostable, parseFixStatus, parseKernel, parsePostableOps, parseSeverity } from './gate-postable';
 
 const BODY =
   'The KYB draft is written to localStorage via JSON.stringify with no encryption, and it is stored indefinitely across all sessions.';
@@ -118,6 +118,28 @@ describe('parse helpers — tolerant of shape, cap hostile input', () => {
       'not an object',
     ]);
     expect(ops).toEqual([{ op: 'strike', quote: 'x', why: undefined }, { op: 'replace', quote: 'y', why: undefined, with: 'z' }]);
+  });
+
+  it('parseKernel accepts a capped fix with a valid effort and rejects everything else', () => {
+    expect(parseKernel({ effort: 'quick-win', fix: 'extract one shared formatUsdString' })).toEqual({
+      effort: 'quick-win',
+      fix: 'extract one shared formatUsdString',
+    });
+    expect(parseKernel({ effort: 'refactor', fix: '  promote the shell  ' })).toEqual({
+      effort: 'refactor',
+      fix: 'promote the shell',
+    });
+    // missing / blank fix
+    expect(parseKernel({ effort: 'quick-win' })).toBeUndefined();
+    expect(parseKernel({ effort: 'quick-win', fix: '   ' })).toBeUndefined();
+    // over-cap fix is REJECTED, never truncated
+    expect(parseKernel({ effort: 'quick-win', fix: 'x'.repeat(301) })).toBeUndefined();
+    // effort is enum-strict — absent or invented values invalidate the kernel
+    expect(parseKernel({ fix: 'do the thing' })).toBeUndefined();
+    expect(parseKernel({ effort: 'trivial', fix: 'do the thing' })).toBeUndefined();
+    // non-objects
+    expect(parseKernel(null)).toBeUndefined();
+    expect(parseKernel('fix it')).toBeUndefined();
   });
 
   it('parseFixStatus / parseSeverity reject junk', () => {

@@ -5307,7 +5307,8 @@ Respond with ONE fenced \`\`\`json block and NOTHING else, matching:
       "ops": [
         { "op": "strike", "quote": "<EXACT substring of codex#3's body to remove>", "why": "<ungrounded>" },
         { "op": "replace", "quote": "<EXACT substring>", "with": "<narrower wording>", "why": "<narrowed>" }
-      ], "fixStatus": "narrow", "rescoredSeverity": "medium" },
+      ], "fixStatus": "narrow", "rescoredSeverity": "medium",
+      "kernel": { "fix": "<smallest fix the VERIFIED claims alone support>", "effort": "quick-win" } },
     { "findingId": "grok#2", "verdict": "false", "reason": "<why it is wrong>", "citation": "<EXACT line quoted from grok#2's own hunk>" }
   ]
 }
@@ -5331,6 +5332,12 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   or security DEFECT \u2014 it earns an inline comment. "quality" = a structural simplification (dead
   branch, narrower scope, a reinvented utility) \u2014 real, but it rides a collapsed summary section,
   never inline prose. Default when you omit it: "bug".
+- "kernel" (optional, partial ONLY): when the claims you VERIFIED \u2014 the body minus your ops \u2014
+  already support a small self-contained fix on their own, send {"fix": "<one imperative sentence,
+  at most 300 characters, resting ONLY on verified claims>", "effort": "quick-win" | "medium" |
+  "refactor"}. It is never posted to the PR; it rides the trail so the repo owner's own triage
+  can act on the verified core of a narrowed finding instead of deferring it with the
+  overstatement. Omit it when the verified remainder supports no concrete action.
 - "tldr" (REQUIRED on agree AND partial \u2014 send it on NO other verdict): 1-2 sentences, at most 280
   characters, in plain conversational English someone who has not read the code would follow \u2014 no
   file paths, no identifiers, no jargon. Say what the PERSON USING the product hits, then the
@@ -5551,6 +5558,17 @@ function parseSuggestion(v) {
   if (replacement.length > SUGGESTION_CHAR_CAP) return void 0;
   return { replacement };
 }
+var KERNEL_EFFORTS = ["quick-win", "medium", "refactor"];
+var KERNEL_FIX_CAP = 300;
+function parseKernel(v) {
+  if (!v || typeof v !== "object") return void 0;
+  const e = v;
+  const fix = typeof e.fix === "string" ? e.fix.trim() : "";
+  if (!fix || fix.length > KERNEL_FIX_CAP) return void 0;
+  if (typeof e.effort !== "string" || !KERNEL_EFFORTS.includes(e.effort))
+    return void 0;
+  return { effort: e.effort, fix };
+}
 function parseSeverity2(v) {
   return typeof v === "string" && SEVERITIES.includes(v) ? v : void 0;
 }
@@ -5697,7 +5715,7 @@ var WHOLE_ENVELOPE_ADVICE = {
 };
 var TOOTHLESS_GATE_ADVICE = "  gate teeth did not engage \u2014 consider a stronger gate model";
 var GATE_ENVELOPE_SCHEMA_VERSION = 1;
-var GATE_TRAIL_SCHEMA_VERSION = 9;
+var GATE_TRAIL_SCHEMA_VERSION = 10;
 var REASON_CAP2 = 700;
 var CITATION_CAP = 500;
 var TLDR_CAP2 = 280;
@@ -5822,6 +5840,7 @@ function parseVerdicts(v) {
     const rescoredSeverity = parseSeverity2(e.rescoredSeverity);
     const postableClass = parsePostableClass(e.class);
     const suggestion = parseSuggestion(e.suggestion);
+    const kernel = parseKernel(e.kernel);
     const sites = parseHolisticSites(e.sites);
     const conventionCitation = parseConventionCitation(e.conventionCitation);
     const tldr = capStr3(e.tldr, TLDR_CAP2);
@@ -5838,6 +5857,7 @@ function parseVerdicts(v) {
       ...fixStatus ? { fixStatus } : {},
       ...rescoredSeverity ? { rescoredSeverity } : {},
       ...suggestion ? { suggestion } : {},
+      ...kernel ? { kernel } : {},
       ...conventionCitation ? { conventionCitation } : {},
       ...sites ? { sites } : {},
       ...tldr ? { tldr } : {},
@@ -5990,7 +6010,10 @@ function reconcileGateVerdicts(findings, parsed, opts = {}) {
       ...premise ? { premise } : {},
       // verify-by-run rides only a CONFIRMED verdict — a hedge on unverified is what the
       // execution-decidable tag is for, and honoring it here would blur the two channels.
-      ...e.verify === "run" && (e.verdict === "agree" || e.verdict === "partial") ? { verifyRequested: true } : {}
+      ...e.verify === "run" && (e.verdict === "agree" || e.verdict === "partial") ? { verifyRequested: true } : {},
+      // The kernel rides PARTIAL only: an agree posts its whole body (nothing was narrowed away),
+      // and an unverified/false carries no verified claims for a kernel to rest on.
+      ...e.verdict === "partial" && e.kernel ? { verifiedKernel: e.kernel } : {}
     };
   });
   const postableRecords = baseRecords.map((r) => {
