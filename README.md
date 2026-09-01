@@ -275,8 +275,8 @@ Every seat is **config, not a hardcode** — two JSON files under `~/.ensemble-a
 
 ```json
 {
-  "codex": { "model": "gpt-5.5", "effort": "xhigh" },
-  "grok":  { "model": "grok-build", "effort": "high" }
+  "codex": { "model": "gpt-5.6-sol", "effort": "max" },
+  "grok":  { "model": "grok-4.5", "effort": "high" }
 }
 ```
 

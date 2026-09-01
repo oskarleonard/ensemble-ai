@@ -43,7 +43,7 @@ export const VOICE_DEFAULTS: Record<VoiceId, VoiceConfig> = {
     cmd: 'grok',
     effort: 'high',
     id: 'grok',
-    model: 'grok-4.5',
+    model: 'grok-4.6',
     sandbox: 'ensemble-review',
     vendor: 'xai',
   },
