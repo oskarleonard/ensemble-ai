@@ -156,6 +156,13 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // sent no pointer. Exists because prose dedup ("same defect as X, post it once there") silently
 // sheds the duplicate's framing — proven on a real run where the duplicate held the ONE sentence
 // naming the dangerous direction of a half-open guard, and triage read only the survivor.
+// v9: adds `premise` — the gate's premise-provenance flag ('external-testimony'): the finding's
+// load-bearing premise asserts an external system's runtime behavior and its only support is
+// in-repo testimony (comments/docs/type-escape fixtures). Additive like v5-v8: absent everywhere
+// the gate sent no flag. An "agree" carrying it is host-downgraded to unverified under
+// downgradeReason 'external-testimony' so testimony never posts as fact; on partial/unverified it
+// is advisory — trail consumers should render the weaker premise class (e.g. an amber chip)
+// instead of presenting the claim as ground truth.
 // v10: adds `verifiedKernel` — on a PARTIAL, the smallest self-contained fix supported by ONLY
 // the claims the gate verified (the kernel that survives the narrowing), with a coarse effort tag.
 // Additive like v5-v9: absent everywhere the gate sent none, and on every non-partial verdict.
@@ -164,13 +171,6 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // verified core is a cheap fix is exactly the finding triage otherwise buries (proven on a real
 // run: a partial/low carrying a 15-minute extraction was deferred as a refactor, then re-raised
 // verbatim by a human reviewer).
-// v9: adds `premise` — the gate's premise-provenance flag ('external-testimony'): the finding's
-// load-bearing premise asserts an external system's runtime behavior and its only support is
-// in-repo testimony (comments/docs/type-escape fixtures). Additive like v5-v8: absent everywhere
-// the gate sent no flag. An "agree" carrying it is host-downgraded to unverified under
-// downgradeReason 'external-testimony' so testimony never posts as fact; on partial/unverified it
-// is advisory — trail consumers should render the weaker premise class (e.g. an amber chip)
-// instead of presenting the claim as ground truth.
 export const GATE_TRAIL_SCHEMA_VERSION = 10;
 
 const REASON_CAP = 700;

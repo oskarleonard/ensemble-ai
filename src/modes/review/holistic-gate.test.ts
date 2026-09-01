@@ -370,6 +370,26 @@ describe('applyHolisticPolicy — the three guardrails, mechanized', () => {
     expect(out.tldr).toBeNull();
   });
 
+  it('AGREE-ONLY: the unpostable partial KEEPS its verifiedKernel — owner-facing triage data survives the posting refusal', () => {
+    const kernel = { effort: 'quick-win' as const, fix: 'extract one shared formatUsdString' };
+    const [out] = applyHolisticPolicy(
+      [
+        record({
+          effectiveVerdict: 'partial',
+          postableBody: 'narrowed',
+          postableStatus: 'postable',
+          tldr: "Let's fix it.",
+          verifiedKernel: kernel,
+        }),
+      ],
+      entry(BOTH_SITES),
+      DEPS
+    );
+    expect(out.postableStatus).toBe('not-postable');
+    expect(out.tldr).toBeNull();
+    expect(out.verifiedKernel).toEqual(kernel);
+  });
+
   it('MED CAP: a HIGH with no conventions citation is capped, and says where from', () => {
     const [out] = applyHolisticPolicy([record()], entry(BOTH_SITES), DEPS);
     expect(out.severity).toBe('medium');
