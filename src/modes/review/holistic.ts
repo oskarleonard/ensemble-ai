@@ -42,23 +42,36 @@ export const HOLISTIC_SEAT_ID = 'holistic';
 // citation of a conventions doc (holistic-gate.ts) — a model assertion never uncaps.
 export const HOLISTIC_SEVERITY_CAP: Severity = 'medium';
 
-// Vendor seat defaults = vendor maximum (spec §3, Oskar's policy). The lens rides the Anthropic
-// side, so it is elastic by CONSUMER policy (review-depth / engine modes), never cheaped by default.
-export const HOLISTIC_DEFAULTS = { effort: 'max', model: 'opus' } as const;
+// The lens rides the Anthropic side and is elastic by CONSUMER policy (review-depth / engine
+// modes, `--holistic-model`/`--holistic-effort`, a voices.json `holistic` entry). Unlike the
+// producer seats (vendor maximum, spec §3), its default effort is `high`: the lens is single-seat,
+// MED-capped, and runs a bounded three-class search — max bought little over high there, and the
+// seat is meant to be cheap enough to leave on for every full review (Oskar, 2026-09-01).
+export const HOLISTIC_DEFAULTS = { effort: 'high', model: 'opus' } as const;
 
 // ── Seat resolution (the registry entry) ──────────────────────────────────────────────
+
+// `--holistic-model` / `--holistic-effort` — same shape and posture as the gate/reviewer seat
+// flags (gate-seat.ts): a flag overrides the file; an unknown effort flag is ignored + warned,
+// never silently dropped at spawn.
+export interface HolisticSeatFlags {
+  effort?: string;
+  model?: string;
+}
 
 function nonEmptyStr(v: unknown): string | null {
   return typeof v === 'string' && v.trim() ? v.trim() : null;
 }
 
-// PURE: resolve the lens seat from the raw voices.json object. A `holistic` entry may override
-// `model` / `effort`; a junk value warns and falls back to the built-in top-tier default (the
-// junk-config-never-disables-a-seat posture the gate seat and reviewers.json already have). The
-// spawn identity (cmd/id/vendor) is sourced from the one canonical claude voice — like the gate
-// seat, `cmd` cannot reconfigure the spawn away from a read-only `claude -p`.
+// PURE: resolve the lens seat from flag overrides + the raw voices.json object. Chain per field:
+// flag → the voices.json `holistic` entry → the built-in default. A junk value at any link warns
+// and falls to the next (the junk-config-never-disables-a-seat posture the gate seat and
+// reviewers.json already have). The spawn identity (cmd/id/vendor) is sourced from the one
+// canonical claude voice — like the gate seat, neither a flag nor `cmd` can reconfigure the spawn
+// away from a read-only `claude -p`.
 export function resolveHolisticSeat(
   raw: unknown,
+  flags: HolisticSeatFlags = {},
   warn: (m: string) => void = () => {}
 ): VoiceConfig {
   const root = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
@@ -72,23 +85,37 @@ export function resolveHolisticSeat(
   if (entry && 'cmd' in entry) {
     warn('holistic seat: `cmd` is ignored — the lens is always a `claude -p` spawn (read-only plan mode + write-tool deny-list); remove it');
   }
-  const model = (entry && nonEmptyStr(entry.model)) || HOLISTIC_DEFAULTS.model;
-  const rawEffort = entry ? nonEmptyStr(entry.effort) : null;
+
+  const model = nonEmptyStr(flags.model) || (entry && nonEmptyStr(entry.model)) || HOLISTIC_DEFAULTS.model;
+
+  // Effort: a flag outside the whitelist is ignored + warned (flag/file symmetry — never resolve
+  // a value the spawn would drop), then the chain continues at the file link.
+  const flagEffort = nonEmptyStr(flags.effort);
+  if (flagEffort && !CLAUDE_EFFORTS.has(flagEffort))
+    warn(
+      `holistic seat: --holistic-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — ignored`
+    );
   let effort: string = HOLISTIC_DEFAULTS.effort;
-  if (rawEffort && rawEffort !== 'default') {
-    if (CLAUDE_EFFORTS.has(rawEffort)) effort = rawEffort;
-    else
-      warn(
-        `holistic seat: \`effort\` "${rawEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — using the built-in default "${HOLISTIC_DEFAULTS.effort}"`
-      );
+  if (flagEffort && CLAUDE_EFFORTS.has(flagEffort)) {
+    effort = flagEffort;
+  } else {
+    const rawEffort = entry ? nonEmptyStr(entry.effort) : null;
+    if (rawEffort && rawEffort !== 'default') {
+      if (CLAUDE_EFFORTS.has(rawEffort)) effort = rawEffort;
+      else
+        warn(
+          `holistic seat: \`effort\` "${rawEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — using the built-in default "${HOLISTIC_DEFAULTS.effort}"`
+        );
+    }
   }
   return { ...VOICE_DEFAULTS.claude, effort, model };
 }
 
-// Read + resolve the lens seat from voices.json. A missing file is the zero-config case (silent);
-// any other read failure warns before falling back. Never throws.
+// Read + resolve the lens seat from voices.json + flag overrides. A missing file is the
+// zero-config case (silent); any other read failure warns before falling back. Never throws.
 export function loadHolisticSeat(
   file: string = VOICES_FILE,
+  flags: HolisticSeatFlags = {},
   warn: (m: string) => void = () => {}
 ): VoiceConfig {
   let raw: unknown = {};
@@ -99,7 +126,7 @@ export function loadHolisticSeat(
       warn(`holistic seat: could not read \`${file}\` (${(e as Error).message.split('\n')[0]}) — using the built-in default`);
     raw = {};
   }
-  return resolveHolisticSeat(raw, warn);
+  return resolveHolisticSeat(raw, flags, warn);
 }
 
 // ── Run plan (default off · worktree or nothing) ──────────────────────────────────────
