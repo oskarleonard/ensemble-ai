@@ -8,8 +8,8 @@ import { REVIEWER_IDS, type ReviewerConfig, type ReviewerId } from './types';
 // cross-vendor reviewer, editable by hand or an agent; adding a third vendor
 // later is a new entry, not a code change. Read from a JSON file
 // (env-overridable), falling back to a baked default so the primitive works
-// before the file exists. Default: Codex on gpt-5.5 @ xhigh; Grok on grok-4.5
-// @ high under the deny-by-default `ensemble-review` sandbox.
+// before the file exists. Default: Codex on gpt-5.5 @ xhigh; Grok on grok-4.6
+// @ xhigh under the deny-by-default `ensemble-review` sandbox.
 export const REVIEWERS_FILE =
   process.env.ENSEMBLE_REVIEWERS_FILE ||
   path.join(os.homedir(), '.ensemble-ai', 'reviewers.json');
@@ -22,17 +22,19 @@ export const REVIEWER_DEFAULTS: Record<ReviewerId, ReviewerConfig> = {
     model: 'gpt-5.5',
     vendor: 'openai',
   },
-  // Grok (xAI) — the second cross-vendor lens. grok-4.5 is the stronger of the
-  // CLI-available models (grok-build was RETIRED upstream ~2026-07: every review
-  // failed at the tail with "unknown model id" until the 2026-07-16 heal — when
-  // a grok review reports failed-reviewer with NO raw output, check `grok models`
-  // first). `sandbox` names the OS-enforced read-only profile it runs under
-  // (kernel-blocked writes + secret-read deny — see reviewers/grok.ts).
+  // Grok (xAI) — the second cross-vendor lens. grok-4.6 (2026-08-12) is the
+  // current xAI flagship, and it added `xhigh` reasoning effort (grok-4.5 topped
+  // out at high) — vendor seats run vendor-max, so the default rides both. A
+  // retired model id fails every review at the tail with "unknown model id"
+  // (grok-build did this ~2026-07): when a grok review reports failed-reviewer
+  // with NO raw output, check `grok models` first. `sandbox` names the
+  // OS-enforced read-only profile it runs under (kernel-blocked writes +
+  // secret-read deny — see reviewers/grok.ts).
   grok: {
     cmd: 'grok',
-    effort: 'high',
+    effort: 'xhigh',
     id: 'grok',
-    model: 'grok-4.5',
+    model: 'grok-4.6',
     sandbox: 'ensemble-review',
     vendor: 'xai',
   },
