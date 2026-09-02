@@ -16,7 +16,7 @@ import {
 } from './core/conventions';
 import { isEntrypoint } from './core/entrypoint';
 import { evidenceRef, SEVERITY_LABEL, SEVERITY_ORDER } from './core/findings';
-import { listReviewers, REVIEWERS_FILE } from './core/reviewers';
+import { listReviewers, resolveReviewer, REVIEWERS_FILE } from './core/reviewers';
 import { scrubControl as clean } from './core/sanitize';
 import {
   CORE_REVIEWER_IDS,
@@ -64,7 +64,9 @@ import {
   renderGateVerdicts,
   renderHighGate,
   resolveHighGate,
+  type ShadowGateSeat,
 } from './modes/review/gate';
+import { runCodexReview } from './reviewers/codex';
 import { readGatePacketHeadSha } from './modes/review/gate-hunks';
 import { type GateSeat, loadClaudeReviewerSeat, loadGateSeat } from './modes/review/gate-seat';
 import { readConventionPathsFromTrail, runRegate } from './modes/review/regate';
@@ -254,6 +256,14 @@ Options:
                         reviewer, else it mostly returns unverified — the toothless mode)
   --gate-effort <e>     effort for the GATE seat (low|medium|high|xhigh|max) — overrides the
                         file; an unknown value is ignored (\`ensemble-ai config\` shows the seat)
+  --shadow-gate         ALSO run a cross-vendor SHADOW gate: the codex seat's model judges the
+                        IDENTICAL gate prompt, audit-only (champion/challenger). Its verdicts +
+                        a per-finding comparison vs the authoritative gate land in
+                        shadow-gate-codex-verdicts.json (+ raw transcript); synthesis, posting,
+                        dismissals, and the exit code are unchanged, and a shadow failure never
+                        touches the run
+  --shadow-gate-effort <e>  the shadow seat's effort (default: xhigh — the config you would
+                        actually adopt if the challenger wins; codex validates the value)
   --stage               after a COMPLETED review, stage it as ONE **PENDING** GitHub review under
                         your account (opt-in; REQUIRES a PR **URL**, which binds the diff to the
                         head SHA — a bare \`--pr <N>\` has no commit identity to anchor to). Verified
@@ -1138,6 +1148,8 @@ async function reviewCommand(
         reviewers: { type: 'string' },
         'run-id': { type: 'string' },
         sandbox: { type: 'string' },
+        'shadow-gate': { type: 'boolean' },
+        'shadow-gate-effort': { type: 'string' },
         stage: { type: 'boolean' },
         staged: { type: 'boolean' },
         'strict-high': { type: 'boolean' },
@@ -1541,6 +1553,25 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
                   (m) => console.error(`· ${m}`)
                 ),
               },
+            }
+          : {}),
+        // The SHADOW gate (audit-only, champion/challenger): the codex seat's configured model
+        // judging the identical gate prompt, one effort step below the reviewer bar by default
+        // (xhigh — the config we would actually ADOPT if the challenger wins; measuring at max
+        // would benchmark a seat we would never run). The codex RUNNER binds the spawn to the
+        // codex sandbox + egress fence; gate.ts owns fail-soft and never-authoritative.
+        ...(values['shadow-gate']
+          ? {
+              shadowGate: {
+                config: {
+                  ...resolveReviewer('codex'),
+                  effort:
+                    typeof values['shadow-gate-effort'] === 'string' && values['shadow-gate-effort'].trim()
+                      ? values['shadow-gate-effort'].trim()
+                      : 'xhigh',
+                },
+                run: (p, c, o) => runCodexReview(p, c, o),
+              } satisfies ShadowGateSeat,
             }
           : {}),
         includeClaudeReviewer: true,
