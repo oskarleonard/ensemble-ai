@@ -172,7 +172,7 @@ type ClaudeRunner = (
 // producer died at the shared 12-min diff-packet default with zero output while every
 // other seat finished; a full cross-vendor pass legitimately runs toward an hour on a
 // real repo). A second undersizing proved the same lesson at 40 min: run
-// 2026-08-07-12-42-06 (lisk-backend#683) had the opus@max producer working a large Go
+// 2026-08-07-12-42-06 had the opus@max producer working a large Go
 // repo past 40:00 — the watchdog converted ~40 minutes of nearly-done review into zero
 // output, the exact waste it exists to prevent. Since 2026-08-07 the WEDGE-RECLAIM job
 // belongs to the LIVENESS watchdog (CLAUDE_INACTIVITY_TIMEOUT_MS: the stream-json seat

@@ -680,8 +680,8 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
 
   // The runner names WHY a seat came back empty (persistent transient API error, operator usage
   // limit, an error result, a wedged seat reclaimed by the watchdog). Until 2026-08-19 the gate
-  // collapsed all of them to "gate produced no output", which is how a real dead run (MONEY-618's
-  // review) left no way to tell a retryable 529 from a wedged seat.
+  // collapsed all of them to "gate produced no output", which is how a real dead run (the
+  // 2026-08-19 incident's review) left no way to tell a retryable 529 from a wedged seat.
   it('carries the runner failWhy + stderr tail into the log and the synthesis error', async () => {
     const { base, runId } = seed();
     const logged: string[] = [];
@@ -710,7 +710,7 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
   });
 
   // Losing the gate costs the WHOLE run (every finding drops to unverified); a second gate costs
-  // one seat. The 2026-08-19 lisk-backend#738 gate returned nothing after 13 min and a regate over
+  // one seat. The 2026-08-19 incident's gate returned nothing after 13 min and a regate over
   // the byte-identical packet landed 4 agree / 2 partial / 0 unverified — the failure was transient.
   it('re-spawns ONCE when the seat returns empty, and the retry\'s verdicts stand', async () => {
     const { base, runId } = seed();

@@ -191,8 +191,8 @@ describe('repo-location pre-flight — fails closed with a legible cause', () =>
 
   it('a disallowed root is refused BEFORE any fetch or trail write', () => {
     const res = resolveRepoLocation(
-      { prSlug: 'o/r', repoPath: '/work/lisk-web' },
-      { allowedRoots: ['/personal'], git: git({ 'rev-parse --show-toplevel': ok('/work/lisk-web') }) }
+      { prSlug: 'o/r', repoPath: '/work/webapp' },
+      { allowedRoots: ['/personal'], git: git({ 'rev-parse --show-toplevel': ok('/work/webapp') }) }
     );
     expect(isPreflightError(res) && res.kind).toBe('disallowed-root');
   });

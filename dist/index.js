@@ -3318,6 +3318,11 @@ on its face \u2014 that is another seat's job.
   A function that looks like an existing util but rounds differently, preserves case, or paces
   instead of retries is NOT a reinvention \u2014 it is a different function that resembles one. Filing
   those is worse than filing nothing. If you are not sure the behavior is identical, do not file it.
+- Matching semantics are still not enough: check the ROLE. Two byte-identical value sets can serve
+  different masters \u2014 a picker's display order vs a money guard, a UI list vs a validation set.
+  Merging those couples code that must evolve independently, and proposing that merge is itself a
+  defect. File a reinvention only when both occurrences serve the same role as well as the same
+  behavior.
 - Severity is CAPPED at "medium" by the host. It is lifted ONLY when a conventions doc in this
   project explicitly mandates the pattern the change bypasses \u2014 if so, quote that doc's line in
   your body and give its \`path:line\`. Asserting "this is important" never lifts the cap; only a
@@ -4357,7 +4362,7 @@ var OPERATOR_REVIEW_METHOD = `## How to review (in this order)
 2. Hunt FUNCTIONAL BUGS first: correctness defects, broken edge cases, regressions of
    behavior the diff did not intend to change, authorization gaps, contract drift (API
    shapes, DB writes, event payloads), and state/concurrency hazards.
-   Four hunts reviews are known to skip \u2014 run each explicitly:
+   Five hunts reviews are known to skip \u2014 run each explicitly:
    - NEW GUARD, EVERY ROUTE: when the diff adds a guard or invariant check, enumerate EVERY
      code path that reaches the protected operation (grep the entry points, count the call
      sites) and verify each path passes through it. A guard on two of four routes is a
@@ -4370,6 +4375,13 @@ var OPERATOR_REVIEW_METHOD = `## How to review (in this order)
    - DECLARED-SET COMPLETENESS: when the diff declares an enumerable set (a comment listing
      the N methods a rule covers, a routing matrix, a doc table), verify every element is
      handled and tested \u2014 defects hide in the unsampled remainder.
+   - WRAPPER-BOUNDARY TRACE: when the diff changes, configures, or consumes a component that
+     WRAPS a shared-package or third-party primitive, READ the wrapped source and verify the
+     wrapper preserves the contract end to end \u2014 callback arguments it drops, prop-driven
+     events it re-emits as if user-typed, options it swallows. The bug lives ACROSS the
+     boundary: each side looks correct alone (a wrapper dropping its lib's sourceInfo let a
+     display round-trip silently rewrite submitted amounts \u2014 three seats saw the symptom,
+     none crossed the boundary to the mechanism).
 3. Then the simplify lens: a utility that already exists and was reinvented, a simpler
    function shape, dead or unreachable branches, scope that silently narrowed or widened.
 4. SELF-CHECK every candidate finding before reporting it: re-read the code at the PR head

@@ -77,7 +77,7 @@ describe('clusterPostable — dedup by selection', () => {
     expect(out[0].cluster).toBeUndefined();
   });
 
-  it('merges three DIFFERENTLY-worded takes on one defect via overlap coefficient (real lisk-web#690 shape)', () => {
+  it('merges three DIFFERENTLY-worded takes on one defect via overlap coefficient (a real reviewed-PR shape)', () => {
     // Same localStorage-PII defect, three reviewers, proximate lines, low Jaccard but high
     // overlap-coefficient — the exact case where a Jaccard threshold under-merged.
     const out = clusterPostable([
@@ -91,7 +91,7 @@ describe('clusterPostable — dedup by selection', () => {
   });
 
   it('merges the same defect cited at DIFFERENT lines of one function (10 lines apart)', () => {
-    // Real lisk-web#690 shape: two reviewers flag the same localStorage-PII write in one hook
+    // A real reviewed-PR shape: two reviewers flag the same localStorage-PII write in one hook
     // but cite lines 112 vs 122 — beyond a tight line window, caught by the function-span window.
     const pii = (extra: string): string =>
       `Serializes the full KYB draft (businessDetails, personsData) to localStorage with no encryption; readable by any same-origin script and persists across sessions. ${extra}`;

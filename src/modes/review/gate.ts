@@ -1429,7 +1429,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // ONE re-spawn on a seat that came back empty without timing out. Losing the gate costs the
   // whole run — every reviewer's findings drop to unverified, and the operator is left grounding
   // them by hand — while a second gate costs one seat. Evidence that this is worth paying: the
-  // 2026-08-19 lisk-backend#738 gate returned nothing after 13 minutes, and a `regate` over the
+  // 2026-08-19 incident's gate returned nothing after 13 minutes, and a `regate` over the
   // byte-identical packet with the same model landed 4 agree / 2 partial / 0 unverified.
   // Deliberately NOT retried: a spawn that threw (no seat ever existed — a different fault), a
   // timeout (it was working and too slow; a re-spawn just spends the budget twice), and an

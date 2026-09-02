@@ -23,14 +23,14 @@ import { egressStartFailure, startSeatEgressProxy } from './egress-seat';
 // reviewer real time, but ALWAYS under a watchdog. The lived 40-min 0%-CPU wedge
 // on open stdin proved the timeout is mandatory, not optional.
 // Shared watchdog for the diff-packet seats (a vendor CLI reading ONE pinned packet).
-// Observed: grok used 7 of the old 12 min on lisk-web#759 — a bigger diff would have
+// Observed: grok used 7 of the old 12 min on a mid-size real diff — a bigger one would have
 // pinched. 15 min keeps ≥2× margin; the worktree Anthropic seats carry their own
 // bigger budgets (self-contained.ts).
 export const REVIEW_TIMEOUT_MS = 900_000; // 15 min
 
 // A WORKTREE codex seat (a shell in the PR head) is a different job from the packet read
 // above: it runs the repo's own tooling and greps the tree, and at xhigh reasoning it
-// legitimately outruns 15 min — run 2026-08-26-10-45-52 (lisk-backend#763) killed codex
+// legitimately outruns 15 min — run 2026-08-26-10-45-52 killed codex
 // at 15:02 with every other seat finishing honestly around it, the same lesson the
 // Anthropic seats had already paid twice (self-contained.ts). Since the liveness watchdog
 // below reclaims a WEDGED codex seat, this absolute value is a pure runaway backstop:

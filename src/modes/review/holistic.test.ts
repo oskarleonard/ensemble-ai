@@ -134,6 +134,10 @@ describe('renderHolisticPrompt — every clause the host mechanizes', () => {
   it('teaches the near-miss discipline the fixture negatives exist to police', () => {
     expect(prompt).toContain('check the SEMANTICS match');
     expect(prompt).toContain('is NOT a reinvention');
+    // incident 2026-09-02: the lens filed "this display set duplicates the domain set", the
+    // dedup shipped, and the human reviewer reversed it — same bytes, different role.
+    expect(prompt).toContain('check the ROLE');
+    expect(prompt).toContain('proposing that merge is itself a');
   });
 
   it('scopes the lens to architecture and bars nit classes + duplicate bug-hunting', () => {
