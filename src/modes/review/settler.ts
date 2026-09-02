@@ -18,7 +18,7 @@ import {
 // apply, does this compile, would that test fail). The gate now floors those at `unverified` with an
 // `execution-decidable:` reason (gate-prompt.ts) instead of arguing them away — the miss that
 // motivated all of this was an invalid migration index predicate raised in review and dismissed by
-// prose, when one `docker run postgres:16` would have settled it (lisk-backend#683).
+// prose, when one `docker run postgres:16` would have settled it (incident 2026-08-10).
 //
 // This stage picks those findings up AFTER the gate and settles each one with a real experiment in
 // the run's worktree, attaching the command + decisive output as a receipt. Settlements are

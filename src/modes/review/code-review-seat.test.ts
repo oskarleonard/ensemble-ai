@@ -31,18 +31,18 @@ describe('the one Claude producer — /code-review methodology seat', () => {
     expect(prompt).toContain('SELF-CHECK every candidate finding');
   });
 
-  it('runs the five miss-class hunts human reviewers proved seats skip (lisk-backend#683 + lisk-web#903)', () => {
+  it('runs the five miss-class hunts human reviewers proved seats skip (incidents 2026-08-10 + 2026-09-02)', () => {
     expect(prompt).toContain('NEW GUARD, EVERY ROUTE');
     expect(prompt).toContain('CALLER CENSUS');
     expect(prompt).toContain('TEST EFFECTIVENESS');
     expect(prompt).toContain('DECLARED-SET COMPLETENESS');
-    // #903: the NumericInput wrapper dropped react-number-format's sourceInfo — three seats
-    // flagged the 2-decimal symptom, none read the wrapped source to find the loss mechanism.
+    // incident 2026-09-02: a numeric-input wrapper dropped its library's change-source metadata —
+    // three seats flagged the rounding symptom, none read the wrapped source for the mechanism.
     expect(prompt).toContain('WRAPPER-BOUNDARY TRACE');
     expect(prompt).toMatch(/READ the wrapped source/);
   });
 
-  it('grounds a claimed operational practice in scripts/runbooks, never in sibling comments (lisk-backend#736)', () => {
+  it('grounds a claimed operational practice in scripts/runbooks, never in sibling comments (incident 2026-08-26)', () => {
     expect(prompt).toContain('CLAIM VS PRACTICE');
     expect(prompt).toMatch(/scripts, runbooks, CI\/deploy config/);
     expect(prompt).toMatch(/prove a convention was copied, not that anyone performs it/);

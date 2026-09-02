@@ -277,9 +277,9 @@ describe('acquireDiff — repo identity', () => {
       cwd,
       diffMode: 'pr',
       diffText: SRC,
-      repoIdOverride: repoIdFromSlug('LiskHQ/lisk-web'),
+      repoIdOverride: repoIdFromSlug('acme/webapp'),
     });
-    expect(acquired.repoId).toBe('https://github.com/LiskHQ/lisk-web');
+    expect(acquired.repoId).toBe('https://github.com/acme/webapp');
   });
 
   it('without an override, falls back to the cwd-derived identity (null in a non-repo)', () => {

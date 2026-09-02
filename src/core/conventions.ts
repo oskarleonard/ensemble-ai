@@ -68,7 +68,7 @@ export interface GatheredConventions {
   manifest: ConventionManifest;
 }
 
-// Sized so a real repo's MANDATORY tier fits whole: lisk-backend's CLAUDE.md (19 KB) +
+// Sized so a real repo's MANDATORY tier fits whole: one consumer backend's CLAUDE.md (19 KB) +
 // its nine .claude/rules (57 KB) + the @-included docs/architecture.md (60 KB) is ~136 KB.
 // Under the old 80 KB, run 2026-08-26-10-45-52 handed the seats 2 of those 9 rules and a
 // head-slice of both big docs — while a local Claude session in that repo loads all of it.
@@ -185,7 +185,7 @@ function tierOfRef(parent: ConventionTier, kind: 'include' | 'named'): Conventio
 }
 
 // A README describes what a directory IS, not how to write code in it — and the big ones
-// are galleries and generated indexes (lisk-backend's 118 KB docs/diagrams/README.md, named
+// are galleries and generated indexes (one consumer repo's 118 KB docs/diagrams/README.md, named
 // by a rule, took a third of a 300 KB budget from the docs the rules actually cite). They
 // never rise above SWEPT unless the repo pins one explicitly (`conventions` config).
 function isReadme(rel: string): boolean {

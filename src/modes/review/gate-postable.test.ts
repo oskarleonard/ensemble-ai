@@ -53,7 +53,7 @@ describe('derivePostable — partial narrows the body via ops', () => {
     expect(r.postableFix).toBe('strike');
   });
 
-  it('a replacement may end a sentence on a plain word — the period is punctuation, not a member access (lisk-web#873: "Expired.")', () => {
+  it('a replacement may end a sentence on a plain word — the period is punctuation, not a member access (a real fix ending "Expired.")', () => {
     const r = derivePostable({
       body: BODY, fixStatus: undefined, hunkCode: HUNK, rescoredSeverity: undefined, severity: 'high', verdict: 'partial',
       // "unencrypted." is a new PROSE word; its trailing period used to make it read as `unencrypted.` — an entity.

@@ -28,7 +28,7 @@ import {
 // HISTORY: this seat used to open its prompt with the literal `/code-review` slash command —
 // which, under `claude -p`, INVOKES the skill: a multi-agent pipeline that fans out finder and
 // verifier subagents, each a fresh full-context conversation at the seat's own model/effort.
-// On lisk-backend#683 (run 2026-08-07-17-16-13) one such producer consumed ~77% of a Max 5x
+// On one reviewed backend PR (run 2026-08-07-17-16-13) one such producer consumed ~77% of a Max 5x
 // subscription window, where the operator's interactive single-conversation review of the same
 // PR costs ~5%. The ensemble already IS the multi-voice verification (codex + grok + the gate),
 // so the skill's internal fan-out bought redundant depth at ~15x the price. The seat is now what
@@ -44,7 +44,7 @@ export const COLD_PEER_ROLE =
 // Ordering is deliberate: functional bugs are the reason reviews exist; the simplify lens
 // is second; the self-check is what separates a finding from a guess.
 //
-// Extended 2026-08-10 after lisk-backend#683: a human reviewer landed seven findings AFTER a
+// Extended 2026-08-10 (incident 2026-08-10): a human reviewer landed seven findings AFTER a
 // full ensemble round, CodeRabbit, and the author's own passes — four of them in classes no
 // seat had hunted (a guard covering two of four routes, a guard added to dead code, tests
 // whose fixtures never set the new field, a declared five-method set with two tested). Those
@@ -52,13 +52,13 @@ export const COLD_PEER_ROLE =
 // the worst miss (an enum-cast index predicate no PostgreSQL accepts) had been RAISED earlier
 // and argued away instead of run.
 //
-// Extended 2026-09-02 after lisk-web#903: the fifth hunt (WRAPPER-BOUNDARY TRACE). The costliest
-// human-caught bug lived ACROSS a package boundary — the NumericInput wrapper dropped its lib's
-// sourceInfo, so a display round-trip silently rewrote submitted amounts. Three seats filed the
-// 2-decimal SYMPTOM; none read the wrapped source to find the mechanism, because no step said to
-// cross the boundary.
+// Extended 2026-09-02 (incident 2026-09-02): the fifth hunt (WRAPPER-BOUNDARY TRACE). The
+// costliest human-caught bug lived ACROSS a package boundary — a numeric-input wrapper dropped
+// its library's change-source metadata, so a display round-trip silently rewrote submitted
+// amounts. Three seats filed the rounding SYMPTOM; none read the wrapped source to find the
+// mechanism, because no step said to cross the boundary.
 //
-// Extended 2026-08-26 after lisk-backend#736: a finding rested on "the documented escape hatch" —
+// Extended 2026-08-26 (incident 2026-08-26): a finding rested on "the documented escape hatch" —
 // a paragraph two sibling migrations carried about pre-creating an index out of band — which no
 // script, runbook, or deploy step performs. The maintainer rejected it; the finding worth posting
 // was the gap between the comment and the practice. The self-check now grounds a claimed practice

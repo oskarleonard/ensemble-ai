@@ -45,7 +45,7 @@ describe('the prober prompt — run the change, receipts or it did not happen', 
   });
 
   it('pins the query-plan class: exact SQL, real indexes, scale, count form, sublink-under-OR', () => {
-    // The lived defect (MONEY-622 round 3): NOT EXISTS under an OR stays a per-row SubPlan —
+    // A lived defect (probe round 3 on a real migration PR): NOT EXISTS under an OR stays a per-row SubPlan —
     // 26s on the count path — and only a top-level conjunct plans as an anti-join. The class
     // must also demand representative scale, since a 100-row seed seq-scans "correctly".
     expect(prompt).toContain('EXPLAIN the real plan at REPRESENTATIVE');
@@ -70,7 +70,7 @@ describe('the prober prompt — run the change, receipts or it did not happen', 
     expect(prompt).toContain('Reading is not probing');
   });
 
-  it("replays migrations under the app's own session settings — never a manufactured timeout (lisk-backend#736)", () => {
+  it("replays migrations under the app's own session settings — never a manufactured timeout (incident 2026-08-26)", () => {
     expect(prompt).toContain("under the app's REAL session settings");
     expect(prompt).toMatch(/NEVER add a timeout or a failure condition the app does not configure/);
     expect(prompt).toMatch(/a cancellation you manufactured is not a receipt/);

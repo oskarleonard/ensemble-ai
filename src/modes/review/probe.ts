@@ -114,7 +114,7 @@ export interface ProbePromptArgs {
 
 // PURE: the prober prompt. Encoded as data so a unit test pins the exact contract (house rule).
 //
-// Extended 2026-08-26 after lisk-backend#736: the prober set a `lock_timeout` the app never
+// Extended 2026-08-26 (incident 2026-08-26): the prober set a `lock_timeout` the app never
 // configures so a concurrent INSERT died under an in-transaction CREATE INDEX, and the finding
 // shipped "canceling statement due to lock timeout" as its receipt. The real behaviour was a
 // ~ms wait. The MIGRATIONS bullet now pins the app's own session settings and forbids
