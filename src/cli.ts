@@ -1454,6 +1454,13 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // to review but didn't must fail-loud; a claude legitimately not-run (blocked / no packet)
   // has nothing to gate.
   const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
+  // A shadow with no gate to shadow is a silent no-op — say so instead (the loud-skip posture
+  // --holistic without --repo already has).
+  if (values['shadow-gate'] && !claudeLayerExpected) {
+    console.error(
+      '· shadow gate: requested, but the gate itself will not run on this invocation (--no-claude / blocked diff / no packet) — nothing to shadow'
+    );
+  }
   if (claudeLayerExpected && result.prompt) {
     // The claude REVIEWER seat resolves like the gate below: `--claude-model`/`--claude-effort`
     // → the voices.json `claude` entry → the built-in opus @ max. gate-seat.ts owns the chain

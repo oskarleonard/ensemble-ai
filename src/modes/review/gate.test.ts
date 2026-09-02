@@ -914,6 +914,40 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
       }
     });
 
+    it('records verdicts but NO comparison when the primary gate failed (host-forced unverified is not a judgment)', async () => {
+      const { base, runId } = seed();
+      const logged: string[] = [];
+      const res = await runGate({
+        baseDir: base, config: CFG, expectedHeadSha: HEAD, log: (m) => logged.push(m), reviews,
+        run: async () => okRun('not json'), runId,
+        shadow: { config: SHADOW_CFG, run: async () => okRun(goodEnvelope) },
+      });
+      expect(res.verdicts.every((v) => v.effectiveVerdict === 'unverified')).toBe(true);
+      const art = shadowArtifact(base, runId);
+      expect(art.ok).toBe(true);
+      expect(art.verdicts).toHaveLength(4); // the challenger's judgment still lands
+      expect(art.comparison).toBeNull(); // …but never a "disagreement" against host-forced verdicts
+      expect(art.comparisonSkipped).toContain('no usable envelope');
+      expect(logged.join('\n')).toContain('verdicts recorded, no comparison');
+    });
+
+    it('SKIPS the shadow spawn on packet-fail (nothing can be grounded for either judge), stub artifact lands', async () => {
+      // no packet seeded ⇒ packet-fail
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-rg-'));
+      let shadowSpawns = 0;
+      const logged: string[] = [];
+      await runGate({
+        baseDir: base, config: CFG, expectedHeadSha: HEAD, log: (m) => logged.push(m), reviews,
+        run: async () => okRun(goodEnvelope), runId: 'r',
+        shadow: { config: SHADOW_CFG, run: async () => { shadowSpawns += 1; return okRun(goodEnvelope); } },
+      });
+      expect(shadowSpawns).toBe(0);
+      const art = shadowArtifact(base, 'r');
+      expect(art.ok).toBe(false);
+      expect(art.why).toContain('pinned packet unusable');
+      expect(logged.join('\n')).toContain('skipped (nothing can be grounded');
+    });
+
     it('no shadow configured ⇒ no shadow artifacts, no shadow log line', async () => {
       const { base, runId } = seed();
       const logged: string[] = [];

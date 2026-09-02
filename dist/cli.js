@@ -6229,8 +6229,8 @@ async function runGate(opts) {
     // A holistic `agree` must cite its reinvention inside it.
     ...opts.holistic ? { holistic: { ...opts.holistic, diffFiles: new Set(packetHunks.keys()) } } : {}
   };
-  const settleShadow = async (shadowAttempt2, primary) => {
-    if (!shadowAttempt2 || !opts.shadow) return;
+  const settleShadow = async (shadowAttempt2, primary, primaryUsable) => {
+    if (!opts.shadow) return;
     const seat = opts.shadow.config;
     const name = `shadow-gate-${seat.id}`;
     const writeShadow = (payload) => {
@@ -6253,6 +6253,10 @@ async function runGate(opts) {
         why
       });
     };
+    if (!shadowAttempt2) {
+      if (shadowSkipReason) stub(shadowSkipReason);
+      return;
+    }
     const res2 = await shadowAttempt2;
     if ("threw" in res2) return stub(`spawn failed (${res2.threw.message})`);
     if (res2.raw) {
@@ -6266,6 +6270,22 @@ async function runGate(opts) {
     const parsed2 = parseGateEnvelope(res2.raw);
     if ("failure" in parsed2) return stub(`envelope not usable (${parsed2.failure})`);
     const records = clusterPostable(reconcileGateVerdicts(findings, parsed2, reconcileOpts).records);
+    if (!primaryUsable) {
+      writeShadow({
+        authoritative: false,
+        comparison: null,
+        comparisonSkipped: "primary gate produced no usable envelope \u2014 its verdicts are host-forced, not judged; no judge-vs-judge comparison",
+        ok: true,
+        runId: opts.runId,
+        schemaVersion: SHADOW_GATE_SCHEMA_VERSION,
+        seat: seatMeta,
+        verdicts: records
+      });
+      log(
+        `  \xB7 shadow gate (${seat.id} \xB7 ${seat.model} @ ${seat.effort}): judged ${records.length} finding(s), but the primary gate failed \u2014 verdicts recorded, no comparison`
+      );
+      return;
+    }
     const byId = new Map(primary.map((r) => [r.findingId, r.effectiveVerdict]));
     const disagreements = records.filter((r) => byId.has(r.findingId) && byId.get(r.findingId) !== r.effectiveVerdict).map((r) => ({ findingId: r.findingId, primary: byId.get(r.findingId), shadow: r.effectiveVerdict }));
     const compared = records.filter((r) => byId.has(r.findingId)).length;
@@ -6283,6 +6303,7 @@ async function runGate(opts) {
     );
   };
   let shadowAttempt = null;
+  let shadowSkipReason = null;
   const finalize = async (synthesis2, parsed2, gateSpawned) => {
     const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed2, reconcileOpts);
     for (const w of warnings) log(`  \xB7 ${w}`);
@@ -6291,7 +6312,7 @@ async function runGate(opts) {
     if (!gateTrailWritten) {
       log("  \xB7 gate: gate-verdicts.json FAILED to write \u2014 dismissals not honored (trail loss is LOUD)");
     }
-    await settleShadow(shadowAttempt, records);
+    await settleShadow(shadowAttempt, records, !("failure" in parsed2));
     return { gateSpawned, gateTrailWritten, synthesis: synthesis2, verdicts: records };
   };
   const bail = (logMsg, error, failure, gateSpawned, raw) => {
@@ -6308,17 +6329,21 @@ async function runGate(opts) {
   const prompt = renderGatePrompt(findings, injections, opts.gateEvidence ?? "packet");
   log("Gate: grounding findings against the pinned diff hunks \u2014 verdict tags\u2026");
   if (opts.shadow) {
-    const sh = opts.shadow;
-    log(
-      `  \xB7 shadow gate (${sh.config.id} \xB7 ${sh.config.model} @ ${sh.config.effort}) judging the same findings \u2014 audit-only, never authoritative\u2026`
-    );
-    shadowAttempt = sh.run(prompt, sh.config, {
-      timeoutMs: opts.timeoutMs,
-      ...opts.worktree ? { worktree: opts.worktree } : {}
-    }).then(
-      (r) => r,
-      (e) => ({ threw: e })
-    );
+    if (packetFail) {
+      shadowSkipReason = "pinned packet unusable \u2014 skipped (nothing can be grounded, for either judge)";
+    } else {
+      const sh = opts.shadow;
+      log(
+        `  \xB7 shadow gate (${sh.config.id} \xB7 ${sh.config.model} @ ${sh.config.effort}) judging the same findings \u2014 audit-only, never authoritative\u2026`
+      );
+      shadowAttempt = sh.run(prompt, sh.config, {
+        timeoutMs: opts.timeoutMs,
+        ...opts.worktree ? { worktree: opts.worktree } : {}
+      }).then(
+        (r) => r,
+        (e) => ({ threw: e })
+      );
+    }
   }
   const spawn2 = async () => {
     try {
@@ -9757,6 +9782,11 @@ async function runReviewPipeline(input) {
   let claudeLayerCrashed = false;
   let gateSeat = null;
   const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
+  if (values["shadow-gate"] && !claudeLayerExpected) {
+    console.error(
+      "\xB7 shadow gate: requested, but the gate itself will not run on this invocation (--no-claude / blocked diff / no packet) \u2014 nothing to shadow"
+    );
+  }
   if (claudeLayerExpected && result.prompt) {
     const claudeSeat = loadClaudeReviewerSeat(
       VOICES_FILE,
