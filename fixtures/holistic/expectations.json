@@ -1,6 +1,6 @@
 {
   "conventionsDoc": "AGENTS.md",
-  "note": "The acceptance SUITE for the holistic lens. `plantedPositives` are reinventions the lens MUST catch; `nearMisses` are lookalikes with different semantics it MUST NOT flag. Every anchor below is asserted line-exact against this tree by holistic-fixture.test.ts, so a fixture edit that moves a symbol fails the suite instead of silently rotting. Scoring a real (model-in-the-loop) lens run against this file is scoreHolisticFixture(); the deterministic tests score synthetic finding sets, because judging a near-miss is a MODEL property the host cannot mechanize.",
+  "note": "The acceptance SUITE for the holistic lens. `plantedPositives` are reinventions the lens MUST catch; `nearMisses` are lookalikes it MUST NOT flag \u2014 different semantics, or (lisk-web#903 N2) identical bytes serving a different ROLE. Every anchor below is asserted line-exact against this tree by holistic-fixture.test.ts, so a fixture edit that moves a symbol fails the suite instead of silently rotting. Scoring a real (model-in-the-loop) lens run against this file is scoreHolisticFixture(); the deterministic tests score synthetic finding sets, because judging a near-miss is a MODEL property the host cannot mechanize.",
   "plantedPositives": [
     {
       "id": "currency-reinvention",

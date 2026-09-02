@@ -52,6 +52,12 @@ export const COLD_PEER_ROLE =
 // the worst miss (an enum-cast index predicate no PostgreSQL accepts) had been RAISED earlier
 // and argued away instead of run.
 //
+// Extended 2026-09-02 after lisk-web#903: the fifth hunt (WRAPPER-BOUNDARY TRACE). The costliest
+// human-caught bug lived ACROSS a package boundary — the NumericInput wrapper dropped its lib's
+// sourceInfo, so a display round-trip silently rewrote submitted amounts. Three seats filed the
+// 2-decimal SYMPTOM; none read the wrapped source to find the mechanism, because no step said to
+// cross the boundary.
+//
 // Extended 2026-08-26 after lisk-backend#736: a finding rested on "the documented escape hatch" —
 // a paragraph two sibling migrations carried about pre-creating an index out of band — which no
 // script, runbook, or deploy step performs. The maintainer rejected it; the finding worth posting
