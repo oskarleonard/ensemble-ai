@@ -793,6 +793,9 @@ function loadReviewers(file = REVIEWERS_FILE) {
     return { ...REVIEWER_DEFAULTS };
   }
 }
+function resolveReviewer(id, file = REVIEWERS_FILE) {
+  return loadReviewers(file)[id] ?? REVIEWER_DEFAULTS[id];
+}
 function listReviewers(file = REVIEWERS_FILE) {
   const all = loadReviewers(file);
   return REVIEWER_IDS.map((id) => all[id]);
@@ -6208,6 +6211,7 @@ function renderGateVerdicts(records, opts) {
   );
   return out;
 }
+var SHADOW_GATE_SCHEMA_VERSION = 1;
 async function runGate(opts) {
   const log = opts.log ?? (() => {
   });
@@ -6219,19 +6223,96 @@ async function runGate(opts) {
   }
   const packetHunks = packet.ok ? parsePacketHunks(packet.diff) : /* @__PURE__ */ new Map();
   const { findings, injections } = prepareGateFindings(healthy, packetHunks);
-  const finalize = (synthesis2, parsed2, gateSpawned) => {
-    const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed2, {
-      gateEvidence: opts.gateEvidence,
-      // The pinned packet's file set IS "what this PR changes" — the same bytes the reviewers saw.
-      // A holistic `agree` must cite its reinvention inside it.
-      ...opts.holistic ? { holistic: { ...opts.holistic, diffFiles: new Set(packetHunks.keys()) } } : {}
+  const reconcileOpts = {
+    gateEvidence: opts.gateEvidence,
+    // The pinned packet's file set IS "what this PR changes" — the same bytes the reviewers saw.
+    // A holistic `agree` must cite its reinvention inside it.
+    ...opts.holistic ? { holistic: { ...opts.holistic, diffFiles: new Set(packetHunks.keys()) } } : {}
+  };
+  const settleShadow = async (shadowAttempt2, primary, primaryUsable) => {
+    if (!opts.shadow) return;
+    const seat = opts.shadow.config;
+    const name = `shadow-gate-${seat.id}`;
+    const writeShadow = (payload) => {
+      try {
+        writeTrailFile(opts.baseDir, opts.runId, `${name}-verdicts.json`, JSON.stringify(payload, null, 2));
+      } catch {
+      }
+    };
+    const seatMeta = { effort: seat.effort, id: seat.id, model: seat.model };
+    const stub = (why) => {
+      log(`  \xB7 shadow gate (${seat.id} \xB7 ${seat.model} @ ${seat.effort}): ${why} \u2014 audit-only, run unaffected`);
+      writeShadow({
+        authoritative: false,
+        comparison: null,
+        ok: false,
+        runId: opts.runId,
+        schemaVersion: SHADOW_GATE_SCHEMA_VERSION,
+        seat: seatMeta,
+        verdicts: [],
+        why
+      });
+    };
+    if (!shadowAttempt2) {
+      if (shadowSkipReason) stub(shadowSkipReason);
+      return;
+    }
+    const res2 = await shadowAttempt2;
+    if ("threw" in res2) return stub(`spawn failed (${res2.threw.message})`);
+    if (res2.raw) {
+      try {
+        writeTrailFile(opts.baseDir, opts.runId, `${name}.raw.md`, res2.raw);
+      } catch {
+      }
+    }
+    if (!res2.raw || res2.timedOut)
+      return stub(res2.failWhy ?? (res2.timedOut ? "timed out" : "produced no output"));
+    const parsed2 = parseGateEnvelope(res2.raw);
+    if ("failure" in parsed2) return stub(`envelope not usable (${parsed2.failure})`);
+    const records = clusterPostable(reconcileGateVerdicts(findings, parsed2, reconcileOpts).records);
+    if (!primaryUsable) {
+      writeShadow({
+        authoritative: false,
+        comparison: null,
+        comparisonSkipped: "primary gate produced no usable envelope \u2014 its verdicts are host-forced, not judged; no judge-vs-judge comparison",
+        ok: true,
+        runId: opts.runId,
+        schemaVersion: SHADOW_GATE_SCHEMA_VERSION,
+        seat: seatMeta,
+        verdicts: records
+      });
+      log(
+        `  \xB7 shadow gate (${seat.id} \xB7 ${seat.model} @ ${seat.effort}): judged ${records.length} finding(s), but the primary gate failed \u2014 verdicts recorded, no comparison`
+      );
+      return;
+    }
+    const byId = new Map(primary.map((r) => [r.findingId, r.effectiveVerdict]));
+    const disagreements = records.filter((r) => byId.has(r.findingId) && byId.get(r.findingId) !== r.effectiveVerdict).map((r) => ({ findingId: r.findingId, primary: byId.get(r.findingId), shadow: r.effectiveVerdict }));
+    const compared = records.filter((r) => byId.has(r.findingId)).length;
+    writeShadow({
+      authoritative: false,
+      comparison: { compared, disagreements, matched: compared - disagreements.length },
+      ok: true,
+      runId: opts.runId,
+      schemaVersion: SHADOW_GATE_SCHEMA_VERSION,
+      seat: seatMeta,
+      verdicts: records
     });
+    log(
+      `  \xB7 shadow gate (${seat.id} \xB7 ${seat.model} @ ${seat.effort}): ${compared - disagreements.length}/${compared} verdicts match the primary${disagreements.length ? ` \u2014 ${disagreements.length} disagreement(s), see ${name}-verdicts.json` : ""}`
+    );
+  };
+  let shadowAttempt = null;
+  let shadowSkipReason = null;
+  const finalize = async (synthesis2, parsed2, gateSpawned) => {
+    const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed2, reconcileOpts);
     for (const w of warnings) log(`  \xB7 ${w}`);
     const records = clusterPostable(reconciled);
     const gateTrailWritten = writeGateVerdictsTrail(opts.baseDir, opts.runId, records);
     if (!gateTrailWritten) {
       log("  \xB7 gate: gate-verdicts.json FAILED to write \u2014 dismissals not honored (trail loss is LOUD)");
     }
+    await settleShadow(shadowAttempt, records, !("failure" in parsed2));
     return { gateSpawned, gateTrailWritten, synthesis: synthesis2, verdicts: records };
   };
   const bail = (logMsg, error, failure, gateSpawned, raw) => {
@@ -6247,6 +6328,23 @@ async function runGate(opts) {
   }
   const prompt = renderGatePrompt(findings, injections, opts.gateEvidence ?? "packet");
   log("Gate: grounding findings against the pinned diff hunks \u2014 verdict tags\u2026");
+  if (opts.shadow) {
+    if (packetFail) {
+      shadowSkipReason = "pinned packet unusable \u2014 skipped (nothing can be grounded, for either judge)";
+    } else {
+      const sh = opts.shadow;
+      log(
+        `  \xB7 shadow gate (${sh.config.id} \xB7 ${sh.config.model} @ ${sh.config.effort}) judging the same findings \u2014 audit-only, never authoritative\u2026`
+      );
+      shadowAttempt = sh.run(prompt, sh.config, {
+        timeoutMs: opts.timeoutMs,
+        ...opts.worktree ? { worktree: opts.worktree } : {}
+      }).then(
+        (r) => r,
+        (e) => ({ threw: e })
+      );
+    }
+  }
   const spawn2 = async () => {
     try {
       return await opts.run(prompt, opts.config, {
@@ -7525,6 +7623,8 @@ async function runClaudeReviewLayer(opts) {
     reviews: voiceReviews,
     run,
     runId: opts.runId,
+    // The audit-only shadow gate rides the same call — runGate owns its concurrency + fail-soft.
+    ...opts.shadowGate ? { shadow: opts.shadowGate } : {},
     // A worktree gate verifies against the tree (evidence-bearing) — give it the
     // worktree-sized watchdog; packet mode keeps the shared default.
     timeoutMs: opts.timeoutMs ?? (opts.worktree ? GATE_WORKTREE_TIMEOUT_MS : void 0),
@@ -8923,6 +9023,14 @@ Options:
                         reviewer, else it mostly returns unverified \u2014 the toothless mode)
   --gate-effort <e>     effort for the GATE seat (low|medium|high|xhigh|max) \u2014 overrides the
                         file; an unknown value is ignored (\`ensemble-ai config\` shows the seat)
+  --shadow-gate         ALSO run a cross-vendor SHADOW gate: the codex seat's model judges the
+                        IDENTICAL gate prompt, audit-only (champion/challenger). Its verdicts +
+                        a per-finding comparison vs the authoritative gate land in
+                        shadow-gate-codex-verdicts.json (+ raw transcript); synthesis, posting,
+                        dismissals, and the exit code are unchanged, and a shadow failure never
+                        touches the run
+  --shadow-gate-effort <e>  the shadow seat's effort (default: xhigh \u2014 the config you would
+                        actually adopt if the challenger wins; codex validates the value)
   --stage               after a COMPLETED review, stage it as ONE **PENDING** GitHub review under
                         your account (opt-in; REQUIRES a PR **URL**, which binds the diff to the
                         head SHA \u2014 a bare \`--pr <N>\` has no commit identity to anchor to). Verified
@@ -9513,6 +9621,8 @@ async function reviewCommand(args, profile = "code") {
         reviewers: { type: "string" },
         "run-id": { type: "string" },
         sandbox: { type: "string" },
+        "shadow-gate": { type: "boolean" },
+        "shadow-gate-effort": { type: "string" },
         stage: { type: "boolean" },
         staged: { type: "boolean" },
         "strict-high": { type: "boolean" },
@@ -9672,6 +9782,11 @@ async function runReviewPipeline(input) {
   let claudeLayerCrashed = false;
   let gateSeat = null;
   const claudeLayerExpected = roster.claude && !result.blocked && Boolean(result.prompt);
+  if (values["shadow-gate"] && !claudeLayerExpected) {
+    console.error(
+      "\xB7 shadow gate: requested, but the gate itself will not run on this invocation (--no-claude / blocked diff / no packet) \u2014 nothing to shadow"
+    );
+  }
   if (claudeLayerExpected && result.prompt) {
     const claudeSeat = loadClaudeReviewerSeat(
       VOICES_FILE,
@@ -9743,6 +9858,20 @@ async function runReviewPipeline(input) {
               },
               (m) => console.error(`\xB7 ${m}`)
             )
+          }
+        } : {},
+        // The SHADOW gate (audit-only, champion/challenger): the codex seat's configured model
+        // judging the identical gate prompt, one effort step below the reviewer bar by default
+        // (xhigh — the config we would actually ADOPT if the challenger wins; measuring at max
+        // would benchmark a seat we would never run). The codex RUNNER binds the spawn to the
+        // codex sandbox + egress fence; gate.ts owns fail-soft and never-authoritative.
+        ...values["shadow-gate"] ? {
+          shadowGate: {
+            config: {
+              ...resolveReviewer("codex"),
+              effort: typeof values["shadow-gate-effort"] === "string" && values["shadow-gate-effort"].trim() ? values["shadow-gate-effort"].trim() : "xhigh"
+            },
+            run: (p, c, o) => runCodexReview(p, c, o)
           }
         } : {},
         includeClaudeReviewer: true,

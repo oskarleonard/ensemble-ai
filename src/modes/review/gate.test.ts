@@ -14,6 +14,7 @@ import {
   gateAuthorityActive,
   gateDispositionSummary,
   type GateFinding,
+  type GateRunner,
   honoredHighDismissals,
   parseGateEnvelope,
   prepareGateFindings,
@@ -22,6 +23,7 @@ import {
   renderHighGate,
   resolveHighGate,
   runGate,
+  SHADOW_GATE_SCHEMA_VERSION,
   validateCitation,
   verdictCounts,
   writeGateVerdictsTrail,
@@ -830,6 +832,129 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
       const res = await runGate({ baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews: rs, run, runId });
       expect(res.gateSpawned, label).toBe(expected);
     }
+  });
+
+  // ── The SHADOW gate (audit-only, champion/challenger) ──────────────────────────────
+  describe('shadow gate', () => {
+    const SHADOW_CFG: VoiceConfig = { cmd: 'codex', effort: 'xhigh', id: 'codex', model: 'gpt-5.6-sol', vendor: 'openai' };
+    const shadowArtifact = (base: string, runId: string) =>
+      JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'shadow-gate-codex-verdicts.json'), 'utf8'));
+
+    it('judges the IDENTICAL prompt, writes both artifacts, and records the comparison', async () => {
+      const { base, runId } = seed();
+      const prompts: { primary?: string; shadow?: string } = {};
+      const res = await runGate({
+        baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews,
+        run: async (p) => { prompts.primary = p; return okRun(goodEnvelope); },
+        runId,
+        shadow: { config: SHADOW_CFG, run: async (p) => { prompts.shadow = p; return okRun(goodEnvelope); } },
+      });
+      // property 3: same input — byte-identical prompt, judge vs judge
+      expect(prompts.shadow).toBe(prompts.primary);
+      // property 1: the primary result is the authority, unchanged in shape
+      expect(res.verdicts.map((v) => v.findingId).sort()).toEqual(['claude#1', 'codex#1', 'codex#2', 'grok#1']);
+      expect(fs.readFileSync(path.join(reviewDir(base, runId), 'shadow-gate-codex.raw.md'), 'utf8')).toBe(goodEnvelope);
+      const art = shadowArtifact(base, runId);
+      expect(art).toMatchObject({
+        authoritative: false,
+        ok: true,
+        schemaVersion: SHADOW_GATE_SCHEMA_VERSION,
+        seat: { effort: 'xhigh', id: 'codex', model: 'gpt-5.6-sol' },
+      });
+      // identical envelope through the identical reconcile ⇒ full agreement
+      expect(art.comparison).toEqual({ compared: 4, disagreements: [], matched: 4 });
+      expect(art.verdicts).toHaveLength(4);
+    });
+
+    it('records a per-finding disagreement when the judges differ', async () => {
+      const { base, runId } = seed();
+      // the shadow judges codex#2 partial where the primary said agree
+      const shadowEnvelope = envelope([
+        { citation: ANCHOR, findingId: 'codex#1', reason: 'refuted', verdict: 'false' },
+        { findingId: 'codex#2', reason: 'overstated', verdict: 'partial' },
+        { findingId: 'grok#1', reason: 'overstated', verdict: 'partial' },
+        { findingId: 'claude#1', reason: 'cannot ground', verdict: 'unverified' },
+      ]);
+      const res = await runGate({
+        baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews,
+        run: async () => okRun(goodEnvelope), runId,
+        shadow: { config: SHADOW_CFG, run: async () => okRun(shadowEnvelope) },
+      });
+      expect(res.verdicts.find((v) => v.findingId === 'codex#2')?.effectiveVerdict).toBe('agree');
+      const art = shadowArtifact(base, runId);
+      expect(art.comparison.compared).toBe(4);
+      expect(art.comparison.matched).toBe(3);
+      expect(art.comparison.disagreements).toEqual([
+        { findingId: 'codex#2', primary: 'agree', shadow: 'partial' },
+      ]);
+    });
+
+    it('is FAIL-SOFT: a shadow throw / timeout / junk leaves the run identical and stubs the artifact (property 2)', async () => {
+      const shadowRuns: [string, GateRunner][] = [
+        ['throw', async () => { throw new Error('boom'); }],
+        ['timeout', async () => ({ ok: false, raw: null, stderrTail: '', timedOut: true })],
+        ['junk', async () => okRun('not json')],
+      ];
+      for (const [label, shadowRun] of shadowRuns) {
+        const { base, runId } = seed();
+        const logged: string[] = [];
+        const res = await runGate({
+          baseDir: base, config: CFG, expectedHeadSha: HEAD, log: (m) => logged.push(m), reviews,
+          run: async () => okRun(goodEnvelope), runId,
+          shadow: { config: SHADOW_CFG, run: shadowRun },
+        });
+        // the primary is byte-identical to a run with no shadow
+        expect(res.gateTrailWritten, label).toBe(true);
+        expect(res.verdicts.map((v) => v.findingId).sort(), label).toEqual(['claude#1', 'codex#1', 'codex#2', 'grok#1']);
+        const art = shadowArtifact(base, runId);
+        expect(art.ok, label).toBe(false);
+        expect(art.authoritative, label).toBe(false);
+        expect(art.verdicts, label).toEqual([]);
+        expect(logged.join('\n'), label).toContain('audit-only, run unaffected');
+      }
+    });
+
+    it('records verdicts but NO comparison when the primary gate failed (host-forced unverified is not a judgment)', async () => {
+      const { base, runId } = seed();
+      const logged: string[] = [];
+      const res = await runGate({
+        baseDir: base, config: CFG, expectedHeadSha: HEAD, log: (m) => logged.push(m), reviews,
+        run: async () => okRun('not json'), runId,
+        shadow: { config: SHADOW_CFG, run: async () => okRun(goodEnvelope) },
+      });
+      expect(res.verdicts.every((v) => v.effectiveVerdict === 'unverified')).toBe(true);
+      const art = shadowArtifact(base, runId);
+      expect(art.ok).toBe(true);
+      expect(art.verdicts).toHaveLength(4); // the challenger's judgment still lands
+      expect(art.comparison).toBeNull(); // …but never a "disagreement" against host-forced verdicts
+      expect(art.comparisonSkipped).toContain('no usable envelope');
+      expect(logged.join('\n')).toContain('verdicts recorded, no comparison');
+    });
+
+    it('SKIPS the shadow spawn on packet-fail (nothing can be grounded for either judge), stub artifact lands', async () => {
+      // no packet seeded ⇒ packet-fail
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-rg-'));
+      let shadowSpawns = 0;
+      const logged: string[] = [];
+      await runGate({
+        baseDir: base, config: CFG, expectedHeadSha: HEAD, log: (m) => logged.push(m), reviews,
+        run: async () => okRun(goodEnvelope), runId: 'r',
+        shadow: { config: SHADOW_CFG, run: async () => { shadowSpawns += 1; return okRun(goodEnvelope); } },
+      });
+      expect(shadowSpawns).toBe(0);
+      const art = shadowArtifact(base, 'r');
+      expect(art.ok).toBe(false);
+      expect(art.why).toContain('pinned packet unusable');
+      expect(logged.join('\n')).toContain('skipped (nothing can be grounded');
+    });
+
+    it('no shadow configured ⇒ no shadow artifacts, no shadow log line', async () => {
+      const { base, runId } = seed();
+      const logged: string[] = [];
+      await runGate({ baseDir: base, config: CFG, expectedHeadSha: HEAD, log: (m) => logged.push(m), reviews, run: async () => okRun(goodEnvelope), runId });
+      expect(fs.existsSync(path.join(reviewDir(base, runId), 'shadow-gate-codex-verdicts.json'))).toBe(false);
+      expect(logged.join('\n')).not.toContain('shadow gate');
+    });
   });
 
   it('a missing / sha-mismatched packet at gate time ⇒ all verdicts unverified(packet-fail), prose kept (DC12)', async () => {

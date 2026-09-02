@@ -31,6 +31,7 @@ import { renderCodeReviewSeatPrompt } from './code-review-seat';
 import {
   type GateVerdictRecord,
   type SettlementRecord,
+  type ShadowGateSeat,
   renderGateVerdicts,
   runGate,
 } from './gate';
@@ -268,6 +269,9 @@ export interface ClaudeLayerOptions {
   // ("reviewer = Opus @ high, gate = Fable @ max"). Always a `claude -p` spawn (only model/effort
   // differ). Omitted ⇒ inherits `claudeConfig` (the pre-Phase-3 behavior — one seat for both).
   gateConfig?: VoiceConfig;
+  // The SHADOW gate (audit-only, gate.ts ShadowGateSeat) — a cross-vendor judge over the identical
+  // gate prompt, for champion/challenger measurement. Omitted ⇒ nothing changes.
+  shadowGate?: ShadowGateSeat;
   // The codex+grok reviews already produced + persisted by runReviewMode (the core).
   coreReviews: StoredReview[];
   // THE HISTORY PACKET (./history-packet), when this run built one: `git log` + `git blame` for the
@@ -546,6 +550,8 @@ export async function runClaudeReviewLayer(
     reviews: voiceReviews,
     run,
     runId: opts.runId,
+    // The audit-only shadow gate rides the same call — runGate owns its concurrency + fail-soft.
+    ...(opts.shadowGate ? { shadow: opts.shadowGate } : {}),
     // A worktree gate verifies against the tree (evidence-bearing) — give it the
     // worktree-sized watchdog; packet mode keeps the shared default.
     timeoutMs: opts.timeoutMs ?? (opts.worktree ? GATE_WORKTREE_TIMEOUT_MS : undefined),

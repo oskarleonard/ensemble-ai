@@ -1150,6 +1150,29 @@ export type GateRunner = (
   opts?: RunReviewOpts
 ) => Promise<VoiceRunResult>;
 
+// ── The SHADOW gate (audit-only) ───────────────────────────────────────────────────────
+// A second, cross-vendor judge over the IDENTICAL rendered gate prompt, so the operator can
+// measure whether another vendor's seat gates as well as the authoritative one BEFORE ever
+// moving the seat (champion/challenger). Three properties are load-bearing:
+//
+//  1. NEVER AUTHORITATIVE. Its verdicts land in `shadow-gate-<seat>-verdicts.json` (+ raw
+//     transcript) and nowhere else — synthesis, posting, dedup, dismissals, and the exit gate
+//     read ONLY the primary. `authoritative: false` is stamped into the artifact itself.
+//  2. FAIL-SOFT. A shadow spawn/parse failure logs one line and writes a stub record; the run's
+//     verdicts, trail, and exit are byte-identical to a run without the shadow.
+//  3. SAME INPUT, SAME RECONCILE. It judges the same prompt, and its envelope goes through the
+//     same host reconcile + clustering as the primary's — so a disagreement is judge vs judge,
+//     never pipeline noise. The artifact carries a per-finding comparison for exactly that read.
+export const SHADOW_GATE_SCHEMA_VERSION = 1;
+
+export interface ShadowGateSeat {
+  // The shadow judge's seat (typically the codex reviewer's model at a stepped-down effort).
+  // The RUNNER binds the vendor spawn (sandbox + egress fence included) — config alone can
+  // never point the shadow at an unfenced spawn.
+  config: VoiceConfig;
+  run: GateRunner;
+}
+
 export interface GateRunResult {
   // Did the gate SEAT actually spawn and return? False when no healthy reviewer gave it anything
   // to judge, or when the spawn itself threw — in both cases the seat never existed, so it read
@@ -1179,6 +1202,8 @@ export interface RunGateOptions {
   reviews: VoiceReview[];
   run: GateRunner;
   runId: string;
+  // The audit-only SHADOW gate — off unless supplied (see ShadowGateSeat above).
+  shadow?: ShadowGateSeat;
   timeoutMs?: number;
   // The detached read-only worktree of the PR head — the gate's spawn cwd when it is worktree-fed.
   // Reading the tree is what lets it locate a holistic finding's pattern site (and tell a missing
@@ -1208,19 +1233,112 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // them into the verdict set either.
   const { findings, injections } = prepareGateFindings(healthy, packetHunks);
 
-  const finalize = (
+  // ONE reconcile config for the primary AND the shadow — property 3 of the shadow gate: a
+  // verdict difference must be judge vs judge, never a reconcile-input drift.
+  const reconcileOpts = {
+    gateEvidence: opts.gateEvidence,
+    // The pinned packet's file set IS "what this PR changes" — the same bytes the reviewers saw.
+    // A holistic `agree` must cite its reinvention inside it.
+    ...(opts.holistic
+      ? { holistic: { ...opts.holistic, diffFiles: new Set(packetHunks.keys()) } }
+      : {}),
+  };
+
+  // Settle the SHADOW gate (when one was spawned) against the primary's records. Fail-soft by
+  // construction: every failure path logs one line + writes a stub artifact and returns — the
+  // primary result is already computed and untouchable from here.
+  const settleShadow = async (
+    shadowAttempt: Promise<VoiceRunResult | { threw: Error }> | null,
+    primary: GateVerdictRecord[],
+    // False when the primary produced no usable envelope (spawn death, junk, packet-fail): the
+    // shadow's verdicts still land, but a judge-vs-judge comparison would be pipeline noise —
+    // `comparison` stays null and says why (property 3).
+    primaryUsable: boolean
+  ): Promise<void> => {
+    if (!opts.shadow) return;
+    const seat = opts.shadow.config;
+    const name = `shadow-gate-${seat.id}`;
+    const writeShadow = (payload: object): void => {
+      try {
+        writeTrailFile(opts.baseDir, opts.runId, `${name}-verdicts.json`, JSON.stringify(payload, null, 2));
+      } catch {
+        /* best-effort — audit artifact only */
+      }
+    };
+    const seatMeta = { effort: seat.effort, id: seat.id, model: seat.model };
+    const stub = (why: string): void => {
+      log(`  · shadow gate (${seat.id} · ${seat.model} @ ${seat.effort}): ${why} — audit-only, run unaffected`);
+      writeShadow({
+        authoritative: false, comparison: null, ok: false,
+        runId: opts.runId, schemaVersion: SHADOW_GATE_SCHEMA_VERSION, seat: seatMeta, verdicts: [], why,
+      });
+    };
+    // Requested but never spawned: the packet-fail skip (below) still leaves its artifact — a
+    // trail reader must never have to guess whether the challenger ran.
+    if (!shadowAttempt) {
+      if (shadowSkipReason) stub(shadowSkipReason);
+      return;
+    }
+    const res = await shadowAttempt;
+    if ('threw' in res) return stub(`spawn failed (${res.threw.message})`);
+    if (res.raw) {
+      // Persist the transcript BEFORE parsing, like the primary — an unparseable shadow reply
+      // is exactly the one worth reading when judging the challenger.
+      try {
+        writeTrailFile(opts.baseDir, opts.runId, `${name}.raw.md`, res.raw);
+      } catch {
+        /* best-effort */
+      }
+    }
+    if (!res.raw || res.timedOut)
+      return stub(res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output'));
+    const parsed = parseGateEnvelope(res.raw);
+    if ('failure' in parsed) return stub(`envelope not usable (${parsed.failure})`);
+    // Same reconcile + clustering as the primary; the shadow's reconcile warnings are its own
+    // audit noise, deliberately not logged into the run.
+    const records = clusterPostable(reconcileGateVerdicts(findings, parsed, reconcileOpts).records);
+    // Judge vs judge ONLY when the primary actually judged: against a fail-closed primary
+    // (all-unverified by host fiat) every real shadow verdict would read as a "disagreement" —
+    // pipeline noise wearing a comparison's clothes. The challenger's verdicts still land.
+    if (!primaryUsable) {
+      writeShadow({
+        authoritative: false, comparison: null,
+        comparisonSkipped: 'primary gate produced no usable envelope — its verdicts are host-forced, not judged; no judge-vs-judge comparison',
+        ok: true, runId: opts.runId, schemaVersion: SHADOW_GATE_SCHEMA_VERSION, seat: seatMeta,
+        verdicts: records,
+      });
+      log(
+        `  · shadow gate (${seat.id} · ${seat.model} @ ${seat.effort}): judged ${records.length} finding(s), but the primary gate failed — verdicts recorded, no comparison`
+      );
+      return;
+    }
+    const byId = new Map(primary.map((r) => [r.findingId, r.effectiveVerdict]));
+    const disagreements = records
+      .filter((r) => byId.has(r.findingId) && byId.get(r.findingId) !== r.effectiveVerdict)
+      .map((r) => ({ findingId: r.findingId, primary: byId.get(r.findingId), shadow: r.effectiveVerdict }));
+    const compared = records.filter((r) => byId.has(r.findingId)).length;
+    writeShadow({
+      authoritative: false,
+      comparison: { compared, disagreements, matched: compared - disagreements.length },
+      ok: true, runId: opts.runId, schemaVersion: SHADOW_GATE_SCHEMA_VERSION, seat: seatMeta,
+      verdicts: records,
+    });
+    log(
+      `  · shadow gate (${seat.id} · ${seat.model} @ ${seat.effort}): ${compared - disagreements.length}/${compared} verdicts match the primary${disagreements.length ? ` — ${disagreements.length} disagreement(s), see ${name}-verdicts.json` : ''}`
+    );
+  };
+  // Bound to the spawn started below (null until then); finalize settles it on EVERY exit path.
+  let shadowAttempt: Promise<VoiceRunResult | { threw: Error }> | null = null;
+  // Set when the shadow was requested but deliberately not spawned (packet-fail) — the artifact
+  // still lands as a stub so a trail reader never guesses whether the challenger ran.
+  let shadowSkipReason: string | null = null;
+
+  const finalize = async (
     synthesis: ReviewSynthesis,
     parsed: ParsedGateEnvelope | WholeEnvelopeFailure,
     gateSpawned: boolean
-  ): GateRunResult => {
-    const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed, {
-      gateEvidence: opts.gateEvidence,
-      // The pinned packet's file set IS "what this PR changes" — the same bytes the reviewers saw.
-      // A holistic `agree` must cite its reinvention inside it.
-      ...(opts.holistic
-        ? { holistic: { ...opts.holistic, diffFiles: new Set(packetHunks.keys()) } }
-        : {}),
-    });
+  ): Promise<GateRunResult> => {
+    const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed, reconcileOpts);
     for (const w of warnings) log(`  · ${w}`);
     // Cross-reviewer dedup by selection — one representative per cluster posts; corroboration
     // recorded. Runs AFTER reconcile (needs the full postable set) and BEFORE the trail write
@@ -1230,6 +1348,10 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     if (!gateTrailWritten) {
       log('  · gate: gate-verdicts.json FAILED to write — dismissals not honored (trail loss is LOUD)');
     }
+    // The shadow settles against the FINAL primary records — even on a fail-closed primary the
+    // challenger's own artifact still lands, though a comparison is only computed when the
+    // primary actually judged (a host-forced all-unverified set is not a judgment).
+    await settleShadow(shadowAttempt, records, !('failure' in parsed));
     return { gateSpawned, gateTrailWritten, synthesis, verdicts: records };
   };
 
@@ -1244,7 +1366,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     failure: WholeEnvelopeFailure['failure'],
     gateSpawned: boolean,
     raw?: string
-  ): GateRunResult => {
+  ): Promise<GateRunResult> => {
     log(logMsg);
     return finalize(
       { ...fallbackReviewSynthesis(opts.reviews), error, ...(raw !== undefined ? { raw } : {}) },
@@ -1264,6 +1386,31 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // or the cause is either unreachable (never taught) or unsound (taught to a packet-fed gate).
   const prompt = renderGatePrompt(findings, injections, opts.gateEvidence ?? 'packet');
   log('Gate: grounding findings against the pinned diff hunks — verdict tags…');
+  // THE SHADOW GATE — spawned CONCURRENTLY with the primary on the IDENTICAL prompt (property 3),
+  // settled inside finalize so wall time is max(primary, shadow), not their sum, and so the CLI
+  // never exits with the challenger's artifact half-written. The .then normalizes a throw into
+  // data — nothing from the shadow can reject past finalize.
+  if (opts.shadow) {
+    if (packetFail) {
+      // Nothing can be grounded for ANY judge — spending the challenger's seat here would
+      // buy an all-noise artifact. Skip loudly; settleShadow writes the stub.
+      shadowSkipReason = 'pinned packet unusable — skipped (nothing can be grounded, for either judge)';
+    } else {
+      const sh = opts.shadow;
+      log(
+        `  · shadow gate (${sh.config.id} · ${sh.config.model} @ ${sh.config.effort}) judging the same findings — audit-only, never authoritative…`
+      );
+      shadowAttempt = sh
+        .run(prompt, sh.config, {
+          timeoutMs: opts.timeoutMs,
+          ...(opts.worktree ? { worktree: opts.worktree } : {}),
+        })
+        .then(
+          (r) => r,
+          (e: Error) => ({ threw: e })
+        );
+    }
+  }
   const spawn = async (): Promise<VoiceRunResult | { threw: Error }> => {
     try {
       return await opts.run(prompt, opts.config, {
