@@ -226,6 +226,11 @@ on its face — that is another seat's job.
   A function that looks like an existing util but rounds differently, preserves case, or paces
   instead of retries is NOT a reinvention — it is a different function that resembles one. Filing
   those is worse than filing nothing. If you are not sure the behavior is identical, do not file it.
+- Matching semantics are still not enough: check the ROLE. Two byte-identical value sets can serve
+  different masters — a picker's display order vs a money guard, a UI list vs a validation set.
+  Merging those couples code that must evolve independently, and proposing that merge is itself a
+  defect. File a reinvention only when both occurrences serve the same role as well as the same
+  behavior.
 - Severity is CAPPED at "medium" by the host. It is lifted ONLY when a conventions doc in this
   project explicitly mandates the pattern the change bypasses — if so, quote that doc's line in
   your body and give its \`path:line\`. Asserting "this is important" never lifts the cap; only a
