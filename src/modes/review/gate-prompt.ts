@@ -83,6 +83,20 @@ function hunksBlock(injections: GateInjection[]): string {
     .join('\n\n');
 }
 
+// Taught ONLY on worktree evidence, like the reference-not-found clause below — a packet gate has
+// no tree, so its grounding boundary genuinely IS the shown hunk. Exists because the verdict
+// definitions above say "ground it in the shown hunk", and a judge that follows that to the
+// letter never opens a file: the first shadow-gate run (incident 2026-09-02b trial, run
+// 2026-09-02-17-03-14) downgraded 8 of the primary's 15 verdicts with reasons of the shape
+// "outside the hunk" — while the primary's agrees were tree-verified and spot-checked real. The
+// hunk is the finding's CITATION; on worktree evidence the tree is the EVIDENCE.
+const WORKTREE_GROUNDING_CLAUSE = `
+- GROUND IN THE TREE (worktree evidence): the cited hunk is the finding's CITATION, not your
+  evidence boundary. You have the whole project at the reviewed commit — READ the files a claim
+  depends on (callers, siblings, configs, tests, contract artifacts) to confirm, narrow, or
+  refute it, and cite what you read as file:line in your reason. "unverified" means you could
+  not ground the claim in the hunk OR the tree — never that the hunk alone did not show it.`;
+
 // Taught to the gate ONLY on worktree evidence. A packet-fed gate sees ±25-line hunks, so it
 // cannot distinguish "this reference does not exist at headSha" from "it fell outside my window"
 // — telling it about the cause would invite exactly the unsound claim the host then has to drop
@@ -197,7 +211,7 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   state what THIS finding claims that the primary's body does NOT — the host threads that claim onto
   the primary for the human, so a sharper framing (e.g. one reviewer names the direction that FAILS,
   the other names the direction that wrongly PASSES) is never lost to dedup.${
-    gateEvidence === 'worktree' ? REFERENCE_NOT_FOUND_CLAUSE : ''
+    gateEvidence === 'worktree' ? WORKTREE_GROUNDING_CLAUSE + REFERENCE_NOT_FOUND_CLAUSE : ''
   }${hasHolistic ? holisticClause : ''}`;
 
 // Render the whole gate prompt from the prepared, host-owned findings + the deduped injections.

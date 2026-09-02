@@ -5281,6 +5281,12 @@ function hunksBlock(injections) {
 ${h.text}
 <<<END ${h.label}>>>`).join("\n\n");
 }
+var WORKTREE_GROUNDING_CLAUSE = `
+- GROUND IN THE TREE (worktree evidence): the cited hunk is the finding's CITATION, not your
+  evidence boundary. You have the whole project at the reviewed commit \u2014 READ the files a claim
+  depends on (callers, siblings, configs, tests, contract artifacts) to confirm, narrow, or
+  refute it, and cite what you read as file:line in your reason. "unverified" means you could
+  not ground the claim in the hunk OR the tree \u2014 never that the hunk alone did not show it.`;
 var REFERENCE_NOT_FOUND_CLAUSE = `
 - "cause" (optional, unverified ONLY): you have READ ACCESS to the whole project at the reviewed
   commit, so you can check whether what a finding POINTS AT actually exists. If you looked and the
@@ -5379,7 +5385,7 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   shown), set it to that findingId instead of merely saying so in prose. Your "reason" must still
   state what THIS finding claims that the primary's body does NOT \u2014 the host threads that claim onto
   the primary for the human, so a sharper framing (e.g. one reviewer names the direction that FAILS,
-  the other names the direction that wrongly PASSES) is never lost to dedup.${gateEvidence === "worktree" ? REFERENCE_NOT_FOUND_CLAUSE : ""}${hasHolistic ? holisticClause : ""}`;
+  the other names the direction that wrongly PASSES) is never lost to dedup.${gateEvidence === "worktree" ? WORKTREE_GROUNDING_CLAUSE + REFERENCE_NOT_FOUND_CLAUSE : ""}${hasHolistic ? holisticClause : ""}`;
 function renderGatePrompt(findings, injections, gateEvidence = "packet") {
   return `You are the VERIFIED GATE for a multi-model CODE REVIEW. Several AI reviewers each
 reviewed the SAME diff INDEPENDENTLY. You are given, per finding, the reviewer's claim AND the

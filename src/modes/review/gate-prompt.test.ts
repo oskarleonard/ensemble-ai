@@ -162,6 +162,23 @@ describe('renderGatePrompt — the reference-not-found cause is taught ONLY on w
     expect(prompt).toContain('unverified ONLY');
     expect(prompt).toMatch(/ONLY when\s+you actually looked/);
   });
+
+  // The verdict definitions say "ground it in the shown hunk"; a judge that follows that to the
+  // letter never opens a file. The first shadow-gate run proved it: 8 of 15 primary verdicts
+  // downgraded with "outside the hunk" reasons, while the primary's tree-verified agrees
+  // spot-checked real. On worktree evidence the hunk is the CITATION, the tree is the EVIDENCE.
+  it('a worktree-fed gate is told the hunk is not its evidence boundary (GROUND IN THE TREE)', () => {
+    const prompt = renderGatePrompt(findings, injections, 'worktree');
+    expect(prompt).toContain('GROUND IN THE TREE');
+    expect(prompt).toContain('not your\n  evidence boundary');
+    expect(prompt).toMatch(/could\s+not ground the claim in the hunk OR the tree/);
+  });
+
+  it('a packet-fed gate keeps the hunk as its honest boundary — the clause never renders', () => {
+    const prompt = renderGatePrompt(findings, injections, 'packet');
+    expect(prompt).not.toContain('GROUND IN THE TREE');
+    expect(prompt).not.toContain('evidence boundary');
+  });
 });
 
 // PREMISE PROVENANCE: testimony-vs-fact is a WEIGHING rule, so it is taught on every evidence
