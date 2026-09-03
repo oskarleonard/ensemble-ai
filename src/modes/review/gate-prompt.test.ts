@@ -171,7 +171,10 @@ describe('renderGatePrompt — the reference-not-found cause is taught ONLY on w
     const prompt = renderGatePrompt(findings, injections, 'worktree');
     expect(prompt).toContain('GROUND IN THE TREE');
     expect(prompt).toContain('not your\n  evidence boundary');
-    expect(prompt).toMatch(/could\s+not ground the claim in the hunk OR the tree/);
+    expect(prompt).toMatch(/could not ground\s+the claim in the hunk OR the tree/);
+    // Tree reading confirms/narrows — it must never mint a "false": validateCitation only
+    // accepts hunk-drawn lines, so a tree-sourced refutation would be downgraded as noise.
+    expect(prompt).toContain('never mints a "false"');
   });
 
   it('a packet-fed gate keeps the hunk as its honest boundary — the clause never renders', () => {

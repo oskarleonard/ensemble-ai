@@ -5284,9 +5284,12 @@ ${h.text}
 var WORKTREE_GROUNDING_CLAUSE = `
 - GROUND IN THE TREE (worktree evidence): the cited hunk is the finding's CITATION, not your
   evidence boundary. You have the whole project at the reviewed commit \u2014 READ the files a claim
-  depends on (callers, siblings, configs, tests, contract artifacts) to confirm, narrow, or
-  refute it, and cite what you read as file:line in your reason. "unverified" means you could
-  not ground the claim in the hunk OR the tree \u2014 never that the hunk alone did not show it.`;
+  depends on (callers, siblings, configs, tests, contract artifacts) to confirm or narrow it,
+  and cite what you read as file:line in your reason. "unverified" means you could not ground
+  the claim in the hunk OR the tree \u2014 never that the hunk alone did not show it. Tree reading
+  never mints a "false": a dismissal still requires the hunk-quoted refutation above \u2014 what the
+  tree can contribute AGAINST a finding is "cause": "reference-not-found" or a premise-conflict
+  (below), each of which the host verifies itself.`;
 var REFERENCE_NOT_FOUND_CLAUSE = `
 - "cause" (optional, unverified ONLY): you have READ ACCESS to the whole project at the reviewed
   commit, so you can check whether what a finding POINTS AT actually exists. If you looked and the

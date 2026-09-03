@@ -93,9 +93,12 @@ function hunksBlock(injections: GateInjection[]): string {
 const WORKTREE_GROUNDING_CLAUSE = `
 - GROUND IN THE TREE (worktree evidence): the cited hunk is the finding's CITATION, not your
   evidence boundary. You have the whole project at the reviewed commit — READ the files a claim
-  depends on (callers, siblings, configs, tests, contract artifacts) to confirm, narrow, or
-  refute it, and cite what you read as file:line in your reason. "unverified" means you could
-  not ground the claim in the hunk OR the tree — never that the hunk alone did not show it.`;
+  depends on (callers, siblings, configs, tests, contract artifacts) to confirm or narrow it,
+  and cite what you read as file:line in your reason. "unverified" means you could not ground
+  the claim in the hunk OR the tree — never that the hunk alone did not show it. Tree reading
+  never mints a "false": a dismissal still requires the hunk-quoted refutation above — what the
+  tree can contribute AGAINST a finding is "cause": "reference-not-found" or a premise-conflict
+  (below), each of which the host verifies itself.`;
 
 // Taught to the gate ONLY on worktree evidence. A packet-fed gate sees ±25-line hunks, so it
 // cannot distinguish "this reference does not exist at headSha" from "it fell outside my window"
