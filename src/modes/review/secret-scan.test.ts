@@ -53,6 +53,15 @@ describe('scanDiffForSecrets — sensitive paths', () => {
     }
   });
 
+  it('the template exemption is linear on a hostile dotted path (no catastrophic backtracking)', () => {
+    // Regression guard for the first draft's `(\.[^/]+)*` (exponential: ~1 s at 28 segments).
+    const hostile = '.env' + '.a'.repeat(60) + '!';
+    const t0 = Date.now();
+    const r = scanDiffForSecrets(parseDiffFiles(diffFor(hostile, ['X=1'])));
+    expect(Date.now() - t0).toBeLessThan(200);
+    expect(r.sensitivePaths.map((p) => p.label)).toContain('dotenv'); // not a template → still blocked
+  });
+
   it('a template carrying a REAL credential is still caught by the inline scan', () => {
     const files = parseDiffFiles(diffFor('.env.example', ['AWS_KEY=AKIAIOSFODNN7EXAMPLE']));
     const r = scanDiffForSecrets(files);

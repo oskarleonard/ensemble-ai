@@ -4097,7 +4097,7 @@ var SENSITIVE_PATH_PATTERNS = [
   { label: "git-credentials", re: /(^|\/)\.git-credentials$/ },
   { label: "pkcs12", re: /\.(p12|pfx)$/ }
 ];
-var DOTENV_TEMPLATE_RE = /(^|\/)\.env(\.[^/]+)*\.(template|example|sample)$/;
+var DOTENV_TEMPLATE_RE = /(^|\/)\.env(\.[^/.]+)*\.(template|example|sample)$/;
 var INLINE_SECRET_PATTERNS = [
   { label: "private-key-block", re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
   { label: "aws-access-key", re: /\bAKIA[0-9A-Z]{16}\b/ },
