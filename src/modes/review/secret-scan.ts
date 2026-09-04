@@ -24,6 +24,14 @@ const SENSITIVE_PATH_PATTERNS: { label: string; re: RegExp }[] = [
   { label: 'pkcs12', re: /\.(p12|pfx)$/ },
 ];
 
+// Committed dotenv TEMPLATES (`.env.template`, `.env.example`, `.env.sample`, with
+// or without an environment segment in between) exist precisely to be checked in:
+// they hold placeholders, not values. A path-level block on them is a false
+// positive that stalls every review of a PR documenting a new variable. They are
+// exempt from the `dotenv` PATH rule only — the inline credential scan below still
+// runs on their contents, so a real value pasted into a template is still caught.
+const DOTENV_TEMPLATE_RE = /(^|\/)\.env(\.[^/]+)*\.(template|example|sample)$/;
+
 // Inline credential patterns — high-precision only (to avoid false-positive
 // noise): private-key headers + a few well-shaped provider tokens. Matched on
 // EVERY transmitted diff line (added, removed, AND context) — see payloadLines:
@@ -84,6 +92,7 @@ export function scanDiffForSecrets(
   const inlineSecrets: InlineSecretHit[] = [];
   for (const f of files) {
     for (const { label, re } of SENSITIVE_PATH_PATTERNS) {
+      if (label === 'dotenv' && DOTENV_TEMPLATE_RE.test(f.path)) continue;
       if (re.test(f.path)) sensitivePaths.push({ label, path: f.path });
     }
     if (f.isBinary) continue;
