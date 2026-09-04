@@ -4097,6 +4097,7 @@ var SENSITIVE_PATH_PATTERNS = [
   { label: "git-credentials", re: /(^|\/)\.git-credentials$/ },
   { label: "pkcs12", re: /\.(p12|pfx)$/ }
 ];
+var DOTENV_TEMPLATE_RE = /(^|\/)\.env(\.[^/.]+)*\.(template|example|sample)$/;
 var INLINE_SECRET_PATTERNS = [
   { label: "private-key-block", re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
   { label: "aws-access-key", re: /\bAKIA[0-9A-Z]{16}\b/ },
@@ -4115,6 +4116,7 @@ function scanDiffForSecrets(files, opts = {}) {
   const inlineSecrets = [];
   for (const f of files) {
     for (const { label, re } of SENSITIVE_PATH_PATTERNS) {
+      if (label === "dotenv" && DOTENV_TEMPLATE_RE.test(f.path)) continue;
       if (re.test(f.path)) sensitivePaths.push({ label, path: f.path });
     }
     if (f.isBinary) continue;
