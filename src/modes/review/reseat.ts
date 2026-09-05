@@ -120,7 +120,17 @@ export function splitWorktreePrompt(prompt: string): SplitPrompt {
   if (idx === -1) return unverified;
   const tail = prompt.slice(idx);
   const named = tail.match(/checked out READ-ONLY at (.+?) \(detached at ([^)\n]+)\)/);
-  if (!named) return unverified;
+  // Bounded to the header's own neighbourhood (a genuine tail has this line at offset 101) so this
+  // header being FOUND is not, by itself, enough to trust what follows it: `idx` only proves the
+  // bytes at `idx` match today's header text — nothing stops the packet BODY from quoting that same
+  // text, and if `WORKTREE_SUFFIX_HEADER` is ever reworded, an older persisted prompt's genuine
+  // preamble carries the OLD wording and never competes for `lastIndexOf`, leaving a body-quoted
+  // header as the only match there is. Unbounded, the search below it would read fields off
+  // whatever sits nearest — the body's own words, or a genuine (now-orphaned) preamble further down
+  // — and recover a split at that body-quoted header, silently dropping every genuine byte between
+  // it and the truth. A version-tolerant bound, not a byte-exact anchor, because the offset is free
+  // to drift release to release without this needing to move in lockstep.
+  if (!named || named.index === undefined || named.index > 200) return unverified;
   const base = tail.match(/git diff ([0-9a-f]{7,40})\.\.\.[0-9a-f]{7,40}/);
   const baseSha = base ? base[1] : null;
   const rebuilt = worktreePromptSuffix({ baseSha, headSha: named[2], worktree: named[1] });
@@ -253,7 +263,7 @@ export function checkReseat(
   const split = splitWorktreePrompt(art.prompt);
   if (split.unverifiedTail && !split.recoveredHeader) {
     return {
-      refusal: `seat ${seat}'s persisted prompt carries a worktree preamble whose header this engine cannot recover — refusing to guess where the packet ends`,
+      refusal: `seat ${seat}'s persisted prompt carries a worktree preamble whose header this engine cannot read (the header line, or the fields under it) — refusing to guess where the packet ends; re-run the review instead`,
     };
   }
   // The persisted prompt and the pinned gate packet are two records of ONE head. A preamble naming a
@@ -524,7 +534,10 @@ async function reseatUnderLock(opts: ReseatOptions, pre: ReseatReady): Promise<R
   // because "the run was written by another version" is the fact that explains any wording
   // difference between this seat's prompt and the one on disk. Scrubbed like every other line this
   // module prints, so the habit has no exception for someone to later fill with recovered text.
-  const preambleRerendered = Boolean(split.unverifiedTail && split.recoveredHeader);
+  // Gated on `worktreePrompt` too: a packet-mode retry (no `--repo`, or an unqualified seat) sends
+  // this seat no preamble at all, so there is nothing that was re-rendered — without this gate the
+  // stamp and the log line would claim a rewrite that never happened.
+  const preambleRerendered = Boolean(worktreePrompt && split.unverifiedTail && split.recoveredHeader);
   if (preambleRerendered) {
     log(
       scrubControl(

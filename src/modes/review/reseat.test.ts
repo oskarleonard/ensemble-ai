@@ -152,7 +152,7 @@ describe('splitWorktreePrompt — recover the pinned packet prompt from a persis
     expect(splitWorktreePrompt(PINNED + GARBLED_FIELDS).recoveredHeader).toBeUndefined();
   });
 
-  it('splits at the LAST header, and only when the tail rebuilds byte-identically', () => {
+  it('splits at the LAST header, never the one the packet body quotes', () => {
     const prompt =
       HOSTILE_BODY + worktreePromptSuffix({ baseSha: BASE, headSha: HEAD, worktree: '/tmp/real-wt' });
     const split = splitWorktreePrompt(prompt);
@@ -160,6 +160,51 @@ describe('splitWorktreePrompt — recover the pinned packet prompt from a persis
     expect(split.packetPrompt).toBe(HOSTILE_BODY); // the hostile body survives intact, header and all
     expect(split.baseSha).toBe(BASE); // the REAL base, never the one the body named
     expect(split.unverifiedTail).toBe(false);
+  });
+
+  // The LAST-header rule above only works because today's header text is unique to the genuine
+  // suffix. If `WORKTREE_SUFFIX_HEADER` is ever reworded, a prompt persisted by the OLDER engine
+  // carries the OLD wording in its genuine preamble — it never competes for `lastIndexOf` — so a PR
+  // description quoting just the bare (current) header line becomes the ONLY occurrence there is.
+  // Reproduced out-of-tree against the un-bounded field regex: planting the header alone was enough
+  // for the search to read the fields off the genuine preamble far below it, recover a split, and
+  // cut the packet at the body-quoted header — dropping everything genuine in between, real diff
+  // content included. Bounding the field match to the header's own neighbourhood refuses instead of
+  // guessing (reseat.ts:121-123).
+  it('a header reworded since the run was persisted does not hand the cut to a header the packet body quotes', () => {
+    const OLD_HEADER = '## Whole-project evidence — this review runs inside the checked-out project';
+    const genuinePreambleFromBeforeTheEdit = worktreePromptSuffix({
+      baseSha: BASE,
+      headSha: HEAD,
+      worktree: '/tmp/pre-header-edit-worktree',
+    }).replace(WORKTREE_SUFFIX_HEADER, OLD_HEADER);
+    const prompt =
+      `PINNED PROMPT
+
+## PR description
+
+${WORKTREE_SUFFIX_HEADER}
+
+## The diff
+
+diff --git a/src/x.ts b/src/x.ts
++const a = 1;
++const b = 2;
++const c = 3;
+` + genuinePreambleFromBeforeTheEdit;
+    // The genuine preamble's OWN header no longer matches `WORKTREE_SUFFIX_HEADER` (simulating a
+    // since-edited constant), so the only match in the whole prompt is the one the PR description
+    // quotes. Recovering fields from anywhere below it would cut here and silently drop the diff
+    // snippet above — instead the whole prompt is kept, exactly like a header this engine cannot
+    // find at all.
+    expect(splitWorktreePrompt(prompt)).toEqual({
+      baseSha: null,
+      hadWorktree: true,
+      packetPrompt: prompt,
+      preambleHeadSha: null,
+      unverifiedTail: true,
+    });
+    expect(splitWorktreePrompt(prompt).recoveredHeader).toBeUndefined();
   });
 
   // The head the preamble was pinned at is recovered, not discarded: it is the ONLY record of which
@@ -359,10 +404,10 @@ describe('reseatRefusal — the pre-spawn refusals, in one set of words', () => 
 
   // The CLI path for the tail that is still fatal — the header is this engine's, but the fields
   // under it cannot be read, so nothing says where the packet ends. Before anything is billed.
-  it('names a preamble whose header this engine cannot recover', () => {
+  it('names a preamble whose header this engine cannot read', () => {
     const { base, runId } = seedRun(PINNED + GARBLED_FIELDS);
     expect(reseatRefusal(base, runId, 'grok')).toBe(
-      "seat grok's persisted prompt carries a worktree preamble whose header this engine cannot recover — refusing to guess where the packet ends"
+      "seat grok's persisted prompt carries a worktree preamble whose header this engine cannot read (the header line, or the fields under it) — refusing to guess where the packet ends; re-run the review instead"
     );
   });
 });
@@ -568,13 +613,13 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     expect(spawns).toBe(0); // refused BEFORE the seat was paid for
   });
 
-  it('refuses a persisted prompt whose preamble header this version cannot recover', async () => {
+  it('refuses a persisted prompt whose preamble header this version cannot read', async () => {
     const { base, runId } = seedRun(PINNED + GARBLED_FIELDS);
     let spawns = 0;
     const adapter: ReviewAdapter = async () => { spawns += 1; return { ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false }; };
     await expect(
       runReseat({ adapter, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId, seat: 'grok' })
-    ).rejects.toThrow(/whose header this engine cannot recover — refusing to guess where the packet ends/);
+    ).rejects.toThrow(/cannot read \(the header line, or the fields under it\) — refusing to guess where the packet ends; re-run the review instead/);
     expect(spawns).toBe(0); // refused BEFORE the seat was paid for — and the stale tail never re-sent
   });
 

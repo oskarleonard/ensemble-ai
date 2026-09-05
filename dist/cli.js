@@ -8420,7 +8420,7 @@ ${WORKTREE_SUFFIX_HEADER}`);
   if (idx === -1) return unverified;
   const tail = prompt.slice(idx);
   const named = tail.match(/checked out READ-ONLY at (.+?) \(detached at ([^)\n]+)\)/);
-  if (!named) return unverified;
+  if (!named || named.index === void 0 || named.index > 200) return unverified;
   const base = tail.match(/git diff ([0-9a-f]{7,40})\.\.\.[0-9a-f]{7,40}/);
   const baseSha = base ? base[1] : null;
   const rebuilt = worktreePromptSuffix({ baseSha, headSha: named[2], worktree: named[1] });
@@ -8490,7 +8490,7 @@ function checkReseat(baseDir, runId, seat, worktreeHeadSha) {
   const split = splitWorktreePrompt(art.prompt);
   if (split.unverifiedTail && !split.recoveredHeader) {
     return {
-      refusal: `seat ${seat}'s persisted prompt carries a worktree preamble whose header this engine cannot recover \u2014 refusing to guess where the packet ends`
+      refusal: `seat ${seat}'s persisted prompt carries a worktree preamble whose header this engine cannot read (the header line, or the fields under it) \u2014 refusing to guess where the packet ends; re-run the review instead`
     };
   }
   if (split.preambleHeadSha && split.preambleHeadSha !== headSha) {
@@ -8621,7 +8621,7 @@ async function reseatUnderLock(opts, pre) {
   log(
     `reseat: re-running ${seat} on run ${runId} \xB7 head ${headSha.slice(0, 12)} \xB7 ${worktreePrompt ? "worktree evidence" : "packet evidence"} \xB7 previously ${art.stored.terminalState}`
   );
-  const preambleRerendered = Boolean(split.unverifiedTail && split.recoveredHeader);
+  const preambleRerendered = Boolean(worktreePrompt && split.unverifiedTail && split.recoveredHeader);
   if (preambleRerendered) {
     log(
       scrubControl(
