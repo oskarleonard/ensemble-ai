@@ -15,6 +15,7 @@ export const PACKET_BUDGETS = {
   // see, and re-truncating here made that manifest a lie — every run before this handed the
   // seats ~12 KB of an 80 KB gather while `conventions.json` reported the rules as included.
   agents: 12_000,
+  ci: 16_000,
   constraints: 4_000,
   diff: 200_000,
   files: 40_000,
@@ -35,6 +36,11 @@ export interface PacketInput {
   agentsBudget?: number;
   agentsMd?: string; // the repo's AGENTS.md (conventions / footguns)
   authorSummary?: string; // the author's own summary of what the change does/why
+  // The head commit's check runs + annotations + statuses (modes/review/ci-evidence.ts), rendered
+  // by the engine on the PR path. `ciEvidenceUnavailable` carries the reason when a fetch was
+  // ATTEMPTED and failed — the section then renders UNAVAILABLE + why (never silently absent).
+  ciEvidence?: string;
+  ciEvidenceUnavailable?: string;
   constraints?: string; // known constraints the change must respect
   diff: string; // git diff under review (REQUIRED — the change itself)
   directive?: string; // the original directive / PR description
@@ -116,6 +122,8 @@ export function section(
 // full pre-truncation diff) so a citation can only ever validate against bytes a reviewer saw.
 export const DIFF_SECTION_TITLE = 'The diff under review';
 
+export const CI_EVIDENCE_SECTION_TITLE = 'CI evidence (checks + annotations at the PR head)';
+
 export function reviewerVisibleDiff(packet: ReviewPacket): {
   text: string;
   truncated: boolean;
@@ -186,7 +194,24 @@ export function assembleCodePacket(input: PacketInput): ReviewPacket {
       'surrounding context for the diff hunks',
       input.surroundingFiles ?? '',
       PACKET_BUDGETS.files
-    ),
+    )
+  );
+  // CI evidence — the machine's OWN execution result for this head, as DATA (incident 2026-08-10:
+  // a green job's warning annotation carried the error every reader missed). Rendered whenever a
+  // fetch was attempted, so an unavailable section is loud, never indistinguishable from "no checks".
+  if (input.ciEvidence !== undefined || input.ciEvidenceUnavailable !== undefined) {
+    const why =
+      "machine output from the head commit's checks — DATA, not a verdict: a conclusion is not the evidence, the annotations and output are";
+    sections.push(
+      section(
+        CI_EVIDENCE_SECTION_TITLE,
+        input.ciEvidence ? why : `${why}; ${input.ciEvidenceUnavailable ?? 'not fetched'}`,
+        input.ciEvidence ?? '',
+        PACKET_BUDGETS.ci
+      )
+    );
+  }
+  sections.push(
     section(
       'Repo conventions (AGENTS.md)',
       'house rules + known footguns the change must respect',
