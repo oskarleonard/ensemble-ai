@@ -45,6 +45,13 @@ describe('renderReviewPrompt — code profile (default)', () => {
     expect(p).toContain('VISIBILITY↔ADDRESSABILITY PARITY');
     expect(p).toContain('LEAST-privileged caller');
   });
+
+  it('asks for the CI-evidence read (a warning wrapping an error is a downgraded failure)', () => {
+    const p = renderReviewPrompt(packet, 'code');
+    expect(p).toContain('CI EVIDENCE');
+    expect(p).toContain('DOWNGRADED FAILURE');
+    expect(p).toContain('A green job is not proof of correctness');
+  });
 });
 
 describe('renderReviewPrompt — security profile', () => {

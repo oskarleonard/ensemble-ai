@@ -34,6 +34,15 @@ const CODE_ASK = [
   'used, and the request that fails. If the diff (or its description) claims',
   'consumers need no change, test that claim against the least-privileged caller,',
   'not the author/owner perspective.',
+  '',
+  'CI EVIDENCE: when the packet carries a "CI evidence" section, read it before you',
+  'judge whether the change builds, migrates, or passes its tests. A check’s',
+  'conclusion is not the evidence — its annotations and output are. A WARNING or',
+  'NOTICE annotation whose text is an error (a failed command, a database/compiler/',
+  'linter error, a skipped or soft-failed step) is a DOWNGRADED FAILURE: treat it as a',
+  'finding candidate, locate the code in the diff that produced it, and quote what the',
+  'machine reported verbatim. A green job is not proof of correctness when its own',
+  'output contradicts it.',
 ].join('\n');
 
 // The `security` profile ask: an adversarial security-auditor framing. Same strict
