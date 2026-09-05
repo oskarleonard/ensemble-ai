@@ -203,4 +203,37 @@ describe('assembleCodePacket — CI evidence section', () => {
     expect(s?.note).toContain('HTTP 403');
     expect(s?.note).toMatch(/UNAVAILABLE/);
   });
+
+  // THE ONE BOTH-FIELDS RULE (modes/review/ci-evidence.resolveCiEvidence) — the packet is one of
+  // its seams, not a second opinion. Half-gathered evidence must never be rendered here as if it
+  // were the whole of the head's check output.
+  it('a caller that supplies BOTH gets the UNAVAILABLE note and NO evidence body', () => {
+    const p = assembleCodePacket({
+      ...base,
+      ciEvidence: 'CI-EVIDENCE-BODY-MARKER',
+      ciEvidenceUnavailable: 'check runs unavailable: HTTP 403',
+    });
+    const s = p.sections.find((x) => x.title === CI_EVIDENCE_SECTION_TITLE);
+    expect(s?.included).toBe(false);
+    expect(s?.body).toBe('');
+    expect(s?.note).toContain(
+      'caller supplied both CI evidence and an unavailability reason — treated as unavailable'
+    );
+    // …and the text is nowhere in the packet at all, not merely out of this one section.
+    expect(JSON.stringify(p.sections)).not.toContain('CI-EVIDENCE-BODY-MARKER');
+  });
+
+  // An empty / whitespace-only field is ABSENT, not a value: a section rendered over nothing tells
+  // the seat there is check output to read and then shows it none.
+  it('renders NO section for an empty or whitespace-only field', () => {
+    for (const input of [
+      { ciEvidence: '' },
+      { ciEvidence: '  \n ' },
+      { ciEvidenceUnavailable: '' },
+      { ciEvidence: '', ciEvidenceUnavailable: '   ' },
+    ]) {
+      const p = assembleCodePacket({ ...base, ...input });
+      expect(p.sections.map((x) => x.title)).not.toContain(CI_EVIDENCE_SECTION_TITLE);
+    }
+  });
 });

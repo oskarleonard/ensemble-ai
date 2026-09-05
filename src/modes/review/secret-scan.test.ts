@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { parseDiffFiles } from './diff';
+import { CI_OUTPUT_PATTERNS } from './ci-evidence';
 import { scanDiffForSecrets, scanTextForSecrets } from './secret-scan';
 
 function diffFor(path: string, addedLines: string[]): string {
@@ -149,5 +150,42 @@ describe('scanTextForSecrets — the same inline patterns, over arbitrary text',
 
   it('catches a private-key header on any line', () => {
     expect(scanTextForSecrets('line 1\n-----BEGIN RSA PRIVATE KEY-----\nline 3')?.label).toBe('private-key-block');
+  });
+});
+
+// THE `extra` PARAMETER widens the list FOR ONE CALL. It exists because CI output is leakier than
+// a diff — machine-printed, so it echoes request headers, exported tokens, credentialed URLs —
+// while the DIFF scan's precision bar must not move: a false positive there blocks a review.
+describe('scanTextForSecrets — the `extra` patterns are opt-in, and the DIFF scan never opts in', () => {
+  // Only the patterns CI_OUTPUT_PATTERNS adds that the base list does not already carry: the
+  // other two (aws-access-key, slack-token) are blocked on a diff too, so they prove nothing here.
+  const CI_ONLY: [string, string][] = [
+    ['bearer-token', 'curl -H "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345"'],
+    [
+      'jwt',
+      'session=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N-XgL0n3I9PlFUP0THsR8U',
+    ],
+    ['url-credentials', 'npm ERR! fetch https://ci:hunter2xyz@registry.example/pkg failed'],
+  ];
+
+  for (const [label, text] of CI_ONLY) {
+    it(`matches ${label} WITH the extras and is invisible without them`, () => {
+      expect(scanTextForSecrets(text, CI_OUTPUT_PATTERNS)).toEqual({ label });
+      // The default parameter leaves the base list exactly as it was.
+      expect(scanTextForSecrets(text)).toBeNull();
+    });
+
+    it(`does NOT block a diff carrying ${label} — the payload scan is untouched`, () => {
+      const r = scanDiffForSecrets(parseDiffFiles(diffFor('src/app.ts', [text])));
+      expect(r.blocked).toBe(false);
+      expect(r.inlineSecrets).toHaveLength(0);
+    });
+  }
+
+  // The extras WIDEN, never replace: a base pattern still fires when extras are passed.
+  it('keeps the base patterns when extras are supplied', () => {
+    expect(scanTextForSecrets('ghp_abcdefghijklmnopqrstuvwxyz0123', CI_OUTPUT_PATTERNS)).toEqual({
+      label: 'github-token',
+    });
   });
 });

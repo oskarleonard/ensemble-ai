@@ -310,6 +310,21 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, gate 
       expect(prompt).toContain('CI evidence UNAVAILABLE');
     });
 
+    // THE ONE BOTH-FIELDS RULE (ci-evidence.resolveCiEvidence) is applied at THIS hop too, not
+    // only inside the renderer: the layer must hand the producer the same account of the head the
+    // packet seats were given, or the two arbitrations can differ and one seat reads evidence the
+    // engine had already decided not to trust.
+    it('a caller that passes BOTH reaches the producer as UNAVAILABLE, with no evidence body', async () => {
+      const prompt = await producerPromptFor('code', {
+        ciEvidence: 'CI-MARKER-TEXT',
+        ciEvidenceUnavailable: 'CI-UNAVAILABLE-MARKER',
+      });
+      expect(prompt).not.toContain('CI-MARKER-TEXT');
+      expect(prompt).toContain(
+        'CI evidence UNAVAILABLE: caller supplied both CI evidence and an unavailability reason — treated as unavailable'
+      );
+    });
+
     it('`code` WITHOUT the pinned diff keeps the packet prompt — never a blind skill run', async () => {
       const base = tmpTrail();
       const runId = 'p-code-nodiff';

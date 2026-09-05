@@ -151,7 +151,12 @@ describe('runReviewMode — the gathered CI evidence reaches the packet and the 
       onProgress: (m) => progress.push(m),
     });
     expect(res.prompt).toContain('CI evidence (checks + annotations at the PR head)');
-    expect(res.prompt).toContain('gh is not on PATH');
+    // The reason the seats are shown is the RULE's, not the caller's: the caller's own reason
+    // describes only half of a contradiction, and naming the contradiction is what makes the bug
+    // findable in the prompt the seat actually read.
+    expect(res.prompt).toContain(
+      'caller supplied both CI evidence and an unavailability reason — treated as unavailable'
+    );
     expect(res.prompt).not.toContain('CI-EVIDENCE-BODY-MARKER');
     expect(
       progress.some((m) =>

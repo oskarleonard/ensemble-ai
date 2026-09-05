@@ -129,15 +129,28 @@ describe('the one Claude producer — /code-review methodology seat', () => {
     expect(headings(withNote)).toBe(1);
   });
 
-  it('prefers the gathered text when a caller passes both — and still renders ONE heading', () => {
+  // THE ONE BOTH-FIELDS RULE (ci-evidence.resolveCiEvidence). This seat used to PREFER the text
+  // while the packet seats were shown UNAVAILABLE for the same run — two seats reading different
+  // accounts of one head. Now it reads what every other seat reads: half-gathered evidence must
+  // never be presented as the whole of the head's check output.
+  it('treats a caller that passes BOTH as UNAVAILABLE — no evidence body, ONE heading', () => {
     const both = renderCodeReviewSeatPrompt({
       ...args,
       ciEvidence: 'Head commit: abc',
       ciEvidenceUnavailable: 'gh is not on PATH',
     });
     expect(headings(both)).toBe(1);
-    expect(both).toContain('Head commit: abc');
-    expect(both).not.toContain('UNAVAILABLE');
+    expect(both).not.toContain('Head commit: abc');
+    expect(both).toContain(
+      'CI evidence UNAVAILABLE: caller supplied both CI evidence and an unavailability reason — treated as unavailable'
+    );
+  });
+
+  // An empty / whitespace-only string is ABSENT, not a value: a heading over nothing tells the
+  // seat there is evidence to read and then shows it none.
+  it('renders no CI heading for an empty or whitespace-only field', () => {
+    expect(headings(renderCodeReviewSeatPrompt({ ...args, ciEvidence: '   \n ' }))).toBe(0);
+    expect(headings(renderCodeReviewSeatPrompt({ ...args, ciEvidenceUnavailable: '' }))).toBe(0);
   });
 
   it('renders no CI heading at all when neither the text nor a reason was passed', () => {

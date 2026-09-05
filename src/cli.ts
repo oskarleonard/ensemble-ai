@@ -335,7 +335,14 @@ Diff source (give at most ONE; default = current branch):
   --diff-file <path>   a raw unified diff read from a file
   (stdin)              a piped diff, e.g. \`git diff main...HEAD | ensemble-ai security\`
 
-Options + exit codes are identical to \`ensemble-ai review\` (run \`review --help\`).`;
+Options:
+  --no-ci-evidence      do NOT fetch the PR head's check runs + annotations + statuses into the
+                        packet (PR path only; default ON). \`security\` runs the SAME gather as
+                        \`review\` — a failing job's own output is often the first evidence of the
+                        very class this profile hunts (a leaked token echoed into a build log)
+  (all others)          identical to \`ensemble-ai review\` (run \`review --help\`)
+
+Exit codes are identical to \`ensemble-ai review\`.`;
 
 function genRunId(): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');

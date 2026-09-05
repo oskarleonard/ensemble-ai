@@ -170,10 +170,14 @@ refused — was printed verbatim in a *green* job whose validation step downgrad
 - Best-effort: a `gh` failure renders a loud **UNAVAILABLE** section with the reason and one stderr
   line — it never blocks a review.
 - Same trust class as the diff and the PR description (repo-CI text the seats already receive).
-  The rendered text still passes the inline credential patterns; any hit **withholds** the section.
+  Scanned **twice**: every untrusted field before truncation (a hit renders `[redacted: <kind>]` in
+  place, keeping the rest of the evidence), then the whole rendered text (a hit there **withholds**
+  the section). Check output is leakier than a diff — machine-printed, so it echoes headers and
+  exported tokens — so it is scanned with extra patterns the diff scan never uses.
 - Unlike the diff, check output can carry text from installed apps and bots (not the repo owner or
   the PR author) and URLs pointing at internal CI hosts — the section is hedged as untrusted data in
-  every prompt, credential patterns withhold it entirely, and `--no-ci-evidence` opts out per run.
+  every prompt, a URL is rendered only as `http(s)` without query, fragment, or userinfo, and
+  `--no-ci-evidence` opts out per run.
 - Caps: 10 annotated checks × 25 annotations, ~14k chars structurally, 16k in the packet budget.
 - The rendered body also lands in the trail as `ci-evidence.md`.
 

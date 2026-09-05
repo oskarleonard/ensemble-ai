@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { CI_EVIDENCE_LIMITS, fetchCiEvidence } from './ci-evidence';
+import { CI_EVIDENCE_BOTH_REASON, CI_EVIDENCE_LIMITS, fetchCiEvidence, resolveCiEvidence } from './ci-evidence';
 import type { GhRunner } from './stage';
 
 const SHA = 'a'.repeat(40);
@@ -163,12 +163,24 @@ describe('fetchCiEvidence — the head commit\'s checks as DATA', () => {
     expect(res).toEqual({ error: expect.stringContaining('rate limited'), ok: false });
   });
 
+  // THE SECOND NET. Every untrusted FIELD is scanned (and redacted) before truncation, so the
+  // whole-text scan exists for the bytes no field owns — here a credential in a URL PATH, which
+  // survives the query-string strip and is rendered verbatim as the human's pointer.
   it('WITHHOLDS the whole section when an inline credential pattern appears in check output', () => {
     const leaky = {
       ...happy,
-      [`api repos/${SLUG}/check-runs/102/annotations`]: [
-        { ...WARNING_WRAPPING_AN_ERROR[0], message: 'debug: GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123' },
-      ],
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+        check_runs: [
+          {
+            conclusion: 'failure',
+            details_url: 'https://ci.example/run/ghp_abcdefghijklmnopqrstuvwxyz0123',
+            id: 111,
+            name: 'lint',
+            output: { annotations_count: 0, summary: null, title: null },
+            status: 'completed',
+          },
+        ],
+      },
     };
     const res = fetchCiEvidence({ gh: fakeGh(leaky), headSha: SHA, pr: 7, repoSlug: SLUG });
     expect(res.ok).toBe(false);
@@ -177,6 +189,26 @@ describe('fetchCiEvidence — the head commit\'s checks as DATA', () => {
       expect(res.error).toContain('github-token');
       expect(res.error).not.toContain('ghp_');
     }
+  });
+
+  // …and a credential inside a FIELD costs that field, not the whole section: the redaction is
+  // named in place and every other piece of evidence on the head still reaches the seats. The
+  // section only disappears when nothing else could contain the leak.
+  it('redacts a leaky FIELD in place and keeps the rest of the evidence', () => {
+    const leaky = {
+      ...happy,
+      [`api repos/${SLUG}/check-runs/102/annotations`]: [
+        { ...WARNING_WRAPPING_AN_ERROR[0], message: 'debug: GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123' },
+      ],
+    };
+    const res = fetchCiEvidence({ gh: fakeGh(leaky), headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('[redacted: github-token]');
+    expect(res.text).not.toContain('ghp_');
+    // The rest of the head's evidence is untouched.
+    expect(res.text).toContain('eslint exited 1: 3 problems');
+    expect(res.text).toContain('review-bot');
   });
 
   it('caps annotations per check and says how many were cut', () => {
@@ -302,10 +334,10 @@ describe('fetchCiEvidence — malformed payloads degrade, they never throw', () 
 // evidence the module exists for (incident 2026-08-10 — the annotation in the green job), and
 // what it says about itself must be true.
 describe('fetchCiEvidence — the maxChars budget keeps the evidence, not the boilerplate', () => {
-  // 3080 = the 2760 chars of EVIDENCE this case has always pinned, plus the omission-line reserve
-  // as it now stands (4 kinds × 80 — the API page-cap line joined it). The evidence budget under
-  // test is unchanged; only the scaffolding held back around it grew.
-  const TIGHT = 3080;
+  // 3160 = the 2760 chars of EVIDENCE this case has always pinned, plus the omission-line reserve
+  // as it now stands (5 kinds × 80 — the check-run and status API page-cap lines joined it). The
+  // evidence budget under test is unchanged; only the scaffolding held back around it grew.
+  const TIGHT = 3160;
 
   it('keeps annotations under a tight budget, stays inside the cap, and counts only what it rendered', () => {
     const res = fetchCiEvidence({
@@ -445,7 +477,7 @@ describe('fetchCiEvidence — gh calls and how each failure degrades', () => {
     expect(calls).toEqual([
       `api repos/${SLUG}/commits/${SHA}/check-runs?per_page=100`,
       `api repos/${SLUG}/check-runs/102/annotations?per_page=50`,
-      `api repos/${SLUG}/commits/${SHA}/status`,
+      `api repos/${SLUG}/commits/${SHA}/status?per_page=100`,
     ]);
   });
 
@@ -896,5 +928,285 @@ describe('fetchCiEvidence — URLs render only as http(s), without query or frag
     expect(res.text).toContain('https://bot.example/1');
     expect(res.text).not.toContain('sig=deadbeef');
     expect(res.text).not.toContain('#frag');
+  });
+});
+
+// THE ONE BOTH-FIELDS RULE. `ciEvidence` and `ciEvidenceUnavailable` are mutually exclusive by
+// contract, and every consumer used to decide for itself what "both" meant — the engine dropped
+// the text, the worktree producer preferred it. Two seats reading different accounts of the same
+// head is the failure mode, so the rule lives HERE and every seam calls it.
+describe('resolveCiEvidence — one rule, at the exported boundary', () => {
+  it('BOTH supplied ⇒ unavailable, naming the contradiction rather than either half', () => {
+    expect(resolveCiEvidence('## Check runs\n- failure · lint', 'gh is not on PATH')).toEqual({
+      kind: 'unavailable',
+      reason: CI_EVIDENCE_BOTH_REASON,
+    });
+    expect(CI_EVIDENCE_BOTH_REASON).toBe(
+      'caller supplied both CI evidence and an unavailability reason — treated as unavailable'
+    );
+  });
+
+  it('text alone is text; a reason alone is that reason, verbatim', () => {
+    expect(resolveCiEvidence('evidence', undefined)).toEqual({ kind: 'text', text: 'evidence' });
+    expect(resolveCiEvidence(undefined, 'HTTP 403')).toEqual({ kind: 'unavailable', reason: 'HTTP 403' });
+  });
+
+  it('neither ⇒ none — no fetch was attempted, so the section must not exist', () => {
+    expect(resolveCiEvidence(undefined, undefined)).toEqual({ kind: 'none' });
+  });
+
+  // An empty string renders nothing a reviewer can read; treating it as present makes a section
+  // that says nothing, which reads exactly like a head with no checks.
+  it('an empty / whitespace-only string is ABSENT, on either side', () => {
+    expect(resolveCiEvidence('', '')).toEqual({ kind: 'none' });
+    expect(resolveCiEvidence('   \n\t ', undefined)).toEqual({ kind: 'none' });
+    expect(resolveCiEvidence(undefined, '  ')).toEqual({ kind: 'none' });
+    // …so an empty text beside a real reason is a SINGLE field, not a contradiction.
+    expect(resolveCiEvidence('  ', 'HTTP 403')).toEqual({ kind: 'unavailable', reason: 'HTTP 403' });
+    expect(resolveCiEvidence('evidence', '   ')).toEqual({ kind: 'text', text: 'evidence' });
+  });
+});
+
+// THE COMMIT-STATUS PAGE CAP. The legacy endpoint pages like every other: a commit with more
+// statuses than a page returns a truncated array, and nothing in the array says so. A busy repo
+// (one status per bot, per environment, per deploy) reaches that cap.
+describe('fetchCiEvidence — the commit-status page cap is stated, never rendered as the whole', () => {
+  const statusPayload = (extra: Record<string, unknown>): Record<string, unknown> => ({
+    [`api repos/${SLUG}/commits/${SHA}/check-runs`]: { check_runs: [] },
+    [`api repos/${SLUG}/commits/${SHA}/status`]: {
+      state: 'success',
+      statuses: [{ context: 'review-bot', description: 'ok', state: 'success' }],
+      ...extra,
+    },
+  });
+
+  it('says how many statuses the API page cap left unfetched', () => {
+    const res = fetchCiEvidence({
+      gh: fakeGh(statusPayload({ total_count: 140 })),
+      headSha: SHA,
+      pr: 7,
+      repoSlug: SLUG,
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('… 139 status(es) not fetched (API page cap)');
+    expect(res.truncated).toBe(true);
+  });
+
+  it('ignores a total_count that is missing, non-numeric, or lower than the page it returned', () => {
+    for (const total of [undefined, 'many', Number.NaN, 0]) {
+      const res = fetchCiEvidence({
+        gh: fakeGh(statusPayload(total === undefined ? {} : { total_count: total })),
+        headSha: SHA,
+        pr: 7,
+        repoSlug: SLUG,
+      });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      expect(res.text).toContain('review-bot');
+      expect(res.text).not.toContain('status(es) not fetched (API page cap)');
+    }
+  });
+});
+
+// A DROPPED ELEMENT is not the same fact as an empty array. "(no check runs on this commit)" and
+// "(none)" are CLAIMS ABOUT THE COMMIT; making either out of a payload this module could not read
+// is the false green the whole section exists to prevent — one level below the top-level shape
+// guard, which only sees whether the field was an array at all.
+describe('fetchCiEvidence — junk elements are traced, never read as "nothing ran"', () => {
+  it('an array of only junk reports the SHAPE, never "no check runs on this commit"', () => {
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: { check_runs: [null, 1, 'x'] },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.checks).toBe(0);
+    expect(res.text).toContain('(check runs unavailable: unexpected payload shape)');
+    expect(res.text).not.toContain('(no check runs on this commit)');
+    expect(res.truncated).toBe(true);
+  });
+
+  it('counts the drops on its own line when SOME elements survived', () => {
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+        check_runs: [
+          null,
+          'x',
+          { conclusion: 'failure', id: 1201, name: 'real-check', output: null, status: 'completed' },
+        ],
+      },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('real-check');
+    expect(res.text).toContain('… 2 check run(s) dropped (unexpected element shape)');
+    // The header's `N total` is true of what was RENDERED; the line above says what it is missing.
+    expect(res.text).toContain('Check runs: 1 total');
+    expect(res.truncated).toBe(true);
+  });
+
+  it('holds statuses to the SAME rule — junk elements are dropped, counted, and never "(none)"', () => {
+    const onlyJunk = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: { check_runs: [] },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: { state: 'success', statuses: [null, 2, 'x'] },
+    });
+    const a = fetchCiEvidence({ gh: onlyJunk, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(a.ok).toBe(true);
+    if (!a.ok) return;
+    expect(a.text).toContain('(statuses unavailable: unexpected payload shape)');
+    expect(a.text).not.toContain('(none)');
+
+    const mixed = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: { check_runs: [] },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: {
+        state: 'success',
+        statuses: [null, 'x', { context: 'review-bot', description: 'ok', state: 'success' }],
+      },
+    });
+    const b = fetchCiEvidence({ gh: mixed, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(b.ok).toBe(true);
+    if (!b.ok) return;
+    expect(b.text).toContain('review-bot');
+    expect(b.text).toContain('… 2 status(es) dropped (unexpected element shape)');
+    // A junk element must never render as a row that reads like a real status.
+    expect(b.text).not.toContain('- unknown · (unnamed status)');
+    expect(b.truncated).toBe(true);
+  });
+});
+
+// SCAN BEFORE TRUNCATION. Slicing first leaves a PREFIX of a live credential that no pattern
+// matches — so the whole-text scan then sees a string it cannot recognise and passes the section
+// through. The scan runs on the FULL collapsed value; only a clean value is ever sliced.
+describe('fetchCiEvidence — a field is scanned whole, then truncated', () => {
+  it('redacts a token that the field cap would have sliced into an unrecognisable prefix', () => {
+    const summary = `${'x'.repeat(495)} ghp_${'A'.repeat(36)}`;
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+        check_runs: [
+          {
+            conclusion: 'failure',
+            id: 1301,
+            name: 'leaky',
+            output: { annotations_count: 0, summary, title: null },
+            status: 'completed',
+          },
+        ],
+      },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('summary: [redacted: github-token]');
+    // Not even the 4-char head of the token survives — the old slice(500) landed exactly there.
+    expect(res.text).not.toContain('ghp_');
+    expect(res.text).not.toContain('x'.repeat(495));
+  });
+
+  // CI output is LEAKIER than a diff: it is machine-printed, so it echoes the request headers and
+  // the tokens a step exported. Those shapes are scanned here and NOT on the diff.
+  const CI_LEAKS: [string, string][] = [
+    ['aws-access-key', 'configured AKIAIOSFODNN7EXAMPLE for the deploy step'],
+    ['bearer-token', 'curl -H "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345"'],
+    [
+      'jwt',
+      'session=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N-XgL0n3I9PlFUP0THsR8U',
+    ],
+    ['slack-token', 'notify failed for xoxb-1234567890-abcdefghij'],
+    ['url-credentials', 'npm ERR! fetch https://ci:hunter2xyz@registry.example/pkg failed'],
+  ];
+
+  for (const [label, leak] of CI_LEAKS) {
+    it(`redacts ${label} inside an annotation message`, () => {
+      const gh = fakeGh({
+        ...happy,
+        [`api repos/${SLUG}/check-runs/102/annotations`]: [
+          { ...WARNING_WRAPPING_AN_ERROR[0], message: leak },
+        ],
+      });
+      const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      expect(res.text).toContain(`[redacted: ${label}]`);
+      // The value itself never reaches the packet — only its kind.
+      expect(res.text).not.toContain(leak.split(' ').find((w) => w.length > 18) ?? leak);
+      // …and the surrounding evidence survives: a redaction costs a FIELD, not the section.
+      expect(res.text).toContain('eslint exited 1: 3 problems');
+    });
+  }
+});
+
+// A URL in this section is the human's pointer to the check page. `HTTPS://…` is the same address
+// a case-sensitive prefix test threw away, and a URL whose AUTHORITY carries userinfo is a
+// credential the packet must not hold — rendering the host without it would fabricate a different
+// URL than the payload actually held, so the whole value is dropped.
+describe('fetchCiEvidence — URL scheme is case-insensitive and userinfo is rejected', () => {
+  const withUrls = (details: string, target: string): Record<string, unknown> => ({
+    [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+      check_runs: [
+        {
+          conclusion: 'failure',
+          details_url: details,
+          id: 1401,
+          name: 'has-a-url',
+          output: { annotations_count: 0, summary: null, title: null },
+          status: 'completed',
+        },
+      ],
+    },
+    [`api repos/${SLUG}/commits/${SHA}/status`]: {
+      state: 'failure',
+      statuses: [{ context: 'bot', description: 'd', state: 'failure', target_url: target }],
+    },
+  });
+
+  it('keeps an UPPERCASE scheme, still without its query or fragment', () => {
+    const res = fetchCiEvidence({
+      gh: fakeGh(withUrls('HTTPS://Example.com/x?y#z', 'HtTp://Example.com/s?q=1')),
+      headSha: SHA,
+      pr: 7,
+      repoSlug: SLUG,
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('HTTPS://Example.com/x');
+    expect(res.text).not.toContain('?y');
+    expect(res.text).not.toContain('#z');
+    expect(res.text).toContain('HtTp://Example.com/s');
+    expect(res.text).not.toContain('q=1');
+  });
+
+  it('omits a URL whose authority carries userinfo — the check itself still renders', () => {
+    const res = fetchCiEvidence({
+      gh: fakeGh(withUrls('https://user:tok@host/p', 'https://deploy:key@bot.example/1')),
+      headSha: SHA,
+      pr: 7,
+      repoSlug: SLUG,
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('has-a-url');
+    expect(res.text).toContain('bot');
+    expect(res.text).not.toContain('@');
+    expect(res.text).not.toContain('tok');
+    expect(res.text).not.toContain('key');
+  });
+
+  // The `@` must be read in the AUTHORITY only: a path segment carrying one is an ordinary URL
+  // (a scoped npm package, a pinned ref) and rejecting it would drop a usable link.
+  it('keeps a URL whose `@` is in the PATH, not the authority', () => {
+    const res = fetchCiEvidence({
+      gh: fakeGh(withUrls('https://ci.example/pkg/@scope/name', 'https://bot.example/1')),
+      headSha: SHA,
+      pr: 7,
+      repoSlug: SLUG,
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('https://ci.example/pkg/@scope/name');
   });
 });

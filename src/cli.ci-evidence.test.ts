@@ -106,7 +106,7 @@ function scriptGh(): void {
     if (cmd === 'gh' && args[0] === 'repo' && args[1] === 'view') return 'o/r\n';
     if (cmd === 'gh' && a.includes('/check-runs?')) return checkRuns();
     if (cmd === 'gh' && a.includes('/annotations')) return ANNOTATIONS;
-    if (cmd === 'gh' && a.endsWith('/status')) return JSON.stringify({ statuses: [] });
+    if (cmd === 'gh' && a.includes('/status')) return JSON.stringify({ statuses: [] });
     if (cmd === 'gh' && a.includes('/pulls/')) throw new Error('gh api pulls: unresolved');
     if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'diff') return DIFF;
     throw new Error(`unexpected exec: ${cmd} ${a}`);

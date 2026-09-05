@@ -1,3 +1,4 @@
+import { resolveCiEvidence } from '../modes/review/ci-evidence';
 import type { PacketSection, ReviewPacket } from './types';
 
 // Per-section character budgets — bound the prompt BY CONSTRUCTION (the
@@ -39,6 +40,8 @@ export interface PacketInput {
   // The head commit's check runs + annotations + statuses (modes/review/ci-evidence.ts), rendered
   // by the engine on the PR path. `ciEvidenceUnavailable` carries the reason when a fetch was
   // ATTEMPTED and failed — the section then renders UNAVAILABLE + why (never silently absent).
+  // MUTUALLY EXCLUSIVE, and the arbitration is `resolveCiEvidence`'s, not this file's: both
+  // supplied ⇒ UNAVAILABLE with the both-fields reason; empty/whitespace-only ⇒ absent.
   ciEvidence?: string;
   ciEvidenceUnavailable?: string;
   constraints?: string; // known constraints the change must respect
@@ -199,7 +202,12 @@ export function assembleCodePacket(input: PacketInput): ReviewPacket {
   // CI evidence — the machine's OWN execution result for this head, as DATA (incident 2026-08-10:
   // a green job's warning annotation carried the error every reader missed). Rendered whenever a
   // fetch was attempted, so an unavailable section is loud, never indistinguishable from "no checks".
-  if (input.ciEvidence !== undefined || input.ciEvidenceUnavailable !== undefined) {
+  // ONE both-fields rule for the whole engine (modes/review/ci-evidence.ts): evidence, or the
+  // reason there is none — never a section that carries text the engine had already decided not
+  // to trust. It also settles what an EMPTY string means (absent), so the section is never
+  // rendered over nothing with nothing to say about why.
+  const ci = resolveCiEvidence(input.ciEvidence, input.ciEvidenceUnavailable);
+  if (ci.kind !== 'none') {
     // The note carries the HEDGE as well as the framing. This packet prompt has no
     // untrusted-instructions clause of its own (that one is rendered into the WORKTREE seats'
     // prompts), and the section's own bytes are the least owner-controlled thing in the packet:
@@ -210,10 +218,8 @@ export function assembleCodePacket(input: PacketInput): ReviewPacket {
     sections.push(
       section(
         CI_EVIDENCE_SECTION_TITLE,
-        // `|| 'not fetched'`, not `??`: an empty reason is as absent as a missing one, and the
-        // section would otherwise render `…; ` and say nothing about why it is empty.
-        input.ciEvidence ? why : `${why}; ${input.ciEvidenceUnavailable || 'not fetched'}`,
-        input.ciEvidence ?? '',
+        ci.kind === 'text' ? why : `${why}; ${ci.reason}`,
+        ci.kind === 'text' ? ci.text : '',
         PACKET_BUDGETS.ci
       )
     );

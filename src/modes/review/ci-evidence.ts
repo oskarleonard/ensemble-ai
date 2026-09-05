@@ -11,8 +11,11 @@ import type { GhRunner } from './stage';
 // exactly the cheap, mechanical evidence a seat never gathers on its own.
 //
 // TRUST. Check output is repo-CI text: the same class as the diff and the PR description the seats
-// already receive — bytes the seat reads, never orders it takes. The rendered text still passes the
-// engine's inline credential patterns; any hit WITHHOLDS the whole section (loudly).
+// already receive — bytes the seat reads, never orders it takes. It is also LEAKIER than a diff —
+// machine-printed, so it echoes headers and exported tokens — so it is scanned twice, with the
+// engine's inline credential patterns PLUS this module's own (CI_OUTPUT_PATTERNS): once per field
+// before truncation (a hit redacts that field, keeping the rest of the evidence), and once over
+// the whole rendered text as the second net (a hit there WITHHOLDS the section, loudly).
 //
 // BEST-EFFORT. A `gh` failure degrades to `{ ok: false, error }`; the caller renders a named
 // UNAVAILABLE section and one stderr line. Nothing here throws.
@@ -34,6 +37,48 @@ export const CI_EVIDENCE_LIMITS: CiEvidenceLimits = {
 };
 
 export const CI_EVIDENCE_TRAIL_FILE = 'ci-evidence.md';
+
+// EXTRA credential shapes, scanned on CI text ONLY (never on a diff). A build log is
+// machine-printed: it echoes the request headers, the token a step exported, the URL a client was
+// handed. Those shapes are leaks here and false-positive noise on a hand-written diff, so they
+// live at THIS surface rather than in the shared list secret-scan.ts applies to the payload.
+export const CI_OUTPUT_PATTERNS: readonly { label: string; re: RegExp }[] = [
+  { label: 'aws-access-key', re: /\bAKIA[0-9A-Z]{16}\b/ },
+  { label: 'bearer-token', re: /\bBearer\s+[A-Za-z0-9\-._~+/]{20,}=*/i },
+  { label: 'jwt', re: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/ },
+  { label: 'slack-token', re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/ },
+  { label: 'url-credentials', re: /[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/i },
+];
+
+// THE ONE BOTH-FIELDS RULE. `ciEvidence` and `ciEvidenceUnavailable` are mutually exclusive by
+// contract — evidence, or the reason there is none — and every consumer used to decide for itself
+// what "both" meant (the engine dropped the text, the worktree producer preferred it). Two seats
+// describing the same run differently is the failure mode: the packet reading UNAVAILABLE while
+// the one Claude producer reads evidence the engine had already decided not to trust. So the rule
+// lives HERE, at the exported boundary, and every seam calls it.
+//
+// A caller that supplies both has a bug, and the safe reading of a bug is the LOUD one: an
+// unavailable section says "the head's check output is missing", while half-gathered text would be
+// read as the whole of it. An empty / whitespace-only string is ABSENT, not a value: it renders
+// nothing a reviewer can read, and treating it as present makes a section that says nothing.
+export const CI_EVIDENCE_BOTH_REASON =
+  'caller supplied both CI evidence and an unavailability reason — treated as unavailable';
+
+export type CiEvidenceResolution =
+  | { kind: 'none' }
+  | { kind: 'text'; text: string }
+  | { kind: 'unavailable'; reason: string };
+
+export function resolveCiEvidence(evidence?: string, unavailable?: string): CiEvidenceResolution {
+  const text = evidence !== undefined && evidence.trim() !== '' ? evidence : undefined;
+  const reason = unavailable !== undefined && unavailable.trim() !== '' ? unavailable : undefined;
+  if (text !== undefined && reason !== undefined) {
+    return { kind: 'unavailable', reason: CI_EVIDENCE_BOTH_REASON };
+  }
+  if (text !== undefined) return { kind: 'text', text };
+  if (reason !== undefined) return { kind: 'unavailable', reason };
+  return { kind: 'none' };
+}
 
 export interface CiEvidenceInput {
   gh: GhRunner;
@@ -136,26 +181,48 @@ const oneLine = (v: unknown, max: number): string =>
 // dropped. A check's `details_url` is a pointer for the human reading the review, and the payload
 // is whatever `gh` returned — a `javascript:`/`data:` scheme is not a check page, and a query
 // string on a CI link routinely carries a signed token nobody needs in the packet.
+// The scheme match is CASE-INSENSITIVE: `HTTPS://…` is the same address, and a case-sensitive
+// prefix test rejected it — dropping a usable link — while `javascript:`/`data:` stayed rejected
+// either way, so the strictness bought nothing. And a URL whose AUTHORITY carries userinfo
+// (`https://user:token@host/p`) is rejected outright: the credential is the point of the reject,
+// and rendering the host without it would fabricate a different URL than the payload held.
+const HTTP_SCHEME = /^https?:\/\//i;
 const httpUrl = (v: unknown, max: number): string => {
   const bare = (typeof v === 'string' ? v : '').trim().split(/[?#]/)[0];
-  return bare.startsWith('http://') || bare.startsWith('https://') ? oneLine(bare, max) : '';
+  if (!HTTP_SCHEME.test(bare)) return '';
+  // The authority is everything up to the first `/` after the scheme; an `@` in it is userinfo.
+  if (bare.replace(HTTP_SCHEME, '').split('/')[0].includes('@')) return '';
+  return oneLine(bare, max);
+};
+
+// EVERY untrusted string this module renders goes through here — check names, app slugs, output
+// titles/summaries, annotation levels/paths/titles/messages/details, status states/contexts/
+// descriptions, and `gh`'s own error text (its stderr can echo the credential it just failed to
+// authenticate with).
+//
+// SCAN BEFORE TRUNCATION. `oneLine` used to slice first and let the whole-text scan at the end
+// catch what remained — but a slice through a token leaves a PREFIX that no pattern matches and
+// that is still the head of a live credential, and the final scan then sees a string it cannot
+// recognise and passes the section through. So the scan runs on the FULL collapsed value and a
+// hit replaces the field entirely; only a clean value is ever sliced. The whole-text scan stays
+// as the SECOND net, for the bytes no field owns (a URL, the scaffolding).
+const field = (v: unknown, max: number): string => {
+  const full = (
+    typeof v === 'string' ? v : typeof v === 'number' || typeof v === 'boolean' ? String(v) : ''
+  )
+    .replace(/\s+/g, ' ')
+    .trim();
+  const hit = scanTextForSecrets(full, CI_OUTPUT_PATTERNS);
+  return hit ? `[redacted: ${hit.label}]` : full.slice(0, max);
 };
 
 const label = (c: CheckRun): string =>
-  oneLine(c.conclusion ?? c.status ?? 'unknown', 40).toLowerCase() || 'unknown';
-const name = (c: CheckRun): string => oneLine(c.name, 200) || '(unnamed check)';
+  field(c.conclusion ?? c.status ?? 'unknown', 40).toLowerCase() || 'unknown';
+const name = (c: CheckRun): string => field(c.name, 200) || '(unnamed check)';
 const output = (c: CheckRun): Record<string, unknown> => asRecord(c.output);
 const annotationsCount = (c: CheckRun): number => {
   const n = output(c).annotations_count;
   return typeof n === 'number' && Number.isFinite(n) ? n : 0;
-};
-
-// `gh`'s own stderr can echo the credential it just failed to authenticate with. Error strings
-// leave this module (to the trail file, to stderr, to the packet's UNAVAILABLE note), so they
-// get the same inline-credential scan as the rendered evidence.
-const safe = (s: string): string => {
-  const hit = scanTextForSecrets(s);
-  return hit ? `[redacted: ${hit.label}]` : s;
 };
 
 // One candidate row, admitted to the text as a UNIT (a check row plus its summary line; one
@@ -184,11 +251,13 @@ interface AnnotationBlock {
 const cost = (lines: readonly string[]): number => lines.reduce((n, l) => n + l.length + 1, 0);
 
 // Room held back so the bookkeeping lines the selection itself causes still fit inside
-// `maxChars` — four section-level ones (check runs not shown, check runs the API page cap left
-// unfetched, annotated checks not shown, statuses not shown). A block's own `… N more
-// annotation(s) …` line is charged to the block.
+// `maxChars` — five section-level ones (check runs not shown, check runs the API page cap left
+// unfetched, annotated checks not shown, statuses not shown, statuses the API page cap left
+// unfetched). A block's own `… N more annotation(s) …` line is charged to the block. The reserve
+// is a POOL, not a per-line allowance: the two `… N … dropped (unexpected element shape)` traces
+// are short and fit inside it alongside the rest.
 const OMISSION_LINE_RESERVE = 80;
-const OMISSION_LINE_KINDS = 4;
+const OMISSION_LINE_KINDS = 5;
 
 const ANNOTATIONS_HEADING = '## Annotations (the checks\' own remarks on this head — level, then path:line)';
 
@@ -199,7 +268,7 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   let headSha = input.headSha;
   if (!headSha) {
     const head = ghJson<unknown>(gh, ['pr', 'view', String(input.pr), '-R', repoSlug, '--json', 'headRefOid']);
-    if (!head.ok) return { error: `head SHA unavailable: ${safe(oneLine(head.error, 200))}`, ok: false };
+    if (!head.ok) return { error: `head SHA unavailable: ${field(head.error, 200)}`, ok: false };
     const oid = asRecord(head.value).headRefOid;
     if (typeof oid !== 'string' || !oid) {
       return { error: 'head SHA unavailable: `gh pr view` returned no headRefOid', ok: false };
@@ -218,7 +287,7 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   const headResolved = !input.headSha;
 
   const runs = ghJson<unknown>(gh, ['api', `repos/${repoSlug}/commits/${headSha}/check-runs?per_page=100`]);
-  if (!runs.ok) return { error: `check runs unavailable: ${safe(oneLine(runs.error, 200))}`, ok: false };
+  if (!runs.ok) return { error: `check runs unavailable: ${field(runs.error, 200)}`, ok: false };
   const rawChecks = asRecord(runs.value).check_runs;
   // `check_runs` is an ARRAY or it is not the payload this module was told to read. A non-object
   // top level, a missing field, a `null` — each is a shape to REPORT, never "no check runs on
@@ -226,8 +295,13 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   // we did not understand is exactly the false green this section exists to prevent.
   const checkRunsShaped = Array.isArray(rawChecks);
   // A non-object ELEMENT (`null`, a string, a number) carries no evidence and every accessor
-  // below would dereference it — drop it here, where the array is first read.
-  const checks = asArray<CheckRun>(rawChecks)
+  // below would dereference it — drop it here, where the array is first read. The DROP is
+  // counted: an array that held elements this module could not read is not the same fact as an
+  // empty one, and silently equating them says "no checks ran" about a payload we did not
+  // understand — the false green this section exists to prevent, one level deeper than the
+  // top-level shape guard above.
+  const checkElements = asArray<CheckRun>(rawChecks);
+  const checks = checkElements
     .filter((c) => isRecord(c))
     .sort(
       // `localeCompare` with an explicit locale: the sort order of the evidence a reviewer
@@ -257,8 +331,8 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
 
   // ── Check runs ───────────────────────────────────────────────────────────────────────
   const rowFor = (c: CheckRun): Item => {
-    const app = oneLine(asRecord(c.app).slug, 60);
-    const title = oneLine(output(c).title, 120);
+    const app = field(asRecord(c.app).slug, 60);
+    const title = field(output(c).title, 120);
     const url = httpUrl(c.details_url, 300);
     const lines = [
       `- ${label(c)} · ${name(c)}${app ? ` (${app})` : ''}${title ? ` — ${title}` : ''}${url ? ` — ${url}` : ''}`,
@@ -266,17 +340,25 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
     // A GREEN job's summary is evidence too (incident 2026-08-10: the migration the database
     // refused was printed in a passing job's own output). Green rows are still admitted LAST
     // under `maxChars`, so this line only ever costs the budget when there was room left.
-    const summary = oneLine(output(c).summary, 500);
+    const summary = field(output(c).summary, 500);
     if (summary) lines.push(`  summary: ${summary}`);
     return { lines };
   };
   const failingRows = checks.filter((c) => conclusionRank(c) !== SUCCESS_RANK).map(rowFor);
   const successRows = checks.filter((c) => conclusionRank(c) === SUCCESS_RANK).map(rowFor);
-  const checkRunsNote = !checkRunsShaped
-    ? `(check runs unavailable: ${UNEXPECTED_SHAPE})`
-    : checks.length === 0
-      ? '(no check runs on this commit)'
-      : '';
+  // Every element dropped ⇒ the same note the top-level guard renders: the payload was there and
+  // this module could not read ANY of it, so "(no check runs on this commit)" would be a claim
+  // about the commit made out of bytes we failed to parse.
+  const checksDropped = checkElements.length - checks.length;
+  const checkRunsNote =
+    !checkRunsShaped || (checks.length === 0 && checksDropped > 0)
+      ? `(check runs unavailable: ${UNEXPECTED_SHAPE})`
+      : checks.length === 0
+        ? '(no check runs on this commit)'
+        : '';
+  // …and when SOME survived, the drop is a line of its own: the header's count is then true of
+  // what was rendered, and this says what the count is missing.
+  const checksDroppedLine = `… ${checksDropped} check run(s) dropped (unexpected element shape)`;
 
   // ── Annotations (non-green and green checks INTERLEAVED, non-green first) ───────────
   // The cap used to be a plain head-slice of the rank order, which handed every slot to the
@@ -313,7 +395,7 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
       `repos/${repoSlug}/check-runs/${checkId}/annotations?per_page=50`,
     ]);
     if (!res.ok || !Array.isArray(res.value)) {
-      const why = res.ok ? UNEXPECTED_SHAPE : safe(oneLine(res.error, 200));
+      const why = res.ok ? UNEXPECTED_SHAPE : field(res.error, 200);
       blocks.push({ heading, knownTotal: 0, note: `- annotations unavailable: ${why}`, units: [] });
       continue;
     }
@@ -324,10 +406,10 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
     const fetched = all.slice(0, Math.max(0, limits.maxAnnotationsPerCheck));
     const units = fetched.map((raw) => {
       const a = asRecord(raw);
-      const title = oneLine(a.title, 120);
-      const where = `[${oneLine(a.annotation_level, 40) || 'note'}] ${oneLine(a.path, 300)}:${oneLine(a.start_line, 20)}`;
-      const unit = [`- ${where}${title && title !== name(c) ? ` — ${title}` : ''} — ${oneLine(a.message, 600)}`];
-      const details = oneLine(a.raw_details, 300);
+      const title = field(a.title, 120);
+      const where = `[${field(a.annotation_level, 40) || 'note'}] ${field(a.path, 300)}:${field(a.start_line, 20)}`;
+      const unit = [`- ${where}${title && title !== name(c) ? ` — ${title}` : ''} — ${field(a.message, 600)}`];
+      const details = field(a.raw_details, 300);
       if (details) unit.push(`  details: ${details}`);
       return unit;
     });
@@ -342,24 +424,46 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   }
 
   // ── Commit statuses (legacy API — bots post here) ───────────────────────────────────
-  const st = ghJson<unknown>(gh, ['api', `repos/${repoSlug}/commits/${headSha}/status`]);
+  // `per_page=100`, and the combined status's own `total_count` read back under the SAME guards
+  // as the check runs': the legacy endpoint pages exactly like the modern one, so a commit with
+  // more statuses than a page returns a truncated array and nothing in it says so. A busy repo
+  // (one status per bot, per environment, per deploy) reaches that cap, and the section would
+  // otherwise render a partial list as if it were the whole of the commit's statuses.
+  const st = ghJson<unknown>(gh, ['api', `repos/${repoSlug}/commits/${headSha}/status?per_page=100`]);
   const rawStatuses = st.ok ? asRecord(st.value).statuses : undefined;
   // Same rule as `check_runs`: an array, or a shape to report. `(none)` is a claim that this
   // commit has no statuses — only a real empty array earns it.
   const statusesShaped = Array.isArray(rawStatuses);
-  const statusRows: Item[] = asArray<CommitStatus>(rawStatuses).map((raw) => {
-    const s = asRecord(raw);
-    const desc = oneLine(s.description, 200);
-    const url = httpUrl(s.target_url, 300);
-    return {
-      lines: [
-        `- ${oneLine(s.state, 40) || 'unknown'} · ${oneLine(s.context, 200) || '(unnamed status)'}${desc ? ` — ${desc}` : ''}${url ? ` (${url})` : ''}`,
-      ],
-    };
-  });
+  // …and the same ELEMENT guard: a `null`/string/number element carries no evidence, `asRecord`
+  // would render it as an empty `- unknown · (unnamed status)` row that reads like a real status,
+  // and it would inflate the denominator the page-cap arithmetic below is computed against.
+  const statusElements = asArray<CommitStatus>(rawStatuses);
+  const statusRows: Item[] = statusElements
+    .filter((s) => isRecord(s))
+    .map((raw) => {
+      const s = asRecord(raw);
+      const desc = field(s.description, 200);
+      const url = httpUrl(s.target_url, 300);
+      return {
+        lines: [
+          `- ${field(s.state, 40) || 'unknown'} · ${field(s.context, 200) || '(unnamed status)'}${desc ? ` — ${desc}` : ''}${url ? ` (${url})` : ''}`,
+        ],
+      };
+    });
+  const statusesDropped = statusElements.length - statusRows.length;
+  const rawStatusTotal = st.ok ? asRecord(st.value).total_count : undefined;
+  const totalStatuses =
+    typeof rawStatusTotal === 'number' &&
+    Number.isFinite(rawStatusTotal) &&
+    rawStatusTotal > statusRows.length
+      ? rawStatusTotal
+      : statusRows.length;
+  const statusesNotFetched = totalStatuses - statusRows.length;
+  const statusesNotFetchedLine = `… ${statusesNotFetched} status(es) not fetched (API page cap)`;
+  const statusesDroppedLine = `… ${statusesDropped} status(es) dropped (unexpected element shape)`;
   const statusNote = !st.ok
-    ? `(statuses unavailable: ${safe(oneLine(st.error, 200))})`
-    : !statusesShaped
+    ? `(statuses unavailable: ${field(st.error, 200)})`
+    : !statusesShaped || (statusRows.length === 0 && statusesDropped > 0)
       ? `(statuses unavailable: ${UNEXPECTED_SHAPE})`
       : statusRows.length === 0
         ? '(none)'
@@ -449,8 +553,13 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   const omittedChecks = failingRows.length + successRows.length - keptFailing.length - keptSuccess.length;
   const omittedStatuses = statusRows.length - keptStatuses.length;
   const shownAnnotations = keptBlocks.reduce((n, k) => n + k.shown, 0);
+  // Every way the rendered text is less than what the head actually holds — a page the API
+  // capped, an element this module could not read, a row the budget refused.
   const truncated =
     checksNotFetched > 0 ||
+    statusesNotFetched > 0 ||
+    checksDropped > 0 ||
+    statusesDropped > 0 ||
     notFetched > 0 ||
     blocksDropped > 0 ||
     omittedChecks > 0 ||
@@ -467,6 +576,7 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
     ...keptSuccess.flatMap((i) => i.lines),
     ...(omittedChecks > 0 ? [`… ${omittedChecks} more check run(s) not shown`] : []),
     ...(checksNotFetched > 0 ? [checksNotFetchedLine] : []),
+    ...(checks.length > 0 && checksDropped > 0 ? [checksDroppedLine] : []),
     '',
     ANNOTATIONS_HEADING,
     ...keptBlocks.flatMap(({ block, shown }) => [
@@ -483,9 +593,14 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
     ...(statusNote ? [statusNote] : []),
     ...keptStatuses.flatMap((i) => i.lines),
     ...(omittedStatuses > 0 ? [`… ${omittedStatuses} more status(es) not shown`] : []),
+    ...(statusesNotFetched > 0 ? [statusesNotFetchedLine] : []),
+    ...(statusRows.length > 0 && statusesDropped > 0 ? [statusesDroppedLine] : []),
   ].join('\n');
 
-  const secret = scanTextForSecrets(text);
+  // THE SECOND NET. Every untrusted FIELD was already scanned (and redacted) before truncation;
+  // this catches the bytes no field owns — a URL, the scaffolding, a shape a field-level slice
+  // reassembled across a join.
+  const secret = scanTextForSecrets(text, CI_OUTPUT_PATTERNS);
   if (secret) {
     return {
       error: `withheld: an inline credential pattern (${secret.label}) appeared in check output`,

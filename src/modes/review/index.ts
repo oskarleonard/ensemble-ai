@@ -21,7 +21,7 @@ import {
 } from '../../core/types';
 import { REVIEW_ADAPTERS } from '../../reviewers/registry';
 
-import { CI_EVIDENCE_TRAIL_FILE } from './ci-evidence';
+import { CI_EVIDENCE_BOTH_REASON, CI_EVIDENCE_TRAIL_FILE, resolveCiEvidence } from './ci-evidence';
 import {
   acquireDiff,
   type AcquiredDiff,
@@ -300,21 +300,22 @@ export async function runReviewMode(
     );
   }
 
-  // A caller that supplied BOTH has a bug, and the safe reading of a bug is the LOUD one: an
-  // unavailable section says "the head's check output is missing", while half-gathered text would
-  // be read as the whole of it. Never both — and the drop is announced, not silent.
-  const bothCiEvidence = opts.ciEvidence !== undefined && opts.ciEvidenceUnavailable !== undefined;
+  // ONE both-fields rule, owned by ci-evidence.ts and applied at every seam (this engine, the
+  // packet, the worktree producer). The drop is announced, not silent.
+  const ci = resolveCiEvidence(opts.ciEvidence, opts.ciEvidenceUnavailable);
+  const bothCiEvidence = ci.kind === 'unavailable' && ci.reason === CI_EVIDENCE_BOTH_REASON;
   if (bothCiEvidence) {
     log('CI evidence: caller supplied both text and an unavailable reason — treating as unavailable');
   }
-  const ciEvidence = bothCiEvidence ? undefined : opts.ciEvidence;
+  const ciEvidence = ci.kind === 'text' ? ci.text : undefined;
+  const ciEvidenceUnavailable = ci.kind === 'unavailable' ? ci.reason : undefined;
 
   const packet = assembleCodePacket({
     agentsBudget: conventionManifest?.capBytes,
     agentsMd,
     authorSummary: opts.authorSummary,
     ciEvidence,
-    ciEvidenceUnavailable: opts.ciEvidenceUnavailable,
+    ciEvidenceUnavailable,
     diff: acquired.diff,
     directive: opts.directive,
     objective:

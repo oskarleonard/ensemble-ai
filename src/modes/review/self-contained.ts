@@ -26,6 +26,7 @@ import type { RunReviewOpts } from '../../reviewers/codex';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
+import { resolveCiEvidence } from './ci-evidence';
 import { claudeWorktreePromptSuffix, runClaudeReviewVoice } from './claude';
 import { renderCodeReviewSeatPrompt } from './code-review-seat';
 import {
@@ -260,7 +261,8 @@ export interface ClaudeLayerOptions {
   // reaches the PACKET seats through the packet prompt; the WORKTREE producer renders its own
   // prompt instead, so it needs the text handed to it directly or it alone reviews blind to the
   // head's own check output. Omitted ⇒ no section (nothing else in the layer reads it).
-  // MUTUALLY EXCLUSIVE with `ciEvidenceUnavailable` — evidence, or the reason there is none.
+  // MUTUALLY EXCLUSIVE with `ciEvidenceUnavailable` — evidence, or the reason there is none; both
+  // supplied ⇒ UNAVAILABLE, by the shared `resolveCiEvidence` rule (./ci-evidence).
   ciEvidence?: string;
   // The reason a fetch was ATTEMPTED and FAILED, for the same producer: silence would read to it
   // as a PR with no checks, so the failure is rendered as its own loud note instead.
@@ -408,14 +410,18 @@ export async function runClaudeReviewLayer(
   // The `history/` clause is rendered iff the packet carries DATA — a prompt must never name
   // evidence the seat cannot open (a shallow clone yields a README and nothing else).
   const hasHistory = historyPacketHasData(opts.historyPacket);
+  const ciForProducer = resolveCiEvidence(opts.ciEvidence, opts.ciEvidenceUnavailable);
   const producerPrompt = !opts.worktree
     ? opts.reviewPrompt
     : isCodeProfile && opts.baseSha && opts.pinnedDiff
       ? renderCodeReviewSeatPrompt({
           baseSha: opts.baseSha,
-          ...(opts.ciEvidence ? { ciEvidence: opts.ciEvidence } : {}),
-          ...(opts.ciEvidenceUnavailable
-            ? { ciEvidenceUnavailable: opts.ciEvidenceUnavailable }
+          // ONE both-fields rule (./ci-evidence), applied HERE too: the layer must hand the
+          // producer the same account of the head the packet seats were given, so the arbitration
+          // cannot differ between the two hops.
+          ...(ciForProducer.kind === 'text' ? { ciEvidence: ciForProducer.text } : {}),
+          ...(ciForProducer.kind === 'unavailable'
+            ? { ciEvidenceUnavailable: ciForProducer.reason }
             : {}),
           diff: opts.pinnedDiff,
           headSha: opts.expectedHeadSha,
