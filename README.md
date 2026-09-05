@@ -306,7 +306,10 @@ Two plumbing commands rehydrate an existing run's **trail** instead of re-runnin
   core seat died (incident 2026-09-02b: a vendor CLI's self-update broke its sandbox twice in a day)
   while every other seat and the gate completed. Re-runs JUST that seat against the run's own
   `prompt.<seat>.md` — byte-identical to what every seat saw, with the worktree preamble re-issued for
-  the freshly re-materialized head — then regates the union. A seat that completed is refused
+  the freshly re-materialized head — then regates the union. A preamble written by **another engine
+  version** (the suffix wording changed after the run was persisted) is **re-rendered, not refused**:
+  the pinned packet before its header is what stays byte-identical, and the `reseats[]` entry says so
+  with `preambleRerendered: true`. A seat that completed is refused
   (re-running a healthy seat is a new review); `claude` is not supported yet. Without `--repo` (or when
   the worktree cannot be made) the seat **and the regate of the whole run** fall to packet evidence —
   reference-not-found + holistic verification OFF. **A packet-mode retry is PERMANENT for that seat** —

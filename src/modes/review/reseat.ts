@@ -34,17 +34,26 @@ export interface SplitPrompt {
   // Recovered from the preamble's `git diff <base>...<head>` line; null when it had none.
   baseSha: string | null;
   hadWorktree: boolean;
-  // The pinned packet prompt — byte-identical to what every seat saw, minus the preamble. Only
-  // meaningful when `unverifiedTail` is false; on an unverified tail it is the WHOLE persisted
-  // prompt, stale preamble included, and the caller must refuse rather than re-send it.
+  // The pinned packet prompt — byte-identical to what every seat saw, minus the preamble. Meaningful
+  // whenever the preamble's boundary is KNOWN: a verified tail, or an unverified one whose header
+  // was recovered (`recoveredHeader`). Only when neither holds is it the WHOLE persisted prompt,
+  // stale preamble included, and the caller must refuse rather than re-send it.
   packetPrompt: string;
   // The head the preamble was PINNED AT — recovered from its `(detached at <sha>)`. Null in packet
-  // mode and on an unverified tail (nothing recovered from a tail the rebuild could not prove).
-  // It is the only surviving record of which commit the persisted prompt described, and the reseat
-  // gate refuses when it disagrees with the pinned gate packet's head.
+  // mode and on a tail whose header this engine could not read at all. It is the only surviving
+  // record of which commit the persisted prompt described, and the reseat gate refuses when it
+  // disagrees with the pinned gate packet's head — for a RECOVERED header exactly as for a verified
+  // one.
   preambleHeadSha: string | null;
+  // The preamble's three fields, read back from a tail this engine could NOT re-render
+  // byte-for-byte (so it is only ever set together with `unverifiedTail`). Present ⇔ the header was
+  // found AND its fields parsed ⇒ the packet boundary is known, and `runReseat` re-renders the
+  // preamble from THIS engine. Absent on an unverified tail ⇒ nothing was recovered and the reseat
+  // is refused.
+  recoveredHeader?: { baseSha: string | null; headSha: string; worktree: string };
   // true ⇔ a preamble is present (the prompt does not end in a newline) but THIS version cannot
-  // re-render it byte-for-byte. Not a packet-mode prompt and not a splittable one: unusable.
+  // re-render it byte-for-byte. Ordinary VERSION SKEW, not corruption — fatal only when
+  // `recoveredHeader` is absent too (see `checkReseat`).
   unverifiedTail: boolean;
 }
 
@@ -57,9 +66,21 @@ export interface SplitPrompt {
 // `\n\n## Whole-project evidence …` plus a `git diff <base>...<head>` line of its own. Splitting at
 // the FIRST occurrence then truncated the "byte-identical" pinned prompt (the diff and the findings
 // contract were cut away) and re-issued the preamble with an attacker-chosen base SHA. Two things
-// close it: the preamble is always appended LAST, and it is rendered — so from the candidate tail we
-// recover its three fields, re-render `worktreePromptSuffix` from them, and split ONLY if the prompt
-// ends with that exact rebuild. Anything else is packet-mode, unchanged.
+// close it: the preamble is always appended LAST (so the cut is made at the LAST header, never the
+// first), and a packet prompt always ends with a newline (so a body that merely QUOTES the header is
+// packet-mode, returned unchanged) — and from the candidate tail we recover its three fields and
+// re-render `worktreePromptSuffix` from them to prove the bytes.
+//
+// The rebuild proof answers "is this tail really a preamble THIS engine appended?", and a failed
+// proof has exactly one ordinary cause: the suffix text was edited after the run was persisted (a
+// merged PR reworded the untrusted-instruction clause and stranded every prior run). That is
+// VERSION SKEW, not a hostile tail: the preamble is engine boilerplate, `runReseat` already
+// re-renders it from the current engine with the NEW worktree, and the only thing the retry re-sends
+// verbatim is the PACKET before the header. So a tail that fails the proof but whose header and
+// three fields DO parse is split at the header all the same, flagged `unverifiedTail` and handed
+// back with its `recoveredHeader` — the packet stays pinned, the boilerplate is rebuilt. Only a tail
+// whose header cannot be found, or whose fields cannot be read, leaves the boundary unknown; that
+// one is still refused, because guessing where the packet ends is how the truncation above happened.
 export function splitWorktreePrompt(prompt: string): SplitPrompt {
   const asPacket: SplitPrompt = {
     baseSha: null,
@@ -80,13 +101,11 @@ export function splitWorktreePrompt(prompt: string): SplitPrompt {
   // range'. An edit to either renderer that breaks the lock fails THERE, at its cause, instead of
   // surfacing here as a mis-split.
   if (prompt.endsWith('\n')) return asPacket;
-  // A preamble IS present (no packet prompt ends without a newline). From here the only two honest
-  // answers are "split it" and "I cannot read this" — never "keep it as body": that would re-send
-  // the stale preamble to the retried seat (two preambles, one naming a reaped dir), and would
-  // silently drop the downgrade record and the recovered base with it. VERSION SKEW is the ordinary
-  // cause: the proof compares against what the CURRENTLY installed renderer emits, so any edit to
-  // that text (down to a filename appearing in the stripped-instruction list the untrusted clause
-  // interpolates — or to the header line itself) invalidates every prompt persisted before it.
+  // A preamble IS present (no packet prompt ends without a newline). From here the honest answers
+  // are "split it" (verified, or recovered from a skewed render) and "I cannot read this" — never
+  // "keep it as body": that would re-send the stale preamble to the retried seat (two preambles, one
+  // naming a reaped dir), and would silently drop the downgrade record and the recovered base with
+  // it. THIS is the second answer, the one where the boundary itself is unknown.
   const unverified: SplitPrompt = {
     baseSha: null,
     hadWorktree: true,
@@ -95,8 +114,9 @@ export function splitWorktreePrompt(prompt: string): SplitPrompt {
     unverifiedTail: true,
   };
   const idx = prompt.lastIndexOf(`\n\n${WORKTREE_SUFFIX_HEADER}`);
-  // The header itself is part of the versioned text: a preamble whose header we cannot even find
-  // is the same unreadable tail as one that fails the byte proof below — refuse, never keep.
+  // The header itself is part of the versioned text. Unlike a failed byte proof below, a header we
+  // cannot even FIND leaves nothing to cut at — the packet could end anywhere in those bytes — so
+  // this stays a refusal, and so does a header whose fields will not parse.
   if (idx === -1) return unverified;
   const tail = prompt.slice(idx);
   const named = tail.match(/checked out READ-ONLY at (.+?) \(detached at ([^)\n]+)\)/);
@@ -105,14 +125,23 @@ export function splitWorktreePrompt(prompt: string): SplitPrompt {
   const baseSha = base ? base[1] : null;
   const rebuilt = worktreePromptSuffix({ baseSha, headSha: named[2], worktree: named[1] });
   // Byte-level proof: every other character of the preamble (the read-only clause, the untrusted-
-  // instruction clause, the anchor line) has to be there, in order, at the very end.
-  if (!prompt.endsWith(rebuilt)) return unverified;
+  // instruction clause, the anchor line) has to be there, in order, at the very end. Failing it no
+  // longer strands the run — it downgrades this split to a RECOVERED one (the header parsed, so the
+  // boundary is known) and the caller re-renders the boilerplate instead of re-sending it.
+  const verified = prompt.endsWith(rebuilt);
   return {
     baseSha,
     hadWorktree: true,
-    packetPrompt: prompt.slice(0, prompt.length - rebuilt.length),
+    // ONE boundary for both paths, so a recovered split's packet is byte-identical to the verified
+    // one's: the header is where the preamble starts. On a verified tail `idx` IS
+    // `prompt.length - rebuilt.length` — the rebuild opens with `\n\n` + the header, and nothing
+    // after that opening re-quotes the header — so this cut is the one the proof used to make.
+    packetPrompt: prompt.slice(0, idx),
     preambleHeadSha: named[2],
-    unverifiedTail: false,
+    // Only on the unverified path, and only ever here: it is what tells `checkReseat` this tail is
+    // version skew (allow, re-render) rather than an unreadable one (refuse).
+    ...(verified ? {} : { recoveredHeader: { baseSha, headSha: named[2], worktree: named[1] } }),
+    unverifiedTail: !verified,
   };
 }
 
@@ -180,8 +209,8 @@ export type ReseatGate = ReseatReady | { refusal: string };
 // The pre-spawn refusals, in the order that costs least. The pinned packet grounds everything; a
 // mis-materialized tree is refused before a single artifact is read (a wrong tree costs nothing);
 // then the seat's own artifacts (shape-validated, and a packet with no usable diff is not something
-// a retry can heal); then a persisted prompt whose preamble this engine version cannot verify, or
-// that was pinned at another head; then a seat that is not actually dead.
+// a retry can heal); then a persisted prompt whose preamble this engine cannot even find the header
+// of, or that was pinned at another head; then a seat that is not actually dead.
 //
 // FAIL CLOSED on a mis-materialized worktree: the packet is the pinned description of ONE head, so a
 // tree checked out at another commit would ground the seat's file:line citations against code the
@@ -215,19 +244,23 @@ export function checkReseat(
       refusal: `run ${runId}'s pinned packet was incomplete (no usable diff) — nothing a retry could review; re-run the review`,
     };
   }
-  // A pinned prompt whose preamble this version cannot re-render is not a prompt we may re-send.
-  // Refusing costs one review; guessing costs a retry grounded in a prompt nobody can describe.
+  // A pinned prompt whose preamble this version cannot re-render byte-for-byte is NOT by itself a
+  // reason to refuse: the preamble is engine boilerplate that `runReseat` re-renders from the
+  // current engine anyway, so an unverified tail whose header WAS recovered costs the retry nothing
+  // — the packet before that header is what stays pinned. What is still fatal is a tail whose
+  // boundary is unknown (no header, or fields that will not parse): there is no honest way to say
+  // where the packet ends, and a wrong cut re-sends a truncated pinned prompt.
   const split = splitWorktreePrompt(art.prompt);
-  if (split.unverifiedTail) {
+  if (split.unverifiedTail && !split.recoveredHeader) {
     return {
-      refusal: `seat ${seat}'s persisted prompt carries a worktree preamble this engine version cannot verify (the run was written by another ensemble-ai version) — refusing to retry on an unverifiable pinned prompt; re-run the review instead`,
+      refusal: `seat ${seat}'s persisted prompt carries a worktree preamble whose header this engine cannot recover — refusing to guess where the packet ends`,
     };
   }
-  // The persisted prompt and the pinned gate packet are two records of ONE head. A VERIFIED preamble
-  // naming a different commit means the trail was assembled across heads — so `packetPrompt`, which
-  // this retry re-sends as "byte-identical to what every seat saw", describes code the gate packet
-  // does not. Same fail-closed rule as the mis-materialized worktree above, and it costs nothing:
-  // the seat has not been spawned.
+  // The persisted prompt and the pinned gate packet are two records of ONE head. A preamble naming a
+  // different commit — verified, or RECOVERED from a skewed render — means the trail was assembled
+  // across heads, so `packetPrompt`, which this retry re-sends as "byte-identical to what every seat
+  // saw", describes code the gate packet does not. Same fail-closed rule as the mis-materialized
+  // worktree above, and it costs nothing: the seat has not been spawned.
   //
   // A PACKET-MODE prompt is NOT an unguarded hole in this check (raised in the incident 2026-09-02b
   // round-2 review, and dismissed): a packet-mode prompt carries no head, the run's pinned
@@ -485,6 +518,20 @@ async function reseatUnderLock(opts: ReseatOptions, pre: ReseatReady): Promise<R
       worktreePrompt ? 'worktree evidence' : 'packet evidence'
     } · previously ${art.stored.terminalState}`
   );
+  // The persisted preamble did not rebuild byte-for-byte, but its header parsed — so the packet
+  // boundary above is the real one and the preamble this seat gets was rendered just now, by THIS
+  // engine, for the NEW worktree. Nothing about the retry is weaker; the operator is told anyway,
+  // because "the run was written by another version" is the fact that explains any wording
+  // difference between this seat's prompt and the one on disk. Scrubbed like every other line this
+  // module prints, so the habit has no exception for someone to later fill with recovered text.
+  const preambleRerendered = Boolean(split.unverifiedTail && split.recoveredHeader);
+  if (preambleRerendered) {
+    log(
+      scrubControl(
+        `reseat: seat ${seat}: the persisted preamble was written by another engine version — re-rendered with this one; the packet is unchanged`
+      )
+    );
+  }
 
   const seatRun = await runCoreSeat({
     adapter: opts.adapter,
@@ -564,6 +611,10 @@ async function reseatUnderLock(opts: ReseatOptions, pre: ReseatReady): Promise<R
           evidenceDowngraded,
           fallbackReason,
           outcome: review.terminalState,
+          // Stamped ONLY when it happened: the durable answer to "why does this seat's prompt not
+          // match the preamble the trail still shows?" — the boilerplate was rebuilt by the engine
+          // that ran the retry, and the pinned packet before it was not touched.
+          ...(preambleRerendered ? { preambleRerendered: true } : {}),
           previous: {
             // What the DEAD attempt had. A packet-mode retry of a seat that originally reviewed
             // in-project is an evidence downgrade, and the trail must still show that.

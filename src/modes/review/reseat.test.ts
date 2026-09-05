@@ -62,11 +62,22 @@ diff --git a/src/x.ts b/src/x.ts
 // A LEGITIMATE preamble from another ensemble-ai version: the shape is recoverable, but one word of
 // the rendered text differs, so the rebuild proof cannot verify it. (Any edit to the suffix — even
 // STRIPPED_INSTRUCTION_PATHS gaining a filename — does this to every prompt persisted before it.)
-const SKEWED_PREAMBLE = worktreePromptSuffix({
+const SKEWED_WORKTREE = '/tmp/older-version-worktree';
+const skewedPreamble = (headSha: string): string =>
+  worktreePromptSuffix({ baseSha: BASE, headSha, worktree: SKEWED_WORKTREE }).replace(
+    'Anchor every finding',
+    'Anchor each finding'
+  );
+const SKEWED_PREAMBLE = skewedPreamble(HEAD);
+
+// The OTHER kind of unreadable tail, and the one still refused: the header is exactly this engine's,
+// but the line the three fields are recovered FROM was reworded too. Nothing says where the packet
+// ends, so there is no honest cut to make.
+const GARBLED_FIELDS = worktreePromptSuffix({
   baseSha: BASE,
   headSha: HEAD,
-  worktree: '/tmp/older-version-worktree',
-}).replace('Anchor every finding', 'Anchor each finding');
+  worktree: SKEWED_WORKTREE,
+}).replace('checked out READ-ONLY at', 'checked out read-only at');
 
 describe('splitWorktreePrompt — recover the pinned packet prompt from a persisted seat prompt', () => {
   it('returns a packet-mode prompt unchanged', () => {
@@ -103,15 +114,42 @@ describe('splitWorktreePrompt — recover the pinned packet prompt from a persis
 
   // A preamble THIS version cannot re-render is not something to guess around: keeping it inside
   // `packetPrompt` would hand a worktree retry TWO preambles, and would re-silence the downgrade
-  // record and the recovered base. It is flagged, and the reseat is refused.
-  it('a version-skewed preamble is flagged unverified, never silently kept as body', () => {
-    expect(splitWorktreePrompt(PINNED + SKEWED_PREAMBLE)).toEqual({
+  // record and the recovered base. But refusing outright was just as wrong — the suffix is engine
+  // boilerplate the retry re-renders anyway, so a merged reword of it stranded every run persisted
+  // before it. The tail is flagged AND its fields are handed back; the cut is the header, exactly
+  // where the verified path cuts, so the pinned packet is byte-identical either way.
+  it('a version-skewed preamble is split at the header and its fields recovered, never kept as body', () => {
+    const verified = splitWorktreePrompt(
+      PINNED + worktreePromptSuffix({ baseSha: BASE, headSha: HEAD, worktree: SKEWED_WORKTREE })
+    );
+    const skewed = splitWorktreePrompt(PINNED + SKEWED_PREAMBLE);
+    expect(skewed).toEqual({
+      baseSha: BASE,
+      hadWorktree: true,
+      packetPrompt: PINNED, // the pinned packet, with the other version's tail cut away
+      preambleHeadSha: HEAD,
+      recoveredHeader: { baseSha: BASE, headSha: HEAD, worktree: SKEWED_WORKTREE },
+      unverifiedTail: true, // …still flagged: these bytes were never proven
+    });
+    // The load-bearing equality: recovery must not move the boundary the proof would have used.
+    expect(skewed.packetPrompt).toBe(verified.packetPrompt);
+    // …and the VERIFIED path is untouched by any of it.
+    expect(verified.unverifiedTail).toBe(false);
+    expect(verified.recoveredHeader).toBeUndefined();
+  });
+
+  // The boundary is the whole question. A header this engine recognises but CANNOT read the fields
+  // under is not version skew it can work around — there is nothing to cut at, and a wrong cut
+  // re-sends a truncated pinned prompt (the incident 2026-09-02b failure, from the other direction).
+  it('a header whose fields will not parse recovers nothing and stays unverified', () => {
+    expect(splitWorktreePrompt(PINNED + GARBLED_FIELDS)).toEqual({
       baseSha: null,
       hadWorktree: true,
-      packetPrompt: PINNED + SKEWED_PREAMBLE,
-      preambleHeadSha: null, // nothing recovered from a tail the rebuild could not verify
+      packetPrompt: PINNED + GARBLED_FIELDS,
+      preambleHeadSha: null,
       unverifiedTail: true,
     });
+    expect(splitWorktreePrompt(PINNED + GARBLED_FIELDS).recoveredHeader).toBeUndefined();
   });
 
   it('splits at the LAST header, and only when the tail rebuilds byte-identically', () => {
@@ -220,6 +258,11 @@ const adapterDenied: ReviewAdapter = async () => ({ egressDenials: [DENIAL], ok:
 const OLD_WORKTREE_PROMPT =
   PINNED + worktreePromptSuffix({ baseSha: BASE, headSha: RUN_HEAD, worktree: '/tmp/reaped-long-ago' });
 
+// The same prompt, written by an ensemble-ai whose suffix wording differs — pinned at the head THIS
+// run's gate packet names, so what the reseat gate is exercised on is the preamble recovery itself
+// and not the across-heads check.
+const SKEWED_WORKTREE_PROMPT = PINNED + skewedPreamble(RUN_HEAD);
+
 // A minimal, fully typed RegateResult — what the injected regate seam returns instead of a gate spawn.
 const REGATE_OK: RegateResult = {
   headSha: RUN_HEAD,
@@ -298,11 +341,28 @@ describe('reseatRefusal — the pre-spawn refusals, in one set of words', () => 
     expect(reseatRefusal(base, runId, 'grok')).toMatch(/prompt\.grok\.md/);
   });
 
-  // The CLI path for the version-skewed preamble: the same string, before anything is billed.
-  it('names a preamble this engine version cannot verify', () => {
+  // A preamble from ANOTHER engine version is no longer a refusal: the packet before the header is
+  // what the retry re-sends, and the boilerplate after it is re-rendered by the engine running it.
+  it('allows a preamble this engine version cannot re-render, once its header is recovered', () => {
+    const { base, runId } = seedRun(SKEWED_WORKTREE_PROMPT);
+    expect(reseatRefusal(base, runId, 'grok')).toBeNull();
+  });
+
+  // …and the across-heads check applies to a RECOVERED header exactly as to a verified one: this
+  // one is pinned at HEAD while the run's gate packet is at RUN_HEAD.
+  it('still refuses a RECOVERED preamble pinned at a different head', () => {
     const { base, runId } = seedRun(PINNED + SKEWED_PREAMBLE);
     expect(reseatRefusal(base, runId, 'grok')).toBe(
-      "seat grok's persisted prompt carries a worktree preamble this engine version cannot verify (the run was written by another ensemble-ai version) — refusing to retry on an unverifiable pinned prompt; re-run the review instead"
+      `seat grok's persisted prompt was pinned at ${HEAD.slice(0, 12)} but the run's gate packet is at ${RUN_HEAD.slice(0, 12)} — refusing to retry across heads`
+    );
+  });
+
+  // The CLI path for the tail that is still fatal — the header is this engine's, but the fields
+  // under it cannot be read, so nothing says where the packet ends. Before anything is billed.
+  it('names a preamble whose header this engine cannot recover', () => {
+    const { base, runId } = seedRun(PINNED + GARBLED_FIELDS);
+    expect(reseatRefusal(base, runId, 'grok')).toBe(
+      "seat grok's persisted prompt carries a worktree preamble whose header this engine cannot recover — refusing to guess where the packet ends"
     );
   });
 });
@@ -379,9 +439,11 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     const { base, runId } = seedRun(OLD_WORKTREE_PROMPT);
     const seen: Array<{ prompt: string; worktree?: string }> = [];
     const adapter: ReviewAdapter = async (prompt, _cfg, opts) => { seen.push({ prompt, worktree: opts?.worktree }); return { ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false }; };
+    const logs: string[] = [];
     const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-reseat-wt-'));
     const res = await runReseat({
-      adapter, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, qualification: qualifyGrokSeat('ensemble-review'),
+      adapter, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, log: (m) => logs.push(m),
+      qualification: qualifyGrokSeat('ensemble-review'),
       reviewer: GROK, runId, seat: 'grok', worktree: { baseSha: null, dir: wt, headSha: RUN_HEAD },
     });
     expect(res.ok).toBe(true);
@@ -401,6 +463,11 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     };
     expect(manifest.realizedEvidence.grok).toBe('worktree');
     expect(manifest.sandboxProfiles.grok).toEqual(qualifyGrokSeat('ensemble-review').profile);
+    // A VERIFIED tail rebuilt byte-for-byte, so nothing was re-rendered around the operator: no
+    // stamp on the trail entry, and no line about another engine version.
+    const synth = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'claude-synthesis.json'), 'utf8')) as { reseats: Array<Record<string, unknown>> };
+    expect('preambleRerendered' in synth.reseats[0]).toBe(false);
+    expect(logs.some((l) => l.includes('written by another engine version'))).toBe(false);
   });
 
   it('carries the seat egress denials out AND appends them to the trail, never replacing prior ones', async () => {
@@ -501,14 +568,48 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     expect(spawns).toBe(0); // refused BEFORE the seat was paid for
   });
 
-  it('refuses a persisted prompt whose preamble this version cannot re-render', async () => {
-    const { base, runId } = seedRun(PINNED + SKEWED_PREAMBLE);
+  it('refuses a persisted prompt whose preamble header this version cannot recover', async () => {
+    const { base, runId } = seedRun(PINNED + GARBLED_FIELDS);
     let spawns = 0;
     const adapter: ReviewAdapter = async () => { spawns += 1; return { ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false }; };
     await expect(
       runReseat({ adapter, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId, seat: 'grok' })
-    ).rejects.toThrow(/cannot verify .* refusing to retry on an unverifiable pinned prompt/);
+    ).rejects.toThrow(/whose header this engine cannot recover — refusing to guess where the packet ends/);
     expect(spawns).toBe(0); // refused BEFORE the seat was paid for — and the stale tail never re-sent
+  });
+
+  // The defect this closes (observed live): a merged PR reworded the suffix and EVERY run persisted
+  // before it became un-reseatable. Byte-identity of the tail was never the contract — the retry
+  // already re-renders the preamble with the new worktree — so the packet is what stays pinned, and
+  // the version skew is recorded rather than fatal.
+  it('re-renders a preamble written by another engine version: pinned packet + fresh suffix, stamped and said aloud', async () => {
+    const { base, runId } = seedRun(SKEWED_WORKTREE_PROMPT);
+    const seen: Array<{ prompt: string; worktree?: string }> = [];
+    const adapter: ReviewAdapter = async (prompt, _cfg, o) => { seen.push({ prompt, worktree: o?.worktree }); return { ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false }; };
+    const logs: string[] = [];
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-reseat-wt-'));
+    const res = await runReseat({
+      adapter, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, log: (m) => logs.push(m),
+      qualification: qualifyGrokSeat('ensemble-review'), reviewer: GROK, runId, seat: 'grok',
+      worktree: { baseSha: null, dir: wt, headSha: RUN_HEAD },
+    });
+    expect(res.ok).toBe(true);
+    expect(res.realized).toBe('worktree');
+    expect(res.evidenceDowngraded).toBe(false); // worktree → worktree, exactly as a verified tail
+    // The prompt the seat actually got: the PINNED packet, plus a suffix rendered by THIS engine for
+    // the NEW dir — with the recovered base range carried through. Byte-for-byte, not "contains".
+    expect(seen).toHaveLength(1);
+    expect(seen[0].prompt).toBe(PINNED + worktreePromptSuffix({ baseSha: BASE, headSha: RUN_HEAD, worktree: wt }));
+    expect(seen[0].prompt).not.toContain('Anchor each finding'); // the other version's wording
+    expect(seen[0].prompt).not.toContain(SKEWED_WORKTREE); // nor its reaped dir
+    // Said aloud exactly once…
+    expect(logs.filter((l) => l.includes('written by another engine version'))).toHaveLength(1);
+    // …and stamped durably, beside every other field the entry always carries.
+    const synth = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'claude-synthesis.json'), 'utf8')) as {
+      reseats: Array<{ baseSha: string | null; preambleRerendered?: boolean; previous: { hadWorktree: boolean }; realized: string }>;
+    };
+    expect(synth.reseats[0].preambleRerendered).toBe(true);
+    expect(synth.reseats[0]).toMatchObject({ baseSha: BASE, previous: { hadWorktree: true }, realized: 'worktree' });
   });
 
   it('fails CLOSED when the run has no gate packet', async () => {
