@@ -267,6 +267,25 @@ Because a wrong *"use the existing util X"* is the most credibility-burning comm
 - **A clean holistic pass is not an architecture certification.** The search space is the whole tree, so run-to-run variance is expected: the lens finds valuable things when it looks. Silence means it did not find one this time.
 **Acceptance fixture** (`fixtures/holistic/`): a small planted tree with **several** reinventions the lens must catch and **several** near-miss lookalikes it must not flag — a util that resembles the canonical one but rounds half-to-even, preserves case, or paces a queue instead of retrying. `scoreHolisticFixture()` grades a live run against it. The vitest suite runs the *gating* mechanics deterministically against that tree with a stubbed seat (both-sites quoting, the citation-required uncap, agree-only posting, the symlink fence) — it does **not** claim to prove the model's judgment, which no stub can. What the host guarantees is that a citation is real; that a *comparison* is sound is the lens's job, and the negative half of the fixture is how you measure it.
 
+### Healing a run — `regate` and `reseat`
+
+Two plumbing commands rehydrate an existing run's **trail** instead of re-running the review:
+
+- **`ensemble-ai regate --out <dir> --run-id <id> [<pr-url> --repo <path>]`** — the synthesis gate died
+  (timeout, quota) and fail-closed every verdict to `unverified` while the reviewer work sat complete
+  on disk. Re-spawns ONE gate seat over the persisted reviews + pinned packet and rewrites
+  `gate-verdicts.json` + `claude-synthesis.json` in place. No reviewer re-runs.
+- **`ensemble-ai reseat --out <dir> --run-id <id> --seat <codex|grok> [<pr-url> --repo <path>]`** — one
+  core seat died (incident 2026-09-02b: a vendor CLI's self-update broke its sandbox twice in a day)
+  while every other seat and the gate completed. Re-runs JUST that seat against the run's own
+  `prompt.<seat>.md` — byte-identical to what every seat saw, with the worktree preamble re-issued for
+  the freshly re-materialized head — then regates the union. A seat that completed is refused
+  (re-running a healthy seat is a new review); `claude` is not supported yet. The attempt is stamped
+  into `claude-synthesis.json` (`reseats[]`) and the manifest's realized-evidence map is kept true.
+
+Neither re-runs the execution settler, the shadow gate, or the receipt. Exit `0` healed · `1` failed
+again · `3` usage/missing trail.
+
 ### Configuring the seats — `reviewers.json` and `voices.json`
 
 Every seat is **config, not a hardcode** — two JSON files under `~/.ensemble-ai/` (each env-overridable: `ENSEMBLE_REVIEWERS_FILE` / `ENSEMBLE_VOICES_FILE`). Run `ensemble-ai config` (alias of `ensemble-ai reviewers`) to print the **resolved** seats — id · vendor · model · effort · sandbox, plus which file each came from — so what you see is exactly what the modes run. Neither file needs to exist; a missing or junk entry falls back to the baked default (a bad config can never silently disable a seat).

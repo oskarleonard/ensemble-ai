@@ -16,13 +16,15 @@ import {
 } from './core/conventions';
 import { isEntrypoint } from './core/entrypoint';
 import { evidenceRef, SEVERITY_LABEL, SEVERITY_ORDER } from './core/findings';
-import { listReviewers, resolveReviewer, REVIEWERS_FILE } from './core/reviewers';
+import { listReviewers, loadReviewers, resolveReviewer, REVIEWERS_FILE } from './core/reviewers';
 import { scrubControl as clean } from './core/sanitize';
 import {
   CORE_REVIEWER_IDS,
+  isCoreReviewerId,
   isReviewerId,
   parseReviewerIds,
   REVIEWER_IDS,
+  type ReviewerConfig,
   type ReviewerId,
   type Severity,
   type StoredReview,
@@ -67,9 +69,11 @@ import {
   type ShadowGateSeat,
 } from './modes/review/gate';
 import { runCodexReview } from './reviewers/codex';
+import { REVIEW_ADAPTERS } from './reviewers/registry';
 import { readGatePacketHeadSha } from './modes/review/gate-hunks';
 import { type GateSeat, loadClaudeReviewerSeat, loadGateSeat } from './modes/review/gate-seat';
 import { readConventionPathsFromTrail, runRegate } from './modes/review/regate';
+import { readSeatArtifacts, runReseat } from './modes/review/reseat';
 import { loadHolisticSeat } from './modes/review/holistic';
 import {
   acquireDiff,
@@ -96,7 +100,11 @@ import {
   type ReviewProfile,
   stripSecurityTag,
 } from './modes/review/profile';
-import { formatEvidenceFooter } from './modes/review/seat-evidence';
+import {
+  formatEgressDenialCounts,
+  formatEvidenceFooter,
+  SEAT_QUALIFIERS,
+} from './modes/review/seat-evidence';
 import { isPreflightError } from './modes/review/worktree';
 import { execGit } from './modes/review/git-exec';
 import { checkPinDrift, describePinDrift } from './plumbing/pin-check';
@@ -181,6 +189,9 @@ Plumbing (no reviewer runs — inspect the engine):
   regate       re-run ONLY the synthesis gate over an existing run's trail — heals a
                run whose gate died (all-unverified fail-close) without re-billing any
                reviewer. \`regate --help\` for the contract.
+  reseat       re-run ONE failed reviewer seat over an existing run's trail, then regate the
+               union — heals a run whose codex/grok seat died without re-billing the others.
+               \`reseat --help\` for the contract.
   reviewers    (alias: config) list the configured cross-vendor registry (read-only).
   diff         show the assembled review packet that WOULD be sent — cost-preview/debug.
 
@@ -3242,6 +3253,174 @@ async function regateCommand(args: string[]): Promise<number> {
   }
 }
 
+const RESEAT_USAGE = `ensemble-ai reseat — re-run ONE failed reviewer seat over an existing run's trail, then regate.
+
+regate's sibling, one stage earlier. When a run completed except for one core seat (a vendor
+CLI's sandbox refused to start, a watchdog reclaimed a silent seat), reseat re-runs JUST that
+seat against the run's own pinned packet — the persisted prompt.<seat>.md, byte-identical to
+what every seat saw — then re-runs the gate over the union of all persisted voices, rewriting
+gate-verdicts.json + claude-synthesis.json in place. No other seat is re-billed.
+
+Usage:
+  ensemble-ai reseat [<pr-url>] --out <dir> --run-id <id> --seat <codex|grok>
+                     [--repo <path>] [--gate-model <m>] [--gate-effort <e>]
+                     [--reviewers-file <p>] [--sandbox <profile>]
+
+  <pr-url>          the SAME GitHub PR URL the original review took — required only with
+                    --repo (the worktree re-materialization fetches pull/<N>/head)
+  --out <dir>       the trail base the original run wrote (its <run-id>/ dir lives here)
+  --run-id <id>     the original run's id
+  --seat <id>       the FAILED core seat to re-run. A seat that completed is refused —
+                    re-running a healthy seat is a new review. \`claude\` is not supported yet
+                    (the producer runs inside the claude layer; re-fire the review instead)
+  --repo <path>     local clone of the PR's repo — re-materializes the head read-only so the
+                    seat (when its sandbox qualifies) and the gate are evidence-bearing.
+                    Unavailable/failed → LOUD fallback to packet evidence
+  --gate-model <m>  gate seat pin — same resolution chain as review (flag → voices.json
+  --gate-effort <e> \`gate\` entry → the claude voice → built-in default)
+  --reviewers-file  reviewers config (default ~/.ensemble-ai/reviewers.json)
+  --sandbox <p>     override the seat's sandbox profile (tightens only — see review --sandbox)
+
+Not re-run (same as regate): the execution settler, the shadow gate, the receipt.
+Exit: 0 = seat reviewed + gate completed · 1 = seat failed again, or the gate failed ·
+3 = usage / missing trail.
+`;
+
+// reseat: heal a run whose ONE seat died, without re-running the others. The trail is the
+// contract (persistReview wrote the seat's exact prompt + packet), so this is: read the seat's
+// artifacts, optionally re-materialize the head, re-run the seat, regate the union.
+async function reseatCommand(args: string[]): Promise<number> {
+  let values: Record<string, string | boolean | undefined>;
+  let positionals: string[];
+  try {
+    ({ positionals, values } = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        'gate-effort': { type: 'string' },
+        'gate-model': { type: 'string' },
+        help: { short: 'h', type: 'boolean' },
+        out: { type: 'string' },
+        repo: { type: 'string' },
+        'reviewers-file': { type: 'string' },
+        'run-id': { type: 'string' },
+        sandbox: { type: 'string' },
+        seat: { type: 'string' },
+      },
+    }));
+  } catch (e) {
+    console.error(`ensemble-ai reseat: ${(e as Error).message}`);
+    return 3;
+  }
+  if (values.help) {
+    console.log(RESEAT_USAGE);
+    return 0;
+  }
+  const out = typeof values.out === 'string' ? values.out.trim() : '';
+  const runId = typeof values['run-id'] === 'string' ? values['run-id'].trim() : '';
+  const seatRaw = typeof values.seat === 'string' ? values.seat.trim() : '';
+  if (!out || !runId || !seatRaw) {
+    console.error('ensemble-ai reseat: --out, --run-id and --seat are required\n');
+    console.error(RESEAT_USAGE);
+    return 3;
+  }
+  if (!isCoreReviewerId(seatRaw)) {
+    console.error(
+      seatRaw === 'claude'
+        ? 'ensemble-ai reseat: --seat claude is not supported yet — the producer runs inside the claude layer; re-fire the review instead'
+        : `ensemble-ai reseat: --seat "${seatRaw}" — expected one of ${CORE_REVIEWER_IDS.join(', ')}`
+    );
+    return 3;
+  }
+  const seat = seatRaw;
+
+  // Fail closed BEFORE any spawn: no pinned packet ⇒ nothing to ground against; no seat
+  // artifacts ⇒ nothing to re-run; a healthy seat ⇒ nothing to retry.
+  const headSha = readGatePacketHeadSha(out, runId);
+  if (!headSha) {
+    console.error(`ensemble-ai reseat: run ${runId} has no usable packet.gate.json under ${out} — was this run made by \`review --out\`?`);
+    return 3;
+  }
+  const art = readSeatArtifacts(out, runId, seat);
+  if ('error' in art) {
+    console.error(`ensemble-ai reseat: ${art.error}`);
+    return 3;
+  }
+  if (art.stored.terminalState === 'reviewed') {
+    console.error(`ensemble-ai reseat: seat ${seat} completed in run ${runId} — nothing to retry (re-running a healthy seat is a new review)`);
+    return 3;
+  }
+
+  const reviewersFile = typeof values['reviewers-file'] === 'string' ? values['reviewers-file'] : REVIEWERS_FILE;
+  const sandbox = typeof values.sandbox === 'string' ? values.sandbox : undefined;
+  const reviewer: ReviewerConfig = { ...loadReviewers(reviewersFile)[seat], ...(sandbox ? { sandbox } : {}) };
+  const gateSeat = loadGateSeat(
+    VOICES_FILE,
+    {
+      effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+      model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+    },
+    (m) => console.error(`· ${m}`)
+  );
+
+  // Worktree evidence is opt-in and best-effort, exactly like regate.
+  let session: WorktreeSession | null = null;
+  const repoFlag = typeof values.repo === 'string' ? values.repo.trim() : '';
+  if (repoFlag) {
+    const url = positionals[0]?.trim() ?? '';
+    const ref = url ? parsePrUrl(url) : null;
+    if (!ref) {
+      console.error('ensemble-ai reseat: --repo needs the original PR URL as the positional (the head is re-fetched as pull/<N>/head)');
+      return 3;
+    }
+    console.error(`· re-materializing the PR head as a read-only worktree of ${repoFlag}…`);
+    const made = openWorktree({ baseSha: null, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
+    if (isPreflightError(made)) {
+      console.error(`· ⚠ worktree unavailable (${made.kind}: ${made.message}) — re-running ${seat} on PACKET evidence`);
+    } else {
+      session = made;
+    }
+  }
+
+  try {
+    const res = await runReseat({
+      adapter: REVIEW_ADAPTERS[seat],
+      baseDir: out,
+      conventionPaths: readConventionPathsFromTrail(out, runId),
+      gateConfig: gateSeat.config,
+      log: (m) => console.error(`· ${m}`),
+      ...(session ? { qualification: SEAT_QUALIFIERS[seat]({ config: reviewer, worktree: session.dir }) } : {}),
+      reviewer,
+      runId,
+      seat,
+      ...(session ? { worktree: { baseSha: session.baseSha, dir: session.dir, headSha: session.headSha } } : {}),
+    });
+    // Loud on BOTH outcomes, exactly as a full run reports them: a seat that lost the worktree
+    // it was asked for, and a seat that reached past its vendor allowlist, are facts about the
+    // retry that must not be quieter than the fan-out that produced the dead seat.
+    if (res.fallbackReason) console.error(`· ⚠ ${res.fallbackReason}`);
+    if (res.egressDenials.length > 0) {
+      console.error(`· ⚠ egress fence: ${formatEgressDenialCounts(res.egressDenials)}`);
+    }
+    if (!res.gate) {
+      console.log(`\nreseat: seat ${seat} FAILED AGAIN — ${clean(res.review.summary).slice(0, 300)}\n(the new failure is now the trail's record; the gate was not re-run)`);
+      return 1;
+    }
+    console.log(renderGateVerdicts(res.gate.verdicts, { scrub: clean, trailWritten: true }).join('\n'));
+    console.log(
+      res.ok
+        ? `\nreseat: ${seat} reviewed (${res.review.findings.length} finding(s), evidence ${res.realized}) — gate completed over ${res.gate.reviews} voice(s); verdicts updated in ${out}/${runId}/`
+        : `\nreseat: ${seat} reviewed, but the gate FAILED — verdicts remain fail-closed unverified (see stderr for the cause)`
+    );
+    return res.ok ? 0 : 1;
+  } catch (e) {
+    console.error(`ensemble-ai reseat: ${(e as Error).message}`);
+    return 3;
+  } finally {
+    session?.reap();
+  }
+}
+
 // ── The probe command (the execution prober — modes/review/probe.ts) ───────────────────
 
 const PROBE_USAGE = `ensemble-ai probe — check a backend PR by RUNNING it (the execution prober).
@@ -3486,6 +3665,7 @@ export async function main(argv: string[]): Promise<number> {
   if (raw === 'diff') return diffCommand(argv.slice(1));
   if (raw === 'pin-check') return pinCheckCommand(argv.slice(1));
   if (raw === 'regate') return regateCommand(argv.slice(1));
+  if (raw === 'reseat') return reseatCommand(argv.slice(1));
   // The execution prober — NOT in the read-only mode registry on purpose: it runs the PR's code.
   if (raw === 'probe') return probeCommand(argv.slice(1));
 

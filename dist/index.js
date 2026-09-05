@@ -3936,12 +3936,13 @@ function sandboxProfilesFor(quals) {
   }
   return map;
 }
+var WORKTREE_SUFFIX_HEADER = "## Whole-project evidence \u2014 you are running inside the project";
 function worktreePromptSuffix(args) {
   const range = args.baseSha ? `
 The change under review is exactly: git diff ${args.baseSha}...${args.headSha}` : "";
   return `
 
-## Whole-project evidence \u2014 you are running inside the project
+${WORKTREE_SUFFIX_HEADER}
 
 The full project at the PR head is checked out READ-ONLY at ${args.worktree} (detached at ${args.headSha}), and it is your working directory.${range}
 Read any file there for whole-project context: a finding may cite an UNCHANGED file (a reinvented
