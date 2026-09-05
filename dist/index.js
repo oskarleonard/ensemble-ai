@@ -4264,7 +4264,10 @@ async function runReviewMode(opts) {
       );
       if (seat.review.terminalState !== "reviewed") {
         log(
-          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat --seat ${id} --out '${opts.out}' --run-id ${opts.runId}`
+          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat ${wt ? "<pr-url> --repo <path-to-your-clone> " : ""}--seat ${id} --out '${opts.out}' --run-id ${opts.runId}`
+        );
+        log(
+          "  \xB7   (without --repo the retried seat AND the whole-run regate fall back to PACKET evidence)"
         );
       }
       return [id, seat];

@@ -3283,8 +3283,9 @@ Usage:
 Not re-run (same as regate): the execution settler, the shadow gate, and the receipt — a healed run
 keeps the receipt its original roster earned.
 Exit: 0 = seat reviewed + gate completed · 1 = seat failed again, the gate failed, or the retry
-threw AFTER the seat was spawned · 3 = a pre-spawn refusal: usage, a missing trail or seat
-artifact, a healthy seat, a worktree at a different head — nothing was billed.
+threw AFTER the seat was spawned · 3 = a pre-spawn refusal: usage, a missing or malformed trail or
+seat artifact, a healthy seat, a worktree at a different head, a persisted prompt pinned at a
+different head than the run's gate packet — nothing was billed.
 `;
 
 // reseat: heal a run whose ONE seat died, without re-running the others. The trail is the
@@ -3361,6 +3362,11 @@ async function reseatCommand(args: string[]): Promise<number> {
 
   // Worktree evidence is opt-in and best-effort, exactly like regate.
   let session: WorktreeSession | null = null;
+  // Set ONLY when `--repo` was given and the tree could not be materialized. It is the difference
+  // between "the operator chose a packet retry" and "the operator asked for evidence and lost it",
+  // and without it both write `fallbackReason: null` into the trail — provenance a later reader
+  // cannot tell apart. The module makes it the run's fallback reason and records it durably.
+  let worktreeUnavailable: string | undefined;
   const repoFlag = typeof values.repo === 'string' ? values.repo.trim() : '';
   if (repoFlag) {
     const url = positionals[0]?.trim() ?? '';
@@ -3374,7 +3380,9 @@ async function reseatCommand(args: string[]): Promise<number> {
     if (isPreflightError(made)) {
       // A reseat re-gates the WHOLE run, so a lost worktree costs more than the retried seat's own
       // evidence: the regate that follows also drops to packet grounding, and with it the gate's
-      // reference-not-found check and its holistic two-site verification. Name both.
+      // reference-not-found check and its holistic two-site verification. Name both — HERE, before
+      // the seat is billed, because the module's own line only lands after the spawn returns.
+      worktreeUnavailable = `worktree unavailable (${made.kind}: ${made.message}) — re-ran on PACKET evidence`;
       console.error(`· ⚠ worktree unavailable (${made.kind}: ${made.message}) — re-running ${seat} AND regating the whole run on PACKET evidence (reference-not-found + holistic verification OFF)`);
     } else {
       session = made;
@@ -3400,6 +3408,7 @@ async function reseatCommand(args: string[]): Promise<number> {
       runId,
       seat,
       ...(session ? { worktree: { baseSha: session.baseSha, dir: session.dir, headSha: session.headSha } } : {}),
+      ...(worktreeUnavailable ? { worktreeUnavailable } : {}),
     });
     // The lost worktree, the egress rollup and the evidence downgrade are all said by the module,
     // through the `log` above — de-duped there, on purpose, so an echo here would double them.

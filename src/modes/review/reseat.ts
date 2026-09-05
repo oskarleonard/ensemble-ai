@@ -37,6 +37,11 @@ export interface SplitPrompt {
   // meaningful when `unverifiedTail` is false; on an unverified tail it is the WHOLE persisted
   // prompt, stale preamble included, and the caller must refuse rather than re-send it.
   packetPrompt: string;
+  // The head the preamble was PINNED AT — recovered from its `(detached at <sha>)`. Null in packet
+  // mode and on an unverified tail (nothing recovered from a tail the rebuild could not prove).
+  // It is the only surviving record of which commit the persisted prompt described, and the reseat
+  // gate refuses when it disagrees with the pinned gate packet's head.
+  preambleHeadSha: string | null;
   // true ⇔ a preamble is present (the prompt does not end in a newline) but THIS version cannot
   // re-render it byte-for-byte. Not a packet-mode prompt and not a splittable one: unusable.
   unverifiedTail: boolean;
@@ -59,6 +64,7 @@ export function splitWorktreePrompt(prompt: string): SplitPrompt {
     baseSha: null,
     hadWorktree: false,
     packetPrompt: prompt,
+    preambleHeadSha: null,
     unverifiedTail: false,
   };
   // STRUCTURAL LOCK, read BEFORE the proof: `renderReviewPrompt` always ends its output with a
@@ -66,6 +72,12 @@ export function splitWorktreePrompt(prompt: string): SplitPrompt {
   // `persistReview` writes the prompt raw. So a persisted prompt that ends in a newline is a packet
   // prompt — whatever header text it quotes is BODY — and one that does not is a prompt some engine
   // version appended a preamble to.
+  //
+  // BOTH HALVES ARE PINNED BY TESTS, not by this comment: reseat.test.ts, describe 'the
+  // trailing-newline lock the split classifies on' — 'renderReviewPrompt always ends with a newline,
+  // in BOTH profiles' and 'worktreePromptSuffix never ends with a newline, with or without a base
+  // range'. An edit to either renderer that breaks the lock fails THERE, at its cause, instead of
+  // surfacing here as a mis-split.
   if (prompt.endsWith('\n')) return asPacket;
   const idx = prompt.lastIndexOf(`\n\n${WORKTREE_SUFFIX_HEADER}`);
   if (idx === -1) return asPacket;
@@ -80,6 +92,7 @@ export function splitWorktreePrompt(prompt: string): SplitPrompt {
     baseSha: null,
     hadWorktree: true,
     packetPrompt: prompt,
+    preambleHeadSha: null,
     unverifiedTail: true,
   };
   const tail = prompt.slice(idx);
@@ -95,6 +108,7 @@ export function splitWorktreePrompt(prompt: string): SplitPrompt {
     baseSha,
     hadWorktree: true,
     packetPrompt: prompt.slice(0, prompt.length - rebuilt.length),
+    preambleHeadSha: named[2],
     unverifiedTail: false,
   };
 }
@@ -105,8 +119,23 @@ export interface SeatArtifacts {
   stored: StoredReview;
 }
 
+// Is this parsed JSON actually a packet? `JSON.parse` succeeding proves only that the bytes were
+// JSON — `null`, `{}` and `[]` all parse. The two fields the retry path DEREFERENCES are checked:
+// `complete` (it decides the no-output short-circuit runCoreSeat applies) and `sections` (the gate
+// and the receipt read it as a list of section records).
+function isReviewPacketShape(v: unknown): v is ReviewPacket {
+  if (typeof v !== 'object' || v === null) return false;
+  const p = v as Record<string, unknown>;
+  if (typeof p.complete !== 'boolean' || !Array.isArray(p.sections)) return false;
+  return (p.sections as unknown[]).every((s) => typeof s === 'object' && s !== null);
+}
+
 // The three artifacts persistReview wrote for this seat. Any one missing ⇒ a named error — the
-// trail is the contract, and a partial trail is not something to guess around.
+// trail is the contract, and a partial trail is not something to guess around. Neither is a partial
+// ARTIFACT: this runs inside the no-billing preflight (`checkReseat`), so a packet that parses but
+// is not a packet has to be refused HERE (exit 3, nothing billed) rather than blowing up after the
+// seat spawn, where the CLI can only report "failed after the seat spawn" — the opposite of the
+// truth about what the operator was charged for. The stored review is shape-guarded by `readReview`.
 export function readSeatArtifacts(
   baseDir: string,
   runId: string,
@@ -115,14 +144,16 @@ export function readSeatArtifacts(
   const dir = reviewDir(baseDir, runId);
   const stored = readReview(baseDir, runId, seat);
   if (!stored) return { error: `run ${runId} has no review.${seat}.json under ${baseDir}` };
-  let packet: ReviewPacket;
+  let parsed: unknown;
   try {
-    packet = JSON.parse(
-      fs.readFileSync(path.join(dir, `packet.${seat}.json`), 'utf8')
-    ) as ReviewPacket;
+    parsed = JSON.parse(fs.readFileSync(path.join(dir, `packet.${seat}.json`), 'utf8'));
   } catch {
     return { error: `run ${runId} has no readable packet.${seat}.json` };
   }
+  if (!isReviewPacketShape(parsed)) {
+    return { error: `run ${runId} has an unreadable packet.${seat}.json (unexpected shape)` };
+  }
+  const packet = parsed;
   let prompt: string;
   try {
     prompt = fs.readFileSync(path.join(dir, `prompt.${seat}.md`), 'utf8');
@@ -168,6 +199,16 @@ function checkReseat(
       refusal: `seat ${seat}'s persisted prompt carries a worktree preamble this engine version cannot verify (the run was written by another ensemble-ai version) — refusing to retry on an unverifiable pinned prompt; re-run the review instead`,
     };
   }
+  // The persisted prompt and the pinned gate packet are two records of ONE head. A VERIFIED preamble
+  // naming a different commit means the trail was assembled across heads — so `packetPrompt`, which
+  // this retry re-sends as "byte-identical to what every seat saw", describes code the gate packet
+  // does not. Same fail-closed rule as the mis-materialized worktree above, and it costs nothing:
+  // the seat has not been spawned.
+  if (split.preambleHeadSha && split.preambleHeadSha !== headSha) {
+    return {
+      refusal: `seat ${seat}'s persisted prompt was pinned at ${split.preambleHeadSha.slice(0, 12)} but the run's gate packet is at ${headSha.slice(0, 12)} — refusing to retry across heads`,
+    };
+  }
   if (art.stored.terminalState === 'reviewed') {
     return {
       refusal: `seat ${seat} completed in run ${runId} — nothing to retry (re-running a healthy seat is a new review)`,
@@ -206,6 +247,11 @@ export interface ReseatOptions {
   seat: CoreReviewerId;
   // The PR head re-materialized by the CLI (openWorktree). Absent ⇒ the seat runs on the packet.
   worktree?: { baseSha: string | null; dir: string; headSha: string };
+  // Why there is no `worktree` even though the caller ASKED for one (a `--repo` whose
+  // materialization failed preflight). A lost worktree and a retry that never wanted one both arrive
+  // here as "no worktree", and only the caller can tell them apart — so it says which, and this
+  // becomes the run's `fallbackReason`: the result, one log line, and the durable `reseats[]` entry.
+  worktreeUnavailable?: string;
 }
 
 export interface ReseatResult {
@@ -317,13 +363,17 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
   // wording (it has no reason to report), so the run would otherwise look exactly like one that was
   // never asked for a worktree at all. Name it here — this is the loud-not-silent rule, and the
   // result, the log and the trail entry all carry the SAME string.
+  // …and a `--repo` that never MATERIALIZED never reaches this module as a worktree at all, so its
+  // reason has to come from the caller (`worktreeUnavailable`). Without it the trail writes
+  // `fallbackReason: null` for both a lost worktree and a deliberate packet retry — durable
+  // provenance that cannot tell a degradation from a choice.
   const fallbackReason =
     seatRun.fallbackReason ??
     (wt && !qualified
       ? `${seat}: no sandbox qualification for the re-materialized worktree${
           opts.qualification?.reason ? ` (${opts.qualification.reason})` : ''
         } — re-ran on the PACKET`
-      : null);
+      : (opts.worktreeUnavailable ?? null));
   // Logged ONLY when synthesized here: a reason that came from runCoreSeat was already logged there.
   if (fallbackReason && !seatRun.fallbackReason) log(`reseat: ⚠ ${fallbackReason}`);
   // An evidence DOWNGRADE is a fact of its own, and not one `fallbackReason` covers: a retry can run
@@ -384,11 +434,12 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
     log
   );
   // The manifest's REALIZED map tells consumers what each seat actually read — keep it true. So is
-  // `sandboxProfiles`: it names the fence each seat's evidence was gathered behind, and leaving the
-  // ORIGINAL run's profile there beside a freshly rewritten realized class would attest this retry's
-  // in-project read under a fence it never ran under. Only a worktree retry touches it — a
-  // packet-mode retry ran behind no fence at all, and the original entry stays the record of the
-  // attempt that did.
+  // `sandboxProfiles`: it names the fence each seat's evidence was gathered behind, and the two are
+  // read TOGETHER. A worktree retry rewrites this seat's entry to the fence it actually ran behind.
+  // A packet-mode retry ran behind NO fence, so its entry is DELETED: leaving the original run's
+  // profile beside a freshly rewritten `realized: packet` attests a jail this attempt never entered
+  // — the manifest would claim a fence for evidence gathered outside one. Only this seat's key
+  // moves; every other seat's record of its own attempt is untouched.
   try {
     const mp = path.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
     if (fs.existsSync(mp)) {
@@ -405,6 +456,10 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
           ...(manifest.sandboxProfiles ?? {}),
           [seat]: opts.qualification.profile,
         };
+      } else if (seatRun.realized === 'packet' && manifest.sandboxProfiles) {
+        const profiles = { ...manifest.sandboxProfiles };
+        delete profiles[seat];
+        manifest.sandboxProfiles = profiles;
       }
       writeTrailFile(baseDir, runId, EVIDENCE_MANIFEST_FILE, JSON.stringify(manifest, null, 2));
     }

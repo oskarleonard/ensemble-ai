@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 
 import { persistReview, reviewDir } from '../../core/artifacts';
 import type { EgressDenial } from '../../core/egress-proxy';
+import { renderReviewPrompt } from '../../core/prompt';
 import type { ReviewerConfig, ReviewPacket } from '../../core/types';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
@@ -19,6 +20,16 @@ import {
   worktreePromptSuffix,
 } from './seat-evidence';
 import type { ReviewAdapter } from './seat-run';
+
+// A packet with a real section — the lock is about the RENDERER's frame, and an empty packet would
+// pin the trailing newline of a body that was never there.
+const LOCK_PACKET: ReviewPacket = {
+  complete: true,
+  objective: 'o',
+  pr: 7,
+  repo: 'acme/webapp',
+  sections: [{ body: 'diff --git a/x.ts b/x.ts\n+const a = 1;', included: true, note: 'the change under review', title: 'The diff', truncated: false }],
+};
 
 const BASE = 'b'.repeat(40);
 const HEAD = 'c'.repeat(40);
@@ -53,7 +64,7 @@ const SKEWED_PREAMBLE = worktreePromptSuffix({
 
 describe('splitWorktreePrompt — recover the pinned packet prompt from a persisted seat prompt', () => {
   it('returns a packet-mode prompt unchanged', () => {
-    expect(splitWorktreePrompt('PINNED PROMPT')).toEqual({ baseSha: null, hadWorktree: false, packetPrompt: 'PINNED PROMPT', unverifiedTail: false });
+    expect(splitWorktreePrompt('PINNED PROMPT')).toEqual({ baseSha: null, hadWorktree: false, packetPrompt: 'PINNED PROMPT', preambleHeadSha: null, unverifiedTail: false });
   });
 
   it('strips the worktree preamble at the shared header and recovers the base SHA', () => {
@@ -67,7 +78,7 @@ describe('splitWorktreePrompt — recover the pinned packet prompt from a persis
 
   it('a preamble with no base range yields baseSha null', () => {
     const prompt = 'P' + worktreePromptSuffix({ baseSha: null, headSha: HEAD, worktree: '/tmp/w' });
-    expect(splitWorktreePrompt(prompt)).toEqual({ baseSha: null, hadWorktree: true, packetPrompt: 'P', unverifiedTail: false });
+    expect(splitWorktreePrompt(prompt)).toEqual({ baseSha: null, hadWorktree: true, packetPrompt: 'P', preambleHeadSha: HEAD, unverifiedTail: false });
   });
 
   // The persisted prompt embeds every packet section body RAW — the PR description among them — so
@@ -79,6 +90,7 @@ describe('splitWorktreePrompt — recover the pinned packet prompt from a persis
       baseSha: null,
       hadWorktree: false,
       packetPrompt: HOSTILE_BODY,
+      preambleHeadSha: null,
       unverifiedTail: false, // it ends with "\n" — a rendered packet prompt, not an appended tail
     });
   });
@@ -91,6 +103,7 @@ describe('splitWorktreePrompt — recover the pinned packet prompt from a persis
       baseSha: null,
       hadWorktree: true,
       packetPrompt: 'PINNED PROMPT\n' + SKEWED_PREAMBLE,
+      preambleHeadSha: null, // nothing recovered from a tail the rebuild could not verify
       unverifiedTail: true,
     });
   });
@@ -104,6 +117,29 @@ describe('splitWorktreePrompt — recover the pinned packet prompt from a persis
     expect(split.baseSha).toBe(BASE); // the REAL base, never the one the body named
     expect(split.unverifiedTail).toBe(false);
   });
+
+  // The head the preamble was pinned at is recovered, not discarded: it is the ONLY record of which
+  // commit the persisted prompt described, and the reseat gate compares it against the pinned packet.
+  it('recovers the head the verified preamble was pinned at', () => {
+    const prompt = 'P' + worktreePromptSuffix({ baseSha: BASE, headSha: HEAD, worktree: '/tmp/w' });
+    expect(splitWorktreePrompt(prompt).preambleHeadSha).toBe(HEAD);
+  });
+});
+
+// THE STRUCTURAL LOCK splitWorktreePrompt classifies on, before any proof runs: a persisted prompt
+// that ends in a newline is a packet prompt (whatever header text its body quotes), and one that
+// does not carries an appended preamble. It was an invariant asserted only in a comment; an edit to
+// either renderer that broke it would have surfaced far from its cause, as a mis-split.
+describe('the trailing-newline lock the split classifies on', () => {
+  it('renderReviewPrompt always ends with a newline, in BOTH profiles', () => {
+    expect(renderReviewPrompt(LOCK_PACKET).endsWith('\n')).toBe(true);
+    expect(renderReviewPrompt(LOCK_PACKET, 'security').endsWith('\n')).toBe(true);
+  });
+
+  it('worktreePromptSuffix never ends with a newline, with or without a base range', () => {
+    expect(worktreePromptSuffix({ baseSha: BASE, headSha: HEAD, worktree: '/tmp/w' }).endsWith('\n')).toBe(false);
+    expect(worktreePromptSuffix({ baseSha: null, headSha: HEAD, worktree: '/tmp/w' }).endsWith('\n')).toBe(false);
+  });
 });
 
 const GATE_CFG: VoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
@@ -111,6 +147,10 @@ const RUN_HEAD = 'd'.repeat(40);
 const PACKET: ReviewPacket = { complete: true, objective: 'o', pr: 0, repo: 'acme/webapp', sections: [] };
 const GROK: ReviewerConfig = { cmd: 'grok', effort: 'xhigh', id: 'grok', model: 'grok-x', sandbox: 'ensemble-review', vendor: 'xai' };
 const CODEX: ReviewerConfig = { cmd: 'codex', effort: 'xhigh', id: 'codex', model: 'gpt-x', vendor: 'openai' };
+
+// The fence the ORIGINAL fan-out recorded for this seat — deliberately not the one a retry would
+// name, so a stale entry is distinguishable from a rewritten one.
+const STALE_PROFILE = { id: 'ensemble-review-v0', mode: 'deny-by-default' };
 
 const GATE_DIFF = `diff --git a/src/x.ts b/src/x.ts
 index 111..222 100644
@@ -290,6 +330,11 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
 
   it('a seat that fails AGAIN stops before the gate — no regate, verdicts untouched', async () => {
     const { base, runId } = seedRun();
+    // Seed the ORIGINAL run's verdicts: "untouched" has to be asserted against bytes that exist.
+    // Against a fixture that never had verdicts the assertion passes for the wrong reason.
+    const verdictsPath = path.join(reviewDir(base, runId), 'gate-verdicts.json');
+    const ORIGINAL_VERDICTS = JSON.stringify({ schemaVersion: 1, verdicts: [{ findingId: 'codex#1', reason: 'from the ORIGINAL gate', verdict: 'agree' }] }, null, 2);
+    fs.writeFileSync(verdictsPath, ORIGINAL_VERDICTS);
     let gateCalls = 0;
     const res = await runReseat({
       adapter: adapterDead, baseDir: base, gateConfig: GATE_CFG,
@@ -300,7 +345,7 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     expect(res.gate).toBeNull();
     expect(res.review.terminalState).toBe('failed-reviewer');
     expect(gateCalls).toBe(0);
-    expect(fs.existsSync(path.join(reviewDir(base, runId), 'gate-verdicts.json'))).toBe(false);
+    expect(fs.readFileSync(verdictsPath, 'utf8')).toBe(ORIGINAL_VERDICTS); // byte-for-byte, not merely absent
     const synth = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'claude-synthesis.json'), 'utf8')) as { reseats: Array<{ outcome: string; summary: string }> };
     expect(synth.reseats[0].outcome).toBe('failed-reviewer'); // the attempt is on record either way
     expect(synth.reseats[0].summary).toContain('sandbox refused again'); // …and it says WHY
@@ -445,5 +490,99 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     await expect(
       runReseat({ adapter: adapterOk, baseDir: empty, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId: 'nope', seat: 'grok' })
     ).rejects.toThrow(/packet\.gate\.json/);
+  });
+
+  // `sandboxProfiles` names the fence each seat's evidence was gathered behind. A packet-mode retry
+  // ran behind NO fence, so leaving the ORIGINAL run's profile beside a freshly rewritten
+  // `realized: packet` attests a fence this seat never ran under — the manifest would say the retry
+  // read the packet from inside a Seatbelt jail it never entered.
+  it('a packet-mode retry DROPS the seat\'s stale sandbox profile; a worktree retry rewrites it', async () => {
+    const withProfiles = (): { base: string; runId: string } => {
+      const r = seedRun(OLD_WORKTREE_PROMPT);
+      const mp = path.join(reviewDir(r.base, r.runId), 'evidence-manifest.json');
+      const m = JSON.parse(fs.readFileSync(mp, 'utf8')) as Record<string, unknown>;
+      fs.writeFileSync(mp, JSON.stringify({ ...m, sandboxProfiles: { codex: STALE_PROFILE, grok: STALE_PROFILE } }));
+      return r;
+    };
+    const profilesOf = (base: string, runId: string): Record<string, unknown> =>
+      (JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'evidence-manifest.json'), 'utf8')) as { sandboxProfiles: Record<string, unknown> }).sandboxProfiles;
+
+    const a = withProfiles();
+    await runReseat({ adapter: adapterOk, baseDir: a.base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId: a.runId, seat: 'grok' });
+    expect('grok' in profilesOf(a.base, a.runId)).toBe(false); // no fence ran — no fence attested
+    expect(profilesOf(a.base, a.runId).codex).toEqual(STALE_PROFILE); // every other seat untouched
+
+    const b = withProfiles();
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-reseat-wt-'));
+    await runReseat({
+      adapter: adapterOk, baseDir: b.base, gateConfig: GATE_CFG, gateRun: gateOk, qualification: qualifyGrokSeat('ensemble-review'),
+      reviewer: GROK, runId: b.runId, seat: 'grok', worktree: { baseSha: null, dir: wt, headSha: RUN_HEAD },
+    });
+    expect(profilesOf(b.base, b.runId).grok).toEqual(qualifyGrokSeat('ensemble-review').profile);
+  });
+
+  // The no-billing preflight reads the seat's artifacts; a packet that parses but is not a packet
+  // slipped through it and only failed AFTER the spawn — reported as "failed after the seat spawn"
+  // (exit 1), which tells an operator the opposite of the truth about what was billed.
+  it('refuses a malformed packet.<seat>.json BEFORE the spawn', async () => {
+    for (const bytes of ['null', '{}', '{"complete":"yes","sections":[]}', '{"complete":true,"sections":[1]}']) {
+      const { base, runId } = seedRun();
+      fs.writeFileSync(path.join(reviewDir(base, runId), 'packet.grok.json'), bytes);
+      const err = `run ${runId} has an unreadable packet.grok.json (unexpected shape)`;
+      expect(readSeatArtifacts(base, runId, 'grok')).toEqual({ error: err });
+      expect(reseatRefusal(base, runId, 'grok')).toBe(err);
+      let spawns = 0;
+      const adapter: ReviewAdapter = async () => { spawns += 1; return { ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false }; };
+      await expect(
+        runReseat({ adapter, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId, seat: 'grok' })
+      ).rejects.toThrow(err);
+      expect(spawns).toBe(0); // exit 3, nothing billed
+    }
+  });
+
+  // The persisted prompt and the pinned gate packet are two records of ONE head. A verified preamble
+  // naming a DIFFERENT one means the trail was assembled across commits: re-sending that packet
+  // prompt would ground the retry's citations — and then the gate's verification of them — against
+  // code neither record describes.
+  it('refuses a persisted prompt whose preamble was pinned at a DIFFERENT head', async () => {
+    const otherHead = 'f'.repeat(40);
+    const { base, runId } = seedRun(
+      'PINNED PROMPT' + worktreePromptSuffix({ baseSha: BASE, headSha: otherHead, worktree: '/tmp/other-head-wt' })
+    );
+    const err = `seat grok's persisted prompt was pinned at ${otherHead.slice(0, 12)} but the run's gate packet is at ${RUN_HEAD.slice(0, 12)} — refusing to retry across heads`;
+    expect(reseatRefusal(base, runId, 'grok')).toBe(err);
+    let spawns = 0;
+    const adapter: ReviewAdapter = async () => { spawns += 1; return { ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false }; };
+    await expect(
+      runReseat({ adapter, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId, seat: 'grok' })
+    ).rejects.toThrow(err);
+    expect(spawns).toBe(0);
+  });
+
+  // A `--repo` that never materialized is NOT the same event as never passing `--repo`, and the
+  // durable trail is where that difference has to survive: without a reason string both write
+  // `fallbackReason: null`, and a reader of the healed run cannot tell a lost worktree from a
+  // deliberate packet retry.
+  it('a worktree that never materialized names itself — result, ONE log line, trail entry', async () => {
+    const { base, runId } = seedRun(OLD_WORKTREE_PROMPT);
+    const logs: string[] = [];
+    const reason = 'worktree unavailable (git: fetch of pull/7/head failed) — re-ran on PACKET evidence';
+    const res = await runReseat({
+      adapter: adapterOk, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, log: (m) => logs.push(m),
+      reviewer: GROK, runId, seat: 'grok', worktreeUnavailable: reason,
+    });
+    expect(res.realized).toBe('packet');
+    expect(res.fallbackReason).toBe(reason);
+    expect(logs.filter((l) => l.includes(reason))).toHaveLength(1);
+    const synth = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'claude-synthesis.json'), 'utf8')) as { reseats: Array<{ fallbackReason: string }> };
+    expect(synth.reseats[0].fallbackReason).toBe(reason);
+  });
+
+  // …and a reseat that never asked for a worktree still records nothing — the reason is the CLI's
+  // to supply, and its absence is the honest record of "no --repo was passed".
+  it('no worktree and no reason ⇒ fallbackReason stays null', async () => {
+    const { base, runId } = seedRun();
+    const res = await runReseat({ adapter: adapterOk, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId, seat: 'grok' });
+    expect(res.fallbackReason).toBeNull();
   });
 });

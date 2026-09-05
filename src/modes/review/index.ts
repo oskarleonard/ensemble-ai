@@ -381,9 +381,19 @@ export async function runReviewMode(
       );
       // …and names the remedy on the spot: the trail this run already wrote is enough to re-run
       // JUST this seat, and the alternative a reader reaches for otherwise is re-billing everyone.
+      // The hint has to carry the evidence class the run HAD. A reseat without `--repo` re-runs the
+      // seat on the packet AND regates the whole run on packet grounding — so on a worktree run the
+      // bare form steers the operator into the very downgrade the retry then warns about. This run
+      // knows neither the operator's clone path nor the PR URL the reseat CLI parses, so both stay
+      // ANGLE-BRACKET placeholders: a template to fill, never a line to paste blind.
       if (seat.review.terminalState !== 'reviewed') {
         log(
-          `  · → retry just this seat: ensemble-ai reseat --seat ${id} --out '${opts.out}' --run-id ${opts.runId}`
+          `  · → retry just this seat: ensemble-ai reseat ${
+            wt ? '<pr-url> --repo <path-to-your-clone> ' : ''
+          }--seat ${id} --out '${opts.out}' --run-id ${opts.runId}`
+        );
+        log(
+          '  ·   (without --repo the retried seat AND the whole-run regate fall back to PACKET evidence)'
         );
       }
       return [id, seat] as const;

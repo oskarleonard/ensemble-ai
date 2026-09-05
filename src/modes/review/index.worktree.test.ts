@@ -234,3 +234,41 @@ describe('packet mode is byte-compatible — worktree mode OFF changes no receip
     );
   });
 });
+
+// The retry hint is a command an operator PASTES. On a run that HAD worktree evidence, a hint that
+// omits `--repo` walks them straight into the packet-evidence downgrade the retry then warns about —
+// and a reseat's downgrade costs more than the retried seat's own grounding, because the regate of
+// the WHOLE run drops with it. The clone path and the PR URL are the operator's to fill, so they
+// stay angle-bracket placeholders: the line is a template, not something to paste blind.
+describe('a dead seat names the retry — and the hint keeps the run\'s evidence class', () => {
+  const dead = { ok: false as const, raw: null, stderrTail: 'sandbox refused to start', timedOut: false };
+  const NOTE = '(without --repo the retried seat AND the whole-run regate fall back to PACKET evidence)';
+
+  it('a worktree run\'s hint carries --repo, as a placeholder', async () => {
+    const { adapters } = stubAdapters({ grok: dead });
+    const logged: string[] = [];
+    await runReviewMode(
+      runOpts({
+        adapters,
+        onProgress: (m: string) => logged.push(m),
+        reviewers: ['grok'],
+        worktree: { baseSha: BASE, dir: worktreeDir, headSha: HEAD },
+      })
+    );
+    const hint = logged.find((l) => l.includes('retry just this seat'));
+    expect(hint).toContain('ensemble-ai reseat <pr-url> --repo <path-to-your-clone> --seat grok');
+    expect(hint).toContain(`--out '${out}' --run-id wt-run`);
+    expect(logged.filter((l) => l.includes(NOTE))).toHaveLength(1);
+  });
+
+  it('a packet run\'s hint stays the bare form', async () => {
+    const { adapters } = stubAdapters({ grok: dead });
+    const logged: string[] = [];
+    await runReviewMode(
+      runOpts({ adapters, onProgress: (m: string) => logged.push(m), reviewers: ['grok'] })
+    );
+    const hint = logged.find((l) => l.includes('retry just this seat'));
+    expect(hint).toBe(`  · → retry just this seat: ensemble-ai reseat --seat grok --out '${out}' --run-id wt-run`);
+    expect(logged.filter((l) => l.includes(NOTE))).toHaveLength(1);
+  });
+});

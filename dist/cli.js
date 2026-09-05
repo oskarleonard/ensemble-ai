@@ -7077,7 +7077,10 @@ async function runReviewMode(opts) {
       );
       if (seat.review.terminalState !== "reviewed") {
         log(
-          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat --seat ${id} --out '${opts.out}' --run-id ${opts.runId}`
+          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat ${wt ? "<pr-url> --repo <path-to-your-clone> " : ""}--seat ${id} --out '${opts.out}' --run-id ${opts.runId}`
+        );
+        log(
+          "  \xB7   (without --repo the retried seat AND the whole-run regate fall back to PACKET evidence)"
         );
       }
       return [id, seat];
@@ -8041,6 +8044,7 @@ function splitWorktreePrompt(prompt) {
     baseSha: null,
     hadWorktree: false,
     packetPrompt: prompt,
+    preambleHeadSha: null,
     unverifiedTail: false
   };
   if (prompt.endsWith("\n")) return asPacket;
@@ -8052,6 +8056,7 @@ ${WORKTREE_SUFFIX_HEADER}`);
     baseSha: null,
     hadWorktree: true,
     packetPrompt: prompt,
+    preambleHeadSha: null,
     unverifiedTail: true
   };
   const tail = prompt.slice(idx);
@@ -8065,21 +8070,30 @@ ${WORKTREE_SUFFIX_HEADER}`);
     baseSha,
     hadWorktree: true,
     packetPrompt: prompt.slice(0, prompt.length - rebuilt.length),
+    preambleHeadSha: named[2],
     unverifiedTail: false
   };
+}
+function isReviewPacketShape(v) {
+  if (typeof v !== "object" || v === null) return false;
+  const p = v;
+  if (typeof p.complete !== "boolean" || !Array.isArray(p.sections)) return false;
+  return p.sections.every((s) => typeof s === "object" && s !== null);
 }
 function readSeatArtifacts(baseDir, runId, seat) {
   const dir = reviewDir(baseDir, runId);
   const stored = readReview(baseDir, runId, seat);
   if (!stored) return { error: `run ${runId} has no review.${seat}.json under ${baseDir}` };
-  let packet;
+  let parsed;
   try {
-    packet = JSON.parse(
-      fs22.readFileSync(path17.join(dir, `packet.${seat}.json`), "utf8")
-    );
+    parsed = JSON.parse(fs22.readFileSync(path17.join(dir, `packet.${seat}.json`), "utf8"));
   } catch {
     return { error: `run ${runId} has no readable packet.${seat}.json` };
   }
+  if (!isReviewPacketShape(parsed)) {
+    return { error: `run ${runId} has an unreadable packet.${seat}.json (unexpected shape)` };
+  }
+  const packet = parsed;
   let prompt;
   try {
     prompt = fs22.readFileSync(path17.join(dir, `prompt.${seat}.md`), "utf8");
@@ -8106,6 +8120,11 @@ function checkReseat(baseDir, runId, seat, worktreeHeadSha) {
   if (split.unverifiedTail) {
     return {
       refusal: `seat ${seat}'s persisted prompt carries a worktree preamble this engine version cannot verify (the run was written by another ensemble-ai version) \u2014 refusing to retry on an unverifiable pinned prompt; re-run the review instead`
+    };
+  }
+  if (split.preambleHeadSha && split.preambleHeadSha !== headSha) {
+    return {
+      refusal: `seat ${seat}'s persisted prompt was pinned at ${split.preambleHeadSha.slice(0, 12)} but the run's gate packet is at ${headSha.slice(0, 12)} \u2014 refusing to retry across heads`
     };
   }
   if (art.stored.terminalState === "reviewed") {
@@ -8176,7 +8195,7 @@ async function runReseat(opts) {
     ...worktreePrompt ? { worktreePrompt } : {}
   });
   const review = seatRun.review;
-  const fallbackReason = seatRun.fallbackReason ?? (wt && !qualified ? `${seat}: no sandbox qualification for the re-materialized worktree${opts.qualification?.reason ? ` (${opts.qualification.reason})` : ""} \u2014 re-ran on the PACKET` : null);
+  const fallbackReason = seatRun.fallbackReason ?? (wt && !qualified ? `${seat}: no sandbox qualification for the re-materialized worktree${opts.qualification?.reason ? ` (${opts.qualification.reason})` : ""} \u2014 re-ran on the PACKET` : opts.worktreeUnavailable ?? null);
   if (fallbackReason && !seatRun.fallbackReason) log(`reseat: \u26A0 ${fallbackReason}`);
   const evidenceDowngraded = split.hadWorktree && seatRun.realized === "packet";
   if (evidenceDowngraded) {
@@ -8241,6 +8260,10 @@ async function runReseat(opts) {
           ...manifest.sandboxProfiles ?? {},
           [seat]: opts.qualification.profile
         };
+      } else if (seatRun.realized === "packet" && manifest.sandboxProfiles) {
+        const profiles = { ...manifest.sandboxProfiles };
+        delete profiles[seat];
+        manifest.sandboxProfiles = profiles;
       }
       writeTrailFile(baseDir, runId, EVIDENCE_MANIFEST_FILE, JSON.stringify(manifest, null, 2));
     }
@@ -11555,8 +11578,9 @@ Usage:
 Not re-run (same as regate): the execution settler, the shadow gate, and the receipt \u2014 a healed run
 keeps the receipt its original roster earned.
 Exit: 0 = seat reviewed + gate completed \xB7 1 = seat failed again, the gate failed, or the retry
-threw AFTER the seat was spawned \xB7 3 = a pre-spawn refusal: usage, a missing trail or seat
-artifact, a healthy seat, a worktree at a different head \u2014 nothing was billed.
+threw AFTER the seat was spawned \xB7 3 = a pre-spawn refusal: usage, a missing or malformed trail or
+seat artifact, a healthy seat, a worktree at a different head, a persisted prompt pinned at a
+different head than the run's gate packet \u2014 nothing was billed.
 `;
 async function reseatCommand(args) {
   let values;
@@ -11618,6 +11642,7 @@ async function reseatCommand(args) {
     (m) => console.error(`\xB7 ${m}`)
   );
   let session = null;
+  let worktreeUnavailable;
   const repoFlag = typeof values.repo === "string" ? values.repo.trim() : "";
   if (repoFlag) {
     const url = positionals[0]?.trim() ?? "";
@@ -11629,6 +11654,7 @@ async function reseatCommand(args) {
     console.error(`\xB7 re-materializing the PR head as a read-only worktree of ${repoFlag}\u2026`);
     const made = openWorktree({ baseSha: null, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
     if (isPreflightError(made)) {
+      worktreeUnavailable = `worktree unavailable (${made.kind}: ${made.message}) \u2014 re-ran on PACKET evidence`;
       console.error(`\xB7 \u26A0 worktree unavailable (${made.kind}: ${made.message}) \u2014 re-running ${seat} AND regating the whole run on PACKET evidence (reference-not-found + holistic verification OFF)`);
     } else {
       session = made;
@@ -11651,7 +11677,8 @@ async function reseatCommand(args) {
       reviewer,
       runId,
       seat,
-      ...session ? { worktree: { baseSha: session.baseSha, dir: session.dir, headSha: session.headSha } } : {}
+      ...session ? { worktree: { baseSha: session.baseSha, dir: session.dir, headSha: session.headSha } } : {},
+      ...worktreeUnavailable ? { worktreeUnavailable } : {}
     });
     if (!res.gate) {
       console.log(`

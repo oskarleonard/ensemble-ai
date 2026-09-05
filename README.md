@@ -283,12 +283,17 @@ Two plumbing commands rehydrate an existing run's **trail** instead of re-runnin
   (re-running a healthy seat is a new review); `claude` is not supported yet. Without `--repo` (or when
   the worktree cannot be made) the seat **and the regate of the whole run** fall to packet evidence —
   reference-not-found + holistic verification OFF. The attempt is stamped into `claude-synthesis.json`
-  (`reseats[]`) and the manifest's realized-evidence map is updated best-effort (when the run wrote one).
+  (`reseats[]` — including *why* a worktree was not used, so a lost `--repo` is distinguishable from a
+  deliberate packet retry) and the manifest is updated best-effort (when the run wrote one): the seat's
+  realized-evidence entry is rewritten, and its `sandboxProfiles` entry is rewritten by a worktree
+  retry or **dropped** by a packet one — a packet retry ran behind no fence, and the manifest must not
+  attest one it never entered.
 
 Neither re-runs the execution settler, the shadow gate, or the receipt — a healed run keeps the receipt
 its original roster earned. Exit `0` healed · `1` failed again (for `reseat`, also anything that fails
 after the seat was spawned) · `3` a pre-spawn refusal — usage, a missing trail, a healthy seat, a
-worktree at a different head — where nothing was billed.
+malformed seat packet, a worktree at a different head, a persisted prompt pinned at a different head
+than the run's gate packet — where nothing was billed.
 
 ### Configuring the seats — `reviewers.json` and `voices.json`
 
