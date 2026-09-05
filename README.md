@@ -267,6 +267,37 @@ Because a wrong *"use the existing util X"* is the most credibility-burning comm
 - **A clean holistic pass is not an architecture certification.** The search space is the whole tree, so run-to-run variance is expected: the lens finds valuable things when it looks. Silence means it did not find one this time.
 **Acceptance fixture** (`fixtures/holistic/`): a small planted tree with **several** reinventions the lens must catch and **several** near-miss lookalikes it must not flag — a util that resembles the canonical one but rounds half-to-even, preserves case, or paces a queue instead of retrying. `scoreHolisticFixture()` grades a live run against it. The vitest suite runs the *gating* mechanics deterministically against that tree with a stubbed seat (both-sites quoting, the citation-required uncap, agree-only posting, the symlink fence) — it does **not** claim to prove the model's judgment, which no stub can. What the host guarantees is that a citation is real; that a *comparison* is sound is the lens's job, and the negative half of the fixture is how you measure it.
 
+### Healing a run — `regate` and `reseat`
+
+Two plumbing commands rehydrate an existing run's **trail** instead of re-running the review:
+
+- **`ensemble-ai regate --out <dir> --run-id <id> [<pr-url> --repo <path>]`** — the synthesis gate died
+  (timeout, quota) and fail-closed every verdict to `unverified` while the reviewer work sat complete
+  on disk. Re-spawns ONE gate seat over the persisted reviews + pinned packet and rewrites
+  `gate-verdicts.json` + `claude-synthesis.json` in place. No reviewer re-runs.
+- **`ensemble-ai reseat --out <dir> --run-id <id> --seat <codex|grok> [<pr-url> --repo <path>]`** — one
+  core seat died (incident 2026-09-02b: a vendor CLI's self-update broke its sandbox twice in a day)
+  while every other seat and the gate completed. Re-runs JUST that seat against the run's own
+  `prompt.<seat>.md` — byte-identical to what every seat saw, with the worktree preamble re-issued for
+  the freshly re-materialized head — then regates the union. A seat that completed is refused
+  (re-running a healthy seat is a new review); `claude` is not supported yet. Without `--repo` (or when
+  the worktree cannot be made) the seat **and the regate of the whole run** fall to packet evidence —
+  reference-not-found + holistic verification OFF. **A packet-mode retry is PERMANENT for that seat** —
+  it overwrites the seat's persisted prompt and a reviewed seat is never retried — so pass `--repo`
+  whenever the run had worktree evidence. The attempt is stamped into `claude-synthesis.json`
+  (`reseats[]` — including *why* a worktree was not used, so a lost `--repo` is distinguishable from a
+  deliberate packet retry) and the manifest is updated best-effort (when the run wrote one): the seat's
+  realized-evidence entry is rewritten, and its `sandboxProfiles` entry is rewritten by a worktree
+  retry or **dropped** by a packet one — a packet retry ran behind no fence, and the manifest must not
+  attest one it never entered.
+
+Neither re-runs the execution settler, the shadow gate, or the receipt — a healed run keeps the receipt
+its original roster earned. Exit `0` healed · `1` failed again (for `reseat`, also anything that fails
+after the seat was spawned) · `3` a pre-spawn refusal — usage, a missing trail, a healthy seat, a
+malformed or incomplete seat packet, a worktree at a different head, a persisted prompt pinned at a
+different head than the run's gate packet, another reseat already running on the same run (they are
+serialized by an `O_EXCL` `reseat.lock` in the trail dir) — where nothing was billed.
+
 ### Configuring the seats — `reviewers.json` and `voices.json`
 
 Every seat is **config, not a hardcode** — two JSON files under `~/.ensemble-ai/` (each env-overridable: `ENSEMBLE_REVIEWERS_FILE` / `ENSEMBLE_VOICES_FILE`). Run `ensemble-ai config` (alias of `ensemble-ai reviewers`) to print the **resolved** seats — id · vendor · model · effort · sandbox, plus which file each came from — so what you see is exactly what the modes run. Neither file needs to exist; a missing or junk entry falls back to the baked default (a bad config can never silently disable a seat).

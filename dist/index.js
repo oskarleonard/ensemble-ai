@@ -2228,7 +2228,7 @@ function remoteSlug(url) {
   return m ? `${m[1].toLowerCase()}/${m[2].toLowerCase()}` : null;
 }
 function redactUrlCredentials(url) {
-  return url.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@]*@/, "$1***@");
+  return url.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@\s]*@/g, "$1***@");
 }
 function classifyGitError(stderr) {
   const s = stderr.toLowerCase();
@@ -2926,6 +2926,11 @@ var REVIEW_ADAPTERS = {
   grok: runGrokReview
 };
 
+// src/core/sanitize.ts
+function scrubControl(s) {
+  return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
 // src/modes/review/dep-surface.ts
 var MANIFEST_PATTERNS = [
   { label: "npm", re: /(^|\/)package\.json$/ },
@@ -3603,11 +3608,6 @@ function applyHolisticPolicy(records, entryById, deps) {
   });
 }
 
-// src/core/sanitize.ts
-function scrubControl(s) {
-  return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
-}
-
 // src/modes/review/gate-prompt.ts
 var holisticClause = `
 - Holistic-lens findings (findingIds beginning \`${HOLISTIC_SEAT_ID}#\`) are ARCHITECTURE claims from
@@ -3936,12 +3936,13 @@ function sandboxProfilesFor(quals) {
   }
   return map;
 }
+var WORKTREE_SUFFIX_HEADER = "## Whole-project evidence \u2014 you are running inside the project";
 function worktreePromptSuffix(args) {
   const range = args.baseSha ? `
 The change under review is exactly: git diff ${args.baseSha}...${args.headSha}` : "";
   return `
 
-## Whole-project evidence \u2014 you are running inside the project
+${WORKTREE_SUFFIX_HEADER}
 
 The full project at the PR head is checked out READ-ONLY at ${args.worktree} (detached at ${args.headSha}), and it is your working directory.${range}
 Read any file there for whole-project context: a finding may cite an UNCHANGED file (a reinvented
@@ -4257,10 +4258,18 @@ async function runReviewMode(opts) {
         runId: opts.runId,
         ...wt ? { worktree: wt.dir, worktreePrompt } : {}
       });
-      const cause = seat.review.terminalState === "reviewed" ? "" : ` \u2014 ${seat.review.summary.replace(/\s+/g, " ").slice(0, 200)}`;
+      const cause = seat.review.terminalState === "reviewed" ? "" : ` \u2014 ${scrubControl(seat.review.summary).slice(0, 200)}`;
       log(
         `  \xB7 ${id}: ${seat.review.terminalState} \u2014 ${seat.review.findings.length} finding(s) \xB7 evidence ${seat.realized}${cause}`
       );
+      if (seat.review.terminalState !== "reviewed") {
+        log(
+          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat ${wt ? "<pr-url> --repo <path-to-your-clone> " : ""}--seat ${id} --out '${opts.out}' --run-id ${opts.runId}${opts.sandbox ? ` --sandbox ${opts.sandbox}` : ""}${opts.reviewersFile ? ` --reviewers-file '${opts.reviewersFile}'` : ""}`
+        );
+        log(
+          "  \xB7   (without --repo the retried seat AND the whole-run regate fall back to PACKET evidence)"
+        );
+      }
       return [id, seat];
     })
   );

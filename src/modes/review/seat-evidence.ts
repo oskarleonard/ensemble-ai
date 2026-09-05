@@ -148,6 +148,10 @@ export function sandboxProfilesFor(quals: SeatQualifications): SandboxProfileMap
 
 // ── The seat prompt's worktree preamble ───────────────────────────────────────────────
 
+// The preamble's header — exported so a re-run (modes/review/reseat.ts) can strip a persisted
+// prompt at exactly this line and re-append a fresh preamble; the two can never drift.
+export const WORKTREE_SUFFIX_HEADER = '## Whole-project evidence — you are running inside the project';
+
 // PURE: what a worktree-fed CODEX/GROK seat is told, appended to the pinned packet prompt. The
 // packet stays the change under review (and the gate still grounds citations against the pinned
 // reviewer-visible diff); the preamble adds what the packet structurally cannot carry — the whole
@@ -171,7 +175,7 @@ export function worktreePromptSuffix(args: {
     : '';
   return `
 
-## Whole-project evidence — you are running inside the project
+${WORKTREE_SUFFIX_HEADER}
 
 The full project at the PR head is checked out READ-ONLY at ${args.worktree} (detached at ${args.headSha}), and it is your working directory.${range}
 Read any file there for whole-project context: a finding may cite an UNCHANGED file (a reinvented
