@@ -31,6 +31,12 @@ const LOCK_PACKET: ReviewPacket = {
   sections: [{ body: 'diff --git a/x.ts b/x.ts\n+const a = 1;', included: true, note: 'the change under review', title: 'The diff', truncated: false }],
 };
 
+// A packet-mode persisted prompt. It ENDS WITH A NEWLINE because every real one does
+// (`renderReviewPrompt` returns `${head}\n\n${body}\n\n${ask}\n`) — and that newline is the
+// structural lock `splitWorktreePrompt` classifies on, so a fixture without it is not a packet
+// prompt at all: it is a prompt carrying a preamble this version cannot read, and is rightly refused.
+const PINNED = 'PINNED PROMPT\n';
+
 const BASE = 'b'.repeat(40);
 const HEAD = 'c'.repeat(40);
 const ATTACKER_BASE = '9'.repeat(40);
@@ -64,21 +70,21 @@ const SKEWED_PREAMBLE = worktreePromptSuffix({
 
 describe('splitWorktreePrompt — recover the pinned packet prompt from a persisted seat prompt', () => {
   it('returns a packet-mode prompt unchanged', () => {
-    expect(splitWorktreePrompt('PINNED PROMPT')).toEqual({ baseSha: null, hadWorktree: false, packetPrompt: 'PINNED PROMPT', preambleHeadSha: null, unverifiedTail: false });
+    expect(splitWorktreePrompt(PINNED)).toEqual({ baseSha: null, hadWorktree: false, packetPrompt: PINNED, preambleHeadSha: null, unverifiedTail: false });
   });
 
   it('strips the worktree preamble at the shared header and recovers the base SHA', () => {
-    const prompt = 'PINNED PROMPT' + worktreePromptSuffix({ baseSha: BASE, headSha: HEAD, worktree: '/tmp/old-worktree' });
+    const prompt = PINNED + worktreePromptSuffix({ baseSha: BASE, headSha: HEAD, worktree: '/tmp/old-worktree' });
     expect(prompt).toContain(WORKTREE_SUFFIX_HEADER);
     const split = splitWorktreePrompt(prompt);
-    expect(split.packetPrompt).toBe('PINNED PROMPT');
+    expect(split.packetPrompt).toBe(PINNED);
     expect(split.hadWorktree).toBe(true);
     expect(split.baseSha).toBe(BASE);
   });
 
   it('a preamble with no base range yields baseSha null', () => {
-    const prompt = 'P' + worktreePromptSuffix({ baseSha: null, headSha: HEAD, worktree: '/tmp/w' });
-    expect(splitWorktreePrompt(prompt)).toEqual({ baseSha: null, hadWorktree: true, packetPrompt: 'P', preambleHeadSha: HEAD, unverifiedTail: false });
+    const prompt = 'P\n' + worktreePromptSuffix({ baseSha: null, headSha: HEAD, worktree: '/tmp/w' });
+    expect(splitWorktreePrompt(prompt)).toEqual({ baseSha: null, hadWorktree: true, packetPrompt: 'P\n', preambleHeadSha: HEAD, unverifiedTail: false });
   });
 
   // The persisted prompt embeds every packet section body RAW — the PR description among them — so
@@ -99,10 +105,10 @@ describe('splitWorktreePrompt — recover the pinned packet prompt from a persis
   // `packetPrompt` would hand a worktree retry TWO preambles, and would re-silence the downgrade
   // record and the recovered base. It is flagged, and the reseat is refused.
   it('a version-skewed preamble is flagged unverified, never silently kept as body', () => {
-    expect(splitWorktreePrompt('PINNED PROMPT\n' + SKEWED_PREAMBLE)).toEqual({
+    expect(splitWorktreePrompt(PINNED + SKEWED_PREAMBLE)).toEqual({
       baseSha: null,
       hadWorktree: true,
-      packetPrompt: 'PINNED PROMPT\n' + SKEWED_PREAMBLE,
+      packetPrompt: PINNED + SKEWED_PREAMBLE,
       preambleHeadSha: null, // nothing recovered from a tail the rebuild could not verify
       unverifiedTail: true,
     });
@@ -121,7 +127,7 @@ describe('splitWorktreePrompt — recover the pinned packet prompt from a persis
   // The head the preamble was pinned at is recovered, not discarded: it is the ONLY record of which
   // commit the persisted prompt described, and the reseat gate compares it against the pinned packet.
   it('recovers the head the verified preamble was pinned at', () => {
-    const prompt = 'P' + worktreePromptSuffix({ baseSha: BASE, headSha: HEAD, worktree: '/tmp/w' });
+    const prompt = 'P\n' + worktreePromptSuffix({ baseSha: BASE, headSha: HEAD, worktree: '/tmp/w' });
     expect(splitWorktreePrompt(prompt).preambleHeadSha).toBe(HEAD);
   });
 });
@@ -194,8 +200,7 @@ const adapterDenied: ReviewAdapter = async () => ({ egressDenials: [DENIAL], ok:
 // renderer — a hand-typed approximation is not a preamble this engine emitted, and the split's
 // rebuild proof (rightly) refuses to trust one.
 const OLD_WORKTREE_PROMPT =
-  'PINNED PROMPT' +
-  worktreePromptSuffix({ baseSha: BASE, headSha: RUN_HEAD, worktree: '/tmp/reaped-long-ago' });
+  PINNED + worktreePromptSuffix({ baseSha: BASE, headSha: RUN_HEAD, worktree: '/tmp/reaped-long-ago' });
 
 // A minimal, fully typed RegateResult — what the injected regate seam returns instead of a gate spawn.
 const REGATE_OK: RegateResult = {
@@ -208,12 +213,12 @@ const REGATE_OK: RegateResult = {
 
 // Exactly what a real run with a dead grok leaves behind: a reviewed codex, a failed grok stub
 // whose prompt carries the OLD worktree preamble, and the pinned gate packet.
-function seedRun(grokPrompt = 'PINNED PROMPT'): { base: string; runId: string } {
+function seedRun(grokPrompt = PINNED): { base: string; runId: string } {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-reseat-'));
   const runId = 'reseat-run';
   persistReview(base, {
     findings: [{ body: 'b', confidence: 'high', evidence: { file: 'src/x.ts', line: 3 }, id: 'f1', severity: 'high', title: 'shared bug' }],
-    packet: PACKET, prompt: 'PINNED PROMPT', raw: '{}', reviewer: CODEX, runId, summary: 'codex summary', terminalState: 'reviewed',
+    packet: PACKET, prompt: PINNED, raw: '{}', reviewer: CODEX, runId, summary: 'codex summary', terminalState: 'reviewed',
   });
   persistReview(base, {
     findings: [], packet: PACKET, prompt: grokPrompt, raw: null, reviewer: GROK, runId,
@@ -232,7 +237,7 @@ describe('readSeatArtifacts', () => {
     expect('error' in art).toBe(false);
     if ('error' in art) return;
     expect(art.stored.terminalState).toBe('failed-reviewer');
-    expect(art.prompt).toBe('PINNED PROMPT');
+    expect(art.prompt).toBe(PINNED);
     expect(art.packet.repo).toBe('acme/webapp');
   });
 
@@ -277,7 +282,7 @@ describe('reseatRefusal — the pre-spawn refusals, in one set of words', () => 
 
   // The CLI path for the version-skewed preamble: the same string, before anything is billed.
   it('names a preamble this engine version cannot verify', () => {
-    const { base, runId } = seedRun('PINNED PROMPT\n' + SKEWED_PREAMBLE);
+    const { base, runId } = seedRun(PINNED + SKEWED_PREAMBLE);
     expect(reseatRefusal(base, runId, 'grok')).toBe(
       "seat grok's persisted prompt carries a worktree preamble this engine version cannot verify (the run was written by another ensemble-ai version) — refusing to retry on an unverifiable pinned prompt; re-run the review instead"
     );
@@ -364,7 +369,9 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     expect(res.realized).toBe('worktree');
     expect(seen).toHaveLength(1);
     expect(seen[0].worktree).toBe(wt);
-    expect(seen[0].prompt.startsWith('PINNED PROMPT\n\n## Whole-project evidence')).toBe(true);
+    // Three newlines, not two: the packet prompt's own trailing '\n' plus the suffix's leading
+    // '\n\n'. That is what production persists, and the split's lastIndexOf('\n\n' + header) reads it.
+    expect(seen[0].prompt.startsWith('PINNED PROMPT\n\n\n## Whole-project evidence')).toBe(true);
     expect(seen[0].prompt).toContain(wt);
     expect(seen[0].prompt).not.toContain('/tmp/reaped-long-ago');
     expect(seen[0].prompt).toContain(`git diff ${BASE}...${RUN_HEAD}`); // base recovered from the OLD prompt
@@ -425,7 +432,7 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     // The seat never got the tree, and never heard about one.
     expect(seen).toHaveLength(1);
     expect(seen[0].worktree).toBeUndefined();
-    expect(seen[0].prompt).toBe('PINNED PROMPT');
+    expect(seen[0].prompt).toBe(PINNED);
     // Named exactly ONCE (the evidence-mode line says 'packet evidence', lowercase).
     expect(logs.filter((l) => l.includes('PACKET'))).toHaveLength(1);
     const synth = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'claude-synthesis.json'), 'utf8')) as {
@@ -476,7 +483,7 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
   });
 
   it('refuses a persisted prompt whose preamble this version cannot re-render', async () => {
-    const { base, runId } = seedRun('PINNED PROMPT\n' + SKEWED_PREAMBLE);
+    const { base, runId } = seedRun(PINNED + SKEWED_PREAMBLE);
     let spawns = 0;
     const adapter: ReviewAdapter = async () => { spawns += 1; return { ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false }; };
     await expect(
@@ -547,7 +554,7 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
   it('refuses a persisted prompt whose preamble was pinned at a DIFFERENT head', async () => {
     const otherHead = 'f'.repeat(40);
     const { base, runId } = seedRun(
-      'PINNED PROMPT' + worktreePromptSuffix({ baseSha: BASE, headSha: otherHead, worktree: '/tmp/other-head-wt' })
+      PINNED + worktreePromptSuffix({ baseSha: BASE, headSha: otherHead, worktree: '/tmp/other-head-wt' })
     );
     const err = `seat grok's persisted prompt was pinned at ${otherHead.slice(0, 12)} but the run's gate packet is at ${RUN_HEAD.slice(0, 12)} — refusing to retry across heads`;
     expect(reseatRefusal(base, runId, 'grok')).toBe(err);
@@ -584,5 +591,27 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     const { base, runId } = seedRun();
     const res = await runReseat({ adapter: adapterOk, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId, seat: 'grok' });
     expect(res.fallbackReason).toBeNull();
+  });
+});
+
+describe('splitWorktreePrompt — a preamble whose header this version cannot find is unverified, never body', () => {
+  it('a non-newline-terminated prompt with an unrecognisable header refuses instead of keeping the tail', () => {
+    const skewedHeader = 'PINNED PROMPT\n\n## Whole-project evidence — a header wording from another version\n\nThe full project at the PR head is checked out READ-ONLY at /tmp/x (detached at ' + 'c'.repeat(40) + '), and it is your working directory.';
+    expect(skewedHeader.endsWith('\n')).toBe(false);
+    const split = splitWorktreePrompt(skewedHeader);
+    expect(split.unverifiedTail).toBe(true);
+    expect(split.hadWorktree).toBe(true);
+    expect(split.packetPrompt).toBe(skewedHeader);
+    expect(split.baseSha).toBeNull();
+  });
+
+  // The other half of that rule, and the reason it is safe to be this strict: a REAL packet prompt
+  // is newline-terminated and carries no header, so it is still classified as packet mode. The
+  // refusal above costs a re-review only for prompts that genuinely have an unreadable tail.
+  it('a newline-terminated prompt with no header is still packet mode', () => {
+    const real = renderReviewPrompt(LOCK_PACKET);
+    expect(real.endsWith('\n')).toBe(true);
+    expect(real).not.toContain(WORKTREE_SUFFIX_HEADER);
+    expect(splitWorktreePrompt(real)).toEqual({ baseSha: null, hadWorktree: false, packetPrompt: real, preambleHeadSha: null, unverifiedTail: false });
   });
 });

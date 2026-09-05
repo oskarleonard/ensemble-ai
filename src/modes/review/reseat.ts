@@ -79,15 +79,13 @@ export function splitWorktreePrompt(prompt: string): SplitPrompt {
   // range'. An edit to either renderer that breaks the lock fails THERE, at its cause, instead of
   // surfacing here as a mis-split.
   if (prompt.endsWith('\n')) return asPacket;
-  const idx = prompt.lastIndexOf(`\n\n${WORKTREE_SUFFIX_HEADER}`);
-  if (idx === -1) return asPacket;
-  // A preamble IS present. From here the only two honest answers are "split it" and "I cannot read
-  // this" — never "keep it as body": that would re-send the stale preamble to the retried seat
-  // (two preambles, one naming a reaped dir), and would silently drop the downgrade record and the
-  // recovered base with it. VERSION SKEW is the ordinary cause: the proof compares against what the
-  // CURRENTLY installed renderer emits, so any edit to that text (down to a filename appearing in
-  // the stripped-instruction list the untrusted clause interpolates) invalidates every prompt
-  // persisted before it.
+  // A preamble IS present (no packet prompt ends without a newline). From here the only two honest
+  // answers are "split it" and "I cannot read this" — never "keep it as body": that would re-send
+  // the stale preamble to the retried seat (two preambles, one naming a reaped dir), and would
+  // silently drop the downgrade record and the recovered base with it. VERSION SKEW is the ordinary
+  // cause: the proof compares against what the CURRENTLY installed renderer emits, so any edit to
+  // that text (down to a filename appearing in the stripped-instruction list the untrusted clause
+  // interpolates — or to the header line itself) invalidates every prompt persisted before it.
   const unverified: SplitPrompt = {
     baseSha: null,
     hadWorktree: true,
@@ -95,6 +93,10 @@ export function splitWorktreePrompt(prompt: string): SplitPrompt {
     preambleHeadSha: null,
     unverifiedTail: true,
   };
+  const idx = prompt.lastIndexOf(`\n\n${WORKTREE_SUFFIX_HEADER}`);
+  // The header itself is part of the versioned text: a preamble whose header we cannot even find
+  // is the same unreadable tail as one that fails the byte proof below — refuse, never keep.
+  if (idx === -1) return unverified;
   const tail = prompt.slice(idx);
   const named = tail.match(/checked out READ-ONLY at (.+?) \(detached at ([^)\n]+)\)/);
   if (!named) return unverified;
@@ -167,7 +169,9 @@ type ReseatGate = { art: SeatArtifacts; headSha: string; split: SplitPrompt } | 
 
 // The pre-spawn refusals, in the order that costs least. The pinned packet grounds everything; a
 // mis-materialized tree is refused before a single artifact is read (a wrong tree costs nothing);
-// then the seat's own artifacts; then a seat that is not actually dead.
+// then the seat's own artifacts (shape-validated); then a persisted prompt whose preamble this
+// engine version cannot verify, or that was pinned at another head; then a seat that is not
+// actually dead.
 //
 // FAIL CLOSED on a mis-materialized worktree: the packet is the pinned description of ONE head, so a
 // tree checked out at another commit would ground the seat's file:line citations against code the

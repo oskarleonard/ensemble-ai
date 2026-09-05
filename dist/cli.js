@@ -8048,10 +8048,6 @@ function splitWorktreePrompt(prompt) {
     unverifiedTail: false
   };
   if (prompt.endsWith("\n")) return asPacket;
-  const idx = prompt.lastIndexOf(`
-
-${WORKTREE_SUFFIX_HEADER}`);
-  if (idx === -1) return asPacket;
   const unverified = {
     baseSha: null,
     hadWorktree: true,
@@ -8059,6 +8055,10 @@ ${WORKTREE_SUFFIX_HEADER}`);
     preambleHeadSha: null,
     unverifiedTail: true
   };
+  const idx = prompt.lastIndexOf(`
+
+${WORKTREE_SUFFIX_HEADER}`);
+  if (idx === -1) return unverified;
   const tail = prompt.slice(idx);
   const named = tail.match(/checked out READ-ONLY at (.+?) \(detached at ([^)\n]+)\)/);
   if (!named) return unverified;
