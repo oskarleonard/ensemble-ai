@@ -191,6 +191,11 @@ export interface HolisticPromptArgs {
 // PURE: the whole-tree architecture prompt. Encoded as data so a unit test pins the exact
 // contract — every clause here has a mechanical counterpart in holistic-gate.ts, so the lens is
 // never asked for something the host does not verify, nor verified against something unstated.
+//
+// NO CI EVIDENCE, deliberately: this lens answers "is this a reinvention of something the tree
+// already has", a question the head's check runs cannot inform. The section would cost the lens
+// budget and pull it toward the correctness findings the reviewer seats already own. The
+// `code-review` producer and every packet seat get it; this one does not.
 export function renderHolisticPrompt(args: HolisticPromptArgs): string {
   const history = args.history ? `\n\n${HISTORY_PACKET_CLAUSE}` : '';
   return `You are the HOLISTIC / ARCHITECTURE lens of a multi-model code review, reviewing someone

@@ -241,15 +241,21 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, gate 
   // lens, so handing it to a `security` run would silently drop the security-auditor objective
   // while still counting the seat as a completed reviewer.
   describe('the worktree producer prompt respects the review PROFILE', () => {
-    const producerPromptFor = async (profile: 'code' | 'security'): Promise<string> => {
+    // `extra` is how a CI-evidence test reaches the producer prompt: the layer is the ONLY path
+    // from the CLI's gathered text to `renderCodeReviewSeatPrompt`, so it is the seam to pin.
+    const producerPromptFor = async (
+      profile: 'code' | 'security',
+      extra: Partial<Parameters<typeof runClaudeReviewLayer>[0]> = {}
+    ): Promise<string> => {
       const base = tmpTrail();
-      const runId = `p-${profile}`;
+      const runId = `p-${profile}-${Object.keys(extra).join('-') || 'plain'}`;
       seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
       const { calls, run } = makeRunner();
       await runClaudeReviewLayer({
         baseDir: base,
         baseSha: 'b'.repeat(40),
         claudeConfig: CFG,
+        ...extra,
         coreReviews: [stored('codex'), stored('grok')],
         expectedHeadSha: HEAD,
         includeClaudeReviewer: true,
@@ -284,6 +290,39 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, gate 
       // Its packet prompt already carries the diff, so the suffix adds the tree, not a git command.
       expect(prompt).toMatch(/NOT your working directory/);
       expect(prompt).not.toMatch(/Run that command/);
+    });
+
+    // THE CI-EVIDENCE THREAD (incident 2026-08-10). This producer does not read the packet prompt,
+    // so the packet's CI section reaches it only through this layer. Every hop below the renderer
+    // is unit-tested; this pins the hop the renderer cannot see — that the layer actually hands
+    // its argument on, rather than dropping it one call short of the prompt.
+    it('hands the gathered CI evidence down into the producer prompt', async () => {
+      const prompt = await producerPromptFor('code', { ciEvidence: 'CI-MARKER-TEXT' });
+      expect(prompt).toContain('CI-MARKER-TEXT');
+      expect(prompt).toContain('## CI evidence (checks + annotations at the PR head)');
+    });
+
+    it('hands a FAILED fetch down as the loud unavailable note, not as silence', async () => {
+      const prompt = await producerPromptFor('code', {
+        ciEvidenceUnavailable: 'CI-UNAVAILABLE-MARKER',
+      });
+      expect(prompt).toContain('CI-UNAVAILABLE-MARKER');
+      expect(prompt).toContain('CI evidence UNAVAILABLE');
+    });
+
+    // THE ONE BOTH-FIELDS RULE (ci-evidence.resolveCiEvidence) is applied at THIS hop too, not
+    // only inside the renderer: the layer must hand the producer the same account of the head the
+    // packet seats were given, or the two arbitrations can differ and one seat reads evidence the
+    // engine had already decided not to trust.
+    it('a caller that passes BOTH reaches the producer as UNAVAILABLE, with no evidence body', async () => {
+      const prompt = await producerPromptFor('code', {
+        ciEvidence: 'CI-MARKER-TEXT',
+        ciEvidenceUnavailable: 'CI-UNAVAILABLE-MARKER',
+      });
+      expect(prompt).not.toContain('CI-MARKER-TEXT');
+      expect(prompt).toContain(
+        'CI evidence UNAVAILABLE: caller supplied both CI evidence and an unavailability reason — treated as unavailable'
+      );
     });
 
     it('`code` WITHOUT the pinned diff keeps the packet prompt — never a blind skill run', async () => {

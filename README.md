@@ -10,7 +10,7 @@ It's the portable engine behind a cross-vendor *code review* workflow: give it a
 
 | Command | What it does | Key flags |
 | --- | --- | --- |
-| `ensemble-ai review [<pr-url>]` | Self-contained cross-vendor code review — Codex + Grok + a cold Opus as blind peers, then a Claude **gate** grounds each finding (`agree`/`partial`/`false`/`unverified`) + a synthesis. | source: `--pr <N\|url>` · `--staged` · `--working-tree` · `--diff-file <p>` · stdin (default: current branch) · `--reviewers <ids>` · `--no-claude` · gate: `--strict-high` · `--gate-dismissals` · `--gate-model`/`--gate-effort` · `--shadow-gate` (+ `--shadow-gate-effort`) · `--claude-model`/`--claude-effort` · `--holistic` + `--holistic-model`/`--holistic-effort` · `--no-fail-on-high` · **`--stage`** (stage a PENDING review; needs a PR **URL**) · `--post-comment` (deprecated) · `--out <dir>` |
+| `ensemble-ai review [<pr-url>]` | Self-contained cross-vendor code review — Codex + Grok + a cold Opus as blind peers, then a Claude **gate** grounds each finding (`agree`/`partial`/`false`/`unverified`) + a synthesis. | source: `--pr <N\|url>` · `--staged` · `--working-tree` · `--diff-file <p>` · stdin (default: current branch) · `--reviewers <ids>` · `--no-claude` · gate: `--strict-high` · `--gate-dismissals` · `--gate-model`/`--gate-effort` · `--shadow-gate` (+ `--shadow-gate-effort`) · `--claude-model`/`--claude-effort` · `--holistic` + `--holistic-model`/`--holistic-effort` · `--no-fail-on-high` · `--no-ci-evidence` · **`--stage`** (stage a PENDING review; needs a PR **URL**) · `--post-comment` (deprecated) · `--out <dir>` |
 | `ensemble-ai security [<pr-url>]` | `review` under a security-auditor lens + a local dependency-surface flag; findings tagged by class. | identical to `review` (same sources, gate flags, `--stage`) |
 | `ensemble-ai brainstorm "<topic>"` | Cross-vendor ideation: each voice generates → critiques the others → one synthesizes a ranked, deduped recommendation. | `--file <p>` · `--voices <ids>` · `--synthesizer <id>` · `--timeout <s>` · `--json` |
 | `ensemble-ai consult "<q>"` (alias `ask`) | Cross-vendor Q&A: each voice answers independently → one synthesizes AGREE (confident) vs DIVERGE (look closer) + a bottom line. | `--file <p>` · `--critique` · `--voices <ids>` · `--synthesizer <id>` · `--json` |
@@ -153,6 +153,33 @@ Outside macOS the codex seat falls back to the packet.
 **The gate reads the same worktree**, which makes it an evidence-bearing actor in its own right. On worktree evidence it may emit a new downgrade cause, **`reference-not-found`** — "I could not locate what this finding references at `headSha`", the hallucinated-reference red flag — alongside the existing `truncated` / `missing`. The gate is **taught** the cause only when its realized evidence is `worktree`, and the host **honors** it only then: a gate that saw a ±25-line window cannot distinguish "does not exist" from "outside my window", so a packet-fed gate is never told the cause exists, and a cause arriving on packet evidence anyway is dropped with a warning. Teaching and honoring are gated on the same fact. Consumers opt in by keying on the cause; old artifacts keep their meaning.
 
 **The Claude producer** in worktree mode runs the built-in `/code-review` methodology (bugs + structural quality — never style or naming nits) with whole-project context, and maps its findings into the same schema Codex and Grok emit. One Claude producer, not two: same-family corroboration is weak signal and pure dedup load.
+
+### CI evidence — the checks' own output, in the packet
+
+On the PR path the engine fetches the head commit's **check runs, their annotations, and its commit
+statuses** through `gh` and hands them to every seat as a budgeted **"CI evidence"** packet section
+(after the changed files, before the conventions). The reviewer ask carries a standing clause: a
+check's *conclusion* is not the evidence — its annotations and output are — and a **warning or
+notice annotation whose text is an error is a downgraded failure**, i.e. a finding candidate.
+
+Why (incident 2026-08-10): the worst defect of a reviewed change — a migration the database
+refused — was printed verbatim in a *green* job whose validation step downgraded the error to a
+`::warning`. Every reader reviewed the SQL as text; the machine's own result sat unread.
+
+- Default **on** for `--pr`/URL sources; `--no-ci-evidence` opts out. A local diff has no checks.
+- Best-effort: a `gh` failure renders a loud **UNAVAILABLE** section with the reason and one stderr
+  line — it never blocks a review.
+- Same trust class as the diff and the PR description (repo-CI text the seats already receive).
+  Scanned **twice**: every untrusted field before truncation (a hit renders `[redacted: <kind>]` in
+  place, keeping the rest of the evidence), then the whole rendered text (a hit there **withholds**
+  the section). Check output is leakier than a diff — machine-printed, so it echoes headers and
+  exported tokens — so it is scanned with extra patterns the diff scan never uses.
+- Unlike the diff, check output can carry text from installed apps and bots (not the repo owner or
+  the PR author) and URLs pointing at internal CI hosts — the section is hedged as untrusted data in
+  every prompt, a URL is rendered only as `http(s)` without query, fragment, or userinfo, and
+  `--no-ci-evidence` opts out per run.
+- Caps: 10 annotated checks × 25 annotations, ~14k chars structurally, 16k in the packet budget.
+- The rendered body also lands in the trail as `ci-evidence.md`.
 
 ### Reviewing someone else's PR — `--stage`
 

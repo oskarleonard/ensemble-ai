@@ -45,6 +45,13 @@ describe('renderReviewPrompt — code profile (default)', () => {
     expect(p).toContain('VISIBILITY↔ADDRESSABILITY PARITY');
     expect(p).toContain('LEAST-privileged caller');
   });
+
+  it('asks for the CI-evidence read (a warning wrapping an error is a downgraded failure)', () => {
+    const p = renderReviewPrompt(packet, 'code');
+    expect(p).toContain('CI EVIDENCE');
+    expect(p).toContain('DOWNGRADED FAILURE');
+    expect(p).toContain('A green job is not proof of correctness');
+  });
 });
 
 describe('renderReviewPrompt — security profile', () => {
@@ -66,6 +73,18 @@ describe('renderReviewPrompt — security profile', () => {
   it('keeps the SAME strict findings output contract + embedded diff', () => {
     expect(p).toContain('## Output format — STRICT');
     expect(p).toContain('const a = 1;');
+  });
+
+  // The head's own check output is evidence for an auditor too: a migration the database refused,
+  // a dependency install that soft-failed, a secret-scanner step downgraded to a warning — all of
+  // it lands in the CI section, and an auditor that never reads it audits the diff as text. The
+  // clause is shared with the code ask verbatim, so it cannot drift on one profile only.
+  it('carries the SAME CI-evidence clause as the code ask', () => {
+    expect(p).toContain('CI EVIDENCE');
+    expect(p).toContain('DOWNGRADED FAILURE');
+    expect(p).toContain('A green job is not proof of correctness');
+    const clause = (t: string): string => t.slice(t.indexOf('CI EVIDENCE'), t.indexOf('output contradicts it.'));
+    expect(clause(p)).toBe(clause(renderReviewPrompt(packet)));
   });
 });
 

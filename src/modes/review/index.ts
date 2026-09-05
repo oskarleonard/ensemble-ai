@@ -21,6 +21,7 @@ import {
 } from '../../core/types';
 import { REVIEW_ADAPTERS } from '../../reviewers/registry';
 
+import { CI_EVIDENCE_BOTH_REASON, CI_EVIDENCE_TRAIL_FILE, resolveCiEvidence } from './ci-evidence';
 import {
   acquireDiff,
   type AcquiredDiff,
@@ -94,6 +95,11 @@ export interface ReviewModeOptions {
   authorSummary?: string;
   base?: string;
   ceilingBytes?: number;
+  // CI evidence for the PR head (modes/review/ci-evidence.ts) — the rendered text, or the reason a
+  // fetch failed. Either one makes the packet render its CI section (loud when unavailable).
+  // The two are MUTUALLY EXCLUSIVE: evidence, or the reason there is none — never both.
+  ciEvidence?: string;
+  ciEvidenceUnavailable?: string;
   // Cap (bytes) on the gathered conventions text (default in gatherConventions).
   conventionCapBytes?: number;
   // Explicit convention paths (`.ensemble-ai.json` / `--conventions`) — additive.
@@ -294,10 +300,22 @@ export async function runReviewMode(
     );
   }
 
+  // ONE both-fields rule, owned by ci-evidence.ts and applied at every seam (this engine, the
+  // packet, the worktree producer). The drop is announced, not silent.
+  const ci = resolveCiEvidence(opts.ciEvidence, opts.ciEvidenceUnavailable);
+  const bothCiEvidence = ci.kind === 'unavailable' && ci.reason === CI_EVIDENCE_BOTH_REASON;
+  if (bothCiEvidence) {
+    log('CI evidence: caller supplied both text and an unavailable reason — treating as unavailable');
+  }
+  const ciEvidence = ci.kind === 'text' ? ci.text : undefined;
+  const ciEvidenceUnavailable = ci.kind === 'unavailable' ? ci.reason : undefined;
+
   const packet = assembleCodePacket({
     agentsBudget: conventionManifest?.capBytes,
     agentsMd,
     authorSummary: opts.authorSummary,
+    ciEvidence,
+    ciEvidenceUnavailable,
     diff: acquired.diff,
     directive: opts.directive,
     objective:
@@ -306,6 +324,15 @@ export async function runReviewMode(
     pr: 0,
     repo: acquired.repoId ?? '',
   });
+  // The rendered CI evidence joins the trail for humans + dashboards (best-effort, like every
+  // trail write). The packet manifest already records the section for the seats.
+  if (ciEvidence) {
+    try {
+      writeTrailFile(opts.out, opts.runId, CI_EVIDENCE_TRAIL_FILE, ciEvidence);
+    } catch {
+      /* trail write is best-effort */
+    }
+  }
   const prompt = renderReviewPrompt(packet, profile);
   if (!packet.complete) {
     log('Packet incomplete (no usable diff) — persisting an empty review.');

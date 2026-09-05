@@ -50,6 +50,38 @@ const INLINE_SECRET_PATTERNS: { label: string; re: RegExp }[] = [
   { label: 'google-api-key', re: /\bAIza[0-9A-Za-z_-]{35}\b/ },
 ];
 
+export interface TextSecretHit {
+  // The matched value is NOT recorded (it's a secret) — only its kind.
+  label: string;
+}
+
+// The first inline credential pattern any line of `lines` matches, else null. Shared by the diff
+// scan below and by any other text the engine ships to a vendor (CI evidence) — ONE base list,
+// plus whatever EXTRA patterns that caller's own surface needs.
+function firstInlineSecret(
+  lines: readonly string[],
+  extra?: readonly { label: string; re: RegExp }[]
+): TextSecretHit | null {
+  for (const { label, re } of extra ? [...INLINE_SECRET_PATTERNS, ...extra] : INLINE_SECRET_PATTERNS) {
+    if (lines.some((line) => re.test(line))) return { label };
+  }
+  return null;
+}
+
+// Scan arbitrary text (not a diff) for inline credentials. PURE.
+//
+// `extra` widens the list FOR THIS CALL ONLY. The DIFF scan below never passes it, so its
+// precision bar (high-confidence provider tokens, no heuristics) is unchanged by anything a
+// noisier surface needs: CI job output is machine-printed rather than human-authored, so it
+// carries shapes (`Authorization: Bearer …`, a JWT, a credentialed URL) that would be
+// false-positive noise on a hand-written diff and are plain leaks in a build log.
+export function scanTextForSecrets(
+  text: string,
+  extra?: readonly { label: string; re: RegExp }[]
+): TextSecretHit | null {
+  return firstInlineSecret(text.split('\n'), extra);
+}
+
 export interface SensitivePathHit {
   label: string;
   path: string;
@@ -102,9 +134,7 @@ export function scanDiffForSecrets(
     if (f.isBinary) continue;
     const lines = payloadLines(f.raw);
     for (const { label, re } of INLINE_SECRET_PATTERNS) {
-      if (lines.some((line) => re.test(line))) {
-        inlineSecrets.push({ label, path: f.path });
-      }
+      if (lines.some((line) => re.test(line))) inlineSecrets.push({ label, path: f.path });
     }
   }
   const hasRisk = sensitivePaths.length > 0 || inlineSecrets.length > 0;

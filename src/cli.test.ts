@@ -179,6 +179,19 @@ describe('mode dispatch + usage', () => {
     expect(await main(['review', '--help'])).toBe(0);
     expect(mockRun).not.toHaveBeenCalled();
   });
+
+  // FLAG PARITY. `security` is a PROFILE over `review` — one `reviewCommand`, one parseArgs, one
+  // CI-evidence gather — so `--no-ci-evidence` works there by construction. What could drift is
+  // the DOCUMENTATION: a security auditor who cannot find the opt-out has no way to know the
+  // gather is on, and it is on by default for every PR source.
+  it('security --help documents --no-ci-evidence (it runs the same gather as review)', async () => {
+    const logs: string[] = [];
+    vi.mocked(console.log).mockImplementation((...a: unknown[]) => {
+      logs.push(a.join(' '));
+    });
+    expect(await main(['security', '--help'])).toBe(0);
+    expect(logs.join('\n')).toContain('--no-ci-evidence');
+  });
 });
 
 describe('--post-comment', () => {
@@ -564,6 +577,18 @@ describe('profile selection (review vs security — same engine)', () => {
     expect(mockRun).toHaveBeenCalledWith(
       expect.objectContaining({ profile: 'security', workingTree: true })
     );
+  });
+
+  // FLAG PARITY, the executable half: `security` shares `reviewCommand`'s parseArgs, so the flag
+  // is recognized there — an unrecognized one is a usage error (exit 3) and the engine never runs.
+  it('security accepts --no-ci-evidence (the same parseArgs as review)', async () => {
+    mockRun.mockResolvedValue(result({ reviews: [storedReview('codex', 'reviewed')] }));
+    expect(await main(['security', '--working-tree', '--no-ci-evidence'])).toBe(0);
+    expect(mockRun).toHaveBeenCalled();
+    // …and the negative control: an unknown flag on the same command IS a usage error.
+    mockRun.mockClear();
+    expect(await main(['security', '--working-tree', '--definitely-not-a-flag'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
   });
 
   it('security honors the SAME HIGH gate (exit 4) as review', async () => {

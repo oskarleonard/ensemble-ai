@@ -5,6 +5,21 @@ import {
 } from '../modes/review/profile';
 import type { ReviewPacket } from './types';
 
+// The machine's own verdict on this change (incident 2026-08-10). It belongs to EVERY profile,
+// not just the general review: a security auditor reading a migration as text while the database's
+// refusal of it sits in a green job's annotations is the same blindness the code seat had. Shared
+// verbatim so the two asks cannot drift — the code profile's rendered text is unchanged.
+const CI_EVIDENCE_CLAUSE = [
+  'CI EVIDENCE: when the packet carries a "CI evidence" section, read it before you',
+  'judge whether the change builds, migrates, or passes its tests. A check’s',
+  'conclusion is not the evidence — its annotations and output are. A WARNING or',
+  'NOTICE annotation whose text is an error (a failed command, a database/compiler/',
+  'linter error, a skipped or soft-failed step) is a DOWNGRADED FAILURE: treat it as a',
+  'finding candidate, locate the code in the diff that produced it, and quote what the',
+  'machine reported verbatim. A green job is not proof of correctness when its own',
+  'output contradicts it.',
+].join('\n');
+
 // The general-review ask (the `code` profile): correctness + security + conventions.
 const CODE_ASK = [
   '## Your task',
@@ -34,6 +49,8 @@ const CODE_ASK = [
   'used, and the request that fails. If the diff (or its description) claims',
   'consumers need no change, test that claim against the least-privileged caller,',
   'not the author/owner perspective.',
+  '',
+  CI_EVIDENCE_CLAUSE,
 ].join('\n');
 
 // The `security` profile ask: an adversarial security-auditor framing. Same strict
@@ -56,6 +73,8 @@ function securityAsk(): string {
     'few high-signal, exploitable findings over many theoretical ones — but do NOT',
     'stay silent on a real vulnerability to keep the list short. Pure code-quality',
     'nits that are not security-relevant belong in a normal review, not here.',
+    '',
+    CI_EVIDENCE_CLAUSE,
   ].join('\n');
 }
 

@@ -38,6 +38,7 @@ import {
   runProbe,
 } from './modes/review/probe';
 import { runProbeGate } from './modes/review/probe-gate';
+import { type CiEvidenceResult, fetchCiEvidence } from './modes/review/ci-evidence';
 import {
   type BrainstormResult,
   isVoiceId,
@@ -248,6 +249,9 @@ Options:
                         (default OFF; skip it when a probe run covers the same PR).
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
+  --no-ci-evidence      do NOT fetch the PR head's check runs + annotations + statuses into the
+                        packet (PR path only; default ON — a green job's warning that wraps an
+                        error is exactly the evidence a seat never gathers on its own)
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
   --strict-high         force STRICT: EVERY HIGH gates (exit 4), even one the gate dismissed —
                         overrides the provenance default (use for untrusted diffs / CI)
@@ -331,7 +335,14 @@ Diff source (give at most ONE; default = current branch):
   --diff-file <path>   a raw unified diff read from a file
   (stdin)              a piped diff, e.g. \`git diff main...HEAD | ensemble-ai security\`
 
-Options + exit codes are identical to \`ensemble-ai review\` (run \`review --help\`).`;
+Options:
+  --no-ci-evidence      do NOT fetch the PR head's check runs + annotations + statuses into the
+                        packet (PR path only; default ON). \`security\` runs the SAME gather as
+                        \`review\` — a failing job's own output is often the first evidence of the
+                        very class this profile hunts (a leaked token echoed into a build log)
+  (all others)          identical to \`ensemble-ai review\` (run \`review --help\`)
+
+Exit codes are identical to \`ensemble-ai review\`.`;
 
 function genRunId(): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1143,6 +1154,7 @@ async function reviewCommand(
         holistic: { type: 'boolean' },
         'holistic-effort': { type: 'string' },
         'holistic-model': { type: 'string' },
+        'no-ci-evidence': { type: 'boolean' },
         'no-claude': { type: 'boolean' },
         'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
@@ -1386,12 +1398,44 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       );
   }
 
+  // CI EVIDENCE (modes/review/ci-evidence.ts): the head commit's check runs + annotations + commit
+  // statuses as DATA in the packet. PR path only (a local diff has no checks), default ON,
+  // best-effort: a gh failure degrades to a named UNAVAILABLE section — never blocks the review.
+  let ciEvidence: string | undefined;
+  let ciEvidenceUnavailable: string | undefined;
+  if (source.postTarget && !values['no-ci-evidence']) {
+    const gh = ghRunner(cwd);
+    const repoSlug = source.postTarget.repoSlug ?? repoSlugFromCwd(gh);
+    const ci: CiEvidenceResult = repoSlug
+      ? fetchCiEvidence({ gh, headSha: source.headShaOverride, pr: source.postTarget.pr, repoSlug })
+      : { error: 'could not resolve the PR repo (owner/repo)', ok: false };
+    if (ci.ok) {
+      ciEvidence = ci.text;
+      console.error(
+        `· CI evidence: ${ci.checks} check run(s) (${ci.failed} failed) · ${ci.annotations} annotation(s) · ${ci.text.length.toLocaleString('en-US')} chars${ci.truncated ? ' (truncated)' : ''}`
+      );
+    } else {
+      ciEvidenceUnavailable = ci.error;
+      console.error(
+        `· CI evidence: unavailable (${ci.error}) — reviewing without the head's check results`
+      );
+    }
+  }
+  // ONE resolution, ahead of BOTH consumers. The pair is mutually exclusive by contract, and
+  // `runReviewMode` enforces that by treating "both supplied" as unavailable — while the worktree
+  // producer renders whatever it is handed. Resolving here is what keeps the two from describing
+  // the same run differently: the packet seats reading UNAVAILABLE while the one Claude producer
+  // reads evidence the engine had already decided not to trust.
+  const ciText = ciEvidenceUnavailable ? undefined : ciEvidence;
+
   let result: ReviewModeResult;
   try {
     result = await runReviewMode({
       allowSensitive: Boolean(values['allow-sensitive']),
       base: typeof values.base === 'string' ? values.base : undefined,
       ceilingBytes,
+      ciEvidence: ciText,
+      ciEvidenceUnavailable,
       conventionCapBytes: conventionCap,
       conventionPaths,
       conventionReader,
@@ -1539,6 +1583,14 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       claudeLayer = await runClaudeReviewLayer({
         baseDir: out,
         baseSha: layerBaseSha,
+        // The worktree producer does NOT review the packet prompt (renderCodeReviewSeatPrompt
+        // replaces it), so the packet's CI section would miss the most valuable seat unless the
+        // text reaches it here — and a FAILED fetch has to reach it too, or that one seat cannot
+        // tell a broken `gh` from a head with no checks. Packet-mode producers already have both
+        // in the pinned prompt. `ciText` — the resolved pair, not the raw locals — so this seat
+        // and the packet seats can never be told different things about the same run.
+        ...(ciText ? { ciEvidence: ciText } : {}),
+        ...(ciEvidenceUnavailable ? { ciEvidenceUnavailable } : {}),
         claudeConfig: claudeSeat.config,
         // The conventions this run actually gathered — the docs a holistic finding may cite to
         // lift its MED severity cap (the gate re-reads the citation out of the tree regardless).
@@ -2777,6 +2829,10 @@ Usage:
 A cost-preview / debug of the EXACT packet the reviewers would receive: the diff
 identity + coverage, the per-section manifest (what the reviewer sees), and the
 prompt size — no vendor is called, nothing is spent.
+
+On a PR source this preview omits two sections \`review\` would add: the PR's own
+description (the directive) and the CI evidence — both are fetched through \`gh\`,
+so the real packet is LARGER than what this prints.
 
 Diff source (give at most ONE; default = current branch, like \`ensemble-ai review\`):
   (default)            <base>...HEAD — the current branch vs origin/HEAD
