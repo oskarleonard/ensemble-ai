@@ -379,6 +379,13 @@ export async function runReviewMode(
       log(
         `  · ${id}: ${seat.review.terminalState} — ${seat.review.findings.length} finding(s) · evidence ${seat.realized}${cause}`
       );
+      // …and names the remedy on the spot: the trail this run already wrote is enough to re-run
+      // JUST this seat, and the alternative a reader reaches for otherwise is re-billing everyone.
+      if (seat.review.terminalState !== 'reviewed') {
+        log(
+          `  · → retry just this seat: ensemble-ai reseat --seat ${id} --out ${opts.out} --run-id ${opts.runId}`
+        );
+      }
       return [id, seat] as const;
     })
   );

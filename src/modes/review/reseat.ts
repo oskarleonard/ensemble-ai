@@ -38,13 +38,31 @@ export interface SplitPrompt {
 }
 
 // PURE. The persisted `prompt.<seat>.md` is the packet prompt PLUS, in worktree mode, a preamble
-// naming the (long reaped) worktree dir. Strip at the shared header; never re-render the packet.
+// naming the (long reaped) worktree dir. Recover the packet prompt by PROVING the tail is a
+// preamble this engine emitted, never by trusting the header text alone.
+//
+// The header line is CONTRIBUTOR-CONTROLLED (incident 2026-09-02b review): the persisted prompt
+// embeds every packet section body raw — the PR description among them — so a PR body can contain
+// `\n\n## Whole-project evidence …` plus a `git diff <base>...<head>` line of its own. Splitting at
+// the FIRST occurrence then truncated the "byte-identical" pinned prompt (the diff and the findings
+// contract were cut away) and re-issued the preamble with an attacker-chosen base SHA. Two things
+// close it: the preamble is always appended LAST, and it is rendered — so from the candidate tail we
+// recover its three fields, re-render `worktreePromptSuffix` from them, and split ONLY if the prompt
+// ends with that exact rebuild. Anything else is packet-mode, unchanged.
 export function splitWorktreePrompt(prompt: string): SplitPrompt {
-  const idx = prompt.indexOf(`\n\n${WORKTREE_SUFFIX_HEADER}`);
-  if (idx === -1) return { baseSha: null, hadWorktree: false, packetPrompt: prompt };
-  const suffix = prompt.slice(idx);
-  const m = suffix.match(/git diff ([0-9a-f]{7,40})\.\.\.[0-9a-f]{7,40}/);
-  return { baseSha: m ? m[1] : null, hadWorktree: true, packetPrompt: prompt.slice(0, idx) };
+  const asPacket: SplitPrompt = { baseSha: null, hadWorktree: false, packetPrompt: prompt };
+  const idx = prompt.lastIndexOf(`\n\n${WORKTREE_SUFFIX_HEADER}`);
+  if (idx === -1) return asPacket;
+  const tail = prompt.slice(idx);
+  const named = tail.match(/checked out READ-ONLY at (.+?) \(detached at ([^)\n]+)\)/);
+  if (!named) return asPacket;
+  const base = tail.match(/git diff ([0-9a-f]{7,40})\.\.\.[0-9a-f]{7,40}/);
+  const baseSha = base ? base[1] : null;
+  const rebuilt = worktreePromptSuffix({ baseSha, headSha: named[2], worktree: named[1] });
+  // Byte-level proof: every other character of the preamble (the read-only clause, the untrusted-
+  // instruction clause, the anchor line) has to be there, in order, at the very end.
+  if (!prompt.endsWith(rebuilt)) return asPacket;
+  return { baseSha, hadWorktree: true, packetPrompt: prompt.slice(0, prompt.length - rebuilt.length) };
 }
 
 export interface SeatArtifacts {
@@ -80,6 +98,55 @@ export function readSeatArtifacts(
   return { packet, prompt, stored };
 }
 
+type ReseatGate = { art: SeatArtifacts; headSha: string } | { refusal: string };
+
+// The pre-spawn refusals, in the order that costs least. The pinned packet grounds everything; a
+// mis-materialized tree is refused before a single artifact is read (a wrong tree costs nothing);
+// then the seat's own artifacts; then a seat that is not actually dead.
+//
+// FAIL CLOSED on a mis-materialized worktree: the packet is the pinned description of ONE head, so a
+// tree checked out at another commit would ground the seat's file:line citations against code the
+// packet does not describe, and the gate would then verify them against the wrong text.
+function checkReseat(
+  baseDir: string,
+  runId: string,
+  seat: CoreReviewerId,
+  worktreeHeadSha?: string
+): ReseatGate {
+  const headSha = readGatePacketHeadSha(baseDir, runId);
+  if (!headSha) {
+    return {
+      refusal: `run ${runId} has no usable packet.gate.json under ${baseDir} — nothing to ground a reseat against (was this run made by \`review --out\`?)`,
+    };
+  }
+  if (worktreeHeadSha && worktreeHeadSha !== headSha) {
+    return {
+      refusal: `worktree is at ${worktreeHeadSha.slice(0, 12)} but run ${runId}'s pinned packet is at ${headSha.slice(0, 12)} — refusing to ground a retry on a different head`,
+    };
+  }
+  const art = readSeatArtifacts(baseDir, runId, seat);
+  if ('error' in art) return { refusal: art.error };
+  if (art.stored.terminalState === 'reviewed') {
+    return {
+      refusal: `seat ${seat} completed in run ${runId} — nothing to retry (re-running a healthy seat is a new review)`,
+    };
+  }
+  return { art, headSha };
+}
+
+// Why this run may NOT be reseated, in the exact words the caller should print — or null when it may.
+// The CLI preflights through this and `runReseat` throws through it, so the two can never drift and
+// the CLI can refuse (exit 3) BEFORE it bills a seat spawn.
+export function reseatRefusal(
+  baseDir: string,
+  runId: string,
+  seat: CoreReviewerId,
+  worktreeHeadSha?: string
+): string | null {
+  const pre = checkReseat(baseDir, runId, seat, worktreeHeadSha);
+  return 'refusal' in pre ? pre.refusal : null;
+}
+
 export interface ReseatOptions {
   adapter: ReviewAdapter;
   baseDir: string;
@@ -104,6 +171,10 @@ export interface ReseatResult {
   // reseat that reached for a host outside its vendor allowlist must not be quieter than the fan-out
   // that produced the dead seat in the first place.
   egressDenials: readonly EgressDenial[];
+  // true ⇔ the dead attempt reviewed IN-PROJECT and this retry read only the packet. A weaker run
+  // than the one it replaces — said aloud by the module's log, stamped into the `reseats[]` entry,
+  // and carried here for a caller that decides what to heal next.
+  evidenceDowngraded: boolean;
   // Why the seat did not get the worktree it was asked for (unqualified sandbox, or a wrapper that
   // provably broke). Null when nothing degraded. Also stamped into the `reseats[]` trail entry.
   fallbackReason: string | null;
@@ -160,28 +231,10 @@ function appendEgressDenials(
 export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
   const log = opts.log ?? (() => {});
   const { baseDir, runId, seat } = opts;
-  const headSha = readGatePacketHeadSha(baseDir, runId);
-  if (!headSha) {
-    throw new Error(
-      `run ${runId} has no usable packet.gate.json under ${baseDir} — nothing to ground a reseat against`
-    );
-  }
-  // FAIL CLOSED on a mis-materialized worktree. The packet is the pinned description of ONE head;
-  // a tree checked out at another commit would ground the seat's file:line citations against code
-  // the packet does not describe, and the gate would then verify them against the wrong text.
-  // Checked before the artifacts are read, so a wrong tree costs nothing.
-  if (opts.worktree && opts.worktree.headSha !== headSha) {
-    throw new Error(
-      `worktree is at ${opts.worktree.headSha.slice(0, 12)} but run ${runId}'s pinned packet is at ${headSha.slice(0, 12)} — refusing to ground a retry on a different head`
-    );
-  }
-  const art = readSeatArtifacts(baseDir, runId, seat);
-  if ('error' in art) throw new Error(art.error);
-  if (art.stored.terminalState === 'reviewed') {
-    throw new Error(
-      `seat ${seat} completed in run ${runId} — nothing to retry (re-running a healthy seat is a new review)`
-    );
-  }
+  // Every pre-spawn refusal, in the CLI's own words (reseatRefusal) — nothing is billed past here.
+  const pre = checkReseat(baseDir, runId, seat, opts.worktree?.headSha);
+  if ('refusal' in pre) throw new Error(pre.refusal);
+  const { art, headSha } = pre;
   const split = splitWorktreePrompt(art.prompt);
   const wt = opts.worktree;
   const qualified = Boolean(wt && opts.qualification?.qualified);
@@ -232,6 +285,16 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
       : null);
   // Logged ONLY when synthesized here: a reason that came from runCoreSeat was already logged there.
   if (fallbackReason && !seatRun.fallbackReason) log(`reseat: ⚠ ${fallbackReason}`);
+  // An evidence DOWNGRADE is a fact of its own, and not one `fallbackReason` covers: a retry can run
+  // on the packet with nothing having "fallen back" (no worktree was ever offered) and still read
+  // LESS than the dead attempt did. The manifest records it silently; the run whose next step is a
+  // heal has to hear it. Said here, once, so every caller of this module speaks it.
+  const evidenceDowngraded = split.hadWorktree && seatRun.realized === 'packet';
+  if (evidenceDowngraded) {
+    log(
+      `reseat: ⚠ ${seat} originally reviewed IN-PROJECT; this retry read only the diff packet — the run's realized evidence is downgraded.`
+    );
+  }
   try {
     writeTrailFile(
       baseDir,
@@ -255,6 +318,11 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
         ...((existing.reseats as unknown[] | undefined) ?? []),
         {
           at: new Date().toISOString(),
+          // The base the OLD preamble named — recovered from `prompt.<seat>.md` just before a
+          // packet-mode retry overwrites it with the bare packet prompt. Without this the range the
+          // dead attempt reviewed is gone from the trail entirely.
+          baseSha: split.baseSha,
+          evidenceDowngraded,
           fallbackReason,
           outcome: review.terminalState,
           previous: {
@@ -274,17 +342,29 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
     }),
     log
   );
-  // The manifest's REALIZED map tells consumers what each seat actually read — keep it true.
+  // The manifest's REALIZED map tells consumers what each seat actually read — keep it true. So is
+  // `sandboxProfiles`: it names the fence each seat's evidence was gathered behind, and leaving the
+  // ORIGINAL run's profile there beside a freshly rewritten realized class would attest this retry's
+  // in-project read under a fence it never ran under. Only a worktree retry touches it — a
+  // packet-mode retry ran behind no fence at all, and the original entry stays the record of the
+  // attempt that did.
   try {
     const mp = path.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
     if (fs.existsSync(mp)) {
       const manifest = JSON.parse(fs.readFileSync(mp, 'utf8')) as {
         realizedEvidence?: Record<string, string>;
+        sandboxProfiles?: Record<string, unknown>;
       };
       manifest.realizedEvidence = {
         ...(manifest.realizedEvidence ?? {}),
         [seat]: seatRun.realized,
       };
+      if (seatRun.realized === 'worktree' && opts.qualification) {
+        manifest.sandboxProfiles = {
+          ...(manifest.sandboxProfiles ?? {}),
+          [seat]: opts.qualification.profile,
+        };
+      }
       writeTrailFile(baseDir, runId, EVIDENCE_MANIFEST_FILE, JSON.stringify(manifest, null, 2));
     }
   } catch (e) {
@@ -294,6 +374,7 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
     log(`reseat: ${seat} FAILED AGAIN — ${review.summary.replace(/\s+/g, ' ').slice(0, 200)}`);
     return {
       egressDenials: seatRun.egressDenials,
+      evidenceDowngraded,
       fallbackReason,
       gate: null,
       ok: false,
@@ -317,6 +398,7 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
   });
   return {
     egressDenials: seatRun.egressDenials,
+    evidenceDowngraded,
     fallbackReason,
     gate,
     ok: gate.ok,

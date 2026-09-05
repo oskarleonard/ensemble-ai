@@ -4262,6 +4262,11 @@ async function runReviewMode(opts) {
       log(
         `  \xB7 ${id}: ${seat.review.terminalState} \u2014 ${seat.review.findings.length} finding(s) \xB7 evidence ${seat.realized}${cause}`
       );
+      if (seat.review.terminalState !== "reviewed") {
+        log(
+          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat --seat ${id} --out ${opts.out} --run-id ${opts.runId}`
+        );
+      }
       return [id, seat];
     })
   );

@@ -73,7 +73,7 @@ import { REVIEW_ADAPTERS } from './reviewers/registry';
 import { readGatePacketHeadSha } from './modes/review/gate-hunks';
 import { type GateSeat, loadClaudeReviewerSeat, loadGateSeat } from './modes/review/gate-seat';
 import { readConventionPathsFromTrail, runRegate } from './modes/review/regate';
-import { readSeatArtifacts, runReseat } from './modes/review/reseat';
+import { reseatRefusal, runReseat } from './modes/review/reseat';
 import { loadHolisticSeat } from './modes/review/holistic';
 import {
   acquireDiff,
@@ -100,11 +100,7 @@ import {
   type ReviewProfile,
   stripSecurityTag,
 } from './modes/review/profile';
-import {
-  formatEgressDenialCounts,
-  formatEvidenceFooter,
-  SEAT_QUALIFIERS,
-} from './modes/review/seat-evidence';
+import { formatEvidenceFooter, SEAT_QUALIFIERS } from './modes/review/seat-evidence';
 import { isPreflightError } from './modes/review/worktree';
 import { execGit } from './modes/review/git-exec';
 import { checkPinDrift, describePinDrift } from './plumbing/pin-check';
@@ -3275,15 +3271,20 @@ Usage:
                     (the producer runs inside the claude layer; re-fire the review instead)
   --repo <path>     local clone of the PR's repo — re-materializes the head read-only so the
                     seat (when its sandbox qualifies) and the gate are evidence-bearing.
-                    Unavailable/failed → LOUD fallback to packet evidence
+                    Unavailable/failed → LOUD fallback: the seat AND the regate of the WHOLE
+                    run drop to packet evidence (reference-not-found + holistic verification OFF)
   --gate-model <m>  gate seat pin — same resolution chain as review (flag → voices.json
   --gate-effort <e> \`gate\` entry → the claude voice → built-in default)
   --reviewers-file  reviewers config (default ~/.ensemble-ai/reviewers.json)
-  --sandbox <p>     override the seat's sandbox profile (tightens only — see review --sandbox)
+  --sandbox <p>     override the seat's sandbox profile — it must resolve to the profile the
+                    worktree qualification requires (see \`review --sandbox\`); anything else
+                    DISqualifies the seat and it re-runs on the packet
 
-Not re-run (same as regate): the execution settler, the shadow gate, the receipt.
-Exit: 0 = seat reviewed + gate completed · 1 = seat failed again, or the gate failed ·
-3 = usage / missing trail.
+Not re-run (same as regate): the execution settler, the shadow gate, the receipt. The receipt is
+not re-minted either — a healed run keeps the receipt its original roster earned.
+Exit: 0 = seat reviewed + gate completed · 1 = seat failed again, the gate failed, or the retry
+threw AFTER the seat was spawned · 3 = a pre-spawn refusal: usage, a missing trail or seat
+artifact, a healthy seat, a worktree at a different head — nothing was billed.
 `;
 
 // reseat: heal a run whose ONE seat died, without re-running the others. The trail is the
@@ -3334,20 +3335,15 @@ async function reseatCommand(args: string[]): Promise<number> {
   }
   const seat = seatRaw;
 
-  // Fail closed BEFORE any spawn: no pinned packet ⇒ nothing to ground against; no seat
-  // artifacts ⇒ nothing to re-run; a healthy seat ⇒ nothing to retry.
+  // Fail closed BEFORE any spawn, through the SAME helper runReseat throws from (so the two can
+  // never drift): no pinned packet ⇒ nothing to ground against; no seat artifacts ⇒ nothing to
+  // re-run; a healthy seat ⇒ nothing to retry. Exit 3 means NOTHING was billed.
   const headSha = readGatePacketHeadSha(out, runId);
-  if (!headSha) {
-    console.error(`ensemble-ai reseat: run ${runId} has no usable packet.gate.json under ${out} — was this run made by \`review --out\`?`);
-    return 3;
-  }
-  const art = readSeatArtifacts(out, runId, seat);
-  if ('error' in art) {
-    console.error(`ensemble-ai reseat: ${art.error}`);
-    return 3;
-  }
-  if (art.stored.terminalState === 'reviewed') {
-    console.error(`ensemble-ai reseat: seat ${seat} completed in run ${runId} — nothing to retry (re-running a healthy seat is a new review)`);
+  const refusal = reseatRefusal(out, runId, seat);
+  if (refusal || !headSha) {
+    // `refusal` is non-null whenever the pinned packet is unreadable — it is the first thing it
+    // checks — so the second branch is unreachable and exists only to narrow the type.
+    console.error(`ensemble-ai reseat: ${refusal ?? 'the pinned packet could not be read'}`);
     return 3;
   }
 
@@ -3376,9 +3372,19 @@ async function reseatCommand(args: string[]): Promise<number> {
     console.error(`· re-materializing the PR head as a read-only worktree of ${repoFlag}…`);
     const made = openWorktree({ baseSha: null, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
     if (isPreflightError(made)) {
-      console.error(`· ⚠ worktree unavailable (${made.kind}: ${made.message}) — re-running ${seat} on PACKET evidence`);
+      // A reseat re-gates the WHOLE run, so a lost worktree costs more than the retried seat's own
+      // evidence: the regate that follows also drops to packet grounding, and with it the gate's
+      // reference-not-found check and its holistic two-site verification. Name both.
+      console.error(`· ⚠ worktree unavailable (${made.kind}: ${made.message}) — re-running ${seat} AND regating the whole run on PACKET evidence (reference-not-found + holistic verification OFF)`);
     } else {
       session = made;
+      // The module refuses a tree at another commit; refuse it HERE too, before the seat is billed.
+      const wrongHead = reseatRefusal(out, runId, seat, session.headSha);
+      if (wrongHead) {
+        console.error(`ensemble-ai reseat: ${wrongHead}`);
+        session.reap();
+        return 3;
+      }
     }
   }
 
@@ -3386,7 +3392,7 @@ async function reseatCommand(args: string[]): Promise<number> {
     const res = await runReseat({
       adapter: REVIEW_ADAPTERS[seat],
       baseDir: out,
-      conventionPaths: readConventionPathsFromTrail(out, runId),
+      // conventionPaths: left to the module, which defaults to THIS run's own trail.
       gateConfig: gateSeat.config,
       log: (m) => console.error(`· ${m}`),
       ...(session ? { qualification: SEAT_QUALIFIERS[seat]({ config: reviewer, worktree: session.dir }) } : {}),
@@ -3395,13 +3401,8 @@ async function reseatCommand(args: string[]): Promise<number> {
       seat,
       ...(session ? { worktree: { baseSha: session.baseSha, dir: session.dir, headSha: session.headSha } } : {}),
     });
-    // Loud on BOTH outcomes, exactly as a full run reports them: a seat that lost the worktree
-    // it was asked for, and a seat that reached past its vendor allowlist, are facts about the
-    // retry that must not be quieter than the fan-out that produced the dead seat.
-    if (res.fallbackReason) console.error(`· ⚠ ${res.fallbackReason}`);
-    if (res.egressDenials.length > 0) {
-      console.error(`· ⚠ egress fence: ${formatEgressDenialCounts(res.egressDenials)}`);
-    }
+    // The lost worktree, the egress rollup and the evidence downgrade are all said by the module,
+    // through the `log` above — de-duped there, on purpose, so an echo here would double them.
     if (!res.gate) {
       console.log(`\nreseat: seat ${seat} FAILED AGAIN — ${clean(res.review.summary).slice(0, 300)}\n(the new failure is now the trail's record; the gate was not re-run)`);
       return 1;
@@ -3414,8 +3415,11 @@ async function reseatCommand(args: string[]): Promise<number> {
     );
     return res.ok ? 0 : 1;
   } catch (e) {
-    console.error(`ensemble-ai reseat: ${(e as Error).message}`);
-    return 3;
+    // Exit 3 is the "nothing was billed" code, and every refusal that earns it has already run
+    // above. Past this point the seat spawn is paid for — a trail write that failed, a gate that
+    // threw — so a caller (or a runner script) must not read it as "the reseat never started".
+    console.error(`ensemble-ai reseat: failed after the seat spawn — ${(e as Error).message}`);
+    return 1;
   } finally {
     session?.reap();
   }

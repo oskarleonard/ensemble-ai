@@ -7075,6 +7075,11 @@ async function runReviewMode(opts) {
       log(
         `  \xB7 ${id}: ${seat.review.terminalState} \u2014 ${seat.review.findings.length} finding(s) \xB7 evidence ${seat.realized}${cause}`
       );
+      if (seat.review.terminalState !== "reviewed") {
+        log(
+          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat --seat ${id} --out ${opts.out} --run-id ${opts.runId}`
+        );
+      }
       return [id, seat];
     })
   );
@@ -8032,13 +8037,19 @@ function writeEvidenceManifest(baseDir, runId, manifest) {
 
 // src/modes/review/reseat.ts
 function splitWorktreePrompt(prompt) {
-  const idx = prompt.indexOf(`
+  const asPacket = { baseSha: null, hadWorktree: false, packetPrompt: prompt };
+  const idx = prompt.lastIndexOf(`
 
 ${WORKTREE_SUFFIX_HEADER}`);
-  if (idx === -1) return { baseSha: null, hadWorktree: false, packetPrompt: prompt };
-  const suffix = prompt.slice(idx);
-  const m = suffix.match(/git diff ([0-9a-f]{7,40})\.\.\.[0-9a-f]{7,40}/);
-  return { baseSha: m ? m[1] : null, hadWorktree: true, packetPrompt: prompt.slice(0, idx) };
+  if (idx === -1) return asPacket;
+  const tail = prompt.slice(idx);
+  const named = tail.match(/checked out READ-ONLY at (.+?) \(detached at ([^)\n]+)\)/);
+  if (!named) return asPacket;
+  const base = tail.match(/git diff ([0-9a-f]{7,40})\.\.\.[0-9a-f]{7,40}/);
+  const baseSha = base ? base[1] : null;
+  const rebuilt = worktreePromptSuffix({ baseSha, headSha: named[2], worktree: named[1] });
+  if (!prompt.endsWith(rebuilt)) return asPacket;
+  return { baseSha, hadWorktree: true, packetPrompt: prompt.slice(0, prompt.length - rebuilt.length) };
 }
 function readSeatArtifacts(baseDir, runId, seat) {
   const dir = reviewDir(baseDir, runId);
@@ -8059,6 +8070,31 @@ function readSeatArtifacts(baseDir, runId, seat) {
     return { error: `run ${runId} has no readable prompt.${seat}.md` };
   }
   return { packet, prompt, stored };
+}
+function checkReseat(baseDir, runId, seat, worktreeHeadSha) {
+  const headSha = readGatePacketHeadSha(baseDir, runId);
+  if (!headSha) {
+    return {
+      refusal: `run ${runId} has no usable packet.gate.json under ${baseDir} \u2014 nothing to ground a reseat against (was this run made by \`review --out\`?)`
+    };
+  }
+  if (worktreeHeadSha && worktreeHeadSha !== headSha) {
+    return {
+      refusal: `worktree is at ${worktreeHeadSha.slice(0, 12)} but run ${runId}'s pinned packet is at ${headSha.slice(0, 12)} \u2014 refusing to ground a retry on a different head`
+    };
+  }
+  const art = readSeatArtifacts(baseDir, runId, seat);
+  if ("error" in art) return { refusal: art.error };
+  if (art.stored.terminalState === "reviewed") {
+    return {
+      refusal: `seat ${seat} completed in run ${runId} \u2014 nothing to retry (re-running a healthy seat is a new review)`
+    };
+  }
+  return { art, headSha };
+}
+function reseatRefusal(baseDir, runId, seat, worktreeHeadSha) {
+  const pre = checkReseat(baseDir, runId, seat, worktreeHeadSha);
+  return "refusal" in pre ? pre.refusal : null;
 }
 function foldSynthesis(baseDir, runId, patch, log) {
   try {
@@ -8085,24 +8121,9 @@ async function runReseat(opts) {
   const log = opts.log ?? (() => {
   });
   const { baseDir, runId, seat } = opts;
-  const headSha = readGatePacketHeadSha(baseDir, runId);
-  if (!headSha) {
-    throw new Error(
-      `run ${runId} has no usable packet.gate.json under ${baseDir} \u2014 nothing to ground a reseat against`
-    );
-  }
-  if (opts.worktree && opts.worktree.headSha !== headSha) {
-    throw new Error(
-      `worktree is at ${opts.worktree.headSha.slice(0, 12)} but run ${runId}'s pinned packet is at ${headSha.slice(0, 12)} \u2014 refusing to ground a retry on a different head`
-    );
-  }
-  const art = readSeatArtifacts(baseDir, runId, seat);
-  if ("error" in art) throw new Error(art.error);
-  if (art.stored.terminalState === "reviewed") {
-    throw new Error(
-      `seat ${seat} completed in run ${runId} \u2014 nothing to retry (re-running a healthy seat is a new review)`
-    );
-  }
+  const pre = checkReseat(baseDir, runId, seat, opts.worktree?.headSha);
+  if ("refusal" in pre) throw new Error(pre.refusal);
+  const { art, headSha } = pre;
   const split = splitWorktreePrompt(art.prompt);
   const wt = opts.worktree;
   const qualified = Boolean(wt && opts.qualification?.qualified);
@@ -8135,6 +8156,12 @@ async function runReseat(opts) {
   const review = seatRun.review;
   const fallbackReason = seatRun.fallbackReason ?? (wt && !qualified ? `${seat}: no sandbox qualification for the re-materialized worktree${opts.qualification?.reason ? ` (${opts.qualification.reason})` : ""} \u2014 re-ran on the PACKET` : null);
   if (fallbackReason && !seatRun.fallbackReason) log(`reseat: \u26A0 ${fallbackReason}`);
+  const evidenceDowngraded = split.hadWorktree && seatRun.realized === "packet";
+  if (evidenceDowngraded) {
+    log(
+      `reseat: \u26A0 ${seat} originally reviewed IN-PROJECT; this retry read only the diff packet \u2014 the run's realized evidence is downgraded.`
+    );
+  }
   try {
     writeTrailFile(
       baseDir,
@@ -8155,6 +8182,11 @@ async function runReseat(opts) {
         ...existing.reseats ?? [],
         {
           at: (/* @__PURE__ */ new Date()).toISOString(),
+          // The base the OLD preamble named — recovered from `prompt.<seat>.md` just before a
+          // packet-mode retry overwrites it with the bare packet prompt. Without this the range the
+          // dead attempt reviewed is gone from the trail entirely.
+          baseSha: split.baseSha,
+          evidenceDowngraded,
           fallbackReason,
           outcome: review.terminalState,
           previous: {
@@ -8182,6 +8214,12 @@ async function runReseat(opts) {
         ...manifest.realizedEvidence ?? {},
         [seat]: seatRun.realized
       };
+      if (seatRun.realized === "worktree" && opts.qualification) {
+        manifest.sandboxProfiles = {
+          ...manifest.sandboxProfiles ?? {},
+          [seat]: opts.qualification.profile
+        };
+      }
       writeTrailFile(baseDir, runId, EVIDENCE_MANIFEST_FILE, JSON.stringify(manifest, null, 2));
     }
   } catch (e) {
@@ -8191,6 +8229,7 @@ async function runReseat(opts) {
     log(`reseat: ${seat} FAILED AGAIN \u2014 ${review.summary.replace(/\s+/g, " ").slice(0, 200)}`);
     return {
       egressDenials: seatRun.egressDenials,
+      evidenceDowngraded,
       fallbackReason,
       gate: null,
       ok: false,
@@ -8212,6 +8251,7 @@ async function runReseat(opts) {
   });
   return {
     egressDenials: seatRun.egressDenials,
+    evidenceDowngraded,
     fallbackReason,
     gate,
     ok: gate.ok,
@@ -11481,15 +11521,20 @@ Usage:
                     (the producer runs inside the claude layer; re-fire the review instead)
   --repo <path>     local clone of the PR's repo \u2014 re-materializes the head read-only so the
                     seat (when its sandbox qualifies) and the gate are evidence-bearing.
-                    Unavailable/failed \u2192 LOUD fallback to packet evidence
+                    Unavailable/failed \u2192 LOUD fallback: the seat AND the regate of the WHOLE
+                    run drop to packet evidence (reference-not-found + holistic verification OFF)
   --gate-model <m>  gate seat pin \u2014 same resolution chain as review (flag \u2192 voices.json
   --gate-effort <e> \`gate\` entry \u2192 the claude voice \u2192 built-in default)
   --reviewers-file  reviewers config (default ~/.ensemble-ai/reviewers.json)
-  --sandbox <p>     override the seat's sandbox profile (tightens only \u2014 see review --sandbox)
+  --sandbox <p>     override the seat's sandbox profile \u2014 it must resolve to the profile the
+                    worktree qualification requires (see \`review --sandbox\`); anything else
+                    DISqualifies the seat and it re-runs on the packet
 
-Not re-run (same as regate): the execution settler, the shadow gate, the receipt.
-Exit: 0 = seat reviewed + gate completed \xB7 1 = seat failed again, or the gate failed \xB7
-3 = usage / missing trail.
+Not re-run (same as regate): the execution settler, the shadow gate, the receipt. The receipt is
+not re-minted either \u2014 a healed run keeps the receipt its original roster earned.
+Exit: 0 = seat reviewed + gate completed \xB7 1 = seat failed again, the gate failed, or the retry
+threw AFTER the seat was spawned \xB7 3 = a pre-spawn refusal: usage, a missing trail or seat
+artifact, a healthy seat, a worktree at a different head \u2014 nothing was billed.
 `;
 async function reseatCommand(args) {
   let values;
@@ -11534,17 +11579,9 @@ async function reseatCommand(args) {
   }
   const seat = seatRaw;
   const headSha = readGatePacketHeadSha(out, runId);
-  if (!headSha) {
-    console.error(`ensemble-ai reseat: run ${runId} has no usable packet.gate.json under ${out} \u2014 was this run made by \`review --out\`?`);
-    return 3;
-  }
-  const art = readSeatArtifacts(out, runId, seat);
-  if ("error" in art) {
-    console.error(`ensemble-ai reseat: ${art.error}`);
-    return 3;
-  }
-  if (art.stored.terminalState === "reviewed") {
-    console.error(`ensemble-ai reseat: seat ${seat} completed in run ${runId} \u2014 nothing to retry (re-running a healthy seat is a new review)`);
+  const refusal = reseatRefusal(out, runId, seat);
+  if (refusal || !headSha) {
+    console.error(`ensemble-ai reseat: ${refusal ?? "the pinned packet could not be read"}`);
     return 3;
   }
   const reviewersFile = typeof values["reviewers-file"] === "string" ? values["reviewers-file"] : REVIEWERS_FILE;
@@ -11570,16 +11607,22 @@ async function reseatCommand(args) {
     console.error(`\xB7 re-materializing the PR head as a read-only worktree of ${repoFlag}\u2026`);
     const made = openWorktree({ baseSha: null, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
     if (isPreflightError(made)) {
-      console.error(`\xB7 \u26A0 worktree unavailable (${made.kind}: ${made.message}) \u2014 re-running ${seat} on PACKET evidence`);
+      console.error(`\xB7 \u26A0 worktree unavailable (${made.kind}: ${made.message}) \u2014 re-running ${seat} AND regating the whole run on PACKET evidence (reference-not-found + holistic verification OFF)`);
     } else {
       session = made;
+      const wrongHead = reseatRefusal(out, runId, seat, session.headSha);
+      if (wrongHead) {
+        console.error(`ensemble-ai reseat: ${wrongHead}`);
+        session.reap();
+        return 3;
+      }
     }
   }
   try {
     const res = await runReseat({
       adapter: REVIEW_ADAPTERS[seat],
       baseDir: out,
-      conventionPaths: readConventionPathsFromTrail(out, runId),
+      // conventionPaths: left to the module, which defaults to THIS run's own trail.
       gateConfig: gateSeat.config,
       log: (m) => console.error(`\xB7 ${m}`),
       ...session ? { qualification: SEAT_QUALIFIERS[seat]({ config: reviewer, worktree: session.dir }) } : {},
@@ -11588,10 +11631,6 @@ async function reseatCommand(args) {
       seat,
       ...session ? { worktree: { baseSha: session.baseSha, dir: session.dir, headSha: session.headSha } } : {}
     });
-    if (res.fallbackReason) console.error(`\xB7 \u26A0 ${res.fallbackReason}`);
-    if (res.egressDenials.length > 0) {
-      console.error(`\xB7 \u26A0 egress fence: ${formatEgressDenialCounts(res.egressDenials)}`);
-    }
     if (!res.gate) {
       console.log(`
 reseat: seat ${seat} FAILED AGAIN \u2014 ${scrubControl(res.review.summary).slice(0, 300)}
@@ -11606,8 +11645,8 @@ reseat: ${seat} reviewed, but the gate FAILED \u2014 verdicts remain fail-closed
     );
     return res.ok ? 0 : 1;
   } catch (e) {
-    console.error(`ensemble-ai reseat: ${e.message}`);
-    return 3;
+    console.error(`ensemble-ai reseat: failed after the seat spawn \u2014 ${e.message}`);
+    return 1;
   } finally {
     session?.reap();
   }
