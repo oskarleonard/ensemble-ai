@@ -171,6 +171,9 @@ refused — was printed verbatim in a *green* job whose validation step downgrad
   line — it never blocks a review.
 - Same trust class as the diff and the PR description (repo-CI text the seats already receive).
   The rendered text still passes the inline credential patterns; any hit **withholds** the section.
+- Unlike the diff, check output can carry text from installed apps and bots (not the repo owner or
+  the PR author) and URLs pointing at internal CI hosts — the section is hedged as untrusted data in
+  every prompt, credential patterns withhold it entirely, and `--no-ci-evidence` opts out per run.
 - Caps: 10 annotated checks × 25 annotations, ~14k chars structurally, 16k in the packet budget.
 - The rendered body also lands in the trail as `ci-evidence.md`.
 

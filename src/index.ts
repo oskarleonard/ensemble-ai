@@ -39,6 +39,10 @@ export * from './modes/review';
 export * from './modes/review/diff';
 export * from './modes/review/secret-scan';
 export * from './modes/review/receipt';
+// The head commit's check runs + annotations + statuses, gathered through `gh`. Exported so a
+// consumer (the dashboard) fills the packet's CI evidence section from the SAME gatherer the CLI
+// runs — one gatherer, one set of caps, no drift in what a seat is told the machine said.
+export * from './modes/review/ci-evidence';
 // ── Worktree evidence mode: identity · lifecycle · manifest · the Claude producer ─
 // Exported so a consumer (the dashboard) drives the SAME lifecycle the CLI does —
 // one engine, no drift. Evidence identity is what makes a receipt mean what it says.

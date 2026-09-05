@@ -7,14 +7,23 @@ import type { ReviewModeResult } from './modes/review';
 // API this file is about, which can be made to FAIL on demand.
 vi.mock('./modes/review', () => ({ runReviewMode: vi.fn() }));
 vi.mock('node:child_process', () => ({ execFileSync: vi.fn() }));
+// Mock ONLY the spawned Opus layer (the real roster/render helpers stay), so the OTHER consumer of
+// the gathered evidence — the worktree producer, which never reads the packet prompt — is pinned
+// at the CLI seam without spawning a `claude -p`.
+vi.mock('./modes/review/self-contained', async (importActual) => ({
+  ...(await importActual<typeof import('./modes/review/self-contained')>()),
+  runClaudeReviewLayer: vi.fn(),
+}));
 
 import { execFileSync } from 'node:child_process';
 
 import { main } from './cli';
 import { runReviewMode } from './modes/review';
+import { runClaudeReviewLayer } from './modes/review/self-contained';
 
 const mockRun = vi.mocked(runReviewMode);
 const mockExec = vi.mocked(execFileSync);
+const mockLayer = vi.mocked(runClaudeReviewLayer);
 
 // A minimal engine result so reviewCommand runs to completion (exit 0). No `prompt`, so the
 // self-contained Opus layer is never expected and no real seat is ever spawned.
@@ -115,6 +124,7 @@ const errorLines = (): string[] =>
 beforeEach(() => {
   mockRun.mockReset();
   mockRun.mockResolvedValue(engineResult());
+  mockLayer.mockReset();
   mockExec.mockReset();
   checkRuns = () => CHECK_RUNS;
   scriptGh();
@@ -171,5 +181,55 @@ describe('CI evidence that cannot be fetched degrades LOUDLY, never silently', (
     const line = errorLines().find((l) => l.includes('CI evidence:'));
     expect(line).toContain('unavailable');
     expect(line).toContain("reviewing without the head's check results");
+  });
+});
+
+// The packet is not the only consumer. The worktree claude producer renders its OWN prompt
+// (renderCodeReviewSeatPrompt), so the gathered text reaches that seat only if the CLI hands it to
+// the Opus layer — the seam below. Without this the most valuable producer could go blind to the
+// head's own check output and every renderer test would still pass.
+describe('the gathered evidence also reaches the Opus layer (the worktree producer)', () => {
+  const withLayer = (): void => {
+    mockRun.mockResolvedValue({
+      ...engineResult(),
+      pinnedDiff: DIFF,
+      prompt: 'PACKET PROMPT',
+    } as unknown as ReviewModeResult);
+    mockLayer.mockResolvedValue({
+      claudeReview: null,
+      gateTrailWritten: true,
+      gateVerdicts: [],
+      modelLabel: 'opus',
+      synthesis: {
+        agreements: [],
+        bottomLine: 'ok',
+        by: 'claude',
+        degraded: false,
+        disagreements: [],
+        ok: true,
+        raw: null,
+        summary: 's',
+      },
+    } as unknown as Awaited<ReturnType<typeof runClaudeReviewLayer>>);
+  };
+
+  it('passes the rendered CI text into runClaudeReviewLayer', async () => {
+    withLayer();
+    await main(['review', 'https://github.com/o/r/pull/7']);
+    expect(mockLayer).toHaveBeenCalledWith(
+      expect.objectContaining({ ciEvidence: expect.stringContaining('failure \u00b7 lint') })
+    );
+    expect(mockLayer.mock.calls[0][0].ciEvidenceUnavailable).toBeUndefined();
+  });
+
+  it('passes the REASON instead when the fetch failed — the seat must not read silence as green', async () => {
+    withLayer();
+    checkRuns = () => {
+      throw Object.assign(new Error('gh failed'), { stderr: 'gh: HTTP 403 — forbidden' });
+    };
+    await main(['review', 'https://github.com/o/r/pull/7']);
+    const opts = mockLayer.mock.calls[0][0];
+    expect(opts.ciEvidence).toBeUndefined();
+    expect(opts.ciEvidenceUnavailable).toContain('check runs unavailable');
   });
 });

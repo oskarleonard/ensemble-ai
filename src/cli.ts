@@ -1407,6 +1407,12 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       );
     }
   }
+  // ONE resolution, ahead of BOTH consumers. The pair is mutually exclusive by contract, and
+  // `runReviewMode` enforces that by treating "both supplied" as unavailable — while the worktree
+  // producer renders whatever it is handed. Resolving here is what keeps the two from describing
+  // the same run differently: the packet seats reading UNAVAILABLE while the one Claude producer
+  // reads evidence the engine had already decided not to trust.
+  const ciText = ciEvidenceUnavailable ? undefined : ciEvidence;
 
   let result: ReviewModeResult;
   try {
@@ -1414,7 +1420,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       allowSensitive: Boolean(values['allow-sensitive']),
       base: typeof values.base === 'string' ? values.base : undefined,
       ceilingBytes,
-      ciEvidence,
+      ciEvidence: ciText,
       ciEvidenceUnavailable,
       conventionCapBytes: conventionCap,
       conventionPaths,
@@ -1567,8 +1573,9 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         // replaces it), so the packet's CI section would miss the most valuable seat unless the
         // text reaches it here — and a FAILED fetch has to reach it too, or that one seat cannot
         // tell a broken `gh` from a head with no checks. Packet-mode producers already have both
-        // in the pinned prompt.
-        ...(ciEvidence ? { ciEvidence } : {}),
+        // in the pinned prompt. `ciText` — the resolved pair, not the raw locals — so this seat
+        // and the packet seats can never be told different things about the same run.
+        ...(ciText ? { ciEvidence: ciText } : {}),
         ...(ciEvidenceUnavailable ? { ciEvidenceUnavailable } : {}),
         claudeConfig: claudeSeat.config,
         // The conventions this run actually gathered — the docs a holistic finding may cite to
@@ -2808,6 +2815,10 @@ Usage:
 A cost-preview / debug of the EXACT packet the reviewers would receive: the diff
 identity + coverage, the per-section manifest (what the reviewer sees), and the
 prompt size — no vendor is called, nothing is spent.
+
+On a PR source this preview omits two sections \`review\` would add: the PR's own
+description (the directive) and the CI evidence — both are fetched through \`gh\`,
+so the real packet is LARGER than what this prints.
 
 Diff source (give at most ONE; default = current branch, like \`ensemble-ai review\`):
   (default)            <base>...HEAD — the current branch vs origin/HEAD

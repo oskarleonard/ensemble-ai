@@ -950,92 +950,6 @@ interface ReviewModeResult {
 declare const DEFAULT_OBJECTIVE = "Adversarial cross-vendor review of a code diff \u2014 find correctness, security, and convention issues a same-vendor author might miss.";
 declare function runReviewMode(opts: ReviewModeOptions): Promise<ReviewModeResult>;
 
-declare const EVIDENCE_MANIFEST_SCHEMA_VERSION = 1;
-declare const EVIDENCE_MANIFEST_FILE = "evidence-manifest.json";
-interface ManifestBlob {
-    blobSha: string;
-    path: string;
-}
-interface EvidenceManifest {
-    headSha: string;
-    intendedEvidence: EvidenceMap;
-    readableSurface: ManifestBlob[];
-    realizedEvidence: EvidenceMap;
-    sandboxProfiles: SandboxProfileMap;
-    schemaVersion: number;
-    scopeNote: string;
-}
-declare function parseLsTree(text: string): ManifestBlob[];
-declare function readReadableSurface(worktree: string, headSha: string, deps: {
-    git: GitRun;
-}): ManifestBlob[];
-declare function buildEvidenceManifest(args: {
-    headSha: string;
-    intendedEvidence: EvidenceMap;
-    readableSurface: ManifestBlob[];
-    realizedEvidence: EvidenceMap;
-    sandboxProfiles: SandboxProfileMap;
-}): EvidenceManifest;
-declare function writeEvidenceManifest(baseDir: string, runId: string, manifest: EvidenceManifest): boolean;
-
-declare const COLD_PEER_ROLE = "You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.";
-declare const OPERATOR_REVIEW_METHOD = "## How to review (in this order)\n\n1. Walk the diff hunk by hunk. For every touched function, read enough surrounding code \u2014\n   its callers, its callees, the rest of the file \u2014 to judge the change in context, not in\n   isolation.\n2. Hunt FUNCTIONAL BUGS first: correctness defects, broken edge cases, regressions of\n   behavior the diff did not intend to change, authorization gaps, contract drift (API\n   shapes, DB writes, event payloads), and state/concurrency hazards.\n   Five hunts reviews are known to skip \u2014 run each explicitly:\n   - NEW GUARD, EVERY ROUTE: when the diff adds a guard or invariant check, enumerate EVERY\n     code path that reaches the protected operation (grep the entry points, count the call\n     sites) and verify each path passes through it. A guard on two of four routes is a\n     finding, and the call-site enumeration is its proof.\n   - CALLER CENSUS: for every function the diff touches, count its non-test callers. Zero\n     production callers is dead code \u2014 a guard or fix added there protects nothing.\n   - TEST EFFECTIVENESS: for each new behavior, name the test that FAILS if the behavior is\n     reverted. A fixture that never sets the new field makes every assertion on it vacuous\n     (zero-value == zero-value still passes with the feature deleted).\n   - DECLARED-SET COMPLETENESS: when the diff declares an enumerable set (a comment listing\n     the N methods a rule covers, a routing matrix, a doc table), verify every element is\n     handled and tested \u2014 defects hide in the unsampled remainder.\n   - WRAPPER-BOUNDARY TRACE: when the diff changes, configures, or consumes a component that\n     WRAPS a shared-package or third-party primitive, READ the wrapped source and verify the\n     wrapper preserves the contract end to end \u2014 callback arguments it drops, prop-driven\n     events it re-emits as if user-typed, options it swallows. The bug lives ACROSS the\n     boundary: each side looks correct alone (a wrapper dropping its lib's sourceInfo let a\n     display round-trip silently rewrite submitted amounts \u2014 three seats saw the symptom,\n     none crossed the boundary to the mechanism).\n3. Then the simplify lens: a utility that already exists and was reinvented, a simpler\n   function shape, dead or unreachable branches, scope that silently narrowed or widened.\n4. SELF-CHECK every candidate finding before reporting it: re-read the code at the PR head\n   and ask \"does this actually make sense \u2014 what concrete input or state makes it fail?\"\n   Drop anything you cannot ground at file:line. Downgrade confidence on anything that\n   depends on an assumption you could not verify in the tree. EXCEPTION \u2014 execution-decidable\n   claims: when a finding turns on runtime behavior you cannot run here (would this DDL\n   apply, does this compile, would that test fail), do NOT talk yourself out of it by arguing\n   how the runtime probably behaves. Report it, ground what the reading supports, and name\n   the exact command that would settle it.\n   - CLAIM VS PRACTICE: a finding that leans on something the tree only DESCRIBES \u2014 a comment\n     saying an index is \"pre-created out of band\", a docstring naming a step ops runs first, a\n     paragraph repeated across sibling files \u2014 is grounded only if that practice exists in the\n     repo's operational files: scripts, runbooks, CI/deploy config, Makefile targets. Sibling\n     files repeating a paragraph prove a convention was copied, not that anyone performs it.\n     When the practice is absent, do not build on the claim: the finding is the inconsistency\n     itself \u2014 say which is true, the comment or the deploy path.\n   - CI EVIDENCE: when the prompt carries a CI evidence section, read it before judging whether\n     the change builds, migrates, or passes its tests. A WARNING or NOTICE annotation whose text\n     is an error is a DOWNGRADED FAILURE \u2014 a finding candidate: locate the code in the diff that\n     produced it and quote what the machine reported. A green job is not proof of correctness\n     when its own output contradicts it.";
-declare const QUALITY_LENS = "Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits \u2014 they are noise on someone else's pull request.";
-interface CodeReviewSeatPromptArgs {
-    baseSha: string;
-    ciEvidence?: string;
-    ciEvidenceUnavailable?: string;
-    diff: string;
-    headSha: string;
-    history?: boolean;
-    worktree: string;
-}
-declare function renderCodeReviewSeatPrompt(args: CodeReviewSeatPromptArgs): string;
-
-declare const CLAUDE_CAPABILITY_FENCE: SandboxProfileRef;
-declare const CLAUDE_EFFORTS: Set<string>;
-declare const CLAUDE_REVIEW_DENIED_TOOLS: readonly ["Bash", "Agent", "Task", "WebFetch", "WebSearch", "Write", "Edit", "MultiEdit", "NotebookEdit"];
-declare const CLAUDE_READ_TOOLS: readonly ["Read", "Grep", "Glob"];
-declare function homeReadDenyRules(homeDir: string): string[];
-interface ClaudeSeatFence {
-    homeDir?: string;
-    readRoot?: string;
-}
-declare function buildClaudeReviewArgs(prompt: string, config?: VoiceConfig, fence?: ClaudeSeatFence): string[];
-declare function makeNeutralSeatCwd(): string;
-declare function isTransientApiErrorReply(raw: string): boolean;
-declare function isUsageLimitReply(raw: string): boolean;
-declare function isRetryableApiStatus(status: number | null): boolean;
-declare const USAGE_LIMIT_FAIL_PREFIX = "operator usage limit reached";
-declare function isUsageLimitFailure(failWhy: string | undefined): boolean;
-declare const TRANSIENT_RETRY_DELAYS_MS: readonly [15000, 45000];
-declare const TRANSIENT_FAST_FAIL_MS = 120000;
-declare const CLAUDE_INACTIVITY_TIMEOUT_MS = 600000;
-interface StreamResultEvent {
-    apiErrorStatus: number | null;
-    found: boolean;
-    isError: boolean;
-    text: string | null;
-}
-declare function extractStreamResult(stdout: string): StreamResultEvent;
-type ReviewerExec = typeof runReviewerExec;
-interface ClaudeVoiceSeams {
-    exec?: ReviewerExec;
-    fastFailMs?: number;
-    inactivityTimeoutMs?: number;
-    retryDelaysMs?: readonly number[];
-}
-declare function runClaudeReviewVoice(prompt: string, config: VoiceConfig, opts?: RunReviewOpts, seams?: ClaudeVoiceSeams): Promise<VoiceRunResult>;
-declare function claudeWorktreePromptSuffix(args: {
-    headSha: string;
-    history?: boolean;
-    worktree: string;
-}): string;
-
-declare const ENSEMBLE_CONFIG_PATH: string;
-declare function asRecord(v: unknown): Record<string, unknown> | null;
-declare function readEnsembleConfig(configPath?: string): Record<string, unknown>;
-
 interface PostingPosture {
     inlineSeverityFloor: Severity;
     maxSuggestionLines: number;
@@ -1046,21 +960,6 @@ declare const DEFAULT_POSTURE: PostingPosture;
 declare function resolvePosture(raw: unknown): PostingPosture;
 declare function loadPostingPosture(profile: ReviewProfile, configPath?: string): PostingPosture;
 declare function meetsInlineFloor(severity: Severity, floor: Severity): boolean;
-
-interface PrPushContext {
-    headRefName: string;
-    headRepoOwner: string | null;
-    isCrossRepository: boolean;
-    viewerCanPushBase: boolean;
-}
-type PushFenceVerdict = {
-    allowed: false;
-    reason: string;
-} | {
-    allowed: true;
-};
-declare function evaluatePushFence(ctx: PrPushContext, prSlug: string): PushFenceVerdict;
-declare function parsePushContext(prJson: unknown, viewerCanPushBase: unknown): PrPushContext;
 
 declare const STAGE_MARKER = "<!-- ensemble-ai:staged-review v1 -->";
 declare function defuseUntrusted(s: string): string;
@@ -1161,6 +1060,135 @@ declare function stageReview(payload: StagedReviewPayload, target: StageTarget, 
     log?: (m: string) => void;
     reviewedHeadSha: string;
 }): StageResult;
+
+interface CiEvidenceLimits {
+    maxAnnotationChecks: number;
+    maxAnnotationsPerCheck: number;
+    maxChars: number;
+}
+declare const CI_EVIDENCE_LIMITS: CiEvidenceLimits;
+declare const CI_EVIDENCE_TRAIL_FILE = "ci-evidence.md";
+interface CiEvidenceInput {
+    gh: GhRunner;
+    headSha?: string;
+    limits?: Partial<CiEvidenceLimits>;
+    pr: number;
+    repoSlug: string;
+}
+type CiEvidenceResult = {
+    annotations: number;
+    checks: number;
+    failed: number;
+    headSha: string;
+    ok: true;
+    text: string;
+    truncated: boolean;
+} | {
+    error: string;
+    ok: false;
+};
+declare function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult;
+
+declare const EVIDENCE_MANIFEST_SCHEMA_VERSION = 1;
+declare const EVIDENCE_MANIFEST_FILE = "evidence-manifest.json";
+interface ManifestBlob {
+    blobSha: string;
+    path: string;
+}
+interface EvidenceManifest {
+    headSha: string;
+    intendedEvidence: EvidenceMap;
+    readableSurface: ManifestBlob[];
+    realizedEvidence: EvidenceMap;
+    sandboxProfiles: SandboxProfileMap;
+    schemaVersion: number;
+    scopeNote: string;
+}
+declare function parseLsTree(text: string): ManifestBlob[];
+declare function readReadableSurface(worktree: string, headSha: string, deps: {
+    git: GitRun;
+}): ManifestBlob[];
+declare function buildEvidenceManifest(args: {
+    headSha: string;
+    intendedEvidence: EvidenceMap;
+    readableSurface: ManifestBlob[];
+    realizedEvidence: EvidenceMap;
+    sandboxProfiles: SandboxProfileMap;
+}): EvidenceManifest;
+declare function writeEvidenceManifest(baseDir: string, runId: string, manifest: EvidenceManifest): boolean;
+
+declare const COLD_PEER_ROLE = "You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.";
+declare const OPERATOR_REVIEW_METHOD = "## How to review (in this order)\n\n1. Walk the diff hunk by hunk. For every touched function, read enough surrounding code \u2014\n   its callers, its callees, the rest of the file \u2014 to judge the change in context, not in\n   isolation.\n2. Hunt FUNCTIONAL BUGS first: correctness defects, broken edge cases, regressions of\n   behavior the diff did not intend to change, authorization gaps, contract drift (API\n   shapes, DB writes, event payloads), and state/concurrency hazards.\n   Five hunts reviews are known to skip \u2014 run each explicitly:\n   - NEW GUARD, EVERY ROUTE: when the diff adds a guard or invariant check, enumerate EVERY\n     code path that reaches the protected operation (grep the entry points, count the call\n     sites) and verify each path passes through it. A guard on two of four routes is a\n     finding, and the call-site enumeration is its proof.\n   - CALLER CENSUS: for every function the diff touches, count its non-test callers. Zero\n     production callers is dead code \u2014 a guard or fix added there protects nothing.\n   - TEST EFFECTIVENESS: for each new behavior, name the test that FAILS if the behavior is\n     reverted. A fixture that never sets the new field makes every assertion on it vacuous\n     (zero-value == zero-value still passes with the feature deleted).\n   - DECLARED-SET COMPLETENESS: when the diff declares an enumerable set (a comment listing\n     the N methods a rule covers, a routing matrix, a doc table), verify every element is\n     handled and tested \u2014 defects hide in the unsampled remainder.\n   - WRAPPER-BOUNDARY TRACE: when the diff changes, configures, or consumes a component that\n     WRAPS a shared-package or third-party primitive, READ the wrapped source and verify the\n     wrapper preserves the contract end to end \u2014 callback arguments it drops, prop-driven\n     events it re-emits as if user-typed, options it swallows. The bug lives ACROSS the\n     boundary: each side looks correct alone (a wrapper dropping its lib's sourceInfo let a\n     display round-trip silently rewrite submitted amounts \u2014 three seats saw the symptom,\n     none crossed the boundary to the mechanism).\n3. Then the simplify lens: a utility that already exists and was reinvented, a simpler\n   function shape, dead or unreachable branches, scope that silently narrowed or widened.\n4. SELF-CHECK every candidate finding before reporting it: re-read the code at the PR head\n   and ask \"does this actually make sense \u2014 what concrete input or state makes it fail?\"\n   Drop anything you cannot ground at file:line. Downgrade confidence on anything that\n   depends on an assumption you could not verify in the tree. EXCEPTION \u2014 execution-decidable\n   claims: when a finding turns on runtime behavior you cannot run here (would this DDL\n   apply, does this compile, would that test fail), do NOT talk yourself out of it by arguing\n   how the runtime probably behaves. Report it, ground what the reading supports, and name\n   the exact command that would settle it.\n   - CLAIM VS PRACTICE: a finding that leans on something the tree only DESCRIBES \u2014 a comment\n     saying an index is \"pre-created out of band\", a docstring naming a step ops runs first, a\n     paragraph repeated across sibling files \u2014 is grounded only if that practice exists in the\n     repo's operational files: scripts, runbooks, CI/deploy config, Makefile targets. Sibling\n     files repeating a paragraph prove a convention was copied, not that anyone performs it.\n     When the practice is absent, do not build on the claim: the finding is the inconsistency\n     itself \u2014 say which is true, the comment or the deploy path.\n   - CI EVIDENCE: when the prompt carries a CI evidence section, read it before judging whether\n     the change builds, migrates, or passes its tests. A WARNING or NOTICE annotation whose text\n     is an error is a DOWNGRADED FAILURE \u2014 a finding candidate: locate the code in the diff that\n     produced it and quote what the machine reported. A green job is not proof of correctness\n     when its own output contradicts it.";
+declare const QUALITY_LENS = "Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits \u2014 they are noise on someone else's pull request.";
+interface CodeReviewSeatPromptArgs {
+    baseSha: string;
+    ciEvidence?: string;
+    ciEvidenceUnavailable?: string;
+    diff: string;
+    headSha: string;
+    history?: boolean;
+    worktree: string;
+}
+declare function renderCodeReviewSeatPrompt(args: CodeReviewSeatPromptArgs): string;
+
+declare const CLAUDE_CAPABILITY_FENCE: SandboxProfileRef;
+declare const CLAUDE_EFFORTS: Set<string>;
+declare const CLAUDE_REVIEW_DENIED_TOOLS: readonly ["Bash", "Agent", "Task", "WebFetch", "WebSearch", "Write", "Edit", "MultiEdit", "NotebookEdit"];
+declare const CLAUDE_READ_TOOLS: readonly ["Read", "Grep", "Glob"];
+declare function homeReadDenyRules(homeDir: string): string[];
+interface ClaudeSeatFence {
+    homeDir?: string;
+    readRoot?: string;
+}
+declare function buildClaudeReviewArgs(prompt: string, config?: VoiceConfig, fence?: ClaudeSeatFence): string[];
+declare function makeNeutralSeatCwd(): string;
+declare function isTransientApiErrorReply(raw: string): boolean;
+declare function isUsageLimitReply(raw: string): boolean;
+declare function isRetryableApiStatus(status: number | null): boolean;
+declare const USAGE_LIMIT_FAIL_PREFIX = "operator usage limit reached";
+declare function isUsageLimitFailure(failWhy: string | undefined): boolean;
+declare const TRANSIENT_RETRY_DELAYS_MS: readonly [15000, 45000];
+declare const TRANSIENT_FAST_FAIL_MS = 120000;
+declare const CLAUDE_INACTIVITY_TIMEOUT_MS = 600000;
+interface StreamResultEvent {
+    apiErrorStatus: number | null;
+    found: boolean;
+    isError: boolean;
+    text: string | null;
+}
+declare function extractStreamResult(stdout: string): StreamResultEvent;
+type ReviewerExec = typeof runReviewerExec;
+interface ClaudeVoiceSeams {
+    exec?: ReviewerExec;
+    fastFailMs?: number;
+    inactivityTimeoutMs?: number;
+    retryDelaysMs?: readonly number[];
+}
+declare function runClaudeReviewVoice(prompt: string, config: VoiceConfig, opts?: RunReviewOpts, seams?: ClaudeVoiceSeams): Promise<VoiceRunResult>;
+declare function claudeWorktreePromptSuffix(args: {
+    headSha: string;
+    history?: boolean;
+    worktree: string;
+}): string;
+
+declare const ENSEMBLE_CONFIG_PATH: string;
+declare function asRecord(v: unknown): Record<string, unknown> | null;
+declare function readEnsembleConfig(configPath?: string): Record<string, unknown>;
+
+interface PrPushContext {
+    headRefName: string;
+    headRepoOwner: string | null;
+    isCrossRepository: boolean;
+    viewerCanPushBase: boolean;
+}
+type PushFenceVerdict = {
+    allowed: false;
+    reason: string;
+} | {
+    allowed: true;
+};
+declare function evaluatePushFence(ctx: PrPushContext, prSlug: string): PushFenceVerdict;
+declare function parsePushContext(prJson: unknown, viewerCanPushBase: unknown): PrPushContext;
 
 interface FixtureAnchor {
     file: string;
@@ -1337,4 +1365,4 @@ declare function resolveMode(v: string): string;
 declare function isMode(v: string): v is ModeName;
 declare function isImplemented(mode: ModeName): boolean;
 
-export { AGENT_INSTRUCTION_NAMES, type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormOptions, type BrainstormResult, type BuildReceiptResult, CLAUDE_CAPABILITY_FENCE, CLAUDE_EFFORTS, CLAUDE_INACTIVITY_TIMEOUT_MS, CLAUDE_READ_TOOLS, CLAUDE_REVIEW_DENIED_TOOLS, CODEX_INACTIVITY_TIMEOUT_MS, CODEX_SANDBOX_PROFILE, COLD_PEER_ROLE, CORE_WORKTREE_REVIEW_TIMEOUT_MS, CRITIQUE_STANCES, type ClaudeSeatFence, type ClaudeVoiceSeams, type CodeReviewSeatPromptArgs, type CodexReviewResult, type CodexSandboxPaths, type ConsultResult, type ConsultSynthesis, type ConventionCitation, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type ConventionTier, type Coverage, type CoverageFileEntry, type CoveragePolicy, type Critique, type CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_POSTURE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, ENSEMBLE_CONFIG_PATH, EVIDENCE_CLASSES, EVIDENCE_MANIFEST_FILE, EVIDENCE_MANIFEST_SCHEMA_VERSION, EVIDENCE_SEATS, type EvidenceClass, type EvidenceGap, type EvidenceManifest, type EvidenceMap, type EvidenceSeat, type FileDiff, type FileKind, type FixtureAnchor, type FixtureScore, GROK_CLI_SANDBOX, GROK_SANDBOX_PROFILE, GROK_WORKTREE_REVIEW_TIMEOUT_MS, type GatherConfig, type GatheredConventions, type GhResult, type GhRunner, type GitRun, type GitRunAsync, HARNESS_SEATS, HOLISTIC_DEFAULTS, HOLISTIC_MIN_ANCHOR_NONWS, HOLISTIC_SEAT_ID, HOLISTIC_SEVERITY_CAP, type HarnessSeat, type HolisticEntry, type HolisticFixture, type HolisticPlan, type HolisticPolicyDeps, type HolisticPromptArgs, type HolisticProvenance, type HolisticRunner, type HolisticSeatFlags, type HolisticSite, type HolisticSiteRole, IMPLEMENTED_MODES, type Idea, type InlineSecretHit, MDNS_RESPONDER_SOCKET, MODES, MODE_ALIASES, type ManifestBlob, type ModeName, type NearMiss, OPERATOR_REVIEW_METHOD, type OmitReason, POLICY_VERSIONS, POLICY_VERSION_EVIDENCE, POLICY_VERSION_LEGACY, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PendingState, type PersistReviewInput, type PlacedFinding, type PlantedPositive, type PolicyHashInputs, type PostingPosture, type PrPushContext, type PreflightError, type PreflightErrorKind, type PushFenceVerdict, QUALIFY_PROBE_PORT, QUALITY_LENS, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type RankedIdea, type RawIdea, type ReceiptCoverage, type ReceiptKey, type RepoLocation, type ReviewEvidence, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, type ReviewSummary, ReviewerConfig, type ReviewerExec, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunHolisticLensOptions, type RunReviewOpts, SANDBOX_WRITABLE_TMP, STAGE_MARKER, SUGGESTION_HARD_CAP, type SandboxProfileMap, type SandboxProfileRef, type ScoredFinding, SeatDiagnostics, type SecretScanResult, type SensitivePathHit, Severity, type SiteCheck, type SiteReader, type StageCounts, type StageFailure, type StagePlan, type StageResult, type StageSuccess, type StageTarget, type StagedComment, type StagedReviewPayload, StoredReview, type StreamResultEvent, type SummaryBodyInput, type SynthesisResult, TRANSIENT_FAST_FAIL_MS, TRANSIENT_RETRY_DELAYS_MS, TerminalState, type TextSecretHit, UNTRUSTED_INSTRUCTIONS_CLAUSE, USAGE_LIMIT_FAIL_PREFIX, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, VOICE_IDS, type VoiceAnswerResult, type VoiceConfig, type VoiceCritiqueResult$1 as VoiceCritiqueResult, type VoiceGenerateResult, type VoiceId, type VoiceRunResult, WORKTREE_LOCK_ERROR, type Worktree, type WorktreeEvidence, acquireDiff, acquireRepoLock, acquireRepoLockAsync, allowedRootsFromConfig, applyHolisticPolicy, asRecord, buildClaudeReviewArgs, buildClaudeVoiceArgs, buildCodexReviewArgs, buildCodexWorktreeArgs, buildDiffReceipt, buildEvidenceManifest, buildGrokReviewArgs, buildStagedReviewPayload, canonicalizeDiff, capHolisticSeverity, checkFreshness, classifyFileKind, classifyGitError, classifyPending, claudeWorktreePromptSuffix, codexSandboxSupported, computeCoverage, computePolicyHash, computePolicyHashAt, index as consult, coverageCounts, coverageShortfall, defaultCodexSandboxPaths, defaultReceiptStore, defuseUntrusted, diffDigest, ensureSandboxProfile, escapesRoot, evaluatePushFence, evidenceShortfall, extractDirRefs, extractGrokText, extractIncludes, extractRefs, extractStreamResult, fallbackSynthesis$1 as fallbackSynthesis, findQuoteSpan, findQuoteSpans, findingTrailer, formatEvidenceShortfall, fsConventionReader, gatherConventions, hasDepSurface, hasGeneratedHeader, holisticCapWasLifted, homeReadDenyRules, isCommitSha, isConventionsDoc, isDiffReviewed, isEnsembleStagedReview, isEvidenceClass, isEvidenceSeat, isHolisticRecord, isImplemented, isMode, isPolicyVersion, isPreflightError, isRetryableApiStatus, isStrippedPath, isTestPath, isTransientApiErrorReply, isUnsafeReadRoot, isUsageLimitFailure, isUsageLimitReply, isVoiceId, keyOf, killTree, listReviewers, listVoices, loadHolisticFixture, loadHolisticSeat, loadPostingPosture, loadReviewers, loadVoices, makeEscalatingKill, makeNeutralSeatCwd, makeOwnerOnlyTempDir, materializeWorktree, materializeWorktreeAsync, materializedDiffClause, meetsInlineFloor, memoryConventionReader, omittedLine, parseConventionCitation, parseCritique, parseDiffFiles, parseHolisticSites, parseIdeas, parseLsTree, parsePushContext, parseReviewSummaries, parseReviewers, parseSynthesis, parseTrailerIds, parseVoiceIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, planPlacement, readEnsembleConfig, readOnlyWorktreeClause, readReadableSurface, readReceipt, readReview, readReviewsForRun, reapWorktree, reapWorktreeAsync, receiptIdentityMatches, receiptKeyHash, receiptPath, receiptPolicyVersion, redactUrlCredentials, remoteSlug, renderCodeReviewSeatPrompt, renderCodexSandboxProfile, renderCritiquePrompt, renderGeneratePrompt, renderHolisticPrompt, renderInlineComment, renderSummaryBody, renderSynthesisPrompt, repoIdFromSlug, resolveBase, resolveBin, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveHolisticPlan, resolveHolisticSeat, resolveInRepo, resolveMode, resolvePolicyVersion, resolvePosture, resolveReceipt, resolveRepoId, resolveRepoLocation, resolveRepoLocationAsync, resolveReviewSandbox, resolveReviewer, reviewDir, rootAllowed, runBrainstormMode, runClaudeReview, runClaudeReviewVoice, runClaudeVoice, runCodexReview, runGrokReview, runHolisticLens, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, scanTextForSecrets, scoreHolisticFixture, sha256Hex, stageReview, stripAgentInstructions, stripAgentInstructionsAsync, summarizeCoverage, validateReceiptShape, verifyFixtureAnchors, verifySiteAtHead, worktreeReader, wrapWithSandbox, writeCodexSandboxProfile, writeEvidenceManifest, writeReceipt, writeTrailFile };
+export { AGENT_INSTRUCTION_NAMES, type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormOptions, type BrainstormResult, type BuildReceiptResult, CI_EVIDENCE_LIMITS, CI_EVIDENCE_TRAIL_FILE, CLAUDE_CAPABILITY_FENCE, CLAUDE_EFFORTS, CLAUDE_INACTIVITY_TIMEOUT_MS, CLAUDE_READ_TOOLS, CLAUDE_REVIEW_DENIED_TOOLS, CODEX_INACTIVITY_TIMEOUT_MS, CODEX_SANDBOX_PROFILE, COLD_PEER_ROLE, CORE_WORKTREE_REVIEW_TIMEOUT_MS, CRITIQUE_STANCES, type CiEvidenceInput, type CiEvidenceLimits, type CiEvidenceResult, type ClaudeSeatFence, type ClaudeVoiceSeams, type CodeReviewSeatPromptArgs, type CodexReviewResult, type CodexSandboxPaths, type ConsultResult, type ConsultSynthesis, type ConventionCitation, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type ConventionTier, type Coverage, type CoverageFileEntry, type CoveragePolicy, type Critique, type CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_POSTURE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, ENSEMBLE_CONFIG_PATH, EVIDENCE_CLASSES, EVIDENCE_MANIFEST_FILE, EVIDENCE_MANIFEST_SCHEMA_VERSION, EVIDENCE_SEATS, type EvidenceClass, type EvidenceGap, type EvidenceManifest, type EvidenceMap, type EvidenceSeat, type FileDiff, type FileKind, type FixtureAnchor, type FixtureScore, GROK_CLI_SANDBOX, GROK_SANDBOX_PROFILE, GROK_WORKTREE_REVIEW_TIMEOUT_MS, type GatherConfig, type GatheredConventions, type GhResult, type GhRunner, type GitRun, type GitRunAsync, HARNESS_SEATS, HOLISTIC_DEFAULTS, HOLISTIC_MIN_ANCHOR_NONWS, HOLISTIC_SEAT_ID, HOLISTIC_SEVERITY_CAP, type HarnessSeat, type HolisticEntry, type HolisticFixture, type HolisticPlan, type HolisticPolicyDeps, type HolisticPromptArgs, type HolisticProvenance, type HolisticRunner, type HolisticSeatFlags, type HolisticSite, type HolisticSiteRole, IMPLEMENTED_MODES, type Idea, type InlineSecretHit, MDNS_RESPONDER_SOCKET, MODES, MODE_ALIASES, type ManifestBlob, type ModeName, type NearMiss, OPERATOR_REVIEW_METHOD, type OmitReason, POLICY_VERSIONS, POLICY_VERSION_EVIDENCE, POLICY_VERSION_LEGACY, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PendingState, type PersistReviewInput, type PlacedFinding, type PlantedPositive, type PolicyHashInputs, type PostingPosture, type PrPushContext, type PreflightError, type PreflightErrorKind, type PushFenceVerdict, QUALIFY_PROBE_PORT, QUALITY_LENS, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, type RankedIdea, type RawIdea, type ReceiptCoverage, type ReceiptKey, type RepoLocation, type ReviewEvidence, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, type ReviewSummary, ReviewerConfig, type ReviewerExec, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunHolisticLensOptions, type RunReviewOpts, SANDBOX_WRITABLE_TMP, STAGE_MARKER, SUGGESTION_HARD_CAP, type SandboxProfileMap, type SandboxProfileRef, type ScoredFinding, SeatDiagnostics, type SecretScanResult, type SensitivePathHit, Severity, type SiteCheck, type SiteReader, type StageCounts, type StageFailure, type StagePlan, type StageResult, type StageSuccess, type StageTarget, type StagedComment, type StagedReviewPayload, StoredReview, type StreamResultEvent, type SummaryBodyInput, type SynthesisResult, TRANSIENT_FAST_FAIL_MS, TRANSIENT_RETRY_DELAYS_MS, TerminalState, type TextSecretHit, UNTRUSTED_INSTRUCTIONS_CLAUSE, USAGE_LIMIT_FAIL_PREFIX, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, VOICE_IDS, type VoiceAnswerResult, type VoiceConfig, type VoiceCritiqueResult$1 as VoiceCritiqueResult, type VoiceGenerateResult, type VoiceId, type VoiceRunResult, WORKTREE_LOCK_ERROR, type Worktree, type WorktreeEvidence, acquireDiff, acquireRepoLock, acquireRepoLockAsync, allowedRootsFromConfig, applyHolisticPolicy, asRecord, buildClaudeReviewArgs, buildClaudeVoiceArgs, buildCodexReviewArgs, buildCodexWorktreeArgs, buildDiffReceipt, buildEvidenceManifest, buildGrokReviewArgs, buildStagedReviewPayload, canonicalizeDiff, capHolisticSeverity, checkFreshness, classifyFileKind, classifyGitError, classifyPending, claudeWorktreePromptSuffix, codexSandboxSupported, computeCoverage, computePolicyHash, computePolicyHashAt, index as consult, coverageCounts, coverageShortfall, defaultCodexSandboxPaths, defaultReceiptStore, defuseUntrusted, diffDigest, ensureSandboxProfile, escapesRoot, evaluatePushFence, evidenceShortfall, extractDirRefs, extractGrokText, extractIncludes, extractRefs, extractStreamResult, fallbackSynthesis$1 as fallbackSynthesis, fetchCiEvidence, findQuoteSpan, findQuoteSpans, findingTrailer, formatEvidenceShortfall, fsConventionReader, gatherConventions, hasDepSurface, hasGeneratedHeader, holisticCapWasLifted, homeReadDenyRules, isCommitSha, isConventionsDoc, isDiffReviewed, isEnsembleStagedReview, isEvidenceClass, isEvidenceSeat, isHolisticRecord, isImplemented, isMode, isPolicyVersion, isPreflightError, isRetryableApiStatus, isStrippedPath, isTestPath, isTransientApiErrorReply, isUnsafeReadRoot, isUsageLimitFailure, isUsageLimitReply, isVoiceId, keyOf, killTree, listReviewers, listVoices, loadHolisticFixture, loadHolisticSeat, loadPostingPosture, loadReviewers, loadVoices, makeEscalatingKill, makeNeutralSeatCwd, makeOwnerOnlyTempDir, materializeWorktree, materializeWorktreeAsync, materializedDiffClause, meetsInlineFloor, memoryConventionReader, omittedLine, parseConventionCitation, parseCritique, parseDiffFiles, parseHolisticSites, parseIdeas, parseLsTree, parsePushContext, parseReviewSummaries, parseReviewers, parseSynthesis, parseTrailerIds, parseVoiceIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, planPlacement, readEnsembleConfig, readOnlyWorktreeClause, readReadableSurface, readReceipt, readReview, readReviewsForRun, reapWorktree, reapWorktreeAsync, receiptIdentityMatches, receiptKeyHash, receiptPath, receiptPolicyVersion, redactUrlCredentials, remoteSlug, renderCodeReviewSeatPrompt, renderCodexSandboxProfile, renderCritiquePrompt, renderGeneratePrompt, renderHolisticPrompt, renderInlineComment, renderSummaryBody, renderSynthesisPrompt, repoIdFromSlug, resolveBase, resolveBin, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveHolisticPlan, resolveHolisticSeat, resolveInRepo, resolveMode, resolvePolicyVersion, resolvePosture, resolveReceipt, resolveRepoId, resolveRepoLocation, resolveRepoLocationAsync, resolveReviewSandbox, resolveReviewer, reviewDir, rootAllowed, runBrainstormMode, runClaudeReview, runClaudeReviewVoice, runClaudeVoice, runCodexReview, runGrokReview, runHolisticLens, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, scanTextForSecrets, scoreHolisticFixture, sha256Hex, stageReview, stripAgentInstructions, stripAgentInstructionsAsync, summarizeCoverage, validateReceiptShape, verifyFixtureAnchors, verifySiteAtHead, worktreeReader, wrapWithSandbox, writeCodexSandboxProfile, writeEvidenceManifest, writeReceipt, writeTrailFile };

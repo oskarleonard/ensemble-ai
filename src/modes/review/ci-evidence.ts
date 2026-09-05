@@ -170,10 +170,11 @@ interface AnnotationBlock {
 const cost = (lines: readonly string[]): number => lines.reduce((n, l) => n + l.length + 1, 0);
 
 // Room held back so the bookkeeping lines the selection itself causes still fit inside
-// `maxChars` — three section-level ones (check runs not shown, annotated checks not shown,
-// statuses not shown). A block's own `… N more annotation(s) …` line is charged to the block.
+// `maxChars` — four section-level ones (check runs not shown, check runs the API page cap left
+// unfetched, annotated checks not shown, statuses not shown). A block's own `… N more
+// annotation(s) …` line is charged to the block.
 const OMISSION_LINE_RESERVE = 80;
-const OMISSION_LINE_KINDS = 3;
+const OMISSION_LINE_KINDS = 4;
 
 const ANNOTATIONS_HEADING = '## Annotations (the checks\' own remarks on this head — level, then path:line)';
 
@@ -184,7 +185,7 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   let headSha = input.headSha;
   if (!headSha) {
     const head = ghJson<unknown>(gh, ['pr', 'view', String(input.pr), '-R', repoSlug, '--json', 'headRefOid']);
-    if (!head.ok) return { error: `head SHA unavailable: ${safe(head.error)}`, ok: false };
+    if (!head.ok) return { error: `head SHA unavailable: ${safe(oneLine(head.error, 200))}`, ok: false };
     const oid = asRecord(head.value).headRefOid;
     if (typeof oid !== 'string' || !oid) {
       return { error: 'head SHA unavailable: `gh pr view` returned no headRefOid', ok: false };
@@ -193,7 +194,7 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   }
 
   const runs = ghJson<unknown>(gh, ['api', `repos/${repoSlug}/commits/${headSha}/check-runs?per_page=100`]);
-  if (!runs.ok) return { error: `check runs unavailable: ${safe(runs.error)}`, ok: false };
+  if (!runs.ok) return { error: `check runs unavailable: ${safe(oneLine(runs.error, 200))}`, ok: false };
   const rawChecks = asRecord(runs.value).check_runs;
   // A non-object ELEMENT (`null`, a string, a number) carries no evidence and every accessor
   // below would dereference it — drop it here, where the array is first read.
@@ -204,6 +205,18 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
       // reads must not depend on the machine that gathered it.
       (a, b) => conclusionRank(a) - conclusionRank(b) || name(a).localeCompare(name(b), 'en')
     );
+  // THE PAGE CAP. The call above asks for one page of 100. A commit with more check runs than
+  // that returns exactly 100 and the rest are simply absent — so the API's own `total_count` is
+  // the only way to know they existed. Without it the header would call 100 the "total" and a
+  // reviewer would read "no failures" out of a page that never contained them. Guarded: the
+  // payload is whatever `gh` returned, so a missing, non-finite, or under-counting field is
+  // ignored rather than believed.
+  const rawTotal = asRecord(runs.value).total_count;
+  const totalChecks =
+    typeof rawTotal === 'number' && Number.isFinite(rawTotal) && rawTotal > checks.length
+      ? rawTotal
+      : checks.length;
+  const checksNotFetched = totalChecks - checks.length;
   const failed = checks.filter((c) => conclusionRank(c) === 0).length;
   const pending = checks.filter((c) => conclusionRank(c) === 2).length;
   const success = checks.filter((c) => conclusionRank(c) === SUCCESS_RANK).length;
@@ -236,9 +249,17 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   const blocks: AnnotationBlock[] = [];
   for (const c of annotated) {
     const heading = `### ${name(c)} (${label(c)})`;
+    // The id is interpolated into a `gh api` PATH, and the payload is whatever `gh` returned —
+    // so it is admitted only as what the API documents it to be: an integer. Anything else is
+    // junk or a path fragment, and neither is a check run to fetch.
+    const checkId = Number.isInteger(c.id) ? String(c.id) : null;
+    if (checkId === null) {
+      blocks.push({ heading, knownTotal: 0, note: '- annotations unavailable: non-numeric check id', units: [] });
+      continue;
+    }
     const res = ghJson<unknown>(gh, [
       'api',
-      `repos/${repoSlug}/check-runs/${oneLine(c.id, 40)}/annotations?per_page=50`,
+      `repos/${repoSlug}/check-runs/${checkId}/annotations?per_page=50`,
     ]);
     if (!res.ok || !Array.isArray(res.value)) {
       const why = res.ok ? UNEXPECTED_SHAPE : safe(oneLine(res.error, 200));
@@ -295,8 +316,10 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   // drops the last section, which is exactly the annotation this module exists to surface
   // (incident 2026-08-10). So each item is admitted on what it is WORTH: annotation blocks,
   // then the checks that failed, then the statuses, then the green rows.
+  // `total` is only honest when the page held everything; otherwise the header says which it is.
   const headerLine = (annotations: number): string =>
-    `Check runs: ${checks.length} total · ${failed} failed · ${success} success · ${pending} pending · ${annotations} annotation(s) shown`;
+    `Check runs: ${checksNotFetched > 0 ? `${checks.length} fetched of ${totalChecks}` : `${checks.length} total`} · ${failed} failed · ${success} success · ${pending} pending · ${annotations} annotation(s) shown`;
+  const checksNotFetchedLine = `… ${checksNotFetched} check run(s) not fetched (API page cap)`;
   const notFetchedLine = `… ${notFetched} annotated check(s) not fetched (cap: maxAnnotationChecks)`;
   const moreAnnotations = (n: number): string => `… ${n} more annotation(s) not shown`;
   // Charged up front: the header (at its longest — every fetched annotation kept) and every
@@ -317,9 +340,11 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   ]);
   // What is left after the always-rendered scaffolding and the reserve. Below roughly 408 chars
   // (the scaffolding of a typical commit — two header lines, three section headings, a cap note
-  // — plus its three omission lines) nothing is admitted and the text is the scaffolding alone,
-  // which can itself exceed the cap: the caller's budget is a budget for EVIDENCE, not a licence
-  // to render a document with no head.
+  // — plus its omission lines) nothing is admitted and the text is the scaffolding alone, which
+  // can itself exceed the cap: the caller's budget is a budget for EVIDENCE, not a licence to
+  // render a document with no head. That floor is not fixed — it RISES with whatever the
+  // scaffolding embeds, and a `gh` error note (a statuses failure, capped at 200 chars) is part
+  // of the scaffolding.
   const budget = limits.maxChars - OMISSION_LINE_RESERVE * OMISSION_LINE_KINDS;
   // Greedy, in priority order: each call spends from the shared `used` running total.
   const keep = (items: Item[]): Item[] =>
@@ -363,6 +388,7 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   const omittedStatuses = statusRows.length - keptStatuses.length;
   const shownAnnotations = keptBlocks.reduce((n, k) => n + k.shown, 0);
   const truncated =
+    checksNotFetched > 0 ||
     notFetched > 0 ||
     blocksDropped > 0 ||
     omittedChecks > 0 ||
@@ -378,6 +404,7 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
     ...keptFailing.flatMap((i) => i.lines),
     ...keptSuccess.flatMap((i) => i.lines),
     ...(omittedChecks > 0 ? [`… ${omittedChecks} more check run(s) not shown`] : []),
+    ...(checksNotFetched > 0 ? [checksNotFetchedLine] : []),
     '',
     ANNOTATIONS_HEADING,
     ...keptBlocks.flatMap(({ block, shown }) => [

@@ -300,17 +300,22 @@ describe('fetchCiEvidence — malformed payloads degrade, they never throw', () 
 // evidence the module exists for (incident 2026-08-10 — the annotation in the green job), and
 // what it says about itself must be true.
 describe('fetchCiEvidence — the maxChars budget keeps the evidence, not the boilerplate', () => {
+  // 3080 = the 2760 chars of EVIDENCE this case has always pinned, plus the omission-line reserve
+  // as it now stands (4 kinds × 80 — the API page-cap line joined it). The evidence budget under
+  // test is unchanged; only the scaffolding held back around it grew.
+  const TIGHT = 3080;
+
   it('keeps annotations under a tight budget, stays inside the cap, and counts only what it rendered', () => {
     const res = fetchCiEvidence({
       gh: fakeGh(crowded(12)),
       headSha: SHA,
-      limits: { maxChars: 3000 },
+      limits: { maxChars: TIGHT },
       pr: 7,
       repoSlug: SLUG,
     });
     expect(res.ok).toBe(true);
     if (!res.ok) return;
-    expect(res.text.length).toBeLessThanOrEqual(3000);
+    expect(res.text.length).toBeLessThanOrEqual(TIGHT);
     // The section the module exists for survives the cut, with real annotation lines in it.
     expect(res.text).toContain('## Annotations');
     expect(res.text).toMatch(/- \[(warning|failure)\] src\/job-\d+\.ts:\d+/);
@@ -372,6 +377,59 @@ describe('fetchCiEvidence — the maxChars budget keeps the evidence, not the bo
     if (!res.ok) return;
     expect(res.text).toContain('298 more annotation(s) not shown');
     expect(res.annotations).toBe(2);
+  });
+
+  // The check-runs call is `per_page=100`. A commit with more checks than that returns ONE page,
+  // and a header that called it the "total" would be a lie told under the word `total` — the one
+  // claim this section cannot afford, because a reviewer reads "no failures" out of it.
+  it('says how many check runs the API page cap left unfetched, and stops calling them the total', () => {
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+        check_runs: Array.from({ length: 100 }, (_, i) => ({
+          conclusion: 'success',
+          id: 1000 + i,
+          name: `job-${String(i).padStart(3, '0')}`,
+          output: { annotations_count: 0, summary: null, title: null },
+          status: 'completed',
+        })),
+        total_count: 150,
+      },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('Check runs: 100 fetched of 150');
+    expect(res.text).not.toContain('100 total');
+    expect(res.text).toContain('… 50 check run(s) not fetched (API page cap)');
+    expect(res.truncated).toBe(true);
+  });
+
+  it('keeps the plain `N total` header when the page held every check run', () => {
+    const res = fetchCiEvidence({ gh: fakeGh(happy), headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('Check runs: 3 total');
+    expect(res.text).not.toContain('not fetched (API page cap)');
+    expect(res.truncated).toBe(false);
+  });
+
+  it('ignores a total_count that is missing, non-numeric, or lower than the page it returned', () => {
+    for (const total of [undefined, 'many', Number.NaN, 1]) {
+      const gh = fakeGh({
+        [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+          check_runs: CHECK_RUNS.check_runs,
+          ...(total === undefined ? {} : { total_count: total }),
+        },
+        [`api repos/${SLUG}/check-runs/102/annotations`]: WARNING_WRAPPING_AN_ERROR,
+        [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+      });
+      const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      expect(res.text).toContain('Check runs: 3 total');
+      expect(res.text).not.toContain('not fetched (API page cap)');
+    }
   });
 });
 
@@ -499,6 +557,37 @@ describe('fetchCiEvidence — junk elements and blocks too big to admit whole', 
     expect(res.annotations).toBe(1);
     expect((res.text.match(/^- \[/gm) ?? []).length).toBe(1);
     expect(res.text).toContain('must be marked IMMUTABLE');
+  });
+
+  // The check id is interpolated into a `gh api` PATH. The payload is whatever `gh` returned, so
+  // a non-integer id is either junk or a path fragment — neither is a check run to fetch.
+  it('never builds an annotations path out of a non-numeric check id', () => {
+    const calls: string[] = [];
+    const gh = fakeGh(
+      {
+        [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+          check_runs: [
+            {
+              conclusion: 'failure',
+              id: '102/annotations?x=1&y=../../../repos/other/secret/actions',
+              name: 'lint',
+              output: { annotations_count: 3, summary: null, title: null },
+              status: 'completed',
+            },
+          ],
+        },
+        [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+      },
+      calls
+    );
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    // No annotations call was made at all (the fake `gh` throws on any call not scripted above).
+    expect(calls.some((c) => c.includes('/annotations'))).toBe(false);
+    // …and the block says why, rather than vanishing.
+    expect(res.text).toContain('- annotations unavailable: non-numeric check id');
+    expect(res.annotations).toBe(0);
   });
 
   it('admits a verbose check\'s block PARTIALLY rather than losing every annotation it has', () => {
