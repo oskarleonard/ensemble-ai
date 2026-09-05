@@ -11,6 +11,7 @@ import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { persistGatePacket } from './gate-hunks';
+import type { RegateOptions, RegateResult } from './regate';
 import { readSeatArtifacts, runReseat, splitWorktreePrompt } from './reseat';
 import {
   qualifyGrokSeat,
@@ -86,6 +87,19 @@ const PRIOR_DENIAL: EgressDenial = { host: 'other.example', method: 'CONNECT', p
 // Only a WORKTREE seat has an egress proxy, so only a worktree attempt can report denials.
 const adapterDenied: ReviewAdapter = async () => ({ egressDenials: [DENIAL], ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false });
 
+// A prompt persisted by a run whose worktree was reaped long ago: the preamble names a dir that no
+// longer exists, and the original base SHA survives ONLY in this text.
+const OLD_WORKTREE_PROMPT = 'PINNED PROMPT' + `\n\n## Whole-project evidence — you are running inside the project\n\nThe full project at the PR head is checked out READ-ONLY at /tmp/reaped-long-ago (detached at ${RUN_HEAD}), and it is your working directory.\nThe change under review is exactly: git diff ${BASE}...${RUN_HEAD}\n`;
+
+// A minimal, fully typed RegateResult — what the injected regate seam returns instead of a gate spawn.
+const REGATE_OK: RegateResult = {
+  headSha: RUN_HEAD,
+  ok: true,
+  reviews: 2,
+  synthesis: { agreements: [], bottomLine: 'fix then merge', by: 'claude', degraded: false, disagreements: [], ok: true, raw: null, summary: 's' },
+  verdicts: [],
+};
+
 // Exactly what a real run with a dead grok leaves behind: a reviewed codex, a failed grok stub
 // whose prompt carries the OLD worktree preamble, and the pinned gate packet.
 function seedRun(grokPrompt = 'PINNED PROMPT'): { base: string; runId: string } {
@@ -145,12 +159,12 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     expect(verdicts.verdicts.map((v) => v.findingId)).toEqual(expect.arrayContaining(['codex#1', 'grok#1']));
     const synth = JSON.parse(fs.readFileSync(path.join(dir, 'claude-synthesis.json'), 'utf8')) as {
       claudeReview: { voiceId: string }; regatedAt: string;
-      reseats: Array<{ fallbackReason: string | null; outcome: string; previous: { terminalState: string }; realized: string; seat: string; summary: string }>;
+      reseats: Array<{ fallbackReason: string | null; outcome: string; previous: { hadWorktree: boolean; terminalState: string }; realized: string; seat: string; summary: string }>;
     };
     expect(synth.claudeReview.voiceId).toBe('claude'); // merged, never clobbered
     expect(typeof synth.regatedAt).toBe('string');
     expect(synth.reseats).toHaveLength(1);
-    expect(synth.reseats[0]).toMatchObject({ fallbackReason: null, outcome: 'reviewed', previous: { terminalState: 'failed-reviewer' }, realized: 'packet', seat: 'grok', summary: 'grok summary' });
+    expect(synth.reseats[0]).toMatchObject({ fallbackReason: null, outcome: 'reviewed', previous: { hadWorktree: false, terminalState: 'failed-reviewer' }, realized: 'packet', seat: 'grok', summary: 'grok summary' });
     expect(res.egressDenials).toEqual([]); // a packet seat runs unfenced — no proxy, no denials
     expect(res.fallbackReason).toBeNull();
     const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'evidence-manifest.json'), 'utf8')) as { realizedEvidence: Record<string, string> };
@@ -184,8 +198,7 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
   });
 
   it('worktree mode: the seat gets the pinned prompt + a FRESH preamble naming the new dir and the recovered base', async () => {
-    const oldPrompt = 'PINNED PROMPT' + `\n\n## Whole-project evidence — you are running inside the project\n\nThe full project at the PR head is checked out READ-ONLY at /tmp/reaped-long-ago (detached at ${RUN_HEAD}), and it is your working directory.\nThe change under review is exactly: git diff ${BASE}...${RUN_HEAD}\n`;
-    const { base, runId } = seedRun(oldPrompt);
+    const { base, runId } = seedRun(OLD_WORKTREE_PROMPT);
     const seen: Array<{ prompt: string; worktree?: string }> = [];
     const adapter: ReviewAdapter = async (prompt, _cfg, opts) => { seen.push({ prompt, worktree: opts?.worktree }); return { ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false }; };
     const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-reseat-wt-'));
@@ -233,13 +246,66 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     expect(synth.reseats[0].fallbackReason).toContain('strict');
   });
 
-  // conventionPaths only reaches the holistic severity cap deep inside the gate, so what is
-  // observable here is that the trail default is READ and threaded without disturbing the regate.
-  it('defaults conventionPaths from the run trail when the caller gathered none', async () => {
-    const { base, runId } = seedRun();
-    fs.writeFileSync(path.join(reviewDir(base, runId), 'conventions.json'), JSON.stringify({ files: [{ included: true, path: 'CONVENTIONS.md' }] }));
-    const res = await runReseat({ adapter: adapterOk, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId, seat: 'grok' });
+  // A worktree with NO qualification is the hole a bare `qualification?.qualified` check leaves:
+  // seat-run has no reason to report, so without a synthesized one the run is indistinguishable
+  // from a reseat that was never asked for a worktree at all.
+  it('a worktree supplied with NO qualification names the fallback — result, ONE log line, trail entry', async () => {
+    const { base, runId } = seedRun(OLD_WORKTREE_PROMPT);
+    const seen: Array<{ prompt: string; worktree?: string }> = [];
+    const adapter: ReviewAdapter = async (prompt, _cfg, o) => { seen.push({ prompt, worktree: o?.worktree }); return { ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false }; };
+    const logs: string[] = [];
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-reseat-wt-'));
+    const res = await runReseat({
+      adapter, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, log: (m) => logs.push(m),
+      reviewer: GROK, runId, seat: 'grok', worktree: { baseSha: null, dir: wt, headSha: RUN_HEAD },
+    });
+    expect(res.realized).toBe('packet');
+    expect(res.fallbackReason).toMatch(/^grok: .*PACKET$/);
+    // The seat never got the tree, and never heard about one.
+    expect(seen).toHaveLength(1);
+    expect(seen[0].worktree).toBeUndefined();
+    expect(seen[0].prompt).toBe('PINNED PROMPT');
+    // Named exactly ONCE (the evidence-mode line says 'packet evidence', lowercase).
+    expect(logs.filter((l) => l.includes('PACKET'))).toHaveLength(1);
+    const synth = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'claude-synthesis.json'), 'utf8')) as {
+      reseats: Array<{ fallbackReason: string; previous: { hadWorktree: boolean } }>;
+    };
+    expect(synth.reseats[0].fallbackReason).toBe(res.fallbackReason);
+    // …and the trail still shows this seat originally reviewed in a worktree.
+    expect(synth.reseats[0].previous.hadWorktree).toBe(true);
+  });
+
+  it('threads conventionPaths to the regate: the trail default when the caller has none, the caller when it does', async () => {
+    const captured: RegateOptions[] = [];
+    const regate = async (o: RegateOptions): Promise<RegateResult> => { captured.push(o); return REGATE_OK; };
+    // A fresh run per assertion: a healed seat is `reviewed`, and reseating it again is refused.
+    const seeded = (): { base: string; runId: string } => {
+      const r = seedRun();
+      fs.writeFileSync(path.join(reviewDir(r.base, r.runId), 'conventions.json'), JSON.stringify({ files: [{ included: true, path: 'CONVENTIONS.md' }, { included: false, path: 'docs/BIG.md' }] }));
+      return r;
+    };
+    const a = seeded();
+    const res = await runReseat({ adapter: adapterOk, baseDir: a.base, gateConfig: GATE_CFG, regate, reviewer: GROK, runId: a.runId, seat: 'grok' });
     expect(res.ok).toBe(true);
+    expect(captured[0].conventionPaths).toEqual(['CONVENTIONS.md']); // this run's trail, excluded path filtered out
+    const b = seeded();
+    await runReseat({ adapter: adapterOk, baseDir: b.base, gateConfig: GATE_CFG, conventionPaths: ['GATHERED.md'], regate, reviewer: GROK, runId: b.runId, seat: 'grok' });
+    expect(captured[1].conventionPaths).toEqual(['GATHERED.md']); // the caller's own beats the trail
+    expect(captured).toHaveLength(2);
+  });
+
+  it('refuses a worktree checked out at a DIFFERENT head than the pinned packet', async () => {
+    const { base, runId } = seedRun();
+    let spawns = 0;
+    const adapter: ReviewAdapter = async () => { spawns += 1; return { ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false }; };
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-reseat-wt-'));
+    await expect(
+      runReseat({
+        adapter, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, qualification: qualifyHarnessSeat(),
+        reviewer: GROK, runId, seat: 'grok', worktree: { baseSha: null, dir: wt, headSha: 'e'.repeat(40) },
+      })
+    ).rejects.toThrow(/refusing to ground a retry on a different head/);
+    expect(spawns).toBe(0); // refused BEFORE the seat was paid for
   });
 
   it('fails CLOSED when the run has no gate packet', async () => {

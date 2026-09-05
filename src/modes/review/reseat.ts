@@ -90,6 +90,8 @@ export interface ReseatOptions {
   log?: (m: string) => void;
   // This seat's sandbox qualification for the NEW worktree. Absent ⇒ packet-mode run.
   qualification?: SeatQualification;
+  // Injected for tests — the regate over the union. The default is the real one.
+  regate?: typeof runRegate;
   reviewer: ReviewerConfig;
   runId: string;
   seat: CoreReviewerId;
@@ -141,15 +143,17 @@ function appendEgressDenials(
   log: (m: string) => void
 ): void {
   if (denials.length === 0) return;
-  log(`reseat: ⚠ egress fence: ${formatEgressDenialCounts(denials)}`);
   try {
+    // Inside the try with the write: this whole record is best-effort, and a throw while merely
+    // FORMATTING the rollup must not abort a reseat whose seat spawn is already paid for.
+    log(`reseat: ⚠ egress fence: ${formatEgressDenialCounts(denials)}`);
     const p = path.join(reviewDir(baseDir, runId), 'egress-denials.json');
     const prior = fs.existsSync(p) ? (JSON.parse(fs.readFileSync(p, 'utf8')) as unknown) : [];
     const merged = [...(Array.isArray(prior) ? (prior as EgressDenial[]) : []), ...denials];
     writeTrailFile(baseDir, runId, 'egress-denials.json', JSON.stringify(merged, null, 2));
   } catch (e) {
-    // Best-effort like every trail write — the denial already reached the log line above.
-    log(`reseat: egress-denials.json could not be updated (${(e as Error).message})`);
+    // Best-effort like every trail write — the denial also rides out on the ReseatResult.
+    log(`reseat: egress-denials.json could not be recorded (${(e as Error).message})`);
   }
 }
 
@@ -160,6 +164,15 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
   if (!headSha) {
     throw new Error(
       `run ${runId} has no usable packet.gate.json under ${baseDir} — nothing to ground a reseat against`
+    );
+  }
+  // FAIL CLOSED on a mis-materialized worktree. The packet is the pinned description of ONE head;
+  // a tree checked out at another commit would ground the seat's file:line citations against code
+  // the packet does not describe, and the gate would then verify them against the wrong text.
+  // Checked before the artifacts are read, so a wrong tree costs nothing.
+  if (opts.worktree && opts.worktree.headSha !== headSha) {
+    throw new Error(
+      `worktree is at ${opts.worktree.headSha.slice(0, 12)} but run ${runId}'s pinned packet is at ${headSha.slice(0, 12)} — refusing to ground a retry on a different head`
     );
   }
   const art = readSeatArtifacts(baseDir, runId, seat);
@@ -206,6 +219,19 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
     ...(worktreePrompt ? { worktreePrompt } : {}),
   });
   const review = seatRun.review;
+  // A worktree the caller supplied with NO qualification never reaches seat-run's own fallback
+  // wording (it has no reason to report), so the run would otherwise look exactly like one that was
+  // never asked for a worktree at all. Name it here — this is the loud-not-silent rule, and the
+  // result, the log and the trail entry all carry the SAME string.
+  const fallbackReason =
+    seatRun.fallbackReason ??
+    (wt && !qualified
+      ? `${seat}: no sandbox qualification for the re-materialized worktree${
+          opts.qualification?.reason ? ` (${opts.qualification.reason})` : ''
+        } — re-ran on the PACKET`
+      : null);
+  // Logged ONLY when synthesized here: a reason that came from runCoreSeat was already logged there.
+  if (fallbackReason && !seatRun.fallbackReason) log(`reseat: ⚠ ${fallbackReason}`);
   try {
     writeTrailFile(
       baseDir,
@@ -217,7 +243,6 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
     log(`reseat: review.${seat}.md could not be written (${(e as Error).message})`);
   }
   appendEgressDenials(baseDir, runId, seatRun.egressDenials, log);
-  if (seatRun.fallbackReason) log(`reseat: ⚠ ${seatRun.fallbackReason}`);
   // The attempt is on record whether or not it healed anything. `summary` carries the NEW attempt's
   // own words, so a sandbox refusal or an incomplete-packet short-circuit explains itself here
   // rather than only in the seat file a reader has to go find.
@@ -230,12 +255,20 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
         ...((existing.reseats as unknown[] | undefined) ?? []),
         {
           at: new Date().toISOString(),
-          fallbackReason: seatRun.fallbackReason,
+          fallbackReason,
           outcome: review.terminalState,
-          previous: { summary: art.stored.summary, terminalState: art.stored.terminalState },
+          previous: {
+            // What the DEAD attempt had. A packet-mode retry of a seat that originally reviewed
+            // in-project is an evidence downgrade, and the trail must still show that.
+            hadWorktree: split.hadWorktree,
+            summary: art.stored.summary,
+            terminalState: art.stored.terminalState,
+          },
           realized: seatRun.realized,
           seat,
-          summary: review.summary.slice(0, 300),
+          // 600: persistAttempt's own no-output summary already carries a 300-char stderr tail, so
+          // a tighter slice would cut off the very failure text this field exists to carry.
+          summary: review.summary.slice(0, 600),
         },
       ],
     }),
@@ -261,7 +294,7 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
     log(`reseat: ${seat} FAILED AGAIN — ${review.summary.replace(/\s+/g, ' ').slice(0, 200)}`);
     return {
       egressDenials: seatRun.egressDenials,
-      fallbackReason: seatRun.fallbackReason,
+      fallbackReason,
       gate: null,
       ok: false,
       realized: seatRun.realized,
@@ -273,7 +306,7 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
   );
   // The regate's holistic pass lifts a finding's severity cap when it cites a convention doc, so a
   // caller that did not gather the paths gets the ones THIS RUN recorded rather than none.
-  const gate = await runRegate({
+  const gate = await (opts.regate ?? runRegate)({
     baseDir,
     conventionPaths: opts.conventionPaths ?? readConventionPathsFromTrail(baseDir, runId),
     gateConfig: opts.gateConfig,
@@ -284,7 +317,7 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
   });
   return {
     egressDenials: seatRun.egressDenials,
-    fallbackReason: seatRun.fallbackReason,
+    fallbackReason,
     gate,
     ok: gate.ok,
     realized: seatRun.realized,
