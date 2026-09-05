@@ -73,7 +73,7 @@ import { REVIEW_ADAPTERS } from './reviewers/registry';
 import { readGatePacketHeadSha } from './modes/review/gate-hunks';
 import { type GateSeat, loadClaudeReviewerSeat, loadGateSeat } from './modes/review/gate-seat';
 import { readConventionPathsFromTrail, runRegate } from './modes/review/regate';
-import { reseatRefusal, runReseat } from './modes/review/reseat';
+import { checkReseat, ReseatLockedError, reseatRefusal, runReseat } from './modes/review/reseat';
 import { loadHolisticSeat } from './modes/review/holistic';
 import {
   acquireDiff,
@@ -101,7 +101,7 @@ import {
   stripSecurityTag,
 } from './modes/review/profile';
 import { formatEvidenceFooter, SEAT_QUALIFIERS } from './modes/review/seat-evidence';
-import { isPreflightError } from './modes/review/worktree';
+import { isPreflightError, redactUrlCredentials } from './modes/review/worktree';
 import { execGit } from './modes/review/git-exec';
 import { checkPinDrift, describePinDrift } from './plumbing/pin-check';
 import {
@@ -3272,7 +3272,10 @@ Usage:
   --repo <path>     local clone of the PR's repo — re-materializes the head read-only so the
                     seat (when its sandbox qualifies) and the gate are evidence-bearing.
                     Unavailable/failed → LOUD fallback: the seat AND the regate of the WHOLE
-                    run drop to packet evidence (reference-not-found + holistic verification OFF)
+                    run drop to packet evidence (reference-not-found + holistic verification OFF).
+                    A packet-mode retry is PERMANENT for that seat — it overwrites the seat's
+                    persisted prompt and a reviewed seat is never retried — so pass --repo
+                    whenever the run had worktree evidence
   --gate-model <m>  gate seat pin — same resolution chain as review (flag → voices.json
   --gate-effort <e> \`gate\` entry → the claude voice → built-in default)
   --reviewers-file  reviewers config (default ~/.ensemble-ai/reviewers.json)
@@ -3284,8 +3287,9 @@ Not re-run (same as regate): the execution settler, the shadow gate, and the rec
 keeps the receipt its original roster earned.
 Exit: 0 = seat reviewed + gate completed · 1 = seat failed again, the gate failed, or the retry
 threw AFTER the seat was spawned · 3 = a pre-spawn refusal: usage, a missing or malformed trail or
-seat artifact, a healthy seat, a worktree at a different head, a persisted prompt pinned at a
-different head than the run's gate packet — nothing was billed.
+seat artifact, an incomplete pinned packet, a healthy seat, a worktree at a different head, a
+persisted prompt pinned at a different head than the run's gate packet, another reseat already
+running on this run — nothing was billed.
 `;
 
 // reseat: heal a run whose ONE seat died, without re-running the others. The trail is the
@@ -3338,15 +3342,15 @@ async function reseatCommand(args: string[]): Promise<number> {
 
   // Fail closed BEFORE any spawn, through the SAME helper runReseat throws from (so the two can
   // never drift): no pinned packet ⇒ nothing to ground against; no seat artifacts ⇒ nothing to
-  // re-run; a healthy seat ⇒ nothing to retry. Exit 3 means NOTHING was billed.
-  const headSha = readGatePacketHeadSha(out, runId);
-  const refusal = reseatRefusal(out, runId, seat);
-  if (refusal || !headSha) {
-    // `refusal` is non-null whenever the pinned packet is unreadable — it is the first thing it
-    // checks — so the second branch is unreachable and exists only to narrow the type.
-    console.error(`ensemble-ai reseat: ${refusal ?? 'the pinned packet could not be read'}`);
+  // re-run; an incomplete packet ⇒ nothing a retry could review; a healthy seat ⇒ nothing to retry.
+  // Exit 3 means NOTHING was billed. Reading it ONCE also gives this command the bytes it would
+  // otherwise re-read: the pinned head, and the base range recovered from the persisted prompt.
+  const pre = checkReseat(out, runId, seat);
+  if ('refusal' in pre) {
+    console.error(`ensemble-ai reseat: ${pre.refusal}`);
     return 3;
   }
+  const headSha = pre.headSha;
 
   const reviewersFile = typeof values['reviewers-file'] === 'string' ? values['reviewers-file'] : REVIEWERS_FILE;
   const sandbox = typeof values.sandbox === 'string' ? values.sandbox : undefined;
@@ -3376,14 +3380,24 @@ async function reseatCommand(args: string[]): Promise<number> {
       return 3;
     }
     console.error(`· re-materializing the PR head as a read-only worktree of ${repoFlag}…`);
-    const made = openWorktree({ baseSha: null, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
+    // The BASE the retried seat's fresh preamble will name is the one recovered from the persisted
+    // prompt — so the session is opened at that same base. Passing null here left the session
+    // saying "no base range" while the preamble it produced re-issued one: the seat was told to
+    // review `git diff <base>...<head>` in a tree whose own record of the range was empty, and the
+    // two disagreed about what the change under review even was.
+    const made = openWorktree({ baseSha: pre.split.baseSha, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
     if (isPreflightError(made)) {
       // A reseat re-gates the WHOLE run, so a lost worktree costs more than the retried seat's own
       // evidence: the regate that follows also drops to packet grounding, and with it the gate's
       // reference-not-found check and its holistic two-site verification. Name both — HERE, before
       // the seat is billed, because the module's own line only lands after the spawn returns.
-      worktreeUnavailable = `worktree unavailable (${made.kind}: ${made.message}) — re-ran on PACKET evidence`;
-      console.error(`· ⚠ worktree unavailable (${made.kind}: ${made.message}) — re-running ${seat} AND regating the whole run on PACKET evidence (reference-not-found + holistic verification OFF)`);
+      // git's own stderr, and it is about to be PERSISTED (this becomes the run's fallbackReason in
+      // `reseats[]`). An authenticated remote puts a token in that text, and a crafted branch or
+      // remote name puts terminal escapes in it — so it is redacted, scrubbed and bounded here,
+      // once, before it reaches either the terminal or the trail.
+      const why = redactUrlCredentials(clean(made.message)).slice(0, 300);
+      worktreeUnavailable = `worktree unavailable (${made.kind}: ${why}) — re-ran on PACKET evidence`;
+      console.error(`· ⚠ worktree unavailable (${made.kind}: ${why}) — re-running ${seat} AND regating the whole run on PACKET evidence (reference-not-found + holistic verification OFF)`);
     } else {
       session = made;
       // The module refuses a tree at another commit; refuse it HERE too, before the seat is billed.
@@ -3394,6 +3408,13 @@ async function reseatCommand(args: string[]): Promise<number> {
         return 3;
       }
     }
+  } else if (positionals[0]?.trim()) {
+    // A PR URL alone materializes nothing — `--repo` is what re-fetches the head — so an operator
+    // who passed only the URL is about to get a PACKET retry while believing they asked for
+    // evidence. The flag is not inferrable (no clone path), so this says what will happen instead.
+    console.error(
+      '· note: PR URL given without --repo — ignored; the seat re-runs on PACKET evidence (pass --repo <clone> to re-materialize the head)'
+    );
   }
 
   try {
@@ -3412,6 +3433,14 @@ async function reseatCommand(args: string[]): Promise<number> {
     });
     // The lost worktree, the egress rollup and the evidence downgrade are all said by the module,
     // through the `log` above — de-duped there, on purpose, so an echo here would double them.
+    // The MISSING STAMP is not: the module reports the write failure as a fact on the result,
+    // because a healed run whose trail carries no `reseats[]` entry looks exactly like a run that
+    // was never retried — and the operator is the only one who can still record that it was.
+    if (!res.stampWritten) {
+      console.error(
+        '· ⚠ the reseats[] provenance stamp could not be written — the trail does not record this retry'
+      );
+    }
     if (!res.gate) {
       console.log(`\nreseat: seat ${seat} FAILED AGAIN — ${clean(res.review.summary).slice(0, 300)}\n(the new failure is now the trail's record; the gate was not re-run)`);
       return 1;
@@ -3424,6 +3453,13 @@ async function reseatCommand(args: string[]): Promise<number> {
     );
     return res.ok ? 0 : 1;
   } catch (e) {
+    // …with ONE exception: the per-run lock can only be claimed from inside runReseat (checking it
+    // before taking it is the race it exists to close), and it refuses BEFORE the spawn. It keeps
+    // the "nothing was billed" code it earned.
+    if (e instanceof ReseatLockedError) {
+      console.error(`ensemble-ai reseat: ${e.message}`);
+      return 3;
+    }
     // Exit 3 is the "nothing was billed" code, and every refusal that earns it has already run
     // above. Past this point the seat spawn is paid for — a trail write that failed, a gate that
     // threw — so a caller (or a runner script) must not read it as "the reseat never started".

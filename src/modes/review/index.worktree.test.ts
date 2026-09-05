@@ -268,7 +268,25 @@ describe('a dead seat names the retry — and the hint keeps the run\'s evidence
       runOpts({ adapters, onProgress: (m: string) => logged.push(m), reviewers: ['grok'] })
     );
     const hint = logged.find((l) => l.includes('retry just this seat'));
-    expect(hint).toBe(`  · → retry just this seat: ensemble-ai reseat --seat grok --out '${out}' --run-id wt-run`);
+    expect(hint).toBe(
+      `  · → retry just this seat: ensemble-ai reseat --seat grok --out '${out}' --run-id wt-run --reviewers-file '${NO_REVIEWERS_FILE}'`
+    );
     expect(logged.filter((l) => l.includes(NOTE))).toHaveLength(1);
+  });
+
+  // The retry has to resolve the SAME seat config the dead attempt ran under. `--sandbox` and
+  // `--reviewers-file` are exactly the two inputs that decide it, reseat accepts both, and this run
+  // knows its own values — so a hint that drops them is a command that silently retries a different
+  // seat (a default profile, a different reviewers.json) and calls the result the same review.
+  it('carries the run\'s own --sandbox and --reviewers-file into the hint', async () => {
+    const { adapters } = stubAdapters({ grok: dead });
+    const logged: string[] = [];
+    await runReviewMode(
+      runOpts({ adapters, onProgress: (m: string) => logged.push(m), reviewers: ['grok'], sandbox: 'strict' })
+    );
+    const hint = logged.find((l) => l.includes('retry just this seat'));
+    expect(hint).toBe(
+      `  · → retry just this seat: ensemble-ai reseat --seat grok --out '${out}' --run-id wt-run --sandbox strict --reviewers-file '${NO_REVIEWERS_FILE}'`
+    );
   });
 });

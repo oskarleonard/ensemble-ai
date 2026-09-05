@@ -13,7 +13,7 @@ import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { persistGatePacket } from './gate-hunks';
 import type { RegateOptions, RegateResult } from './regate';
-import { readSeatArtifacts, reseatRefusal, runReseat, splitWorktreePrompt } from './reseat';
+import { readSeatArtifacts, ReseatLockedError, reseatRefusal, runReseat, splitWorktreePrompt } from './reseat';
 import {
   qualifyGrokSeat,
   WORKTREE_SUFFIX_HEADER,
@@ -146,6 +146,21 @@ describe('the trailing-newline lock the split classifies on', () => {
     expect(worktreePromptSuffix({ baseSha: BASE, headSha: HEAD, worktree: '/tmp/w' }).endsWith('\n')).toBe(false);
     expect(worktreePromptSuffix({ baseSha: null, headSha: HEAD, worktree: '/tmp/w' }).endsWith('\n')).toBe(false);
   });
+
+  // The THIRD invariant, and the one the other two rest on: the lock is only a lock if the byte
+  // that decides it survives the round trip to disk. `persistReview` writes the prompt RAW — no
+  // trailing-newline normalization, no re-encode — so what the split reads back is what the
+  // renderer emitted. A writer that "tidied" the file would silently reclassify every prompt.
+  it('persistReview writes prompt.<seat>.md byte-for-byte, newline or not', () => {
+    for (const prompt of ['a prompt that ends with a newline\n', 'a prompt that ends with a period.']) {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-reseat-lock-'));
+      persistReview(base, {
+        findings: [], packet: LOCK_PACKET, prompt, raw: null, reviewer: GROK, runId: 'lock-run',
+        summary: 's', terminalState: 'reviewed',
+      });
+      expect(fs.readFileSync(path.join(reviewDir(base, 'lock-run'), 'prompt.grok.md'), 'utf8')).toBe(prompt);
+    }
+  });
 });
 
 const GATE_CFG: VoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
@@ -190,6 +205,9 @@ const SEAT_REPLY = '```json\n' + JSON.stringify({
 }) + '\n```';
 const adapterOk: ReviewAdapter = async () => ({ ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false });
 const adapterDead: ReviewAdapter = async () => ({ ok: false, raw: null, stderrTail: 'sandbox refused again', timedOut: false });
+// The same dead seat, but its stderr tail carries ANSI escapes — persistAttempt embeds that tail in
+// the summary verbatim, and the summary is what the reseat log prints to a terminal.
+const adapterEscapes: ReviewAdapter = async () => ({ ok: false, raw: null, stderrTail: '\u001b[31msandbox refused again\u001b[0m', timedOut: false });
 const DENIAL: EgressDenial = { host: 'blocked.example', method: 'CONNECT', port: 443, reason: 'host outside the vendor allowlist' };
 const PRIOR_DENIAL: EgressDenial = { host: 'other.example', method: 'CONNECT', port: 443, reason: 'host outside the vendor allowlist' };
 // Only a WORKTREE seat has an egress proxy, so only a worktree attempt can report denials.
@@ -318,6 +336,7 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     expect(typeof synth.regatedAt).toBe('string');
     expect(synth.reseats).toHaveLength(1);
     expect(synth.reseats[0]).toMatchObject({ baseSha: null, evidenceDowngraded: false, fallbackReason: null, outcome: 'reviewed', previous: { hadWorktree: false, terminalState: 'failed-reviewer' }, realized: 'packet', seat: 'grok', summary: 'grok summary' });
+    expect(res.stampWritten).toBe(true); // …and the retry says the stamp actually landed
     expect(res.evidenceDowngraded).toBe(false); // packet → packet is not a downgrade
     expect(res.egressDenials).toEqual([]); // a packet seat runs unfenced — no proxy, no denials
     expect(res.fallbackReason).toBeNull();
@@ -591,6 +610,105 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     const { base, runId } = seedRun();
     const res = await runReseat({ adapter: adapterOk, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId, seat: 'grok' });
     expect(res.fallbackReason).toBeNull();
+  });
+
+  // An INCOMPLETE pinned packet short-circuits runCoreSeat: it persists a "did not review" stub
+  // WITHOUT spawning the seat. A retry over one therefore rewrites the trail and reports a failure
+  // that reads exactly like a paid attempt that failed again — while there was never a diff for any
+  // seat to read. Refused with the artifact checks, where nothing is billed.
+  it('refuses an INCOMPLETE pinned packet before the spawn', async () => {
+    const { base, runId } = seedRun();
+    fs.writeFileSync(path.join(reviewDir(base, runId), 'packet.grok.json'), JSON.stringify({ ...PACKET, complete: false }));
+    const err = `run ${runId}'s pinned packet was incomplete (no usable diff) — nothing a retry could review; re-run the review`;
+    expect(reseatRefusal(base, runId, 'grok')).toBe(err);
+    let spawns = 0;
+    const adapter: ReviewAdapter = async () => { spawns += 1; return { ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false }; };
+    await expect(
+      runReseat({ adapter, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId, seat: 'grok' })
+    ).rejects.toThrow(err);
+    expect(spawns).toBe(0); // exit 3, nothing billed
+  });
+
+  // The `reseats[]` entry is the ONLY durable record that this retry ever happened. Swallowing its
+  // write failure left a healed run whose trail says the seat simply reviewed — a provenance hole
+  // the operator has no way to notice. The fold still never throws; it REPORTS.
+  it('reports a reseats[] provenance stamp that could not be written', async () => {
+    const { base, runId } = seedRun();
+    const p = path.join(reviewDir(base, runId), 'claude-synthesis.json');
+    fs.rmSync(p);
+    // A DIRECTORY where the file belongs: EISDIR on the fold's read, for every user on every
+    // platform. A chmod fixture would be a no-op for root and is ignored outright on Windows.
+    fs.mkdirSync(p);
+    const logs: string[] = [];
+    const res = await runReseat({
+      adapter: adapterOk, baseDir: base, gateConfig: GATE_CFG, log: (m) => logs.push(m),
+      regate: async () => REGATE_OK, reviewer: GROK, runId, seat: 'grok',
+    });
+    expect(res.ok).toBe(true); // the seat DID review — the retry is not a failure, it is unstamped
+    expect(res.stampWritten).toBe(false);
+    expect(logs.filter((l) => l.includes('claude-synthesis.json could not be updated'))).toHaveLength(1);
+  });
+
+  // The failed seat's summary is VENDOR text — persistAttempt embeds the seat's own stderr tail in
+  // it — and this module prints it to a terminal. Unscrubbed, a crafted tail repaints the screen.
+  it('strips terminal control bytes from the failed-seat summary it logs', async () => {
+    const { base, runId } = seedRun();
+    const logs: string[] = [];
+    const res = await runReseat({
+      adapter: adapterEscapes, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk,
+      log: (m) => logs.push(m), reviewer: GROK, runId, seat: 'grok',
+    });
+    expect(res.ok).toBe(false);
+    expect(logs.find((l) => l.includes('FAILED AGAIN'))).toContain('sandbox refused again');
+    expect(logs.some((l) => l.includes('\u001b'))).toBe(false);
+  });
+
+  // egress-denials.json that is not an array (hand-edited, or written by another tool) used to be
+  // REPLACED by this retry's denials — the fence's own record overwritten by the thing recording it.
+  it('leaves a NON-ARRAY egress-denials.json untouched, and says so', async () => {
+    const { base, runId } = seedRun();
+    const p = path.join(reviewDir(base, runId), 'egress-denials.json');
+    const NOT_AN_ARRAY = JSON.stringify({ denials: [PRIOR_DENIAL] });
+    fs.writeFileSync(p, NOT_AN_ARRAY);
+    const logs: string[] = [];
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-reseat-wt-'));
+    const res = await runReseat({
+      adapter: adapterDenied, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, log: (m) => logs.push(m),
+      qualification: qualifyGrokSeat('ensemble-review'), reviewer: GROK, runId, seat: 'grok',
+      worktree: { baseSha: null, dir: wt, headSha: RUN_HEAD },
+    });
+    expect(res.egressDenials).toEqual([DENIAL]); // the result still carries this attempt's denials
+    expect(fs.readFileSync(p, 'utf8')).toBe(NOT_AN_ARRAY); // byte-for-byte — nothing was laundered
+    expect(logs.filter((l) => l.includes('egress-denials.json is not an array'))).toHaveLength(1);
+  });
+
+  // Two reseats of ONE run are unserialized read-modify-writes over the same trail (reseats[], the
+  // denials file, the seat's artifacts, the manifest): last writer wins, and the loser's attempt
+  // disappears from a trail that still billed for it.
+  it('refuses to start while another reseat holds the run lock', async () => {
+    const { base, runId } = seedRun();
+    fs.writeFileSync(path.join(reviewDir(base, runId), 'reseat.lock'), JSON.stringify({ at: new Date().toISOString(), pid: 4242 }));
+    let spawns = 0;
+    const adapter: ReviewAdapter = async () => { spawns += 1; return { ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false }; };
+    const attempt = runReseat({ adapter, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId, seat: 'grok' });
+    await expect(attempt).rejects.toThrow(`another reseat is already running on run ${runId} (lock reseat.lock, since `);
+    // TYPED, because the CLI's exit code turns on it: a held lock refuses BEFORE the spawn, so it
+    // earns the "nothing was billed" exit 3 rather than the post-spawn 1 every other throw gets.
+    await expect(attempt).rejects.toBeInstanceOf(ReseatLockedError);
+    expect(spawns).toBe(0); // nothing billed — the second operator is told to wait
+  });
+
+  // …and a lock nothing holds any more (the process that took it was killed) must not wedge the run
+  // forever: a run that can never be healed again is worse than the narrow race replacing it leaves.
+  it('replaces a STALE lock, proceeds, and releases the lock at the end', async () => {
+    const { base, runId } = seedRun();
+    const p = path.join(reviewDir(base, runId), 'reseat.lock');
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    fs.writeFileSync(p, JSON.stringify({ at: threeHoursAgo.toISOString(), pid: 4242 }));
+    fs.utimesSync(p, threeHoursAgo, threeHoursAgo); // the file's own mtime is the age authority
+    const res = await runReseat({ adapter: adapterOk, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId, seat: 'grok' });
+    expect(res.ok).toBe(true);
+    expect(fs.existsSync(p)).toBe(false); // released in `finally`, whatever the outcome
   });
 });
 

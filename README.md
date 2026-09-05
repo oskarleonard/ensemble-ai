@@ -282,7 +282,9 @@ Two plumbing commands rehydrate an existing run's **trail** instead of re-runnin
   the freshly re-materialized head — then regates the union. A seat that completed is refused
   (re-running a healthy seat is a new review); `claude` is not supported yet. Without `--repo` (or when
   the worktree cannot be made) the seat **and the regate of the whole run** fall to packet evidence —
-  reference-not-found + holistic verification OFF. The attempt is stamped into `claude-synthesis.json`
+  reference-not-found + holistic verification OFF. **A packet-mode retry is PERMANENT for that seat** —
+  it overwrites the seat's persisted prompt and a reviewed seat is never retried — so pass `--repo`
+  whenever the run had worktree evidence. The attempt is stamped into `claude-synthesis.json`
   (`reseats[]` — including *why* a worktree was not used, so a lost `--repo` is distinguishable from a
   deliberate packet retry) and the manifest is updated best-effort (when the run wrote one): the seat's
   realized-evidence entry is rewritten, and its `sandboxProfiles` entry is rewritten by a worktree
@@ -292,8 +294,9 @@ Two plumbing commands rehydrate an existing run's **trail** instead of re-runnin
 Neither re-runs the execution settler, the shadow gate, or the receipt — a healed run keeps the receipt
 its original roster earned. Exit `0` healed · `1` failed again (for `reseat`, also anything that fails
 after the seat was spawned) · `3` a pre-spawn refusal — usage, a missing trail, a healthy seat, a
-malformed seat packet, a worktree at a different head, a persisted prompt pinned at a different head
-than the run's gate packet — where nothing was billed.
+malformed or incomplete seat packet, a worktree at a different head, a persisted prompt pinned at a
+different head than the run's gate packet, another reseat already running on the same run (they are
+serialized by an `O_EXCL` `reseat.lock` in the trail dir) — where nothing was billed.
 
 ### Configuring the seats — `reviewers.json` and `voices.json`
 

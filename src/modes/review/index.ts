@@ -12,6 +12,7 @@ import {
 } from '../../core/packet';
 import { renderReviewPrompt } from '../../core/prompt';
 import { loadReviewers } from '../../core/reviewers';
+import { scrubControl } from '../../core/sanitize';
 import {
   CORE_REVIEWER_IDS,
   type ReviewerConfig,
@@ -375,7 +376,10 @@ export async function runReviewMode(
       const cause =
         seat.review.terminalState === 'reviewed'
           ? ''
-          : ` — ${seat.review.summary.replace(/\s+/g, ' ').slice(0, 200)}`;
+          // VENDOR text (persistAttempt embeds the seat's own stderr tail in a failure summary) on
+          // its way to a terminal: scrubControl strips the C0/DEL bytes and collapses the
+          // whitespace this line used to fold by hand.
+          : ` — ${scrubControl(seat.review.summary).slice(0, 200)}`;
       log(
         `  · ${id}: ${seat.review.terminalState} — ${seat.review.findings.length} finding(s) · evidence ${seat.realized}${cause}`
       );
@@ -386,11 +390,18 @@ export async function runReviewMode(
       // bare form steers the operator into the very downgrade the retry then warns about. This run
       // knows neither the operator's clone path nor the PR URL the reseat CLI parses, so both stay
       // ANGLE-BRACKET placeholders: a template to fill, never a line to paste blind.
+      // …and it carries the two inputs that DECIDE the seat's config, when this run set them:
+      // reseat resolves the reviewer from `--reviewers-file` and can override its profile with
+      // `--sandbox`, so a hint that drops them retries a DIFFERENT seat (the default reviewers.json,
+      // the default profile) and calls the result the same review. Unlike the clone path, this run
+      // knows both values — so they are filled in, not placeholders.
       if (seat.review.terminalState !== 'reviewed') {
         log(
           `  · → retry just this seat: ensemble-ai reseat ${
             wt ? '<pr-url> --repo <path-to-your-clone> ' : ''
-          }--seat ${id} --out '${opts.out}' --run-id ${opts.runId}`
+          }--seat ${id} --out '${opts.out}' --run-id ${opts.runId}${
+            opts.sandbox ? ` --sandbox ${opts.sandbox}` : ''
+          }${opts.reviewersFile ? ` --reviewers-file '${opts.reviewersFile}'` : ''}`
         );
         log(
           '  ·   (without --repo the retried seat AND the whole-run regate fall back to PACKET evidence)'

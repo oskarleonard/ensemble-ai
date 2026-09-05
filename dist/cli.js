@@ -2696,7 +2696,7 @@ function remoteSlug(url) {
   return m ? `${m[1].toLowerCase()}/${m[2].toLowerCase()}` : null;
 }
 function redactUrlCredentials(url) {
-  return url.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@]*@/, "$1***@");
+  return url.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@\s]*@/g, "$1***@");
 }
 function classifyGitError(stderr) {
   const s = stderr.toLowerCase();
@@ -7071,13 +7071,13 @@ async function runReviewMode(opts) {
         runId: opts.runId,
         ...wt ? { worktree: wt.dir, worktreePrompt } : {}
       });
-      const cause = seat.review.terminalState === "reviewed" ? "" : ` \u2014 ${seat.review.summary.replace(/\s+/g, " ").slice(0, 200)}`;
+      const cause = seat.review.terminalState === "reviewed" ? "" : ` \u2014 ${scrubControl(seat.review.summary).slice(0, 200)}`;
       log(
         `  \xB7 ${id}: ${seat.review.terminalState} \u2014 ${seat.review.findings.length} finding(s) \xB7 evidence ${seat.realized}${cause}`
       );
       if (seat.review.terminalState !== "reviewed") {
         log(
-          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat ${wt ? "<pr-url> --repo <path-to-your-clone> " : ""}--seat ${id} --out '${opts.out}' --run-id ${opts.runId}`
+          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat ${wt ? "<pr-url> --repo <path-to-your-clone> " : ""}--seat ${id} --out '${opts.out}' --run-id ${opts.runId}${opts.sandbox ? ` --sandbox ${opts.sandbox}` : ""}${opts.reviewersFile ? ` --reviewers-file '${opts.reviewersFile}'` : ""}`
         );
         log(
           "  \xB7   (without --repo the retried seat AND the whole-run regate fall back to PACKET evidence)"
@@ -8116,6 +8116,11 @@ function checkReseat(baseDir, runId, seat, worktreeHeadSha) {
   }
   const art = readSeatArtifacts(baseDir, runId, seat);
   if ("error" in art) return { refusal: art.error };
+  if (!art.packet.complete) {
+    return {
+      refusal: `run ${runId}'s pinned packet was incomplete (no usable diff) \u2014 nothing a retry could review; re-run the review`
+    };
+  }
   const split = splitWorktreePrompt(art.prompt);
   if (split.unverifiedTail) {
     return {
@@ -8138,13 +8143,73 @@ function reseatRefusal(baseDir, runId, seat, worktreeHeadSha) {
   const pre = checkReseat(baseDir, runId, seat, worktreeHeadSha);
   return "refusal" in pre ? pre.refusal : null;
 }
+var RESEAT_LOCK_FILE = "reseat.lock";
+var RESEAT_LOCK_STALE_MS = 2 * 60 * 60 * 1e3;
+var ReseatLockedError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ReseatLockedError";
+  }
+};
+function readReseatLock(p) {
+  let startedMs;
+  let since;
+  try {
+    const st = fs22.statSync(p);
+    startedMs = st.mtimeMs;
+    since = new Date(st.mtimeMs).toISOString();
+  } catch {
+    return null;
+  }
+  try {
+    const held = JSON.parse(fs22.readFileSync(p, "utf8"));
+    if (typeof held.at === "string") since = held.at;
+  } catch {
+  }
+  return { since, startedMs };
+}
+function acquireReseatLock(baseDir, runId) {
+  const p = path17.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
+  const held = () => `another reseat is already running on run ${runId} (lock ${RESEAT_LOCK_FILE}, since ${readReseatLock(p)?.since ?? "unknown"})`;
+  const claim = () => {
+    try {
+      return fs22.openSync(p, "wx");
+    } catch {
+      return null;
+    }
+  };
+  let fd = claim();
+  if (fd === null) {
+    const prior = readReseatLock(p);
+    if (prior && Date.now() - prior.startedMs <= RESEAT_LOCK_STALE_MS) throw new ReseatLockedError(held());
+    try {
+      fs22.rmSync(p, { force: true });
+    } catch {
+    }
+    fd = claim();
+    if (fd === null) throw new ReseatLockedError(held());
+  }
+  try {
+    fs22.writeFileSync(fd, JSON.stringify({ at: (/* @__PURE__ */ new Date()).toISOString(), pid: process.pid }));
+  } finally {
+    fs22.closeSync(fd);
+  }
+  return () => {
+    try {
+      fs22.rmSync(p, { force: true });
+    } catch {
+    }
+  };
+}
 function foldSynthesis(baseDir, runId, patch, log) {
   try {
     const p = path17.join(reviewDir(baseDir, runId), "claude-synthesis.json");
     const existing = fs22.existsSync(p) ? JSON.parse(fs22.readFileSync(p, "utf8")) : {};
     writeTrailFile(baseDir, runId, "claude-synthesis.json", JSON.stringify(patch(existing), null, 2));
+    return true;
   } catch (e) {
     log(`reseat: claude-synthesis.json could not be updated (${e.message})`);
+    return false;
   }
 }
 function appendEgressDenials(baseDir, runId, denials, log) {
@@ -8153,18 +8218,32 @@ function appendEgressDenials(baseDir, runId, denials, log) {
     log(`reseat: \u26A0 egress fence: ${formatEgressDenialCounts(denials)}`);
     const p = path17.join(reviewDir(baseDir, runId), "egress-denials.json");
     const prior = fs22.existsSync(p) ? JSON.parse(fs22.readFileSync(p, "utf8")) : [];
-    const merged = [...Array.isArray(prior) ? prior : [], ...denials];
+    if (!Array.isArray(prior)) {
+      log(
+        "reseat: egress-denials.json is not an array \u2014 leaving it untouched; this retry's denials are in the result only"
+      );
+      return;
+    }
+    const merged = [...prior, ...denials];
     writeTrailFile(baseDir, runId, "egress-denials.json", JSON.stringify(merged, null, 2));
   } catch (e) {
     log(`reseat: egress-denials.json could not be recorded (${e.message})`);
   }
 }
 async function runReseat(opts) {
+  const pre = checkReseat(opts.baseDir, opts.runId, opts.seat, opts.worktree?.headSha);
+  if ("refusal" in pre) throw new Error(pre.refusal);
+  const release = acquireReseatLock(opts.baseDir, opts.runId);
+  try {
+    return await reseatUnderLock(opts, pre);
+  } finally {
+    release();
+  }
+}
+async function reseatUnderLock(opts, pre) {
   const log = opts.log ?? (() => {
   });
   const { baseDir, runId, seat } = opts;
-  const pre = checkReseat(baseDir, runId, seat, opts.worktree?.headSha);
-  if ("refusal" in pre) throw new Error(pre.refusal);
   const { art, headSha, split } = pre;
   const wt = opts.worktree;
   const qualified = Boolean(wt && opts.qualification?.qualified);
@@ -8196,7 +8275,7 @@ async function runReseat(opts) {
   });
   const review = seatRun.review;
   const fallbackReason = seatRun.fallbackReason ?? (wt && !qualified ? `${seat}: no sandbox qualification for the re-materialized worktree${opts.qualification?.reason ? ` (${opts.qualification.reason})` : ""} \u2014 re-ran on the PACKET` : opts.worktreeUnavailable ?? null);
-  if (fallbackReason && !seatRun.fallbackReason) log(`reseat: \u26A0 ${fallbackReason}`);
+  if (fallbackReason && !seatRun.fallbackReason) log(`reseat: \u26A0 ${scrubControl(fallbackReason)}`);
   const evidenceDowngraded = split.hadWorktree && seatRun.realized === "packet";
   if (evidenceDowngraded) {
     log(
@@ -8214,7 +8293,7 @@ async function runReseat(opts) {
     log(`reseat: review.${seat}.md could not be written (${e.message})`);
   }
   appendEgressDenials(baseDir, runId, seatRun.egressDenials, log);
-  foldSynthesis(
+  const stampWritten = foldSynthesis(
     baseDir,
     runId,
     (existing) => ({
@@ -8271,7 +8350,7 @@ async function runReseat(opts) {
     log(`reseat: ${EVIDENCE_MANIFEST_FILE} could not be updated (${e.message})`);
   }
   if (review.terminalState !== "reviewed") {
-    log(`reseat: ${seat} FAILED AGAIN \u2014 ${review.summary.replace(/\s+/g, " ").slice(0, 200)}`);
+    log(`reseat: ${seat} FAILED AGAIN \u2014 ${scrubControl(review.summary).slice(0, 200)}`);
     return {
       egressDenials: seatRun.egressDenials,
       evidenceDowngraded,
@@ -8279,7 +8358,8 @@ async function runReseat(opts) {
       gate: null,
       ok: false,
       realized: seatRun.realized,
-      review
+      review,
+      stampWritten
     };
   }
   log(
@@ -8301,7 +8381,8 @@ async function runReseat(opts) {
     gate,
     ok: gate.ok,
     realized: seatRun.realized,
-    review
+    review,
+    stampWritten
   };
 }
 
@@ -11567,7 +11648,10 @@ Usage:
   --repo <path>     local clone of the PR's repo \u2014 re-materializes the head read-only so the
                     seat (when its sandbox qualifies) and the gate are evidence-bearing.
                     Unavailable/failed \u2192 LOUD fallback: the seat AND the regate of the WHOLE
-                    run drop to packet evidence (reference-not-found + holistic verification OFF)
+                    run drop to packet evidence (reference-not-found + holistic verification OFF).
+                    A packet-mode retry is PERMANENT for that seat \u2014 it overwrites the seat's
+                    persisted prompt and a reviewed seat is never retried \u2014 so pass --repo
+                    whenever the run had worktree evidence
   --gate-model <m>  gate seat pin \u2014 same resolution chain as review (flag \u2192 voices.json
   --gate-effort <e> \`gate\` entry \u2192 the claude voice \u2192 built-in default)
   --reviewers-file  reviewers config (default ~/.ensemble-ai/reviewers.json)
@@ -11579,8 +11663,9 @@ Not re-run (same as regate): the execution settler, the shadow gate, and the rec
 keeps the receipt its original roster earned.
 Exit: 0 = seat reviewed + gate completed \xB7 1 = seat failed again, the gate failed, or the retry
 threw AFTER the seat was spawned \xB7 3 = a pre-spawn refusal: usage, a missing or malformed trail or
-seat artifact, a healthy seat, a worktree at a different head, a persisted prompt pinned at a
-different head than the run's gate packet \u2014 nothing was billed.
+seat artifact, an incomplete pinned packet, a healthy seat, a worktree at a different head, a
+persisted prompt pinned at a different head than the run's gate packet, another reseat already
+running on this run \u2014 nothing was billed.
 `;
 async function reseatCommand(args) {
   let values;
@@ -11624,12 +11709,12 @@ async function reseatCommand(args) {
     return 3;
   }
   const seat = seatRaw;
-  const headSha = readGatePacketHeadSha(out, runId);
-  const refusal = reseatRefusal(out, runId, seat);
-  if (refusal || !headSha) {
-    console.error(`ensemble-ai reseat: ${refusal ?? "the pinned packet could not be read"}`);
+  const pre = checkReseat(out, runId, seat);
+  if ("refusal" in pre) {
+    console.error(`ensemble-ai reseat: ${pre.refusal}`);
     return 3;
   }
+  const headSha = pre.headSha;
   const reviewersFile = typeof values["reviewers-file"] === "string" ? values["reviewers-file"] : REVIEWERS_FILE;
   const sandbox = typeof values.sandbox === "string" ? values.sandbox : void 0;
   const reviewer = { ...loadReviewers(reviewersFile)[seat], ...sandbox ? { sandbox } : {} };
@@ -11652,10 +11737,11 @@ async function reseatCommand(args) {
       return 3;
     }
     console.error(`\xB7 re-materializing the PR head as a read-only worktree of ${repoFlag}\u2026`);
-    const made = openWorktree({ baseSha: null, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
+    const made = openWorktree({ baseSha: pre.split.baseSha, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
     if (isPreflightError(made)) {
-      worktreeUnavailable = `worktree unavailable (${made.kind}: ${made.message}) \u2014 re-ran on PACKET evidence`;
-      console.error(`\xB7 \u26A0 worktree unavailable (${made.kind}: ${made.message}) \u2014 re-running ${seat} AND regating the whole run on PACKET evidence (reference-not-found + holistic verification OFF)`);
+      const why = redactUrlCredentials(scrubControl(made.message)).slice(0, 300);
+      worktreeUnavailable = `worktree unavailable (${made.kind}: ${why}) \u2014 re-ran on PACKET evidence`;
+      console.error(`\xB7 \u26A0 worktree unavailable (${made.kind}: ${why}) \u2014 re-running ${seat} AND regating the whole run on PACKET evidence (reference-not-found + holistic verification OFF)`);
     } else {
       session = made;
       const wrongHead = reseatRefusal(out, runId, seat, session.headSha);
@@ -11665,6 +11751,10 @@ async function reseatCommand(args) {
         return 3;
       }
     }
+  } else if (positionals[0]?.trim()) {
+    console.error(
+      "\xB7 note: PR URL given without --repo \u2014 ignored; the seat re-runs on PACKET evidence (pass --repo <clone> to re-materialize the head)"
+    );
   }
   try {
     const res = await runReseat({
@@ -11680,6 +11770,11 @@ async function reseatCommand(args) {
       ...session ? { worktree: { baseSha: session.baseSha, dir: session.dir, headSha: session.headSha } } : {},
       ...worktreeUnavailable ? { worktreeUnavailable } : {}
     });
+    if (!res.stampWritten) {
+      console.error(
+        "\xB7 \u26A0 the reseats[] provenance stamp could not be written \u2014 the trail does not record this retry"
+      );
+    }
     if (!res.gate) {
       console.log(`
 reseat: seat ${seat} FAILED AGAIN \u2014 ${scrubControl(res.review.summary).slice(0, 300)}
@@ -11694,6 +11789,10 @@ reseat: ${seat} reviewed, but the gate FAILED \u2014 verdicts remain fail-closed
     );
     return res.ok ? 0 : 1;
   } catch (e) {
+    if (e instanceof ReseatLockedError) {
+      console.error(`ensemble-ai reseat: ${e.message}`);
+      return 3;
+    }
     console.error(`ensemble-ai reseat: failed after the seat spawn \u2014 ${e.message}`);
     return 1;
   } finally {

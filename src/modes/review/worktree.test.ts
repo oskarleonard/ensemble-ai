@@ -54,6 +54,19 @@ describe('redactUrlCredentials — a token in the remote URL never reaches a mes
     // scp-style has no `://`, so `git@` (a username, not a secret) stays.
     expect(redactUrlCredentials('git@github.com:o/r.git')).toBe('git@github.com:o/r.git');
   });
+
+  // The message a failed preflight carries is git's OWN stderr, which quotes the remote back inside
+  // a sentence — the token is mid-string, and a redaction anchored at the start never sees it. That
+  // text is printed AND persisted (a reseat records it as the run's fallback reason).
+  it('redacts every occurrence, wherever it sits in a sentence', () => {
+    const out = redactUrlCredentials(
+      "fetch pull/7/head from https://***@github.com/o/r failed: fatal: could not read Username for 'https://ghp_SECRET@github.com': terminal prompts disabled (https://x:ghp_OTHER@proxy.example)"
+    );
+    expect(out).not.toContain('SECRET');
+    expect(out).not.toContain('OTHER');
+    expect(out).not.toContain('ghp_');
+    expect(out).toContain("could not read Username for 'https://***@github.com'");
+  });
 });
 
 describe('error taxonomy — a named cause, never a generic git failure', () => {
