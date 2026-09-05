@@ -5,13 +5,19 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { persistReview, reviewDir } from '../../core/artifacts';
+import type { EgressDenial } from '../../core/egress-proxy';
 import type { ReviewerConfig, ReviewPacket } from '../../core/types';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { persistGatePacket } from './gate-hunks';
 import { readSeatArtifacts, runReseat, splitWorktreePrompt } from './reseat';
-import { qualifyHarnessSeat, WORKTREE_SUFFIX_HEADER, worktreePromptSuffix } from './seat-evidence';
+import {
+  qualifyGrokSeat,
+  qualifyHarnessSeat,
+  WORKTREE_SUFFIX_HEADER,
+  worktreePromptSuffix,
+} from './seat-evidence';
 import type { ReviewAdapter } from './seat-run';
 
 const BASE = 'b'.repeat(40);
@@ -75,6 +81,10 @@ const SEAT_REPLY = '```json\n' + JSON.stringify({
 }) + '\n```';
 const adapterOk: ReviewAdapter = async () => ({ ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false });
 const adapterDead: ReviewAdapter = async () => ({ ok: false, raw: null, stderrTail: 'sandbox refused again', timedOut: false });
+const DENIAL: EgressDenial = { host: 'blocked.example', method: 'CONNECT', port: 443, reason: 'host outside the vendor allowlist' };
+const PRIOR_DENIAL: EgressDenial = { host: 'other.example', method: 'CONNECT', port: 443, reason: 'host outside the vendor allowlist' };
+// Only a WORKTREE seat has an egress proxy, so only a worktree attempt can report denials.
+const adapterDenied: ReviewAdapter = async () => ({ egressDenials: [DENIAL], ok: true, raw: SEAT_REPLY, stderrTail: '', timedOut: false });
 
 // Exactly what a real run with a dead grok leaves behind: a reviewed codex, a failed grok stub
 // whose prompt carries the OLD worktree preamble, and the pinned gate packet.
@@ -135,12 +145,14 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     expect(verdicts.verdicts.map((v) => v.findingId)).toEqual(expect.arrayContaining(['codex#1', 'grok#1']));
     const synth = JSON.parse(fs.readFileSync(path.join(dir, 'claude-synthesis.json'), 'utf8')) as {
       claudeReview: { voiceId: string }; regatedAt: string;
-      reseats: Array<{ outcome: string; previous: { terminalState: string }; realized: string; seat: string }>;
+      reseats: Array<{ fallbackReason: string | null; outcome: string; previous: { terminalState: string }; realized: string; seat: string; summary: string }>;
     };
     expect(synth.claudeReview.voiceId).toBe('claude'); // merged, never clobbered
     expect(typeof synth.regatedAt).toBe('string');
     expect(synth.reseats).toHaveLength(1);
-    expect(synth.reseats[0]).toMatchObject({ outcome: 'reviewed', previous: { terminalState: 'failed-reviewer' }, realized: 'packet', seat: 'grok' });
+    expect(synth.reseats[0]).toMatchObject({ fallbackReason: null, outcome: 'reviewed', previous: { terminalState: 'failed-reviewer' }, realized: 'packet', seat: 'grok', summary: 'grok summary' });
+    expect(res.egressDenials).toEqual([]); // a packet seat runs unfenced — no proxy, no denials
+    expect(res.fallbackReason).toBeNull();
     const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'evidence-manifest.json'), 'utf8')) as { realizedEvidence: Record<string, string> };
     expect(manifest.realizedEvidence.grok).toBe('packet'); // truth after a packet-mode retry
     expect(manifest.realizedEvidence.codex).toBe('worktree'); // untouched
@@ -166,8 +178,9 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     expect(res.review.terminalState).toBe('failed-reviewer');
     expect(gateCalls).toBe(0);
     expect(fs.existsSync(path.join(reviewDir(base, runId), 'gate-verdicts.json'))).toBe(false);
-    const synth = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'claude-synthesis.json'), 'utf8')) as { reseats: Array<{ outcome: string }> };
+    const synth = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'claude-synthesis.json'), 'utf8')) as { reseats: Array<{ outcome: string; summary: string }> };
     expect(synth.reseats[0].outcome).toBe('failed-reviewer'); // the attempt is on record either way
+    expect(synth.reseats[0].summary).toContain('sandbox refused again'); // …and it says WHY
   });
 
   it('worktree mode: the seat gets the pinned prompt + a FRESH preamble naming the new dir and the recovered base', async () => {
@@ -188,6 +201,45 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     expect(seen[0].prompt).toContain(wt);
     expect(seen[0].prompt).not.toContain('/tmp/reaped-long-ago');
     expect(seen[0].prompt).toContain(`git diff ${BASE}...${RUN_HEAD}`); // base recovered from the OLD prompt
+  });
+
+  it('carries the seat egress denials out AND appends them to the trail, never replacing prior ones', async () => {
+    const { base, runId } = seedRun();
+    // A denial the ORIGINAL fan-out already recorded — a reseat must not launder it away.
+    fs.writeFileSync(path.join(reviewDir(base, runId), 'egress-denials.json'), JSON.stringify([PRIOR_DENIAL]));
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-reseat-wt-'));
+    const res = await runReseat({
+      adapter: adapterDenied, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, qualification: qualifyHarnessSeat(),
+      reviewer: GROK, runId, seat: 'grok', worktree: { baseSha: null, dir: wt, headSha: RUN_HEAD },
+    });
+    expect(res.ok).toBe(true);
+    expect(res.egressDenials).toEqual([DENIAL]);
+    expect(res.fallbackReason).toBeNull();
+    const denials = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'egress-denials.json'), 'utf8')) as EgressDenial[];
+    expect(denials).toEqual([PRIOR_DENIAL, DENIAL]);
+  });
+
+  it('an UNQUALIFIED sandbox re-runs on the packet and the reason rides the result + the trail entry', async () => {
+    const { base, runId } = seedRun();
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-reseat-wt-'));
+    const res = await runReseat({
+      adapter: adapterOk, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk,
+      qualification: qualifyGrokSeat('strict'), // the REAL qualifier: a bare `strict` sandbox is not qualified
+      reviewer: GROK, runId, seat: 'grok', worktree: { baseSha: null, dir: wt, headSha: RUN_HEAD },
+    });
+    expect(res.realized).toBe('packet');
+    expect(res.fallbackReason).toContain('strict');
+    const synth = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'claude-synthesis.json'), 'utf8')) as { reseats: Array<{ fallbackReason: string }> };
+    expect(synth.reseats[0].fallbackReason).toContain('strict');
+  });
+
+  // conventionPaths only reaches the holistic severity cap deep inside the gate, so what is
+  // observable here is that the trail default is READ and threaded without disturbing the regate.
+  it('defaults conventionPaths from the run trail when the caller gathered none', async () => {
+    const { base, runId } = seedRun();
+    fs.writeFileSync(path.join(reviewDir(base, runId), 'conventions.json'), JSON.stringify({ files: [{ included: true, path: 'CONVENTIONS.md' }] }));
+    const res = await runReseat({ adapter: adapterOk, baseDir: base, gateConfig: GATE_CFG, gateRun: gateOk, reviewer: GROK, runId, seat: 'grok' });
+    expect(res.ok).toBe(true);
   });
 
   it('fails CLOSED when the run has no gate packet', async () => {

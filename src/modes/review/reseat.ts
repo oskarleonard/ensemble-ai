@@ -2,14 +2,25 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { readReview, reviewDir, writeTrailFile } from '../../core/artifacts';
+import type { EgressDenial } from '../../core/egress-proxy';
 import type { CoreReviewerId, ReviewerConfig, ReviewPacket, StoredReview } from '../../core/types';
 import type { VoiceConfig } from '../brainstorm/types';
 
 import type { EvidenceClass } from './evidence';
 import { EVIDENCE_MANIFEST_FILE } from './evidence-manifest';
 import { readGatePacketHeadSha } from './gate-hunks';
-import { type RegateOptions, type RegateResult, runRegate } from './regate';
-import { type SeatQualification, WORKTREE_SUFFIX_HEADER, worktreePromptSuffix } from './seat-evidence';
+import {
+  readConventionPathsFromTrail,
+  type RegateOptions,
+  type RegateResult,
+  runRegate,
+} from './regate';
+import {
+  formatEgressDenialCounts,
+  type SeatQualification,
+  WORKTREE_SUFFIX_HEADER,
+  worktreePromptSuffix,
+} from './seat-evidence';
 import { type ReviewAdapter, RETRIES_ON_PACKET, runCoreSeat } from './seat-run';
 import { renderReviewMarkdown, storedToVoiceReview } from './self-contained';
 
@@ -87,6 +98,13 @@ export interface ReseatOptions {
 }
 
 export interface ReseatResult {
+  // Connections this attempt's egress proxy REFUSED. LOUD by contract, exactly as in a full run: a
+  // reseat that reached for a host outside its vendor allowlist must not be quieter than the fan-out
+  // that produced the dead seat in the first place.
+  egressDenials: readonly EgressDenial[];
+  // Why the seat did not get the worktree it was asked for (unqualified sandbox, or a wrapper that
+  // provably broke). Null when nothing degraded. Also stamped into the `reseats[]` trail entry.
+  fallbackReason: string | null;
   // Null when the seat failed again (the gate is NOT re-run over an unchanged voice set).
   gate: RegateResult | null;
   // true ⇔ the seat reviewed AND the regate produced a usable envelope.
@@ -113,6 +131,28 @@ function foldSynthesis(
   }
 }
 
+// Merge this attempt's refused connections into the run's own egress-denials.json. A reseat is an
+// EXTRA seat spawn against a trail that may ALREADY carry denials from the original fan-out, so the
+// file is appended to, never replaced — dropping an earlier seat's denial would launder the fence.
+function appendEgressDenials(
+  baseDir: string,
+  runId: string,
+  denials: readonly EgressDenial[],
+  log: (m: string) => void
+): void {
+  if (denials.length === 0) return;
+  log(`reseat: ⚠ egress fence: ${formatEgressDenialCounts(denials)}`);
+  try {
+    const p = path.join(reviewDir(baseDir, runId), 'egress-denials.json');
+    const prior = fs.existsSync(p) ? (JSON.parse(fs.readFileSync(p, 'utf8')) as unknown) : [];
+    const merged = [...(Array.isArray(prior) ? (prior as EgressDenial[]) : []), ...denials];
+    writeTrailFile(baseDir, runId, 'egress-denials.json', JSON.stringify(merged, null, 2));
+  } catch (e) {
+    // Best-effort like every trail write — the denial already reached the log line above.
+    log(`reseat: egress-denials.json could not be updated (${(e as Error).message})`);
+  }
+}
+
 export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
   const log = opts.log ?? (() => {});
   const { baseDir, runId, seat } = opts;
@@ -132,11 +172,6 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
   const split = splitWorktreePrompt(art.prompt);
   const wt = opts.worktree;
   const qualified = Boolean(wt && opts.qualification?.qualified);
-  if (wt && !qualified) {
-    log(
-      `reseat: ⚠ ${opts.qualification?.reason ?? 'no sandbox qualification'} — ${seat} re-runs on the PACKET`
-    );
-  }
   const worktreePrompt =
     wt && qualified
       ? split.packetPrompt +
@@ -163,7 +198,12 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
     retryOnPacket: RETRIES_ON_PACKET[seat],
     reviewer: opts.reviewer,
     runId,
-    ...(worktreePrompt && wt ? { worktree: wt.dir, worktreePrompt } : {}),
+    // The worktree rides through even when the seat does NOT qualify: runCoreSeat's packet branch
+    // is what turns "asked for a worktree, could not have one" into the loud `fallbackReason` a
+    // full run records. Without `worktreePrompt` it stays a packet run — the seat is never told
+    // about a tree it did not get.
+    ...(wt ? { worktree: wt.dir } : {}),
+    ...(worktreePrompt ? { worktreePrompt } : {}),
   });
   const review = seatRun.review;
   try {
@@ -176,7 +216,11 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
   } catch (e) {
     log(`reseat: review.${seat}.md could not be written (${(e as Error).message})`);
   }
-  // The attempt is on record whether or not it healed anything.
+  appendEgressDenials(baseDir, runId, seatRun.egressDenials, log);
+  if (seatRun.fallbackReason) log(`reseat: ⚠ ${seatRun.fallbackReason}`);
+  // The attempt is on record whether or not it healed anything. `summary` carries the NEW attempt's
+  // own words, so a sandbox refusal or an incomplete-packet short-circuit explains itself here
+  // rather than only in the seat file a reader has to go find.
   foldSynthesis(
     baseDir,
     runId,
@@ -186,10 +230,12 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
         ...((existing.reseats as unknown[] | undefined) ?? []),
         {
           at: new Date().toISOString(),
+          fallbackReason: seatRun.fallbackReason,
           outcome: review.terminalState,
           previous: { summary: art.stored.summary, terminalState: art.stored.terminalState },
           realized: seatRun.realized,
           seat,
+          summary: review.summary.slice(0, 300),
         },
       ],
     }),
@@ -213,19 +259,35 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
   }
   if (review.terminalState !== 'reviewed') {
     log(`reseat: ${seat} FAILED AGAIN — ${review.summary.replace(/\s+/g, ' ').slice(0, 200)}`);
-    return { gate: null, ok: false, realized: seatRun.realized, review };
+    return {
+      egressDenials: seatRun.egressDenials,
+      fallbackReason: seatRun.fallbackReason,
+      gate: null,
+      ok: false,
+      realized: seatRun.realized,
+      review,
+    };
   }
   log(
     `reseat: ${seat} reviewed — ${review.findings.length} finding(s) · evidence ${seatRun.realized} · regating the union…`
   );
+  // The regate's holistic pass lifts a finding's severity cap when it cites a convention doc, so a
+  // caller that did not gather the paths gets the ones THIS RUN recorded rather than none.
   const gate = await runRegate({
     baseDir,
-    conventionPaths: opts.conventionPaths,
+    conventionPaths: opts.conventionPaths ?? readConventionPathsFromTrail(baseDir, runId),
     gateConfig: opts.gateConfig,
     log,
     ...(opts.gateRun ? { run: opts.gateRun } : {}),
     runId,
     ...(wt ? { worktree: wt.dir } : {}),
   });
-  return { gate, ok: gate.ok, realized: seatRun.realized, review };
+  return {
+    egressDenials: seatRun.egressDenials,
+    fallbackReason: seatRun.fallbackReason,
+    gate,
+    ok: gate.ok,
+    realized: seatRun.realized,
+    review,
+  };
 }
