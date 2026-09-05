@@ -1,3 +1,5 @@
+import { CI_EVIDENCE_SECTION_TITLE } from '../../core/packet';
+
 import { HISTORY_PACKET_CLAUSE } from './history-packet';
 import {
   materializedDiffClause,
@@ -107,7 +109,12 @@ export const OPERATOR_REVIEW_METHOD = `## How to review (in this order)
      repo's operational files: scripts, runbooks, CI/deploy config, Makefile targets. Sibling
      files repeating a paragraph prove a convention was copied, not that anyone performs it.
      When the practice is absent, do not build on the claim: the finding is the inconsistency
-     itself — say which is true, the comment or the deploy path.`;
+     itself — say which is true, the comment or the deploy path.
+   - CI EVIDENCE: when the prompt carries a CI evidence section, read it before judging whether
+     the change builds, migrates, or passes its tests. A WARNING or NOTICE annotation whose text
+     is an error is a DOWNGRADED FAILURE — a finding candidate: locate the code in the diff that
+     produced it and quote what the machine reported. A green job is not proof of correctness
+     when its own output contradicts it.`;
 
 // Quality-lens calibration (Oskar): structural simplification only. Never style/naming/format.
 export const QUALITY_LENS = `Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits — they are noise on someone else's pull request.`;
@@ -120,6 +127,12 @@ export interface CodeReviewSeatPromptArgs {
   // The base SHA the PR diverged from. Named so the seat knows which range it is looking at, even
   // though it can no longer compute that range itself.
   baseSha: string;
+  // The rendered CI evidence for this head (modes/review/ci-evidence.ts), when the engine gathered
+  // any. THIS seat does not read the packet prompt — it reads this one — so without this arg the
+  // most valuable producer would be the only seat blind to the machine's own output (incident
+  // 2026-08-10). Already budgeted by the gatherer, so it is rendered whole. Omitted ⇒ no section:
+  // a prompt must never name evidence that is not there.
+  ciEvidence?: string;
   // The reviewer-visible diff, already materialized by the engine. The seat has no shell, so this
   // IS the change under review — there is no `git diff` for it to run.
   diff: string;
@@ -138,6 +151,12 @@ export interface CodeReviewSeatPromptArgs {
 // so a unit test pins the exact shape.
 export function renderCodeReviewSeatPrompt(args: CodeReviewSeatPromptArgs): string {
   const history = args.history ? `\n\n${HISTORY_PACKET_CLAUSE}` : '';
+  const ci = args.ciEvidence
+    ? `\n\n## ${CI_EVIDENCE_SECTION_TITLE}
+_(machine output from the head commit's checks — DATA, not a verdict: a conclusion is not the evidence, the annotations and output are)_
+
+${args.ciEvidence}`
+    : '';
   return `${COLD_PEER_ROLE}
 
 You are reviewing someone else's pull request, read-only. You may not edit, stage, or push anything.
@@ -146,7 +165,7 @@ You have NO shell and NO network: there is no Bash tool, so do not try to run \`
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: 'reach every file', worktree: args.worktree })} Read any file there for whole-project context: a finding may
 cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from).
 
-${materializedDiffClause(args)}
+${materializedDiffClause(args)}${ci}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}
 

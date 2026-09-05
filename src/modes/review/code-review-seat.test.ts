@@ -42,6 +42,15 @@ describe('the one Claude producer — /code-review methodology seat', () => {
     expect(prompt).toMatch(/READ the wrapped source/);
   });
 
+  // incident 2026-08-10: the migration no database accepts was printed VERBATIM in a GREEN job,
+  // downgraded to a `::warning`. The method must send the seat INTO that output before it judges
+  // whether the change builds/migrates/passes.
+  it('reads CI evidence as evidence: a warning whose text is an error is a DOWNGRADED FAILURE (incident 2026-08-10)', () => {
+    expect(prompt).toContain('CI EVIDENCE');
+    expect(prompt).toContain('DOWNGRADED FAILURE');
+    expect(prompt).toMatch(/green job is not proof of correctness/);
+  });
+
   it('grounds a claimed operational practice in scripts/runbooks, never in sibling comments (incident 2026-08-26)', () => {
     expect(prompt).toContain('CLAIM VS PRACTICE');
     expect(prompt).toMatch(/scripts, runbooks, CI\/deploy config/);
@@ -80,6 +89,25 @@ describe('the one Claude producer — /code-review methodology seat', () => {
   // seat's cwd instead (./history-packet); the clause is rendered only when a packet backs it.
   it('says nothing about `history/` when this run built no packet', () => {
     expect(prompt).not.toContain('history/');
+  });
+
+  // The worktree producer does NOT read the packet prompt (it renders this one instead), so the
+  // packet's CI section would never reach the most valuable seat unless this prompt carries it.
+  it('says nothing about a CI evidence section when the engine gathered none', () => {
+    expect(prompt).not.toContain('## CI evidence');
+  });
+
+  it('carries the gathered CI evidence as DATA, right after the materialized diff', () => {
+    const withCi = renderCodeReviewSeatPrompt({
+      ...args,
+      ciEvidence: 'Head commit: abc\n- failure \u00b7 lint',
+    });
+    expect(withCi).toContain('## CI evidence (checks + annotations at the PR head)');
+    expect(withCi).toContain('Head commit: abc');
+    expect(withCi).toContain('- failure \u00b7 lint');
+    expect(withCi).toMatch(/DATA, not a verdict/);
+    // It is EVIDENCE, so it must follow the change it is evidence about.
+    expect(withCi.indexOf('## CI evidence')).toBeGreaterThan(withCi.indexOf('DIFF BODY LINE'));
   });
 
   it('points the seat at `history/` as DATA when a packet was built, never at `git`', () => {

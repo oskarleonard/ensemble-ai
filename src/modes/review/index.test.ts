@@ -4,8 +4,11 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { reviewDir } from '../../core/artifacts';
+import type { ReviewerId } from '../../core/types';
 
+import { CI_EVIDENCE_TRAIL_FILE } from './ci-evidence';
 import { runReviewMode } from './index';
+import type { ReviewAdapter } from './seat-run';
 
 // A diff that stages a `.env` file — the secret-scan blocks it (fail-closed) before any
 // reviewer runs, so NO packet/trail file should ever hit disk (no secret-on-disk).
@@ -49,5 +52,98 @@ describe('runReviewMode — no trail write before the secret-scan clears', () =>
     // packet embedding the .env line) was written to disk before the scan passed.
     expect(fs.existsSync(out)).toBe(false);
     expect(fs.existsSync(reviewDir(out, 'sec-run'))).toBe(false);
+  });
+});
+
+// Long enough to clear DIFF_USEFUL_FLOOR — a diff too small to review assembles no packet.
+const CODE_DIFF = [
+  'diff --git a/src/x.ts b/src/x.ts',
+  'index 1111111..2222222 100644',
+  '--- a/src/x.ts',
+  '+++ b/src/x.ts',
+  '@@ -1,6 +1,9 @@',
+  ' const a = 1;',
+  '+const b = 2;',
+  '+export function addTwoNumbersTogether(left: number, right: number): number {',
+  '+  return left + right;',
+  '+}',
+  ' export { a };',
+  ' // a trailing comment so the packet clears the useful-diff floor',
+  ' // and the reviewer sees a coherent, complete change to look at',
+  '',
+].join('\n');
+
+const REVIEW = '```json\n{"summary":"looked at it","findings":[]}\n```';
+// No reviewers.json at this path ⇒ the baked defaults.
+const NO_REVIEWERS_FILE = path.join(os.tmpdir(), 'ensemble-ci-no-such-reviewers.json');
+
+function stubAdapters(): Record<ReviewerId, ReviewAdapter> {
+  const reply: ReviewAdapter = async () => ({
+    ok: true,
+    raw: REVIEW,
+    stderrTail: '',
+    timedOut: false,
+  });
+  return { claude: reply, codex: reply, grok: reply };
+}
+
+// CI EVIDENCE (incident 2026-08-10): the head's own check output is DATA every seat must see. The
+// engine gathers it; this mode's job is to put it in the packet AND on the trail, so a human and a
+// dashboard can read exactly what the seats read.
+describe('runReviewMode — the gathered CI evidence reaches the packet and the trail', () => {
+  let out: string;
+  let cwd: string;
+  beforeEach(() => {
+    out = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-ci-ev-'));
+    cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-ci-ev-cwd-'));
+  });
+  afterEach(() => {
+    for (const d of [out, cwd]) fs.rmSync(d, { force: true, recursive: true });
+  });
+
+  const opts = (): Parameters<typeof runReviewMode>[0] => ({
+    adapters: stubAdapters(),
+    conventionReader: null,
+    cwd,
+    diffMode: 'pr',
+    diffText: CODE_DIFF,
+    headShaOverride: 'a'.repeat(40),
+    noConventions: true,
+    out,
+    receiptStore: path.join(out, 'receipts'),
+    reviewers: ['grok'],
+    reviewersFile: NO_REVIEWERS_FILE,
+    runId: 'ci-run',
+  });
+
+  it("threads ciEvidence into every seat's packet and writes ci-evidence.md to the trail", async () => {
+    const res = await runReviewMode({
+      ...opts(),
+      ciEvidence: 'Head commit: abc\n## Check runs\n- failure \u00b7 lint',
+    });
+    expect(res.blocked).toBe(false);
+    expect(res.prompt).toContain('CI evidence (checks + annotations at the PR head)');
+    expect(res.prompt).toContain('failure \u00b7 lint');
+    expect(
+      fs.existsSync(path.join(reviewDir(out, 'ci-run'), CI_EVIDENCE_TRAIL_FILE))
+    ).toBe(true);
+  });
+
+  it('renders the section LOUDLY when a fetch was attempted and failed — never silently absent', async () => {
+    const res = await runReviewMode({ ...opts(), ciEvidenceUnavailable: 'gh is not on PATH' });
+    expect(res.prompt).toContain('CI evidence (checks + annotations at the PR head)');
+    expect(res.prompt).toContain('gh is not on PATH');
+    // Nothing was gathered, so nothing joins the trail.
+    expect(
+      fs.existsSync(path.join(reviewDir(out, 'ci-run'), CI_EVIDENCE_TRAIL_FILE))
+    ).toBe(false);
+  });
+
+  it('renders no CI section at all when no fetch was attempted (the local-diff path)', async () => {
+    const res = await runReviewMode(opts());
+    expect(res.prompt).not.toContain('CI evidence (checks + annotations at the PR head)');
+    expect(
+      fs.existsSync(path.join(reviewDir(out, 'ci-run'), CI_EVIDENCE_TRAIL_FILE))
+    ).toBe(false);
   });
 });

@@ -160,6 +160,7 @@ var PACKET_BUDGETS = {
   // see, and re-truncating here made that manifest a lie — every run before this handed the
   // seats ~12 KB of an 80 KB gather while `conventions.json` reported the rules as included.
   agents: 12e3,
+  ci: 16e3,
   constraints: 4e3,
   diff: 2e5,
   files: 4e4,
@@ -201,6 +202,7 @@ function section(title, why, body, budget) {
   };
 }
 var DIFF_SECTION_TITLE = "The diff under review";
+var CI_EVIDENCE_SECTION_TITLE = "CI evidence (checks + annotations at the PR head)";
 function reviewerVisibleDiff(packet) {
   const s = packet.sections.find((sec) => sec.title === DIFF_SECTION_TITLE);
   return { text: s?.body ?? "", truncated: s?.truncated ?? false };
@@ -247,7 +249,20 @@ function assembleCodePacket(input) {
       "surrounding context for the diff hunks",
       input.surroundingFiles ?? "",
       PACKET_BUDGETS.files
-    ),
+    )
+  );
+  if (input.ciEvidence !== void 0 || input.ciEvidenceUnavailable !== void 0) {
+    const why = "machine output from the head commit's checks \u2014 DATA, not a verdict: a conclusion is not the evidence, the annotations and output are";
+    sections.push(
+      section(
+        CI_EVIDENCE_SECTION_TITLE,
+        input.ciEvidence ? why : `${why}; ${input.ciEvidenceUnavailable ?? "not fetched"}`,
+        input.ciEvidence ?? "",
+        PACKET_BUDGETS.ci
+      )
+    );
+  }
+  sections.push(
     section(
       "Repo conventions (AGENTS.md)",
       "house rules + known footguns the change must respect",
@@ -371,7 +386,16 @@ var CODE_ASK = [
   "when each endpoint is correct in isolation: name the caller role, the reference",
   "used, and the request that fails. If the diff (or its description) claims",
   "consumers need no change, test that claim against the least-privileged caller,",
-  "not the author/owner perspective."
+  "not the author/owner perspective.",
+  "",
+  'CI EVIDENCE: when the packet carries a "CI evidence" section, read it before you',
+  "judge whether the change builds, migrates, or passes its tests. A check\u2019s",
+  "conclusion is not the evidence \u2014 its annotations and output are. A WARNING or",
+  "NOTICE annotation whose text is an error (a failed command, a database/compiler/",
+  "linter error, a skipped or soft-failed step) is a DOWNGRADED FAILURE: treat it as a",
+  "finding candidate, locate the code in the diff that produced it, and quote what the",
+  "machine reported verbatim. A green job is not proof of correctness when its own",
+  "output contradicts it."
 ].join("\n");
 function securityAsk() {
   const classes = SECURITY_CLASSES.filter((c) => c.id !== "other").map((c) => `  - [${c.id}] ${c.label}`).join("\n");
@@ -423,6 +447,7 @@ ${ask}
 `;
 }
 export {
+  CI_EVIDENCE_SECTION_TITLE,
   CONFIDENCES,
   CORE_REVIEWER_IDS,
   DIFF_SECTION_TITLE,

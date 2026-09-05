@@ -256,6 +256,11 @@ export interface ClaudeLayerOptions {
   // told the exact range under review. Absent ⇒ the seat reviews the pinned packet prompt (it
   // still reads the tree, it is just not told the range).
   baseSha?: string | null;
+  // The run's rendered CI evidence (modes/review/ci-evidence.ts), when the engine gathered any. It
+  // reaches the PACKET seats through the packet prompt; the WORKTREE producer renders its own
+  // prompt instead, so it needs the text handed to it directly or it alone reviews blind to the
+  // head's own check output. Omitted ⇒ no section (nothing else in the layer reads it).
+  ciEvidence?: string;
   claudeConfig: VoiceConfig;
   // The run's gathered conventions files (repo-relative). The ONLY docs a holistic finding may
   // cite to lift its MED severity cap — and the gate re-reads the citation out of the tree anyway.
@@ -404,6 +409,7 @@ export async function runClaudeReviewLayer(
     : isCodeProfile && opts.baseSha && opts.pinnedDiff
       ? renderCodeReviewSeatPrompt({
           baseSha: opts.baseSha,
+          ...(opts.ciEvidence ? { ciEvidence: opts.ciEvidence } : {}),
           diff: opts.pinnedDiff,
           headSha: opts.expectedHeadSha,
           history: hasHistory,

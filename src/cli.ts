@@ -36,6 +36,7 @@ import {
   runProbe,
 } from './modes/review/probe';
 import { runProbeGate } from './modes/review/probe-gate';
+import { type CiEvidenceResult, fetchCiEvidence } from './modes/review/ci-evidence';
 import {
   type BrainstormResult,
   isVoiceId,
@@ -241,6 +242,9 @@ Options:
                         (default OFF; skip it when a probe run covers the same PR).
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
+  --no-ci-evidence      do NOT fetch the PR head's check runs + annotations + statuses into the
+                        packet (PR path only; default ON — a green job's warning that wraps an
+                        error is exactly the evidence a seat never gathers on its own)
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
   --strict-high         force STRICT: EVERY HIGH gates (exit 4), even one the gate dismissed —
                         overrides the provenance default (use for untrusted diffs / CI)
@@ -1136,6 +1140,7 @@ async function reviewCommand(
         holistic: { type: 'boolean' },
         'holistic-effort': { type: 'string' },
         'holistic-model': { type: 'string' },
+        'no-ci-evidence': { type: 'boolean' },
         'no-claude': { type: 'boolean' },
         'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
@@ -1379,12 +1384,38 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       );
   }
 
+  // CI EVIDENCE (modes/review/ci-evidence.ts): the head commit's check runs + annotations + commit
+  // statuses as DATA in the packet. PR path only (a local diff has no checks), default ON,
+  // best-effort: a gh failure degrades to a named UNAVAILABLE section — never blocks the review.
+  let ciEvidence: string | undefined;
+  let ciEvidenceUnavailable: string | undefined;
+  if (source.postTarget && !values['no-ci-evidence']) {
+    const gh = ghRunner(cwd);
+    const repoSlug = source.postTarget.repoSlug ?? repoSlugFromCwd(gh);
+    const ci: CiEvidenceResult = repoSlug
+      ? fetchCiEvidence({ gh, headSha: source.headShaOverride, pr: source.postTarget.pr, repoSlug })
+      : { error: 'could not resolve the PR repo (owner/repo)', ok: false };
+    if (ci.ok) {
+      ciEvidence = ci.text;
+      console.error(
+        `· CI evidence: ${ci.checks} check run(s) (${ci.failed} failed) · ${ci.annotations} annotation(s) · ${ci.text.length.toLocaleString('en-US')} chars${ci.truncated ? ' (truncated)' : ''}`
+      );
+    } else {
+      ciEvidenceUnavailable = ci.error;
+      console.error(
+        `· CI evidence: unavailable (${ci.error}) — reviewing without the head's check results`
+      );
+    }
+  }
+
   let result: ReviewModeResult;
   try {
     result = await runReviewMode({
       allowSensitive: Boolean(values['allow-sensitive']),
       base: typeof values.base === 'string' ? values.base : undefined,
       ceilingBytes,
+      ciEvidence,
+      ciEvidenceUnavailable,
       conventionCapBytes: conventionCap,
       conventionPaths,
       conventionReader,
@@ -1532,6 +1563,10 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       claudeLayer = await runClaudeReviewLayer({
         baseDir: out,
         baseSha: layerBaseSha,
+        // The worktree producer does NOT review the packet prompt (renderCodeReviewSeatPrompt
+        // replaces it), so the packet's CI section would miss the most valuable seat unless the
+        // text reaches it here. Packet-mode producers already have it in the pinned prompt.
+        ...(ciEvidence ? { ciEvidence } : {}),
         claudeConfig: claudeSeat.config,
         // The conventions this run actually gathered — the docs a holistic finding may cite to
         // lift its MED severity cap (the gate re-reads the citation out of the tree regardless).

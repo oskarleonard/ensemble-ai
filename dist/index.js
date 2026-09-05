@@ -166,6 +166,7 @@ var PACKET_BUDGETS = {
   // see, and re-truncating here made that manifest a lie — every run before this handed the
   // seats ~12 KB of an 80 KB gather while `conventions.json` reported the rules as included.
   agents: 12e3,
+  ci: 16e3,
   constraints: 4e3,
   diff: 2e5,
   files: 4e4,
@@ -207,6 +208,7 @@ function section(title, why, body, budget) {
   };
 }
 var DIFF_SECTION_TITLE = "The diff under review";
+var CI_EVIDENCE_SECTION_TITLE = "CI evidence (checks + annotations at the PR head)";
 function reviewerVisibleDiff(packet) {
   const s = packet.sections.find((sec) => sec.title === DIFF_SECTION_TITLE);
   return { text: s?.body ?? "", truncated: s?.truncated ?? false };
@@ -253,7 +255,20 @@ function assembleCodePacket(input) {
       "surrounding context for the diff hunks",
       input.surroundingFiles ?? "",
       PACKET_BUDGETS.files
-    ),
+    )
+  );
+  if (input.ciEvidence !== void 0 || input.ciEvidenceUnavailable !== void 0) {
+    const why = "machine output from the head commit's checks \u2014 DATA, not a verdict: a conclusion is not the evidence, the annotations and output are";
+    sections.push(
+      section(
+        CI_EVIDENCE_SECTION_TITLE,
+        input.ciEvidence ? why : `${why}; ${input.ciEvidenceUnavailable ?? "not fetched"}`,
+        input.ciEvidence ?? "",
+        PACKET_BUDGETS.ci
+      )
+    );
+  }
+  sections.push(
     section(
       "Repo conventions (AGENTS.md)",
       "house rules + known footguns the change must respect",
@@ -399,7 +414,16 @@ var CODE_ASK = [
   "when each endpoint is correct in isolation: name the caller role, the reference",
   "used, and the request that fails. If the diff (or its description) claims",
   "consumers need no change, test that claim against the least-privileged caller,",
-  "not the author/owner perspective."
+  "not the author/owner perspective.",
+  "",
+  'CI EVIDENCE: when the packet carries a "CI evidence" section, read it before you',
+  "judge whether the change builds, migrates, or passes its tests. A check\u2019s",
+  "conclusion is not the evidence \u2014 its annotations and output are. A WARNING or",
+  "NOTICE annotation whose text is an error (a failed command, a database/compiler/",
+  "linter error, a skipped or soft-failed step) is a DOWNGRADED FAILURE: treat it as a",
+  "finding candidate, locate the code in the diff that produced it, and quote what the",
+  "machine reported verbatim. A green job is not proof of correctness when its own",
+  "output contradicts it."
 ].join("\n");
 function securityAsk() {
   const classes = SECURITY_CLASSES.filter((c) => c.id !== "other").map((c) => `  - [${c.id}] ${c.label}`).join("\n");
@@ -2926,6 +2950,71 @@ var REVIEW_ADAPTERS = {
   grok: runGrokReview
 };
 
+// src/modes/review/secret-scan.ts
+var SENSITIVE_PATH_PATTERNS = [
+  { label: "dotenv", re: /(^|\/)\.env(\.[^/]+)?$/ },
+  { label: "secrets-env", re: /(^|\/)secrets\.env$/ },
+  { label: "pem", re: /\.pem$/ },
+  { label: "private-key", re: /\.key$/ },
+  { label: "ssh-key", re: /(^|\/)id_(rsa|ed25519|ecdsa|dsa)$/ },
+  { label: "auth-json", re: /(^|\/)auth\.json$/ },
+  { label: "netrc", re: /(^|\/)\.netrc$/ },
+  { label: "aws-credentials", re: /(^|\/)\.aws\/credentials$/ },
+  { label: "npmrc", re: /(^|\/)\.npmrc$/ },
+  { label: "pypirc", re: /(^|\/)\.pypirc$/ },
+  { label: "git-credentials", re: /(^|\/)\.git-credentials$/ },
+  { label: "pkcs12", re: /\.(p12|pfx)$/ }
+];
+var DOTENV_TEMPLATE_RE = /(^|\/)\.env(\.[^/.]+)*\.(template|example|sample)$/;
+var INLINE_SECRET_PATTERNS = [
+  { label: "private-key-block", re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
+  { label: "aws-access-key", re: /\bAKIA[0-9A-Z]{16}\b/ },
+  { label: "github-token", re: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/ },
+  { label: "slack-token", re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/ },
+  { label: "openai-key", re: /\bsk-[A-Za-z0-9]{20,}\b/ },
+  { label: "google-api-key", re: /\bAIza[0-9A-Za-z_-]{35}\b/ }
+];
+function firstInlineSecret(lines) {
+  for (const { label, re } of INLINE_SECRET_PATTERNS) {
+    if (lines.some((line) => re.test(line))) return { label };
+  }
+  return null;
+}
+function scanTextForSecrets(text) {
+  return firstInlineSecret(text.split("\n"));
+}
+function payloadLines(section2) {
+  return section2.split("\n").filter(
+    (l) => l.startsWith("+") && !l.startsWith("+++") || l.startsWith("-") && !l.startsWith("---") || l.startsWith(" ")
+  ).map((l) => l.slice(1));
+}
+function scanDiffForSecrets(files, opts = {}) {
+  const sensitivePaths = [];
+  const inlineSecrets = [];
+  for (const f of files) {
+    for (const { label, re } of SENSITIVE_PATH_PATTERNS) {
+      if (label === "dotenv" && DOTENV_TEMPLATE_RE.test(f.path)) continue;
+      if (re.test(f.path)) sensitivePaths.push({ label, path: f.path });
+    }
+    if (f.isBinary) continue;
+    const lines = payloadLines(f.raw);
+    for (const { label, re } of INLINE_SECRET_PATTERNS) {
+      if (lines.some((line) => re.test(line))) inlineSecrets.push({ label, path: f.path });
+    }
+  }
+  const hasRisk = sensitivePaths.length > 0 || inlineSecrets.length > 0;
+  const overridden = Boolean(opts.allowSensitive);
+  return {
+    blocked: hasRisk && !overridden,
+    inlineSecrets,
+    overridden,
+    sensitivePaths
+  };
+}
+
+// src/modes/review/ci-evidence.ts
+var CI_EVIDENCE_TRAIL_FILE = "ci-evidence.md";
+
 // src/modes/review/dep-surface.ts
 var MANIFEST_PATTERNS = [
   { label: "npm", re: /(^|\/)package\.json$/ },
@@ -4082,61 +4171,6 @@ var RETRIES_ON_PACKET = {
   grok: false
 };
 
-// src/modes/review/secret-scan.ts
-var SENSITIVE_PATH_PATTERNS = [
-  { label: "dotenv", re: /(^|\/)\.env(\.[^/]+)?$/ },
-  { label: "secrets-env", re: /(^|\/)secrets\.env$/ },
-  { label: "pem", re: /\.pem$/ },
-  { label: "private-key", re: /\.key$/ },
-  { label: "ssh-key", re: /(^|\/)id_(rsa|ed25519|ecdsa|dsa)$/ },
-  { label: "auth-json", re: /(^|\/)auth\.json$/ },
-  { label: "netrc", re: /(^|\/)\.netrc$/ },
-  { label: "aws-credentials", re: /(^|\/)\.aws\/credentials$/ },
-  { label: "npmrc", re: /(^|\/)\.npmrc$/ },
-  { label: "pypirc", re: /(^|\/)\.pypirc$/ },
-  { label: "git-credentials", re: /(^|\/)\.git-credentials$/ },
-  { label: "pkcs12", re: /\.(p12|pfx)$/ }
-];
-var DOTENV_TEMPLATE_RE = /(^|\/)\.env(\.[^/.]+)*\.(template|example|sample)$/;
-var INLINE_SECRET_PATTERNS = [
-  { label: "private-key-block", re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
-  { label: "aws-access-key", re: /\bAKIA[0-9A-Z]{16}\b/ },
-  { label: "github-token", re: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/ },
-  { label: "slack-token", re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/ },
-  { label: "openai-key", re: /\bsk-[A-Za-z0-9]{20,}\b/ },
-  { label: "google-api-key", re: /\bAIza[0-9A-Za-z_-]{35}\b/ }
-];
-function payloadLines(section2) {
-  return section2.split("\n").filter(
-    (l) => l.startsWith("+") && !l.startsWith("+++") || l.startsWith("-") && !l.startsWith("---") || l.startsWith(" ")
-  ).map((l) => l.slice(1));
-}
-function scanDiffForSecrets(files, opts = {}) {
-  const sensitivePaths = [];
-  const inlineSecrets = [];
-  for (const f of files) {
-    for (const { label, re } of SENSITIVE_PATH_PATTERNS) {
-      if (label === "dotenv" && DOTENV_TEMPLATE_RE.test(f.path)) continue;
-      if (re.test(f.path)) sensitivePaths.push({ label, path: f.path });
-    }
-    if (f.isBinary) continue;
-    const lines = payloadLines(f.raw);
-    for (const { label, re } of INLINE_SECRET_PATTERNS) {
-      if (lines.some((line) => re.test(line))) {
-        inlineSecrets.push({ label, path: f.path });
-      }
-    }
-  }
-  const hasRisk = sensitivePaths.length > 0 || inlineSecrets.length > 0;
-  const overridden = Boolean(opts.allowSensitive);
-  return {
-    blocked: hasRisk && !overridden,
-    inlineSecrets,
-    overridden,
-    sensitivePaths
-  };
-}
-
 // src/modes/review/index.ts
 var DEFAULT_OBJECTIVE = "Adversarial cross-vendor review of a code diff \u2014 find correctness, security, and convention issues a same-vendor author might miss.";
 function qualifyCoreSeats(reviewers, worktree, configs) {
@@ -4207,12 +4241,20 @@ async function runReviewMode(opts) {
     agentsBudget: conventionManifest?.capBytes,
     agentsMd,
     authorSummary: opts.authorSummary,
+    ciEvidence: opts.ciEvidence,
+    ciEvidenceUnavailable: opts.ciEvidenceUnavailable,
     diff: acquired.diff,
     directive: opts.directive,
     objective: opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE),
     pr: 0,
     repo: acquired.repoId ?? ""
   });
+  if (opts.ciEvidence) {
+    try {
+      writeTrailFile(opts.out, opts.runId, CI_EVIDENCE_TRAIL_FILE, opts.ciEvidence);
+    } catch {
+    }
+  }
   const prompt = renderReviewPrompt(packet, profile);
   if (!packet.complete) {
     log("Packet incomplete (no usable diff) \u2014 persisting an empty review.");
@@ -4400,13 +4442,24 @@ var OPERATOR_REVIEW_METHOD = `## How to review (in this order)
      repo's operational files: scripts, runbooks, CI/deploy config, Makefile targets. Sibling
      files repeating a paragraph prove a convention was copied, not that anyone performs it.
      When the practice is absent, do not build on the claim: the finding is the inconsistency
-     itself \u2014 say which is true, the comment or the deploy path.`;
+     itself \u2014 say which is true, the comment or the deploy path.
+   - CI EVIDENCE: when the prompt carries a CI evidence section, read it before judging whether
+     the change builds, migrates, or passes its tests. A WARNING or NOTICE annotation whose text
+     is an error is a DOWNGRADED FAILURE \u2014 a finding candidate: locate the code in the diff that
+     produced it and quote what the machine reported. A green job is not proof of correctness
+     when its own output contradicts it.`;
 var QUALITY_LENS = `Report BUGS and STRUCTURAL quality only: correctness defects, scope-narrowing, simpler function shape, dead branches, and reinvented utilities. NEVER report style, naming, formatting, or import-ordering nits \u2014 they are noise on someone else's pull request.`;
 var SCHEMA_BLOCK2 = `{"summary":"<one sentence>","findings":[{"title":"<short>","body":"<what is wrong, why, and the fix>","severity":"high|medium|low","confidence":"high|medium|low","evidence":{"file":"<repo-relative path>","line":<number>}}]}`;
 function renderCodeReviewSeatPrompt(args) {
   const history = args.history ? `
 
 ${HISTORY_PACKET_CLAUSE}` : "";
+  const ci = args.ciEvidence ? `
+
+## ${CI_EVIDENCE_SECTION_TITLE}
+_(machine output from the head commit's checks \u2014 DATA, not a verdict: a conclusion is not the evidence, the annotations and output are)_
+
+${args.ciEvidence}` : "";
   return `${COLD_PEER_ROLE}
 
 You are reviewing someone else's pull request, read-only. You may not edit, stage, or push anything.
@@ -4415,7 +4468,7 @@ You have NO shell and NO network: there is no Bash tool, so do not try to run \`
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: "reach every file", worktree: args.worktree })} Read any file there for whole-project context: a finding may
 cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from).
 
-${materializedDiffClause(args)}
+${materializedDiffClause(args)}${ci}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}
 
@@ -5633,6 +5686,7 @@ function isImplemented(mode) {
 }
 export {
   AGENT_INSTRUCTION_NAMES,
+  CI_EVIDENCE_SECTION_TITLE,
   CLAUDE_CAPABILITY_FENCE,
   CLAUDE_EFFORTS2 as CLAUDE_EFFORTS,
   CLAUDE_INACTIVITY_TIMEOUT_MS,
@@ -5872,6 +5926,7 @@ export {
   sanitizePathSegment,
   scanDependencySurface,
   scanDiffForSecrets,
+  scanTextForSecrets,
   scoreHolisticFixture,
   section,
   securityClassLabel,

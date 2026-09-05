@@ -20,6 +20,7 @@ import {
 } from '../../core/types';
 import { REVIEW_ADAPTERS } from '../../reviewers/registry';
 
+import { CI_EVIDENCE_TRAIL_FILE } from './ci-evidence';
 import {
   acquireDiff,
   type AcquiredDiff,
@@ -93,6 +94,10 @@ export interface ReviewModeOptions {
   authorSummary?: string;
   base?: string;
   ceilingBytes?: number;
+  // CI evidence for the PR head (modes/review/ci-evidence.ts) — the rendered text, or the reason a
+  // fetch failed. Either one makes the packet render its CI section (loud when unavailable).
+  ciEvidence?: string;
+  ciEvidenceUnavailable?: string;
   // Cap (bytes) on the gathered conventions text (default in gatherConventions).
   conventionCapBytes?: number;
   // Explicit convention paths (`.ensemble-ai.json` / `--conventions`) — additive.
@@ -297,6 +302,8 @@ export async function runReviewMode(
     agentsBudget: conventionManifest?.capBytes,
     agentsMd,
     authorSummary: opts.authorSummary,
+    ciEvidence: opts.ciEvidence,
+    ciEvidenceUnavailable: opts.ciEvidenceUnavailable,
     diff: acquired.diff,
     directive: opts.directive,
     objective:
@@ -305,6 +312,15 @@ export async function runReviewMode(
     pr: 0,
     repo: acquired.repoId ?? '',
   });
+  // The rendered CI evidence joins the trail for humans + dashboards (best-effort, like every
+  // trail write). The packet manifest already records the section for the seats.
+  if (opts.ciEvidence) {
+    try {
+      writeTrailFile(opts.out, opts.runId, CI_EVIDENCE_TRAIL_FILE, opts.ciEvidence);
+    } catch {
+      /* trail write is best-effort */
+    }
+  }
   const prompt = renderReviewPrompt(packet, profile);
   if (!packet.complete) {
     log('Packet incomplete (no usable diff) — persisting an empty review.');

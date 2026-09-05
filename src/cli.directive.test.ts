@@ -69,17 +69,28 @@ let prView: () => string = () => JSON.stringify({ body: BODY, title: TITLE });
 function scriptGh(): void {
   mockExec.mockImplementation(((cmd: string, args: readonly string[] = []) => {
     const a = args.join(' ');
-    if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') return prView();
+    // `gh pr view` now has TWO consumers on this path: the directive fetch (title,body — the one
+    // under test, scripted by `prView`) and the CI-evidence gatherer's head resolution. Different
+    // questions get different answers, so scripting one never silently answers the other.
+    if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      return a.includes('headRefOid') ? JSON.stringify({ headRefOid: 'h'.repeat(40) }) : prView();
+    }
+    // The CI-evidence gatherer's own calls — answered emptily: this file is about the directive.
+    if (cmd === 'gh' && args[0] === 'repo' && args[1] === 'view') return 'o/r\n';
+    if (cmd === 'gh' && a.includes('/check-runs')) return JSON.stringify({ check_runs: [] });
+    if (cmd === 'gh' && a.includes('/status')) return JSON.stringify({ statuses: [] });
     if (cmd === 'gh' && a.includes('/pulls/')) throw new Error('gh api pulls: unresolved');
     if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'diff') return DIFF;
     throw new Error(`unexpected exec: ${cmd} ${a}`);
   }) as unknown as typeof execFileSync);
 }
 
-const prViewCalls = (): string[][] =>
+// The DIRECTIVE fetch's argv, and only it — selected by the fields it asks for, since the
+// CI-evidence gatherer reaches for `gh pr view` too (with a different --json).
+const directiveCalls = (): string[][] =>
   mockExec.mock.calls
-    .filter((c) => c[0] === 'gh' && ((c[1] ?? []) as string[])[1] === 'view')
-    .map((c) => (c[1] ?? []) as string[]);
+    .map((c) => (c[1] ?? []) as string[])
+    .filter((a) => a[0] === 'pr' && a[1] === 'view' && a.includes('title,body'));
 
 const directiveOf = (): string | undefined => mockRun.mock.calls[0]?.[0].directive;
 
@@ -105,7 +116,7 @@ afterEach(() => {
 describe('the PR description fills the packet directive slot', () => {
   it('a URL PR threads title + body, addressed with -R so it works from any cwd', async () => {
     expect(await main(['review', 'https://github.com/o/r/pull/7'])).toBe(0);
-    expect(prViewCalls()).toEqual([
+    expect(directiveCalls()).toEqual([
       ['pr', 'view', '7', '-R', 'o/r', '--json', 'title,body'],
     ]);
     expect(directiveOf()).toBe(`${TITLE}\n\n${BODY}`);
@@ -113,7 +124,7 @@ describe('the PR description fills the packet directive slot', () => {
 
   it('a bare `--pr <N>` omits -R (it targets the cwd repo, exactly as the diff fetch did)', async () => {
     expect(await main(['review', '--pr', '7'])).toBe(0);
-    expect(prViewCalls()).toEqual([['pr', 'view', '7', '--json', 'title,body']]);
+    expect(directiveCalls()).toEqual([['pr', 'view', '7', '--json', 'title,body']]);
     expect(directiveOf()).toBe(`${TITLE}\n\n${BODY}`);
   });
 
@@ -125,7 +136,7 @@ describe('the PR description fills the packet directive slot', () => {
 
   it('a NON-PR source fetches nothing — a working-tree diff has no stated intent to read', async () => {
     expect(await main(['review', '--working-tree'])).toBe(0);
-    expect(prViewCalls()).toEqual([]);
+    expect(directiveCalls()).toEqual([]);
     expect(directiveOf()).toBeUndefined();
   });
 });
