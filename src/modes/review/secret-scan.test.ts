@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { parseDiffFiles } from './diff';
-import { scanDiffForSecrets } from './secret-scan';
+import { scanDiffForSecrets, scanTextForSecrets } from './secret-scan';
 
 function diffFor(path: string, addedLines: string[]): string {
   return `diff --git a/${path} b/${path}
@@ -134,5 +134,20 @@ describe('scanDiffForSecrets — clean diff', () => {
     expect(r.blocked).toBe(false);
     expect(r.sensitivePaths).toHaveLength(0);
     expect(r.inlineSecrets).toHaveLength(0);
+  });
+});
+
+describe('scanTextForSecrets — the same inline patterns, over arbitrary text', () => {
+  it('returns null for ordinary CI output', () => {
+    expect(scanTextForSecrets('✓ 214 tests passed\nwarning: deprecated API used in src/a.ts')).toBeNull();
+  });
+
+  it('names the FIRST matching pattern and never the value', () => {
+    const hit = scanTextForSecrets('token leaked: ghp_abcdefghijklmnopqrstuvwxyz0123');
+    expect(hit).toEqual({ label: 'github-token' });
+  });
+
+  it('catches a private-key header on any line', () => {
+    expect(scanTextForSecrets('line 1\n-----BEGIN RSA PRIVATE KEY-----\nline 3')?.label).toBe('private-key-block');
   });
 });

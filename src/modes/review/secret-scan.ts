@@ -50,6 +50,25 @@ const INLINE_SECRET_PATTERNS: { label: string; re: RegExp }[] = [
   { label: 'google-api-key', re: /\bAIza[0-9A-Za-z_-]{35}\b/ },
 ];
 
+export interface TextSecretHit {
+  // The matched value is NOT recorded (it's a secret) — only its kind.
+  label: string;
+}
+
+// The first inline credential pattern any line of `lines` matches, else null. Shared by the diff
+// scan below and by any other text the engine ships to a vendor (CI evidence) — ONE pattern list.
+function firstInlineSecret(lines: readonly string[]): TextSecretHit | null {
+  for (const { label, re } of INLINE_SECRET_PATTERNS) {
+    if (lines.some((line) => re.test(line))) return { label };
+  }
+  return null;
+}
+
+// Scan arbitrary text (not a diff) for inline credentials. PURE.
+export function scanTextForSecrets(text: string): TextSecretHit | null {
+  return firstInlineSecret(text.split('\n'));
+}
+
 export interface SensitivePathHit {
   label: string;
   path: string;
@@ -102,9 +121,7 @@ export function scanDiffForSecrets(
     if (f.isBinary) continue;
     const lines = payloadLines(f.raw);
     for (const { label, re } of INLINE_SECRET_PATTERNS) {
-      if (lines.some((line) => re.test(line))) {
-        inlineSecrets.push({ label, path: f.path });
-      }
+      if (lines.some((line) => re.test(line))) inlineSecrets.push({ label, path: f.path });
     }
   }
   const hasRisk = sensitivePaths.length > 0 || inlineSecrets.length > 0;
