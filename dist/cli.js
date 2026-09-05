@@ -7077,7 +7077,7 @@ async function runReviewMode(opts) {
       );
       if (seat.review.terminalState !== "reviewed") {
         log(
-          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat --seat ${id} --out ${opts.out} --run-id ${opts.runId}`
+          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat --seat ${id} --out '${opts.out}' --run-id ${opts.runId}`
         );
       }
       return [id, seat];
@@ -8037,19 +8037,36 @@ function writeEvidenceManifest(baseDir, runId, manifest) {
 
 // src/modes/review/reseat.ts
 function splitWorktreePrompt(prompt) {
-  const asPacket = { baseSha: null, hadWorktree: false, packetPrompt: prompt };
+  const asPacket = {
+    baseSha: null,
+    hadWorktree: false,
+    packetPrompt: prompt,
+    unverifiedTail: false
+  };
+  if (prompt.endsWith("\n")) return asPacket;
   const idx = prompt.lastIndexOf(`
 
 ${WORKTREE_SUFFIX_HEADER}`);
   if (idx === -1) return asPacket;
+  const unverified = {
+    baseSha: null,
+    hadWorktree: true,
+    packetPrompt: prompt,
+    unverifiedTail: true
+  };
   const tail = prompt.slice(idx);
   const named = tail.match(/checked out READ-ONLY at (.+?) \(detached at ([^)\n]+)\)/);
-  if (!named) return asPacket;
+  if (!named) return unverified;
   const base = tail.match(/git diff ([0-9a-f]{7,40})\.\.\.[0-9a-f]{7,40}/);
   const baseSha = base ? base[1] : null;
   const rebuilt = worktreePromptSuffix({ baseSha, headSha: named[2], worktree: named[1] });
-  if (!prompt.endsWith(rebuilt)) return asPacket;
-  return { baseSha, hadWorktree: true, packetPrompt: prompt.slice(0, prompt.length - rebuilt.length) };
+  if (!prompt.endsWith(rebuilt)) return unverified;
+  return {
+    baseSha,
+    hadWorktree: true,
+    packetPrompt: prompt.slice(0, prompt.length - rebuilt.length),
+    unverifiedTail: false
+  };
 }
 function readSeatArtifacts(baseDir, runId, seat) {
   const dir = reviewDir(baseDir, runId);
@@ -8085,12 +8102,18 @@ function checkReseat(baseDir, runId, seat, worktreeHeadSha) {
   }
   const art = readSeatArtifacts(baseDir, runId, seat);
   if ("error" in art) return { refusal: art.error };
+  const split = splitWorktreePrompt(art.prompt);
+  if (split.unverifiedTail) {
+    return {
+      refusal: `seat ${seat}'s persisted prompt carries a worktree preamble this engine version cannot verify (the run was written by another ensemble-ai version) \u2014 refusing to retry on an unverifiable pinned prompt; re-run the review instead`
+    };
+  }
   if (art.stored.terminalState === "reviewed") {
     return {
       refusal: `seat ${seat} completed in run ${runId} \u2014 nothing to retry (re-running a healthy seat is a new review)`
     };
   }
-  return { art, headSha };
+  return { art, headSha, split };
 }
 function reseatRefusal(baseDir, runId, seat, worktreeHeadSha) {
   const pre = checkReseat(baseDir, runId, seat, worktreeHeadSha);
@@ -8123,8 +8146,7 @@ async function runReseat(opts) {
   const { baseDir, runId, seat } = opts;
   const pre = checkReseat(baseDir, runId, seat, opts.worktree?.headSha);
   if ("refusal" in pre) throw new Error(pre.refusal);
-  const { art, headSha } = pre;
-  const split = splitWorktreePrompt(art.prompt);
+  const { art, headSha, split } = pre;
   const wt = opts.worktree;
   const qualified = Boolean(wt && opts.qualification?.qualified);
   const worktreePrompt = wt && qualified ? split.packetPrompt + worktreePromptSuffix({
@@ -11530,8 +11552,8 @@ Usage:
                     worktree qualification requires (see \`review --sandbox\`); anything else
                     DISqualifies the seat and it re-runs on the packet
 
-Not re-run (same as regate): the execution settler, the shadow gate, the receipt. The receipt is
-not re-minted either \u2014 a healed run keeps the receipt its original roster earned.
+Not re-run (same as regate): the execution settler, the shadow gate, and the receipt \u2014 a healed run
+keeps the receipt its original roster earned.
 Exit: 0 = seat reviewed + gate completed \xB7 1 = seat failed again, the gate failed, or the retry
 threw AFTER the seat was spawned \xB7 3 = a pre-spawn refusal: usage, a missing trail or seat
 artifact, a healthy seat, a worktree at a different head \u2014 nothing was billed.

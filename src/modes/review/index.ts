@@ -383,7 +383,7 @@ export async function runReviewMode(
       // JUST this seat, and the alternative a reader reaches for otherwise is re-billing everyone.
       if (seat.review.terminalState !== 'reviewed') {
         log(
-          `  · → retry just this seat: ensemble-ai reseat --seat ${id} --out ${opts.out} --run-id ${opts.runId}`
+          `  · → retry just this seat: ensemble-ai reseat --seat ${id} --out '${opts.out}' --run-id ${opts.runId}`
         );
       }
       return [id, seat] as const;

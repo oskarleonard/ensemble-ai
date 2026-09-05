@@ -3280,8 +3280,8 @@ Usage:
                     worktree qualification requires (see \`review --sandbox\`); anything else
                     DISqualifies the seat and it re-runs on the packet
 
-Not re-run (same as regate): the execution settler, the shadow gate, the receipt. The receipt is
-not re-minted either — a healed run keeps the receipt its original roster earned.
+Not re-run (same as regate): the execution settler, the shadow gate, and the receipt — a healed run
+keeps the receipt its original roster earned.
 Exit: 0 = seat reviewed + gate completed · 1 = seat failed again, the gate failed, or the retry
 threw AFTER the seat was spawned · 3 = a pre-spawn refusal: usage, a missing trail or seat
 artifact, a healthy seat, a worktree at a different head — nothing was billed.

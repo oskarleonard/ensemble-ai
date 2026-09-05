@@ -33,8 +33,13 @@ export interface SplitPrompt {
   // Recovered from the preamble's `git diff <base>...<head>` line; null when it had none.
   baseSha: string | null;
   hadWorktree: boolean;
-  // The pinned packet prompt — byte-identical to what every seat saw, minus the preamble.
+  // The pinned packet prompt — byte-identical to what every seat saw, minus the preamble. Only
+  // meaningful when `unverifiedTail` is false; on an unverified tail it is the WHOLE persisted
+  // prompt, stale preamble included, and the caller must refuse rather than re-send it.
   packetPrompt: string;
+  // true ⇔ a preamble is present (the prompt does not end in a newline) but THIS version cannot
+  // re-render it byte-for-byte. Not a packet-mode prompt and not a splittable one: unusable.
+  unverifiedTail: boolean;
 }
 
 // PURE. The persisted `prompt.<seat>.md` is the packet prompt PLUS, in worktree mode, a preamble
@@ -50,19 +55,48 @@ export interface SplitPrompt {
 // recover its three fields, re-render `worktreePromptSuffix` from them, and split ONLY if the prompt
 // ends with that exact rebuild. Anything else is packet-mode, unchanged.
 export function splitWorktreePrompt(prompt: string): SplitPrompt {
-  const asPacket: SplitPrompt = { baseSha: null, hadWorktree: false, packetPrompt: prompt };
+  const asPacket: SplitPrompt = {
+    baseSha: null,
+    hadWorktree: false,
+    packetPrompt: prompt,
+    unverifiedTail: false,
+  };
+  // STRUCTURAL LOCK, read BEFORE the proof: `renderReviewPrompt` always ends its output with a
+  // newline (`${head}\n\n${body}\n\n${ask}\n`), `worktreePromptSuffix` ends with '.', and
+  // `persistReview` writes the prompt raw. So a persisted prompt that ends in a newline is a packet
+  // prompt — whatever header text it quotes is BODY — and one that does not is a prompt some engine
+  // version appended a preamble to.
+  if (prompt.endsWith('\n')) return asPacket;
   const idx = prompt.lastIndexOf(`\n\n${WORKTREE_SUFFIX_HEADER}`);
   if (idx === -1) return asPacket;
+  // A preamble IS present. From here the only two honest answers are "split it" and "I cannot read
+  // this" — never "keep it as body": that would re-send the stale preamble to the retried seat
+  // (two preambles, one naming a reaped dir), and would silently drop the downgrade record and the
+  // recovered base with it. VERSION SKEW is the ordinary cause: the proof compares against what the
+  // CURRENTLY installed renderer emits, so any edit to that text (down to a filename appearing in
+  // the stripped-instruction list the untrusted clause interpolates) invalidates every prompt
+  // persisted before it.
+  const unverified: SplitPrompt = {
+    baseSha: null,
+    hadWorktree: true,
+    packetPrompt: prompt,
+    unverifiedTail: true,
+  };
   const tail = prompt.slice(idx);
   const named = tail.match(/checked out READ-ONLY at (.+?) \(detached at ([^)\n]+)\)/);
-  if (!named) return asPacket;
+  if (!named) return unverified;
   const base = tail.match(/git diff ([0-9a-f]{7,40})\.\.\.[0-9a-f]{7,40}/);
   const baseSha = base ? base[1] : null;
   const rebuilt = worktreePromptSuffix({ baseSha, headSha: named[2], worktree: named[1] });
   // Byte-level proof: every other character of the preamble (the read-only clause, the untrusted-
   // instruction clause, the anchor line) has to be there, in order, at the very end.
-  if (!prompt.endsWith(rebuilt)) return asPacket;
-  return { baseSha, hadWorktree: true, packetPrompt: prompt.slice(0, prompt.length - rebuilt.length) };
+  if (!prompt.endsWith(rebuilt)) return unverified;
+  return {
+    baseSha,
+    hadWorktree: true,
+    packetPrompt: prompt.slice(0, prompt.length - rebuilt.length),
+    unverifiedTail: false,
+  };
 }
 
 export interface SeatArtifacts {
@@ -98,7 +132,7 @@ export function readSeatArtifacts(
   return { packet, prompt, stored };
 }
 
-type ReseatGate = { art: SeatArtifacts; headSha: string } | { refusal: string };
+type ReseatGate = { art: SeatArtifacts; headSha: string; split: SplitPrompt } | { refusal: string };
 
 // The pre-spawn refusals, in the order that costs least. The pinned packet grounds everything; a
 // mis-materialized tree is refused before a single artifact is read (a wrong tree costs nothing);
@@ -126,12 +160,20 @@ function checkReseat(
   }
   const art = readSeatArtifacts(baseDir, runId, seat);
   if ('error' in art) return { refusal: art.error };
+  // A pinned prompt whose preamble this version cannot re-render is not a prompt we may re-send.
+  // Refusing costs one review; guessing costs a retry grounded in a prompt nobody can describe.
+  const split = splitWorktreePrompt(art.prompt);
+  if (split.unverifiedTail) {
+    return {
+      refusal: `seat ${seat}'s persisted prompt carries a worktree preamble this engine version cannot verify (the run was written by another ensemble-ai version) — refusing to retry on an unverifiable pinned prompt; re-run the review instead`,
+    };
+  }
   if (art.stored.terminalState === 'reviewed') {
     return {
       refusal: `seat ${seat} completed in run ${runId} — nothing to retry (re-running a healthy seat is a new review)`,
     };
   }
-  return { art, headSha };
+  return { art, headSha, split };
 }
 
 // Why this run may NOT be reseated, in the exact words the caller should print — or null when it may.
@@ -234,8 +276,7 @@ export async function runReseat(opts: ReseatOptions): Promise<ReseatResult> {
   // Every pre-spawn refusal, in the CLI's own words (reseatRefusal) — nothing is billed past here.
   const pre = checkReseat(baseDir, runId, seat, opts.worktree?.headSha);
   if ('refusal' in pre) throw new Error(pre.refusal);
-  const { art, headSha } = pre;
-  const split = splitWorktreePrompt(art.prompt);
+  const { art, headSha, split } = pre;
   const wt = opts.worktree;
   const qualified = Boolean(wt && opts.qualification?.qualified);
   const worktreePrompt =

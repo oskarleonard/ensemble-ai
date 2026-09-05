@@ -4264,7 +4264,7 @@ async function runReviewMode(opts) {
       );
       if (seat.review.terminalState !== "reviewed") {
         log(
-          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat --seat ${id} --out ${opts.out} --run-id ${opts.runId}`
+          `  \xB7 \u2192 retry just this seat: ensemble-ai reseat --seat ${id} --out '${opts.out}' --run-id ${opts.runId}`
         );
       }
       return [id, seat];
