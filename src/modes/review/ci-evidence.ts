@@ -87,8 +87,8 @@ interface CommitStatus {
 // back that is not what the type claims becomes an empty value plus a note in the text — never
 // a thrown TypeError out of a function whose whole contract is best-effort.
 const asArray = <T>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
-const asRecord = (v: unknown): Record<string, unknown> =>
-  typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+const isRecord = (v: unknown): boolean => typeof v === 'object' && v !== null && !Array.isArray(v);
+const asRecord = (v: unknown): Record<string, unknown> => (isRecord(v) ? (v as Record<string, unknown>) : {});
 const isArrayish = (v: unknown): boolean => v === undefined || v === null || Array.isArray(v);
 
 const UNEXPECTED_SHAPE = 'unexpected payload shape';
@@ -141,21 +141,34 @@ const safe = (s: string): string => {
   return hit ? `[redacted: ${hit.label}]` : s;
 };
 
-// One candidate block of rendered lines, admitted to the text as a UNIT (an annotation block is
-// its heading plus its own annotation lines — half a block is not evidence).
+// One candidate row, admitted to the text as a UNIT (a check row plus its summary line; one
+// commit status). Half a row is not evidence.
 interface Item {
-  // Annotation lines this item renders — the only source of the reported annotation count.
-  annotations: number;
-  // Annotations of the same check this item does NOT render (per-check cap or per_page).
-  annotationsBehind: number;
   lines: string[];
+}
+
+// One check's annotations. Unlike a row, a block is admitted PARTIALLY: a check that annotates
+// verbosely can cost more than the whole budget on its own (25 × ~1 KB), and dropping it whole
+// would strand the budget and lose exactly the evidence this module exists for.
+interface AnnotationBlock {
+  heading: string;
+  // The check's TRUE annotation total — its own annotations_count, floored by the response
+  // length. The denominator of the block's `… N more annotation(s) not shown`. Zero for a
+  // block that could not be fetched: its note is the trace, a count would be a guess.
+  knownTotal: number;
+  // `- annotations unavailable: …` in place of any units.
+  note: string;
+  // One entry per annotation: its `- […]` line plus its optional `details:` line, kept
+  // together — a line of detail without the annotation it details is noise.
+  units: string[][];
 }
 
 // A line costs its own length plus the newline that joins it.
 const cost = (lines: readonly string[]): number => lines.reduce((n, l) => n + l.length + 1, 0);
 
 // Room held back so the bookkeeping lines the selection itself causes still fit inside
-// `maxChars` — three sections can each end in one `… N more … not shown` line.
+// `maxChars` — three section-level ones (check runs not shown, annotated checks not shown,
+// statuses not shown). A block's own `… N more annotation(s) …` line is charged to the block.
 const OMISSION_LINE_RESERVE = 80;
 const OMISSION_LINE_KINDS = 3;
 
@@ -179,11 +192,15 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   const runs = ghJson<unknown>(gh, ['api', `repos/${repoSlug}/commits/${headSha}/check-runs?per_page=100`]);
   if (!runs.ok) return { error: `check runs unavailable: ${safe(runs.error)}`, ok: false };
   const rawChecks = asRecord(runs.value).check_runs;
-  const checks = asArray<CheckRun>(rawChecks).sort(
-    // `localeCompare` with an explicit locale: the sort order of the evidence a reviewer reads
-    // must not depend on the machine that gathered it.
-    (a, b) => conclusionRank(a) - conclusionRank(b) || name(a).localeCompare(name(b), 'en')
-  );
+  // A non-object ELEMENT (`null`, a string, a number) carries no evidence and every accessor
+  // below would dereference it — drop it here, where the array is first read.
+  const checks = asArray<CheckRun>(rawChecks)
+    .filter((c) => isRecord(c))
+    .sort(
+      // `localeCompare` with an explicit locale: the sort order of the evidence a reviewer
+      // reads must not depend on the machine that gathered it.
+      (a, b) => conclusionRank(a) - conclusionRank(b) || name(a).localeCompare(name(b), 'en')
+    );
   const failed = checks.filter((c) => conclusionRank(c) === 0).length;
   const pending = checks.filter((c) => conclusionRank(c) === 2).length;
   const success = checks.filter((c) => conclusionRank(c) === SUCCESS_RANK).length;
@@ -198,7 +215,7 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
     ];
     const summary = oneLine(output(c).summary, 500);
     if (conclusionRank(c) !== SUCCESS_RANK && summary) lines.push(`  summary: ${summary}`);
-    return { annotations: 0, annotationsBehind: 0, lines };
+    return { lines };
   };
   const failingRows = checks.filter((c) => conclusionRank(c) !== SUCCESS_RANK).map(rowFor);
   const successRows = checks.filter((c) => conclusionRank(c) === SUCCESS_RANK).map(rowFor);
@@ -213,33 +230,37 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   const annotated = annotatedAll.slice(0, Math.max(0, limits.maxAnnotationChecks));
   const notFetched = annotatedAll.length - annotated.length;
 
-  const blocks: Item[] = [];
+  const blocks: AnnotationBlock[] = [];
   for (const c of annotated) {
-    const lines = [`### ${name(c)} (${label(c)})`];
+    const heading = `### ${name(c)} (${label(c)})`;
     const res = ghJson<unknown>(gh, [
       'api',
       `repos/${repoSlug}/check-runs/${oneLine(c.id, 40)}/annotations?per_page=50`,
     ]);
     if (!res.ok || !Array.isArray(res.value)) {
-      lines.push(`- annotations unavailable: ${res.ok ? UNEXPECTED_SHAPE : safe(oneLine(res.error, 200))}`);
-      blocks.push({ annotations: 0, annotationsBehind: 0, lines });
+      const why = res.ok ? UNEXPECTED_SHAPE : safe(oneLine(res.error, 200));
+      blocks.push({ heading, knownTotal: 0, note: `- annotations unavailable: ${why}`, units: [] });
       continue;
     }
     const all = asArray<Annotation>(res.value);
-    const shown = all.slice(0, Math.max(0, limits.maxAnnotationsPerCheck));
-    // The response itself is per_page-capped, so its length is a FLOOR on how many exist; the
-    // check's own annotations_count is the real denominator.
-    const behind = Math.max(0, Math.max(annotationsCount(c), all.length) - shown.length);
-    for (const raw of shown) {
+    const fetched = all.slice(0, Math.max(0, limits.maxAnnotationsPerCheck));
+    const units = fetched.map((raw) => {
       const a = asRecord(raw);
       const title = oneLine(a.title, 120);
       const where = `[${oneLine(a.annotation_level, 40) || 'note'}] ${oneLine(a.path, 300)}:${oneLine(a.start_line, 20)}`;
-      lines.push(`- ${where}${title && title !== name(c) ? ` — ${title}` : ''} — ${oneLine(a.message, 600)}`);
+      const unit = [`- ${where}${title && title !== name(c) ? ` — ${title}` : ''} — ${oneLine(a.message, 600)}`];
       const details = oneLine(a.raw_details, 300);
-      if (details) lines.push(`  details: ${details}`);
-    }
-    if (behind > 0) lines.push(`… ${behind} more annotation(s) not shown`);
-    blocks.push({ annotations: shown.length, annotationsBehind: behind, lines });
+      if (details) unit.push(`  details: ${details}`);
+      return unit;
+    });
+    // The response itself is per_page-capped, so its length is a FLOOR on how many exist; the
+    // check's own annotations_count is the real denominator.
+    blocks.push({
+      heading,
+      knownTotal: Math.max(annotationsCount(c), all.length),
+      note: '',
+      units,
+    });
   }
 
   // ── Commit statuses (legacy API — bots post here) ───────────────────────────────────
@@ -250,8 +271,6 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
     const desc = oneLine(s.description, 200);
     const url = oneLine(s.target_url, 300);
     return {
-      annotations: 0,
-      annotationsBehind: 0,
       lines: [
         `- ${oneLine(s.state, 40) || 'unknown'} · ${oneLine(s.context, 200) || '(unnamed status)'}${desc ? ` — ${desc}` : ''}${url ? ` (${url})` : ''}`,
       ],
@@ -273,11 +292,12 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   const headerLine = (annotations: number): string =>
     `Check runs: ${checks.length} total · ${failed} failed · ${success} success · ${pending} pending · ${annotations} annotation(s) shown`;
   const notFetchedLine = `… ${notFetched} annotated check(s) not fetched (cap: maxAnnotationChecks)`;
-  // Charged up front: the header (at its longest — every block kept) and every heading/note
-  // that is always rendered. Only what is left over is up for selection.
+  const moreAnnotations = (n: number): string => `… ${n} more annotation(s) not shown`;
+  // Charged up front: the header (at its longest — every fetched annotation kept) and every
+  // heading/note that is always rendered. Only what is left over is up for selection.
   let used = cost([
     `Head commit: ${headSha}`,
-    headerLine(blocks.reduce((n, b) => n + b.annotations, 0)),
+    headerLine(blocks.reduce((n, b) => n + b.units.length, 0)),
     '',
     '## Check runs',
     ...(checkRunsNote ? [checkRunsNote] : []),
@@ -289,9 +309,11 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
     '## Commit statuses',
     ...(statusNote ? [statusNote] : []),
   ]);
-  // What is left after the always-rendered scaffolding and the reserve. If even that scaffolding
-  // overruns `maxChars` (a budget smaller than a header) nothing is admitted — the caller's cap
-  // is a budget for evidence, not a licence to render a document with no head.
+  // What is left after the always-rendered scaffolding and the reserve. Below roughly 408 chars
+  // (the scaffolding of a typical commit — two header lines, three section headings, a cap note
+  // — plus its three omission lines) nothing is admitted and the text is the scaffolding alone,
+  // which can itself exceed the cap: the caller's budget is a budget for EVIDENCE, not a licence
+  // to render a document with no head.
   const budget = limits.maxChars - OMISSION_LINE_RESERVE * OMISSION_LINE_KINDS;
   // Greedy, in priority order: each call spends from the shared `used` running total.
   const keep = (items: Item[]): Item[] =>
@@ -300,21 +322,46 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
       used += cost(item.lines);
       return true;
     });
-  const keptBlocks = keep(blocks);
+  // Blocks come first, and a block too big to afford WHOLE is admitted for as many of its
+  // annotations as fit: its heading and its own `… N more …` line are charged first (at their
+  // worst — nothing shown), then units, each kept with its `details:` line. A block that cannot
+  // even afford its heading plus its first annotation is dropped and counted — a heading over
+  // nothing is not evidence, and the count is the trace it leaves.
+  const keptBlocks: { block: AnnotationBlock; shown: number }[] = [];
+  let blocksDropped = 0;
+  for (const block of blocks) {
+    const base = cost([
+      block.heading,
+      ...(block.note ? [block.note] : []),
+      ...(block.knownTotal > 0 ? [moreAnnotations(block.knownTotal)] : []),
+    ]);
+    const first = block.units.length > 0 ? cost(block.units[0]) : 0;
+    if (used + base + first > budget) {
+      blocksDropped += 1;
+      continue;
+    }
+    used += base;
+    let shown = 0;
+    for (const unit of block.units) {
+      if (used + cost(unit) > budget) break;
+      used += cost(unit);
+      shown += 1;
+    }
+    keptBlocks.push({ block, shown });
+  }
   const keptFailing = keep(failingRows);
   const keptStatuses = keep(statusRows);
   const keptSuccess = keep(successRows);
 
-  const kept = new Set(keptBlocks);
-  const droppedAnnotations = blocks
-    .filter((b) => !kept.has(b))
-    .reduce((n, b) => n + b.annotations + b.annotationsBehind, 0);
   const omittedChecks = failingRows.length + successRows.length - keptFailing.length - keptSuccess.length;
   const omittedStatuses = statusRows.length - keptStatuses.length;
-  const shownAnnotations = keptBlocks.reduce((n, b) => n + b.annotations, 0);
-  const behindShown = keptBlocks.reduce((n, b) => n + b.annotationsBehind, 0);
+  const shownAnnotations = keptBlocks.reduce((n, k) => n + k.shown, 0);
   const truncated =
-    notFetched > 0 || behindShown > 0 || droppedAnnotations > 0 || omittedChecks > 0 || omittedStatuses > 0;
+    notFetched > 0 ||
+    blocksDropped > 0 ||
+    omittedChecks > 0 ||
+    omittedStatuses > 0 ||
+    keptBlocks.some((k) => k.block.knownTotal > k.shown);
 
   const text = [
     `Head commit: ${headSha}`,
@@ -327,9 +374,14 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
     ...(omittedChecks > 0 ? [`… ${omittedChecks} more check run(s) not shown`] : []),
     '',
     ANNOTATIONS_HEADING,
-    ...keptBlocks.flatMap((i) => i.lines),
+    ...keptBlocks.flatMap(({ block, shown }) => [
+      block.heading,
+      ...(block.note ? [block.note] : []),
+      ...block.units.slice(0, shown).flat(),
+      ...(block.knownTotal - shown > 0 ? [moreAnnotations(block.knownTotal - shown)] : []),
+    ]),
     ...(notFetched > 0 ? [notFetchedLine] : []),
-    ...(droppedAnnotations > 0 ? [`… ${droppedAnnotations} more annotation(s) not shown`] : []),
+    ...(blocksDropped > 0 ? [`… ${blocksDropped} annotated check(s) not shown`] : []),
     ...(blocks.length === 0 && notFetched === 0 ? ['(no annotations)'] : []),
     '',
     '## Commit statuses',

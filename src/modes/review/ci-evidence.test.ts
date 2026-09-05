@@ -426,3 +426,84 @@ describe('fetchCiEvidence — gh calls and how each failure degrades', () => {
     expect(res.text.indexOf('novel')).toBeLessThan(res.text.indexOf('aaa-sorts-first'));
   });
 });
+
+// A check run is whatever came back in the array — including nothing at all. And a budget is a
+// budget for EVIDENCE: a check that annotates verbosely must lose the tail of its annotations,
+// never the whole block, and a block that could not be shown at all must leave a trace.
+describe('fetchCiEvidence — junk elements and blocks too big to admit whole', () => {
+  it('drops non-object elements inside check_runs instead of dereferencing them', () => {
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+        check_runs: [
+          null,
+          'nope',
+          5,
+          {
+            conclusion: 'failure',
+            id: 501,
+            name: 'real-check',
+            output: { annotations_count: 0, summary: 'the only real element', title: null },
+            status: 'completed',
+          },
+        ],
+      },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.checks).toBe(1);
+    expect(res.failed).toBe(1);
+    expect(res.text).toContain('real-check');
+    expect(res.text).toContain('the only real element');
+    // One check row and one status row — the three junk elements render nothing.
+    expect((res.text.match(/^- /gm) ?? []).length).toBe(2);
+  });
+
+  it('admits a verbose check\'s block PARTIALLY rather than losing every annotation it has', () => {
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+        check_runs: [
+          {
+            conclusion: 'failure',
+            id: 601,
+            name: 'verbose',
+            output: { annotations_count: 15, summary: null, title: null },
+            status: 'completed',
+          },
+        ],
+      },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+      // 15 annotations at the module's own per-annotation caps: 600-char message, 300-char
+      // details. The whole block is ~14 KB — more than the DEFAULT maxChars on its own.
+      [`api repos/${SLUG}/check-runs/601/annotations`]: Array.from({ length: 15 }, (_, i) => ({
+        annotation_level: 'failure',
+        message: `annotation ${i + 1}: ${'x'.repeat(600)}`,
+        path: 'src/verbose.ts',
+        raw_details: 'y'.repeat(300),
+        start_line: i + 1,
+      })),
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    const rendered = (res.text.match(/^- \[failure\] src\/verbose\.ts:\d+/gm) ?? []).length;
+    expect(rendered).toBeGreaterThanOrEqual(10);
+    expect(rendered).toBeLessThan(15);
+    expect(res.text.length).toBeLessThanOrEqual(14_000);
+    expect(res.annotations).toBe(rendered);
+    // The remainder folds into this check's own line, counted off its true total.
+    expect(res.text).toContain(`… ${15 - rendered} more annotation(s) not shown`);
+    expect(res.truncated).toBe(true);
+  });
+
+  it('leaves a trace when a block cannot be admitted at all, even an unavailable one', () => {
+    const gh = fakeGh({ ...happy, [`api repos/${SLUG}/check-runs/102/annotations`]: 'ERR:HTTP 500' });
+    const res = fetchCiEvidence({ gh, headSha: SHA, limits: { maxChars: 400 }, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('1 annotated check(s) not shown');
+    expect(res.text).not.toContain('annotations unavailable');
+    expect(res.truncated).toBe(true);
+  });
+});
