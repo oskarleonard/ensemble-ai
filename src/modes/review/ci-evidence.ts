@@ -192,6 +192,10 @@ const httpUrl = (v: unknown, max: number): string => {
   if (!HTTP_SCHEME.test(bare)) return '';
   // The authority is everything up to the first `/` after the scheme; an `@` in it is userinfo.
   if (bare.replace(HTTP_SCHEME, '').split('/')[0].includes('@')) return '';
+  // Scanned on the whitespace-collapsed FULL string before the cap, same rule as field(): a slice
+  // through a token here would leave an unrecognisable prefix the whole-text scan at the end
+  // could not catch either. A hit is disposed of exactly like a userinfo URL: the whole value.
+  if (scanTextForSecrets(bare.replace(/\s+/g, ' '), CI_OUTPUT_PATTERNS)) return '';
   return oneLine(bare, max);
 };
 
@@ -251,11 +255,17 @@ interface AnnotationBlock {
 const cost = (lines: readonly string[]): number => lines.reduce((n, l) => n + l.length + 1, 0);
 
 // Room held back so the bookkeeping lines the selection itself causes still fit inside
-// `maxChars` — five section-level ones (check runs not shown, check runs the API page cap left
-// unfetched, annotated checks not shown, statuses not shown, statuses the API page cap left
-// unfetched). A block's own `… N more annotation(s) …` line is charged to the block. The reserve
-// is a POOL, not a per-line allowance: the two `… N … dropped (unexpected element shape)` traces
-// are short and fit inside it alongside the rest.
+// `maxChars` — a POOL, not a per-line allowance, that funds all SEVEN of them: check runs not
+// shown, check runs not fetched (API page cap), check runs dropped (unexpected element shape),
+// annotated checks not shown, statuses not shown, statuses not fetched (API page cap), and
+// statuses dropped (unexpected element shape). A block's own `… N more annotation(s) …` line is
+// charged to the block instead, never to this reserve.
+//
+// `OMISSION_LINE_KINDS` stays 5, not 7 — it was never a one-line-per-kind allowance, and widening
+// it is unnecessary: the fixed text of all seven lines together is ~276 chars against this
+// 80 × 5 = 400-char pool, leaving ~124 chars of headroom for every count's digits combined — a
+// proven worst case of ≤304 chars even with every count at 4 digits (the realistic ceiling; the
+// two API-supplied counts are bounded further by the page size). The reserve cannot be exceeded.
 const OMISSION_LINE_RESERVE = 80;
 const OMISSION_LINE_KINDS = 5;
 
@@ -315,11 +325,14 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   // payload is whatever `gh` returned, so a missing, non-finite, or under-counting field is
   // ignored rather than believed.
   const rawTotal = asRecord(runs.value).total_count;
+  // Measured against the RAW element count, not the post-`isRecord` `checks.length`: the page cap
+  // counts what the page held back, junk elements or not, so a junk element already charged to
+  // `checksDropped` below is never ALSO charged here as unfetched.
   const totalChecks =
-    typeof rawTotal === 'number' && Number.isFinite(rawTotal) && rawTotal > checks.length
+    typeof rawTotal === 'number' && Number.isFinite(rawTotal) && rawTotal > checkElements.length
       ? rawTotal
-      : checks.length;
-  const checksNotFetched = totalChecks - checks.length;
+      : checkElements.length;
+  const checksNotFetched = totalChecks - checkElements.length;
   // The buckets are the RANKS, and every fetched check lands in exactly one of them — so they sum
   // to `checks.length`. Without the inconclusive bucket a cancelled/skipped/neutral/stale check
   // (and every conclusion GitHub adds after this was written) vanished from the tally, and a
@@ -452,13 +465,15 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
     });
   const statusesDropped = statusElements.length - statusRows.length;
   const rawStatusTotal = st.ok ? asRecord(st.value).total_count : undefined;
+  // Same rule as the check runs' page cap above: measured against the RAW element count so a junk
+  // element is charged once, to `statusesDropped`, never also to "not fetched (API page cap)".
   const totalStatuses =
     typeof rawStatusTotal === 'number' &&
     Number.isFinite(rawStatusTotal) &&
-    rawStatusTotal > statusRows.length
+    rawStatusTotal > statusElements.length
       ? rawStatusTotal
-      : statusRows.length;
-  const statusesNotFetched = totalStatuses - statusRows.length;
+      : statusElements.length;
+  const statusesNotFetched = totalStatuses - statusElements.length;
   const statusesNotFetchedLine = `… ${statusesNotFetched} status(es) not fetched (API page cap)`;
   const statusesDroppedLine = `… ${statusesDropped} status(es) dropped (unexpected element shape)`;
   const statusNote = !st.ok

@@ -2261,6 +2261,7 @@ var httpUrl = (v, max) => {
   const bare = (typeof v === "string" ? v : "").trim().split(/[?#]/)[0];
   if (!HTTP_SCHEME.test(bare)) return "";
   if (bare.replace(HTTP_SCHEME, "").split("/")[0].includes("@")) return "";
+  if (scanTextForSecrets(bare.replace(/\s+/g, " "), CI_OUTPUT_PATTERNS)) return "";
   return oneLine(bare, max);
 };
 var field = (v, max) => {
@@ -2307,8 +2308,8 @@ function fetchCiEvidence(input) {
     (a, b) => conclusionRank(a) - conclusionRank(b) || name(a).localeCompare(name(b), "en")
   );
   const rawTotal = asRecord2(runs.value).total_count;
-  const totalChecks = typeof rawTotal === "number" && Number.isFinite(rawTotal) && rawTotal > checks.length ? rawTotal : checks.length;
-  const checksNotFetched = totalChecks - checks.length;
+  const totalChecks = typeof rawTotal === "number" && Number.isFinite(rawTotal) && rawTotal > checkElements.length ? rawTotal : checkElements.length;
+  const checksNotFetched = totalChecks - checkElements.length;
   const failed = checks.filter((c) => conclusionRank(c) === 0).length;
   const inconclusive = checks.filter((c) => conclusionRank(c) === INCONCLUSIVE_RANK).length;
   const pending = checks.filter((c) => conclusionRank(c) === 2).length;
@@ -2392,8 +2393,8 @@ function fetchCiEvidence(input) {
   });
   const statusesDropped = statusElements.length - statusRows.length;
   const rawStatusTotal = st.ok ? asRecord2(st.value).total_count : void 0;
-  const totalStatuses = typeof rawStatusTotal === "number" && Number.isFinite(rawStatusTotal) && rawStatusTotal > statusRows.length ? rawStatusTotal : statusRows.length;
-  const statusesNotFetched = totalStatuses - statusRows.length;
+  const totalStatuses = typeof rawStatusTotal === "number" && Number.isFinite(rawStatusTotal) && rawStatusTotal > statusElements.length ? rawStatusTotal : statusElements.length;
+  const statusesNotFetched = totalStatuses - statusElements.length;
   const statusesNotFetchedLine = `\u2026 ${statusesNotFetched} status(es) not fetched (API page cap)`;
   const statusesDroppedLine = `\u2026 ${statusesDropped} status(es) dropped (unexpected element shape)`;
   const statusNote = !st.ok ? `(statuses unavailable: ${field(st.error, 200)})` : !statusesShaped || statusRows.length === 0 && statusesDropped > 0 ? `(statuses unavailable: ${UNEXPECTED_SHAPE})` : statusRows.length === 0 ? "(none)" : "";

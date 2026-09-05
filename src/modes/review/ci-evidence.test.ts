@@ -166,7 +166,11 @@ describe('fetchCiEvidence — the head commit\'s checks as DATA', () => {
   // THE SECOND NET. Every untrusted FIELD is scanned (and redacted) before truncation, so the
   // whole-text scan exists for the bytes no field owns — here a credential in a URL PATH, which
   // survives the query-string strip and is rendered verbatim as the human's pointer.
-  it('WITHHOLDS the whole section when an inline credential pattern appears in check output', () => {
+  // Gate-3 fix review, Finding 1: httpUrl now scans BEFORE the cap too, so a credential in a
+  // `details_url` — the one field the earlier scan-before-truncate pass (G4) did not enumerate —
+  // is caught there and the URL is DROPPED, the same disposal a userinfo URL already gets. It no
+  // longer needs the whole-text second net to catch it, so the check itself still renders.
+  it('drops a details_url that carries a credential, rather than reaching the second net', () => {
     const leaky = {
       ...happy,
       [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
@@ -183,12 +187,11 @@ describe('fetchCiEvidence — the head commit\'s checks as DATA', () => {
       },
     };
     const res = fetchCiEvidence({ gh: fakeGh(leaky), headSha: SHA, pr: 7, repoSlug: SLUG });
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.error).toContain('withheld');
-      expect(res.error).toContain('github-token');
-      expect(res.error).not.toContain('ghp_');
-    }
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('lint');
+    expect(res.text).not.toContain('ghp_');
+    expect(res.text).not.toContain('https://ci.example/run/');
   });
 
   // …and a credential inside a FIELD costs that field, not the whole section: the redaction is
@@ -1076,6 +1079,28 @@ describe('fetchCiEvidence — junk elements are traced, never read as "nothing r
     expect(b.text).not.toContain('- unknown · (unnamed status)');
     expect(b.truncated).toBe(true);
   });
+
+  // A page that held EVERYTHING (`total_count` matches the raw element count) must not also be
+  // read as a page the cap cut short: the junk element is counted once, as a drop, never twice.
+  it('a page that held everything, with one junk element, is a drop — not ALSO a page-cap miss', () => {
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: { check_runs: [] },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: {
+        state: 'success',
+        statuses: [
+          { context: 'review-bot', description: 'ok', state: 'success' },
+          null,
+          { context: 'other-bot', description: 'ok', state: 'success' },
+        ],
+        total_count: 3,
+      },
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).not.toContain('status(es) not fetched (API page cap)');
+    expect(res.text).toContain('… 1 status(es) dropped (unexpected element shape)');
+  });
 });
 
 // SCAN BEFORE TRUNCATION. Slicing first leaves a PREFIX of a live credential that no pattern
@@ -1138,6 +1163,37 @@ describe('fetchCiEvidence — a field is scanned whole, then truncated', () => {
       expect(res.text).toContain('eslint exited 1: 3 problems');
     });
   }
+});
+
+// The URL is the one field that used to reach `oneLine` (slice-then-render) without going through
+// `field()`'s scan-before-truncate rule — so a credential past the cap's edge was sliced away
+// UNSCANNED, and the whole-text scan at the end then saw only a harmless-looking prefix.
+describe('fetchCiEvidence — a URL is scanned whole, then truncated (the same rule as field())', () => {
+  it('drops a details_url whose credential the 300-char cap would otherwise slice away unscanned', () => {
+    const url = `https://ci.example.com/run/${'x'.repeat(280)}/ghp_${'A'.repeat(36)}`;
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+        check_runs: [
+          {
+            conclusion: 'failure',
+            details_url: url,
+            id: 1501,
+            name: 'leaky-url',
+            output: { annotations_count: 0, summary: null, title: null },
+            status: 'completed',
+          },
+        ],
+      },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    // The check itself still renders — only its tainted URL is gone, not the whole section.
+    expect(res.text).toContain('leaky-url');
+    expect(res.text).not.toContain('ghp_');
+    expect(res.text).not.toContain('https://ci.example.com/run/xxx');
+  });
 });
 
 // A URL in this section is the human's pointer to the check page. `HTTPS://…` is the same address
