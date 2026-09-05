@@ -18,7 +18,9 @@ import type { GhRunner } from './stage';
 // UNAVAILABLE section and one stderr line. Nothing here throws.
 
 export interface CiEvidenceLimits {
-  // At most this many checks get their annotations fetched (failure/warning-bearing first).
+  // At most this many checks get their annotations fetched. The slots are shared round-robin
+  // between the non-green checks and the green ones (non-green first), so a cap never spends
+  // itself entirely on failures and leaves a passing job's annotations unread.
   maxAnnotationChecks: number;
   maxAnnotationsPerCheck: number;
   // Structural cap on the rendered text — the packet section's own budget is the last resort.
@@ -89,9 +91,11 @@ interface CommitStatus {
 const asArray = <T>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
 const isRecord = (v: unknown): boolean => typeof v === 'object' && v !== null && !Array.isArray(v);
 const asRecord = (v: unknown): Record<string, unknown> => (isRecord(v) ? (v as Record<string, unknown>) : {});
-const isArrayish = (v: unknown): boolean => v === undefined || v === null || Array.isArray(v);
 
 const UNEXPECTED_SHAPE = 'unexpected payload shape';
+
+// A commit id, and nothing else: sha1 (40 hex) or sha256 (64 hex).
+const COMMIT_SHA = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/i;
 
 // `gh <args>` → parsed JSON, or a named error. Never throws.
 function ghJson<T>(gh: GhRunner, args: string[]): { ok: true; value: T } | { error: string; ok: false } {
@@ -108,13 +112,14 @@ function ghJson<T>(gh: GhRunner, args: string[]): { ok: true; value: T } | { err
 // string `success` earns the green tier: a conclusion GitHub adds after this was written is
 // INCONCLUSIVE (tier 1), so it keeps its summary instead of being filed away as a passing job.
 const FAILED = new Set(['action_required', 'failure', 'startup_failure', 'timed_out']);
+const INCONCLUSIVE_RANK = 1;
 const SUCCESS_RANK = 3;
 function conclusionRank(c: CheckRun): number {
   const conclusion = typeof c.conclusion === 'string' ? c.conclusion : null;
   if (conclusion && FAILED.has(conclusion)) return 0;
   if (conclusion === 'success') return SUCCESS_RANK;
   if (!conclusion) return 2;
-  return 1;
+  return INCONCLUSIVE_RANK;
 }
 
 // Any JSON value → one trimmed, length-capped line. Only the JSON SCALARS render: `String(v)` on
@@ -126,6 +131,15 @@ const oneLine = (v: unknown, max: number): string =>
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, max);
+
+// A URL is rendered only when it IS one: an http(s) address, with its query string and fragment
+// dropped. A check's `details_url` is a pointer for the human reading the review, and the payload
+// is whatever `gh` returned — a `javascript:`/`data:` scheme is not a check page, and a query
+// string on a CI link routinely carries a signed token nobody needs in the packet.
+const httpUrl = (v: unknown, max: number): string => {
+  const bare = (typeof v === 'string' ? v : '').trim().split(/[?#]/)[0];
+  return bare.startsWith('http://') || bare.startsWith('https://') ? oneLine(bare, max) : '';
+};
 
 const label = (c: CheckRun): string =>
   oneLine(c.conclusion ?? c.status ?? 'unknown', 40).toLowerCase() || 'unknown';
@@ -192,10 +206,25 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
     }
     headSha = oid;
   }
+  // The head SHA is interpolated into `gh api` PATHS (check-runs, /status) and it arrives either
+  // from the caller or from a payload — so it is admitted only as what a commit id is: 40 hex
+  // (sha1) or 64 hex (sha256). Anything else is junk or a path fragment, and neither is a commit
+  // to ask the API about. Rejected HERE, before the first call that interpolates it.
+  if (!COMMIT_SHA.test(headSha)) {
+    return { error: 'head SHA rejected: not a 40/64-hex commit SHA', ok: false };
+  }
+  // Whether the caller PINNED the head or we resolved it just now. The difference is the
+  // reviewer's to know, not ours to hide — see the head line below.
+  const headResolved = !input.headSha;
 
   const runs = ghJson<unknown>(gh, ['api', `repos/${repoSlug}/commits/${headSha}/check-runs?per_page=100`]);
   if (!runs.ok) return { error: `check runs unavailable: ${safe(oneLine(runs.error, 200))}`, ok: false };
   const rawChecks = asRecord(runs.value).check_runs;
+  // `check_runs` is an ARRAY or it is not the payload this module was told to read. A non-object
+  // top level, a missing field, a `null` — each is a shape to REPORT, never "no check runs on
+  // this commit": that sentence is a claim about the commit's CI, and reading it out of a payload
+  // we did not understand is exactly the false green this section exists to prevent.
+  const checkRunsShaped = Array.isArray(rawChecks);
   // A non-object ELEMENT (`null`, a string, a number) carries no evidence and every accessor
   // below would dereference it — drop it here, where the array is first read.
   const checks = asArray<CheckRun>(rawChecks)
@@ -217,7 +246,12 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
       ? rawTotal
       : checks.length;
   const checksNotFetched = totalChecks - checks.length;
+  // The buckets are the RANKS, and every fetched check lands in exactly one of them — so they sum
+  // to `checks.length`. Without the inconclusive bucket a cancelled/skipped/neutral/stale check
+  // (and every conclusion GitHub adds after this was written) vanished from the tally, and a
+  // reviewer subtracting failed+success+pending from the total read the remainder as nothing.
   const failed = checks.filter((c) => conclusionRank(c) === 0).length;
+  const inconclusive = checks.filter((c) => conclusionRank(c) === INCONCLUSIVE_RANK).length;
   const pending = checks.filter((c) => conclusionRank(c) === 2).length;
   const success = checks.filter((c) => conclusionRank(c) === SUCCESS_RANK).length;
 
@@ -225,25 +259,42 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   const rowFor = (c: CheckRun): Item => {
     const app = oneLine(asRecord(c.app).slug, 60);
     const title = oneLine(output(c).title, 120);
-    const url = oneLine(c.details_url, 300);
+    const url = httpUrl(c.details_url, 300);
     const lines = [
       `- ${label(c)} · ${name(c)}${app ? ` (${app})` : ''}${title ? ` — ${title}` : ''}${url ? ` — ${url}` : ''}`,
     ];
+    // A GREEN job's summary is evidence too (incident 2026-08-10: the migration the database
+    // refused was printed in a passing job's own output). Green rows are still admitted LAST
+    // under `maxChars`, so this line only ever costs the budget when there was room left.
     const summary = oneLine(output(c).summary, 500);
-    if (conclusionRank(c) !== SUCCESS_RANK && summary) lines.push(`  summary: ${summary}`);
+    if (summary) lines.push(`  summary: ${summary}`);
     return { lines };
   };
   const failingRows = checks.filter((c) => conclusionRank(c) !== SUCCESS_RANK).map(rowFor);
   const successRows = checks.filter((c) => conclusionRank(c) === SUCCESS_RANK).map(rowFor);
-  const checkRunsNote = !isArrayish(rawChecks)
+  const checkRunsNote = !checkRunsShaped
     ? `(check runs unavailable: ${UNEXPECTED_SHAPE})`
     : checks.length === 0
       ? '(no check runs on this commit)'
       : '';
 
-  // ── Annotations (failure/warning-bearing checks first) ──────────────────────────────
+  // ── Annotations (non-green and green checks INTERLEAVED, non-green first) ───────────
+  // The cap used to be a plain head-slice of the rank order, which handed every slot to the
+  // failing checks and left the green ones unfetched — and a green job's annotation is the exact
+  // evidence this module exists for (incident 2026-08-10). So the slots are shared: one non-green,
+  // one green, one non-green, … each side in its own rank/name order, non-green taking the odd
+  // slot when the sides are uneven. Whatever the cap is, both kinds get through it.
   const annotatedAll = checks.filter((c) => annotationsCount(c) > 0);
-  const annotated = annotatedAll.slice(0, Math.max(0, limits.maxAnnotationChecks));
+  const annotatedOther = annotatedAll.filter((c) => conclusionRank(c) !== SUCCESS_RANK);
+  const annotatedGreen = annotatedAll.filter((c) => conclusionRank(c) === SUCCESS_RANK);
+  const annotationChecks = Math.max(0, limits.maxAnnotationChecks);
+  const annotated: CheckRun[] = [];
+  for (let i = 0; i < Math.max(annotatedOther.length, annotatedGreen.length); i += 1) {
+    if (annotated.length >= annotationChecks) break;
+    if (i < annotatedOther.length) annotated.push(annotatedOther[i]);
+    if (annotated.length >= annotationChecks) break;
+    if (i < annotatedGreen.length) annotated.push(annotatedGreen[i]);
+  }
   const notFetched = annotatedAll.length - annotated.length;
 
   const blocks: AnnotationBlock[] = [];
@@ -293,10 +344,13 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   // ── Commit statuses (legacy API — bots post here) ───────────────────────────────────
   const st = ghJson<unknown>(gh, ['api', `repos/${repoSlug}/commits/${headSha}/status`]);
   const rawStatuses = st.ok ? asRecord(st.value).statuses : undefined;
+  // Same rule as `check_runs`: an array, or a shape to report. `(none)` is a claim that this
+  // commit has no statuses — only a real empty array earns it.
+  const statusesShaped = Array.isArray(rawStatuses);
   const statusRows: Item[] = asArray<CommitStatus>(rawStatuses).map((raw) => {
     const s = asRecord(raw);
     const desc = oneLine(s.description, 200);
-    const url = oneLine(s.target_url, 300);
+    const url = httpUrl(s.target_url, 300);
     return {
       lines: [
         `- ${oneLine(s.state, 40) || 'unknown'} · ${oneLine(s.context, 200) || '(unnamed status)'}${desc ? ` — ${desc}` : ''}${url ? ` (${url})` : ''}`,
@@ -305,7 +359,7 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   });
   const statusNote = !st.ok
     ? `(statuses unavailable: ${safe(oneLine(st.error, 200))})`
-    : !isArrayish(rawStatuses)
+    : !statusesShaped
       ? `(statuses unavailable: ${UNEXPECTED_SHAPE})`
       : statusRows.length === 0
         ? '(none)'
@@ -317,15 +371,23 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
   // (incident 2026-08-10). So each item is admitted on what it is WORTH: annotation blocks,
   // then the checks that failed, then the statuses, then the green rows.
   // `total` is only honest when the page held everything; otherwise the header says which it is.
+  //
+  // HEAD IDENTITY. A pinned head came from the caller and provably names the reviewed bytes. A
+  // RESOLVED one was read off the PR at gather time — and `gh pr diff` carries no commit identity,
+  // so a push between the diff and this call makes the checks below describe a different tree.
+  // The seat cannot tell those apart from the SHA alone, so the line says which it is.
+  const headLine = headResolved
+    ? `Head commit: ${headSha} (resolved when the evidence was gathered — the reviewed diff carries no commit identity, so a push in between can make them differ)`
+    : `Head commit: ${headSha}`;
   const headerLine = (annotations: number): string =>
-    `Check runs: ${checksNotFetched > 0 ? `${checks.length} fetched of ${totalChecks}` : `${checks.length} total`} · ${failed} failed · ${success} success · ${pending} pending · ${annotations} annotation(s) shown`;
+    `Check runs: ${checksNotFetched > 0 ? `${checks.length} fetched of ${totalChecks}` : `${checks.length} total`} · ${failed} failed · ${inconclusive} inconclusive · ${success} success · ${pending} pending · ${annotations} annotation(s) shown`;
   const checksNotFetchedLine = `… ${checksNotFetched} check run(s) not fetched (API page cap)`;
   const notFetchedLine = `… ${notFetched} annotated check(s) not fetched (cap: maxAnnotationChecks)`;
   const moreAnnotations = (n: number): string => `… ${n} more annotation(s) not shown`;
   // Charged up front: the header (at its longest — every fetched annotation kept) and every
   // heading/note that is always rendered. Only what is left over is up for selection.
   let used = cost([
-    `Head commit: ${headSha}`,
+    headLine,
     headerLine(blocks.reduce((n, b) => n + b.units.length, 0)),
     '',
     '## Check runs',
@@ -396,7 +458,7 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
     keptBlocks.some((k) => k.block.knownTotal > k.shown);
 
   const text = [
-    `Head commit: ${headSha}`,
+    headLine,
     headerLine(shownAnnotations),
     '',
     '## Check runs',

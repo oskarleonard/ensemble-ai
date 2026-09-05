@@ -131,12 +131,14 @@ describe('fetchCiEvidence — the head commit\'s checks as DATA', () => {
     expect(res.failed).toBe(1);
     expect(res.annotations).toBe(1);
     expect(res.headSha).toBe(SHA);
-    // Failed check sorts first and carries its output summary; success rows carry none.
+    // Failed check sorts first and carries its output summary — and so does the GREEN row: a
+    // passing job's own summary is evidence too, it is just admitted last under the budget.
     const lint = res.text.indexOf('lint');
     const unit = res.text.indexOf('unit-tests');
     expect(lint).toBeGreaterThan(-1);
     expect(lint).toBeLessThan(unit);
     expect(res.text).toContain('eslint exited 1: 3 problems');
+    expect(res.text).toContain('summary: validation finished');
     // The incident 2026-08-10 shape: a SUCCESS job whose annotation text is an error.
     expect(res.text).toContain('[warning] db/migrations/0042_add_index.sql:1');
     expect(res.text).toContain('pq: functions in index predicate must be marked IMMUTABLE');
@@ -506,7 +508,13 @@ describe('fetchCiEvidence — gh calls and how each failure degrades', () => {
     expect(res.ok).toBe(true);
     if (!res.ok) return;
     expect(res.text).toContain('the new conclusion explains itself here');
-    expect(res.text).not.toContain('green summaries are noise');
+    // Green summaries ride along now, so the RANK is what this pins: the unrecognised conclusion
+    // is INCONCLUSIVE — counted in that bucket rather than as a pass, and rendered ahead of the
+    // success row (which sorts first alphabetically, so only the rank can put it second).
+    expect(res.text).toContain('· 0 failed · 1 inconclusive · 1 success · 0 pending ·');
+    expect(res.text.indexOf('the new conclusion explains itself here')).toBeLessThan(
+      res.text.indexOf('green summaries are noise')
+    );
     expect(res.text.indexOf('novel')).toBeLessThan(res.text.indexOf('aaa-sorts-first'));
   });
 });
@@ -635,5 +643,258 @@ describe('fetchCiEvidence — junk elements and blocks too big to admit whole', 
     expect(res.text).toContain('1 annotated check(s) not shown');
     expect(res.text).not.toContain('annotations unavailable');
     expect(res.truncated).toBe(true);
+  });
+});
+
+// THE HEAD SHA is interpolated into `gh api` PATHS and arrives either from the caller or from a
+// payload. So it is admitted only as what a commit id is — 40 hex (sha1) or 64 hex (sha256) —
+// and it is rejected BEFORE the first call that would carry it into a URL.
+describe('fetchCiEvidence — the head SHA is admitted only as a commit id', () => {
+  it('rejects a path-shaped head SHA before any gh api call interpolates it', () => {
+    const calls: string[] = [];
+    const res = fetchCiEvidence({ gh: fakeGh(happy, calls), headSha: '../../x', pr: 7, repoSlug: SLUG });
+    expect(res).toEqual({ error: 'head SHA rejected: not a 40/64-hex commit SHA', ok: false });
+    // The runner was never asked for the check runs OR the commit status — nothing at all.
+    expect(calls.some((c) => c.includes('check-runs'))).toBe(false);
+    expect(calls.some((c) => c.includes('/status'))).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it('rejects a non-hex headRefOid that `gh pr view` resolved, too', () => {
+    const calls: string[] = [];
+    const gh = fakeGh({ ...happy, [`pr view 7 -R ${SLUG} --json headRefOid`]: { headRefOid: 'not-a-sha' } }, calls);
+    const res = fetchCiEvidence({ gh, pr: 7, repoSlug: SLUG });
+    expect(res).toEqual({ error: 'head SHA rejected: not a 40/64-hex commit SHA', ok: false });
+    expect(calls).toEqual([`pr view 7 -R ${SLUG} --json headRefOid`]);
+  });
+
+  it('admits a 64-hex (sha256) commit id', () => {
+    const sha256 = 'b'.repeat(64);
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${sha256}/check-runs`]: { check_runs: [] },
+      [`api repos/${SLUG}/commits/${sha256}/status`]: STATUSES,
+    });
+    const res = fetchCiEvidence({ gh, headSha: sha256, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.headSha).toBe(sha256);
+  });
+});
+
+// THE TALLY. Every fetched check lands in exactly one rank, so the header's buckets must sum to
+// the fetched count. Without an `inconclusive` bucket a cancelled/skipped/neutral check simply
+// vanished from the header, and a reviewer subtracting the other three read the remainder as zero.
+describe('fetchCiEvidence — the header buckets sum to what was fetched', () => {
+  it('counts cancelled/skipped checks in an `inconclusive` bucket', () => {
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+        check_runs: [
+          { conclusion: 'skipped', id: 801, name: 'skip-me', output: { annotations_count: 0 }, status: 'completed' },
+          { conclusion: 'cancelled', id: 802, name: 'cancel-me', output: { annotations_count: 0 }, status: 'completed' },
+          { conclusion: 'failure', id: 803, name: 'lint', output: { annotations_count: 0 }, status: 'completed' },
+          { conclusion: 'success', id: 804, name: 'unit', output: { annotations_count: 0 }, status: 'completed' },
+          { conclusion: null, id: 805, name: 'running', output: { annotations_count: 0 }, status: 'in_progress' },
+        ],
+      },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain(
+      'Check runs: 5 total · 1 failed · 2 inconclusive · 1 success · 1 pending · 0 annotation(s) shown'
+    );
+    // …and the buckets are EXHAUSTIVE: they add up to the count the same header reports.
+    const nums = /· (\d+) failed · (\d+) inconclusive · (\d+) success · (\d+) pending ·/.exec(res.text);
+    expect(nums).not.toBeNull();
+    expect((nums ?? []).slice(1).reduce((n, s) => n + Number(s), 0)).toBe(res.checks);
+  });
+});
+
+// "(no check runs on this commit)" is a CLAIM ABOUT THE COMMIT'S CI, and a reviewer reads it as
+// "nothing ran". A payload this module did not understand is never allowed to make that claim —
+// only a real, empty array is.
+describe('fetchCiEvidence — an unreadable payload never claims the commit has no checks', () => {
+  const shapes: [string, unknown][] = [
+    ['a null top-level payload', null],
+    ['a top-level payload with no check_runs at all', {}],
+    ['a null check_runs', { check_runs: null }],
+    ['a string top-level payload', 'nope'],
+    ['an array top-level payload', [{ conclusion: 'failure', id: 1, name: 'x', status: 'completed' }]],
+  ];
+  for (const [what, payload] of shapes) {
+    it(`reports ${what} as an unexpected shape`, () => {
+      const gh = fakeGh({
+        [`api repos/${SLUG}/commits/${SHA}/check-runs`]: payload,
+        [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+      });
+      const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      expect(res.checks).toBe(0);
+      expect(res.text).toContain('(check runs unavailable: unexpected payload shape)');
+      expect(res.text).not.toContain('(no check runs on this commit)');
+    });
+  }
+
+  it('keeps "(no check runs on this commit)" for a REAL empty array', () => {
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: { check_runs: [] },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('(no check runs on this commit)');
+    expect(res.text).not.toContain('check runs unavailable');
+  });
+
+  it('holds statuses to the same rule — `(none)` is earned only by a real empty array', () => {
+    const cases: [unknown, string][] = [
+      [{ state: 'success' }, '(statuses unavailable: unexpected payload shape)'],
+      [{ state: 'success', statuses: null }, '(statuses unavailable: unexpected payload shape)'],
+      [null, '(statuses unavailable: unexpected payload shape)'],
+      [{ state: 'success', statuses: [] }, '(none)'],
+    ];
+    for (const [payload, expected] of cases) {
+      const gh = fakeGh({
+        [`api repos/${SLUG}/commits/${SHA}/check-runs`]: { check_runs: [] },
+        [`api repos/${SLUG}/commits/${SHA}/status`]: payload,
+      });
+      const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      expect(res.text).toContain(expected);
+    }
+  });
+});
+
+// HEAD IDENTITY. A pinned head came from the caller and names the reviewed bytes. A RESOLVED one
+// was read off the PR at gather time, and `gh pr diff` carries no commit identity — so a push
+// between the diff and this call makes the checks describe a different tree. The seat cannot tell
+// those apart from the SHA alone, so the line does.
+describe('fetchCiEvidence — the head line says whether the SHA was pinned or resolved', () => {
+  it('marks a head it resolved itself', () => {
+    const gh = fakeGh({ ...happy, [`pr view 7 -R ${SLUG} --json headRefOid`]: { headRefOid: SHA } });
+    const res = fetchCiEvidence({ gh, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text.split('\n')[0]).toBe(
+      `Head commit: ${SHA} (resolved when the evidence was gathered — the reviewed diff carries no commit identity, so a push in between can make them differ)`
+    );
+  });
+
+  it('leaves the line bare when the caller pinned the head', () => {
+    const res = fetchCiEvidence({ gh: fakeGh(happy), headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text.split('\n')[0]).toBe(`Head commit: ${SHA}`);
+  });
+});
+
+// THE CAP IS SHARED. A head-slice of the rank order spends every annotation slot on the failing
+// checks — and the green job's annotation is the exact evidence this module exists for (incident
+// 2026-08-10). So the slots interleave: one non-green, one green, non-green first.
+describe('fetchCiEvidence — green jobs keep their share of the annotation cap', () => {
+  function mixed(): Record<string, unknown> {
+    const responses: Record<string, unknown> = {
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+        check_runs: [
+          ...Array.from({ length: 8 }, (_, i) => ({
+            conclusion: 'failure',
+            id: 900 + i,
+            name: `failed-${i}`,
+            output: { annotations_count: 1, summary: null, title: null },
+            status: 'completed',
+          })),
+          ...Array.from({ length: 4 }, (_, i) => ({
+            conclusion: 'success',
+            id: 950 + i,
+            name: `green-${i}`,
+            output: { annotations_count: 1, summary: null, title: null },
+            status: 'completed',
+          })),
+        ],
+      },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+    };
+    for (let i = 0; i < 8; i += 1) {
+      responses[`api repos/${SLUG}/check-runs/${900 + i}/annotations`] = [
+        { annotation_level: 'failure', message: `failed job ${i} said no`, path: `src/f${i}.ts`, start_line: 1 },
+      ];
+    }
+    for (let i = 0; i < 4; i += 1) {
+      responses[`api repos/${SLUG}/check-runs/${950 + i}/annotations`] = [
+        { annotation_level: 'warning', message: `green job ${i} wrapped an error`, path: `src/g${i}.ts`, start_line: 1 },
+      ];
+    }
+    return responses;
+  }
+
+  it('fetches and renders EVERY green annotated check under a cap of 10, dropping failed ones', () => {
+    const calls: string[] = [];
+    const res = fetchCiEvidence({ gh: fakeGh(mixed(), calls), headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    // All four green checks were fetched AND rendered.
+    for (let i = 0; i < 4; i += 1) {
+      expect(calls).toContain(`api repos/${SLUG}/check-runs/${950 + i}/annotations?per_page=50`);
+      expect(res.text).toContain(`green job ${i} wrapped an error`);
+    }
+    // The cap still bought exactly 10 fetches, and 12 - 10 = 2 checks went unfetched…
+    expect(calls.filter((c) => c.includes('/annotations')).length).toBe(10);
+    expect(res.text).toContain('2 annotated check(s) not fetched (cap: maxAnnotationChecks)');
+    // …and the two that lost their slot are FAILED checks — the tail of the rank order.
+    for (let i = 0; i < 6; i += 1) expect(res.text).toContain(`failed job ${i} said no`);
+    expect(res.text).not.toContain('failed job 6 said no');
+    expect(res.text).not.toContain('failed job 7 said no');
+    expect(res.truncated).toBe(true);
+  });
+});
+
+// A URL in this section is the human's pointer to the check page — so it is rendered only when it
+// IS one. A `javascript:`/`data:` value is not a check page, and a CI link's query string
+// routinely carries a signed token that has no business in a packet handed to four vendors.
+describe('fetchCiEvidence — URLs render only as http(s), without query or fragment', () => {
+  it('strips ?query and #fragment, and omits a non-http scheme entirely', () => {
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+        check_runs: [
+          {
+            conclusion: 'failure',
+            details_url: 'https://ci.example.com/run/1?token=abc#x',
+            id: 1101,
+            name: 'has-a-url',
+            output: { annotations_count: 0, summary: null, title: null },
+            status: 'completed',
+          },
+          {
+            conclusion: 'failure',
+            details_url: 'javascript:alert(1)',
+            id: 1102,
+            name: 'has-a-scheme',
+            output: { annotations_count: 0, summary: null, title: null },
+            status: 'completed',
+          },
+        ],
+      },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: {
+        state: 'failure',
+        statuses: [
+          { context: 'bot', description: 'd', state: 'failure', target_url: 'https://bot.example/1?sig=deadbeef#frag' },
+        ],
+      },
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.text).toContain('https://ci.example.com/run/1');
+    expect(res.text).not.toContain('token=abc');
+    expect(res.text).not.toContain('#x');
+    // The check itself is still rendered — only its unusable URL is gone.
+    expect(res.text).toContain('has-a-scheme');
+    expect(res.text).not.toContain('javascript:');
+    expect(res.text).toContain('https://bot.example/1');
+    expect(res.text).not.toContain('sig=deadbeef');
+    expect(res.text).not.toContain('#frag');
   });
 });

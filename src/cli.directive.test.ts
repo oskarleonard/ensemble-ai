@@ -73,7 +73,7 @@ function scriptGh(): void {
     // under test, scripted by `prView`) and the CI-evidence gatherer's head resolution. Different
     // questions get different answers, so scripting one never silently answers the other.
     if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
-      return a.includes('headRefOid') ? JSON.stringify({ headRefOid: 'h'.repeat(40) }) : prView();
+      return a.includes('headRefOid') ? JSON.stringify({ headRefOid: 'a'.repeat(40) }) : prView();
     }
     // The CI-evidence gatherer's own calls — answered emptily: this file is about the directive.
     if (cmd === 'gh' && args[0] === 'repo' && args[1] === 'view') return 'o/r\n';

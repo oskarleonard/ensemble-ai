@@ -361,6 +361,16 @@ var SECURITY_CLASSES = [
 var KNOWN_CLASS_IDS = new Set(SECURITY_CLASSES.map((c) => c.id));
 
 // src/core/prompt.ts
+var CI_EVIDENCE_CLAUSE = [
+  'CI EVIDENCE: when the packet carries a "CI evidence" section, read it before you',
+  "judge whether the change builds, migrates, or passes its tests. A check\u2019s",
+  "conclusion is not the evidence \u2014 its annotations and output are. A WARNING or",
+  "NOTICE annotation whose text is an error (a failed command, a database/compiler/",
+  "linter error, a skipped or soft-failed step) is a DOWNGRADED FAILURE: treat it as a",
+  "finding candidate, locate the code in the diff that produced it, and quote what the",
+  "machine reported verbatim. A green job is not proof of correctness when its own",
+  "output contradicts it."
+].join("\n");
 var CODE_ASK = [
   "## Your task",
   "Find correctness bugs, security issues, broken conventions, and risky",
@@ -390,14 +400,7 @@ var CODE_ASK = [
   "consumers need no change, test that claim against the least-privileged caller,",
   "not the author/owner perspective.",
   "",
-  'CI EVIDENCE: when the packet carries a "CI evidence" section, read it before you',
-  "judge whether the change builds, migrates, or passes its tests. A check\u2019s",
-  "conclusion is not the evidence \u2014 its annotations and output are. A WARNING or",
-  "NOTICE annotation whose text is an error (a failed command, a database/compiler/",
-  "linter error, a skipped or soft-failed step) is a DOWNGRADED FAILURE: treat it as a",
-  "finding candidate, locate the code in the diff that produced it, and quote what the",
-  "machine reported verbatim. A green job is not proof of correctness when its own",
-  "output contradicts it."
+  CI_EVIDENCE_CLAUSE
 ].join("\n");
 function securityAsk() {
   const classes = SECURITY_CLASSES.filter((c) => c.id !== "other").map((c) => `  - [${c.id}] ${c.label}`).join("\n");
@@ -413,7 +416,9 @@ function securityAsk() {
     "and name the attack: the untrusted source, the sink, and the exploit. Prefer a",
     "few high-signal, exploitable findings over many theoretical ones \u2014 but do NOT",
     "stay silent on a real vulnerability to keep the list short. Pure code-quality",
-    "nits that are not security-relevant belong in a normal review, not here."
+    "nits that are not security-relevant belong in a normal review, not here.",
+    "",
+    CI_EVIDENCE_CLAUSE
   ].join("\n");
 }
 function renderReviewPrompt(packet, profile = "code") {

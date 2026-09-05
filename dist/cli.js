@@ -4144,8 +4144,8 @@ var CI_EVIDENCE_TRAIL_FILE = "ci-evidence.md";
 var asArray = (v) => Array.isArray(v) ? v : [];
 var isRecord = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var asRecord2 = (v) => isRecord(v) ? v : {};
-var isArrayish = (v) => v === void 0 || v === null || Array.isArray(v);
 var UNEXPECTED_SHAPE = "unexpected payload shape";
+var COMMIT_SHA = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/i;
 function ghJson(gh, args) {
   const res = gh(args);
   if (!res.ok) return { error: res.error, ok: false };
@@ -4156,15 +4156,20 @@ function ghJson(gh, args) {
   }
 }
 var FAILED = /* @__PURE__ */ new Set(["action_required", "failure", "startup_failure", "timed_out"]);
+var INCONCLUSIVE_RANK = 1;
 var SUCCESS_RANK = 3;
 function conclusionRank(c) {
   const conclusion = typeof c.conclusion === "string" ? c.conclusion : null;
   if (conclusion && FAILED.has(conclusion)) return 0;
   if (conclusion === "success") return SUCCESS_RANK;
   if (!conclusion) return 2;
-  return 1;
+  return INCONCLUSIVE_RANK;
 }
 var oneLine = (v, max) => (typeof v === "string" ? v : typeof v === "number" || typeof v === "boolean" ? String(v) : "").replace(/\s+/g, " ").trim().slice(0, max);
+var httpUrl = (v, max) => {
+  const bare = (typeof v === "string" ? v : "").trim().split(/[?#]/)[0];
+  return bare.startsWith("http://") || bare.startsWith("https://") ? oneLine(bare, max) : "";
+};
 var label = (c) => oneLine(c.conclusion ?? c.status ?? "unknown", 40).toLowerCase() || "unknown";
 var name = (c) => oneLine(c.name, 200) || "(unnamed check)";
 var output = (c) => asRecord2(c.output);
@@ -4193,9 +4198,14 @@ function fetchCiEvidence(input) {
     }
     headSha = oid;
   }
+  if (!COMMIT_SHA.test(headSha)) {
+    return { error: "head SHA rejected: not a 40/64-hex commit SHA", ok: false };
+  }
+  const headResolved = !input.headSha;
   const runs = ghJson(gh, ["api", `repos/${repoSlug}/commits/${headSha}/check-runs?per_page=100`]);
   if (!runs.ok) return { error: `check runs unavailable: ${safe(oneLine(runs.error, 200))}`, ok: false };
   const rawChecks = asRecord2(runs.value).check_runs;
+  const checkRunsShaped = Array.isArray(rawChecks);
   const checks = asArray(rawChecks).filter((c) => isRecord(c)).sort(
     // `localeCompare` with an explicit locale: the sort order of the evidence a reviewer
     // reads must not depend on the machine that gathered it.
@@ -4205,24 +4215,34 @@ function fetchCiEvidence(input) {
   const totalChecks = typeof rawTotal === "number" && Number.isFinite(rawTotal) && rawTotal > checks.length ? rawTotal : checks.length;
   const checksNotFetched = totalChecks - checks.length;
   const failed = checks.filter((c) => conclusionRank(c) === 0).length;
+  const inconclusive = checks.filter((c) => conclusionRank(c) === INCONCLUSIVE_RANK).length;
   const pending = checks.filter((c) => conclusionRank(c) === 2).length;
   const success = checks.filter((c) => conclusionRank(c) === SUCCESS_RANK).length;
   const rowFor = (c) => {
     const app = oneLine(asRecord2(c.app).slug, 60);
     const title = oneLine(output(c).title, 120);
-    const url = oneLine(c.details_url, 300);
+    const url = httpUrl(c.details_url, 300);
     const lines = [
       `- ${label(c)} \xB7 ${name(c)}${app ? ` (${app})` : ""}${title ? ` \u2014 ${title}` : ""}${url ? ` \u2014 ${url}` : ""}`
     ];
     const summary = oneLine(output(c).summary, 500);
-    if (conclusionRank(c) !== SUCCESS_RANK && summary) lines.push(`  summary: ${summary}`);
+    if (summary) lines.push(`  summary: ${summary}`);
     return { lines };
   };
   const failingRows = checks.filter((c) => conclusionRank(c) !== SUCCESS_RANK).map(rowFor);
   const successRows = checks.filter((c) => conclusionRank(c) === SUCCESS_RANK).map(rowFor);
-  const checkRunsNote = !isArrayish(rawChecks) ? `(check runs unavailable: ${UNEXPECTED_SHAPE})` : checks.length === 0 ? "(no check runs on this commit)" : "";
+  const checkRunsNote = !checkRunsShaped ? `(check runs unavailable: ${UNEXPECTED_SHAPE})` : checks.length === 0 ? "(no check runs on this commit)" : "";
   const annotatedAll = checks.filter((c) => annotationsCount(c) > 0);
-  const annotated = annotatedAll.slice(0, Math.max(0, limits.maxAnnotationChecks));
+  const annotatedOther = annotatedAll.filter((c) => conclusionRank(c) !== SUCCESS_RANK);
+  const annotatedGreen = annotatedAll.filter((c) => conclusionRank(c) === SUCCESS_RANK);
+  const annotationChecks = Math.max(0, limits.maxAnnotationChecks);
+  const annotated = [];
+  for (let i = 0; i < Math.max(annotatedOther.length, annotatedGreen.length); i += 1) {
+    if (annotated.length >= annotationChecks) break;
+    if (i < annotatedOther.length) annotated.push(annotatedOther[i]);
+    if (annotated.length >= annotationChecks) break;
+    if (i < annotatedGreen.length) annotated.push(annotatedGreen[i]);
+  }
   const notFetched = annotatedAll.length - annotated.length;
   const blocks = [];
   for (const c of annotated) {
@@ -4261,23 +4281,25 @@ function fetchCiEvidence(input) {
   }
   const st = ghJson(gh, ["api", `repos/${repoSlug}/commits/${headSha}/status`]);
   const rawStatuses = st.ok ? asRecord2(st.value).statuses : void 0;
+  const statusesShaped = Array.isArray(rawStatuses);
   const statusRows = asArray(rawStatuses).map((raw) => {
     const s = asRecord2(raw);
     const desc = oneLine(s.description, 200);
-    const url = oneLine(s.target_url, 300);
+    const url = httpUrl(s.target_url, 300);
     return {
       lines: [
         `- ${oneLine(s.state, 40) || "unknown"} \xB7 ${oneLine(s.context, 200) || "(unnamed status)"}${desc ? ` \u2014 ${desc}` : ""}${url ? ` (${url})` : ""}`
       ]
     };
   });
-  const statusNote = !st.ok ? `(statuses unavailable: ${safe(oneLine(st.error, 200))})` : !isArrayish(rawStatuses) ? `(statuses unavailable: ${UNEXPECTED_SHAPE})` : statusRows.length === 0 ? "(none)" : "";
-  const headerLine = (annotations) => `Check runs: ${checksNotFetched > 0 ? `${checks.length} fetched of ${totalChecks}` : `${checks.length} total`} \xB7 ${failed} failed \xB7 ${success} success \xB7 ${pending} pending \xB7 ${annotations} annotation(s) shown`;
+  const statusNote = !st.ok ? `(statuses unavailable: ${safe(oneLine(st.error, 200))})` : !statusesShaped ? `(statuses unavailable: ${UNEXPECTED_SHAPE})` : statusRows.length === 0 ? "(none)" : "";
+  const headLine = headResolved ? `Head commit: ${headSha} (resolved when the evidence was gathered \u2014 the reviewed diff carries no commit identity, so a push in between can make them differ)` : `Head commit: ${headSha}`;
+  const headerLine = (annotations) => `Check runs: ${checksNotFetched > 0 ? `${checks.length} fetched of ${totalChecks}` : `${checks.length} total`} \xB7 ${failed} failed \xB7 ${inconclusive} inconclusive \xB7 ${success} success \xB7 ${pending} pending \xB7 ${annotations} annotation(s) shown`;
   const checksNotFetchedLine = `\u2026 ${checksNotFetched} check run(s) not fetched (API page cap)`;
   const notFetchedLine = `\u2026 ${notFetched} annotated check(s) not fetched (cap: maxAnnotationChecks)`;
   const moreAnnotations = (n) => `\u2026 ${n} more annotation(s) not shown`;
   let used = cost([
-    `Head commit: ${headSha}`,
+    headLine,
     headerLine(blocks.reduce((n, b) => n + b.units.length, 0)),
     "",
     "## Check runs",
@@ -4326,7 +4348,7 @@ function fetchCiEvidence(input) {
   const shownAnnotations = keptBlocks.reduce((n, k) => n + k.shown, 0);
   const truncated = checksNotFetched > 0 || notFetched > 0 || blocksDropped > 0 || omittedChecks > 0 || omittedStatuses > 0 || keptBlocks.some((k) => k.block.knownTotal > k.shown);
   const text = [
-    `Head commit: ${headSha}`,
+    headLine,
     headerLine(shownAnnotations),
     "",
     "## Check runs",
@@ -4824,6 +4846,16 @@ function stripSecurityTag(title) {
 }
 
 // src/core/prompt.ts
+var CI_EVIDENCE_CLAUSE = [
+  'CI EVIDENCE: when the packet carries a "CI evidence" section, read it before you',
+  "judge whether the change builds, migrates, or passes its tests. A check\u2019s",
+  "conclusion is not the evidence \u2014 its annotations and output are. A WARNING or",
+  "NOTICE annotation whose text is an error (a failed command, a database/compiler/",
+  "linter error, a skipped or soft-failed step) is a DOWNGRADED FAILURE: treat it as a",
+  "finding candidate, locate the code in the diff that produced it, and quote what the",
+  "machine reported verbatim. A green job is not proof of correctness when its own",
+  "output contradicts it."
+].join("\n");
 var CODE_ASK = [
   "## Your task",
   "Find correctness bugs, security issues, broken conventions, and risky",
@@ -4853,14 +4885,7 @@ var CODE_ASK = [
   "consumers need no change, test that claim against the least-privileged caller,",
   "not the author/owner perspective.",
   "",
-  'CI EVIDENCE: when the packet carries a "CI evidence" section, read it before you',
-  "judge whether the change builds, migrates, or passes its tests. A check\u2019s",
-  "conclusion is not the evidence \u2014 its annotations and output are. A WARNING or",
-  "NOTICE annotation whose text is an error (a failed command, a database/compiler/",
-  "linter error, a skipped or soft-failed step) is a DOWNGRADED FAILURE: treat it as a",
-  "finding candidate, locate the code in the diff that produced it, and quote what the",
-  "machine reported verbatim. A green job is not proof of correctness when its own",
-  "output contradicts it."
+  CI_EVIDENCE_CLAUSE
 ].join("\n");
 function securityAsk() {
   const classes = SECURITY_CLASSES.filter((c) => c.id !== "other").map((c) => `  - [${c.id}] ${c.label}`).join("\n");
@@ -4876,7 +4901,9 @@ function securityAsk() {
     "and name the attack: the untrusted source, the sink, and the exploit. Prefer a",
     "few high-signal, exploitable findings over many theoretical ones \u2014 but do NOT",
     "stay silent on a real vulnerability to keep the list short. Pure code-quality",
-    "nits that are not security-relevant belong in a normal review, not here."
+    "nits that are not security-relevant belong in a normal review, not here.",
+    "",
+    CI_EVIDENCE_CLAUSE
   ].join("\n");
 }
 function renderReviewPrompt(packet, profile = "code") {

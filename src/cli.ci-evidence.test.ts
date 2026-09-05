@@ -69,7 +69,7 @@ const engineResult = (): ReviewModeResult =>
   }) as unknown as ReviewModeResult;
 
 const DIFF = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+y\n';
-const HEAD = 'h'.repeat(40);
+const HEAD = 'a'.repeat(40); // a real 40-hex commit id: the gatherer admits nothing else
 
 // One failing check with one annotation — the shape the whole feature exists for.
 const CHECK_RUNS = JSON.stringify({
