@@ -139,6 +139,31 @@ describe('runReviewMode — the gathered CI evidence reaches the packet and the 
     ).toBe(false);
   });
 
+  // The two fields are MUTUALLY EXCLUSIVE by contract. A caller that sets both has a bug, and the
+  // safe reading of a bug is the loud one: half-gathered evidence must never be presented to the
+  // seats as if it were the head's whole check output.
+  it('treats a caller that supplies BOTH text and a reason as UNAVAILABLE, loudly', async () => {
+    const progress: string[] = [];
+    const res = await runReviewMode({
+      ...opts(),
+      ciEvidence: 'Head commit: abc\n## Check runs\n- failure \u00b7 CI-EVIDENCE-BODY-MARKER',
+      ciEvidenceUnavailable: 'gh is not on PATH',
+      onProgress: (m) => progress.push(m),
+    });
+    expect(res.prompt).toContain('CI evidence (checks + annotations at the PR head)');
+    expect(res.prompt).toContain('gh is not on PATH');
+    expect(res.prompt).not.toContain('CI-EVIDENCE-BODY-MARKER');
+    expect(
+      progress.some((m) =>
+        m.includes('caller supplied both text and an unavailable reason — treating as unavailable')
+      )
+    ).toBe(true);
+    // Nothing trustworthy was gathered, so nothing joins the trail either.
+    expect(
+      fs.existsSync(path.join(reviewDir(out, 'ci-run'), CI_EVIDENCE_TRAIL_FILE))
+    ).toBe(false);
+  });
+
   it('renders no CI section at all when no fetch was attempted (the local-diff path)', async () => {
     const res = await runReviewMode(opts());
     expect(res.prompt).not.toContain('CI evidence (checks + annotations at the PR head)');

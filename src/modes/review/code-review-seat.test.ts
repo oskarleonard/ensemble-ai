@@ -12,6 +12,9 @@ const args = {
 // Spec §3 + the build-time MUST-VERIFY (settled: headless `claude -p` DOES invoke the built-in
 // skill). The prompt shape is the contract — a silent drop of the skill invocation would quietly
 // downgrade this seat to a generic reviewer.
+const headings = (s: string): number =>
+  (s.match(/^## CI evidence \(checks \+ annotations at the PR head\)$/gm) ?? []).length;
+
 describe('the one Claude producer — /code-review methodology seat', () => {
   const prompt = renderCodeReviewSeatPrompt(args);
 
@@ -108,6 +111,35 @@ describe('the one Claude producer — /code-review methodology seat', () => {
     expect(withCi).toMatch(/DATA, not a verdict/);
     // It is EVIDENCE, so it must follow the change it is evidence about.
     expect(withCi.indexOf('## CI evidence')).toBeGreaterThan(withCi.indexOf('DIFF BODY LINE'));
+    expect(headings(withCi)).toBe(1);
+  });
+
+  // Silence about a fetch that was ATTEMPTED and FAILED reads to the seat exactly like a PR with
+  // no checks at all. The packet seats already get a loud UNAVAILABLE section; this producer reads
+  // its own prompt, so without this note it alone would mistake a broken `gh` for a green head.
+  it('renders a LOUD unavailable note under the SAME heading when the fetch failed', () => {
+    const withNote = renderCodeReviewSeatPrompt({ ...args, ciEvidenceUnavailable: 'gh is not on PATH' });
+    expect(withNote).toContain('## CI evidence (checks + annotations at the PR head)');
+    expect(withNote).toContain(
+      "_(CI evidence UNAVAILABLE: gh is not on PATH — reviewing without the head's check results)_"
+    );
+    // One section, not two: a second heading would read as a second body.
+    expect(headings(withNote)).toBe(1);
+  });
+
+  it('prefers the gathered text when a caller passes both — and still renders ONE heading', () => {
+    const both = renderCodeReviewSeatPrompt({
+      ...args,
+      ciEvidence: 'Head commit: abc',
+      ciEvidenceUnavailable: 'gh is not on PATH',
+    });
+    expect(headings(both)).toBe(1);
+    expect(both).toContain('Head commit: abc');
+    expect(both).not.toContain('UNAVAILABLE');
+  });
+
+  it('renders no CI heading at all when neither the text nor a reason was passed', () => {
+    expect(headings(prompt)).toBe(0);
   });
 
   it('points the seat at `history/` as DATA when a packet was built, never at `git`', () => {

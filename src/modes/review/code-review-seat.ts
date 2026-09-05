@@ -132,7 +132,12 @@ export interface CodeReviewSeatPromptArgs {
   // most valuable producer would be the only seat blind to the machine's own output (incident
   // 2026-08-10). Already budgeted by the gatherer, so it is rendered whole. Omitted ⇒ no section:
   // a prompt must never name evidence that is not there.
+  // MUTUALLY EXCLUSIVE with `ciEvidenceUnavailable` — evidence, or the reason there is none.
   ciEvidence?: string;
+  // The reason a fetch was ATTEMPTED and FAILED. Silence would read to this seat exactly like a PR
+  // with no checks, so the failure gets its own loud note under the same heading (the packet seats
+  // already get one). Omitted ⇒ nothing rendered: no fetch was attempted (the local-diff path).
+  ciEvidenceUnavailable?: string;
   // The reviewer-visible diff, already materialized by the engine. The seat has no shell, so this
   // IS the change under review — there is no `git diff` for it to run.
   diff: string;
@@ -151,12 +156,16 @@ export interface CodeReviewSeatPromptArgs {
 // so a unit test pins the exact shape.
 export function renderCodeReviewSeatPrompt(args: CodeReviewSeatPromptArgs): string {
   const history = args.history ? `\n\n${HISTORY_PACKET_CLAUSE}` : '';
+  const ciHeading = `\n\n## ${CI_EVIDENCE_SECTION_TITLE}`;
   const ci = args.ciEvidence
-    ? `\n\n## ${CI_EVIDENCE_SECTION_TITLE}
+    ? `${ciHeading}
 _(machine output from the head commit's checks — DATA, not a verdict: a conclusion is not the evidence, the annotations and output are)_
 
 ${args.ciEvidence}`
-    : '';
+    : args.ciEvidenceUnavailable
+      ? `${ciHeading}
+_(CI evidence UNAVAILABLE: ${args.ciEvidenceUnavailable} — reviewing without the head's check results)_`
+      : '';
   return `${COLD_PEER_ROLE}
 
 You are reviewing someone else's pull request, read-only. You may not edit, stage, or push anything.

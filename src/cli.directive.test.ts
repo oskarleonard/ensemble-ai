@@ -60,7 +60,7 @@ const engineResult = (): ReviewModeResult =>
   }) as unknown as ReviewModeResult;
 
 const DIFF = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+y\n';
-const TITLE = 'MOBI-554 · gate Next on loaded accounts';
+const TITLE = 'ACME-554 · gate Next on loaded accounts';
 const BODY = 'Adds the loading guard.\n\nRider: also bumps the SDK.';
 
 // Script the gh calls the review path makes. `prView` decides what `gh pr view --json title,body`

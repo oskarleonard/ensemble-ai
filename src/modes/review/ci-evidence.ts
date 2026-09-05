@@ -117,15 +117,18 @@ function conclusionRank(c: CheckRun): number {
   return 1;
 }
 
-// Any JSON value → one trimmed, length-capped line. Coerces rather than assuming a string:
-// `.replace` on a number the API sent where a string was documented would throw.
-const oneLine = (s: unknown, max: number): string =>
-  String(s ?? '')
+// Any JSON value → one trimmed, length-capped line. Only the JSON SCALARS render: `String(v)` on
+// an object throws when the payload defines away its own primitive conversion (`{ toString: null,
+// valueOf: null }` survives a JSON round-trip), and an object rendered as `[object Object]` was
+// never evidence anyway — so a non-scalar is absent, not an exception out of a best-effort path.
+const oneLine = (v: unknown, max: number): string =>
+  (typeof v === 'string' ? v : typeof v === 'number' || typeof v === 'boolean' ? String(v) : '')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, max);
 
-const label = (c: CheckRun): string => oneLine(c.conclusion ?? c.status ?? 'unknown', 40).toLowerCase();
+const label = (c: CheckRun): string =>
+  oneLine(c.conclusion ?? c.status ?? 'unknown', 40).toLowerCase() || 'unknown';
 const name = (c: CheckRun): string => oneLine(c.name, 200) || '(unnamed check)';
 const output = (c: CheckRun): Record<string, unknown> => asRecord(c.output);
 const annotationsCount = (c: CheckRun): number => {
@@ -242,7 +245,10 @@ export function fetchCiEvidence(input: CiEvidenceInput): CiEvidenceResult {
       blocks.push({ heading, knownTotal: 0, note: `- annotations unavailable: ${why}`, units: [] });
       continue;
     }
-    const all = asArray<Annotation>(res.value);
+    // The same ELEMENT guard the check runs get: a `null`/string/number element carries no
+    // evidence, and admitting it renders an empty `- [note] :` row that reads like a real
+    // annotation — and inflates the count the header reports.
+    const all = asArray<Annotation>(res.value).filter((a) => isRecord(a));
     const fetched = all.slice(0, Math.max(0, limits.maxAnnotationsPerCheck));
     const units = fetched.map((raw) => {
       const a = asRecord(raw);

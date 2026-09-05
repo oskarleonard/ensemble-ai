@@ -96,6 +96,7 @@ export interface ReviewModeOptions {
   ceilingBytes?: number;
   // CI evidence for the PR head (modes/review/ci-evidence.ts) — the rendered text, or the reason a
   // fetch failed. Either one makes the packet render its CI section (loud when unavailable).
+  // The two are MUTUALLY EXCLUSIVE: evidence, or the reason there is none — never both.
   ciEvidence?: string;
   ciEvidenceUnavailable?: string;
   // Cap (bytes) on the gathered conventions text (default in gatherConventions).
@@ -298,11 +299,20 @@ export async function runReviewMode(
     );
   }
 
+  // A caller that supplied BOTH has a bug, and the safe reading of a bug is the LOUD one: an
+  // unavailable section says "the head's check output is missing", while half-gathered text would
+  // be read as the whole of it. Never both — and the drop is announced, not silent.
+  const bothCiEvidence = opts.ciEvidence !== undefined && opts.ciEvidenceUnavailable !== undefined;
+  if (bothCiEvidence) {
+    log('CI evidence: caller supplied both text and an unavailable reason — treating as unavailable');
+  }
+  const ciEvidence = bothCiEvidence ? undefined : opts.ciEvidence;
+
   const packet = assembleCodePacket({
     agentsBudget: conventionManifest?.capBytes,
     agentsMd,
     authorSummary: opts.authorSummary,
-    ciEvidence: opts.ciEvidence,
+    ciEvidence,
     ciEvidenceUnavailable: opts.ciEvidenceUnavailable,
     diff: acquired.diff,
     directive: opts.directive,
@@ -314,9 +324,9 @@ export async function runReviewMode(
   });
   // The rendered CI evidence joins the trail for humans + dashboards (best-effort, like every
   // trail write). The packet manifest already records the section for the seats.
-  if (opts.ciEvidence) {
+  if (ciEvidence) {
     try {
-      writeTrailFile(opts.out, opts.runId, CI_EVIDENCE_TRAIL_FILE, opts.ciEvidence);
+      writeTrailFile(opts.out, opts.runId, CI_EVIDENCE_TRAIL_FILE, ciEvidence);
     } catch {
       /* trail write is best-effort */
     }

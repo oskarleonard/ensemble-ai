@@ -250,6 +250,32 @@ describe('fetchCiEvidence — malformed payloads degrade, they never throw', () 
     expect(res.text).toContain('annotations unavailable: unexpected payload shape');
   });
 
+  // An adversarial (or merely future) payload can hold a field that refuses to become a primitive.
+  // `String(v)` on it throws out of a function whose whole contract is best-effort, so the
+  // coercion admits only the JSON scalars and renders everything else as absent.
+  it('never throws on a field that refuses to become a primitive', () => {
+    const gh = fakeGh({
+      [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
+        check_runs: [
+          {
+            conclusion: 'failure',
+            id: 701,
+            name: { toString: null, valueOf: null },
+            output: { annotations_count: 0, summary: 'the summary survives', title: null },
+            status: 'completed',
+          },
+        ],
+      },
+      [`api repos/${SLUG}/commits/${SHA}/status`]: STATUSES,
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.checks).toBe(1);
+    expect(res.text).toContain('(unnamed check)');
+    expect(res.text).toContain('the summary survives');
+  });
+
   it('survives checks that tie on rank with a missing name and a non-object output', () => {
     const gh = fakeGh({
       [`api repos/${SLUG}/commits/${SHA}/check-runs`]: {
@@ -458,6 +484,21 @@ describe('fetchCiEvidence — junk elements and blocks too big to admit whole', 
     expect(res.text).toContain('the only real element');
     // One check row and one status row — the three junk elements render nothing.
     expect((res.text.match(/^- /gm) ?? []).length).toBe(2);
+  });
+
+  // Same guard as `check_runs`: a junk ELEMENT inside an annotations payload carries no evidence,
+  // and counting it renders an empty `- [note] :` row that reads like a real annotation.
+  it('drops non-object elements inside an annotations payload instead of counting them as rows', () => {
+    const gh = fakeGh({
+      ...happy,
+      [`api repos/${SLUG}/check-runs/102/annotations`]: [null, 'x', 5, WARNING_WRAPPING_AN_ERROR[0]],
+    });
+    const res = fetchCiEvidence({ gh, headSha: SHA, pr: 7, repoSlug: SLUG });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.annotations).toBe(1);
+    expect((res.text.match(/^- \[/gm) ?? []).length).toBe(1);
+    expect(res.text).toContain('must be marked IMMUTABLE');
   });
 
   it('admits a verbose check\'s block PARTIALLY rather than losing every annotation it has', () => {

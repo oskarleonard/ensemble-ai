@@ -984,6 +984,7 @@ declare const QUALITY_LENS = "Report BUGS and STRUCTURAL quality only: correctne
 interface CodeReviewSeatPromptArgs {
     baseSha: string;
     ciEvidence?: string;
+    ciEvidenceUnavailable?: string;
     diff: string;
     headSha: string;
     history?: boolean;

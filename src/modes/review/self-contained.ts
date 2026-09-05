@@ -260,7 +260,11 @@ export interface ClaudeLayerOptions {
   // reaches the PACKET seats through the packet prompt; the WORKTREE producer renders its own
   // prompt instead, so it needs the text handed to it directly or it alone reviews blind to the
   // head's own check output. Omitted ⇒ no section (nothing else in the layer reads it).
+  // MUTUALLY EXCLUSIVE with `ciEvidenceUnavailable` — evidence, or the reason there is none.
   ciEvidence?: string;
+  // The reason a fetch was ATTEMPTED and FAILED, for the same producer: silence would read to it
+  // as a PR with no checks, so the failure is rendered as its own loud note instead.
+  ciEvidenceUnavailable?: string;
   claudeConfig: VoiceConfig;
   // The run's gathered conventions files (repo-relative). The ONLY docs a holistic finding may
   // cite to lift its MED severity cap — and the gate re-reads the citation out of the tree anyway.
@@ -410,6 +414,9 @@ export async function runClaudeReviewLayer(
       ? renderCodeReviewSeatPrompt({
           baseSha: opts.baseSha,
           ...(opts.ciEvidence ? { ciEvidence: opts.ciEvidence } : {}),
+          ...(opts.ciEvidenceUnavailable
+            ? { ciEvidenceUnavailable: opts.ciEvidenceUnavailable }
+            : {}),
           diff: opts.pinnedDiff,
           headSha: opts.expectedHeadSha,
           history: hasHistory,

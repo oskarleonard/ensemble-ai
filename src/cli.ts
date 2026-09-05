@@ -1565,8 +1565,11 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         baseSha: layerBaseSha,
         // The worktree producer does NOT review the packet prompt (renderCodeReviewSeatPrompt
         // replaces it), so the packet's CI section would miss the most valuable seat unless the
-        // text reaches it here. Packet-mode producers already have it in the pinned prompt.
+        // text reaches it here — and a FAILED fetch has to reach it too, or that one seat cannot
+        // tell a broken `gh` from a head with no checks. Packet-mode producers already have both
+        // in the pinned prompt.
         ...(ciEvidence ? { ciEvidence } : {}),
+        ...(ciEvidenceUnavailable ? { ciEvidenceUnavailable } : {}),
         claudeConfig: claudeSeat.config,
         // The conventions this run actually gathered — the docs a holistic finding may cite to
         // lift its MED severity cap (the gate re-reads the citation out of the tree regardless).
