@@ -1507,7 +1507,9 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     {
       agreements: parsed.agreements,
       bottomLine: parsed.bottomLine,
-      by: 'claude',
+      // The synthesis credits the seat that actually judged — 'claude' for the anthropic gate,
+      // 'codex' when the vendor axis put sol in the seat. Never a hardcode now that both exist.
+      by: opts.config.id,
       degraded: false,
       disagreements: parsed.disagreements,
       ok: true,

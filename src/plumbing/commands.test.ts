@@ -71,6 +71,8 @@ describe('reviewers / config command', () => {
     await main(['config', '--json', '--voices-file', voicesFile, '--reviewers-file', '/nope.json']);
     expect(JSON.parse(logged).gate).toEqual({
       effort: 'max', effortSource: 'file', model: 'fable', modelSource: 'file',
+      // The vendor axis (sol-gate promotion): surfaced so `config` shows WHO judges.
+      vendor: 'anthropic', vendorSource: 'default',
     });
     fs.rmSync(dir, { force: true, recursive: true });
   });
