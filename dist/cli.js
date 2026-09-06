@@ -8420,17 +8420,24 @@ ${WORKTREE_SUFFIX_HEADER}`);
   if (idx === -1) return unverified;
   const tail = prompt.slice(idx);
   const named = tail.match(/checked out READ-ONLY at (.+?) \(detached at ([^)\n]+)\)/);
-  if (!named) return unverified;
+  if (!named || named.index === void 0 || named.index > 200) return unverified;
   const base = tail.match(/git diff ([0-9a-f]{7,40})\.\.\.[0-9a-f]{7,40}/);
   const baseSha = base ? base[1] : null;
   const rebuilt = worktreePromptSuffix({ baseSha, headSha: named[2], worktree: named[1] });
-  if (!prompt.endsWith(rebuilt)) return unverified;
+  const verified = prompt.endsWith(rebuilt);
   return {
     baseSha,
     hadWorktree: true,
-    packetPrompt: prompt.slice(0, prompt.length - rebuilt.length),
+    // ONE boundary for both paths, so a recovered split's packet is byte-identical to the verified
+    // one's: the header is where the preamble starts. On a verified tail `idx` IS
+    // `prompt.length - rebuilt.length` — the rebuild opens with `\n\n` + the header, and nothing
+    // after that opening re-quotes the header — so this cut is the one the proof used to make.
+    packetPrompt: prompt.slice(0, idx),
     preambleHeadSha: named[2],
-    unverifiedTail: false
+    // Only on the unverified path, and only ever here: it is what tells `checkReseat` this tail is
+    // version skew (allow, re-render) rather than an unreadable one (refuse).
+    ...verified ? {} : { recoveredHeader: { baseSha, headSha: named[2], worktree: named[1] } },
+    unverifiedTail: !verified
   };
 }
 function isReviewPacketShape(v) {
@@ -8481,9 +8488,9 @@ function checkReseat(baseDir, runId, seat, worktreeHeadSha) {
     };
   }
   const split = splitWorktreePrompt(art.prompt);
-  if (split.unverifiedTail) {
+  if (split.unverifiedTail && !split.recoveredHeader) {
     return {
-      refusal: `seat ${seat}'s persisted prompt carries a worktree preamble this engine version cannot verify (the run was written by another ensemble-ai version) \u2014 refusing to retry on an unverifiable pinned prompt; re-run the review instead`
+      refusal: `seat ${seat}'s persisted prompt carries a worktree preamble whose header this engine cannot read (the header line, or the fields under it) \u2014 refusing to guess where the packet ends; re-run the review instead`
     };
   }
   if (split.preambleHeadSha && split.preambleHeadSha !== headSha) {
@@ -8614,6 +8621,14 @@ async function reseatUnderLock(opts, pre) {
   log(
     `reseat: re-running ${seat} on run ${runId} \xB7 head ${headSha.slice(0, 12)} \xB7 ${worktreePrompt ? "worktree evidence" : "packet evidence"} \xB7 previously ${art.stored.terminalState}`
   );
+  const preambleRerendered = Boolean(worktreePrompt && split.unverifiedTail && split.recoveredHeader);
+  if (preambleRerendered) {
+    log(
+      scrubControl(
+        `reseat: seat ${seat}: the persisted preamble was written by another engine version \u2014 re-rendered with this one; the packet is unchanged`
+      )
+    );
+  }
   const seatRun = await runCoreSeat({
     adapter: opts.adapter,
     log,
@@ -8668,6 +8683,10 @@ async function reseatUnderLock(opts, pre) {
           evidenceDowngraded,
           fallbackReason,
           outcome: review.terminalState,
+          // Stamped ONLY when it happened: the durable answer to "why does this seat's prompt not
+          // match the preamble the trail still shows?" — the boilerplate was rebuilt by the engine
+          // that ran the retry, and the pinned packet before it was not touched.
+          ...preambleRerendered ? { preambleRerendered: true } : {},
           previous: {
             // What the DEAD attempt had. A packet-mode retry of a seat that originally reviewed
             // in-project is an evidence downgrade, and the trail must still show that.
