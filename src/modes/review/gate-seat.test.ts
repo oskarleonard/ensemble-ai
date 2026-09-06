@@ -265,3 +265,80 @@ describe('resolveClaudeReviewerSeat — headless seat never rides the CLI defaul
     expect(seat.effortSource).toBe('default');
   });
 });
+
+// ── The VENDOR axis (the sol-gate promotion, 2026-09-06) ────────────────────────────────
+describe('resolveGateSeat — vendor axis (anthropic default · codex = the shadow-proven judge)', () => {
+  const warnAll = (): { warn: (m: string) => void; warnings: string[] } => {
+    const warnings: string[] = [];
+    return { warn: (m) => warnings.push(m), warnings };
+  };
+
+  it('defaults to anthropic — pre-vendor configs resolve byte-identically', () => {
+    const seat = resolveGateSeat({}, {}, () => {});
+    expect(seat.vendor).toBe('anthropic');
+    expect(seat.vendorSource).toBe('default');
+    expect(seat.config.cmd).toBe('claude');
+    expect(seat.config.vendor).toBe('anthropic');
+  });
+
+  it('--gate-vendor codex resolves the shadow-proven baked seat (gpt-5.6-sol @ xhigh, codex identity)', () => {
+    const seat = resolveGateSeat({}, { vendor: 'codex' }, () => {});
+    expect(seat.vendor).toBe('codex');
+    expect(seat.vendorSource).toBe('flag');
+    expect(seat.config).toMatchObject({ cmd: 'codex', id: 'codex', vendor: 'openai', model: 'gpt-5.6-sol', effort: 'xhigh' });
+    expect(seat.modelSource).toBe('default');
+    expect(seat.effortSource).toBe('default');
+  });
+
+  it('a voices.json `gate.vendor: codex` entry carries its own model/effort — `ultra` is a KNOWN codex effort', () => {
+    const seat = resolveGateSeat({ gate: { effort: 'ultra', model: 'gpt-5.6-terra', vendor: 'codex' } }, {}, () => {});
+    expect(seat).toMatchObject({ vendor: 'codex', vendorSource: 'file', effortSource: 'file', modelSource: 'file' });
+    expect(seat.config).toMatchObject({ model: 'gpt-5.6-terra', effort: 'ultra' });
+  });
+
+  it('the codex chain NEVER inherits from the claude voice — cross-vendor inheritance is meaningless', () => {
+    const seat = resolveGateSeat({ claude: { effort: 'high', model: 'opus' }, gate: { vendor: 'codex' } }, {}, () => {});
+    expect(seat.config.model).toBe('gpt-5.6-sol');
+    expect(seat.config.effort).toBe('xhigh');
+  });
+
+  it('a junk codex effort warns and falls to the baked xhigh (junk never disables or re-tiers the seat)', () => {
+    const { warn, warnings } = warnAll();
+    const seat = resolveGateSeat({ gate: { effort: 'turbo', vendor: 'codex' } }, {}, warn);
+    expect(seat.config.effort).toBe('xhigh');
+    expect(warnings.some((w) => w.includes('not a known codex effort'))).toBe(true);
+  });
+
+  it('a junk vendor warns and stays anthropic — flag and file alike', () => {
+    const { warn, warnings } = warnAll();
+    expect(resolveGateSeat({}, { vendor: 'xai' }, warn).vendor).toBe('anthropic');
+    expect(resolveGateSeat({ gate: { vendor: 'google' } }, {}, warn).vendor).toBe('anthropic');
+    expect(warnings).toHaveLength(2);
+  });
+
+  it('the vendor FLAG beats the file, and the entry\'s model/effort do NOT follow across vendors', () => {
+    const { warn, warnings } = warnAll();
+    const seat = resolveGateSeat({ gate: { model: 'gpt-5.6-sol', vendor: 'codex' } }, { vendor: 'anthropic' }, warn);
+    expect(seat.vendor).toBe('anthropic');
+    expect(seat.vendorSource).toBe('flag');
+    // "gpt-5.6-sol" into a claude spawn is an unknown-model death — the codex-scoped entry is
+    // skipped LOUDLY and the anthropic chain falls to its own defaults.
+    expect(seat.config.cmd).toBe('claude');
+    expect(seat.config.model).not.toBe('gpt-5.6-sol');
+    expect(warnings.some((w) => w.includes('codex-scoped'))).toBe(true);
+  });
+
+  it('the inverse: an anthropic-scoped entry never leaks its model into a codex gate', () => {
+    const { warn, warnings } = warnAll();
+    const seat = resolveGateSeat({ gate: { effort: 'max', model: 'fable' } }, { vendor: 'codex' }, warn);
+    expect(seat.config).toMatchObject({ cmd: 'codex', model: 'gpt-5.6-sol', effort: 'xhigh' });
+    expect(warnings.some((w) => w.includes('anthropic-scoped'))).toBe(true);
+  });
+
+  it('`cmd` on a codex-vendor entry is still ignored + warned — the runner binding is code', () => {
+    const { warn, warnings } = warnAll();
+    const seat = resolveGateSeat({ gate: { cmd: 'bash', vendor: 'codex' } }, {}, warn);
+    expect(seat.config.cmd).toBe('codex');
+    expect(warnings.some((w) => w.includes('`cmd` is ignored'))).toBe(true);
+  });
+});

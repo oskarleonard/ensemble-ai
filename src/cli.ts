@@ -64,11 +64,13 @@ import {
   type GateAuthorityInputs,
   gateAuthorityLabel,
   gateDispositionSummary,
+  type GateRunner,
   renderGateVerdicts,
   renderHighGate,
   resolveHighGate,
   type ShadowGateSeat,
 } from './modes/review/gate';
+import { runClaudeReviewVoice } from './modes/review/claude';
 import { runCodexReview } from './reviewers/codex';
 import { REVIEW_ADAPTERS } from './reviewers/registry';
 import { readGatePacketHeadSha } from './modes/review/gate-hunks';
@@ -265,8 +267,14 @@ Options:
   --gate-model <m>      model for the GATE (synthesis) seat — overrides the voices.json
                         \`gate\` entry; the gate is always claude -p (keep it ≥ your strongest
                         reviewer, else it mostly returns unverified — the toothless mode)
-  --gate-effort <e>     effort for the GATE seat (low|medium|high|xhigh|max) — overrides the
-                        file; an unknown value is ignored (\`ensemble-ai config\` shows the seat)
+  --gate-effort <e>     effort for the GATE seat — validated against the resolved VENDOR's own
+                        ladder (anthropic: low|medium|high|xhigh|max · codex: low..xhigh|max|ultra);
+                        an unknown value is ignored (\`ensemble-ai config\` shows the seat)
+  --gate-vendor <v>     WHO judges: anthropic (default — the claude -p gate) or codex (the same
+                        fenced codex runner the shadow trial proved; baked seat gpt-5.6-sol @
+                        xhigh). Chain: flag → voices.json \`gate.vendor\` → anthropic. With
+                        --shadow-gate the shadow REVERSES automatically: a codex gate is shadowed
+                        by the anthropic champion, and vice versa
   --shadow-gate         ALSO run a cross-vendor SHADOW gate: the codex seat's model judges the
                         IDENTICAL gate prompt, audit-only (champion/challenger). Its verdicts +
                         a per-finding comparison vs the authoritative gate land in
@@ -1150,6 +1158,7 @@ async function reviewCommand(
         'gate-dismissals': { type: 'boolean' },
         'gate-effort': { type: 'string' },
         'gate-model': { type: 'string' },
+        'gate-vendor': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
         holistic: { type: 'boolean' },
         'holistic-effort': { type: 'string' },
@@ -1535,9 +1544,14 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       {
         effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
         model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+        vendor: typeof values['gate-vendor'] === 'string' ? values['gate-vendor'] : undefined,
       },
       (m) => console.error(`· ${m}`)
     );
+    if (gateSeat.vendor === 'codex')
+      console.error(
+        `· gate seat: CODEX (${gateSeat.config.model} @ ${gateSeat.config.effort}) — the fenced codex runner judges; the anthropic gate is off this run${values['shadow-gate'] ? ' (shadowing as the audit-only champion)' : ''}`
+      );
     // THE HISTORY PACKET (modes/review/history-packet.ts). The capability fence removed Bash from
     // the Anthropic seats, which took away the `git log`/`git blame` a reviewer genuinely uses. The
     // ENGINE runs those commands instead and seeds each fenced seat's own cwd with the answers as
@@ -1621,23 +1635,42 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
               },
             }
           : {}),
-        // The SHADOW gate (audit-only, champion/challenger): the codex seat's configured model
-        // judging the identical gate prompt, one effort step below the reviewer bar by default
-        // (xhigh — the config we would actually ADOPT if the challenger wins; measuring at max
-        // would benchmark a seat we would never run). The codex RUNNER binds the spawn to the
-        // codex sandbox + egress fence; gate.ts owns fail-soft and never-authoritative.
+        // The GATE runner binds to the RESOLVED vendor in code — config alone can never point
+        // the gate at an unfenced spawn. anthropic (default) keeps the layer's claude runner;
+        // codex is the same fenced runner the shadow trial proved.
+        ...(gateSeat.vendor === 'codex' ? { gateRun: ((p, c, o) => runCodexReview(p, c, o)) as GateRunner } : {}),
+        // The SHADOW gate (audit-only): always the OTHER vendor's judge, so the comparison stays
+        // champion-vs-challenger whichever seat holds the gate. anthropic primary ⇒ the codex
+        // challenger shadows (reviewer-configured model @ xhigh — the seat we would adopt);
+        // codex primary ⇒ the anthropic CHAMPION shadows (resolved through the claude chain, NOT
+        // the gate entry — that entry now describes the codex seat). Each runner binds its own
+        // sandbox + egress fence; gate.ts owns fail-soft and never-authoritative.
         ...(values['shadow-gate']
           ? {
-              shadowGate: {
-                config: {
-                  ...resolveReviewer('codex'),
-                  effort:
-                    typeof values['shadow-gate-effort'] === 'string' && values['shadow-gate-effort'].trim()
-                      ? values['shadow-gate-effort'].trim()
-                      : 'xhigh',
-                },
-                run: (p, c, o) => runCodexReview(p, c, o),
-              } satisfies ShadowGateSeat,
+              shadowGate: (gateSeat.vendor === 'codex'
+                ? {
+                    config: loadClaudeReviewerSeat(
+                      VOICES_FILE,
+                      {
+                        effort:
+                          typeof values['shadow-gate-effort'] === 'string' && values['shadow-gate-effort'].trim()
+                            ? values['shadow-gate-effort'].trim()
+                            : undefined,
+                      },
+                      (m) => console.error(`· ${m}`)
+                    ).config,
+                    run: (p, c, o) => runClaudeReviewVoice(p, c, o),
+                  }
+                : {
+                    config: {
+                      ...resolveReviewer('codex'),
+                      effort:
+                        typeof values['shadow-gate-effort'] === 'string' && values['shadow-gate-effort'].trim()
+                          ? values['shadow-gate-effort'].trim()
+                          : 'xhigh',
+                    },
+                    run: (p, c, o) => runCodexReview(p, c, o),
+                  }) satisfies ShadowGateSeat,
             }
           : {}),
         includeClaudeReviewer: true,
@@ -2808,6 +2841,8 @@ async function reviewersCommand(args: string[]): Promise<number> {
       effortSource: gateSeat.effortSource,
       model: gateSeat.config.model,
       modelSource: gateSeat.modelSource,
+      vendor: gateSeat.vendor,
+      vendorSource: gateSeat.vendorSource,
     },
     reviewers: listReviewers(reviewersFile),
     reviewersFile,
@@ -3245,6 +3280,10 @@ async function regateCommand(args: string[]): Promise<number> {
     {
       effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
       model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+      // This path binds the claude runner only — pin the chain to anthropic so a voices.json
+      // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
+      // death). The codex gate is a `review` feature; wiring it here is a separate change.
+      vendor: 'anthropic',
     },
     (m) => console.error(`· ${m}`)
   );
@@ -3416,6 +3455,10 @@ async function reseatCommand(args: string[]): Promise<number> {
     {
       effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
       model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+      // This path binds the claude runner only — pin the chain to anthropic so a voices.json
+      // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
+      // death). The codex gate is a `review` feature; wiring it here is a separate change.
+      vendor: 'anthropic',
     },
     (m) => console.error(`· ${m}`)
   );
@@ -3660,6 +3703,10 @@ async function probeCommand(rest: string[]): Promise<number> {
     {
       effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
       model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+      // This path binds the claude runner only — pin the chain to anthropic so a voices.json
+      // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
+      // death). The codex gate is a `review` feature; wiring it here is a separate change.
+      vendor: 'anthropic',
     },
     (m) => console.error(`· ${m}`)
   );

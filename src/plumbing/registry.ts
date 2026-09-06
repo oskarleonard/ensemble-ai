@@ -16,6 +16,10 @@ export interface GateSeatView {
   effortSource: SeatSource;
   model: string;
   modelSource: SeatSource;
+  // The gate's resolved vendor (the sol-gate axis). Optional so pre-vendor callers/tests keep
+  // rendering; absent renders as anthropic — the only vendor that existed before the axis.
+  vendor?: string;
+  vendorSource?: SeatSource;
 }
 
 export interface RegistryView {
@@ -63,7 +67,7 @@ export function renderRegistry(view: RegistryView): string {
   // resolved model/effort came from (flag/file/default) — the standing "which config" legibility.
   out.push('  review synthesis  (the verified GATE — always claude -p; {model,effort} only)');
   out.push(
-    `    ${'gate'.padEnd(7)} anthropic · ${view.gate.model} @ ${view.gate.effort}  · source model:${view.gate.modelSource} · effort:${view.gate.effortSource}`
+    `    ${'gate'.padEnd(7)} ${view.gate.vendor ?? 'anthropic'} · ${view.gate.model} @ ${view.gate.effort}  · source model:${view.gate.modelSource} · effort:${view.gate.effortSource}${view.gate.vendor && view.gate.vendor !== 'anthropic' ? ` · vendor:${view.gate.vendorSource ?? 'default'}` : ''}`
   );
   out.push('');
   return out.join('\n');

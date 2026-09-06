@@ -30,6 +30,7 @@ import { resolveCiEvidence } from './ci-evidence';
 import { claudeWorktreePromptSuffix, runClaudeReviewVoice } from './claude';
 import { renderCodeReviewSeatPrompt } from './code-review-seat';
 import {
+  type GateRunner,
   type GateVerdictRecord,
   type SettlementRecord,
   type ShadowGateSeat,
@@ -283,6 +284,10 @@ export interface ClaudeLayerOptions {
   // The SHADOW gate (audit-only, gate.ts ShadowGateSeat) — a cross-vendor judge over the identical
   // gate prompt, for champion/challenger measurement. Omitted ⇒ nothing changes.
   shadowGate?: ShadowGateSeat;
+  // The PRIMARY gate's runner when the resolved gate vendor is not anthropic (the sol-gate
+  // promotion). Omitted ⇒ the layer's own claude runner — the pre-vendor behavior, unchanged.
+  // Bound in CODE by the caller from the resolved vendor; never from config.
+  gateRun?: GateRunner;
   // The codex+grok reviews already produced + persisted by runReviewMode (the core).
   coreReviews: StoredReview[];
   // THE HISTORY PACKET (./history-packet), when this run built one: `git log` + `git blame` for the
@@ -567,7 +572,9 @@ export async function runClaudeReviewLayer(
       : {}),
     log,
     reviews: voiceReviews,
-    run,
+    // The vendor-bound gate runner (sol-gate promotion) — absent ⇒ the layer's claude runner,
+    // the pre-vendor behavior byte for byte.
+    run: opts.gateRun ?? run,
     runId: opts.runId,
     // The audit-only shadow gate rides the same call — runGate owns its concurrency + fail-soft.
     ...(opts.shadowGate ? { shadow: opts.shadowGate } : {}),
