@@ -473,7 +473,7 @@ describe('renderClaudeLayer — grouped, scannable stdout block', () => {
     });
     const text = renderClaudeLayer(res).join('\n');
     expect(text).toContain('claude [anthropic/opus]');
-    expect(text).toContain('Claude synthesis');
+    expect(text).toContain('Gate synthesis');
     expect(text).toContain('bottom line');
     // the gate block: per-finding tags + the summary counts line
     expect(text).toContain('gate — grounded verdicts');

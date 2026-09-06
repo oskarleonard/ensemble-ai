@@ -701,7 +701,7 @@ export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
   const s = result.synthesis;
   out.push('');
   out.push(
-    `  Claude synthesis${s.by ? ` (by ${s.by})` : ''}${s.degraded ? ' — DEGRADED (deterministic fallback, NOT cross-confirmed)' : ''}`
+    `  Gate synthesis${s.by ? ` (by ${s.by})` : ''}${s.degraded ? ' — DEGRADED (deterministic fallback, NOT cross-confirmed)' : ''}`
   );
   if (s.summary) out.push(`     ${scrub(s.summary).slice(0, 400)}`);
   if (s.agreements.length > 0) {

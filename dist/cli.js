@@ -8114,7 +8114,7 @@ function renderClaudeLayer(result) {
   const s = result.synthesis;
   out.push("");
   out.push(
-    `  Claude synthesis${s.by ? ` (by ${s.by})` : ""}${s.degraded ? " \u2014 DEGRADED (deterministic fallback, NOT cross-confirmed)" : ""}`
+    `  Gate synthesis${s.by ? ` (by ${s.by})` : ""}${s.degraded ? " \u2014 DEGRADED (deterministic fallback, NOT cross-confirmed)" : ""}`
   );
   if (s.summary) out.push(`     ${scrubControl(s.summary).slice(0, 400)}`);
   if (s.agreements.length > 0) {
@@ -9856,8 +9856,10 @@ Options:
   --claude-effort <e>   effort for the claude REVIEWER seat (low|medium|high|xhigh|max) \u2014
                         overrides the file; built-in default: max
   --gate-model <m>      model for the GATE (synthesis) seat \u2014 overrides the voices.json
-                        \`gate\` entry; the gate is always claude -p (keep it \u2265 your strongest
-                        reviewer, else it mostly returns unverified \u2014 the toothless mode)
+                        \`gate\` entry; applies to the RESOLVED vendor's spawn \u2014 pass
+                        --gate-vendor alongside when crossing vendors, or an anthropic model
+                        name rides into a codex spawn (and dies loudly at spawn). Keep the gate
+                        \u2265 your strongest reviewer, else it mostly returns unverified
   --gate-effort <e>     effort for the GATE seat \u2014 validated against the resolved VENDOR's own
                         ladder (anthropic: low|medium|high|xhigh|max \xB7 codex: low..xhigh|max|ultra);
                         an unknown value is ignored (\`ensemble-ai config\` shows the seat)
@@ -9866,14 +9868,16 @@ Options:
                         xhigh). Chain: flag \u2192 voices.json \`gate.vendor\` \u2192 anthropic. With
                         --shadow-gate the shadow REVERSES automatically: a codex gate is shadowed
                         by the anthropic champion, and vice versa
-  --shadow-gate         ALSO run a cross-vendor SHADOW gate: the codex seat's model judges the
-                        IDENTICAL gate prompt, audit-only (champion/challenger). Its verdicts +
-                        a per-finding comparison vs the authoritative gate land in
-                        shadow-gate-codex-verdicts.json (+ raw transcript); synthesis, posting,
+  --shadow-gate         ALSO run the OTHER vendor's judge over the IDENTICAL gate prompt,
+                        audit-only (champion/challenger \u2014 the direction follows --gate-vendor:
+                        an anthropic gate is shadowed by the codex challenger, a codex gate by
+                        the anthropic champion). Verdicts + a per-finding comparison land in
+                        shadow-gate-<seat>-verdicts.json (+ raw transcript); synthesis, posting,
                         dismissals, and the exit code are unchanged, and a shadow failure never
                         touches the run
-  --shadow-gate-effort <e>  the shadow seat's effort (default: xhigh \u2014 the config you would
-                        actually adopt if the challenger wins; codex validates the value)
+  --shadow-gate-effort <e>  the shadow seat's effort (defaults: codex shadow xhigh \u2014 the seat
+                        you would adopt; anthropic shadow resolves the claude chain). The
+                        shadow's own vendor validates the value
   --stage               after a COMPLETED review, stage it as ONE **PENDING** GitHub review under
                         your account (opt-in; REQUIRES a PR **URL**, which binds the diff to the
                         head SHA \u2014 a bare \`--pr <N>\` has no commit identity to anchor to). Verified

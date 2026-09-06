@@ -6,9 +6,10 @@ import { VOICE_DEFAULTS, VOICES_FILE } from '../brainstorm/voices';
 import { CLAUDE_EFFORTS } from './claude';
 
 // The GATE seat — the synthesis reviewer — is independently configurable from the `claude`
-// review VOICE: "reviewer = Opus @ high, gate = Fable @ max" must be expressible. But the gate
-// is ALWAYS a `claude -p` spawn under the read-only plan-mode + write-tool deny-list belt, so it
-// takes `{model, effort}` ONLY — a `cmd` key can't reconfigure the spawn away from claude and is
+// review VOICE: "reviewer = Opus @ high, gate = Fable @ max" must be expressible. The spawn is
+// ALWAYS one of the two FENCED runners, picked by the VENDOR axis below (anthropic = `claude -p`
+// under plan-mode + write-tool deny; codex = the sandboxed + egress-fenced codex runner) — so it
+// takes `{model, effort, vendor}` ONLY: a `cmd` key can't reconfigure the spawn and is
 // ignored + warned (the read-only posture can't be configured away). Resolution chain: the
 // voices.json `gate` entry → the `claude` entry (model/effort only) → the built-in default (Opus,
 // i.e. the 'default' sentinel → no --model/--effort). A junk entry falls to the next link + a
