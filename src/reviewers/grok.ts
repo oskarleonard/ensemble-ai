@@ -336,14 +336,18 @@ export function parseGrokStream(stdout: string): GrokStreamSummary {
 
 // THE LEGACY FALLBACK, kept deliberately. Pulls the review out of grok's OLD
 // `--output-format json` envelope, where the reply was `.text`. Reached only when
-// parseGrokStream saw NO stream objects at all (`events === 0`) — i.e. a future grok
-// that ignores or drops `streaming-messages-json` and answers in the old shape, or in
-// plain text. That drift then DEGRADES to a working review instead of crashing the seat.
+// parseGrokStream saw NO stream objects at all (`events === 0`) AND the raw stdout does
+// not itself look like a stream line — i.e. a future grok that ignores or drops
+// `streaming-messages-json` and answers in the old shape, or in plain text. That drift
+// then DEGRADES to a working review instead of crashing the seat.
 //
-// It is NOT reachable for a CUT stream (events > 0, no result line): there the raw stdout
-// is a heap of NDJSON, and this function's raw-stdout degrade would hand parseFindings
-// that heap as if it were a review. Fail closed is the only correct answer there, and
-// runGrokReview's `events === 0` guard is what keeps the two cases apart.
+// It is NOT reachable for a CUT stream, including one cut INSIDE its very first line. A
+// stream cut after at least one full line already fails the `events === 0` gate. A stream
+// cut inside its first line still has `events === 0` (the truncated line never parses),
+// so runGrokReview also sniffs the raw stdout itself (`/^\s*\{\s*"type"\s*:/`) and skips
+// this function whenever it looks stream-shaped — otherwise this function's raw-stdout
+// degrade would hand parseFindings that partial line as if it were a review. Fail closed
+// is the only correct answer in both cases.
 export function extractGrokText(stdout: string): string | null {
   try {
     const env = JSON.parse(stdout) as { text?: unknown };
@@ -461,7 +465,7 @@ export async function runGrokReview(
     // parseFindings a pile of half-written events dressed as a review.
     const text = !raw || !stream
       ? null
-      : stream.events === 0
+      : stream.events === 0 && !/^\s*\{\s*"type"\s*:/.test(raw)
         ? extractGrokText(raw)
         : stream.text;
     const stalled = timedOut && timedOutReason === 'inactivity';

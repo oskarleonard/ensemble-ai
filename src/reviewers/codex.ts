@@ -35,9 +35,10 @@ export const REVIEW_TIMEOUT_MS = 900_000; // 15 min
 // Anthropic seats had already paid twice (self-contained.ts). Since the liveness watchdog
 // below reclaims a WEDGED codex seat, this absolute value is a pure runaway backstop:
 // sized past honest work, because a killed honest seat loses everything already paid
-// for. It is codex's figure, not a shared core one: a seat without a liveness signal
-// (grok, GROK_WORKTREE_REVIEW_TIMEOUT_MS) must pay for a wedge at its full budget and so
-// earns a smaller one.
+// for. It is codex's own figure, not a literally shared core constant — but grok is no
+// longer the seat without a liveness signal: it streams `streaming-messages-json` and
+// arms the same inactivity watchdog, so both worktree seats now carry the same 60-min
+// runaway backstop (grok's own GROK_WORKTREE_REVIEW_TIMEOUT_MS), not a smaller one.
 export const CORE_WORKTREE_REVIEW_TIMEOUT_MS = 3_600_000; // 60 min runaway backstop
 
 // codex `--json` emits an event per item (a command run, a reasoning step, a message)

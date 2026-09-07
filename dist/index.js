@@ -2293,7 +2293,7 @@ async function runGrokReview(prompt, config, opts = {}) {
       timeoutMs
     });
     const stream = raw ? parseGrokStream(raw) : null;
-    const text = !raw || !stream ? null : stream.events === 0 ? extractGrokText(raw) : stream.text;
+    const text = !raw || !stream ? null : stream.events === 0 && !/^\s*\{\s*"type"\s*:/.test(raw) ? extractGrokText(raw) : stream.text;
     const stalled = timedOut && timedOutReason === "inactivity";
     return {
       // Snapshotted HERE, in the return expression — it is evaluated before the `finally` closes the

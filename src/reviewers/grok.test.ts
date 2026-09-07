@@ -409,6 +409,18 @@ describe('runGrokReview (stdout capture)', () => {
     expect(result.raw).toBeNull(); // NOT the NDJSON blob, which parseFindings would choke on
   });
 
+  // THE NARROW HOLE F1 CLOSES: a stream cut INSIDE its very first line still has events === 0
+  // (the truncated line never parses as JSON), so without the extra sniff on the raw stdout this
+  // would misread as format-drift and hand parseFindings a JSON fragment as if it were a review.
+  it('fails closed on a stream cut inside its FIRST line — not mistaken for the legacy envelope', async () => {
+    const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    child?.stdout.emit('data', Buffer.from(STREAM_LINES[0].slice(0, 40)));
+    child?.emit('close');
+    const result = await p;
+    expect(result.ok).toBe(false);
+    expect(result.raw).toBeNull();
+  });
+
   // FORMAT DRIFT DEGRADES, it does not crash: a grok that ignored the streaming flag answers in the
   // old envelope, which is not a stream at all — so the legacy extractor is allowed to take it.
   it('still reads the OLD json envelope when grok emits no stream at all', async () => {
