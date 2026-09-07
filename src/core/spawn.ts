@@ -144,7 +144,7 @@ const STREAM_TAIL_LIMIT = 1_000_000;
 
 // Cut the tail on a LINE boundary: it is persisted as newline-delimited JSON, and a cut made on a
 // char boundary would hand a line-oriented reader a partial first object.
-function boundedStreamTail(tail: string, limit: number): string {
+export function boundedStreamTail(tail: string, limit: number): string {
   if (tail.length <= limit) return tail;
   return tail.slice(-limit).replace(/^[^\n]*\n/, '');
 }

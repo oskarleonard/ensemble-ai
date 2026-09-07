@@ -4,35 +4,58 @@ import path from 'node:path';
 
 import { resolveBin } from '../core/bin';
 import { type EgressProxy, proxyEnv } from '../core/egress-proxy';
-import { runReviewerExec } from '../core/spawn';
+import { boundedStreamTail, runReviewerExec } from '../core/spawn';
 import type { ReviewerConfig } from '../core/types';
 import type { SandboxProfileRef } from '../modes/review/evidence';
 
-import {
-  type CodexReviewResult,
-  REVIEW_TIMEOUT_MS,
-  type RunReviewOpts,
-} from './codex';
+import { type CodexReviewResult, type RunReviewOpts } from './codex';
 import { egressStartFailure, startSeatEgressProxy } from './egress-seat';
 
-// A worktree grok seat holds a shell in the PR head and legitimately outruns the packet budget,
-// but unlike codex it has NO liveness signal yet — `-p --output-format json` prints its envelope
-// at the end, so a wedged seat and a working one look the same until the absolute watchdog
-// fires. A bigger budget is therefore also a bigger wedge cost, which is why this is 30 min and
-// not codex's 60 (CORE_WORKTREE_REVIEW_TIMEOUT_MS rests on the `--json` watchdog): double the
-// packet budget for the bigger full-review packet, while a wedge still dies in 30. Raise it to
-// codex's figure once grok exposes a progress stream to arm `inactivityTimeoutMs` on.
-export const GROK_WORKTREE_REVIEW_TIMEOUT_MS = 1_800_000; // 30 min runaway backstop
+// GROK NOW HAS A LIVENESS SIGNAL, and these three numbers are what that bought.
+//
+// The old shape: `-p --output-format json` printed ONE envelope at the very end, so a wedged seat
+// and a working one looked identical until the absolute watchdog fired. `inactivityTimeoutMs` had
+// nothing to reset on, the absolute cap WAS the only watchdog, and a bigger budget was therefore
+// also a bigger wedge cost — which is why the worktree seat was held at 30 min rather than codex's
+// 60. The header said: "Raise it to codex's figure once grok exposes a progress stream to arm
+// `inactivityTimeoutMs` on." `--output-format streaming-messages-json --include-partial-messages`
+// is that stream (verified live 2026-09-07 on the pinned grok 1.0.5): NDJSON where even the model's
+// REASONING arrives as `thinking_delta` events, so silence really does mean a wedge and never
+// "it is thinking hard".
+//
+// So the roles swap, exactly as they did for codex. The LIVENESS watchdog is now the one doing the
+// real work — it reclaims a wedge in 15 min of silence on BOTH paths — and the absolute caps
+// degrade to pure runaway backstops, sized PAST honest work rather than at it. That matters:
+// grok-4.6 at xhigh now takes 10–15 min per seat almost regardless of packet size (2026-09-05:
+// 9.9–14.6 min finished, and two seats died at exactly 15.0 min — the right tail of honest work,
+// killed by a cap that was never meant to police it). A killed honest seat loses everything already
+// paid for; a wedge now dies in 15 either way.
+export const GROK_PACKET_REVIEW_TIMEOUT_MS = 1_800_000; // 30 min runaway backstop
+export const GROK_WORKTREE_REVIEW_TIMEOUT_MS = 3_600_000; // 60 min runaway backstop (codex's figure)
+
+// The liveness watchdog: this long with NOTHING on stdout means a wedged seat, not a slow one.
+// Sized at CODEX_INACTIVITY_TIMEOUT_MS for the same reason — it is the seat's OLD ENTIRE packet
+// budget, so honest work is never worse off than it was before the watchdog existed, while a wedge
+// dies in 15 min instead of 30/60. grok's stream is finer-grained than codex's (per-token deltas,
+// not per-completed-item), so 15 min of true silence is an even stronger wedge signal here.
+export const GROK_INACTIVITY_TIMEOUT_MS = 900_000; // 15 min of SILENCE
+
+// The bounded NDJSON tail kept as a diagnostic when a seat is reclaimed — what it was doing last.
+// Smaller than codex's 1 MB because grok streams per-TOKEN deltas: 100 KB is already thousands of
+// events, and the tail is a post-mortem, not the reply.
+const GROK_STREAM_TAIL_LIMIT = 100_000; // 100 KB
 
 // The Grok (xAI) review adapter — the second cross-vendor lens beside Codex. It
 // mirrors codex.ts but for the THREE ways grok's CLI differs (verified live
 // 2026-06-29, grok v0.2.73):
 //   1. The reply prints to STDOUT, not an `-o` file → runReviewerExec in stdout
 //      mode (the codex path is outfile mode; the watchdog/group-kill are shared).
-//   2. `--output-format json` wraps the reply in an envelope {text,stopReason,…};
-//      the actual review is `.text` (which itself carries the ```json findings
-//      block → parseFindings, the SAME path codex uses; grok's `--json-schema`
-//      is unreliable so we never use it — symmetry IS robustness here).
+//   2. `--output-format streaming-messages-json --include-partial-messages`
+//      prints NDJSON while it works and hands the WHOLE reply back on its final
+//      `result` line; the actual review is that line's `.result` (which itself
+//      carries the ```json findings block → parseFindings, the SAME path codex
+//      uses; grok's `--json-schema` is unreliable so we never use it — symmetry
+//      IS robustness here). See parseGrokStream.
 //   3. Read-only is an OS-enforced `--sandbox` profile (Seatbelt/Landlock),
 //      fail-closed — NOT codex's `-s read-only`. This is safety-critical: a
 //      reviewer must provably never mutate the work (see ensureSandboxProfile).
@@ -202,7 +225,11 @@ export const GROK_SANDBOX_PROFILE: SandboxProfileRef = {
 
 // PURE: the exact grok CLI args for a review. Encodes every lived lesson as DATA
 // so a unit test pins it: `-p <prompt>` (single-turn, prints to stdout) ·
-// `--output-format json` (the envelope gives a real `stopReason` terminal signal)
+// `--output-format streaming-messages-json` + `--include-partial-messages` (the
+// NDJSON progress stream — it is what ARMS the liveness watchdog, and its final
+// `result` line still carries a real `stop_reason` terminal signal; the pair is
+// load-bearing, `--include-partial-messages` is what makes the deltas flow
+// DURING work rather than only at each block's end)
 // · `-m <model>` + `--effort <effort>` (the CONFIGURED strong model) ·
 // `--sandbox <profile>` (THE boundary — an OS-enforced read-only sandbox, never
 // tool-denial) · `--cwd <neutral>` (the diff is IN the prompt, not the cwd —
@@ -218,7 +245,8 @@ export function buildGrokReviewArgs(
     '-p',
     prompt,
     '--output-format',
-    'json',
+    'streaming-messages-json',
+    '--include-partial-messages',
     '-m',
     config.model,
     '--effort',
@@ -234,10 +262,92 @@ export function buildGrokReviewArgs(
   ];
 }
 
-// Pull the review text out of grok's `--output-format json` envelope. The reply
-// is `.text` (it carries the ```json findings block, which parseFindings then
-// reads). Falls back to the raw stdout if it isn't the expected envelope (e.g. a
-// plain-format surprise) so a format drift degrades, not crashes.
+// What one grok NDJSON stream says, reduced to the facts the seat acts on.
+export interface GrokStreamSummary {
+  // How many well-formed STREAM OBJECTS were seen (a line with a `type`). Zero means the stdout was
+  // never grok's NDJSON at all — which is precisely the signal that licenses the legacy-envelope
+  // fallback below. Non-zero with `sawResult: false` means a stream that was CUT: fail closed.
+  events: number;
+  isError: boolean;
+  sawResult: boolean;
+  stopReason: string | null;
+  subtype: string | null;
+  // The whole reply, or null. NEVER reassembled from deltas — see below.
+  text: string | null;
+}
+
+// PURE: read grok's `--output-format streaming-messages-json` NDJSON.
+//
+// Line shapes (verified live 2026-09-07, grok 1.0.5 — fixtures/grok/streaming-messages.ndjson):
+//   {"type":"system","subtype":"init",…}                       once, first
+//   {"type":"stream_event","event":{…}}                        while working — message_start,
+//     content_block_start/_delta/_stop (thinking_delta | text_delta), message_delta, message_stop
+//   {"type":"assistant","message":{content:[…],"stop_reason":…}}
+//   {"type":"result","subtype":"success","is_error":false,"result":"<the whole reply>",…}  LAST
+//
+// TWO RULES CARRY THE WHOLE DESIGN:
+//
+// 1. THE REPLY IS THE `result` LINE, never the deltas. grok hands the complete text back on that
+//    one line, so there is nothing to reassemble — and reassembling would be actively WRONG: a
+//    stream cut mid-answer would yield a plausible-looking HALF REVIEW that parseFindings would
+//    happily read as a completed review with fewer findings. A partial review is not a review.
+//    No `result` line ⇒ `text: null`, `sawResult: false` ⇒ the caller records failed-reviewer.
+// 2. A BROKEN LINE IS SKIPPED, NEVER THROWN. The watchdog kills the process GROUP mid-write, so a
+//    reclaimed seat's last line is routinely a partial object. Parsing must survive that: this is
+//    the post-mortem path, and it must not itself explode.
+//
+// `text` is returned ONLY on an unambiguous success — `is_error === false`, `subtype === "success"`,
+// and a non-empty string after trim. A refusal or a length-stop still emits a valid `result` line,
+// and returning its (empty or error) payload would let parseFindings read an empty, falsely
+// "reviewed" findings object — the same trap extractGrokText's empty-`.text` guard exists for.
+export function parseGrokStream(stdout: string): GrokStreamSummary {
+  const summary: GrokStreamSummary = {
+    events: 0,
+    isError: false,
+    sawResult: false,
+    stopReason: null,
+    subtype: null,
+    text: null,
+  };
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue;
+    let obj: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (typeof parsed !== 'object' || parsed === null) continue;
+      obj = parsed as Record<string, unknown>;
+    } catch {
+      continue; // a partial line (killed mid-write) or noise — never fatal (rule 2)
+    }
+    if (typeof obj.type !== 'string') continue; // not a stream object → not counted as an event
+    summary.events++;
+    if (obj.type !== 'result') continue;
+    // The terminal line. Take the LAST one if grok ever emitted more than one.
+    summary.sawResult = true;
+    summary.isError = obj.is_error === true;
+    summary.subtype = typeof obj.subtype === 'string' ? obj.subtype : null;
+    summary.stopReason = typeof obj.stop_reason === 'string' ? obj.stop_reason : null;
+    const reply = typeof obj.result === 'string' ? obj.result : '';
+    summary.text =
+      !summary.isError && summary.subtype === 'success' && reply.trim() ? reply : null;
+  }
+  return summary;
+}
+
+// THE LEGACY FALLBACK, kept deliberately. Pulls the review out of grok's OLD
+// `--output-format json` envelope, where the reply was `.text`. Reached only when
+// parseGrokStream saw NO stream objects at all (`events === 0`) AND the raw stdout does
+// not itself look like a stream line — i.e. a future grok that ignores or drops
+// `streaming-messages-json` and answers in the old shape, or in plain text. That drift
+// then DEGRADES to a working review instead of crashing the seat.
+//
+// It is NOT reachable for a CUT stream, including one cut INSIDE its very first line. A
+// stream cut after at least one full line already fails the `events === 0` gate. A stream
+// cut inside its first line still has `events === 0` (the truncated line never parses),
+// so runGrokReview also sniffs the raw stdout itself (`/^\s*\{\s*"type"\s*:/`) and skips
+// this function whenever it looks stream-shaped — otherwise this function's raw-stdout
+// degrade would hand parseFindings that partial line as if it were a review. Fail closed
+// is the only correct answer in both cases.
 export function extractGrokText(stdout: string): string | null {
   try {
     const env = JSON.parse(stdout) as { text?: unknown };
@@ -256,16 +366,19 @@ export function extractGrokText(stdout: string): string | null {
 
 // Invoke Grok READ-ONLY with the embedded packet prompt over the shared
 // runReviewerExec spawn contract (the same group-aware watchdog + backstop codex
-// uses — grok forks a leader/subagents, so the group-kill is mandatory). Returns
-// the same shape as runCodexReview so the caller treats both reviewers uniformly:
-// `raw` is grok's `.text` (ready for parseFindings). On grok's separate xAI quota.
+// uses — grok forks a leader/subagents, so the group-kill is mandatory, PLUS the
+// liveness watchdog its NDJSON stream now arms). Returns the same shape as
+// runCodexReview so the caller treats both reviewers uniformly: `raw` is the
+// stream's `result` reply (ready for parseFindings), `stream` its bounded NDJSON
+// tail, `timedOutReason` which watchdog fired. On grok's separate xAI quota.
 export async function runGrokReview(
   prompt: string,
   config: ReviewerConfig,
   opts: RunReviewOpts = {}
 ): Promise<CodexReviewResult> {
   const timeoutMs =
-    opts.timeoutMs ?? (opts.worktree ? GROK_WORKTREE_REVIEW_TIMEOUT_MS : REVIEW_TIMEOUT_MS);
+    opts.timeoutMs ??
+    (opts.worktree ? GROK_WORKTREE_REVIEW_TIMEOUT_MS : GROK_PACKET_REVIEW_TIMEOUT_MS);
   // Pin the boundary to a proven read-only profile (provisioning the resolved one,
   // which is exactly what buildGrokReviewArgs will pass to --sandbox).
   const sandbox = resolveReviewSandbox(config.sandbox);
@@ -333,24 +446,49 @@ export async function runGrokReview(
   try {
     ensureSandboxProfile(sandbox);
     cwd = worktreeCwd ?? fs.mkdtempSync(path.join(os.tmpdir(), 'grok-review-'));
-    const { raw, stderrTail, timedOut } = await runReviewerExec({
+    const { raw, stderrTail, timedOut, timedOutReason } = await runReviewerExec({
       args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
       bin: resolveGrokBin(),
       capture: 'stdout',
       ...(proxy ? { env: proxyEnv(proxy.url) } : {}),
+      // THE LIVENESS WATCHDOG. Under `capture: 'stdout'` the accumulated stdout IS what resets it
+      // (spawn.ts), and grok's NDJSON now flows throughout the work — so this reclaims a WEDGED
+      // seat in 15 min while `timeoutMs` above stands back as a pure runaway backstop.
+      inactivityTimeoutMs: GROK_INACTIVITY_TIMEOUT_MS,
       onSpawn: opts.onSpawn,
       stderrLimit: 2000,
       timeoutMs,
     });
-    const text = raw ? extractGrokText(raw) : null;
+    const stream = raw ? parseGrokStream(raw) : null;
+    // The reply is the stream's `result` line. The legacy envelope is tried ONLY when the stdout was
+    // never the NDJSON stream (`events === 0`) — a CUT stream fails closed rather than handing
+    // parseFindings a pile of half-written events dressed as a review.
+    const text = !raw || !stream
+      ? null
+      : stream.events === 0 && !/^\s*\{\s*"type"\s*:/.test(raw)
+        ? extractGrokText(raw)
+        : stream.text;
+    const stalled = timedOut && timedOutReason === 'inactivity';
     return {
       // Snapshotted HERE, in the return expression — it is evaluated before the `finally` closes the
       // proxy, so the denial audit the footer and `egress-denials.json` depend on is never lost.
       ...(proxy ? { egressDenials: [...proxy.denials] } : {}),
+      // A liveness reclaim NAMES ITSELF, the way codex's toCodexResult does: the trail must say "it
+      // went silent" (a wedge — reclaim it, do not buy it more budget) and never the generic "timed
+      // out" it shares with an honest seat the backstop cut.
+      ...(stalled
+        ? {
+            failWhy: `the liveness watchdog cut it after ${Math.round(GROK_INACTIVITY_TIMEOUT_MS / 60_000)} min of silence`,
+          }
+        : {}),
       ok: text !== null,
       raw: text,
       stderrTail,
+      // The bounded NDJSON tail: a reclaimed seat leaves a record of what it was doing, not just
+      // "it timed out". Cut on a line boundary — the trail persists it as .jsonl.
+      ...(raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {}),
       timedOut,
+      ...(timedOutReason ? { timedOutReason } : {}),
     };
   } finally {
     proxy?.close();

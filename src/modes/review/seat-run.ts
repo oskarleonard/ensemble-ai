@@ -94,9 +94,12 @@ function timedOutSummary(result: CodexReviewResult, timing: SeatTiming): string 
   const minutes = Math.round((timing.endedAt - timing.startedAt) / 60_000);
   const watchdog =
     result.timedOutReason === 'inactivity'
-      ? 'the liveness watchdog reclaimed a silent seat'
-      : 'the absolute watchdog cut it while still running';
-  return `The reviewer timed out before completing (${watchdog} after ${minutes} min) — its output is incomplete and not trusted.`;
+      ? // Elapsed is NOT the silence: a seat can work for 30 min and then go quiet for 15. Only the
+        // adapter knows its own silence budget, so it states the figure in `failWhy` (returned
+        // above); this generic wording is the fallback for a seat that named none.
+        'the liveness watchdog cut it on a silent seat'
+      : `the absolute backstop cut it after ${minutes} min`;
+  return `The reviewer timed out before completing (${watchdog}) — its output is incomplete and not trusted.`;
 }
 
 // The seat's run FACTS for the trail, written for every attempt. The stderr tail is the noise
