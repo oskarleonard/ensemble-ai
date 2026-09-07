@@ -1696,7 +1696,10 @@ function runCodexReview(prompt, config, opts = {}) {
 import fs9 from "fs";
 import os6 from "os";
 import path6 from "path";
-var GROK_WORKTREE_REVIEW_TIMEOUT_MS = 18e5;
+var GROK_PACKET_REVIEW_TIMEOUT_MS = 18e5;
+var GROK_WORKTREE_REVIEW_TIMEOUT_MS = 36e5;
+var GROK_INACTIVITY_TIMEOUT_MS = 9e5;
+var GROK_STREAM_TAIL_LIMIT = 1e5;
 var GROK_BIN_CANDIDATES = [path6.join(os6.homedir(), ".grok", "bin", "grok")];
 function resolveGrokBin() {
   return resolveBin("grok", {
@@ -1768,7 +1771,8 @@ function buildGrokReviewArgs(config, prompt, cwd) {
     "-p",
     prompt,
     "--output-format",
-    "json",
+    "streaming-messages-json",
+    "--include-partial-messages",
     "-m",
     config.model,
     "--effort",
@@ -1783,6 +1787,37 @@ function buildGrokReviewArgs(config, prompt, cwd) {
     "--no-memory"
   ];
 }
+function parseGrokStream(stdout) {
+  const summary = {
+    events: 0,
+    isError: false,
+    sawResult: false,
+    stopReason: null,
+    subtype: null,
+    text: null
+  };
+  for (const line of stdout.split("\n")) {
+    if (!line.trim()) continue;
+    let obj;
+    try {
+      const parsed = JSON.parse(line);
+      if (typeof parsed !== "object" || parsed === null) continue;
+      obj = parsed;
+    } catch {
+      continue;
+    }
+    if (typeof obj.type !== "string") continue;
+    summary.events++;
+    if (obj.type !== "result") continue;
+    summary.sawResult = true;
+    summary.isError = obj.is_error === true;
+    summary.subtype = typeof obj.subtype === "string" ? obj.subtype : null;
+    summary.stopReason = typeof obj.stop_reason === "string" ? obj.stop_reason : null;
+    const reply = typeof obj.result === "string" ? obj.result : "";
+    summary.text = !summary.isError && summary.subtype === "success" && reply.trim() ? reply : null;
+  }
+  return summary;
+}
 function extractGrokText(stdout) {
   try {
     const env = JSON.parse(stdout);
@@ -1793,7 +1828,7 @@ function extractGrokText(stdout) {
   return trimmed || null;
 }
 async function runGrokReview(prompt, config, opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? (opts.worktree ? GROK_WORKTREE_REVIEW_TIMEOUT_MS : REVIEW_TIMEOUT_MS);
+  const timeoutMs = opts.timeoutMs ?? (opts.worktree ? GROK_WORKTREE_REVIEW_TIMEOUT_MS : GROK_PACKET_REVIEW_TIMEOUT_MS);
   const sandbox = resolveReviewSandbox(config.sandbox);
   const worktreeCwd = opts.worktree;
   if (worktreeCwd && sandbox !== GROK_CLI_SANDBOX) {
@@ -1816,24 +1851,40 @@ async function runGrokReview(prompt, config, opts = {}) {
   try {
     ensureSandboxProfile(sandbox);
     cwd = worktreeCwd ?? fs9.mkdtempSync(path6.join(os6.tmpdir(), "grok-review-"));
-    const { raw, stderrTail, timedOut } = await runReviewerExec({
+    const { raw, stderrTail, timedOut, timedOutReason } = await runReviewerExec({
       args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
       bin: resolveGrokBin(),
       capture: "stdout",
       ...proxy ? { env: proxyEnv(proxy.url) } : {},
+      // THE LIVENESS WATCHDOG. Under `capture: 'stdout'` the accumulated stdout IS what resets it
+      // (spawn.ts), and grok's NDJSON now flows throughout the work — so this reclaims a WEDGED
+      // seat in 15 min while `timeoutMs` above stands back as a pure runaway backstop.
+      inactivityTimeoutMs: GROK_INACTIVITY_TIMEOUT_MS,
       onSpawn: opts.onSpawn,
       stderrLimit: 2e3,
       timeoutMs
     });
-    const text = raw ? extractGrokText(raw) : null;
+    const stream = raw ? parseGrokStream(raw) : null;
+    const text = !raw || !stream ? null : stream.events === 0 ? extractGrokText(raw) : stream.text;
+    const stalled = timedOut && timedOutReason === "inactivity";
     return {
       // Snapshotted HERE, in the return expression — it is evaluated before the `finally` closes the
       // proxy, so the denial audit the footer and `egress-denials.json` depend on is never lost.
       ...proxy ? { egressDenials: [...proxy.denials] } : {},
+      // A liveness reclaim NAMES ITSELF, the way codex's toCodexResult does: the trail must say "it
+      // went silent" (a wedge — reclaim it, do not buy it more budget) and never the generic "timed
+      // out" it shares with an honest seat the backstop cut.
+      ...stalled ? {
+        failWhy: `the liveness watchdog cut it after ${Math.round(GROK_INACTIVITY_TIMEOUT_MS / 6e4)} min of silence`
+      } : {},
       ok: text !== null,
       raw: text,
       stderrTail,
-      timedOut
+      // The bounded NDJSON tail: a reclaimed seat leaves a record of what it was doing, not just
+      // "it timed out". Cut on a line boundary — the trail persists it as .jsonl.
+      ...raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
+      timedOut,
+      ...timedOutReason ? { timedOutReason } : {}
     };
   } finally {
     proxy?.close();
@@ -7177,8 +7228,13 @@ async function adapterOnce(adapter, prompt, reviewer, opts) {
 function timedOutSummary(result, timing) {
   if (result.failWhy) return result.failWhy;
   const minutes = Math.round((timing.endedAt - timing.startedAt) / 6e4);
-  const watchdog = result.timedOutReason === "inactivity" ? "the liveness watchdog reclaimed a silent seat" : "the absolute watchdog cut it while still running";
-  return `The reviewer timed out before completing (${watchdog} after ${minutes} min) \u2014 its output is incomplete and not trusted.`;
+  const watchdog = result.timedOutReason === "inactivity" ? (
+    // Elapsed is NOT the silence: a seat can work for 30 min and then go quiet for 15. Only the
+    // adapter knows its own silence budget, so it states the figure in `failWhy` (returned
+    // above); this generic wording is the fallback for a seat that named none.
+    "the liveness watchdog cut it on a silent seat"
+  ) : `the absolute backstop cut it after ${minutes} min`;
+  return `The reviewer timed out before completing (${watchdog}) \u2014 its output is incomplete and not trusted.`;
 }
 function seatDiagnostics(result, timing) {
   return {

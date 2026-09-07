@@ -140,6 +140,16 @@ run is a human's call, never a silent downgrade. A seat that merely *times out* 
 not a viability signal, so it is not re-run: it stands as a failed reviewer, and a failed reviewer
 cannot qualify a receipt.
 
+**Two watchdogs per core seat, and the liveness one does the real work.** Both `codex` (`--json`) and
+`grok` (`--output-format streaming-messages-json --include-partial-messages`) emit a machine-readable
+progress stream while they work — grok's carries the model's *reasoning* deltas, so silence really
+does mean a wedged seat rather than a long think. **15 min with nothing on that stream** reclaims the
+seat, and the trail says so (`timedOutReason: inactivity`, plus a bounded tail of the stream beside
+the reply). The absolute cap is then a **runaway backstop** rather than the thing policing honest
+work: **60 min** in the worktree for both seats, and on the packet **30 min** for `grok` (whose seats
+now legitimately run 10-15 min) against `codex`'s 15. A killed honest seat loses everything already
+paid for; a wedge dies in 15 either way.
+
 **Honest containment.** The wrapper denies **exec** of any path inside the worktree, but a shell-capable agent can still read an untrusted file as *data* (`sh worktree/x.sh`). No-exec narrows the vector; it does not close it. The rest of the profile is the real boundary, and it is narrower than "nothing but the worktree" — state it exactly:
 
 - **Reads.** `$HOME` is not readable, so no ssh key, vendor credential, or other repo on disk is reachable — except `~/.codex`, which the seat must read to call its own API. The allowed *system* roots include `/private/var`, which contains the per-user `$TMPDIR`; a secret another process parked in its own temp dir **is** readable. The claim is "no credential in `$HOME`", not "no credential anywhere". A read root that is, or contains, `$HOME` (`~/bin/node` ⇒ `nodePrefix` = `$HOME`) is **refused**: the profile fails to build rather than grant it.

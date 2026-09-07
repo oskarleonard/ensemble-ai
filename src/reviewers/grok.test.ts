@@ -6,14 +6,32 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { fileURLToPath } from 'node:url';
+
 import {
   buildGrokReviewArgs,
   ensureSandboxProfile,
   extractGrokText,
+  GROK_INACTIVITY_TIMEOUT_MS,
+  GROK_PACKET_REVIEW_TIMEOUT_MS,
+  GROK_WORKTREE_REVIEW_TIMEOUT_MS,
+  parseGrokStream,
   resolveReviewSandbox,
   runGrokReview,
 } from './grok';
+import { REVIEW_TIMEOUT_MS } from './codex';
 import type { ReviewerConfig } from '../core/types';
+
+// The REAL captured stream (grok 1.0.5, `--output-format streaming-messages-json
+// --include-partial-messages`), scrubbed of session/uuid values. The parser is pinned against what
+// grok actually printed, not against a hand-written idea of it.
+const STREAM_FIXTURE = fs.readFileSync(
+  fileURLToPath(new URL('../../fixtures/grok/streaming-messages.ndjson', import.meta.url)),
+  'utf8'
+);
+const STREAM_LINES = STREAM_FIXTURE.trimEnd().split('\n');
+// The same stream with its terminal `result` line removed — a seat killed before it answered.
+const CUT_STREAM = `${STREAM_LINES.slice(0, -1).join('\n')}\n`;
 
 const CONFIG: ReviewerConfig = {
   cmd: 'grok',
@@ -68,12 +86,17 @@ afterEach(() => {
 });
 
 describe('buildGrokReviewArgs', () => {
-  it('pins single-turn JSON output, the configured model+effort, the deny-by-default sandbox, and the neutral cwd', () => {
+  it('pins single-turn STREAMING output, the configured model+effort, the deny-by-default sandbox, and the neutral cwd', () => {
     const args = buildGrokReviewArgs(CONFIG, 'PROMPT', '/tmp/cwd');
     // single-turn: the prompt is the value of -p (reply prints to stdout).
     expect(args[args.indexOf('-p') + 1]).toBe('PROMPT');
-    // the JSON envelope (gives a stopReason terminal signal).
-    expect(args[args.indexOf('--output-format') + 1]).toBe('json');
+    // THE LIVENESS PAIR. `streaming-messages-json` makes stdout an NDJSON progress stream (which is
+    // what arms inactivityTimeoutMs) whose final `result` line still carries a terminal stop_reason;
+    // `--include-partial-messages` is what makes the deltas flow DURING the work. A revert to the
+    // one-envelope-at-the-end `json` format would silently disarm the watchdog — hence pinned.
+    expect(args[args.indexOf('--output-format') + 1]).toBe('streaming-messages-json');
+    expect(args).toContain('--include-partial-messages');
+    expect(args.join(' ')).not.toContain('--output-format json');
     // the CONFIGURED strong model + effort, not the account default.
     expect(args[args.indexOf('-m') + 1]).toBe('grok-4.5');
     expect(args[args.indexOf('--effort') + 1]).toBe('high');
@@ -110,6 +133,105 @@ describe('buildGrokReviewArgs', () => {
   });
 });
 
+// The three numbers the liveness work bought. The LIVENESS bar is the one that polices wedges; the
+// two absolute caps are runaway backstops sized PAST honest work (grok-4.6 at xhigh legitimately
+// runs 10-15 min per seat, and the old 15-min packet cap was killing that right tail).
+describe('the grok seat watchdogs', () => {
+  it('pins the packet + worktree backstops and the silence bar', () => {
+    expect(GROK_PACKET_REVIEW_TIMEOUT_MS).toBe(30 * 60_000);
+    expect(GROK_WORKTREE_REVIEW_TIMEOUT_MS).toBe(60 * 60_000);
+    expect(GROK_INACTIVITY_TIMEOUT_MS).toBe(15 * 60_000);
+  });
+
+  it('keeps the silence bar STRICTLY under both backstops — otherwise it could never fire', () => {
+    expect(GROK_INACTIVITY_TIMEOUT_MS).toBeLessThan(GROK_PACKET_REVIEW_TIMEOUT_MS);
+    expect(GROK_INACTIVITY_TIMEOUT_MS).toBeLessThan(GROK_WORKTREE_REVIEW_TIMEOUT_MS);
+  });
+});
+
+// Reading grok's NDJSON. Two rules carry the design: the reply is the `result` line (never
+// reassembled from deltas — a partial review is not a review), and a broken line is skipped, never
+// thrown (the watchdog kills mid-write, so a post-mortem parse must survive a half-object).
+describe('parseGrokStream', () => {
+  it('reads the whole reply off the result line of a REAL captured stream', () => {
+    const s = parseGrokStream(STREAM_FIXTURE);
+    expect(s.text).toBe('probe ok');
+    expect(s.stopReason).toBe('end_turn');
+    expect(s.subtype).toBe('success');
+    expect(s.sawResult).toBe(true);
+    expect(s.isError).toBe(false);
+    expect(s.events).toBeGreaterThanOrEqual(20);
+  });
+
+  it('FAILS CLOSED on a stream cut before its result line — the deltas are never reassembled', () => {
+    // The reply text IS in this stream, as `text_delta` events. Recovering it would hand
+    // parseFindings a plausible HALF review that reads as a completed one with fewer findings.
+    expect(CUT_STREAM).toContain('text_delta');
+    const s = parseGrokStream(CUT_STREAM);
+    expect(s.sawResult).toBe(false);
+    expect(s.text).toBeNull();
+    expect(s.stopReason).toBeNull();
+    expect(s.events).toBeGreaterThan(0); // it WAS a stream — the answer just never arrived
+  });
+
+  it('ignores a trailing PARTIAL line (killed mid-write) instead of throwing', () => {
+    const halfWritten = `${CUT_STREAM}${STREAM_LINES[STREAM_LINES.length - 1].slice(0, 40)}`;
+    const s = parseGrokStream(halfWritten);
+    expect(s.sawResult).toBe(false);
+    expect(s.text).toBeNull();
+  });
+
+  it('skips a broken line mid-stream and still reads the result', () => {
+    const noisy = [
+      ...STREAM_LINES.slice(0, 3),
+      '{"type":"stream_ev',
+      ...STREAM_LINES.slice(3),
+    ].join('\n');
+    expect(parseGrokStream(noisy).text).toBe('probe ok');
+  });
+
+  it('skips blank lines', () => {
+    expect(parseGrokStream(`\n\n${STREAM_FIXTURE}\n\n`).text).toBe('probe ok');
+  });
+
+  it('returns null when the result line reports an error', () => {
+    const s = parseGrokStream(
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}\n'
+    );
+    expect(s.sawResult).toBe(true);
+    expect(s.isError).toBe(true);
+    expect(s.text).toBeNull();
+  });
+
+  it('returns null for a non-success subtype even when is_error is false', () => {
+    const s = parseGrokStream(
+      '{"type":"result","subtype":"error_max_turns","is_error":false,"result":"half an answer"}\n'
+    );
+    expect(s.subtype).toBe('error_max_turns');
+    expect(s.text).toBeNull();
+  });
+
+  it('returns null for an empty reply — a refusal still emits a valid result line', () => {
+    const s = parseGrokStream(
+      '{"type":"result","subtype":"success","is_error":false,"result":"   ","stop_reason":"refusal"}\n'
+    );
+    expect(s.sawResult).toBe(true);
+    expect(s.stopReason).toBe('refusal');
+    expect(s.text).toBeNull();
+  });
+
+  it('counts NO events for the old json envelope — which is what licenses the legacy fallback', () => {
+    const s = parseGrokStream('{"text":"REVIEW","stopReason":"EndTurn"}');
+    expect(s.events).toBe(0);
+    expect(s.sawResult).toBe(false);
+    expect(s.text).toBeNull();
+  });
+
+  it('is empty-safe', () => {
+    expect(parseGrokStream('')).toMatchObject({ events: 0, sawResult: false, text: null });
+  });
+});
+
 describe('resolveReviewSandbox', () => {
   it('keeps a proven deny-by-default profile', () => {
     expect(resolveReviewSandbox('strict')).toBe('strict');
@@ -128,7 +250,11 @@ describe('resolveReviewSandbox', () => {
   });
 });
 
-describe('extractGrokText', () => {
+// THE LEGACY FALLBACK. Not the live path any more (parseGrokStream is), but kept and kept TESTED:
+// a future grok that drops or ignores `streaming-messages-json` answers in this old shape, and the
+// seat must degrade to a working review rather than crash. runGrokReview reaches it only when the
+// stdout was never the NDJSON stream at all.
+describe('extractGrokText (legacy envelope fallback)', () => {
   it('pulls .text out of the --output-format json envelope', () => {
     const env = JSON.stringify({
       sessionId: 'x',
@@ -213,30 +339,45 @@ describe('ensureSandboxProfile', () => {
   });
 });
 
+// One NDJSON stream, as grok prints it: an init line, some work, then the terminal `result` line.
+const grokStream = (reply: string): string =>
+  [
+    JSON.stringify({ session_id: 'S', subtype: 'init', type: 'system' }),
+    JSON.stringify({ event: { type: 'message_start' }, type: 'stream_event' }),
+    JSON.stringify({
+      event: { delta: { text: reply, type: 'text_delta' }, type: 'content_block_delta' },
+      type: 'stream_event',
+    }),
+    JSON.stringify({
+      is_error: false,
+      result: reply,
+      stop_reason: 'end_turn',
+      subtype: 'success',
+      type: 'result',
+    }),
+  ].join('\n') + '\n';
+
 describe('runGrokReview (stdout capture)', () => {
-  it('captures the reply from STDOUT (piped) and returns the envelope .text on a clean close', async () => {
+  it("captures the NDJSON stream from STDOUT (piped) and returns the result line's reply on a clean close", async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
-    // stdout MUST be piped for grok (its reply is stdout, not an -o file).
+    // stdout MUST be piped for grok (its reply is stdout, not an -o file) — and under
+    // `capture: 'stdout'` that same pipe is what resets the liveness watchdog.
     expect(lastOpts.stdio[1]).toBe('pipe');
     expect(lastOpts.detached).toBe(true); // group-reapable
-    child?.stdout.emit(
-      'data',
-      Buffer.from(
-        JSON.stringify({ stopReason: 'EndTurn', text: 'REVIEW BODY' })
-      )
-    );
+    child?.stdout.emit('data', Buffer.from(grokStream('REVIEW BODY')));
     child?.emit('close');
     const result = await p;
     expect(result.ok).toBe(true);
     expect(result.raw).toBe('REVIEW BODY');
     expect(result.timedOut).toBe(false);
+    expect(result.timedOutReason).toBeUndefined();
   });
 
   it('accumulates chunked stdout before settling', async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
-    const env = JSON.stringify({ stopReason: 'EndTurn', text: 'CHUNKED' });
-    child?.stdout.emit('data', Buffer.from(env.slice(0, 10)));
-    child?.stdout.emit('data', Buffer.from(env.slice(10)));
+    const stream = grokStream('CHUNKED');
+    child?.stdout.emit('data', Buffer.from(stream.slice(0, 60)));
+    child?.stdout.emit('data', Buffer.from(stream.slice(60)));
     child?.emit('close');
     const result = await p;
     expect(result.raw).toBe('CHUNKED');
@@ -244,17 +385,54 @@ describe('runGrokReview (stdout capture)', () => {
 
   it('does NOT truncate when exit fires before the final stdout chunk (Codex f4)', async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
-    // exit arrives BEFORE the pipe has delivered the rest of the envelope — the old
-    // settle-on-exit read a truncated (invalid) JSON here. The grace defers to close.
-    child?.stdout.emit('data', Buffer.from('{"text":"FULL'));
+    // exit arrives BEFORE the pipe has delivered the rest of the RESULT LINE — settling on exit
+    // would read a half-written terminal line, i.e. a seat that answered read as one that never
+    // did. The grace defers to close.
+    const stream = grokStream('FULL REVIEW');
+    const split = stream.length - 30;
+    child?.stdout.emit('data', Buffer.from(stream.slice(0, split)));
     child?.emit('exit');
-    child?.stdout.emit('data', Buffer.from(' REVIEW"}'));
+    child?.stdout.emit('data', Buffer.from(stream.slice(split)));
     child?.emit('close');
     const result = await p;
-    expect(result.raw).toBe('FULL REVIEW'); // the whole envelope, not 'FULL'
+    expect(result.raw).toBe('FULL REVIEW');
   });
 
-  it('kills the child (group-aware) when the watchdog fires, and reports null/timedOut', async () => {
+  // FAIL CLOSED. This is the whole point of not reassembling deltas: a killed seat's stdout is a
+  // heap of half-finished NDJSON, and the ONLY safe reading of it is "no review".
+  it('fails closed on a stream cut before its result line — never the raw NDJSON as a "review"', async () => {
+    const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    child?.stdout.emit('data', Buffer.from(CUT_STREAM));
+    child?.emit('close');
+    const result = await p;
+    expect(result.ok).toBe(false);
+    expect(result.raw).toBeNull(); // NOT the NDJSON blob, which parseFindings would choke on
+  });
+
+  // FORMAT DRIFT DEGRADES, it does not crash: a grok that ignored the streaming flag answers in the
+  // old envelope, which is not a stream at all — so the legacy extractor is allowed to take it.
+  it('still reads the OLD json envelope when grok emits no stream at all', async () => {
+    const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    child?.stdout.emit(
+      'data',
+      Buffer.from(JSON.stringify({ stopReason: 'EndTurn', text: 'LEGACY REVIEW' }))
+    );
+    child?.emit('close');
+    const result = await p;
+    expect(result.ok).toBe(true);
+    expect(result.raw).toBe('LEGACY REVIEW');
+  });
+
+  it('returns a bounded NDJSON tail so a seat leaves a record of what it was doing', async () => {
+    const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    child?.stdout.emit('data', Buffer.from(grokStream('REVIEW BODY')));
+    child?.emit('close');
+    const result = await p;
+    expect(result.stream).toContain('"type":"stream_event"');
+    expect(result.stream).toContain('"subtype":"success"');
+  });
+
+  it('kills the child (group-aware) when the absolute backstop fires, and names that watchdog', async () => {
     const p = runGrokReview(
       'PROMPT',
       {
@@ -268,8 +446,50 @@ describe('runGrokReview (stdout capture)', () => {
     child?.emit('close');
     const result = await p;
     expect(result.timedOut).toBe(true);
+    expect(result.timedOutReason).toBe('absolute');
+    expect(result.failWhy).toBeUndefined(); // it was still working — not a wedge
     expect(result.ok).toBe(false);
     expect(result.raw).toBeNull();
+  });
+
+  // THE POINT OF THE WHOLE CHANGE. A seat that goes silent is reclaimed at the SILENCE bar, long
+  // before the runaway backstop, and it names itself so the trail never confuses a wedge with an
+  // honest seat the backstop cut.
+  it('reclaims a SILENT seat at the liveness bar and says so', async () => {
+    vi.useFakeTimers();
+    const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    // It spoke once, then went quiet — so the rolling bar is armed and reset, not never-started.
+    child?.stdout.emit('data', Buffer.from('{"type":"system","subtype":"init"}\n'));
+    vi.advanceTimersByTime(GROK_INACTIVITY_TIMEOUT_MS + 1_000);
+    expect(child?.kills[0]).toBe('SIGTERM');
+    child?.emit('close');
+    const result = await p;
+    expect(result.timedOut).toBe(true);
+    expect(result.timedOutReason).toBe('inactivity');
+    expect(result.failWhy).toBe('the liveness watchdog cut it after 15 min of silence');
+    expect(result.ok).toBe(false);
+    expect(result.raw).toBeNull();
+  });
+
+  // The other half of the bargain: the bar reclaims wedges, it does not police honest work. Two
+  // 14-min stretches of silence — 28 min of work, which the OLD 15-min packet cap would have
+  // killed outright — and the rolling reset carries it through untouched.
+  it('a seat that keeps streaming is NEVER cut by the liveness bar', async () => {
+    vi.useFakeTimers();
+    const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    const almost = GROK_INACTIVITY_TIMEOUT_MS - 60_000; // 14 min of quiet, then a heartbeat
+    for (let i = 0; i < 2; i++) {
+      child?.stdout.emit('data', Buffer.from(`{"type":"stream_event","n":${i}}\n`));
+      vi.advanceTimersByTime(almost);
+    }
+    expect(2 * almost).toBeGreaterThan(REVIEW_TIMEOUT_MS); // the budget this change bought back
+    expect(2 * almost).toBeLessThan(GROK_PACKET_REVIEW_TIMEOUT_MS); // still inside the backstop
+    expect(child?.kills).toHaveLength(0);
+    child?.stdout.emit('data', Buffer.from(grokStream('SLOW BUT HONEST')));
+    child?.emit('close');
+    const result = await p;
+    expect(result.timedOut).toBe(false);
+    expect(result.raw).toBe('SLOW BUT HONEST');
   });
 });
 

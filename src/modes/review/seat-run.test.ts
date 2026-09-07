@@ -232,8 +232,10 @@ describe('a seat persists its run diagnostics and progress stream beside the rep
     const seat = await worktreeSeat(adapter);
     expect(seat.review.terminalState).toBe('failed-reviewer');
     expect(seat.review.summary).toContain('timed out before completing');
-    expect(seat.review.summary).toContain('absolute watchdog');
-    expect(seat.review.summary).toMatch(/after \d+ min/);
+    // The BACKSTOP, not the liveness bar: this seat was still producing when it was cut, so the
+    // reading is "give it budget", never "it wedged".
+    expect(seat.review.summary).toMatch(/the absolute backstop cut it after \d+ min/);
+    expect(seat.review.summary).not.toContain('silent');
     expect(seat.review.diagnostics?.timedOutReason).toBe('absolute');
     expect(seat.review.diagnostics?.stderrTail).toBe('last stderr line');
     expect(seat.review.diagnostics?.elapsedMs).toBeGreaterThanOrEqual(0);
@@ -250,6 +252,29 @@ describe('a seat persists its run diagnostics and progress stream beside the rep
     expect(seat.review.summary).toBe('stalled: no --json output for 15 min (wedged seat reclaimed)');
     expect(seat.review.diagnostics?.timedOutReason).toBe('inactivity');
     expect(seat.review.diagnostics?.failWhy).toContain('stalled');
+  });
+
+  // The grok seat's own wording, carried the same way (only the adapter knows its silence budget —
+  // elapsed time is NOT the silence, since a seat can work 40 min and then go quiet for 15).
+  it("carries the grok seat's liveness wording through as the summary", async () => {
+    const { adapter } = stubAdapter([
+      timedOut({
+        failWhy: 'the liveness watchdog cut it after 15 min of silence',
+        timedOutReason: 'inactivity',
+      }),
+    ]);
+    const seat = await worktreeSeat(adapter);
+    expect(seat.review.summary).toBe('the liveness watchdog cut it after 15 min of silence');
+    expect(seat.review.terminalState).toBe('failed-reviewer');
+    expect(seat.review.diagnostics?.timedOutReason).toBe('inactivity');
+  });
+
+  // A seat that named no wording still must not read as "it was still working".
+  it('falls back to a reason-aware wording when the adapter named none', async () => {
+    const { adapter } = stubAdapter([timedOut({ timedOutReason: 'inactivity' })]);
+    const seat = await worktreeSeat(adapter);
+    expect(seat.review.summary).toContain('the liveness watchdog cut it on a silent seat');
+    expect(seat.review.summary).not.toContain('absolute backstop');
   });
 
   it('the progress stream lands as <id>-stream.jsonl in the trail, and a reviewed seat still records timing', async () => {
