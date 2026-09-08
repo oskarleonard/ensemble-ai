@@ -2843,6 +2843,20 @@ function removeLockIfOwned(lock, token) {
   } catch {
   }
 }
+function holderPidFromToken(token) {
+  const m = /^(\d+):/.exec(token);
+  if (!m) return null;
+  const pid = Number(m[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+function isHolderDead(pid) {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (e) {
+    return e.code === "ESRCH";
+  }
+}
 function tryAcquireOnce(lock, token, staleMs) {
   try {
     const fd = fs12.openSync(lock, fs12.constants.O_CREAT | fs12.constants.O_EXCL | fs12.constants.O_WRONLY, 384);
@@ -2865,8 +2879,17 @@ function tryAcquireOnce(lock, token, staleMs) {
     if (e.code !== "EEXIST") throw e;
     try {
       const held = fs12.readFileSync(lock, "utf8").trim();
-      const age = Date.now() - fs12.statSync(lock).mtimeMs;
-      if (age > staleMs) removeLockIfOwned(lock, held);
+      const pid = holderPidFromToken(held);
+      if (pid !== null && isHolderDead(pid)) {
+        process.stderr.write(
+          `\u26A0 ensemble-ai: reclaiming worktree lock at ${lock} \u2014 holder pid ${pid} is gone
+`
+        );
+        removeLockIfOwned(lock, held);
+      } else {
+        const age = Date.now() - fs12.statSync(lock).mtimeMs;
+        if (age > staleMs) removeLockIfOwned(lock, held);
+      }
     } catch {
     }
     return null;
@@ -6182,6 +6205,7 @@ export {
   gatherConventions,
   hasDepSurface,
   hasGeneratedHeader,
+  holderPidFromToken,
   holisticCapWasLifted,
   homeReadDenyRules,
   isCommitSha,
@@ -6191,6 +6215,7 @@ export {
   isEnsembleStagedReview,
   isEvidenceClass,
   isEvidenceSeat,
+  isHolderDead,
   isHolisticRecord,
   isImplemented,
   isMode,
@@ -6258,6 +6283,7 @@ export {
   receiptPolicyVersion,
   redactUrlCredentials,
   remoteSlug,
+  removeLockIfOwned,
   renderCodeReviewSeatPrompt,
   renderCodexSandboxProfile,
   renderCritiquePrompt,

@@ -399,8 +399,10 @@ export function isStrippedPath(p: string, stripped: readonly string[]): boolean 
 }
 
 // Serialize per repo: `git worktree add` writes into the SHARED `.git`. O_EXCL create is the
-// lock; a stale lock older than the TTL is reclaimed (a crashed run must not wedge the repo
-// forever). Returns a release function; never throws on release.
+// lock; a stale lock is reclaimed so a crashed run cannot wedge the repo forever — either
+// because its holder pid is provably DEAD (reclaimed at once) or, for a token with no live/dead
+// signal, because its mtime is older than the TTL. Returns a release function; never throws on
+// release.
 //
 // OWNERSHIP IS PROVEN, NOT ASSUMED. A blind `unlink(lock)` on release is unsafe once reclaim
 // exists: holder A stalls past the TTL, B reclaims and takes the lock, A finishes and its
@@ -412,11 +414,35 @@ function lockToken(): string {
   return `${process.pid}:${randomUUID()}`;
 }
 
-function removeLockIfOwned(lock: string, token: string): void {
+export function removeLockIfOwned(lock: string, token: string): void {
   try {
     if (fs.readFileSync(lock, 'utf8').trim() === token) fs.unlinkSync(lock);
   } catch {
     /* gone, or replaced by another holder — either way it is not ours to remove */
+  }
+}
+
+// The holder pid a token records (`lockToken()` writes `${pid}:${uuid}`). Returns null for any
+// token that does not begin with a positive-integer pid — a legacy or hand-written token then
+// falls back to the mtime TTL rule instead of being force-reclaimed on a guess.
+export function holderPidFromToken(token: string): number | null {
+  const m = /^(\d+):/.exec(token);
+  if (!m) return null;
+  const pid = Number(m[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+// Is the process that holds the lock gone? `process.kill(pid, 0)` sends NO signal — it only probes
+// whether the pid is deliverable. ESRCH ⇒ no such process: the holder died mid-hold (the wedge this
+// reclaim exists for), so its lock is a corpse. EPERM ⇒ the pid exists but is owned by another user
+// (a foreign LIVE process, possibly a reused number): treat it as ALIVE and keep the TTL rule —
+// force-reclaiming there could delete a lock a genuinely-running process still holds.
+export function isHolderDead(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ESRCH';
   }
 }
 
@@ -462,10 +488,24 @@ function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => vo
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
     try {
       const held = fs.readFileSync(lock, 'utf8').trim();
-      const age = Date.now() - fs.statSync(lock).mtimeMs;
-      // Reclaim ONLY the exact stale lock we just observed: if the holder released and a third
-      // process took it in between, `held` no longer matches and we leave the new lock alone.
-      if (age > staleMs) removeLockIfOwned(lock, held);
+      // A lock whose holder pid is DEAD is stale regardless of the TTL: a process that died
+      // holding it (a killed/crashed provisioning) can never release, so waiting out the full
+      // TTL just wedges every sibling for ten minutes against a corpse. A token with no parseable
+      // pid, or one whose pid is still alive, keeps the mtime TTL rule below.
+      const pid = holderPidFromToken(held);
+      if (pid !== null && isHolderDead(pid)) {
+        process.stderr.write(
+          `⚠ ensemble-ai: reclaiming worktree lock at ${lock} — holder pid ${pid} is gone\n`
+        );
+        // Reclaim ONLY the exact token we observed (the ownership guard re-reads and compares),
+        // so a holder that released and a third process's fresh lock are never removed.
+        removeLockIfOwned(lock, held);
+      } else {
+        const age = Date.now() - fs.statSync(lock).mtimeMs;
+        // Reclaim ONLY the exact stale lock we just observed: if the holder released and a third
+        // process took it in between, `held` no longer matches and we leave the new lock alone.
+        if (age > staleMs) removeLockIfOwned(lock, held);
+      }
     } catch {
       /* raced with the holder — just wait */
     }
