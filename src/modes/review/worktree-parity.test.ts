@@ -29,6 +29,16 @@ function reapedDeadPid(): number {
   return r.pid;
 }
 
+// A TRUE orphan stand-in: double-forked so its parent (`sh`) exits at once and the sleeper is
+// reparented to init — exactly the production shape. (A direct child of this process would sit
+// as a zombie until reaped, which the sync acquire's blocking wait would never allow.)
+function orphanedSleeper(): number {
+  const out = spawnSync('sh', ['-c', 'sleep 60 >/dev/null 2>&1 & echo $!'], { encoding: 'utf8' });
+  const pid = Number(out.stdout.trim());
+  expect(Number.isInteger(pid) && pid > 0).toBe(true);
+  return pid;
+}
+
 // THE PARITY PIN. The async twins exist so a server consumer can materialize without freezing
 // its event loop (lived 2026-07-17: a sync 760-file checkout on a request path took a prod
 // dashboard dark for ~5 minutes). The design promise is "one protocol, two waiting styles —
@@ -398,25 +408,44 @@ describe('acquireRepoLockAsync — same file, same protocol, loop-friendly wait'
   // dead REGARDLESS of the TTL, exactly like the sync acquire (worktree.test.ts). Both share
   // tryAcquireOnce today, but that shared path is precisely what this suite exists to pin — a
   // future fork of the EEXIST branch in only one acquire must fail here, not ship green.
-  it('reclaims a dead-pid holder at once when no orphaned git child runs, and holds while one does — exactly like the sync acquire', async () => {
+  it('settles a dead holder exactly like the sync acquire: no in-lock git → reclaim; ambiguous → TTL; confirmed orphan → terminate then reclaim', async () => {
     const dir = lockDir();
     const lock = path.join(dir, 'ensemble-ai-worktree.lock');
     const dead = reapedDeadPid();
     expect(isHolderDead(dead)).toBe(true); // precondition: the reaped child really is gone
     fs.writeFileSync(lock, `${dead}:crashed-provisioning`);
-    // An orphan is still writing: held (the TTL rule applies) — parity with sync.
+    // Ambiguous (a live-parented in-lock git somewhere): held, the TTL rule applies.
     await expect(
-      acquireRepoLockAsync(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, orphanProbe: () => true })
+      acquireRepoLockAsync(dir, {
+        retries: 1,
+        sleepMs: 1,
+        staleMs: 60 * 60_000,
+        scanner: async () => ({ orphans: [], others: 1, unknown: false }),
+      })
     ).rejects.toThrow(/could not acquire the worktree lock/);
-    // No orphan: reclaimed at once, far inside a TTL that will not expire.
+    // A confirmed orphan (a detached sleeper this test owns): terminated, then reclaimed —
+    // through the NON-blocking async path (the scanner answers a Promise).
+    const pid = orphanedSleeper();
     const release = await acquireRepoLockAsync(dir, {
       retries: 3,
       sleepMs: 1,
       staleMs: 60 * 60_000,
-      orphanProbe: () => false,
+      scanner: async () => ({ orphans: [pid], others: 0, unknown: false }),
     });
     expect(fs.readFileSync(lock, 'utf8')).not.toContain('crashed-provisioning');
+    expect(isHolderDead(pid)).toBe(true);
     release();
+    // No in-lock git at all: reclaimed at once.
+    fs.writeFileSync(lock, `${dead}:crashed-again`);
+    const release2 = await acquireRepoLockAsync(dir, {
+      retries: 3,
+      sleepMs: 1,
+      staleMs: 60 * 60_000,
+      scanner: async () => ({ orphans: [], others: 0, unknown: false }),
+    });
+    expect(fs.existsSync(lock)).toBe(true);
+    expect(fs.readFileSync(lock, 'utf8')).not.toContain('crashed-again');
+    release2();
     expect(fs.existsSync(lock)).toBe(false);
   });
 

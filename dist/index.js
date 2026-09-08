@@ -2642,10 +2642,12 @@ function persistGatePacket(baseDir, runId, input) {
 
 // src/modes/review/worktree.ts
 import { execFileSync as execFileSync5 } from "child_process";
+import * as childProcess from "child_process";
 import { randomUUID } from "crypto";
 import fs12 from "fs";
 import path11 from "path";
 import { setTimeout as sleepAsync } from "timers/promises";
+import { promisify } from "util";
 
 // src/modes/review/git-exec.ts
 import { execFileSync as execFileSync4 } from "child_process";
@@ -2873,77 +2875,205 @@ function isHolderDead(pid) {
     return e.code === "ESRCH";
   }
 }
-function hasOrphanedGitChild(psOutput, parentDead) {
+var IN_LOCK_GIT_SIGNATURE = "core.hooksPath=/dev/null";
+var PS_ARGS = ["-axo", "pid=,ppid=,command="];
+var PS_OPTS = { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 5e3 };
+var SCAN_MEMO_MS = 5e3;
+var ORPHAN_KILL_GRACE_MS = 1500;
+function listInLockGitProcesses(psOutput, parentDead) {
+  const out = [];
   for (const line of psOutput.split("\n")) {
     const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
     if (!m) continue;
+    const pid = Number(m[1]);
     const ppid = Number(m[2]);
     const cmd = m[3];
-    if (!/(^|[\s/])git\s/.test(cmd) || !cmd.includes("core.hooksPath=/dev/null")) continue;
-    if (ppid === 1 || parentDead(ppid)) return true;
+    if (!/(^|[\s/])git\s/.test(cmd) || !cmd.includes(IN_LOCK_GIT_SIGNATURE)) continue;
+    if (pid === process.pid) continue;
+    out.push({ orphan: ppid === 1 || parentDead(ppid), pid, ppid });
   }
-  return false;
+  return out;
 }
-function orphanedGitChildrenExist() {
-  try {
-    const out = execFileSync5("ps", ["-axo", "pid=,ppid=,command="], {
-      encoding: "utf8",
-      maxBuffer: 16 * 1024 * 1024,
-      timeout: 5e3
-    });
-    return hasOrphanedGitChild(out, isHolderDead);
-  } catch {
-    return true;
-  }
+function summarizeInLockGit(procs) {
+  return {
+    orphans: procs.filter((p) => p.orphan).map((p) => p.pid),
+    others: procs.filter((p) => !p.orphan).length,
+    unknown: false
+  };
 }
-var DEFAULT_LOCK_STALE_MS = GIT_TIMEOUT_MS + 5 * 6e4;
-function touchRepoLock(gitCommonDir) {
-  const lock = repoLockPath(gitCommonDir);
-  const now = /* @__PURE__ */ new Date();
-  try {
-    if (!fs12.readFileSync(lock, "utf8").trim().startsWith(`${process.pid}:`)) return;
-    fs12.utimesSync(lock, now, now);
-  } catch {
-  }
-}
-function tryAcquireOnce(lock, token, staleMs, orphanProbe) {
-  try {
-    const fd = fs12.openSync(lock, fs12.constants.O_CREAT | fs12.constants.O_EXCL | fs12.constants.O_WRONLY, 384);
-    try {
-      fs12.writeSync(fd, token);
-      fs12.closeSync(fd);
-    } catch (we) {
-      try {
-        fs12.closeSync(fd);
-      } catch {
-      }
-      try {
-        fs12.unlinkSync(lock);
-      } catch {
-      }
-      throw we;
-    }
-    return () => removeLockIfOwned(lock, token);
-  } catch (e) {
-    if (e.code !== "EEXIST") throw e;
-    try {
-      const held = fs12.readFileSync(lock, "utf8").trim();
-      const pid = holderPidFromToken(held);
-      const dead = pid !== null && isHolderDead(pid);
-      const age = Date.now() - fs12.statSync(lock).mtimeMs;
-      const reclaim = age > staleMs || dead && !orphanProbe();
-      if (reclaim) {
-        const reclaimed = removeLockIfOwned(lock, held);
-        if (reclaimed && dead) {
-          process.stderr.write(
-            `\u26A0 ensemble-ai: reclaimed worktree lock at ${lock} \u2014 holder pid ${pid} was gone (no orphaned git child running, or the lock aged past the TTL)
+var UNKNOWN_SCAN = { orphans: [], others: 0, unknown: true };
+var scanFailureLogged = false;
+function scanFailed(e) {
+  if (!scanFailureLogged) {
+    scanFailureLogged = true;
+    const why = e instanceof Error ? e.message : String(e);
+    process.stderr.write(
+      `\u26A0 ensemble-ai: could not scan for in-lock git processes (${why}) \u2014 dead-holder reclaim falls back to the TTL
 `
-          );
-        }
-      }
+    );
+  }
+  return UNKNOWN_SCAN;
+}
+var scanMemo = null;
+function memoized() {
+  return scanMemo && Date.now() - scanMemo.at < SCAN_MEMO_MS ? scanMemo.scan : null;
+}
+function remember(scan) {
+  scanMemo = { at: Date.now(), scan };
+  return scan;
+}
+function resetInLockGitScanMemoForTests() {
+  scanMemo = null;
+}
+function scanInLockGit() {
+  const hit = memoized();
+  if (hit) return hit;
+  try {
+    const out = execFileSync5("ps", PS_ARGS, PS_OPTS);
+    return remember(summarizeInLockGit(listInLockGitProcesses(out, isHolderDead)));
+  } catch (e) {
+    return scanFailed(e);
+  }
+}
+async function scanInLockGitAsync() {
+  const hit = memoized();
+  if (hit) return hit;
+  try {
+    const { stdout } = await promisify(childProcess.execFile)("ps", PS_ARGS, PS_OPTS);
+    return remember(summarizeInLockGit(listInLockGitProcesses(stdout, isHolderDead)));
+  } catch (e) {
+    return scanFailed(e);
+  }
+}
+function decideDeadHolder(scan) {
+  if (scan.unknown) return "ttl";
+  if (scan.orphans.length > 0) return "terminate-orphans";
+  return scan.others > 0 ? "ttl" : "reclaim";
+}
+function signalAll(pids, signal) {
+  for (const pid of pids) {
+    try {
+      process.kill(pid, signal);
     } catch {
     }
+  }
+}
+var alivePids = (pids) => pids.filter((p) => !isHolderDead(p));
+function terminateOrphansSync(pids) {
+  signalAll(pids, "SIGTERM");
+  const deadline = Date.now() + ORPHAN_KILL_GRACE_MS;
+  let alive = alivePids(pids);
+  while (alive.length > 0 && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    alive = alivePids(pids);
+  }
+  if (alive.length > 0) {
+    signalAll(alive, "SIGKILL");
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  }
+  scanMemo = null;
+  return alivePids(pids);
+}
+async function terminateOrphansAsync(pids) {
+  signalAll(pids, "SIGTERM");
+  const deadline = Date.now() + ORPHAN_KILL_GRACE_MS;
+  let alive = alivePids(pids);
+  while (alive.length > 0 && Date.now() < deadline) {
+    await sleepAsync(50);
+    alive = alivePids(pids);
+  }
+  if (alive.length > 0) {
+    signalAll(alive, "SIGKILL");
+    await sleepAsync(100);
+  }
+  scanMemo = null;
+  return alivePids(pids);
+}
+var DEFAULT_LOCK_STALE_MS = GIT_TIMEOUT_MS + 5 * 6e4;
+function touchLockIfOwned(lock, token) {
+  try {
+    if (fs12.readFileSync(lock, "utf8").trim() !== token) return false;
+    const now = /* @__PURE__ */ new Date();
+    fs12.utimesSync(lock, now, now);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function makeRelease(lock, token) {
+  const release = () => {
+    removeLockIfOwned(lock, token);
+  };
+  return Object.assign(release, { touch: () => touchLockIfOwned(lock, token) });
+}
+function touchLease(release) {
+  release.touch?.();
+}
+function tryCreate(lock, token) {
+  let fd;
+  try {
+    fd = fs12.openSync(lock, fs12.constants.O_CREAT | fs12.constants.O_EXCL | fs12.constants.O_WRONLY, 384);
+  } catch (e) {
+    if (e.code === "EEXIST") return "contended";
+    throw e;
+  }
+  try {
+    fs12.writeSync(fd, token);
+    fs12.closeSync(fd);
+  } catch (we) {
+    try {
+      fs12.closeSync(fd);
+    } catch {
+    }
+    try {
+      fs12.unlinkSync(lock);
+    } catch {
+    }
+    throw we;
+  }
+  return makeRelease(lock, token);
+}
+function readContention(lock) {
+  try {
+    const held = fs12.readFileSync(lock, "utf8").trim();
+    const pid = holderPidFromToken(held);
+    return {
+      age: Date.now() - fs12.statSync(lock).mtimeMs,
+      dead: pid !== null && isHolderDead(pid),
+      held,
+      pid
+    };
+  } catch {
     return null;
+  }
+}
+function reclaimContended(lock, c, why) {
+  if (removeLockIfOwned(lock, c.held)) {
+    process.stderr.write(`\u26A0 ensemble-ai: reclaimed worktree lock at ${lock} \u2014 ${why}
+`);
+  }
+}
+function settleDeadHolder(lock, c, scan, survivors) {
+  switch (decideDeadHolder(scan)) {
+    case "reclaim":
+      reclaimContended(lock, c, `holder pid ${c.pid} was gone and no in-lock git process is running`);
+      return;
+    case "terminate-orphans":
+      if (survivors && survivors.length === 0) {
+        reclaimContended(
+          lock,
+          c,
+          `holder pid ${c.pid} was gone; terminated its orphaned git ${scan.orphans.join(", ")}`
+        );
+      } else if (survivors) {
+        process.stderr.write(
+          `\u26A0 ensemble-ai: orphaned git ${survivors.join(", ")} of dead holder ${c.pid} survived termination \u2014 keeping the TTL rule for ${lock}
+`
+        );
+      }
+      return;
+    case "ttl":
+      return;
   }
 }
 function lockPathAndBudget(gitCommonDir, opts) {
@@ -2951,19 +3081,50 @@ function lockPathAndBudget(gitCommonDir, opts) {
   const sleepMs = Math.max(1, opts.sleepMs ?? 500);
   const staleMs = opts.staleMs ?? DEFAULT_LOCK_STALE_MS;
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
-  const orphanProbe = opts.orphanProbe ?? orphanedGitChildrenExist;
-  return { lock, orphanProbe, retries, sleepMs, staleMs };
+  return { lock, retries, sleepMs, staleMs };
 }
 function lockWedgedError(lock, retries, sleepMs) {
   return new Error(
     `ensemble-ai: ${WORKTREE_LOCK_ERROR} at ${lock} after ${retries} attempts (${Math.round(retries * sleepMs / 1e3)}s) \u2014 another review is materializing a worktree in this repo`
   );
 }
+function attemptSync(lock, token, staleMs, scanner) {
+  const created = tryCreate(lock, token);
+  if (created !== "contended") return created;
+  const c = readContention(lock);
+  if (!c) return null;
+  if (c.age > staleMs) {
+    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? "unknown"})`);
+    return null;
+  }
+  if (!c.dead) return null;
+  const scanned = scanner();
+  const scan = scanned instanceof Promise ? UNKNOWN_SCAN : scanned;
+  const survivors = decideDeadHolder(scan) === "terminate-orphans" ? terminateOrphansSync(scan.orphans) : null;
+  settleDeadHolder(lock, c, scan, survivors);
+  return null;
+}
+async function attemptAsync(lock, token, staleMs, scanner) {
+  const created = tryCreate(lock, token);
+  if (created !== "contended") return created;
+  const c = readContention(lock);
+  if (!c) return null;
+  if (c.age > staleMs) {
+    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? "unknown"})`);
+    return null;
+  }
+  if (!c.dead) return null;
+  const scan = await scanner();
+  const survivors = decideDeadHolder(scan) === "terminate-orphans" ? await terminateOrphansAsync(scan.orphans) : null;
+  settleDeadHolder(lock, c, scan, survivors);
+  return null;
+}
 function acquireRepoLock(gitCommonDir, opts = {}) {
-  const { lock, orphanProbe, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const scanner = opts.scanner ?? scanInLockGit;
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
-    const release = tryAcquireOnce(lock, token, staleMs, orphanProbe);
+    const release = attemptSync(lock, token, staleMs, scanner);
     if (release) return release;
     if (i === retries) break;
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleepMs);
@@ -2971,10 +3132,11 @@ function acquireRepoLock(gitCommonDir, opts = {}) {
   throw lockWedgedError(lock, retries, sleepMs);
 }
 async function acquireRepoLockAsync(gitCommonDir, opts = {}) {
-  const { lock, orphanProbe, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const scanner = opts.scanner ?? scanInLockGitAsync;
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
-    const release = tryAcquireOnce(lock, token, staleMs, orphanProbe);
+    const release = await attemptAsync(lock, token, staleMs, scanner);
     if (release) return release;
     if (i === retries) break;
     await sleepAsync(sleepMs);
@@ -3006,7 +3168,7 @@ function materializeWorktree(args, deps) {
     if (!fetched.ok) {
       return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
     }
-    touchRepoLock(gitCommonDir);
+    touchLease(release);
     const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     dir = path11.join(parent, "head");
     const added = deps.git(
@@ -3017,7 +3179,7 @@ function materializeWorktree(args, deps) {
       const kind = /invalid reference|not a valid object|unknown revision/i.test(added.error) ? "no-such-pr" : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
-    touchRepoLock(gitCommonDir);
+    touchLease(release);
     const head = deps.git(["rev-parse", "HEAD"], { cwd: dir });
     const actual = head.ok ? head.text.trim() : "";
     if (actual !== args.headSha) {
@@ -3120,7 +3282,7 @@ async function materializeWorktreeAsync(args, deps) {
     if (!fetched.ok) {
       return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
     }
-    touchRepoLock(gitCommonDir);
+    touchLease(release);
     const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     dir = path11.join(parent, "head");
     const added = await deps.git(
@@ -3131,7 +3293,7 @@ async function materializeWorktreeAsync(args, deps) {
       const kind = /invalid reference|not a valid object|unknown revision/i.test(added.error) ? "no-such-pr" : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
-    touchRepoLock(gitCommonDir);
+    touchLease(release);
     const head = await deps.git(["rev-parse", "HEAD"], { cwd: dir });
     const actual = head.ok ? head.text.trim() : "";
     if (actual !== args.headSha) {
@@ -6237,6 +6399,7 @@ export {
   consult_exports as consult,
   coverageCounts,
   coverageShortfall,
+  decideDeadHolder,
   defaultCodexSandboxPaths,
   defaultReceiptStore,
   defuseUntrusted,
@@ -6262,7 +6425,6 @@ export {
   gatherConventions,
   hasDepSurface,
   hasGeneratedHeader,
-  hasOrphanedGitChild,
   holderPidFromToken,
   holisticCapWasLifted,
   homeReadDenyRules,
@@ -6291,6 +6453,7 @@ export {
   isVoiceId,
   keyOf,
   killTree,
+  listInLockGitProcesses,
   listReviewers,
   listVoices,
   loadHolisticFixture,
@@ -6308,7 +6471,6 @@ export {
   memoryConventionReader,
   omittedLine,
   oneOf,
-  orphanedGitChildrenExist,
   parseConventionCitation,
   parseCritique,
   parseDiffFiles,
@@ -6353,6 +6515,7 @@ export {
   renderSummaryBody,
   renderSynthesisPrompt,
   repoIdFromSlug,
+  resetInLockGitScanMemoForTests,
   resolveBase,
   resolveBin,
   resolveCiEvidence,
@@ -6386,6 +6549,8 @@ export {
   sanitizePathSegment,
   scanDependencySurface,
   scanDiffForSecrets,
+  scanInLockGit,
+  scanInLockGitAsync,
   scanTextForSecrets,
   scoreHolisticFixture,
   section,
@@ -6398,8 +6563,11 @@ export {
   stripSecurityTag,
   stripTrailingCommas,
   summarizeCoverage,
+  summarizeInLockGit,
+  terminateOrphansAsync,
+  terminateOrphansSync,
   titleCase,
-  touchRepoLock,
+  touchLockIfOwned,
   validateReceiptShape,
   verifyFixtureAnchors,
   verifySiteAtHead,

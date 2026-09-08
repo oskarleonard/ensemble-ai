@@ -1,8 +1,10 @@
 import { execFileSync } from 'node:child_process';
+import * as childProcess from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { setTimeout as sleepAsync } from 'node:timers/promises';
+import { promisify } from 'node:util';
 
 import { makeOwnerOnlyTempDir } from '../../core/artifacts';
 
@@ -221,7 +223,7 @@ const WORKTREE_PARENT_PREFIX = 'ensemble-worktree-';
 
 // The per-repo lock file lives in the shared `.git` common dir. ONE derivation of its path, so the
 // acquire, the lease refresh, and the reclaim can never touch different files (a drift would make
-// touchRepoLock silently refresh nothing).
+// the lease refresh silently touch nothing).
 function repoLockPath(gitCommonDir: string): string {
   return path.join(gitCommonDir, 'ensemble-ai-worktree.lock');
 }
@@ -471,154 +473,297 @@ export function isHolderDead(pid: number): boolean {
 // holder and reclaiming exactly that holder).
 // THE DEAD-HOLDER RECLAIM. A dead holder pid does NOT prove the critical section is over: the
 // lock serializes child `git fetch` / `git worktree add` processes, and a SIGKILL/OOM of the Node
-// parent leaves a REPARENTED git child still writing the shared .git — UNTIMED, because
-// GIT_TIMEOUT_MS is the parent's execFileSync timer and dies with it (#83 review, all three
-// vendors converged; no fixed grace can bound that). So a dead holder's lock is reclaimed at once
-// ONLY when no orphaned in-lock git child is running on this host — nothing can still be writing;
-// while one is, the live-holder TTL rule applies exactly as before. The probe is a `ps` scan for
-// a `git` process carrying this module's INERT_GIT_CONFIG signature whose parent is gone
-// (reparented to pid 1, or a ppid that no longer exists).
-export type OrphanGitProbe = () => boolean;
+// parent leaves a REPARENTED git child still writing the shared .git — UNTIMED, because the
+// per-command git timeout is the parent's execFileSync timer and dies with it (#83 review; no
+// fixed grace can bound that). So when the holder is dead, the reclaimer scans the host for
+// in-lock git processes (this module's INERT_GIT_CONFIG signature) and decides:
+//   • none at all            → nothing can be writing → reclaim NOW;
+//   • CONFIRMED orphans      → parent gone (reparented to pid 1, or a dead ppid): abandoned by
+//                              construction — nobody will ever consume their result — so they are
+//                              TERMINATED (SIGTERM, then SIGKILL) and the lock is reclaimed once
+//                              they are gone. A writer that survives (EPERM) keeps the TTL rule;
+//   • AMBIGUOUS (live parent) → a sibling review in another repo, or an orphan adopted by a
+//                              subreaper — indistinguishable from here → the TTL rule, exactly as
+//                              before this change;
+//   • scan failed            → unknown → the TTL rule (logged once per process).
+// The scan is memoized for a few seconds so a waiting sibling never forks `ps` per retry, and the
+// async acquire runs it without blocking the event loop.
+export interface InLockGitProcess {
+  orphan: boolean;
+  pid: number;
+  ppid: number;
+}
+export interface InLockGitScan {
+  orphans: number[];
+  others: number;
+  unknown: boolean;
+}
+export type InLockGitScanner = () => InLockGitScan | Promise<InLockGitScan>;
+
+const IN_LOCK_GIT_SIGNATURE = 'core.hooksPath=/dev/null';
+const PS_ARGS = ['-axo', 'pid=,ppid=,command='];
+const PS_OPTS = { encoding: 'utf8' as const, maxBuffer: 16 * 1024 * 1024, timeout: 5_000 };
+const SCAN_MEMO_MS = 5_000;
+const ORPHAN_KILL_GRACE_MS = 1_500;
 
 // Pure classifier over `ps -axo pid=,ppid=,command=` output — unit-testable without processes.
-export function hasOrphanedGitChild(
+// Only a `git` carrying this module's inert-config signature counts; this process itself never
+// does (its own children are parented, not orphaned).
+export function listInLockGitProcesses(
   psOutput: string,
   parentDead: (pid: number) => boolean
-): boolean {
+): InLockGitProcess[] {
+  const out: InLockGitProcess[] = [];
   for (const line of psOutput.split('\n')) {
     const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
     if (!m) continue;
+    const pid = Number(m[1]);
     const ppid = Number(m[2]);
     const cmd = m[3];
-    if (!/(^|[\s/])git\s/.test(cmd) || !cmd.includes('core.hooksPath=/dev/null')) continue;
-    if (ppid === 1 || parentDead(ppid)) return true;
+    if (!/(^|[\s/])git\s/.test(cmd) || !cmd.includes(IN_LOCK_GIT_SIGNATURE)) continue;
+    if (pid === process.pid) continue;
+    out.push({ orphan: ppid === 1 || parentDead(ppid), pid, ppid });
   }
-  return false;
+  return out;
 }
 
-// The live probe. Fails CLOSED: if `ps` is unavailable or errors, report "an orphan may exist" so
-// the reclaim falls back to the TTL rule rather than racing a writer it could not see. The 16 MB
-// buffer is load-bearing, NOT decorative: `execFileSync`'s default maxBuffer is 1 MB, and a full
-// `ps -axo …` dump on a busy host (thousands of processes, long argv) blows past that and throws
-// ENOBUFS on EVERY call — which the catch turns into a permanent, silent fail-closed that reverts
-// the whole dead-holder reclaim to the TTL wedge this probe exists to avoid (cross-vendor review,
-// claude-f4).
-export function orphanedGitChildrenExist(): boolean {
-  try {
-    const out = execFileSync('ps', ['-axo', 'pid=,ppid=,command='], {
-      encoding: 'utf8',
-      maxBuffer: 16 * 1024 * 1024,
-      timeout: 5_000,
-    });
-    return hasOrphanedGitChild(out, isHolderDead);
-  } catch {
-    return true;
+export function summarizeInLockGit(procs: InLockGitProcess[]): InLockGitScan {
+  return {
+    orphans: procs.filter((p) => p.orphan).map((p) => p.pid),
+    others: procs.filter((p) => !p.orphan).length,
+    unknown: false,
+  };
+}
+
+const UNKNOWN_SCAN: InLockGitScan = { orphans: [], others: 0, unknown: true };
+let scanFailureLogged = false;
+function scanFailed(e: unknown): InLockGitScan {
+  if (!scanFailureLogged) {
+    scanFailureLogged = true;
+    const why = e instanceof Error ? e.message : String(e);
+    process.stderr.write(
+      `⚠ ensemble-ai: could not scan for in-lock git processes (${why}) — dead-holder reclaim falls back to the TTL\n`
+    );
   }
+  return UNKNOWN_SCAN;
+}
+
+let scanMemo: { at: number; scan: InLockGitScan } | null = null;
+function memoized(): InLockGitScan | null {
+  return scanMemo && Date.now() - scanMemo.at < SCAN_MEMO_MS ? scanMemo.scan : null;
+}
+function remember(scan: InLockGitScan): InLockGitScan {
+  scanMemo = { at: Date.now(), scan };
+  return scan;
+}
+export function resetInLockGitScanMemoForTests(): void {
+  scanMemo = null;
+}
+
+// The live scanners: sync for the sync acquire, non-blocking for the async twin.
+export function scanInLockGit(): InLockGitScan {
+  const hit = memoized();
+  if (hit) return hit;
+  try {
+    const out = execFileSync('ps', PS_ARGS, PS_OPTS);
+    return remember(summarizeInLockGit(listInLockGitProcesses(out, isHolderDead)));
+  } catch (e) {
+    return scanFailed(e);
+  }
+}
+export async function scanInLockGitAsync(): Promise<InLockGitScan> {
+  const hit = memoized();
+  if (hit) return hit;
+  try {
+    // Resolved lazily: consumer test suites mock node:child_process without execFile.
+    const { stdout } = await promisify(childProcess.execFile)('ps', PS_ARGS, PS_OPTS);
+    return remember(summarizeInLockGit(listInLockGitProcesses(stdout, isHolderDead)));
+  } catch (e) {
+    return scanFailed(e);
+  }
+}
+
+export type DeadHolderDecision = 'reclaim' | 'terminate-orphans' | 'ttl';
+export function decideDeadHolder(scan: InLockGitScan): DeadHolderDecision {
+  if (scan.unknown) return 'ttl';
+  if (scan.orphans.length > 0) return 'terminate-orphans';
+  return scan.others > 0 ? 'ttl' : 'reclaim';
+}
+
+function signalAll(pids: number[], signal: NodeJS.Signals): void {
+  for (const pid of pids) {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      /* already gone, or not ours to signal (EPERM) — the survivor check decides */
+    }
+  }
+}
+const alivePids = (pids: number[]): number[] => pids.filter((p) => !isHolderDead(p));
+
+// Terminate CONFIRMED orphans (SIGTERM, a short grace, then SIGKILL). Returns the survivors —
+// a non-empty list (e.g. EPERM on a foreign-owned process) means the reclaim must NOT proceed.
+export function terminateOrphansSync(pids: number[]): number[] {
+  signalAll(pids, 'SIGTERM');
+  const deadline = Date.now() + ORPHAN_KILL_GRACE_MS;
+  let alive = alivePids(pids);
+  while (alive.length > 0 && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    alive = alivePids(pids);
+  }
+  if (alive.length > 0) {
+    signalAll(alive, 'SIGKILL');
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  }
+  scanMemo = null; // the host changed under us — the next scan must be fresh
+  return alivePids(pids);
+}
+export async function terminateOrphansAsync(pids: number[]): Promise<number[]> {
+  signalAll(pids, 'SIGTERM');
+  const deadline = Date.now() + ORPHAN_KILL_GRACE_MS;
+  let alive = alivePids(pids);
+  while (alive.length > 0 && Date.now() < deadline) {
+    await sleepAsync(50);
+    alive = alivePids(pids);
+  }
+  if (alive.length > 0) {
+    signalAll(alive, 'SIGKILL');
+    await sleepAsync(100);
+  }
+  scanMemo = null;
+  return alivePids(pids);
 }
 
 // The default TTL for a holder that is (or may be) ALIVE. Tied to the per-command git timeout:
-// the holder touches the lock after each completed op, so a live holder's lock is never older
-// than ONE op — which git-exec bounds at GIT_TIMEOUT_MS. The TTL therefore clears one op plus
-// margin by construction (the hold-duration invariant, structural instead of a comment).
+// the holder refreshes its lease after each completed op, so a live holder's lock is never older
+// than ONE op — which git-exec bounds at GIT_TIMEOUT_MS (a consumer's own async runner MUST bound
+// its commands the same way; see GitRunAsync). The TTL therefore clears one op plus margin by
+// construction (the hold-duration invariant, structural instead of a comment).
 export const DEFAULT_LOCK_STALE_MS = GIT_TIMEOUT_MS + 5 * 60_000;
 
-// Lease refresh: the holder calls this after each completed in-lock op so the live-holder TTL
-// measures "time since the holder last made progress", not time since acquire. OWNED refresh only:
-// the token starts with the holder's pid, so a lock this process does not hold (released and
-// taken by a sibling) is never re-leased from here. Best-effort and silent — a missing lock or a
-// refused utimes must never fail the materialization that just succeeded.
-export function touchRepoLock(gitCommonDir: string): void {
-  const lock = repoLockPath(gitCommonDir);
-  const now = new Date();
+// A lease refresh proves the EXACT token: the holder's release function carries it, so a lock
+// this process no longer holds (released and taken by a sibling) is never re-leased. Best-effort
+// and silent — a missing lock or a refused utimes must never fail the op that just succeeded.
+export type LockRelease = (() => void) & { touch: () => boolean };
+export function touchLockIfOwned(lock: string, token: string): boolean {
   try {
-    if (!fs.readFileSync(lock, 'utf8').trim().startsWith(`${process.pid}:`)) return;
+    if (fs.readFileSync(lock, 'utf8').trim() !== token) return false;
+    const now = new Date();
     fs.utimesSync(lock, now, now);
+    return true;
   } catch {
-    /* no lock to refresh (released / reclaimed) or a read-only fs — nothing to do */
+    return false;
   }
 }
+function makeRelease(lock: string, token: string): LockRelease {
+  const release = () => {
+    removeLockIfOwned(lock, token);
+  };
+  return Object.assign(release, { touch: () => touchLockIfOwned(lock, token) });
+}
+// Materialize paths call this after each completed in-lock op; an injected test lock (a bare
+// release function) simply has no lease to refresh.
+function touchLease(release: (() => void) & { touch?: () => boolean }): void {
+  release.touch?.();
+}
 
-function tryAcquireOnce(
-  lock: string,
-  token: string,
-  staleMs: number,
-  orphanProbe: OrphanGitProbe
-): (() => void) | null {
+// One exclusive-create attempt. Returns the release on success; 'contended' on EEXIST; throws
+// any other errno (ENOENT/EACCES/EROFS are caller bugs, never contention — claude-f4 r2).
+function tryCreate(lock: string, token: string): LockRelease | 'contended' {
+  let fd: number;
   try {
-    const fd = fs.openSync(lock, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-    // ANY failure after the exclusive create — write OR close — must unlink the lock this
-    // process just made, or it strands a lock file with no releaser and every later acquire
-    // reads contention until the staleMs reclaim (DEFAULT_LOCK_STALE_MS). The r2 fix guarded only the
-    // write and left the trailing closeSync OUTSIDE the recovery — the same strand class,
-    // one line later; r3's only unanimous finding (codex+grok+claude, grounded verbatim).
-    // The file is unconditionally ours on this path: O_EXCL proved we created it.
-    try {
-      fs.writeSync(fd, token);
-      fs.closeSync(fd);
-    } catch (we) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        /* already closed, or close is what failed — the unlink below is the recovery */
-      }
-      try {
-        fs.unlinkSync(lock);
-      } catch {
-        /* worst case: the stale reclaim gets it */
-      }
-      throw we;
-    }
-    return () => removeLockIfOwned(lock, token);
+    fd = fs.openSync(lock, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
   } catch (e) {
-    // ONLY EEXIST is contention. A bare catch here turned every other errno — a nonexistent
-    // gitCommonDir (ENOENT), a permissions refusal (EACCES), a read-only fs (EROFS) — into
-    // "someone holds the lock", which the acquire loop then retries for the FULL budget
-    // (DEFAULT_LOCK_STALE_MS at defaults). On a CLI that was a slow confusing failure; on a server
-    // request path it is a multi-minute hang for a caller bug that should throw in one millisecond.
-    // (Cross-vendor review of this very diff, claude-f4 — confirmed against the hunk.)
-    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return 'contended';
+    throw e;
+  }
+  // ANY failure after the exclusive create — write OR close — must unlink the lock this process
+  // just made, or it strands a lock file with no releaser (r3's unanimous finding).
+  try {
+    fs.writeSync(fd, token);
+    fs.closeSync(fd);
+  } catch (we) {
     try {
-      const held = fs.readFileSync(lock, 'utf8').trim();
-      // A lock whose holder pid is DEAD is stale regardless of the TTL: a process that died
-      // holding it (a killed/crashed provisioning) can never release, so waiting out the full
-      // TTL just wedges every sibling for the whole DEFAULT_LOCK_STALE_MS against a corpse. A token
-      // with no parseable pid, or one whose pid is still alive, keeps the mtime TTL rule instead —
-      // `isHolderDead` is only probed when the token yields a pid at all.
-      const pid = holderPidFromToken(held);
-      const dead = pid !== null && isHolderDead(pid);
-      const age = Date.now() - fs.statSync(lock).mtimeMs;
-      // A DEAD holder is reclaimed at once when no orphaned in-lock git child is running on this
-      // host (its critical section is provably over); while one is, the live-holder TTL rule
-      // applies. A live or unknown holder keeps the TTL rule. Age = time since the holder last
-      // touched the lock (acquire, or a completed in-lock op). The TTL is checked first so the
-      // expensive `ps` orphan probe only runs when a dead holder is still within its TTL — the one
-      // case where the probe actually decides the outcome.
-      const reclaim = age > staleMs || (dead && !orphanProbe());
-      // Reclaim ONLY the exact token we observed: the ownership guard re-reads and compares, so if
-      // the holder released and a third process took the lock in between, `held` no longer matches
-      // and we leave that new lock alone. The dead-pid log fires AFTER the reclaim and only when it
-      // actually removed the lock — so a write failure (e.g. a closed fd 2 on a daemonized
-      // consumer) can never skip the reclaim, and the line never announces a reclaim that a
-      // token-change race refused.
-      if (reclaim) {
-        const reclaimed = removeLockIfOwned(lock, held);
-        if (reclaimed && dead) {
-          process.stderr.write(
-            `⚠ ensemble-ai: reclaimed worktree lock at ${lock} — holder pid ${pid} was gone (no orphaned git child running, or the lock aged past the TTL)\n`
-          );
-        }
-      }
+      fs.closeSync(fd);
     } catch {
-      /* raced with the holder — just wait */
+      /* already closed, or close is what failed — the unlink below is the recovery */
     }
+    try {
+      fs.unlinkSync(lock);
+    } catch {
+      /* worst case: the stale reclaim gets it */
+    }
+    throw we;
+  }
+  return makeRelease(lock, token);
+}
+
+interface Contention {
+  age: number;
+  dead: boolean;
+  held: string;
+  pid: number | null;
+}
+// What the contended lock says about its holder; null when the holder released meanwhile.
+function readContention(lock: string): Contention | null {
+  try {
+    const held = fs.readFileSync(lock, 'utf8').trim();
+    const pid = holderPidFromToken(held);
+    return {
+      age: Date.now() - fs.statSync(lock).mtimeMs,
+      dead: pid !== null && isHolderDead(pid),
+      held,
+      pid,
+    };
+  } catch {
     return null;
   }
 }
 
+// Reclaim ONLY the exact token we observed: removeLockIfOwned re-reads and compares, so if the
+// holder released and a third process took the lock in between, `held` no longer matches and the
+// new lock is left alone. The log fires AFTER the reclaim and only when it actually removed the
+// lock — a write failure can never skip the reclaim, and it never announces a refused one.
+function reclaimContended(lock: string, c: Contention, why: string): void {
+  if (removeLockIfOwned(lock, c.held)) {
+    process.stderr.write(`⚠ ensemble-ai: reclaimed worktree lock at ${lock} — ${why}\n`);
+  }
+}
+
+// The shared dead-holder ladder, after the scan (sync and async differ only in how they scanned
+// and how they wait while terminating). Survivors of a termination keep the TTL rule.
+function settleDeadHolder(
+  lock: string,
+  c: Contention,
+  scan: InLockGitScan,
+  survivors: number[] | null
+): void {
+  switch (decideDeadHolder(scan)) {
+    case 'reclaim':
+      reclaimContended(lock, c, `holder pid ${c.pid} was gone and no in-lock git process is running`);
+      return;
+    case 'terminate-orphans':
+      if (survivors && survivors.length === 0) {
+        reclaimContended(
+          lock,
+          c,
+          `holder pid ${c.pid} was gone; terminated its orphaned git ${scan.orphans.join(', ')}`
+        );
+      } else if (survivors) {
+        process.stderr.write(
+          `⚠ ensemble-ai: orphaned git ${survivors.join(', ')} of dead holder ${c.pid} survived termination — keeping the TTL rule for ${lock}\n`
+        );
+      }
+      return;
+    case 'ttl':
+      return;
+  }
+}
+
 export interface LockOpts {
-  // Injectable for tests; production uses the live `ps` probe.
-  orphanProbe?: OrphanGitProbe;
   retries?: number;
+  // Injectable for tests; production uses the live `ps` scanners.
+  scanner?: InLockGitScanner;
   sleepMs?: number;
   staleMs?: number;
 }
@@ -636,13 +781,11 @@ function lockPathAndBudget(gitCommonDir: string, opts: LockOpts) {
   //
   // THE HOLD-DURATION INVARIANT (protocol-wide, both waiting styles): a live holder's lock must
   // never be reclaimed mid-materialization. It is structural now, not a comment: the holder
-  // touches the lock after every completed in-lock op (touchRepoLock — the mtime heartbeat the
-  // old comment asked for), so the lock's age never exceeds ONE op, and DEFAULT_LOCK_STALE_MS is
-  // derived from that op's git timeout plus margin. A dead holder is reclaimed at once when no
-  // orphaned git child is running (its critical section is provably over); otherwise this same TTL.
+  // refreshes its lease after every completed in-lock op, so the lock's age never exceeds ONE
+  // op, and DEFAULT_LOCK_STALE_MS is derived from that op's git timeout plus margin. A dead
+  // holder is settled by the in-lock git scan above (reclaim / terminate orphans / TTL).
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
-  const orphanProbe = opts.orphanProbe ?? orphanedGitChildrenExist;
-  return { lock, orphanProbe, retries, sleepMs, staleMs };
+  return { lock, retries, sleepMs, staleMs };
 }
 
 function lockWedgedError(lock: string, retries: number, sleepMs: number): Error {
@@ -651,51 +794,62 @@ function lockWedgedError(lock: string, retries: number, sleepMs: number): Error 
   );
 }
 
-export function acquireRepoLock(
-  gitCommonDir: string,
-  opts: LockOpts = {}
-): () => void {
-  const { lock, orphanProbe, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+// One acquire attempt, sync. A contended lock past the TTL is reclaimed by age alone; a dead
+// holder inside the TTL is settled by the scan. An injected scanner that answers a Promise
+// cannot be awaited here → treated as unknown (the TTL rule), never as "no orphans".
+function attemptSync(lock: string, token: string, staleMs: number, scanner: InLockGitScanner): LockRelease | null {
+  const created = tryCreate(lock, token);
+  if (created !== 'contended') return created;
+  const c = readContention(lock);
+  if (!c) return null;
+  if (c.age > staleMs) {
+    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? 'unknown'})`);
+    return null;
+  }
+  if (!c.dead) return null;
+  const scanned = scanner();
+  const scan = scanned instanceof Promise ? UNKNOWN_SCAN : scanned;
+  const survivors = decideDeadHolder(scan) === 'terminate-orphans' ? terminateOrphansSync(scan.orphans) : null;
+  settleDeadHolder(lock, c, scan, survivors);
+  return null;
+}
+
+async function attemptAsync(lock: string, token: string, staleMs: number, scanner: InLockGitScanner): Promise<LockRelease | null> {
+  const created = tryCreate(lock, token);
+  if (created !== 'contended') return created;
+  const c = readContention(lock);
+  if (!c) return null;
+  if (c.age > staleMs) {
+    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? 'unknown'})`);
+    return null;
+  }
+  if (!c.dead) return null;
+  const scan = await scanner();
+  const survivors =
+    decideDeadHolder(scan) === 'terminate-orphans' ? await terminateOrphansAsync(scan.orphans) : null;
+  settleDeadHolder(lock, c, scan, survivors);
+  return null;
+}
+
+export function acquireRepoLock(gitCommonDir: string, opts: LockOpts = {}): LockRelease {
+  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const scanner = opts.scanner ?? scanInLockGit;
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
-    const release = tryAcquireOnce(lock, token, staleMs, orphanProbe);
+    const release = attemptSync(lock, token, staleMs, scanner);
     if (release) return release;
     if (i === retries) break; // the budget is spent — don't sleep just to throw (r3, grok-f2)
-    // Synchronous sleep because THIS FUNCTION is synchronous (the CLI path has nothing else to
-    // do) — NOT because the exclusion needs it. The lock is the O_EXCL FILE: its held state is
-    // indifferent to what the holder's thread does, and a sibling's create fails on the file,
-    // not on our call stack — so holding it across an `await` opens no window
-    // (acquireRepoLockAsync below holds this same lock the same way; worktree-parity.test.ts
-    // pins the claim). The previous comment here asserted the opposite ("an async gap would let
-    // a sibling interleave a worktree add") — that was WRONG, and believing it kept a consumer
-    // dashboard's event loop frozen for the length of every large materialization. A comment
-    // asserting a concurrency property belongs in a test, not prose.
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleepMs);
   }
   throw lockWedgedError(lock, retries, sleepMs);
 }
 
-// The async twin — SAME lock file, SAME token write, SAME staleness rule (all shared via
-// tryAcquireOnce, so the two acquires cannot drift), with the one difference that the
-// between-attempts sleep yields the event loop instead of freezing it. For a SERVER consumer
-// this is the whole point: a request path can wait its turn on the repo lock without taking
-// every other request hostage. Mixed holders interoperate live — an old sync CLI holding the
-// lock makes this waiter retry, and vice versa — because the protocol is the file, not the
-// caller's threading model.
-//
-// NO CANCELLATION IN v1 — do not abandon the returned promise. A caller that Promise.races
-// this and walks away leaves the loop polling; if it later acquires, the lock is held with
-// no releaser until the staleMs reclaim. Bound waiting with `retries`, never with a race
-// (r2 review, claude-f1 — accepted as a documented contract rather than grown into an
-// AbortSignal API no current consumer needs).
-export async function acquireRepoLockAsync(
-  gitCommonDir: string,
-  opts: LockOpts = {}
-): Promise<() => void> {
-  const { lock, orphanProbe, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+export async function acquireRepoLockAsync(gitCommonDir: string, opts: LockOpts = {}): Promise<LockRelease> {
+  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const scanner = opts.scanner ?? scanInLockGitAsync;
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
-    const release = tryAcquireOnce(lock, token, staleMs, orphanProbe);
+    const release = await attemptAsync(lock, token, staleMs, scanner);
     if (release) return release;
     if (i === retries) break; // the budget is spent — don't sleep just to throw (r3, grok-f2)
     await sleepAsync(sleepMs);
@@ -710,7 +864,7 @@ export function materializeWorktree(
   args: { headSha: string; location: RepoLocation; pr: number; worktreeRoot?: string },
   // `lock` is injected so the serialization can be exercised (and stubbed) independently of the
   // real repo — the default IS the per-repo O_EXCL lock.
-  deps: { git: GitRun; lock?: (gitCommonDir: string) => () => void }
+  deps: { git: GitRun; lock?: (gitCommonDir: string) => (() => void) | LockRelease }
 ): PreflightError | Worktree {
   const { location } = args;
   const common = deps.git(['rev-parse', '--git-common-dir'], { cwd: location.repoRoot });
@@ -746,7 +900,7 @@ export function materializeWorktree(
     // Do NOT add --no-recurse-submodules here: `git worktree add` rejects it on every git ("unknown
     // option" — it killed every real materialization until 2026-07-10). The inert posture holds
     // without it; see the submodule bullet in this file's header.
-    touchRepoLock(gitCommonDir); // lease refresh: the fetch completed, the age clock restarts
+    touchLease(release); // lease refresh: the fetch completed, the age clock restarts
     const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     dir = path.join(parent, 'head');
     const added = deps.git(
@@ -759,7 +913,7 @@ export function materializeWorktree(
         : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
-    touchRepoLock(gitCommonDir); // lease refresh: the add completed
+    touchLease(release); // lease refresh: the add completed
     const head = deps.git(['rev-parse', 'HEAD'], { cwd: dir });
     const actual = head.ok ? head.text.trim() : '';
     if (actual !== args.headSha) {
@@ -832,6 +986,8 @@ export function reapWorktree(repoRoot: string, dir: string, deps: { git: GitRun 
 // failure, not a code-review hope. The sync versions remain the CLI path (nothing else to
 // do while materializing) — this is one protocol with two waiting styles, not a fork.
 
+// CONTRACT: a consumer's async runner MUST bound every command (a GIT_TIMEOUT_MS-class timeout) —
+// the lock's live-holder TTL is derived from that bound (DEFAULT_LOCK_STALE_MS).
 export type GitRunAsync = (
   args: string[],
   opts?: { cwd?: string; env?: Record<string, string> }
@@ -892,7 +1048,7 @@ export async function materializeWorktreeAsync(
   args: { headSha: string; location: RepoLocation; pr: number; worktreeRoot?: string },
   deps: {
     git: GitRunAsync;
-    lock?: (gitCommonDir: string) => Promise<() => void> | (() => void);
+    lock?: (gitCommonDir: string) => Promise<(() => void) | LockRelease> | (() => void) | LockRelease;
   }
 ): Promise<PreflightError | Worktree> {
   const { location } = args;
@@ -920,7 +1076,7 @@ export async function materializeWorktreeAsync(
       return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
     }
     // Materialize by SHA, not FETCH_HEAD — same reasoning as the sync twin above.
-    touchRepoLock(gitCommonDir); // lease refresh: the fetch completed, the age clock restarts
+    touchLease(release); // lease refresh: the fetch completed, the age clock restarts
     const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     dir = path.join(parent, 'head');
     const added = await deps.git(
@@ -933,7 +1089,7 @@ export async function materializeWorktreeAsync(
         : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
-    touchRepoLock(gitCommonDir); // lease refresh: the add completed
+    touchLease(release); // lease refresh: the add completed
     const head = await deps.git(['rev-parse', 'HEAD'], { cwd: dir });
     const actual = head.ok ? head.text.trim() : '';
     if (actual !== args.headSha) {
