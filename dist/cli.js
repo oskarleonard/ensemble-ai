@@ -2169,11 +2169,11 @@ async function runBrainstormMode(opts) {
 // src/modes/review/claude.ts
 import fs16 from "fs";
 import os9 from "os";
-import path13 from "path";
+import path14 from "path";
 
 // src/modes/review/history-packet.ts
 import fs15 from "fs";
-import path12 from "path";
+import path13 from "path";
 
 // src/modes/review/ensemble-config.ts
 import fs11 from "fs";
@@ -3097,8 +3097,73 @@ function hunkCodeLines(hunk) {
 // src/modes/review/worktree.ts
 import { randomUUID } from "crypto";
 import fs14 from "fs";
-import path11 from "path";
+import path12 from "path";
 import { setTimeout as sleepAsync } from "timers/promises";
+
+// src/modes/review/git-exec.ts
+import { execFileSync as execFileSync4 } from "child_process";
+import path11 from "path";
+function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
+  const cmd = configured?.trim();
+  if (!cmd) return "ssh -o BatchMode=yes";
+  const bin = path11.basename(cmd.split(/\s+/)[0]);
+  return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
+}
+function effectiveSshCommand(cwd, cache) {
+  const key = cwd ?? "";
+  if (cache.has(key)) return cache.get(key);
+  let value = process.env.GIT_SSH_COMMAND?.trim() || void 0;
+  if (!value) {
+    try {
+      value = execFileSync4("git", ["config", "--get", "core.sshCommand"], {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"]
+      }).trim() || void 0;
+    } catch {
+      value = void 0;
+    }
+  }
+  cache.set(key, value);
+  return value;
+}
+function nonInteractiveEnv(configuredSsh) {
+  const ssh = nonInteractiveSshCommand(configuredSsh);
+  return {
+    GIT_ASKPASS: "",
+    GIT_TERMINAL_PROMPT: "0",
+    SSH_ASKPASS: "",
+    // Absent ⇒ git resolves ssh itself, from the user's own GIT_SSH_COMMAND or core.sshCommand.
+    ...ssh ? { GIT_SSH_COMMAND: ssh } : {}
+  };
+}
+var GIT_TIMEOUT_MS = 6e5;
+var GIT_MAX_BUFFER = 64 * 1024 * 1024;
+function execGit() {
+  const sshByCwd = /* @__PURE__ */ new Map();
+  return (args, opts) => {
+    try {
+      const text = execFileSync4("git", args, {
+        cwd: opts?.cwd,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ...nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)),
+          ...opts?.env ?? {}
+        },
+        maxBuffer: GIT_MAX_BUFFER,
+        timeout: GIT_TIMEOUT_MS
+      });
+      return { ok: true, text };
+    } catch (e) {
+      const err = e;
+      const stderr = err.stderr ? String(err.stderr).trim() : "";
+      return { error: stderr || err.message || "git failed", ok: false };
+    }
+  };
+}
+
+// src/modes/review/worktree.ts
 var WORKTREE_LOCK_ERROR = "could not acquire the worktree lock";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
@@ -3130,18 +3195,18 @@ function allowedRootsFromConfig(configPath) {
   const roots = readEnsembleConfig(configPath).allowedRepoRoots;
   if (!Array.isArray(roots) || roots.length === 0) return null;
   const strs = roots.filter((r) => typeof r === "string" && r.trim().length > 0);
-  return strs.length > 0 ? strs.map((r) => path11.resolve(r)) : null;
+  return strs.length > 0 ? strs.map((r) => path12.resolve(r)) : null;
 }
 function rootAllowed(repoRoot, allowed) {
   if (!allowed) return true;
-  const real = path11.resolve(repoRoot);
+  const real = path12.resolve(repoRoot);
   return allowed.some((root) => {
-    const rel = path11.relative(root, real);
-    return rel === "" || !rel.startsWith("..") && !path11.isAbsolute(rel);
+    const rel = path12.relative(root, real);
+    return rel === "" || !rel.startsWith("..") && !path12.isAbsolute(rel);
   });
 }
 function resolveRepoLocation(args, deps) {
-  const repoPath = path11.resolve(args.repoPath);
+  const repoPath = path12.resolve(args.repoPath);
   const top = deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
   if (!top.ok) {
     return {
@@ -3219,7 +3284,7 @@ function stripAgentInstructions(dir) {
   const removed = [];
   const remove = (rel) => {
     try {
-      fs14.rmSync(path11.join(dir, rel), { force: true, recursive: true });
+      fs14.rmSync(path12.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -3227,7 +3292,7 @@ function stripAgentInstructions(dir) {
   const walk = (rel) => {
     let entries;
     try {
-      entries = fs14.readdirSync(path11.join(dir, rel), { withFileTypes: true });
+      entries = fs14.readdirSync(path12.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -3237,7 +3302,7 @@ function stripAgentInstructions(dir) {
       if (isInstructionName(e.name)) {
         remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
-        if (fs14.existsSync(path11.join(dir, childRel, CURSOR_RULES))) {
+        if (fs14.existsSync(path12.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
         walk(childRel);
@@ -3279,6 +3344,15 @@ function isHolderDead(pid) {
     return e.code === "ESRCH";
   }
 }
+var DEAD_HOLDER_GRACE_MS = 2 * 6e4;
+var DEFAULT_LOCK_STALE_MS = GIT_TIMEOUT_MS + 5 * 6e4;
+function touchRepoLock(gitCommonDir) {
+  const now = /* @__PURE__ */ new Date();
+  try {
+    fs14.utimesSync(path12.join(gitCommonDir, "ensemble-ai-worktree.lock"), now, now);
+  } catch {
+  }
+}
 function tryAcquireOnce(lock, token, staleMs) {
   try {
     const fd = fs14.openSync(lock, fs14.constants.O_CREAT | fs14.constants.O_EXCL | fs14.constants.O_WRONLY, 384);
@@ -3303,11 +3377,12 @@ function tryAcquireOnce(lock, token, staleMs) {
       const held = fs14.readFileSync(lock, "utf8").trim();
       const pid = holderPidFromToken(held);
       const dead = pid !== null && isHolderDead(pid);
-      if (dead || Date.now() - fs14.statSync(lock).mtimeMs > staleMs) {
+      const age = Date.now() - fs14.statSync(lock).mtimeMs;
+      if (dead ? age > DEAD_HOLDER_GRACE_MS : age > staleMs) {
         const reclaimed = removeLockIfOwned(lock, held);
         if (reclaimed && dead) {
           process.stderr.write(
-            `\u26A0 ensemble-ai: reclaimed worktree lock at ${lock} \u2014 holder pid ${pid} was gone
+            `\u26A0 ensemble-ai: reclaimed worktree lock at ${lock} \u2014 holder pid ${pid} was gone and the lock sat untouched past the dead-holder grace
 `
           );
         }
@@ -3318,9 +3393,9 @@ function tryAcquireOnce(lock, token, staleMs) {
   }
 }
 function lockPathAndBudget(gitCommonDir, opts) {
-  const lock = path11.join(gitCommonDir, "ensemble-ai-worktree.lock");
+  const lock = path12.join(gitCommonDir, "ensemble-ai-worktree.lock");
   const sleepMs = Math.max(1, opts.sleepMs ?? 500);
-  const staleMs = opts.staleMs ?? 10 * 6e4;
+  const staleMs = opts.staleMs ?? DEFAULT_LOCK_STALE_MS;
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
   return { lock, retries, sleepMs, staleMs };
 }
@@ -3346,7 +3421,7 @@ function materializeWorktree(args, deps) {
   if (!common.ok) {
     return { kind: "not-a-repo", message: `cannot resolve the git dir of ${location.repoRoot}` };
   }
-  const gitCommonDir = path11.resolve(location.repoRoot, common.text.trim());
+  const gitCommonDir = path12.resolve(location.repoRoot, common.text.trim());
   const release = (deps.lock ?? acquireRepoLock)(gitCommonDir);
   let dir = null;
   try {
@@ -3365,8 +3440,9 @@ function materializeWorktree(args, deps) {
     if (!fetched.ok) {
       return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
     }
+    touchRepoLock(gitCommonDir);
     const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    dir = path11.join(parent, "head");
+    dir = path12.join(parent, "head");
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
       { cwd: location.repoRoot, env: INERT_ENV }
@@ -3375,6 +3451,7 @@ function materializeWorktree(args, deps) {
       const kind = /invalid reference|not a valid object|unknown revision/i.test(added.error) ? "no-such-pr" : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
+    touchRepoLock(gitCommonDir);
     const head = deps.git(["rev-parse", "HEAD"], { cwd: dir });
     const actual = head.ok ? head.text.trim() : "";
     if (actual !== args.headSha) {
@@ -3407,8 +3484,8 @@ function reapWorktree(repoRoot, dir, deps) {
   } catch {
   }
   try {
-    const parent = path11.dirname(dir);
-    if (path11.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
+    const parent = path12.dirname(dir);
+    if (path12.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
       fs14.rmSync(parent, { force: true, recursive: true });
     }
   } catch {
@@ -3728,15 +3805,15 @@ function buildHistoryPacket(args) {
   return { bytes, files, shallow: false, truncated };
 }
 function containedPath(root, rel) {
-  const abs = path12.resolve(root, rel);
-  const back = path12.relative(path12.resolve(root), abs);
+  const abs = path13.resolve(root, rel);
+  const back = path13.relative(path13.resolve(root), abs);
   return back !== "" && !escapesRoot(back) ? abs : null;
 }
 function writeHistoryPacket(cwd, files) {
   for (const f of files) {
     const abs = containedPath(cwd, f.path);
     if (!abs) continue;
-    fs15.mkdirSync(path12.dirname(abs), { recursive: true });
+    fs15.mkdirSync(path13.dirname(abs), { recursive: true });
     fs15.writeFileSync(abs, f.contents, { mode: 256 });
   }
 }
@@ -3771,7 +3848,7 @@ function homeReadDenyRules(homeDir) {
   return CLAUDE_READ_TOOLS.map((t) => denyUnder(t, homeDir));
 }
 function isUnder(child, parent) {
-  return !escapesRoot(path13.relative(path13.resolve(parent), path13.resolve(child)));
+  return !escapesRoot(path14.relative(path14.resolve(parent), path14.resolve(child)));
 }
 function buildClaudeReviewArgs(prompt, config, fence = {}) {
   const homeDir = fence.homeDir ?? os9.homedir();
@@ -5157,7 +5234,7 @@ function scanDependencySurface(files) {
 // src/modes/review/receipt.ts
 import fs19 from "fs";
 import os10 from "os";
-import path15 from "path";
+import path16 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -5241,7 +5318,7 @@ function formatEvidenceShortfall(gaps) {
 
 // src/modes/review/holistic-gate.ts
 import fs18 from "fs";
-import path14 from "path";
+import path15 from "path";
 
 // src/modes/review/holistic.ts
 import fs17 from "fs";
@@ -5451,18 +5528,18 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs18.realpathSync(path14.resolve(worktreeDir));
+    root = fs18.realpathSync(path15.resolve(worktreeDir));
   } catch {
     return () => null;
   }
   const inside = (p) => {
-    const rel = path14.relative(root, p);
+    const rel = path15.relative(root, p);
     return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
-      if (!file || file.includes("\0") || path14.isAbsolute(file)) return null;
-      const target = path14.resolve(root, file);
+      if (!file || file.includes("\0") || path15.isAbsolute(file)) return null;
+      const target = path15.resolve(root, file);
       if (!inside(target)) return null;
       const real = fs18.realpathSync(target);
       if (!inside(real)) return null;
@@ -6910,10 +6987,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path15.join(os10.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path16.join(os10.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path15.join(
+  return path16.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -6934,7 +7011,7 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs19.mkdirSync(path15.dirname(file), { recursive: true, mode: 448 });
+  fs19.mkdirSync(path16.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
   fs19.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
   fs19.chmodSync(tmp, 384);
@@ -8428,11 +8505,11 @@ function loadClaudeReviewerSeat(file = VOICES_FILE, flags = {}, warn = () => {
 
 // src/modes/review/regate.ts
 import fs21 from "fs";
-import path16 from "path";
+import path17 from "path";
 function readConventionPathsFromTrail(baseDir, runId) {
   try {
     const raw = JSON.parse(
-      fs21.readFileSync(path16.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
+      fs21.readFileSync(path17.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
     );
     const paths = (raw.files ?? []).filter((f) => f.included === true && typeof f.path === "string").map((f) => f.path);
     return paths.length > 0 ? paths : void 0;
@@ -8478,7 +8555,7 @@ async function runRegate(opts) {
     ...opts.worktree ? { worktree: opts.worktree } : {}
   });
   try {
-    const p = path16.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
+    const p = path17.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
     const existing = fs21.existsSync(p) ? JSON.parse(fs21.readFileSync(p, "utf8")) : {};
     writeTrailFile(
       opts.baseDir,
@@ -8511,7 +8588,7 @@ async function runRegate(opts) {
 
 // src/modes/review/reseat.ts
 import fs22 from "fs";
-import path17 from "path";
+import path18 from "path";
 
 // src/modes/review/evidence-manifest.ts
 var EVIDENCE_MANIFEST_SCHEMA_VERSION = 1;
@@ -8604,7 +8681,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   if (!stored) return { error: `run ${runId} has no review.${seat}.json under ${baseDir}` };
   let parsed;
   try {
-    parsed = JSON.parse(fs22.readFileSync(path17.join(dir, `packet.${seat}.json`), "utf8"));
+    parsed = JSON.parse(fs22.readFileSync(path18.join(dir, `packet.${seat}.json`), "utf8"));
   } catch {
     return { error: `run ${runId} has no readable packet.${seat}.json` };
   }
@@ -8614,7 +8691,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   const packet = parsed;
   let prompt;
   try {
-    prompt = fs22.readFileSync(path17.join(dir, `prompt.${seat}.md`), "utf8");
+    prompt = fs22.readFileSync(path18.join(dir, `prompt.${seat}.md`), "utf8");
   } catch {
     return { error: `run ${runId} has no readable prompt.${seat}.md` };
   }
@@ -8687,7 +8764,7 @@ function readReseatLock(p) {
   return { since, startedMs };
 }
 function acquireReseatLock(baseDir, runId) {
-  const p = path17.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
+  const p = path18.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
   const held = () => `another reseat is already running on run ${runId} (lock ${RESEAT_LOCK_FILE}, since ${readReseatLock(p)?.since ?? "unknown"})`;
   const claim = () => {
     try {
@@ -8721,7 +8798,7 @@ function acquireReseatLock(baseDir, runId) {
 }
 function foldSynthesis(baseDir, runId, patch, log) {
   try {
-    const p = path17.join(reviewDir(baseDir, runId), "claude-synthesis.json");
+    const p = path18.join(reviewDir(baseDir, runId), "claude-synthesis.json");
     const existing = fs22.existsSync(p) ? JSON.parse(fs22.readFileSync(p, "utf8")) : {};
     writeTrailFile(baseDir, runId, "claude-synthesis.json", JSON.stringify(patch(existing), null, 2));
     return true;
@@ -8734,7 +8811,7 @@ function appendEgressDenials(baseDir, runId, denials, log) {
   if (denials.length === 0) return;
   try {
     log(`reseat: \u26A0 egress fence: ${formatEgressDenialCounts(denials)}`);
-    const p = path17.join(reviewDir(baseDir, runId), "egress-denials.json");
+    const p = path18.join(reviewDir(baseDir, runId), "egress-denials.json");
     const prior = fs22.existsSync(p) ? JSON.parse(fs22.readFileSync(p, "utf8")) : [];
     if (!Array.isArray(prior)) {
       log(
@@ -8857,7 +8934,7 @@ async function reseatUnderLock(opts, pre) {
     log
   );
   try {
-    const mp = path17.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
+    const mp = path18.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
     if (fs22.existsSync(mp)) {
       const manifest = JSON.parse(fs22.readFileSync(mp, "utf8"));
       manifest.realizedEvidence = {
@@ -8913,69 +8990,6 @@ async function reseatUnderLock(opts, pre) {
     realized: seatRun.realized,
     review,
     stampWritten
-  };
-}
-
-// src/modes/review/git-exec.ts
-import { execFileSync as execFileSync4 } from "child_process";
-import path18 from "path";
-function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
-  const cmd = configured?.trim();
-  if (!cmd) return "ssh -o BatchMode=yes";
-  const bin = path18.basename(cmd.split(/\s+/)[0]);
-  return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
-}
-function effectiveSshCommand(cwd, cache) {
-  const key = cwd ?? "";
-  if (cache.has(key)) return cache.get(key);
-  let value = process.env.GIT_SSH_COMMAND?.trim() || void 0;
-  if (!value) {
-    try {
-      value = execFileSync4("git", ["config", "--get", "core.sshCommand"], {
-        cwd,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"]
-      }).trim() || void 0;
-    } catch {
-      value = void 0;
-    }
-  }
-  cache.set(key, value);
-  return value;
-}
-function nonInteractiveEnv(configuredSsh) {
-  const ssh = nonInteractiveSshCommand(configuredSsh);
-  return {
-    GIT_ASKPASS: "",
-    GIT_TERMINAL_PROMPT: "0",
-    SSH_ASKPASS: "",
-    // Absent ⇒ git resolves ssh itself, from the user's own GIT_SSH_COMMAND or core.sshCommand.
-    ...ssh ? { GIT_SSH_COMMAND: ssh } : {}
-  };
-}
-var GIT_TIMEOUT_MS = 6e5;
-var GIT_MAX_BUFFER = 64 * 1024 * 1024;
-function execGit() {
-  const sshByCwd = /* @__PURE__ */ new Map();
-  return (args, opts) => {
-    try {
-      const text = execFileSync4("git", args, {
-        cwd: opts?.cwd,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          ...nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)),
-          ...opts?.env ?? {}
-        },
-        maxBuffer: GIT_MAX_BUFFER,
-        timeout: GIT_TIMEOUT_MS
-      });
-      return { ok: true, text };
-    } catch (e) {
-      const err = e;
-      const stderr = err.stderr ? String(err.stderr).trim() : "";
-      return { error: stderr || err.message || "git failed", ok: false };
-    }
   };
 }
 

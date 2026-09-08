@@ -5,21 +5,24 @@ import path from 'node:path';
 
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
-import { execGit } from './git-exec';
+import { execGit, GIT_TIMEOUT_MS } from './git-exec';
 import {
   acquireRepoLock,
   classifyGitError,
-  type GitRun,
+  DEAD_HOLDER_GRACE_MS,
+  DEFAULT_LOCK_STALE_MS,
   holderPidFromToken,
   isHolderDead,
   isPreflightError,
   materializeWorktree,
   reapWorktree,
   redactUrlCredentials,
-  removeLockIfOwned,
   remoteSlug,
+  removeLockIfOwned,
   resolveRepoLocation,
   rootAllowed,
+  touchRepoLock,
+  type GitRun,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
 } from './worktree';
 
@@ -193,17 +196,53 @@ describe('acquireRepoLock — a holder may only ever remove ITS OWN lock', () =>
 
   // THE DEAD-HOLDER RECLAIM (incident 2026-08-31): a provisioning that DIED holding the lock can
   // never release, so waiting out the full TTL wedges every sibling against a corpse. A lock whose
-  // holder pid is provably gone is stale REGARDLESS of the TTL.
-  it('reclaims a lock whose holder pid is dead at once, even with a fresh mtime and a long TTL', () => {
+  // holder pid is provably gone is reclaimed after the DEAD-HOLDER GRACE — not at once: the
+  // lock guards git children that can outlive the parent (#83 review), so a fresh lock with a
+  // dead pid may still have an orphaned `worktree add` writing behind it.
+  it('does NOT reclaim a dead-pid lock that is still inside the dead-holder grace (an orphaned git child may be writing)', () => {
     const dir = freshDir();
     const dead = reapedDeadPid();
     expect(isHolderDead(dead)).toBe(true); // precondition: the reaped child really is gone
     fs.writeFileSync(lockPath(dir), `${dead}:crashed-provisioning`); // fresh mtime by construction
+    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000 })).toThrow(
+      /could not acquire the worktree lock/
+    );
+    expect(fs.readFileSync(lockPath(dir), 'utf8')).toContain('crashed-provisioning'); // untouched
+    fs.unlinkSync(lockPath(dir));
+  });
+
+  it('reclaims a dead-pid lock once it sat untouched past the grace, even far inside a long TTL', () => {
+    const dir = freshDir();
+    const dead = reapedDeadPid();
+    expect(isHolderDead(dead)).toBe(true);
+    fs.writeFileSync(lockPath(dir), `${dead}:crashed-provisioning`);
+    const past = new Date(Date.now() - DEAD_HOLDER_GRACE_MS - 1_000);
+    fs.utimesSync(lockPath(dir), past, past);
     // A TTL that will not expire during the test, so only the dead-pid path can reclaim.
     const release = acquireRepoLock(dir, { retries: 3, sleepMs: 1, staleMs: 60 * 60_000 });
     expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-provisioning');
     release();
     expect(fs.existsSync(lockPath(dir))).toBe(false);
+  });
+
+  // The lease: the holder touches the lock after each completed in-lock op, so both reclaim
+  // clocks measure time since the holder last made progress.
+  it('touchRepoLock refreshes the lock mtime and is a silent no-op without a lock', () => {
+    const dir = freshDir();
+    expect(() => touchRepoLock(dir)).not.toThrow(); // no lock yet
+    const release = acquireRepoLock(dir);
+    const past = new Date(Date.now() - 60 * 60_000);
+    fs.utimesSync(lockPath(dir), past, past);
+    touchRepoLock(dir);
+    expect(Date.now() - fs.statSync(lockPath(dir)).mtimeMs).toBeLessThan(10_000);
+    release();
+  });
+
+  // The hold-duration invariant, structural: a live holder's lock is never older than one git
+  // op (touched per op), and the default TTL clears one op's timeout with margin.
+  it('the default live-holder TTL clears one git op timeout, and the dead-holder grace is shorter', () => {
+    expect(DEFAULT_LOCK_STALE_MS).toBeGreaterThan(GIT_TIMEOUT_MS);
+    expect(DEAD_HOLDER_GRACE_MS).toBeLessThan(DEFAULT_LOCK_STALE_MS);
   });
 
   // The mirror case: a LIVE holder keeps the TTL rule. This process is alive, so its lock must not

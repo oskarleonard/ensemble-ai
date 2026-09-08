@@ -80,7 +80,7 @@ function nonInteractiveEnv(configuredSsh: string | undefined): Record<string, st
 // A cold `fetch` of a large repo's PR head is genuinely slow, so the bound is generous — but it IS
 // bounded: an unbounded git call would wedge the run exactly the way the reviewer watchdog exists
 // to prevent. `ls-tree -r` of a big tree is the biggest reply, hence the 64 MB buffer.
-const GIT_TIMEOUT_MS = 600_000;
+export const GIT_TIMEOUT_MS = 600_000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
 export function execGit(): GitRun {

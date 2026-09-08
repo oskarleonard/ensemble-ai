@@ -6,6 +6,7 @@ import { setTimeout as sleepAsync } from 'node:timers/promises';
 import { makeOwnerOnlyTempDir } from '../../core/artifacts';
 
 import { readEnsembleConfig } from './ensemble-config';
+import { GIT_TIMEOUT_MS } from './git-exec';
 
 // WORKTREE EVIDENCE MODE — materialize the PR head as a detached, read-only worktree of a repo
 // the user ALREADY has cloned, so a seat sees the whole project the way Oskar does manually,
@@ -460,6 +461,35 @@ export function isHolderDead(pid: number): boolean {
 // SYNCHRONOUS on purpose, even under the async acquire: keeping read→stat→unlink un-awaited
 // preserves its in-process atomicity for free (no interleave point between observing a stale
 // holder and reclaiming exactly that holder).
+// THE DEAD-HOLDER GRACE. A dead holder pid does NOT prove the critical section is over: the lock
+// serializes child `git fetch` / `git worktree add` processes, and a SIGKILL/OOM of the Node
+// parent can leave a REPARENTED git child still writing the shared .git while
+// `process.kill(pid, 0)` already answers ESRCH (the #83 cross-vendor review, codex/grok/claude
+// converged). So a dead holder is reclaimed only once its lock has gone untouched for this
+// long — the holder refreshes the lock after every completed in-lock op (touchRepoLock), so a
+// dead parent's orphan has at most one op's tail past the parent's last touch. Bounded, and
+// still ~5× faster than the live-holder TTL the incident wedged on.
+export const DEAD_HOLDER_GRACE_MS = 2 * 60_000;
+
+// The default TTL for a holder that is (or may be) ALIVE. Tied to the per-command git timeout:
+// the holder touches the lock after each completed op, so a live holder's lock is never older
+// than ONE op — which git-exec bounds at GIT_TIMEOUT_MS. The TTL therefore clears one op plus
+// margin by construction (the hold-duration invariant, structural instead of a comment).
+export const DEFAULT_LOCK_STALE_MS = GIT_TIMEOUT_MS + 5 * 60_000;
+
+// Lease refresh: the holder calls this after each completed in-lock op so both reclaim rules
+// (dead-holder grace, live-holder TTL) measure "time since the holder last made progress", not
+// time since acquire. Best-effort and silent — a missing lock (already released/reclaimed) or a
+// refused utimes must never fail the materialization that just succeeded.
+export function touchRepoLock(gitCommonDir: string): void {
+  const now = new Date();
+  try {
+    fs.utimesSync(path.join(gitCommonDir, 'ensemble-ai-worktree.lock'), now, now);
+  } catch {
+    /* no lock to refresh (released / reclaimed) or a read-only fs — nothing to do */
+  }
+}
+
 function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => void) | null {
   try {
     const fd = fs.openSync(lock, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
@@ -503,17 +533,21 @@ function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => vo
       // so a dead holder never stats the lock).
       const pid = holderPidFromToken(held);
       const dead = pid !== null && isHolderDead(pid);
+      // Age = time since the holder last touched the lock (acquire, or a completed in-lock op).
+      // A DEAD holder is reclaimed after the dead-holder grace (its orphaned git child, if any,
+      // gets one op's tail to finish); a live or unknown holder keeps the TTL rule.
+      const age = Date.now() - fs.statSync(lock).mtimeMs;
       // Reclaim ONLY the exact token we observed: the ownership guard re-reads and compares, so if
       // the holder released and a third process took the lock in between, `held` no longer matches
       // and we leave that new lock alone. The dead-pid log fires AFTER the reclaim and only when it
       // actually removed the lock — so a write failure (e.g. a closed fd 2 on a daemonized
       // consumer) can never skip the reclaim, and the line never announces a reclaim that a
       // token-change race refused.
-      if (dead || Date.now() - fs.statSync(lock).mtimeMs > staleMs) {
+      if (dead ? age > DEAD_HOLDER_GRACE_MS : age > staleMs) {
         const reclaimed = removeLockIfOwned(lock, held);
         if (reclaimed && dead) {
           process.stderr.write(
-            `⚠ ensemble-ai: reclaimed worktree lock at ${lock} — holder pid ${pid} was gone\n`
+            `⚠ ensemble-ai: reclaimed worktree lock at ${lock} — holder pid ${pid} was gone and the lock sat untouched past the dead-holder grace\n`
           );
         }
       }
@@ -530,17 +564,17 @@ function lockPathAndBudget(gitCommonDir: string, opts: { retries?: number; sleep
   // made the derived retry budget `Math.ceil(staleMs / 0) = Infinity` — a loop that can
   // never reach lockWedgedError, spinning at full CPU in the sync acquire (r2, codex-f1).
   const sleepMs = Math.max(1, opts.sleepMs ?? 500);
-  const staleMs = opts.staleMs ?? 10 * 60_000;
+  const staleMs = opts.staleMs ?? DEFAULT_LOCK_STALE_MS;
   // Wait at least as long as the staleness TTL. A shorter budget could never reach the reclaim
   // branch, so a sibling holding the lock across a legitimately slow `git fetch` (a large repo,
   // a cold object store) would throw as "wedged" while it was merely working.
   //
-  // THE HOLD-DURATION INVARIANT (protocol-wide, both waiting styles): the sum of in-lock op
-  // timeouts must stay comfortably below staleMs, or a slow-but-alive holder gets its lock
-  // reclaimed mid-materialization. Today: fetch(120s) + add(120s) + metadata ≪ 10 min, with
-  // margin. There is NO mtime heartbeat during a hold — if in-lock work ever grows past that
-  // margin, add one (touch the lock per completed op; protocol-compatible) rather than raising
-  // staleMs, which would also stretch every crash-recovery.
+  // THE HOLD-DURATION INVARIANT (protocol-wide, both waiting styles): a live holder's lock must
+  // never be reclaimed mid-materialization. It is structural now, not a comment: the holder
+  // touches the lock after every completed in-lock op (touchRepoLock — the mtime heartbeat the
+  // old comment asked for), so the lock's age never exceeds ONE op, and DEFAULT_LOCK_STALE_MS is
+  // derived from that op's git timeout plus margin. A dead holder is reclaimed after the shorter
+  // DEAD_HOLDER_GRACE_MS instead (its orphaned git child, if any, gets one op's tail).
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
   return { lock, retries, sleepMs, staleMs };
 }
@@ -646,6 +680,7 @@ export function materializeWorktree(
     // Do NOT add --no-recurse-submodules here: `git worktree add` rejects it on every git ("unknown
     // option" — it killed every real materialization until 2026-07-10). The inert posture holds
     // without it; see the submodule bullet in this file's header.
+    touchRepoLock(gitCommonDir); // lease refresh: the fetch completed, the age clock restarts
     const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     dir = path.join(parent, 'head');
     const added = deps.git(
@@ -658,6 +693,7 @@ export function materializeWorktree(
         : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
+    touchRepoLock(gitCommonDir); // lease refresh: the add completed
     const head = deps.git(['rev-parse', 'HEAD'], { cwd: dir });
     const actual = head.ok ? head.text.trim() : '';
     if (actual !== args.headSha) {
@@ -818,6 +854,7 @@ export async function materializeWorktreeAsync(
       return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
     }
     // Materialize by SHA, not FETCH_HEAD — same reasoning as the sync twin above.
+    touchRepoLock(gitCommonDir); // lease refresh: the fetch completed, the age clock restarts
     const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     dir = path.join(parent, 'head');
     const added = await deps.git(
@@ -830,6 +867,7 @@ export async function materializeWorktreeAsync(
         : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
+    touchRepoLock(gitCommonDir); // lease refresh: the add completed
     const head = await deps.git(['rev-parse', 'HEAD'], { cwd: dir });
     const actual = head.ok ? head.text.trim() : '';
     if (actual !== args.headSha) {
