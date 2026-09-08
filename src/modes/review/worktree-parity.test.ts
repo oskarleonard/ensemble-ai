@@ -8,7 +8,6 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   acquireRepoLock,
   acquireRepoLockAsync,
-  DEAD_HOLDER_GRACE_MS,
   isHolderDead,
   materializeWorktree,
   materializeWorktreeAsync,
@@ -399,20 +398,23 @@ describe('acquireRepoLockAsync — same file, same protocol, loop-friendly wait'
   // dead REGARDLESS of the TTL, exactly like the sync acquire (worktree.test.ts). Both share
   // tryAcquireOnce today, but that shared path is precisely what this suite exists to pin — a
   // future fork of the EEXIST branch in only one acquire must fail here, not ship green.
-  it('reclaims a dead-pid holder past the dead-holder grace (not the TTL), exactly like the sync acquire', async () => {
+  it('reclaims a dead-pid holder at once when no orphaned git child runs, and holds while one does — exactly like the sync acquire', async () => {
     const dir = lockDir();
     const lock = path.join(dir, 'ensemble-ai-worktree.lock');
     const dead = reapedDeadPid();
     expect(isHolderDead(dead)).toBe(true); // precondition: the reaped child really is gone
     fs.writeFileSync(lock, `${dead}:crashed-provisioning`);
-    // Inside the grace: held (an orphaned git child may still be writing) — parity with sync.
-    await expect(acquireRepoLockAsync(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000 })).rejects.toThrow(
-      /could not acquire the worktree lock/
-    );
-    const past = new Date(Date.now() - DEAD_HOLDER_GRACE_MS - 1_000);
-    fs.utimesSync(lock, past, past);
-    // Past the grace, far inside a TTL that will not expire: only the dead-pid path can reclaim.
-    const release = await acquireRepoLockAsync(dir, { retries: 3, sleepMs: 1, staleMs: 60 * 60_000 });
+    // An orphan is still writing: held (the TTL rule applies) — parity with sync.
+    await expect(
+      acquireRepoLockAsync(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, orphanProbe: () => true })
+    ).rejects.toThrow(/could not acquire the worktree lock/);
+    // No orphan: reclaimed at once, far inside a TTL that will not expire.
+    const release = await acquireRepoLockAsync(dir, {
+      retries: 3,
+      sleepMs: 1,
+      staleMs: 60 * 60_000,
+      orphanProbe: () => false,
+    });
     expect(fs.readFileSync(lock, 'utf8')).not.toContain('crashed-provisioning');
     release();
     expect(fs.existsSync(lock)).toBe(false);

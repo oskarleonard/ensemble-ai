@@ -2641,6 +2641,7 @@ function persistGatePacket(baseDir, runId, input) {
 }
 
 // src/modes/review/worktree.ts
+import { execFileSync as execFileSync5 } from "child_process";
 import { randomUUID } from "crypto";
 import fs12 from "fs";
 import path11 from "path";
@@ -2872,16 +2873,39 @@ function isHolderDead(pid) {
     return e.code === "ESRCH";
   }
 }
-var DEAD_HOLDER_GRACE_MS = 2 * 6e4;
+function hasOrphanedGitChild(psOutput, parentDead) {
+  for (const line of psOutput.split("\n")) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (!m) continue;
+    const ppid = Number(m[2]);
+    const cmd = m[3];
+    if (!/(^|[\s/])git\s/.test(cmd) || !cmd.includes("core.hooksPath=/dev/null")) continue;
+    if (ppid === 1 || parentDead(ppid)) return true;
+  }
+  return false;
+}
+function orphanedGitChildrenExist() {
+  try {
+    const out = execFileSync5("ps", ["-axo", "pid=,ppid=,command="], {
+      encoding: "utf8",
+      timeout: 5e3
+    });
+    return hasOrphanedGitChild(out, isHolderDead);
+  } catch {
+    return true;
+  }
+}
 var DEFAULT_LOCK_STALE_MS = GIT_TIMEOUT_MS + 5 * 6e4;
 function touchRepoLock(gitCommonDir) {
+  const lock = repoLockPath(gitCommonDir);
   const now = /* @__PURE__ */ new Date();
   try {
-    fs12.utimesSync(repoLockPath(gitCommonDir), now, now);
+    if (!fs12.readFileSync(lock, "utf8").trim().startsWith(`${process.pid}:`)) return;
+    fs12.utimesSync(lock, now, now);
   } catch {
   }
 }
-function tryAcquireOnce(lock, token, staleMs) {
+function tryAcquireOnce(lock, token, staleMs, orphanProbe) {
   try {
     const fd = fs12.openSync(lock, fs12.constants.O_CREAT | fs12.constants.O_EXCL | fs12.constants.O_WRONLY, 384);
     try {
@@ -2905,13 +2929,13 @@ function tryAcquireOnce(lock, token, staleMs) {
       const held = fs12.readFileSync(lock, "utf8").trim();
       const pid = holderPidFromToken(held);
       const dead = pid !== null && isHolderDead(pid);
-      const graceMs = Math.min(DEAD_HOLDER_GRACE_MS, staleMs);
       const age = Date.now() - fs12.statSync(lock).mtimeMs;
-      if (dead ? age > graceMs : age > staleMs) {
+      const reclaim = dead ? !orphanProbe() || age > staleMs : age > staleMs;
+      if (reclaim) {
         const reclaimed = removeLockIfOwned(lock, held);
         if (reclaimed && dead) {
           process.stderr.write(
-            `\u26A0 ensemble-ai: reclaimed worktree lock at ${lock} \u2014 holder pid ${pid} was gone and the lock sat untouched past the dead-holder grace
+            `\u26A0 ensemble-ai: reclaimed worktree lock at ${lock} \u2014 holder pid ${pid} was gone (no orphaned git child running, or the lock aged past the TTL)
 `
           );
         }
@@ -2926,7 +2950,8 @@ function lockPathAndBudget(gitCommonDir, opts) {
   const sleepMs = Math.max(1, opts.sleepMs ?? 500);
   const staleMs = opts.staleMs ?? DEFAULT_LOCK_STALE_MS;
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
-  return { lock, retries, sleepMs, staleMs };
+  const orphanProbe = opts.orphanProbe ?? orphanedGitChildrenExist;
+  return { lock, orphanProbe, retries, sleepMs, staleMs };
 }
 function lockWedgedError(lock, retries, sleepMs) {
   return new Error(
@@ -2934,10 +2959,10 @@ function lockWedgedError(lock, retries, sleepMs) {
   );
 }
 function acquireRepoLock(gitCommonDir, opts = {}) {
-  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const { lock, orphanProbe, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
-    const release = tryAcquireOnce(lock, token, staleMs);
+    const release = tryAcquireOnce(lock, token, staleMs, orphanProbe);
     if (release) return release;
     if (i === retries) break;
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleepMs);
@@ -2945,10 +2970,10 @@ function acquireRepoLock(gitCommonDir, opts = {}) {
   throw lockWedgedError(lock, retries, sleepMs);
 }
 async function acquireRepoLockAsync(gitCommonDir, opts = {}) {
-  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const { lock, orphanProbe, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
-    const release = tryAcquireOnce(lock, token, staleMs);
+    const release = tryAcquireOnce(lock, token, staleMs, orphanProbe);
     if (release) return release;
     if (i === retries) break;
     await sleepAsync(sleepMs);
@@ -6121,7 +6146,6 @@ export {
   CORE_REVIEWER_IDS,
   CORE_WORKTREE_REVIEW_TIMEOUT_MS,
   CRITIQUE_STANCES,
-  DEAD_HOLDER_GRACE_MS,
   DEFAULT_COVERAGE_CEILING,
   DEFAULT_LOCK_STALE_MS,
   DEFAULT_OBJECTIVE,
@@ -6237,6 +6261,7 @@ export {
   gatherConventions,
   hasDepSurface,
   hasGeneratedHeader,
+  hasOrphanedGitChild,
   holderPidFromToken,
   holisticCapWasLifted,
   homeReadDenyRules,
@@ -6282,6 +6307,7 @@ export {
   memoryConventionReader,
   omittedLine,
   oneOf,
+  orphanedGitChildrenExist,
   parseConventionCitation,
   parseCritique,
   parseDiffFiles,
