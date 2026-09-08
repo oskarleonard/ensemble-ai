@@ -472,10 +472,18 @@ export function isHolderDead(pid: number): boolean {
 // serializes child `git fetch` / `git worktree add` processes, and a SIGKILL/OOM of the Node
 // parent can leave a REPARENTED git child still writing the shared .git while
 // `process.kill(pid, 0)` already answers ESRCH (the #83 cross-vendor review, codex/grok/claude
-// converged). So a dead holder is reclaimed only once its lock has gone untouched for this
-// long — the holder refreshes the lock after every completed in-lock op (touchRepoLock), so a
-// dead parent's orphan has at most one op's tail past the parent's last touch. Bounded, and
-// still ~5× faster than the live-holder TTL the incident wedged on.
+// converged). So a dead holder is reclaimed only once its lock has gone untouched for this long —
+// the holder refreshes the lock after every completed in-lock op (touchRepoLock), so in the common
+// case a dead parent's orphan is at most one op's tail past the parent's last touch, and reclaim is
+// far faster than the live-holder TTL the incident wedged on.
+//
+// HONEST LIMIT (deferred to Oskar; codex/grok/claude all flagged it on this PR): that "one op's
+// tail" is NOT bounded by the grace. A single in-lock op is bounded by GIT_TIMEOUT_MS (10 min) only
+// while the parent lives — the timeout is a parent-side execFileSync timer that dies with a
+// SIGKILL/OOM'd parent, after which the reparented git child runs untimed. So a slow orphan
+// (a cold fetch of a large repo) can outlive this 2-min grace and still be writing the shared .git
+// when a sibling reclaims. Closing that fully needs pgid/child-pid tracking in the token (signal the
+// writer before reclaim) or a grace >= GIT_TIMEOUT_MS — a design fork, written up in the run log.
 export const DEAD_HOLDER_GRACE_MS = 2 * 60_000;
 
 // The default TTL for a holder that is (or may be) ALIVE. Tied to the per-command git timeout:
@@ -502,7 +510,7 @@ function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => vo
     const fd = fs.openSync(lock, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
     // ANY failure after the exclusive create — write OR close — must unlink the lock this
     // process just made, or it strands a lock file with no releaser and every later acquire
-    // reads contention until the staleMs reclaim (~10 min). The r2 fix guarded only the
+    // reads contention until the staleMs reclaim (DEFAULT_LOCK_STALE_MS). The r2 fix guarded only the
     // write and left the trailing closeSync OUTSIDE the recovery — the same strand class,
     // one line later; r3's only unanimous finding (codex+grok+claude, grounded verbatim).
     // The file is unconditionally ours on this path: O_EXCL proved we created it.
@@ -527,22 +535,34 @@ function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => vo
     // ONLY EEXIST is contention. A bare catch here turned every other errno — a nonexistent
     // gitCommonDir (ENOENT), a permissions refusal (EACCES), a read-only fs (EROFS) — into
     // "someone holds the lock", which the acquire loop then retries for the FULL budget
-    // (~10 min at defaults). On a CLI that was a slow confusing failure; on a server request
-    // path it is a 10-minute hang for a caller bug that should throw in one millisecond.
+    // (DEFAULT_LOCK_STALE_MS at defaults). On a CLI that was a slow confusing failure; on a server
+    // request path it is a multi-minute hang for a caller bug that should throw in one millisecond.
     // (Cross-vendor review of this very diff, claude-f4 — confirmed against the hunk.)
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
     try {
       const held = fs.readFileSync(lock, 'utf8').trim();
       // A lock whose holder pid is DEAD is stale regardless of the TTL: a process that died
       // holding it (a killed/crashed provisioning) can never release, so waiting out the full
-      // TTL just wedges every sibling for ten minutes against a corpse. A token with no parseable
+      // TTL just wedges every sibling for the whole DEFAULT_LOCK_STALE_MS against a corpse. A token
+      // with no parseable
       // pid, or one whose pid is still alive, keeps the mtime TTL rule instead — `isHolderDead`
       // is only probed when the token yields a pid at all.
       const pid = holderPidFromToken(held);
       const dead = pid !== null && isHolderDead(pid);
       // Age = time since the holder last touched the lock (acquire, or a completed in-lock op).
-      // A DEAD holder is reclaimed after the dead-holder grace (its orphaned git child, if any,
-      // gets one op's tail to finish); a live or unknown holder keeps the TTL rule.
+      // A DEAD holder is reclaimed after the dead-holder grace; a live or unknown holder keeps the
+      // caller's TTL. The grace is CAPPED at staleMs (never allowed to exceed it): a dead holder
+      // must never be held LONGER than a live one, and a caller asking `staleMs: 0` ("reclaim now")
+      // still reclaims a dead holder immediately. Because the derived retry budget comes from
+      // staleMs (lockPathAndBudget) and graceMs <= staleMs, the reclaim branch is always reachable.
+      //
+      // KNOWN RESIDUAL (cross-vendor review of this PR, codex/grok/claude converged — deferred to
+      // Oskar): the grace assumes a dead parent's orphaned git child drains within it, but that
+      // child's only timeout is the parent's execFileSync timer, which dies WITH the parent — so a
+      // reparented `git fetch`/`worktree add` can keep writing the shared .git past the grace. The
+      // robust fix (record the git child's pgid in the token and signal it before reclaim, or size
+      // the grace >= GIT_TIMEOUT_MS) is a design fork; see the run log / PR comment.
+      const graceMs = Math.min(DEAD_HOLDER_GRACE_MS, staleMs);
       const age = Date.now() - fs.statSync(lock).mtimeMs;
       // Reclaim ONLY the exact token we observed: the ownership guard re-reads and compares, so if
       // the holder released and a third process took the lock in between, `held` no longer matches
@@ -550,7 +570,7 @@ function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => vo
       // actually removed the lock — so a write failure (e.g. a closed fd 2 on a daemonized
       // consumer) can never skip the reclaim, and the line never announces a reclaim that a
       // token-change race refused.
-      if (dead ? age > DEAD_HOLDER_GRACE_MS : age > staleMs) {
+      if (dead ? age > graceMs : age > staleMs) {
         const reclaimed = removeLockIfOwned(lock, held);
         if (reclaimed && dead) {
           process.stderr.write(

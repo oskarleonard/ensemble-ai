@@ -347,7 +347,7 @@ describe('the acquire refuses to mistake a caller bug for contention', () => {
     );
     // If these retried as contention they would take retries×sleep — the assertion is that
     // they throw the real errno at once (claude-f4: a bare catch made every errno look
-    // like a held lock, a ~10-minute hang at server defaults).
+    // like a held lock, a multi-minute hang at server defaults — DEFAULT_LOCK_STALE_MS).
     expect(() => acquireRepoLock(missing, { retries: 1000, sleepMs: 50 })).toThrow(/ENOENT/);
     await expect(
       acquireRepoLockAsync(missing, { retries: 1000, sleepMs: 50 })

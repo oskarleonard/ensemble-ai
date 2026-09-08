@@ -225,6 +225,22 @@ describe('acquireRepoLock — a holder may only ever remove ITS OWN lock', () =>
     expect(fs.existsSync(lockPath(dir))).toBe(false);
   });
 
+  // The grace is CAPPED at staleMs, never allowed to exceed it: a dead holder must never be held
+  // LONGER than a live one. A caller asking `staleMs: 0` ("reclaim now") reclaims a corpse at once,
+  // despite the lock's mtime being fresh (well inside the 2-min grace). Before the cap, a dead
+  // holder with staleMs:0 waited the full grace — inverting the intended fast-reclaim semantics.
+  // (cross-vendor review of this PR, claude-f1.)
+  it('reclaims a dead-pid holder immediately under staleMs:0 (grace is capped at staleMs)', () => {
+    const dir = freshDir();
+    const dead = reapedDeadPid();
+    expect(isHolderDead(dead)).toBe(true);
+    fs.writeFileSync(lockPath(dir), `${dead}:crashed-provisioning`); // fresh mtime, inside the grace
+    const release = acquireRepoLock(dir, { retries: 5, sleepMs: 1, staleMs: 0 });
+    expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-provisioning');
+    release();
+    expect(fs.existsSync(lockPath(dir))).toBe(false);
+  });
+
   // The lease: the holder touches the lock after each completed in-lock op, so both reclaim
   // clocks measure time since the holder last made progress.
   it('touchRepoLock refreshes the lock mtime and is a silent no-op without a lock', () => {

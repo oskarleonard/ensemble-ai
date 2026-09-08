@@ -3380,8 +3380,9 @@ function tryAcquireOnce(lock, token, staleMs) {
       const held = fs14.readFileSync(lock, "utf8").trim();
       const pid = holderPidFromToken(held);
       const dead = pid !== null && isHolderDead(pid);
+      const graceMs = Math.min(DEAD_HOLDER_GRACE_MS, staleMs);
       const age = Date.now() - fs14.statSync(lock).mtimeMs;
-      if (dead ? age > DEAD_HOLDER_GRACE_MS : age > staleMs) {
+      if (dead ? age > graceMs : age > staleMs) {
         const reclaimed = removeLockIfOwned(lock, held);
         if (reclaimed && dead) {
           process.stderr.write(
