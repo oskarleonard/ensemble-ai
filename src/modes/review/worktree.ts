@@ -497,11 +497,17 @@ export function hasOrphanedGitChild(
 }
 
 // The live probe. Fails CLOSED: if `ps` is unavailable or errors, report "an orphan may exist" so
-// the reclaim falls back to the TTL rule rather than racing a writer it could not see.
+// the reclaim falls back to the TTL rule rather than racing a writer it could not see. The 16 MB
+// buffer is load-bearing, NOT decorative: `execFileSync`'s default maxBuffer is 1 MB, and a full
+// `ps -axo …` dump on a busy host (thousands of processes, long argv) blows past that and throws
+// ENOBUFS on EVERY call — which the catch turns into a permanent, silent fail-closed that reverts
+// the whole dead-holder reclaim to the TTL wedge this probe exists to avoid (cross-vendor review,
+// claude-f4).
 export function orphanedGitChildrenExist(): boolean {
   try {
     const out = execFileSync('ps', ['-axo', 'pid=,ppid=,command='], {
       encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
       timeout: 5_000,
     });
     return hasOrphanedGitChild(out, isHolderDead);

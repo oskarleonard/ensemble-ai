@@ -2888,6 +2888,7 @@ function orphanedGitChildrenExist() {
   try {
     const out = execFileSync5("ps", ["-axo", "pid=,ppid=,command="], {
       encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
       timeout: 5e3
     });
     return hasOrphanedGitChild(out, isHolderDead);
