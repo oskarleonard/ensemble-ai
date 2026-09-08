@@ -252,7 +252,7 @@ declare function materializeWorktree(args: {
     worktreeRoot?: string;
 }, deps: {
     git: GitRun;
-    lock?: (gitCommonDir: string) => (() => void) | LockRelease;
+    lock?: (gitCommonDir: string) => () => void;
 }): PreflightError | Worktree;
 declare function reapWorktree(repoRoot: string, dir: string, deps: {
     git: GitRun;
@@ -281,7 +281,7 @@ declare function materializeWorktreeAsync(args: {
     worktreeRoot?: string;
 }, deps: {
     git: GitRunAsync;
-    lock?: (gitCommonDir: string) => Promise<(() => void) | LockRelease> | (() => void) | LockRelease;
+    lock?: (gitCommonDir: string) => Promise<() => void> | (() => void);
 }): Promise<PreflightError | Worktree>;
 declare function reapWorktreeAsync(repoRoot: string, dir: string, deps: {
     git: GitRunAsync;

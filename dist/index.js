@@ -2641,7 +2641,6 @@ function persistGatePacket(baseDir, runId, input) {
 }
 
 // src/modes/review/worktree.ts
-import { execFileSync as execFileSync5 } from "child_process";
 import * as childProcess from "child_process";
 import { randomUUID } from "crypto";
 import fs12 from "fs";
@@ -2880,6 +2879,10 @@ var PS_ARGS = ["-axo", "pid=,ppid=,command="];
 var PS_OPTS = { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 5e3 };
 var SCAN_MEMO_MS = 5e3;
 var ORPHAN_KILL_GRACE_MS = 1500;
+var SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
+function sleepSync(ms) {
+  Atomics.wait(SLEEP_BUF, 0, 0, ms);
+}
 function listInLockGitProcesses(psOutput, parentDead) {
   const out = [];
   for (const line of psOutput.split("\n")) {
@@ -2929,7 +2932,7 @@ function scanInLockGit() {
   const hit = memoized();
   if (hit) return hit;
   try {
-    const out = execFileSync5("ps", PS_ARGS, PS_OPTS);
+    const out = childProcess.execFileSync("ps", PS_ARGS, PS_OPTS);
     return remember(summarizeInLockGit(listInLockGitProcesses(out, isHolderDead)));
   } catch (e) {
     return scanFailed(e);
@@ -2964,12 +2967,12 @@ function terminateOrphansSync(pids) {
   const deadline = Date.now() + ORPHAN_KILL_GRACE_MS;
   let alive = alivePids(pids);
   while (alive.length > 0 && Date.now() < deadline) {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
-    alive = alivePids(pids);
+    sleepSync(50);
+    alive = alivePids(alive);
   }
   if (alive.length > 0) {
     signalAll(alive, "SIGKILL");
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    sleepSync(100);
   }
   scanMemo = null;
   return alivePids(pids);
@@ -2980,7 +2983,7 @@ async function terminateOrphansAsync(pids) {
   let alive = alivePids(pids);
   while (alive.length > 0 && Date.now() < deadline) {
     await sleepAsync(50);
-    alive = alivePids(pids);
+    alive = alivePids(alive);
   }
   if (alive.length > 0) {
     signalAll(alive, "SIGKILL");
@@ -3053,8 +3056,8 @@ function reclaimContended(lock, c, why) {
 `);
   }
 }
-function settleDeadHolder(lock, c, scan, survivors) {
-  switch (decideDeadHolder(scan)) {
+function settleDeadHolder(lock, c, decision, orphans, survivors) {
+  switch (decision) {
     case "reclaim":
       reclaimContended(lock, c, `holder pid ${c.pid} was gone and no in-lock git process is running`);
       return;
@@ -3063,7 +3066,7 @@ function settleDeadHolder(lock, c, scan, survivors) {
         reclaimContended(
           lock,
           c,
-          `holder pid ${c.pid} was gone; terminated its orphaned git ${scan.orphans.join(", ")}`
+          `holder pid ${c.pid} was gone; terminated its orphaned git ${orphans.join(", ")}`
         );
       } else if (survivors) {
         process.stderr.write(
@@ -3088,35 +3091,35 @@ function lockWedgedError(lock, retries, sleepMs) {
     `ensemble-ai: ${WORKTREE_LOCK_ERROR} at ${lock} after ${retries} attempts (${Math.round(retries * sleepMs / 1e3)}s) \u2014 another review is materializing a worktree in this repo`
   );
 }
-function attemptSync(lock, token, staleMs, scanner) {
+function attemptPrelude(lock, token, staleMs) {
   const created = tryCreate(lock, token);
-  if (created !== "contended") return created;
+  if (created !== "contended") return { settled: created };
   const c = readContention(lock);
-  if (!c) return null;
+  if (!c) return { settled: null };
   if (c.age > staleMs) {
     reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? "unknown"})`);
-    return null;
+    return { settled: null };
   }
-  if (!c.dead) return null;
+  if (!c.dead) return { settled: null };
+  return { contend: c };
+}
+function attemptSync(lock, token, staleMs, scanner) {
+  const pre = attemptPrelude(lock, token, staleMs);
+  if ("settled" in pre) return pre.settled;
   const scanned = scanner();
   const scan = scanned instanceof Promise ? UNKNOWN_SCAN : scanned;
-  const survivors = decideDeadHolder(scan) === "terminate-orphans" ? terminateOrphansSync(scan.orphans) : null;
-  settleDeadHolder(lock, c, scan, survivors);
+  const decision = decideDeadHolder(scan);
+  const survivors = decision === "terminate-orphans" ? terminateOrphansSync(scan.orphans) : null;
+  settleDeadHolder(lock, pre.contend, decision, scan.orphans, survivors);
   return null;
 }
 async function attemptAsync(lock, token, staleMs, scanner) {
-  const created = tryCreate(lock, token);
-  if (created !== "contended") return created;
-  const c = readContention(lock);
-  if (!c) return null;
-  if (c.age > staleMs) {
-    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? "unknown"})`);
-    return null;
-  }
-  if (!c.dead) return null;
+  const pre = attemptPrelude(lock, token, staleMs);
+  if ("settled" in pre) return pre.settled;
   const scan = await scanner();
-  const survivors = decideDeadHolder(scan) === "terminate-orphans" ? await terminateOrphansAsync(scan.orphans) : null;
-  settleDeadHolder(lock, c, scan, survivors);
+  const decision = decideDeadHolder(scan);
+  const survivors = decision === "terminate-orphans" ? await terminateOrphansAsync(scan.orphans) : null;
+  settleDeadHolder(lock, pre.contend, decision, scan.orphans, survivors);
   return null;
 }
 function acquireRepoLock(gitCommonDir, opts = {}) {
@@ -3127,7 +3130,7 @@ function acquireRepoLock(gitCommonDir, opts = {}) {
     const release = attemptSync(lock, token, staleMs, scanner);
     if (release) return release;
     if (i === retries) break;
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleepMs);
+    sleepSync(sleepMs);
   }
   throw lockWedgedError(lock, retries, sleepMs);
 }

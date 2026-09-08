@@ -406,7 +406,7 @@ describe('acquireRepoLockAsync — same file, same protocol, loop-friendly wait'
 
   // Parity for the dead-holder reclaim: the async twin must reclaim a lock whose holder pid is
   // dead REGARDLESS of the TTL, exactly like the sync acquire (worktree.test.ts). Both share
-  // tryAcquireOnce today, but that shared path is precisely what this suite exists to pin — a
+  // attemptPrelude today, but that shared path is precisely what this suite exists to pin — a
   // future fork of the EEXIST branch in only one acquire must fail here, not ship green.
   it('settles a dead holder exactly like the sync acquire: no in-lock git → reclaim; ambiguous → TTL; confirmed orphan → terminate then reclaim', async () => {
     const dir = lockDir();

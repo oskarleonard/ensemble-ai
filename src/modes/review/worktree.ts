@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process';
 import * as childProcess from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -506,6 +505,14 @@ const PS_OPTS = { encoding: 'utf8' as const, maxBuffer: 16 * 1024 * 1024, timeou
 const SCAN_MEMO_MS = 5_000;
 const ORPHAN_KILL_GRACE_MS = 1_500;
 
+// Block the calling thread for `ms`. `Atomics.wait` never sees a store into this buffer, so it
+// always waits the full timeout; the buffer is reused because a sync wait has no concurrent waiter
+// to race on it (the sync acquire and the orphan-kill grace both run to completion inline).
+const SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
+function sleepSync(ms: number): void {
+  Atomics.wait(SLEEP_BUF, 0, 0, ms);
+}
+
 // Pure classifier over `ps -axo pid=,ppid=,command=` output — unit-testable without processes.
 // Only a `git` carrying this module's inert-config signature counts; this process itself never
 // does (its own children are parented, not orphaned).
@@ -565,7 +572,7 @@ export function scanInLockGit(): InLockGitScan {
   const hit = memoized();
   if (hit) return hit;
   try {
-    const out = execFileSync('ps', PS_ARGS, PS_OPTS);
+    const out = childProcess.execFileSync('ps', PS_ARGS, PS_OPTS);
     return remember(summarizeInLockGit(listInLockGitProcesses(out, isHolderDead)));
   } catch (e) {
     return scanFailed(e);
@@ -608,12 +615,12 @@ export function terminateOrphansSync(pids: number[]): number[] {
   const deadline = Date.now() + ORPHAN_KILL_GRACE_MS;
   let alive = alivePids(pids);
   while (alive.length > 0 && Date.now() < deadline) {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
-    alive = alivePids(pids);
+    sleepSync(50);
+    alive = alivePids(alive);
   }
   if (alive.length > 0) {
     signalAll(alive, 'SIGKILL');
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    sleepSync(100);
   }
   scanMemo = null; // the host changed under us — the next scan must be fresh
   return alivePids(pids);
@@ -624,7 +631,7 @@ export async function terminateOrphansAsync(pids: number[]): Promise<number[]> {
   let alive = alivePids(pids);
   while (alive.length > 0 && Date.now() < deadline) {
     await sleepAsync(50);
-    alive = alivePids(pids);
+    alive = alivePids(alive);
   }
   if (alive.length > 0) {
     signalAll(alive, 'SIGKILL');
@@ -731,14 +738,16 @@ function reclaimContended(lock: string, c: Contention, why: string): void {
 }
 
 // The shared dead-holder ladder, after the scan (sync and async differ only in how they scanned
-// and how they wait while terminating). Survivors of a termination keep the TTL rule.
+// and how they wait while terminating). The decision is derived once by the caller and passed in
+// so it is never re-computed from the same scan. Survivors of a termination keep the TTL rule.
 function settleDeadHolder(
   lock: string,
   c: Contention,
-  scan: InLockGitScan,
+  decision: DeadHolderDecision,
+  orphans: number[],
   survivors: number[] | null
 ): void {
-  switch (decideDeadHolder(scan)) {
+  switch (decision) {
     case 'reclaim':
       reclaimContended(lock, c, `holder pid ${c.pid} was gone and no in-lock git process is running`);
       return;
@@ -747,7 +756,7 @@ function settleDeadHolder(
         reclaimContended(
           lock,
           c,
-          `holder pid ${c.pid} was gone; terminated its orphaned git ${scan.orphans.join(', ')}`
+          `holder pid ${c.pid} was gone; terminated its orphaned git ${orphans.join(', ')}`
         );
       } else if (survivors) {
         process.stderr.write(
@@ -794,40 +803,46 @@ function lockWedgedError(lock: string, retries: number, sleepMs: number): Error 
   );
 }
 
+// The shared prelude of both acquire attempts: try the exclusive create, and on contention read the
+// holder. Returns a `settled` result (the release, or null to retry) when age/liveness alone decides
+// the outcome, or the live `contend` record when only a dead-holder scan can — the scan itself is the
+// sole sync/async difference, so it stays in each twin. Keeping this one function is what stops the
+// two acquires from drifting on everything up to the scan.
+type AttemptPrelude = { settled: LockRelease | null } | { contend: Contention };
+function attemptPrelude(lock: string, token: string, staleMs: number): AttemptPrelude {
+  const created = tryCreate(lock, token);
+  if (created !== 'contended') return { settled: created };
+  const c = readContention(lock);
+  if (!c) return { settled: null };
+  if (c.age > staleMs) {
+    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? 'unknown'})`);
+    return { settled: null };
+  }
+  if (!c.dead) return { settled: null };
+  return { contend: c };
+}
+
 // One acquire attempt, sync. A contended lock past the TTL is reclaimed by age alone; a dead
 // holder inside the TTL is settled by the scan. An injected scanner that answers a Promise
 // cannot be awaited here → treated as unknown (the TTL rule), never as "no orphans".
 function attemptSync(lock: string, token: string, staleMs: number, scanner: InLockGitScanner): LockRelease | null {
-  const created = tryCreate(lock, token);
-  if (created !== 'contended') return created;
-  const c = readContention(lock);
-  if (!c) return null;
-  if (c.age > staleMs) {
-    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? 'unknown'})`);
-    return null;
-  }
-  if (!c.dead) return null;
+  const pre = attemptPrelude(lock, token, staleMs);
+  if ('settled' in pre) return pre.settled;
   const scanned = scanner();
   const scan = scanned instanceof Promise ? UNKNOWN_SCAN : scanned;
-  const survivors = decideDeadHolder(scan) === 'terminate-orphans' ? terminateOrphansSync(scan.orphans) : null;
-  settleDeadHolder(lock, c, scan, survivors);
+  const decision = decideDeadHolder(scan);
+  const survivors = decision === 'terminate-orphans' ? terminateOrphansSync(scan.orphans) : null;
+  settleDeadHolder(lock, pre.contend, decision, scan.orphans, survivors);
   return null;
 }
 
 async function attemptAsync(lock: string, token: string, staleMs: number, scanner: InLockGitScanner): Promise<LockRelease | null> {
-  const created = tryCreate(lock, token);
-  if (created !== 'contended') return created;
-  const c = readContention(lock);
-  if (!c) return null;
-  if (c.age > staleMs) {
-    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? 'unknown'})`);
-    return null;
-  }
-  if (!c.dead) return null;
+  const pre = attemptPrelude(lock, token, staleMs);
+  if ('settled' in pre) return pre.settled;
   const scan = await scanner();
-  const survivors =
-    decideDeadHolder(scan) === 'terminate-orphans' ? await terminateOrphansAsync(scan.orphans) : null;
-  settleDeadHolder(lock, c, scan, survivors);
+  const decision = decideDeadHolder(scan);
+  const survivors = decision === 'terminate-orphans' ? await terminateOrphansAsync(scan.orphans) : null;
+  settleDeadHolder(lock, pre.contend, decision, scan.orphans, survivors);
   return null;
 }
 
@@ -839,7 +854,7 @@ export function acquireRepoLock(gitCommonDir: string, opts: LockOpts = {}): Lock
     const release = attemptSync(lock, token, staleMs, scanner);
     if (release) return release;
     if (i === retries) break; // the budget is spent — don't sleep just to throw (r3, grok-f2)
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleepMs);
+    sleepSync(sleepMs);
   }
   throw lockWedgedError(lock, retries, sleepMs);
 }
@@ -864,7 +879,7 @@ export function materializeWorktree(
   args: { headSha: string; location: RepoLocation; pr: number; worktreeRoot?: string },
   // `lock` is injected so the serialization can be exercised (and stubbed) independently of the
   // real repo — the default IS the per-repo O_EXCL lock.
-  deps: { git: GitRun; lock?: (gitCommonDir: string) => (() => void) | LockRelease }
+  deps: { git: GitRun; lock?: (gitCommonDir: string) => () => void }
 ): PreflightError | Worktree {
   const { location } = args;
   const common = deps.git(['rev-parse', '--git-common-dir'], { cwd: location.repoRoot });
@@ -981,7 +996,7 @@ export function reapWorktree(repoRoot: string, dir: string, deps: { git: GitRun 
 // blockage was purely the *Sync spawn wrappers + the busy-wait sleep. These twins swap those
 // for their async forms and change NOTHING else: same step sequence (common-dir → lock →
 // fetch → add → HEAD assert → strip → release), same INERT_GIT_CONFIG/INERT_ENV, same error
-// taxonomy, same lock file via the shared tryAcquireOnce. worktree-parity.test.ts pins the
+// taxonomy, same lock file via the shared tryCreate + attemptPrelude. worktree-parity.test.ts pins the
 // twins to identical git argv sequences and outcomes, so drift between them is a test
 // failure, not a code-review hope. The sync versions remain the CLI path (nothing else to
 // do while materializing) — this is one protocol with two waiting styles, not a fork.
@@ -1048,7 +1063,7 @@ export async function materializeWorktreeAsync(
   args: { headSha: string; location: RepoLocation; pr: number; worktreeRoot?: string },
   deps: {
     git: GitRunAsync;
-    lock?: (gitCommonDir: string) => Promise<(() => void) | LockRelease> | (() => void) | LockRelease;
+    lock?: (gitCommonDir: string) => Promise<() => void> | (() => void);
   }
 ): Promise<PreflightError | Worktree> {
   const { location } = args;
