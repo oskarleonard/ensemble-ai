@@ -576,17 +576,18 @@ function tryAcquireOnce(
       // A lock whose holder pid is DEAD is stale regardless of the TTL: a process that died
       // holding it (a killed/crashed provisioning) can never release, so waiting out the full
       // TTL just wedges every sibling for the whole DEFAULT_LOCK_STALE_MS against a corpse. A token
-      // with no parseable
-      // pid, or one whose pid is still alive, keeps the mtime TTL rule instead — `isHolderDead`
-      // is only probed when the token yields a pid at all.
+      // with no parseable pid, or one whose pid is still alive, keeps the mtime TTL rule instead —
+      // `isHolderDead` is only probed when the token yields a pid at all.
       const pid = holderPidFromToken(held);
       const dead = pid !== null && isHolderDead(pid);
       const age = Date.now() - fs.statSync(lock).mtimeMs;
       // A DEAD holder is reclaimed at once when no orphaned in-lock git child is running on this
       // host (its critical section is provably over); while one is, the live-holder TTL rule
       // applies. A live or unknown holder keeps the TTL rule. Age = time since the holder last
-      // touched the lock (acquire, or a completed in-lock op).
-      const reclaim = dead ? !orphanProbe() || age > staleMs : age > staleMs;
+      // touched the lock (acquire, or a completed in-lock op). The TTL is checked first so the
+      // expensive `ps` orphan probe only runs when a dead holder is still within its TTL — the one
+      // case where the probe actually decides the outcome.
+      const reclaim = age > staleMs || (dead && !orphanProbe());
       // Reclaim ONLY the exact token we observed: the ownership guard re-reads and compares, so if
       // the holder released and a third process took the lock in between, `held` no longer matches
       // and we leave that new lock alone. The dead-pid log fires AFTER the reclaim and only when it

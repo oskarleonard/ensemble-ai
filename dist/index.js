@@ -2930,7 +2930,7 @@ function tryAcquireOnce(lock, token, staleMs, orphanProbe) {
       const pid = holderPidFromToken(held);
       const dead = pid !== null && isHolderDead(pid);
       const age = Date.now() - fs12.statSync(lock).mtimeMs;
-      const reclaim = dead ? !orphanProbe() || age > staleMs : age > staleMs;
+      const reclaim = age > staleMs || dead && !orphanProbe();
       if (reclaim) {
         const reclaimed = removeLockIfOwned(lock, held);
         if (reclaimed && dead) {
