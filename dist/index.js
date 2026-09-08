@@ -3165,6 +3165,8 @@ function attemptSync(lock, token, staleMs, scope, scanner) {
   const pre = attemptPrelude(lock, token, staleMs);
   if ("settled" in pre) return pre.settled;
   const scanned = scanner(scope);
+  if (scanned instanceof Promise) scanned.catch(() => {
+  });
   const scan = scanned instanceof Promise ? UNKNOWN_SCAN : scanned;
   const survivors = decideDeadHolder(scan) === "terminate-orphans" ? terminateOrphansSync(scan.orphans) : null;
   settleDeadHolder(lock, pre.contend, scan, survivors, pre.expired);

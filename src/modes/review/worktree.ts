@@ -908,6 +908,10 @@ function attemptSync(lock: string, token: string, staleMs: number, scope: LockSc
   const pre = attemptPrelude(lock, token, staleMs);
   if ('settled' in pre) return pre.settled;
   const scanned = scanner(scope);
+  // The sync path cannot await an async scanner, so an injected one degrades to UNKNOWN_SCAN. It
+  // must still be `.catch`'d: a discarded REJECTING promise is an unhandledRejection (process-fatal
+  // under Node's default policy). Production uses the sync scanInLockGit, which never rejects.
+  if (scanned instanceof Promise) scanned.catch(() => {});
   const scan = scanned instanceof Promise ? UNKNOWN_SCAN : scanned;
   const survivors = decideDeadHolder(scan) === 'terminate-orphans' ? terminateOrphansSync(scan.orphans) : null;
   settleDeadHolder(lock, pre.contend, scan, survivors, pre.expired);

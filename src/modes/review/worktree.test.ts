@@ -286,6 +286,17 @@ describe('acquireRepoLock — a holder may only ever remove ITS OWN lock', () =>
     fs.unlinkSync(lockPath(dir));
   });
 
+  it('the sync acquire swallows a REJECTING async scanner instead of leaking an unhandled rejection', () => {
+    const dir = freshDir();
+    deadLock(dir);
+    // A rejecting async scanner on the sync path must degrade to unknown (→ TTL → wedged throw),
+    // never surface as an unhandled promise rejection (which vitest would fail the file on).
+    expect(() =>
+      acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner: async () => { throw new Error('scanner boom'); } })
+    ).toThrow(/could not acquire the worktree lock/);
+    fs.unlinkSync(lockPath(dir));
+  });
+
   // The pure classifiers behind the live scanners: signature + cwd = OURS; parent gone = orphan
   // (with its descendants — git helpers write too); everything else in-lock is ambiguous.
   it('parseProcessTable / classifyInLockGit attribute in-lock git by signature, cwd and parent', () => {
