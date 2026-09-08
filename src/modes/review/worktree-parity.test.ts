@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,17 +8,27 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   acquireRepoLock,
   acquireRepoLockAsync,
-  type GitRun,
-  type GitRunAsync,
+  isHolderDead,
   materializeWorktree,
   materializeWorktreeAsync,
   resolveRepoLocation,
   resolveRepoLocationAsync,
   stripAgentInstructions,
   stripAgentInstructionsAsync,
-  WORKTREE_LOCK_ERROR,
+  type GitRun,
+  type GitRunAsync,
   type Worktree,
+  WORKTREE_LOCK_ERROR,
 } from './worktree';
+
+// A pid guaranteed gone: spawnSync waits for and REAPS the child before returning, so the pid
+// names an already-exited process (mirrors the helper in worktree.test.ts — no hard-coded pid).
+function reapedDeadPid(): number {
+  const r = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  if (typeof r.pid !== 'number') throw new Error('could not spawn a child to reap for a dead pid');
+  return r.pid;
+}
+
 
 // THE PARITY PIN. The async twins exist so a server consumer can materialize without freezing
 // its event loop (lived 2026-07-17: a sync 760-file checkout on a request path took a prod
@@ -336,7 +347,7 @@ describe('the acquire refuses to mistake a caller bug for contention', () => {
     );
     // If these retried as contention they would take retries×sleep — the assertion is that
     // they throw the real errno at once (claude-f4: a bare catch made every errno look
-    // like a held lock, a ~10-minute hang at server defaults).
+    // like a held lock, a multi-minute hang at server defaults — DEFAULT_LOCK_STALE_MS).
     expect(() => acquireRepoLock(missing, { retries: 1000, sleepMs: 50 })).toThrow(/ENOENT/);
     await expect(
       acquireRepoLockAsync(missing, { retries: 1000, sleepMs: 50 })
@@ -382,6 +393,27 @@ describe('acquireRepoLockAsync — same file, same protocol, loop-friendly wait'
     fs.writeFileSync(lock, 'someone-else'); // simulate a reclaim-and-replace
     release();
     expect(fs.readFileSync(lock, 'utf8')).toBe('someone-else');
+  });
+
+  // Parity for the dead-holder reclaim: the async twin must reclaim a lock whose holder pid is
+  // dead REGARDLESS of the TTL, exactly like the sync acquire (worktree.test.ts). Both share
+  // attemptPrelude today, but that shared path is precisely what this suite exists to pin — a
+  // future fork of the EEXIST branch in only one acquire must fail here, not ship green.
+  it('settles a dead holder exactly like the sync acquire: idle host → reclaim; busy → TTL', async () => {
+    const dir = lockDir();
+    const lock = path.join(dir, 'ensemble-ai-worktree.lock');
+    const dead = reapedDeadPid();
+    expect(isHolderDead(dead)).toBe(true); // precondition: the reaped child really is gone
+    fs.writeFileSync(lock, `${dead}:crashed-provisioning`);
+    // Busy (an in-lock git somewhere on the host): held, the TTL rule applies — parity with sync.
+    await expect(
+      acquireRepoLockAsync(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner: async () => ({ busy: true, unknown: false }) })
+    ).rejects.toThrow(/could not acquire the worktree lock/);
+    // Idle: reclaimed at once — through the NON-blocking async path (the scanner answers a Promise).
+    const release = await acquireRepoLockAsync(dir, { retries: 3, sleepMs: 1, staleMs: 60 * 60_000, scanner: async () => ({ busy: false, unknown: false }) });
+    expect(fs.readFileSync(lock, 'utf8')).not.toContain('crashed-provisioning');
+    release();
+    expect(fs.existsSync(lock)).toBe(false);
   });
 
   it('waits its turn without blocking: acquires after the holder releases mid-wait', async () => {

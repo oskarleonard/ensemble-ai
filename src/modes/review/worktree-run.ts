@@ -58,7 +58,7 @@ export function openWorktree(
   args: OpenWorktreeArgs,
   // `lock` is injected exactly as materializeWorktree injects it — the default IS the per-repo
   // O_EXCL lock. A test needs the seam to prove the contended path returns a NAMED cause instead
-  // of throwing (the real lock only gives up after its 10-minute staleness TTL).
+  // of throwing (the real lock only gives up after its DEFAULT_LOCK_STALE_MS staleness TTL).
   deps: { git?: GitRun; lock?: (gitCommonDir: string) => () => void } = {}
 ): PreflightError | WorktreeSession {
   const git = deps.git ?? execGit();

@@ -1,23 +1,43 @@
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
-import { execGit } from './git-exec';
+import { execGit, GIT_TIMEOUT_MS } from './git-exec';
 import {
   acquireRepoLock,
   classifyGitError,
-  type GitRun,
+  decideDeadHolder,
+  DEFAULT_LOCK_STALE_MS,
+  holderPidFromToken,
+  inLockGitCandidates,
+  isHolderDead,
   isPreflightError,
   materializeWorktree,
+  parseProcessTable,
   reapWorktree,
   redactUrlCredentials,
   remoteSlug,
+  removeLockIfOwned,
   resolveRepoLocation,
   rootAllowed,
+  scanInLockGit,
+  scanInLockGitAsync,
+  type GitRun,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
 } from './worktree';
+
+// A pid that is guaranteed to be gone: spawnSync waits for and REAPS the child before it returns,
+// so the returned pid names a process that has already exited. Used to plant a lock whose holder is
+// dead without hard-coding a pid the OS might actually be running.
+function reapedDeadPid(): number {
+  const r = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  if (typeof r.pid !== 'number') throw new Error('could not spawn a child to reap for a dead pid');
+  return r.pid;
+}
+
 
 // The clause is the in-file half of the instruction fence (the strip closes the FILE half). Since
 // the CI evidence section landed, a seat also reads text a CI job PRINTED — the same untrusted
@@ -176,6 +196,231 @@ describe('acquireRepoLock — a holder may only ever remove ITS OWN lock', () =>
     const release = acquireRepoLock(dir);
     expect(() => acquireRepoLock(dir, { retries: 0, sleepMs: 1 })).toThrow(/0s/);
     release();
+  });
+
+  // THE DEAD-HOLDER RECLAIM (incident 2026-08-31): a provisioning that DIED holding the lock can
+  // never release, so waiting out the full TTL wedges every sibling against a corpse. A dead pid
+  // alone proves nothing (its git child may still be writing, #83 review), so the reclaim asks the
+  // host: no in-lock git running anywhere → reclaim now; busy or unknown → the TTL rule.
+  const deadLock = (dir: string) => {
+    const dead = reapedDeadPid();
+    expect(isHolderDead(dead)).toBe(true); // precondition: the reaped child really is gone
+    fs.writeFileSync(lockPath(dir), `${dead}:crashed-provisioning`); // fresh mtime by construction
+  };
+
+  it('reclaims a dead-pid lock at once when the host runs no in-lock git (fresh mtime, long TTL)', () => {
+    const dir = freshDir();
+    deadLock(dir);
+    const release = acquireRepoLock(dir, { retries: 3, sleepMs: 1, staleMs: 60 * 60_000, scanner: () => ({ busy: false, unknown: false }) });
+    expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-provisioning');
+    release();
+    expect(fs.existsSync(lockPath(dir))).toBe(false);
+  });
+
+  it('holds a dead-pid lock while ANY in-lock git runs on the host — the TTL rule, then its backstop', () => {
+    const dir = freshDir();
+    deadLock(dir);
+    const scanner = () => ({ busy: true, unknown: false });
+    expect(() =>
+      acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner })
+    ).toThrow(/could not acquire the worktree lock/);
+    expect(fs.readFileSync(lockPath(dir), 'utf8')).toContain('crashed-provisioning'); // untouched
+    // A positively detected writer gets a SECOND TTL before the backstop: past 1× it is still held…
+    const past1 = new Date(Date.now() - 1_500);
+    fs.utimesSync(lockPath(dir), past1, past1);
+    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 1_000, scanner })).toThrow(
+      /could not acquire the worktree lock/
+    );
+    // …past 2× the backstop reclaims (bounded, never faster than today's TTL while busy).
+    const past2 = new Date(Date.now() - 60_000);
+    fs.utimesSync(lockPath(dir), past2, past2);
+    const release = acquireRepoLock(dir, { retries: 2, sleepMs: 1, staleMs: 1_000, scanner });
+    expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-provisioning');
+    release();
+  });
+
+  it('a cached scan is never reused for a DIFFERENT holder (keyed by the observed token)', () => {
+    const dir = freshDir();
+    deadLock(dir);
+    let scans = 0;
+    const scanner = () => {
+      scans += 1;
+      return { busy: true, unknown: false };
+    };
+    expect(() => acquireRepoLock(dir, { retries: 2, sleepMs: 1, staleMs: 60 * 60_000, scanner })).toThrow(
+      /could not acquire the worktree lock/
+    );
+    expect(scans).toBe(1);
+    // The same waiter cannot be re-entered, but a NEW dead holder within 5 s must re-scan: prove
+    // it through the exported decision + a second acquire whose cache starts empty (per waiter).
+    const dead2 = reapedDeadPid();
+    fs.writeFileSync(lockPath(dir), `${dead2}:another-crash`);
+    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner })).toThrow(
+      /could not acquire the worktree lock/
+    );
+    expect(scans).toBe(2);
+    fs.unlinkSync(lockPath(dir));
+  });
+
+  it('an UNKNOWN scan (ps unavailable) keeps the TTL rule — never "idle"', () => {
+    const dir = freshDir();
+    deadLock(dir);
+    expect(() =>
+      acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner: () => ({ busy: false, unknown: true }) })
+    ).toThrow(/could not acquire the worktree lock/);
+    fs.unlinkSync(lockPath(dir));
+  });
+
+  it('the sync acquire treats a Promise-returning scanner as unknown (it cannot await)', () => {
+    const dir = freshDir();
+    deadLock(dir);
+    expect(() =>
+      acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner: async () => ({ busy: false, unknown: false }) })
+    ).toThrow(/could not acquire the worktree lock/);
+    fs.unlinkSync(lockPath(dir));
+  });
+
+  it('the sync acquire swallows a REJECTING async scanner instead of leaking an unhandled rejection', () => {
+    const dir = freshDir();
+    deadLock(dir);
+    expect(() =>
+      acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner: () => Promise.reject(new Error('boom')) })
+    ).toThrow(/could not acquire the worktree lock/);
+    fs.unlinkSync(lockPath(dir));
+  });
+
+  it('a busy scan is reused within one waiter for a few seconds, not re-forked every retry', () => {
+    const dir = freshDir();
+    deadLock(dir);
+    let scans = 0;
+    const scanner = () => {
+      scans += 1;
+      return ({ busy: true, unknown: false });
+    };
+    expect(() => acquireRepoLock(dir, { retries: 20, sleepMs: 1, staleMs: 60 * 60_000, scanner })).toThrow(
+      /could not acquire the worktree lock/
+    );
+    expect(scans).toBe(1);
+    fs.unlinkSync(lockPath(dir));
+  });
+
+  // The pure classifier behind the live scanners: only a `git` carrying this module's
+  // inert-config signature counts, and never this process itself.
+  it('parseProcessTable / inLockGitCandidates pick out in-lock git by its signature', () => {
+    const sig = 'git -c core.hooksPath=/dev/null -c filter.lfs.smudge= fetch --no-tags origin pull/7/head';
+    const table = parseProcessTable(
+      [
+        `  100     1 ${sig}`,
+        `  101  4242 /usr/local/bin/git -c core.hooksPath=/dev/null worktree add --detach /tmp/x abc`,
+        `  ${process.pid}     1 ${sig}`, // this process → never a candidate
+        '  105     1 /usr/bin/git status', // no signature → ignored
+        '  106     1 node something core.hooksPath=/dev/null', // not git → ignored
+      ].join('\n')
+    );
+    expect(inLockGitCandidates(table).map((r) => r.pid)).toEqual([100, 101]);
+    expect(decideDeadHolder(({ busy: true, unknown: false }))).toBe('ttl');
+    expect(decideDeadHolder(({ busy: false, unknown: true }))).toBe('ttl');
+    expect(decideDeadHolder(({ busy: false, unknown: false }))).toBe('reclaim');
+    expect(parseProcessTable('')).toEqual([]);
+  });
+
+  it('the live scanners run the real ps and answer a scan shape (sync + async)', async () => {
+    const scope = { gitCommonDir: path.join(freshDir(), '.git'), repoRoot: freshDir() };
+    const a = scanInLockGit(scope);
+    expect(typeof a.busy).toBe('boolean');
+    expect(typeof a.unknown).toBe('boolean');
+    const b = await scanInLockGitAsync(scope);
+    expect(typeof b.busy).toBe('boolean');
+  });
+
+  // The lease: the holder refreshes the lock after each completed in-lock op through its own
+  // release handle, which proves the EXACT token — a lock it no longer holds is never re-leased.
+  it('release.touch refreshes the lock only while this exact token holds it', () => {
+    const dir = freshDir();
+    const release = acquireRepoLock(dir);
+    const past = new Date(Date.now() - 60 * 60_000);
+    fs.utimesSync(lockPath(dir), past, past);
+    expect(release.touch()).toBe(true);
+    expect(Date.now() - fs.statSync(lockPath(dir)).mtimeMs).toBeLessThan(10_000);
+    fs.writeFileSync(lockPath(dir), `${process.pid}:someone-else-same-pid`); // same pid, other token
+    fs.utimesSync(lockPath(dir), past, past);
+    expect(release.touch()).toBe(false);
+    expect(Math.abs(fs.statSync(lockPath(dir)).mtimeMs - past.getTime())).toBeLessThan(2_000);
+    fs.unlinkSync(lockPath(dir));
+    expect(release.touch()).toBe(false); // no lock → silent no-op
+  });
+
+  // The hold-duration invariant, structural: a live holder's lock is never older than one git op
+  // (leased per op), and the default TTL clears one op's timeout with margin.
+  it('the default live-holder TTL clears one git op timeout', () => {
+    expect(DEFAULT_LOCK_STALE_MS).toBeGreaterThan(GIT_TIMEOUT_MS);
+  });
+
+  // The mirror case: a LIVE holder keeps the TTL rule. This process is alive, so its lock must not
+  // be reclaimed before the mtime TTL — the acquire waits out its budget and reports wedged.
+  it('does NOT reclaim a lock whose holder pid is alive before the TTL', () => {
+    const dir = freshDir();
+    const live = `${process.pid}:live-holder`; // process.pid is this test runner — alive
+    fs.writeFileSync(lockPath(dir), live);
+    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000 })).toThrow(
+      /could not acquire the worktree lock/
+    );
+    expect(fs.readFileSync(lockPath(dir), 'utf8')).toBe(live); // untouched
+    fs.unlinkSync(lockPath(dir));
+  });
+
+  // A token with no parseable pid gives no life/death signal, so it falls back to the mtime TTL:
+  // fresh ⇒ not reclaimed; aged past the TTL ⇒ reclaimed exactly as before this change.
+  it('a token with no parseable pid falls back to the mtime TTL rule', () => {
+    const dir = freshDir();
+    fs.writeFileSync(lockPath(dir), 'no-pid-here'); // fresh mtime, unparseable pid
+    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000 })).toThrow(
+      /could not acquire the worktree lock/
+    );
+    const old = Date.now() - 60 * 60_000;
+    fs.utimesSync(lockPath(dir), old / 1000, old / 1000);
+    const release = acquireRepoLock(dir, { retries: 2, sleepMs: 1, staleMs: 10 * 60_000 });
+    expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toBe('no-pid-here');
+    release();
+  });
+});
+
+describe('holderPidFromToken — the holder pid a lock token records', () => {
+  it('parses the leading pid a real token carries', () => {
+    expect(holderPidFromToken(`${process.pid}:0f1e-2d3c`)).toBe(process.pid);
+  });
+  it('returns null for a token with no leading positive-integer pid', () => {
+    expect(holderPidFromToken('crashed-run:deadbeef')).toBeNull();
+    expect(holderPidFromToken('')).toBeNull();
+    expect(holderPidFromToken('0:x')).toBeNull(); // pid 0 is not a real holder
+  });
+});
+
+describe('isHolderDead — probes a pid without signalling it', () => {
+  it('reports this live process as alive', () => {
+    expect(isHolderDead(process.pid)).toBe(false);
+  });
+  it('reports a reaped child pid as dead', () => {
+    expect(isHolderDead(reapedDeadPid())).toBe(true);
+  });
+});
+
+// The ownership guard is what makes the dead-holder reclaim safe: even after observing a stale
+// token, removeLockIfOwned re-reads the file and removes it ONLY if it still carries that exact
+// token — so a holder that released and a third party's fresh lock are never deleted.
+describe('removeLockIfOwned — a token that changed since observe is never removed', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-owned-'));
+  afterAll(() => fs.rmSync(tmp, { force: true, recursive: true }));
+
+  it('leaves a lock whose token changed between observe and unlink in place', () => {
+    const lock = path.join(tmp, 'ensemble-ai-worktree.lock');
+    fs.writeFileSync(lock, 'reclaimer-token'); // a third party's fresh lock now sits here
+    removeLockIfOwned(lock, 'stale-observed-token'); // we observed a DIFFERENT token
+    expect(fs.existsSync(lock)).toBe(true);
+    expect(fs.readFileSync(lock, 'utf8')).toBe('reclaimer-token');
+    // and it DOES remove a lock still carrying the exact token we observed
+    removeLockIfOwned(lock, 'reclaimer-token');
+    expect(fs.existsSync(lock)).toBe(false);
   });
 });
 
