@@ -491,21 +491,19 @@ function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => vo
       // A lock whose holder pid is DEAD is stale regardless of the TTL: a process that died
       // holding it (a killed/crashed provisioning) can never release, so waiting out the full
       // TTL just wedges every sibling for ten minutes against a corpse. A token with no parseable
-      // pid, or one whose pid is still alive, keeps the mtime TTL rule below.
+      // pid, or one whose pid is still alive, keeps the mtime TTL rule (the `||` short-circuits,
+      // so a dead holder never stats the lock).
       const pid = holderPidFromToken(held);
-      if (pid !== null && isHolderDead(pid)) {
+      const dead = pid !== null && isHolderDead(pid);
+      if (dead) {
         process.stderr.write(
           `⚠ ensemble-ai: reclaiming worktree lock at ${lock} — holder pid ${pid} is gone\n`
         );
-        // Reclaim ONLY the exact token we observed (the ownership guard re-reads and compares),
-        // so a holder that released and a third process's fresh lock are never removed.
-        removeLockIfOwned(lock, held);
-      } else {
-        const age = Date.now() - fs.statSync(lock).mtimeMs;
-        // Reclaim ONLY the exact stale lock we just observed: if the holder released and a third
-        // process took it in between, `held` no longer matches and we leave the new lock alone.
-        if (age > staleMs) removeLockIfOwned(lock, held);
       }
+      // Reclaim ONLY the exact token we observed: the ownership guard re-reads and compares, so if
+      // the holder released and a third process took the lock in between, `held` no longer matches
+      // and we leave that new lock alone.
+      if (dead || Date.now() - fs.statSync(lock).mtimeMs > staleMs) removeLockIfOwned(lock, held);
     } catch {
       /* raced with the holder — just wait */
     }

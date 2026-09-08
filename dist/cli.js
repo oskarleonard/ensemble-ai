@@ -3298,16 +3298,14 @@ function tryAcquireOnce(lock, token, staleMs) {
     try {
       const held = fs14.readFileSync(lock, "utf8").trim();
       const pid = holderPidFromToken(held);
-      if (pid !== null && isHolderDead(pid)) {
+      const dead = pid !== null && isHolderDead(pid);
+      if (dead) {
         process.stderr.write(
           `\u26A0 ensemble-ai: reclaiming worktree lock at ${lock} \u2014 holder pid ${pid} is gone
 `
         );
-        removeLockIfOwned(lock, held);
-      } else {
-        const age = Date.now() - fs14.statSync(lock).mtimeMs;
-        if (age > staleMs) removeLockIfOwned(lock, held);
       }
+      if (dead || Date.now() - fs14.statSync(lock).mtimeMs > staleMs) removeLockIfOwned(lock, held);
     } catch {
     }
     return null;
