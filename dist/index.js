@@ -2742,6 +2742,9 @@ var INERT_GIT_CONFIG = [
 ];
 var INERT_ENV = { GIT_LFS_SKIP_SMUDGE: "1" };
 var WORKTREE_PARENT_PREFIX = "ensemble-worktree-";
+function repoLockPath(gitCommonDir) {
+  return path11.join(gitCommonDir, "ensemble-ai-worktree.lock");
+}
 var AGENT_INSTRUCTION_NAMES = ["CLAUDE.md", "AGENTS.md", ".claude"];
 var CURSOR_DIR = ".cursor";
 var CURSOR_RULES = "rules";
@@ -2874,7 +2877,7 @@ var DEFAULT_LOCK_STALE_MS = GIT_TIMEOUT_MS + 5 * 6e4;
 function touchRepoLock(gitCommonDir) {
   const now = /* @__PURE__ */ new Date();
   try {
-    fs12.utimesSync(path11.join(gitCommonDir, "ensemble-ai-worktree.lock"), now, now);
+    fs12.utimesSync(repoLockPath(gitCommonDir), now, now);
   } catch {
   }
 }
@@ -2918,7 +2921,7 @@ function tryAcquireOnce(lock, token, staleMs) {
   }
 }
 function lockPathAndBudget(gitCommonDir, opts) {
-  const lock = path11.join(gitCommonDir, "ensemble-ai-worktree.lock");
+  const lock = repoLockPath(gitCommonDir);
   const sleepMs = Math.max(1, opts.sleepMs ?? 500);
   const staleMs = opts.staleMs ?? DEFAULT_LOCK_STALE_MS;
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);

@@ -218,6 +218,13 @@ const INERT_ENV = { GIT_LFS_SKIP_SMUDGE: '1' };
 // caller that passes an arbitrary directory can never make the reap delete that directory's parent.
 const WORKTREE_PARENT_PREFIX = 'ensemble-worktree-';
 
+// The per-repo lock file lives in the shared `.git` common dir. ONE derivation of its path, so the
+// acquire, the lease refresh, and the reclaim can never touch different files (a drift would make
+// touchRepoLock silently refresh nothing).
+function repoLockPath(gitCommonDir: string): string {
+  return path.join(gitCommonDir, 'ensemble-ai-worktree.lock');
+}
+
 export interface Worktree {
   dir: string;
   headSha: string;
@@ -484,7 +491,7 @@ export const DEFAULT_LOCK_STALE_MS = GIT_TIMEOUT_MS + 5 * 60_000;
 export function touchRepoLock(gitCommonDir: string): void {
   const now = new Date();
   try {
-    fs.utimesSync(path.join(gitCommonDir, 'ensemble-ai-worktree.lock'), now, now);
+    fs.utimesSync(repoLockPath(gitCommonDir), now, now);
   } catch {
     /* no lock to refresh (released / reclaimed) or a read-only fs — nothing to do */
   }
@@ -529,8 +536,8 @@ function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => vo
       // A lock whose holder pid is DEAD is stale regardless of the TTL: a process that died
       // holding it (a killed/crashed provisioning) can never release, so waiting out the full
       // TTL just wedges every sibling for ten minutes against a corpse. A token with no parseable
-      // pid, or one whose pid is still alive, keeps the mtime TTL rule (the `||` short-circuits,
-      // so a dead holder never stats the lock).
+      // pid, or one whose pid is still alive, keeps the mtime TTL rule instead — `isHolderDead`
+      // is only probed when the token yields a pid at all.
       const pid = holderPidFromToken(held);
       const dead = pid !== null && isHolderDead(pid);
       // Age = time since the holder last touched the lock (acquire, or a completed in-lock op).
@@ -559,7 +566,7 @@ function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => vo
 }
 
 function lockPathAndBudget(gitCommonDir: string, opts: { retries?: number; sleepMs?: number; staleMs?: number }) {
-  const lock = path.join(gitCommonDir, 'ensemble-ai-worktree.lock');
+  const lock = repoLockPath(gitCommonDir);
   // Clamped ≥1: `?? 500` is nullish-only, so an explicit sleepMs of 0 slipped through and
   // made the derived retry budget `Math.ceil(staleMs / 0) = Infinity` — a loop that can
   // never reach lockWedgedError, spinning at full CPU in the sync acquire (r2, codex-f1).
