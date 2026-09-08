@@ -539,11 +539,13 @@ export function inLockGitCandidates(table: ProcessRow[]): ProcessRow[] {
 }
 export function descendantsOf(table: ProcessRow[], root: number): number[] {
   const out: number[] = [];
+  const seen = new Set<number>([root]); // root pre-seeded so it is never re-queued as its own child
   const queue = [root];
   while (queue.length > 0) {
     const parent = queue.shift()!;
     for (const r of table) {
-      if (r.ppid === parent && !out.includes(r.pid) && r.pid !== root) {
+      if (r.ppid === parent && !seen.has(r.pid)) {
+        seen.add(r.pid);
         out.push(r.pid);
         queue.push(r.pid);
       }
