@@ -2740,7 +2740,12 @@ var INERT_GIT_CONFIG = [
   "-c",
   "filter.lfs.clean=",
   "-c",
-  "filter.lfs.required=false"
+  "filter.lfs.required=false",
+  // No detached auto-gc: `git fetch` otherwise forks `git gc --auto --detach`, which is DESIGNED to
+  // outlive its parent and keeps mutating the shared object store after the fetch returns — a writer
+  // the dead-holder scan cannot see (it carries no inert signature) and that the reap never bounds.
+  "-c",
+  "gc.auto=0"
 ];
 var INERT_ENV = { GIT_LFS_SKIP_SMUDGE: "1" };
 var WORKTREE_PARENT_PREFIX = "ensemble-worktree-";
@@ -3128,16 +3133,16 @@ function settleDeadHolder(lock, c, scan, survivors, expired) {
       return;
   }
 }
-function scopeOf(gitCommonDir) {
-  const repoRoot = path11.basename(gitCommonDir) === ".git" ? path11.dirname(gitCommonDir) : gitCommonDir;
-  return { gitCommonDir, repoRoot };
+function scopeOf(gitCommonDir, repoRoot) {
+  const derived = path11.basename(gitCommonDir) === ".git" ? path11.dirname(gitCommonDir) : gitCommonDir;
+  return { gitCommonDir, repoRoot: repoRoot ?? derived };
 }
 function lockPathAndBudget(gitCommonDir, opts) {
   const lock = repoLockPath(gitCommonDir);
   const sleepMs = Math.max(1, opts.sleepMs ?? 500);
   const staleMs = opts.staleMs ?? DEFAULT_LOCK_STALE_MS;
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
-  return { lock, retries, scope: scopeOf(gitCommonDir), sleepMs, staleMs };
+  return { lock, retries, scope: scopeOf(gitCommonDir, opts.repoRoot), sleepMs, staleMs };
 }
 function lockWedgedError(lock, retries, sleepMs) {
   return new Error(
@@ -3175,7 +3180,12 @@ function attemptSync(lock, token, staleMs, scope, scanner) {
 async function attemptAsync(lock, token, staleMs, scope, scanner) {
   const pre = attemptPrelude(lock, token, staleMs);
   if ("settled" in pre) return pre.settled;
-  const scan = await scanner(scope);
+  let scan;
+  try {
+    scan = await scanner(scope);
+  } catch (e) {
+    scan = scanFailed(e);
+  }
   const survivors = decideDeadHolder(scan) === "terminate-orphans" ? await terminateOrphansAsync(scan.orphans) : null;
   settleDeadHolder(lock, pre.contend, scan, survivors, pre.expired);
   return takeAfterReclaim(lock, token);
@@ -3211,7 +3221,8 @@ function materializeWorktree(args, deps) {
     return { kind: "not-a-repo", message: `cannot resolve the git dir of ${location.repoRoot}` };
   }
   const gitCommonDir = path11.resolve(location.repoRoot, common.text.trim());
-  const release = (deps.lock ?? acquireRepoLock)(gitCommonDir);
+  const acquire = deps.lock ?? ((dir2) => acquireRepoLock(dir2, { repoRoot: location.repoRoot }));
+  const release = acquire(gitCommonDir);
   let dir = null;
   try {
     const fetched = deps.git(
@@ -3325,7 +3336,8 @@ async function materializeWorktreeAsync(args, deps) {
     return { kind: "not-a-repo", message: `cannot resolve the git dir of ${location.repoRoot}` };
   }
   const gitCommonDir = path11.resolve(location.repoRoot, common.text.trim());
-  const release = await (deps.lock ?? acquireRepoLockAsync)(gitCommonDir);
+  const acquire = deps.lock ?? ((dir2) => acquireRepoLockAsync(dir2, { repoRoot: location.repoRoot }));
+  const release = await acquire(gitCommonDir);
   let dir = null;
   try {
     const fetched = await deps.git(

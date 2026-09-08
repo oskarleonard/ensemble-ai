@@ -205,6 +205,10 @@ const INERT_GIT_CONFIG = [
   '-c', 'filter.lfs.process=',
   '-c', 'filter.lfs.clean=',
   '-c', 'filter.lfs.required=false',
+  // No detached auto-gc: `git fetch` otherwise forks `git gc --auto --detach`, which is DESIGNED to
+  // outlive its parent and keeps mutating the shared object store after the fetch returns — a writer
+  // the dead-holder scan cannot see (it carries no inert signature) and that the reap never bounds.
+  '-c', 'gc.auto=0',
 ];
 
 const INERT_ENV = { GIT_LFS_SKIP_SMUDGE: '1' };
@@ -834,6 +838,13 @@ function settleDeadHolder(
 }
 
 export interface LockOpts {
+  // The cwd the in-lock git commands actually run in (`location.repoRoot`). The scan attributes an
+  // orphan as OURS only when its cwd equals this, so it MUST be the real command cwd — deriving it
+  // from `gitCommonDir` misattributes every writer for a linked worktree, a submodule, or a
+  // `--separate-git-dir` layout (the common dir is the main repo's `.git` / an admin dir, never the
+  // checkout the fetch runs in), silently disabling the dead-holder fast path there. The materialize
+  // paths pass it; when absent we fall back to the common-dir heuristic (bare-repo / test seams).
+  repoRoot?: string;
   retries?: number;
   // Injectable for tests; production uses the live `ps` + `lsof` scanners.
   scanner?: InLockGitScanner;
@@ -841,10 +852,11 @@ export interface LockOpts {
   staleMs?: number;
 }
 
-// The repo root this lock protects — where the in-lock git commands run (cwd).
-function scopeOf(gitCommonDir: string): LockScope {
-  const repoRoot = path.basename(gitCommonDir) === '.git' ? path.dirname(gitCommonDir) : gitCommonDir;
-  return { gitCommonDir, repoRoot };
+// The repo root this lock protects — where the in-lock git commands run (cwd). Prefer the caller's
+// real command cwd; only guess from the common dir when it was not supplied.
+function scopeOf(gitCommonDir: string, repoRoot?: string): LockScope {
+  const derived = path.basename(gitCommonDir) === '.git' ? path.dirname(gitCommonDir) : gitCommonDir;
+  return { gitCommonDir, repoRoot: repoRoot ?? derived };
 }
 
 function lockPathAndBudget(gitCommonDir: string, opts: LockOpts) {
@@ -864,7 +876,7 @@ function lockPathAndBudget(gitCommonDir: string, opts: LockOpts) {
   // op, and DEFAULT_LOCK_STALE_MS is derived from that op's git timeout plus margin. A dead
   // holder is settled by the in-lock git scan above (reclaim / terminate own orphans / TTL).
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
-  return { lock, retries, scope: scopeOf(gitCommonDir), sleepMs, staleMs };
+  return { lock, retries, scope: scopeOf(gitCommonDir, opts.repoRoot), sleepMs, staleMs };
 }
 
 function lockWedgedError(lock: string, retries: number, sleepMs: number): Error {
@@ -921,7 +933,16 @@ function attemptSync(lock: string, token: string, staleMs: number, scope: LockSc
 async function attemptAsync(lock: string, token: string, staleMs: number, scope: LockScope, scanner: InLockGitScanner): Promise<LockRelease | null> {
   const pre = attemptPrelude(lock, token, staleMs);
   if ('settled' in pre) return pre.settled;
-  const scan = await scanner(scope);
+  // A rejecting injected scanner degrades to UNKNOWN_SCAN (the TTL rule), the SAME contract the sync
+  // twin's `.catch` gives — never a hard acquire rejection. A transient failure inside a consumer's
+  // custom scanner (an EAGAIN spawning `ps`, a probe timeout) must fall back to waiting, not fail the
+  // materialization on the request path.
+  let scan: InLockGitScan;
+  try {
+    scan = await scanner(scope);
+  } catch (e) {
+    scan = scanFailed(e);
+  }
   const survivors = decideDeadHolder(scan) === 'terminate-orphans' ? await terminateOrphansAsync(scan.orphans) : null;
   settleDeadHolder(lock, pre.contend, scan, survivors, pre.expired);
   return takeAfterReclaim(lock, token);
@@ -968,7 +989,10 @@ export function materializeWorktree(
     return { kind: 'not-a-repo', message: `cannot resolve the git dir of ${location.repoRoot}` };
   }
   const gitCommonDir = path.resolve(location.repoRoot, common.text.trim());
-  const release = (deps.lock ?? acquireRepoLock)(gitCommonDir);
+  // The default acquire is told the REAL command cwd so the scan can attribute this repo's writers;
+  // an injected test lock keeps the bare `(gitCommonDir) => release` seam.
+  const acquire = deps.lock ?? ((dir: string) => acquireRepoLock(dir, { repoRoot: location.repoRoot }));
+  const release = acquire(gitCommonDir);
   let dir: string | null = null;
   try {
     const fetched = deps.git(
@@ -1153,7 +1177,9 @@ export async function materializeWorktreeAsync(
     return { kind: 'not-a-repo', message: `cannot resolve the git dir of ${location.repoRoot}` };
   }
   const gitCommonDir = path.resolve(location.repoRoot, common.text.trim());
-  const release = await (deps.lock ?? acquireRepoLockAsync)(gitCommonDir);
+  // Same as the sync twin: hand the default acquire the real command cwd for attribution.
+  const acquire = deps.lock ?? ((dir: string) => acquireRepoLockAsync(dir, { repoRoot: location.repoRoot }));
+  const release = await acquire(gitCommonDir);
   let dir: string | null = null;
   try {
     const fetched = await deps.git(

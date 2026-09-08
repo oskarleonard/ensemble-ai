@@ -438,6 +438,21 @@ describe('acquireRepoLockAsync — same file, same protocol, loop-friendly wait'
     expect(fs.existsSync(lock)).toBe(false);
   });
 
+  // Parity with the sync twin's rejecting-scanner test (worktree.test.ts): a scanner that REJECTS
+  // must degrade to UNKNOWN_SCAN → the TTL rule (a wedged throw here), never surface as a hard
+  // acquire rejection carrying the scanner's own error. The `scanner` option is public API, so a
+  // consumer's transient scan failure has to fall back to waiting, not fail the materialization.
+  it('degrades a REJECTING async scanner to unknown instead of rejecting with the scanner error', async () => {
+    const dir = lockDir();
+    const lock = path.join(dir, 'ensemble-ai-worktree.lock');
+    const dead = reapedDeadPid();
+    fs.writeFileSync(lock, `${dead}:crashed-provisioning`);
+    await expect(
+      acquireRepoLockAsync(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner: async () => { throw new Error('scanner boom'); } })
+    ).rejects.toThrow(/could not acquire the worktree lock/);
+    fs.rmSync(lock, { force: true });
+  });
+
   it('waits its turn without blocking: acquires after the holder releases mid-wait', async () => {
     const dir = lockDir();
     const release = await acquireRepoLockAsync(dir, { retries: 0, sleepMs: 1 });

@@ -248,6 +248,7 @@ type LockRelease = (() => void) & {
 };
 declare function touchLockIfOwned(lock: string, token: string): boolean;
 interface LockOpts {
+    repoRoot?: string;
     retries?: number;
     scanner?: InLockGitScanner;
     sleepMs?: number;
