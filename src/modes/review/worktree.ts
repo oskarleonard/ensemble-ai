@@ -816,15 +816,26 @@ function attemptPrelude(lock: string, token: string, staleMs: number): AttemptPr
   if (!c) return { settled: null };
   if (c.age > staleMs) {
     reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? 'unknown'})`);
-    return { settled: null };
+    return { settled: takeAfterReclaim(lock, token) };
   }
   if (!c.dead) return { settled: null };
   return { contend: c };
 }
 
+// After a reclaim the lock is free — take it in THIS attempt rather than leaving it for a next
+// loop iteration that may not exist. A reclaim landing on the final retry would otherwise throw
+// "wedged" over a lock we just freed (code-review f5). A sibling that raced in ahead of us keeps
+// it: the re-create simply comes back contended and the caller waits its turn as before.
+function takeAfterReclaim(lock: string, token: string): LockRelease | null {
+  const created = tryCreate(lock, token);
+  return created === 'contended' ? null : created;
+}
+
 // One acquire attempt, sync. A contended lock past the TTL is reclaimed by age alone; a dead
 // holder inside the TTL is settled by the scan. An injected scanner that answers a Promise
-// cannot be awaited here → treated as unknown (the TTL rule), never as "no orphans".
+// cannot be awaited here → treated as unknown (the TTL rule), never as "no orphans". A settle that
+// reclaimed frees the lock, so we re-create it in-attempt (takeAfterReclaim); one that kept the
+// TTL leaves it held, and the re-create harmlessly comes back contended (null).
 function attemptSync(lock: string, token: string, staleMs: number, scanner: InLockGitScanner): LockRelease | null {
   const pre = attemptPrelude(lock, token, staleMs);
   if ('settled' in pre) return pre.settled;
@@ -833,7 +844,7 @@ function attemptSync(lock: string, token: string, staleMs: number, scanner: InLo
   const decision = decideDeadHolder(scan);
   const survivors = decision === 'terminate-orphans' ? terminateOrphansSync(scan.orphans) : null;
   settleDeadHolder(lock, pre.contend, decision, scan.orphans, survivors);
-  return null;
+  return takeAfterReclaim(lock, token);
 }
 
 async function attemptAsync(lock: string, token: string, staleMs: number, scanner: InLockGitScanner): Promise<LockRelease | null> {
@@ -843,7 +854,7 @@ async function attemptAsync(lock: string, token: string, staleMs: number, scanne
   const decision = decideDeadHolder(scan);
   const survivors = decision === 'terminate-orphans' ? await terminateOrphansAsync(scan.orphans) : null;
   settleDeadHolder(lock, pre.contend, decision, scan.orphans, survivors);
-  return null;
+  return takeAfterReclaim(lock, token);
 }
 
 export function acquireRepoLock(gitCommonDir: string, opts: LockOpts = {}): LockRelease {

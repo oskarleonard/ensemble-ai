@@ -233,6 +233,23 @@ describe('acquireRepoLock — a holder may only ever remove ITS OWN lock', () =>
     expect(fs.existsSync(lockPath(dir))).toBe(false);
   });
 
+  // A reclaim that lands on the FINAL retry iteration must still acquire — the freed lock is taken
+  // in the same attempt, not deferred to a next iteration that no longer exists (code-review f5:
+  // retries:0 used to throw "wedged" over a lock it had just reclaimed).
+  it('acquires when the reclaim happens on the last retry iteration (retries:0)', () => {
+    const dir = freshDir();
+    deadLock(dir);
+    const release = acquireRepoLock(dir, {
+      retries: 0,
+      sleepMs: 1,
+      staleMs: 60 * 60_000,
+      scanner: () => ({ orphans: [], others: 0, unknown: false }),
+    });
+    expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-provisioning');
+    release();
+    expect(fs.existsSync(lockPath(dir))).toBe(false);
+  });
+
   it('terminates the CONFIRMED orphans of a dead holder, then reclaims', () => {
     const dir = freshDir();
     deadLock(dir);

@@ -3098,10 +3098,14 @@ function attemptPrelude(lock, token, staleMs) {
   if (!c) return { settled: null };
   if (c.age > staleMs) {
     reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? "unknown"})`);
-    return { settled: null };
+    return { settled: takeAfterReclaim(lock, token) };
   }
   if (!c.dead) return { settled: null };
   return { contend: c };
+}
+function takeAfterReclaim(lock, token) {
+  const created = tryCreate(lock, token);
+  return created === "contended" ? null : created;
 }
 function attemptSync(lock, token, staleMs, scanner) {
   const pre = attemptPrelude(lock, token, staleMs);
@@ -3111,7 +3115,7 @@ function attemptSync(lock, token, staleMs, scanner) {
   const decision = decideDeadHolder(scan);
   const survivors = decision === "terminate-orphans" ? terminateOrphansSync(scan.orphans) : null;
   settleDeadHolder(lock, pre.contend, decision, scan.orphans, survivors);
-  return null;
+  return takeAfterReclaim(lock, token);
 }
 async function attemptAsync(lock, token, staleMs, scanner) {
   const pre = attemptPrelude(lock, token, staleMs);
@@ -3120,7 +3124,7 @@ async function attemptAsync(lock, token, staleMs, scanner) {
   const decision = decideDeadHolder(scan);
   const survivors = decision === "terminate-orphans" ? await terminateOrphansAsync(scan.orphans) : null;
   settleDeadHolder(lock, pre.contend, decision, scan.orphans, survivors);
-  return null;
+  return takeAfterReclaim(lock, token);
 }
 function acquireRepoLock(gitCommonDir, opts = {}) {
   const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
