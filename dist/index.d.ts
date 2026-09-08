@@ -209,7 +209,7 @@ declare function materializedDiffClause(args: {
 declare function stripAgentInstructions(dir: string): string[];
 declare function stripAgentInstructionsAsync(dir: string): Promise<string[]>;
 declare function isStrippedPath(p: string, stripped: readonly string[]): boolean;
-declare function removeLockIfOwned(lock: string, token: string): void;
+declare function removeLockIfOwned(lock: string, token: string): boolean;
 declare function holderPidFromToken(token: string): number | null;
 declare function isHolderDead(pid: number): boolean;
 declare function acquireRepoLock(gitCommonDir: string, opts?: {

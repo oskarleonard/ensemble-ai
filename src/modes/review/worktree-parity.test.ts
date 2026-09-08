@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,6 +10,7 @@ import {
   acquireRepoLockAsync,
   type GitRun,
   type GitRunAsync,
+  isHolderDead,
   materializeWorktree,
   materializeWorktreeAsync,
   resolveRepoLocation,
@@ -18,6 +20,14 @@ import {
   WORKTREE_LOCK_ERROR,
   type Worktree,
 } from './worktree';
+
+// A pid guaranteed gone: spawnSync waits for and REAPS the child before returning, so the pid
+// names an already-exited process (mirrors the helper in worktree.test.ts — no hard-coded pid).
+function reapedDeadPid(): number {
+  const r = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  if (typeof r.pid !== 'number') throw new Error('could not spawn a child to reap for a dead pid');
+  return r.pid;
+}
 
 // THE PARITY PIN. The async twins exist so a server consumer can materialize without freezing
 // its event loop (lived 2026-07-17: a sync 760-file checkout on a request path took a prod
@@ -382,6 +392,23 @@ describe('acquireRepoLockAsync — same file, same protocol, loop-friendly wait'
     fs.writeFileSync(lock, 'someone-else'); // simulate a reclaim-and-replace
     release();
     expect(fs.readFileSync(lock, 'utf8')).toBe('someone-else');
+  });
+
+  // Parity for the dead-holder reclaim: the async twin must reclaim a lock whose holder pid is
+  // dead REGARDLESS of the TTL, exactly like the sync acquire (worktree.test.ts). Both share
+  // tryAcquireOnce today, but that shared path is precisely what this suite exists to pin — a
+  // future fork of the EEXIST branch in only one acquire must fail here, not ship green.
+  it('reclaims a dead-pid holder regardless of the TTL, exactly like the sync acquire', async () => {
+    const dir = lockDir();
+    const lock = path.join(dir, 'ensemble-ai-worktree.lock');
+    const dead = reapedDeadPid();
+    expect(isHolderDead(dead)).toBe(true); // precondition: the reaped child really is gone
+    fs.writeFileSync(lock, `${dead}:crashed-provisioning`); // fresh mtime by construction
+    // A TTL that will not expire during the test, so only the dead-pid path can reclaim.
+    const release = await acquireRepoLockAsync(dir, { retries: 3, sleepMs: 1, staleMs: 60 * 60_000 });
+    expect(fs.readFileSync(lock, 'utf8')).not.toContain('crashed-provisioning');
+    release();
+    expect(fs.existsSync(lock)).toBe(false);
   });
 
   it('waits its turn without blocking: acquires after the holder releases mid-wait', async () => {

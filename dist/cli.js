@@ -3257,9 +3257,13 @@ function lockToken() {
 }
 function removeLockIfOwned(lock, token) {
   try {
-    if (fs14.readFileSync(lock, "utf8").trim() === token) fs14.unlinkSync(lock);
+    if (fs14.readFileSync(lock, "utf8").trim() === token) {
+      fs14.unlinkSync(lock);
+      return true;
+    }
   } catch {
   }
+  return false;
 }
 function holderPidFromToken(token) {
   const m = /^(\d+):/.exec(token);
@@ -3299,13 +3303,15 @@ function tryAcquireOnce(lock, token, staleMs) {
       const held = fs14.readFileSync(lock, "utf8").trim();
       const pid = holderPidFromToken(held);
       const dead = pid !== null && isHolderDead(pid);
-      if (dead) {
-        process.stderr.write(
-          `\u26A0 ensemble-ai: reclaiming worktree lock at ${lock} \u2014 holder pid ${pid} is gone
+      if (dead || Date.now() - fs14.statSync(lock).mtimeMs > staleMs) {
+        const reclaimed = removeLockIfOwned(lock, held);
+        if (reclaimed && dead) {
+          process.stderr.write(
+            `\u26A0 ensemble-ai: reclaimed worktree lock at ${lock} \u2014 holder pid ${pid} was gone
 `
-        );
+          );
+        }
       }
-      if (dead || Date.now() - fs14.statSync(lock).mtimeMs > staleMs) removeLockIfOwned(lock, held);
     } catch {
     }
     return null;

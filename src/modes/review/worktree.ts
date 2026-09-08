@@ -414,12 +414,20 @@ function lockToken(): string {
   return `${process.pid}:${randomUUID()}`;
 }
 
-export function removeLockIfOwned(lock: string, token: string): void {
+// Returns whether THIS call removed the lock: true only if the file still carried the exact
+// observed token and we unlinked it. A caller that logs a reclaim must gate on this — the token
+// can change between observe and here, and announcing a reclaim that did not happen is the worst
+// possible lie in a lock-debugging log.
+export function removeLockIfOwned(lock: string, token: string): boolean {
   try {
-    if (fs.readFileSync(lock, 'utf8').trim() === token) fs.unlinkSync(lock);
+    if (fs.readFileSync(lock, 'utf8').trim() === token) {
+      fs.unlinkSync(lock);
+      return true;
+    }
   } catch {
     /* gone, or replaced by another holder — either way it is not ours to remove */
   }
+  return false;
 }
 
 // The holder pid a token records (`lockToken()` writes `${pid}:${uuid}`). Returns null for any
@@ -495,15 +503,20 @@ function tryAcquireOnce(lock: string, token: string, staleMs: number): (() => vo
       // so a dead holder never stats the lock).
       const pid = holderPidFromToken(held);
       const dead = pid !== null && isHolderDead(pid);
-      if (dead) {
-        process.stderr.write(
-          `⚠ ensemble-ai: reclaiming worktree lock at ${lock} — holder pid ${pid} is gone\n`
-        );
-      }
       // Reclaim ONLY the exact token we observed: the ownership guard re-reads and compares, so if
       // the holder released and a third process took the lock in between, `held` no longer matches
-      // and we leave that new lock alone.
-      if (dead || Date.now() - fs.statSync(lock).mtimeMs > staleMs) removeLockIfOwned(lock, held);
+      // and we leave that new lock alone. The dead-pid log fires AFTER the reclaim and only when it
+      // actually removed the lock — so a write failure (e.g. a closed fd 2 on a daemonized
+      // consumer) can never skip the reclaim, and the line never announces a reclaim that a
+      // token-change race refused.
+      if (dead || Date.now() - fs.statSync(lock).mtimeMs > staleMs) {
+        const reclaimed = removeLockIfOwned(lock, held);
+        if (reclaimed && dead) {
+          process.stderr.write(
+            `⚠ ensemble-ai: reclaimed worktree lock at ${lock} — holder pid ${pid} was gone\n`
+          );
+        }
+      }
     } catch {
       /* raced with the holder — just wait */
     }
