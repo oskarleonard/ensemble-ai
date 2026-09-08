@@ -2876,34 +2876,71 @@ function isHolderDead(pid) {
 }
 var IN_LOCK_GIT_SIGNATURE = "core.hooksPath=/dev/null";
 var PS_ARGS = ["-axo", "pid=,ppid=,command="];
-var PS_OPTS = { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 5e3 };
-var SCAN_MEMO_MS = 5e3;
+var EXEC_OPTS = { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 5e3 };
 var ORPHAN_KILL_GRACE_MS = 1500;
 var SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
 function sleepSync(ms) {
   Atomics.wait(SLEEP_BUF, 0, 0, ms);
 }
-function listInLockGitProcesses(psOutput, parentDead) {
-  const out = [];
+function parseProcessTable(psOutput) {
+  const rows = [];
   for (const line of psOutput.split("\n")) {
     const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
-    if (!m) continue;
-    const pid = Number(m[1]);
-    const ppid = Number(m[2]);
-    const cmd = m[3];
-    if (!/(^|[\s/])git\s/.test(cmd) || !cmd.includes(IN_LOCK_GIT_SIGNATURE)) continue;
-    if (pid === process.pid) continue;
-    out.push({ orphan: ppid === 1 || parentDead(ppid), pid, ppid });
+    if (m) rows.push({ cmd: m[3], pid: Number(m[1]), ppid: Number(m[2]) });
+  }
+  return rows;
+}
+function inLockGitCandidates(table) {
+  return table.filter(
+    (r) => r.pid !== process.pid && /(^|[\s/])git\s/.test(r.cmd) && r.cmd.includes(IN_LOCK_GIT_SIGNATURE)
+  );
+}
+function descendantsOf(table, root) {
+  const out = [];
+  const queue = [root];
+  while (queue.length > 0) {
+    const parent = queue.shift();
+    for (const r of table) {
+      if (r.ppid === parent && !out.includes(r.pid) && r.pid !== root) {
+        out.push(r.pid);
+        queue.push(r.pid);
+      }
+    }
   }
   return out;
 }
-function summarizeInLockGit(procs) {
-  return {
-    orphans: procs.filter((p) => p.orphan).map((p) => p.pid),
-    others: procs.filter((p) => !p.orphan).length,
-    unknown: false
-  };
+function classifyInLockGit(table, scope, cwdOf, parentDead) {
+  const orphans = [];
+  let others = 0;
+  for (const c of inLockGitCandidates(table)) {
+    const cwd = cwdOf(c.pid);
+    const ours = cwd !== null && samePath(cwd, scope.repoRoot);
+    const parentGone = c.ppid === 1 || parentDead(c.ppid);
+    if (ours && parentGone) orphans.push({ pid: c.pid, tree: [c.pid, ...descendantsOf(table, c.pid)] });
+    else others += 1;
+  }
+  return { orphans, others, unknown: false };
 }
+function samePath(a, b) {
+  const real = (p) => {
+    try {
+      return fs12.realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  return real(a) === real(b);
+}
+function parseLsofCwd(output2) {
+  const map = /* @__PURE__ */ new Map();
+  let pid = null;
+  for (const line of output2.split("\n")) {
+    if (line.startsWith("p")) pid = Number(line.slice(1));
+    else if (line.startsWith("n") && pid !== null) map.set(pid, line.slice(1));
+  }
+  return map;
+}
+var lsofArgs = (pids) => ["-a", "-d", "cwd", "-p", pids.join(","), "-Fn"];
 var UNKNOWN_SCAN = { orphans: [], others: 0, unknown: true };
 var scanFailureLogged = false;
 function scanFailed(e) {
@@ -2917,41 +2954,45 @@ function scanFailed(e) {
   }
   return UNKNOWN_SCAN;
 }
-var scanMemo = null;
-function memoized() {
-  return scanMemo && Date.now() - scanMemo.at < SCAN_MEMO_MS ? scanMemo.scan : null;
-}
-function remember(scan) {
-  scanMemo = { at: Date.now(), scan };
-  return scan;
-}
-function resetInLockGitScanMemoForTests() {
-  scanMemo = null;
-}
-function scanInLockGit() {
-  const hit = memoized();
-  if (hit) return hit;
+function scanInLockGit(scope) {
   try {
-    const out = childProcess.execFileSync("ps", PS_ARGS, PS_OPTS);
-    return remember(summarizeInLockGit(listInLockGitProcesses(out, isHolderDead)));
+    const table = parseProcessTable(childProcess.execFileSync("ps", PS_ARGS, EXEC_OPTS));
+    const pids = inLockGitCandidates(table).map((r) => r.pid);
+    let cwds = /* @__PURE__ */ new Map();
+    if (pids.length > 0) {
+      try {
+        cwds = parseLsofCwd(childProcess.execFileSync("lsof", lsofArgs(pids), EXEC_OPTS));
+      } catch (e) {
+        cwds = parseLsofCwd(String(e.stdout ?? ""));
+      }
+    }
+    return classifyInLockGit(table, scope, (pid) => cwds.get(pid) ?? null, isHolderDead);
   } catch (e) {
     return scanFailed(e);
   }
 }
-async function scanInLockGitAsync() {
-  const hit = memoized();
-  if (hit) return hit;
+async function scanInLockGitAsync(scope) {
   try {
-    const { stdout } = await promisify(childProcess.execFile)("ps", PS_ARGS, PS_OPTS);
-    return remember(summarizeInLockGit(listInLockGitProcesses(stdout, isHolderDead)));
+    const execFileAsync = promisify(childProcess.execFile);
+    const ps = await execFileAsync("ps", PS_ARGS, EXEC_OPTS);
+    const table = parseProcessTable(ps.stdout);
+    const pids = inLockGitCandidates(table).map((r) => r.pid);
+    let cwds = /* @__PURE__ */ new Map();
+    if (pids.length > 0) {
+      try {
+        cwds = parseLsofCwd((await execFileAsync("lsof", lsofArgs(pids), EXEC_OPTS)).stdout);
+      } catch (e) {
+        cwds = parseLsofCwd(String(e.stdout ?? ""));
+      }
+    }
+    return classifyInLockGit(table, scope, (pid) => cwds.get(pid) ?? null, isHolderDead);
   } catch (e) {
     return scanFailed(e);
   }
 }
 function decideDeadHolder(scan) {
-  if (scan.unknown) return "ttl";
-  if (scan.orphans.length > 0) return "terminate-orphans";
-  return scan.others > 0 ? "ttl" : "reclaim";
+  if (scan.unknown || scan.others > 0) return "ttl";
+  return scan.orphans.length > 0 ? "terminate-orphans" : "reclaim";
 }
 function signalAll(pids, signal) {
   for (const pid of pids) {
@@ -2962,7 +3003,9 @@ function signalAll(pids, signal) {
   }
 }
 var alivePids = (pids) => pids.filter((p) => !isHolderDead(p));
-function terminateOrphansSync(pids) {
+var flatten = (trees) => trees.flatMap((t) => t.tree);
+function terminateOrphansSync(trees) {
+  const pids = flatten(trees);
   signalAll(pids, "SIGTERM");
   const deadline = Date.now() + ORPHAN_KILL_GRACE_MS;
   let alive = alivePids(pids);
@@ -2974,10 +3017,10 @@ function terminateOrphansSync(pids) {
     signalAll(alive, "SIGKILL");
     sleepSync(100);
   }
-  scanMemo = null;
   return alivePids(pids);
 }
-async function terminateOrphansAsync(pids) {
+async function terminateOrphansAsync(trees) {
+  const pids = flatten(trees);
   signalAll(pids, "SIGTERM");
   const deadline = Date.now() + ORPHAN_KILL_GRACE_MS;
   let alive = alivePids(pids);
@@ -2989,7 +3032,6 @@ async function terminateOrphansAsync(pids) {
     signalAll(alive, "SIGKILL");
     await sleepAsync(100);
   }
-  scanMemo = null;
   return alivePids(pids);
 }
 var DEFAULT_LOCK_STALE_MS = GIT_TIMEOUT_MS + 5 * 6e4;
@@ -3051,23 +3093,20 @@ function readContention(lock) {
   }
 }
 function reclaimContended(lock, c, why) {
-  if (removeLockIfOwned(lock, c.held)) {
-    process.stderr.write(`\u26A0 ensemble-ai: reclaimed worktree lock at ${lock} \u2014 ${why}
+  const reclaimed = removeLockIfOwned(lock, c.held);
+  if (reclaimed) process.stderr.write(`\u26A0 ensemble-ai: reclaimed worktree lock at ${lock} \u2014 ${why}
 `);
-  }
+  return reclaimed;
 }
-function settleDeadHolder(lock, c, decision, orphans, survivors) {
-  switch (decision) {
+function settleDeadHolder(lock, c, scan, survivors, expired) {
+  switch (decideDeadHolder(scan)) {
     case "reclaim":
       reclaimContended(lock, c, `holder pid ${c.pid} was gone and no in-lock git process is running`);
       return;
-    case "terminate-orphans":
+    case "terminate-orphans": {
+      const pids = flatten(scan.orphans);
       if (survivors && survivors.length === 0) {
-        reclaimContended(
-          lock,
-          c,
-          `holder pid ${c.pid} was gone; terminated its orphaned git ${orphans.join(", ")}`
-        );
+        reclaimContended(lock, c, `holder pid ${c.pid} was gone; terminated its orphaned git tree ${pids.join(", ")}`);
       } else if (survivors) {
         process.stderr.write(
           `\u26A0 ensemble-ai: orphaned git ${survivors.join(", ")} of dead holder ${c.pid} survived termination \u2014 keeping the TTL rule for ${lock}
@@ -3075,63 +3114,74 @@ function settleDeadHolder(lock, c, decision, orphans, survivors) {
         );
       }
       return;
+    }
     case "ttl":
+      if (expired) {
+        reclaimContended(
+          lock,
+          c,
+          `holder pid ${c.pid} was gone and the lock aged past the TTL (in-lock git state ${scan.unknown ? "unknown" : "ambiguous"} \u2014 the backstop)`
+        );
+      }
       return;
   }
+}
+function scopeOf(gitCommonDir) {
+  const repoRoot = path11.basename(gitCommonDir) === ".git" ? path11.dirname(gitCommonDir) : gitCommonDir;
+  return { gitCommonDir, repoRoot };
 }
 function lockPathAndBudget(gitCommonDir, opts) {
   const lock = repoLockPath(gitCommonDir);
   const sleepMs = Math.max(1, opts.sleepMs ?? 500);
   const staleMs = opts.staleMs ?? DEFAULT_LOCK_STALE_MS;
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
-  return { lock, retries, sleepMs, staleMs };
+  return { lock, retries, scope: scopeOf(gitCommonDir), sleepMs, staleMs };
 }
 function lockWedgedError(lock, retries, sleepMs) {
   return new Error(
     `ensemble-ai: ${WORKTREE_LOCK_ERROR} at ${lock} after ${retries} attempts (${Math.round(retries * sleepMs / 1e3)}s) \u2014 another review is materializing a worktree in this repo`
   );
 }
+function takeAfterReclaim(lock, token) {
+  const created = tryCreate(lock, token);
+  return created === "contended" ? null : created;
+}
 function attemptPrelude(lock, token, staleMs) {
   const created = tryCreate(lock, token);
   if (created !== "contended") return { settled: created };
   const c = readContention(lock);
   if (!c) return { settled: null };
-  if (c.age > staleMs) {
+  const expired = c.age > staleMs;
+  if (c.dead) return { contend: c, expired };
+  if (expired) {
     reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? "unknown"})`);
     return { settled: takeAfterReclaim(lock, token) };
   }
-  if (!c.dead) return { settled: null };
-  return { contend: c };
+  return { settled: null };
 }
-function takeAfterReclaim(lock, token) {
-  const created = tryCreate(lock, token);
-  return created === "contended" ? null : created;
-}
-function attemptSync(lock, token, staleMs, scanner) {
+function attemptSync(lock, token, staleMs, scope, scanner) {
   const pre = attemptPrelude(lock, token, staleMs);
   if ("settled" in pre) return pre.settled;
-  const scanned = scanner();
+  const scanned = scanner(scope);
   const scan = scanned instanceof Promise ? UNKNOWN_SCAN : scanned;
-  const decision = decideDeadHolder(scan);
-  const survivors = decision === "terminate-orphans" ? terminateOrphansSync(scan.orphans) : null;
-  settleDeadHolder(lock, pre.contend, decision, scan.orphans, survivors);
+  const survivors = decideDeadHolder(scan) === "terminate-orphans" ? terminateOrphansSync(scan.orphans) : null;
+  settleDeadHolder(lock, pre.contend, scan, survivors, pre.expired);
   return takeAfterReclaim(lock, token);
 }
-async function attemptAsync(lock, token, staleMs, scanner) {
+async function attemptAsync(lock, token, staleMs, scope, scanner) {
   const pre = attemptPrelude(lock, token, staleMs);
   if ("settled" in pre) return pre.settled;
-  const scan = await scanner();
-  const decision = decideDeadHolder(scan);
-  const survivors = decision === "terminate-orphans" ? await terminateOrphansAsync(scan.orphans) : null;
-  settleDeadHolder(lock, pre.contend, decision, scan.orphans, survivors);
+  const scan = await scanner(scope);
+  const survivors = decideDeadHolder(scan) === "terminate-orphans" ? await terminateOrphansAsync(scan.orphans) : null;
+  settleDeadHolder(lock, pre.contend, scan, survivors, pre.expired);
   return takeAfterReclaim(lock, token);
 }
 function acquireRepoLock(gitCommonDir, opts = {}) {
-  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
   const scanner = opts.scanner ?? scanInLockGit;
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
-    const release = attemptSync(lock, token, staleMs, scanner);
+    const release = attemptSync(lock, token, staleMs, scope, scanner);
     if (release) return release;
     if (i === retries) break;
     sleepSync(sleepMs);
@@ -3139,11 +3189,11 @@ function acquireRepoLock(gitCommonDir, opts = {}) {
   throw lockWedgedError(lock, retries, sleepMs);
 }
 async function acquireRepoLockAsync(gitCommonDir, opts = {}) {
-  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
   const scanner = opts.scanner ?? scanInLockGitAsync;
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
-    const release = await attemptAsync(lock, token, staleMs, scanner);
+    const release = await attemptAsync(lock, token, staleMs, scope, scanner);
     if (release) return release;
     if (i === retries) break;
     await sleepAsync(sleepMs);
@@ -6396,6 +6446,7 @@ export {
   checkFreshness,
   classifyFileKind,
   classifyGitError,
+  classifyInLockGit,
   classifyPending,
   classifySecurityFinding,
   claudeWorktreePromptSuffix,
@@ -6410,6 +6461,7 @@ export {
   defaultCodexSandboxPaths,
   defaultReceiptStore,
   defuseUntrusted,
+  descendantsOf,
   diffDigest,
   ensureSandboxProfile,
   escapesRoot,
@@ -6435,6 +6487,7 @@ export {
   holderPidFromToken,
   holisticCapWasLifted,
   homeReadDenyRules,
+  inLockGitCandidates,
   isCommitSha,
   isConventionsDoc,
   isCoreReviewerId,
@@ -6460,7 +6513,6 @@ export {
   isVoiceId,
   keyOf,
   killTree,
-  listInLockGitProcesses,
   listReviewers,
   listVoices,
   loadHolisticFixture,
@@ -6486,6 +6538,8 @@ export {
   parseHolisticSites,
   parseIdeas,
   parseLsTree,
+  parseLsofCwd,
+  parseProcessTable,
   parsePushContext,
   parseReviewSummaries,
   parseReviewerIds,
@@ -6522,7 +6576,6 @@ export {
   renderSummaryBody,
   renderSynthesisPrompt,
   repoIdFromSlug,
-  resetInLockGitScanMemoForTests,
   resolveBase,
   resolveBin,
   resolveCiEvidence,
@@ -6570,7 +6623,6 @@ export {
   stripSecurityTag,
   stripTrailingCommas,
   summarizeCoverage,
-  summarizeInLockGit,
   terminateOrphansAsync,
   terminateOrphansSync,
   titleCase,

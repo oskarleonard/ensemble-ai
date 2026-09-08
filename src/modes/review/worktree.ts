@@ -470,77 +470,128 @@ export function isHolderDead(pid: number): boolean {
 // SYNCHRONOUS on purpose, even under the async acquire: keeping read→stat→unlink un-awaited
 // preserves its in-process atomicity for free (no interleave point between observing a stale
 // holder and reclaiming exactly that holder).
-// THE DEAD-HOLDER RECLAIM. A dead holder pid does NOT prove the critical section is over: the
-// lock serializes child `git fetch` / `git worktree add` processes, and a SIGKILL/OOM of the Node
-// parent leaves a REPARENTED git child still writing the shared .git — UNTIMED, because the
-// per-command git timeout is the parent's execFileSync timer and dies with it (#83 review; no
-// fixed grace can bound that). So when the holder is dead, the reclaimer scans the host for
-// in-lock git processes (this module's INERT_GIT_CONFIG signature) and decides:
-//   • none at all            → nothing can be writing → reclaim NOW;
-//   • CONFIRMED orphans      → parent gone (reparented to pid 1, or a dead ppid): abandoned by
-//                              construction — nobody will ever consume their result — so they are
-//                              TERMINATED (SIGTERM, then SIGKILL) and the lock is reclaimed once
-//                              they are gone. A writer that survives (EPERM) keeps the TTL rule;
-//   • AMBIGUOUS (live parent) → a sibling review in another repo, or an orphan adopted by a
-//                              subreaper — indistinguishable from here → the TTL rule, exactly as
-//                              before this change;
-//   • scan failed            → unknown → the TTL rule (logged once per process).
-// The scan is memoized for a few seconds so a waiting sibling never forks `ps` per retry, and the
-// async acquire runs it without blocking the event loop.
-export interface InLockGitProcess {
-  orphan: boolean;
+// THE DEAD-HOLDER RECLAIM — THREAT MODEL (declared; reviews should argue against THESE
+// assumptions, not invent new ones):
+//   • What the lock protects: the shared `.git` of ONE repo while this module's child git
+//     processes (`fetch` / `worktree add`, each carrying INERT_GIT_CONFIG) mutate it.
+//   • Scope: a single POSIX host (macOS / Linux) where `ps` and `lsof` are available. A subreaper
+//     that adopts orphans, a container namespace, or a host without `lsof` are OUT OF SCOPE: the
+//     fast path silently declines there and the pre-existing TTL backstop rules, exactly as
+//     before this change.
+//   • A dead holder pid does NOT prove the critical section is over: a SIGKILL/OOM'd parent
+//     leaves REPARENTED git children still writing — UNTIMED, since the per-command git timeout
+//     was the parent's execFileSync timer. No fixed grace can bound that.
+//   • Attribution: a process is OURS only when it carries the signature AND its working directory
+//     is this lock's repo root (`lsof -d cwd`). Everything else with the signature — another
+//     repo's review, an orphan whose cwd cannot be resolved — is AMBIGUOUS: it is never touched,
+//     and it blocks the fast path (TTL rule).
+//   • Reclaim ladder for a DEAD holder: no in-lock git at all → reclaim NOW · confirmed OWN orphans
+//     (parent gone, cwd = this repo) → terminate the orphan trees (SIGTERM → SIGKILL, descendants
+//     included — git helpers such as git-remote-https write too) and reclaim once every one is
+//     gone · anything ambiguous or an unreadable scan → the TTL rule. A dead holder past the TTL
+//     STILL runs this ladder first: confirmed orphans are terminated before any reclaim; only the
+//     ambiguous/unknown cases fall to the TTL backstop.
+//   • Accepted residuals: the path-based read-then-unlink of the lock file is not atomic across
+//     processes (a rename/dir-based lock is a separate change); pid reuse between a probe and a
+//     signal is a sub-second window; scans are fresh per attempt (no cache).
+export interface ProcessRow {
+  cmd: string;
   pid: number;
   ppid: number;
 }
-export interface InLockGitScan {
-  orphans: number[];
-  others: number;
-  unknown: boolean;
+export interface OrphanTree {
+  pid: number;
+  tree: number[]; // the orphan git plus every descendant, all to be terminated together
 }
-export type InLockGitScanner = () => InLockGitScan | Promise<InLockGitScan>;
+export interface InLockGitScan {
+  orphans: OrphanTree[];
+  others: number; // in-lock git we could not prove is ours (or whose parent lives) — blocks the fast path
+  unknown: boolean; // the host could not be scanned — the TTL rule
+}
+export interface LockScope {
+  gitCommonDir: string;
+  repoRoot: string;
+}
+export type InLockGitScanner = (scope: LockScope) => InLockGitScan | Promise<InLockGitScan>;
 
 const IN_LOCK_GIT_SIGNATURE = 'core.hooksPath=/dev/null';
 const PS_ARGS = ['-axo', 'pid=,ppid=,command='];
-const PS_OPTS = { encoding: 'utf8' as const, maxBuffer: 16 * 1024 * 1024, timeout: 5_000 };
-const SCAN_MEMO_MS = 5_000;
+const EXEC_OPTS = { encoding: 'utf8' as const, maxBuffer: 16 * 1024 * 1024, timeout: 5_000 };
 const ORPHAN_KILL_GRACE_MS = 1_500;
-
-// Block the calling thread for `ms`. `Atomics.wait` never sees a store into this buffer, so it
-// always waits the full timeout; the buffer is reused because a sync wait has no concurrent waiter
-// to race on it (the sync acquire and the orphan-kill grace both run to completion inline).
 const SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
 function sleepSync(ms: number): void {
   Atomics.wait(SLEEP_BUF, 0, 0, ms);
 }
 
-// Pure classifier over `ps -axo pid=,ppid=,command=` output — unit-testable without processes.
-// Only a `git` carrying this module's inert-config signature counts; this process itself never
-// does (its own children are parented, not orphaned).
-export function listInLockGitProcesses(
-  psOutput: string,
-  parentDead: (pid: number) => boolean
-): InLockGitProcess[] {
-  const out: InLockGitProcess[] = [];
+// Pure parsers/classifiers over `ps -axo pid=,ppid=,command=` — unit-testable without processes.
+export function parseProcessTable(psOutput: string): ProcessRow[] {
+  const rows: ProcessRow[] = [];
   for (const line of psOutput.split('\n')) {
     const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
-    if (!m) continue;
-    const pid = Number(m[1]);
-    const ppid = Number(m[2]);
-    const cmd = m[3];
-    if (!/(^|[\s/])git\s/.test(cmd) || !cmd.includes(IN_LOCK_GIT_SIGNATURE)) continue;
-    if (pid === process.pid) continue;
-    out.push({ orphan: ppid === 1 || parentDead(ppid), pid, ppid });
+    if (m) rows.push({ cmd: m[3], pid: Number(m[1]), ppid: Number(m[2]) });
+  }
+  return rows;
+}
+export function inLockGitCandidates(table: ProcessRow[]): ProcessRow[] {
+  return table.filter(
+    (r) => r.pid !== process.pid && /(^|[\s/])git\s/.test(r.cmd) && r.cmd.includes(IN_LOCK_GIT_SIGNATURE)
+  );
+}
+export function descendantsOf(table: ProcessRow[], root: number): number[] {
+  const out: number[] = [];
+  const queue = [root];
+  while (queue.length > 0) {
+    const parent = queue.shift()!;
+    for (const r of table) {
+      if (r.ppid === parent && !out.includes(r.pid) && r.pid !== root) {
+        out.push(r.pid);
+        queue.push(r.pid);
+      }
+    }
   }
   return out;
 }
-
-export function summarizeInLockGit(procs: InLockGitProcess[]): InLockGitScan {
-  return {
-    orphans: procs.filter((p) => p.orphan).map((p) => p.pid),
-    others: procs.filter((p) => !p.orphan).length,
-    unknown: false,
-  };
+// `cwdOf(pid)` → the process's working directory, or null when it could not be resolved.
+export function classifyInLockGit(
+  table: ProcessRow[],
+  scope: LockScope,
+  cwdOf: (pid: number) => string | null,
+  parentDead: (pid: number) => boolean
+): InLockGitScan {
+  const orphans: OrphanTree[] = [];
+  let others = 0;
+  for (const c of inLockGitCandidates(table)) {
+    const cwd = cwdOf(c.pid);
+    const ours = cwd !== null && samePath(cwd, scope.repoRoot);
+    const parentGone = c.ppid === 1 || parentDead(c.ppid);
+    if (ours && parentGone) orphans.push({ pid: c.pid, tree: [c.pid, ...descendantsOf(table, c.pid)] });
+    else others += 1;
+  }
+  return { orphans, others, unknown: false };
 }
+function samePath(a: string, b: string): boolean {
+  const real = (p: string) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  return real(a) === real(b);
+}
+
+// `lsof -a -d cwd -p <pids> -Fn` → { pid → cwd }. A missing lsof, a refused pid, or an empty
+// answer simply leaves entries unresolved (→ ambiguous → TTL) — never a crash, never "ours".
+export function parseLsofCwd(output: string): Map<number, string> {
+  const map = new Map<number, string>();
+  let pid: number | null = null;
+  for (const line of output.split('\n')) {
+    if (line.startsWith('p')) pid = Number(line.slice(1));
+    else if (line.startsWith('n') && pid !== null) map.set(pid, line.slice(1));
+  }
+  return map;
+}
+const lsofArgs = (pids: number[]) => ['-a', '-d', 'cwd', '-p', pids.join(','), '-Fn'];
 
 const UNKNOWN_SCAN: InLockGitScan = { orphans: [], others: 0, unknown: true };
 let scanFailureLogged = false;
@@ -555,36 +606,41 @@ function scanFailed(e: unknown): InLockGitScan {
   return UNKNOWN_SCAN;
 }
 
-let scanMemo: { at: number; scan: InLockGitScan } | null = null;
-function memoized(): InLockGitScan | null {
-  return scanMemo && Date.now() - scanMemo.at < SCAN_MEMO_MS ? scanMemo.scan : null;
-}
-function remember(scan: InLockGitScan): InLockGitScan {
-  scanMemo = { at: Date.now(), scan };
-  return scan;
-}
-export function resetInLockGitScanMemoForTests(): void {
-  scanMemo = null;
-}
-
-// The live scanners: sync for the sync acquire, non-blocking for the async twin.
-export function scanInLockGit(): InLockGitScan {
-  const hit = memoized();
-  if (hit) return hit;
+// The live scanners: sync for the sync acquire, non-blocking for the async twin. Fresh every
+// attempt — a cached "nothing running" answer could authorize a later unsafe reclaim.
+export function scanInLockGit(scope: LockScope): InLockGitScan {
   try {
-    const out = childProcess.execFileSync('ps', PS_ARGS, PS_OPTS);
-    return remember(summarizeInLockGit(listInLockGitProcesses(out, isHolderDead)));
+    const table = parseProcessTable(childProcess.execFileSync('ps', PS_ARGS, EXEC_OPTS));
+    const pids = inLockGitCandidates(table).map((r) => r.pid);
+    let cwds = new Map<number, string>();
+    if (pids.length > 0) {
+      try {
+        cwds = parseLsofCwd(childProcess.execFileSync('lsof', lsofArgs(pids), EXEC_OPTS));
+      } catch (e) {
+        cwds = parseLsofCwd(String((e as { stdout?: string }).stdout ?? ''));
+      }
+    }
+    return classifyInLockGit(table, scope, (pid) => cwds.get(pid) ?? null, isHolderDead);
   } catch (e) {
     return scanFailed(e);
   }
 }
-export async function scanInLockGitAsync(): Promise<InLockGitScan> {
-  const hit = memoized();
-  if (hit) return hit;
+export async function scanInLockGitAsync(scope: LockScope): Promise<InLockGitScan> {
   try {
     // Resolved lazily: consumer test suites mock node:child_process without execFile.
-    const { stdout } = await promisify(childProcess.execFile)('ps', PS_ARGS, PS_OPTS);
-    return remember(summarizeInLockGit(listInLockGitProcesses(stdout, isHolderDead)));
+    const execFileAsync = promisify(childProcess.execFile);
+    const ps = await execFileAsync('ps', PS_ARGS, EXEC_OPTS);
+    const table = parseProcessTable(ps.stdout);
+    const pids = inLockGitCandidates(table).map((r) => r.pid);
+    let cwds = new Map<number, string>();
+    if (pids.length > 0) {
+      try {
+        cwds = parseLsofCwd((await execFileAsync('lsof', lsofArgs(pids), EXEC_OPTS)).stdout);
+      } catch (e) {
+        cwds = parseLsofCwd(String((e as { stdout?: string }).stdout ?? ''));
+      }
+    }
+    return classifyInLockGit(table, scope, (pid) => cwds.get(pid) ?? null, isHolderDead);
   } catch (e) {
     return scanFailed(e);
   }
@@ -592,9 +648,8 @@ export async function scanInLockGitAsync(): Promise<InLockGitScan> {
 
 export type DeadHolderDecision = 'reclaim' | 'terminate-orphans' | 'ttl';
 export function decideDeadHolder(scan: InLockGitScan): DeadHolderDecision {
-  if (scan.unknown) return 'ttl';
-  if (scan.orphans.length > 0) return 'terminate-orphans';
-  return scan.others > 0 ? 'ttl' : 'reclaim';
+  if (scan.unknown || scan.others > 0) return 'ttl';
+  return scan.orphans.length > 0 ? 'terminate-orphans' : 'reclaim';
 }
 
 function signalAll(pids: number[], signal: NodeJS.Signals): void {
@@ -607,10 +662,12 @@ function signalAll(pids: number[], signal: NodeJS.Signals): void {
   }
 }
 const alivePids = (pids: number[]): number[] => pids.filter((p) => !isHolderDead(p));
+const flatten = (trees: OrphanTree[]): number[] => trees.flatMap((t) => t.tree);
 
-// Terminate CONFIRMED orphans (SIGTERM, a short grace, then SIGKILL). Returns the survivors —
-// a non-empty list (e.g. EPERM on a foreign-owned process) means the reclaim must NOT proceed.
-export function terminateOrphansSync(pids: number[]): number[] {
+// Terminate the confirmed orphan trees (SIGTERM, a short grace, then SIGKILL). Returns the
+// survivors — a non-empty list (e.g. EPERM on a foreign-owned process) means no reclaim.
+export function terminateOrphansSync(trees: OrphanTree[]): number[] {
+  const pids = flatten(trees);
   signalAll(pids, 'SIGTERM');
   const deadline = Date.now() + ORPHAN_KILL_GRACE_MS;
   let alive = alivePids(pids);
@@ -622,10 +679,10 @@ export function terminateOrphansSync(pids: number[]): number[] {
     signalAll(alive, 'SIGKILL');
     sleepSync(100);
   }
-  scanMemo = null; // the host changed under us — the next scan must be fresh
   return alivePids(pids);
 }
-export async function terminateOrphansAsync(pids: number[]): Promise<number[]> {
+export async function terminateOrphansAsync(trees: OrphanTree[]): Promise<number[]> {
+  const pids = flatten(trees);
   signalAll(pids, 'SIGTERM');
   const deadline = Date.now() + ORPHAN_KILL_GRACE_MS;
   let alive = alivePids(pids);
@@ -637,7 +694,6 @@ export async function terminateOrphansAsync(pids: number[]): Promise<number[]> {
     signalAll(alive, 'SIGKILL');
     await sleepAsync(100);
   }
-  scanMemo = null;
   return alivePids(pids);
 }
 
@@ -731,50 +787,62 @@ function readContention(lock: string): Contention | null {
 // holder released and a third process took the lock in between, `held` no longer matches and the
 // new lock is left alone. The log fires AFTER the reclaim and only when it actually removed the
 // lock — a write failure can never skip the reclaim, and it never announces a refused one.
-function reclaimContended(lock: string, c: Contention, why: string): void {
-  if (removeLockIfOwned(lock, c.held)) {
-    process.stderr.write(`⚠ ensemble-ai: reclaimed worktree lock at ${lock} — ${why}\n`);
-  }
+function reclaimContended(lock: string, c: Contention, why: string): boolean {
+  const reclaimed = removeLockIfOwned(lock, c.held);
+  if (reclaimed) process.stderr.write(`⚠ ensemble-ai: reclaimed worktree lock at ${lock} — ${why}\n`);
+  return reclaimed;
 }
 
 // The shared dead-holder ladder, after the scan (sync and async differ only in how they scanned
-// and how they wait while terminating). The decision is derived once by the caller and passed in
-// so it is never re-computed from the same scan. Survivors of a termination keep the TTL rule.
+// and how they waited while terminating). `expired` = the lock is also past the TTL: the
+// backstop reclaims the ambiguous/unknown cases the scan could not settle — never before a
+// confirmed orphan has been terminated.
 function settleDeadHolder(
   lock: string,
   c: Contention,
-  decision: DeadHolderDecision,
-  orphans: number[],
-  survivors: number[] | null
+  scan: InLockGitScan,
+  survivors: number[] | null,
+  expired: boolean
 ): void {
-  switch (decision) {
+  switch (decideDeadHolder(scan)) {
     case 'reclaim':
       reclaimContended(lock, c, `holder pid ${c.pid} was gone and no in-lock git process is running`);
       return;
-    case 'terminate-orphans':
+    case 'terminate-orphans': {
+      const pids = flatten(scan.orphans);
       if (survivors && survivors.length === 0) {
-        reclaimContended(
-          lock,
-          c,
-          `holder pid ${c.pid} was gone; terminated its orphaned git ${orphans.join(', ')}`
-        );
+        reclaimContended(lock, c, `holder pid ${c.pid} was gone; terminated its orphaned git tree ${pids.join(', ')}`);
       } else if (survivors) {
         process.stderr.write(
           `⚠ ensemble-ai: orphaned git ${survivors.join(', ')} of dead holder ${c.pid} survived termination — keeping the TTL rule for ${lock}\n`
         );
       }
       return;
+    }
     case 'ttl':
+      if (expired) {
+        reclaimContended(
+          lock,
+          c,
+          `holder pid ${c.pid} was gone and the lock aged past the TTL (in-lock git state ${scan.unknown ? 'unknown' : 'ambiguous'} — the backstop)`
+        );
+      }
       return;
   }
 }
 
 export interface LockOpts {
   retries?: number;
-  // Injectable for tests; production uses the live `ps` scanners.
+  // Injectable for tests; production uses the live `ps` + `lsof` scanners.
   scanner?: InLockGitScanner;
   sleepMs?: number;
   staleMs?: number;
+}
+
+// The repo root this lock protects — where the in-lock git commands run (cwd).
+function scopeOf(gitCommonDir: string): LockScope {
+  const repoRoot = path.basename(gitCommonDir) === '.git' ? path.dirname(gitCommonDir) : gitCommonDir;
+  return { gitCommonDir, repoRoot };
 }
 
 function lockPathAndBudget(gitCommonDir: string, opts: LockOpts) {
@@ -792,34 +860,15 @@ function lockPathAndBudget(gitCommonDir: string, opts: LockOpts) {
   // never be reclaimed mid-materialization. It is structural now, not a comment: the holder
   // refreshes its lease after every completed in-lock op, so the lock's age never exceeds ONE
   // op, and DEFAULT_LOCK_STALE_MS is derived from that op's git timeout plus margin. A dead
-  // holder is settled by the in-lock git scan above (reclaim / terminate orphans / TTL).
+  // holder is settled by the in-lock git scan above (reclaim / terminate own orphans / TTL).
   const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
-  return { lock, retries, sleepMs, staleMs };
+  return { lock, retries, scope: scopeOf(gitCommonDir), sleepMs, staleMs };
 }
 
 function lockWedgedError(lock: string, retries: number, sleepMs: number): Error {
   return new Error(
     `ensemble-ai: ${WORKTREE_LOCK_ERROR} at ${lock} after ${retries} attempts (${Math.round((retries * sleepMs) / 1000)}s) — another review is materializing a worktree in this repo`
   );
-}
-
-// The shared prelude of both acquire attempts: try the exclusive create, and on contention read the
-// holder. Returns a `settled` result (the release, or null to retry) when age/liveness alone decides
-// the outcome, or the live `contend` record when only a dead-holder scan can — the scan itself is the
-// sole sync/async difference, so it stays in each twin. Keeping this one function is what stops the
-// two acquires from drifting on everything up to the scan.
-type AttemptPrelude = { settled: LockRelease | null } | { contend: Contention };
-function attemptPrelude(lock: string, token: string, staleMs: number): AttemptPrelude {
-  const created = tryCreate(lock, token);
-  if (created !== 'contended') return { settled: created };
-  const c = readContention(lock);
-  if (!c) return { settled: null };
-  if (c.age > staleMs) {
-    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? 'unknown'})`);
-    return { settled: takeAfterReclaim(lock, token) };
-  }
-  if (!c.dead) return { settled: null };
-  return { contend: c };
 }
 
 // After a reclaim the lock is free — take it in THIS attempt rather than leaving it for a next
@@ -831,38 +880,53 @@ function takeAfterReclaim(lock: string, token: string): LockRelease | null {
   return created === 'contended' ? null : created;
 }
 
-// One acquire attempt, sync. A contended lock past the TTL is reclaimed by age alone; a dead
-// holder inside the TTL is settled by the scan. An injected scanner that answers a Promise
-// cannot be awaited here → treated as unknown (the TTL rule), never as "no orphans". A settle that
-// reclaimed frees the lock, so we re-create it in-attempt (takeAfterReclaim); one that kept the
-// TTL leaves it held, and the re-create harmlessly comes back contended (null).
-function attemptSync(lock: string, token: string, staleMs: number, scanner: InLockGitScanner): LockRelease | null {
+// The shared first half of an attempt: create, else read the holder. A LIVE (or unknown-pid)
+// holder is reclaimed by age alone once past the TTL; a DEAD holder ALWAYS goes through the scan
+// ladder (even past the TTL — a confirmed orphan is terminated before any reclaim).
+type AttemptPrelude = { settled: LockRelease | null } | { contend: Contention; expired: boolean };
+function attemptPrelude(lock: string, token: string, staleMs: number): AttemptPrelude {
+  const created = tryCreate(lock, token);
+  if (created !== 'contended') return { settled: created };
+  const c = readContention(lock);
+  if (!c) return { settled: null };
+  const expired = c.age > staleMs;
+  if (c.dead) return { contend: c, expired };
+  if (expired) {
+    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? 'unknown'})`);
+    return { settled: takeAfterReclaim(lock, token) };
+  }
+  return { settled: null };
+}
+
+// One acquire attempt, sync. An injected scanner that answers a Promise cannot be awaited here →
+// treated as unknown (the TTL rule), never as "no orphans". A settle that reclaimed frees the
+// lock, so it is re-created in-attempt (takeAfterReclaim); one that held leaves it, and the
+// re-create harmlessly comes back contended (null).
+function attemptSync(lock: string, token: string, staleMs: number, scope: LockScope, scanner: InLockGitScanner): LockRelease | null {
   const pre = attemptPrelude(lock, token, staleMs);
   if ('settled' in pre) return pre.settled;
-  const scanned = scanner();
+  const scanned = scanner(scope);
   const scan = scanned instanceof Promise ? UNKNOWN_SCAN : scanned;
-  const decision = decideDeadHolder(scan);
-  const survivors = decision === 'terminate-orphans' ? terminateOrphansSync(scan.orphans) : null;
-  settleDeadHolder(lock, pre.contend, decision, scan.orphans, survivors);
+  const survivors = decideDeadHolder(scan) === 'terminate-orphans' ? terminateOrphansSync(scan.orphans) : null;
+  settleDeadHolder(lock, pre.contend, scan, survivors, pre.expired);
   return takeAfterReclaim(lock, token);
 }
 
-async function attemptAsync(lock: string, token: string, staleMs: number, scanner: InLockGitScanner): Promise<LockRelease | null> {
+async function attemptAsync(lock: string, token: string, staleMs: number, scope: LockScope, scanner: InLockGitScanner): Promise<LockRelease | null> {
   const pre = attemptPrelude(lock, token, staleMs);
   if ('settled' in pre) return pre.settled;
-  const scan = await scanner();
-  const decision = decideDeadHolder(scan);
-  const survivors = decision === 'terminate-orphans' ? await terminateOrphansAsync(scan.orphans) : null;
-  settleDeadHolder(lock, pre.contend, decision, scan.orphans, survivors);
+  const scan = await scanner(scope);
+  const survivors = decideDeadHolder(scan) === 'terminate-orphans' ? await terminateOrphansAsync(scan.orphans) : null;
+  settleDeadHolder(lock, pre.contend, scan, survivors, pre.expired);
   return takeAfterReclaim(lock, token);
 }
 
 export function acquireRepoLock(gitCommonDir: string, opts: LockOpts = {}): LockRelease {
-  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
   const scanner = opts.scanner ?? scanInLockGit;
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
-    const release = attemptSync(lock, token, staleMs, scanner);
+    const release = attemptSync(lock, token, staleMs, scope, scanner);
     if (release) return release;
     if (i === retries) break; // the budget is spent — don't sleep just to throw (r3, grok-f2)
     sleepSync(sleepMs);
@@ -871,11 +935,11 @@ export function acquireRepoLock(gitCommonDir: string, opts: LockOpts = {}): Lock
 }
 
 export async function acquireRepoLockAsync(gitCommonDir: string, opts: LockOpts = {}): Promise<LockRelease> {
-  const { lock, retries, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
+  const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
   const scanner = opts.scanner ?? scanInLockGitAsync;
   const token = lockToken();
   for (let i = 0; i <= retries; i++) {
-    const release = await attemptAsync(lock, token, staleMs, scanner);
+    const release = await attemptAsync(lock, token, staleMs, scope, scanner);
     if (release) return release;
     if (i === retries) break; // the budget is spent — don't sleep just to throw (r3, grok-f2)
     await sleepAsync(sleepMs);

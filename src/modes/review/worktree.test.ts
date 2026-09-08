@@ -9,23 +9,24 @@ import { execGit, GIT_TIMEOUT_MS } from './git-exec';
 import {
   acquireRepoLock,
   classifyGitError,
+  classifyInLockGit,
   decideDeadHolder,
   DEFAULT_LOCK_STALE_MS,
+  descendantsOf,
   holderPidFromToken,
   isHolderDead,
   isPreflightError,
-  listInLockGitProcesses,
   materializeWorktree,
+  parseLsofCwd,
+  parseProcessTable,
   reapWorktree,
   redactUrlCredentials,
   remoteSlug,
   removeLockIfOwned,
-  resetInLockGitScanMemoForTests,
   resolveRepoLocation,
   rootAllowed,
   scanInLockGit,
   scanInLockGitAsync,
-  summarizeInLockGit,
   type GitRun,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
 } from './worktree';
@@ -211,63 +212,36 @@ describe('acquireRepoLock — a holder may only ever remove ITS OWN lock', () =>
   // THE DEAD-HOLDER RECLAIM (incident 2026-08-31): a provisioning that DIED holding the lock can
   // never release, so waiting out the full TTL wedges every sibling against a corpse. A dead pid
   // alone proves nothing (its git child may still be writing, #83 review), so the reclaim asks the
-  // host: no in-lock git → reclaim now; confirmed orphans → terminate, then reclaim; anything
-  // ambiguous or unknown → the TTL rule, exactly as before.
+  // host: no in-lock git → reclaim now; confirmed OWN orphans → terminate the trees, then reclaim;
+  // anything ambiguous or unknown → the TTL rule, exactly as before.
   const deadLock = (dir: string) => {
     const dead = reapedDeadPid();
     expect(isHolderDead(dead)).toBe(true); // precondition: the reaped child really is gone
     fs.writeFileSync(lockPath(dir), `${dead}:crashed-provisioning`); // fresh mtime by construction
   };
+  const tree = (pid: number) => ({ orphans: [{ pid, tree: [pid] }], others: 0, unknown: false });
 
   it('reclaims a dead-pid lock at once when no in-lock git process is running (fresh mtime, long TTL)', () => {
     const dir = freshDir();
     deadLock(dir);
-    const release = acquireRepoLock(dir, {
-      retries: 3,
-      sleepMs: 1,
-      staleMs: 60 * 60_000,
-      scanner: () => ({ orphans: [], others: 0, unknown: false }),
-    });
+    const release = acquireRepoLock(dir, { retries: 3, sleepMs: 1, staleMs: 60 * 60_000, scanner: () => ({ orphans: [], others: 0, unknown: false }) });
     expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-provisioning');
     release();
     expect(fs.existsSync(lockPath(dir))).toBe(false);
   });
 
-  // A reclaim that lands on the FINAL retry iteration must still acquire — the freed lock is taken
-  // in the same attempt, not deferred to a next iteration that no longer exists (code-review f5:
-  // retries:0 used to throw "wedged" over a lock it had just reclaimed).
-  it('acquires when the reclaim happens on the last retry iteration (retries:0)', () => {
+  it('terminates the CONFIRMED orphan tree of a dead holder, then reclaims', () => {
     const dir = freshDir();
     deadLock(dir);
-    const release = acquireRepoLock(dir, {
-      retries: 0,
-      sleepMs: 1,
-      staleMs: 60 * 60_000,
-      scanner: () => ({ orphans: [], others: 0, unknown: false }),
-    });
-    expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-provisioning');
-    release();
-    expect(fs.existsSync(lockPath(dir))).toBe(false);
-  });
-
-  it('terminates the CONFIRMED orphans of a dead holder, then reclaims', () => {
-    const dir = freshDir();
-    deadLock(dir);
-    // A real stand-in for an orphaned git child: a detached sleeper this test owns.
     const pid = orphanedSleeper();
     expect(isHolderDead(pid)).toBe(false);
-    const release = acquireRepoLock(dir, {
-      retries: 3,
-      sleepMs: 1,
-      staleMs: 60 * 60_000,
-      scanner: () => ({ orphans: [pid], others: 0, unknown: false }),
-    });
+    const release = acquireRepoLock(dir, { retries: 3, sleepMs: 1, staleMs: 60 * 60_000, scanner: () => tree(pid) });
     expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-provisioning');
     expect(isHolderDead(pid)).toBe(true); // the abandoned writer is gone before the reclaim
     release();
   });
 
-  it('holds a dead-pid lock while an AMBIGUOUS in-lock git (live parent) runs — the TTL rule', () => {
+  it('holds a dead-pid lock while AMBIGUOUS in-lock git exists (another repo / live parent) — the TTL rule', () => {
     const dir = freshDir();
     deadLock(dir);
     const scanner = () => ({ orphans: [], others: 1, unknown: false });
@@ -277,12 +251,23 @@ describe('acquireRepoLock — a holder may only ever remove ITS OWN lock', () =>
     expect(fs.readFileSync(lockPath(dir), 'utf8')).toContain('crashed-provisioning'); // untouched
     const past = new Date(Date.now() - 60_000);
     fs.utimesSync(lockPath(dir), past, past);
-    const release = acquireRepoLock(dir, { retries: 2, sleepMs: 1, staleMs: 1_000, scanner });
+    const release = acquireRepoLock(dir, { retries: 2, sleepMs: 1, staleMs: 1_000, scanner }); // the backstop
     expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-provisioning');
     release();
   });
 
-  it('an UNKNOWN scan (ps unavailable) keeps the TTL rule — never "no orphans"', () => {
+  it('a dead holder PAST the TTL still terminates its confirmed orphan before reclaiming (the TTL never races a writer)', () => {
+    const dir = freshDir();
+    deadLock(dir);
+    const past = new Date(Date.now() - 60_000);
+    fs.utimesSync(lockPath(dir), past, past); // past a 1 s TTL
+    const pid = orphanedSleeper();
+    const release = acquireRepoLock(dir, { retries: 3, sleepMs: 1, staleMs: 1_000, scanner: () => tree(pid) });
+    expect(isHolderDead(pid)).toBe(true);
+    release();
+  });
+
+  it('an UNKNOWN scan (ps/lsof unavailable) keeps the TTL rule — never "no orphans"', () => {
     const dir = freshDir();
     deadLock(dir);
     const scanner = () => ({ orphans: [], others: 0, unknown: true });
@@ -296,52 +281,54 @@ describe('acquireRepoLock — a holder may only ever remove ITS OWN lock', () =>
     const dir = freshDir();
     deadLock(dir);
     expect(() =>
-      acquireRepoLock(dir, {
-        retries: 1,
-        sleepMs: 1,
-        staleMs: 60 * 60_000,
-        scanner: async () => ({ orphans: [], others: 0, unknown: false }),
-      })
+      acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner: async () => ({ orphans: [], others: 0, unknown: false }) })
     ).toThrow(/could not acquire the worktree lock/);
     fs.unlinkSync(lockPath(dir));
   });
 
-  // The pure classifier behind the live scanners: only a `git` carrying this module's
-  // inert-config signature counts; parent gone ⇒ orphan, parent alive ⇒ ambiguous.
-  it('listInLockGitProcesses + decideDeadHolder classify real ps-shaped output', () => {
+  // The pure classifiers behind the live scanners: signature + cwd = OURS; parent gone = orphan
+  // (with its descendants — git helpers write too); everything else in-lock is ambiguous.
+  it('parseProcessTable / classifyInLockGit attribute in-lock git by signature, cwd and parent', () => {
     const sig = 'git -c core.hooksPath=/dev/null -c filter.lfs.smudge= fetch --no-tags origin pull/7/head';
-    const parentDead = (pid: number) => pid === 4242;
-    const procs = listInLockGitProcesses(
+    const table = parseProcessTable(
       [
-        `  100     1 ${sig}`, // reparented to init → orphan
-        `  101  4242 ${sig}`, // parent gone → orphan
-        `  102  ${process.pid} ${sig}`, // parented → ambiguous
-        '  103     1 /usr/bin/git status', // no signature → ignored
-        '  104     1 node something core.hooksPath=/dev/null', // not git → ignored
-      ].join('\n'),
-      parentDead
+        `  100     1 ${sig}`, // reparented to init, cwd = ours → orphan
+        `  150   100 git-remote-https origin https://x`, // its helper → in the orphan tree
+        `  101  4242 ${sig}`, // parent gone, cwd = ours → orphan
+        `  102     1 ${sig}`, // orphan but cwd = ANOTHER repo → ambiguous, never touched
+        `  103  ${process.pid} ${sig}`, // parented (a live sibling / subreaper) → ambiguous
+        `  104     1 ${sig}`, // cwd unresolvable → ambiguous
+        '  105     1 /usr/bin/git status', // no signature → ignored
+        '  106     1 node something core.hooksPath=/dev/null', // not git → ignored
+      ].join('\n')
     );
-    expect(procs.map((p) => [p.pid, p.orphan])).toEqual([
-      [100, true],
-      [101, true],
-      [102, false],
-    ]);
-    const scan = summarizeInLockGit(procs);
-    expect(scan).toEqual({ orphans: [100, 101], others: 1, unknown: false });
-    expect(decideDeadHolder(scan)).toBe('terminate-orphans');
-    expect(decideDeadHolder({ orphans: [], others: 1, unknown: false })).toBe('ttl');
+    const scope = { gitCommonDir: '/repo/.git', repoRoot: '/repo' };
+    const cwd = new Map([[100, '/repo'], [101, '/repo'], [102, '/elsewhere'], [103, '/repo']]);
+    const scan = classifyInLockGit(table, scope, (pid) => cwd.get(pid) ?? null, (pid) => pid === 4242);
+    expect(scan).toEqual({
+      orphans: [
+        { pid: 100, tree: [100, 150] },
+        { pid: 101, tree: [101] },
+      ],
+      others: 3,
+      unknown: false,
+    });
+    expect(decideDeadHolder(scan)).toBe('ttl'); // ambiguous ones present → never the fast path
+    expect(decideDeadHolder({ ...scan, others: 0 })).toBe('terminate-orphans');
     expect(decideDeadHolder({ orphans: [], others: 0, unknown: true })).toBe('ttl');
-    expect(decideDeadHolder({ orphans: [], others: 0, unknown: false })).toBe('reclaim');
-    expect(listInLockGitProcesses('', parentDead)).toEqual([]);
+    expect(decideDeadHolder(({ orphans: [], others: 0, unknown: false }))).toBe('reclaim');
+    expect(descendantsOf(table, 100)).toEqual([150]);
+    expect(parseLsofCwd('p100\nfcwd\nn/repo\np101\nfcwd\nn/other\n')).toEqual(
+      new Map([[100, '/repo'], [101, '/other']])
+    );
   });
 
-  it('the live scanners run the real ps and answer a scan shape (sync + async)', async () => {
-    resetInLockGitScanMemoForTests();
-    const a = scanInLockGit();
+  it('the live scanners run the real ps + lsof and answer a scan shape (sync + async)', async () => {
+    const scope = { gitCommonDir: path.join(freshDir(), '.git'), repoRoot: freshDir() };
+    const a = scanInLockGit(scope);
     expect(typeof a.unknown).toBe('boolean');
     expect(Array.isArray(a.orphans)).toBe(true);
-    resetInLockGitScanMemoForTests();
-    const b = await scanInLockGitAsync();
+    const b = await scanInLockGitAsync(scope);
     expect(typeof b.unknown).toBe('boolean');
   });
 
