@@ -721,15 +721,14 @@ function takeAfterReclaim(lock: string, token: string): LockRelease | null {
 
 // The shared first half of an attempt: create, else read the holder. A LIVE (or unknown-pid)
 // holder is reclaimed by age alone once past the TTL; a DEAD holder goes through the scan.
-type AttemptPrelude = { settled: LockRelease | null } | { contend: Contention; expired: boolean };
+type AttemptPrelude = { settled: LockRelease | null } | { contend: Contention };
 function attemptPrelude(lock: string, token: string, staleMs: number): AttemptPrelude {
   const created = tryCreate(lock, token);
   if (created !== 'contended') return { settled: created };
   const c = readContention(lock);
   if (!c) return { settled: null };
-  const expired = c.age > staleMs;
-  if (c.dead) return { contend: c, expired };
-  if (expired) {
+  if (c.dead) return { contend: c };
+  if (c.age > staleMs) {
     reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? 'unknown'})`);
     return { settled: takeAfterReclaim(lock, token) };
   }
@@ -738,14 +737,21 @@ function attemptPrelude(lock: string, token: string, staleMs: number): AttemptPr
 
 // The shared dead-holder settle: an IDLE host reclaims at once; busy/unknown keep the TTL, whose
 // backstop reclaims once expired (the pre-existing behaviour — declared above).
-function settleDeadHolder(lock: string, c: Contention, scan: InLockGitScan, expired: boolean): void {
+// A POSITIVELY detected writer (busy) is not reclaimed at the first TTL — it gets a second TTL
+// (2 × staleMs) before the backstop fires, so the backstop can never be faster than today's
+// while an in-lock git is visibly running; an unreadable scan keeps today's single TTL.
+export const BUSY_BACKSTOP_FACTOR = 2;
+function settleDeadHolder(lock: string, c: Contention, scan: InLockGitScan, staleMs: number): void {
   if (decideDeadHolder(scan) === 'reclaim') {
     reclaimContended(lock, c, `holder pid ${c.pid} was gone and no in-lock git process is running on this host`);
-  } else if (expired) {
+    return;
+  }
+  const backstop = scan.unknown ? staleMs : BUSY_BACKSTOP_FACTOR * staleMs;
+  if (c.age > backstop) {
     reclaimContended(
       lock,
       c,
-      `holder pid ${c.pid} was gone and the lock aged past the TTL (in-lock git state ${scan.unknown ? 'unknown' : 'busy'} — the backstop)`
+      `holder pid ${c.pid} was gone and the lock aged past ${scan.unknown ? 'the TTL' : `${BUSY_BACKSTOP_FACTOR}× the TTL`} (in-lock git state ${scan.unknown ? 'unknown' : 'busy'} — the backstop)`
     );
   }
 }
@@ -754,9 +760,10 @@ function settleDeadHolder(lock: string, c: Contention, scan: InLockGitScan, expi
 interface ScanCache {
   at: number;
   scan: InLockGitScan | null;
+  token: string | null; // the holder the scan was taken for — never reused for another holder
 }
-const fresh = (cache: ScanCache): InLockGitScan | null =>
-  cache.scan && Date.now() - cache.at < SCAN_INTERVAL_MS ? cache.scan : null;
+const fresh = (cache: ScanCache, held: string): InLockGitScan | null =>
+  cache.scan && cache.token === held && Date.now() - cache.at < SCAN_INTERVAL_MS ? cache.scan : null;
 
 // One acquire attempt, sync. An injected scanner that answers a Promise cannot be awaited here →
 // treated as unknown (the TTL rule), never as "idle". A settle that reclaimed frees the lock, so
@@ -765,7 +772,7 @@ const fresh = (cache: ScanCache): InLockGitScan | null =>
 function attemptSync(lock: string, token: string, staleMs: number, scope: LockScope, scanner: InLockGitScanner, cache: ScanCache): LockRelease | null {
   const pre = attemptPrelude(lock, token, staleMs);
   if ('settled' in pre) return pre.settled;
-  let scan = fresh(cache);
+  let scan = fresh(cache, pre.contend.held);
   if (!scan) {
     let scanned: InLockGitScan | Promise<InLockGitScan>;
     try {
@@ -781,15 +788,16 @@ function attemptSync(lock: string, token: string, staleMs: number, scope: LockSc
     }
     cache.at = Date.now();
     cache.scan = scan;
+    cache.token = pre.contend.held;
   }
-  settleDeadHolder(lock, pre.contend, scan, pre.expired);
+  settleDeadHolder(lock, pre.contend, scan, staleMs);
   return takeAfterReclaim(lock, token);
 }
 
 async function attemptAsync(lock: string, token: string, staleMs: number, scope: LockScope, scanner: InLockGitScanner, cache: ScanCache): Promise<LockRelease | null> {
   const pre = attemptPrelude(lock, token, staleMs);
   if ('settled' in pre) return pre.settled;
-  let scan = fresh(cache);
+  let scan = fresh(cache, pre.contend.held);
   if (!scan) {
     try {
       scan = await scanner(scope);
@@ -798,8 +806,9 @@ async function attemptAsync(lock: string, token: string, staleMs: number, scope:
     }
     cache.at = Date.now();
     cache.scan = scan;
+    cache.token = pre.contend.held;
   }
-  settleDeadHolder(lock, pre.contend, scan, pre.expired);
+  settleDeadHolder(lock, pre.contend, scan, staleMs);
   return takeAfterReclaim(lock, token);
 }
 
@@ -807,7 +816,7 @@ export function acquireRepoLock(gitCommonDir: string, opts: LockOpts = {}): Lock
   const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
   const scanner = opts.scanner ?? scanInLockGit;
   const token = lockToken();
-  const cache: ScanCache = { at: 0, scan: null };
+  const cache: ScanCache = { at: 0, scan: null, token: null };
   for (let i = 0; i <= retries; i++) {
     const release = attemptSync(lock, token, staleMs, scope, scanner, cache);
     if (release) return release;
@@ -821,7 +830,7 @@ export async function acquireRepoLockAsync(gitCommonDir: string, opts: LockOpts 
   const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
   const scanner = opts.scanner ?? scanInLockGitAsync;
   const token = lockToken();
-  const cache: ScanCache = { at: 0, scan: null };
+  const cache: ScanCache = { at: 0, scan: null, token: null };
   for (let i = 0; i <= retries; i++) {
     const release = await attemptAsync(lock, token, staleMs, scope, scanner, cache);
     if (release) return release;

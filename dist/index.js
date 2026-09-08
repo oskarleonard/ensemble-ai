@@ -3021,30 +3021,33 @@ function attemptPrelude(lock, token, staleMs) {
   if (created !== "contended") return { settled: created };
   const c = readContention(lock);
   if (!c) return { settled: null };
-  const expired = c.age > staleMs;
-  if (c.dead) return { contend: c, expired };
-  if (expired) {
+  if (c.dead) return { contend: c };
+  if (c.age > staleMs) {
     reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? "unknown"})`);
     return { settled: takeAfterReclaim(lock, token) };
   }
   return { settled: null };
 }
-function settleDeadHolder(lock, c, scan, expired) {
+var BUSY_BACKSTOP_FACTOR = 2;
+function settleDeadHolder(lock, c, scan, staleMs) {
   if (decideDeadHolder(scan) === "reclaim") {
     reclaimContended(lock, c, `holder pid ${c.pid} was gone and no in-lock git process is running on this host`);
-  } else if (expired) {
+    return;
+  }
+  const backstop = scan.unknown ? staleMs : BUSY_BACKSTOP_FACTOR * staleMs;
+  if (c.age > backstop) {
     reclaimContended(
       lock,
       c,
-      `holder pid ${c.pid} was gone and the lock aged past the TTL (in-lock git state ${scan.unknown ? "unknown" : "busy"} \u2014 the backstop)`
+      `holder pid ${c.pid} was gone and the lock aged past ${scan.unknown ? "the TTL" : `${BUSY_BACKSTOP_FACTOR}\xD7 the TTL`} (in-lock git state ${scan.unknown ? "unknown" : "busy"} \u2014 the backstop)`
     );
   }
 }
-var fresh = (cache) => cache.scan && Date.now() - cache.at < SCAN_INTERVAL_MS ? cache.scan : null;
+var fresh = (cache, held) => cache.scan && cache.token === held && Date.now() - cache.at < SCAN_INTERVAL_MS ? cache.scan : null;
 function attemptSync(lock, token, staleMs, scope, scanner, cache) {
   const pre = attemptPrelude(lock, token, staleMs);
   if ("settled" in pre) return pre.settled;
-  let scan = fresh(cache);
+  let scan = fresh(cache, pre.contend.held);
   if (!scan) {
     let scanned;
     try {
@@ -3061,14 +3064,15 @@ function attemptSync(lock, token, staleMs, scope, scanner, cache) {
     }
     cache.at = Date.now();
     cache.scan = scan;
+    cache.token = pre.contend.held;
   }
-  settleDeadHolder(lock, pre.contend, scan, pre.expired);
+  settleDeadHolder(lock, pre.contend, scan, staleMs);
   return takeAfterReclaim(lock, token);
 }
 async function attemptAsync(lock, token, staleMs, scope, scanner, cache) {
   const pre = attemptPrelude(lock, token, staleMs);
   if ("settled" in pre) return pre.settled;
-  let scan = fresh(cache);
+  let scan = fresh(cache, pre.contend.held);
   if (!scan) {
     try {
       scan = await scanner(scope);
@@ -3077,15 +3081,16 @@ async function attemptAsync(lock, token, staleMs, scope, scanner, cache) {
     }
     cache.at = Date.now();
     cache.scan = scan;
+    cache.token = pre.contend.held;
   }
-  settleDeadHolder(lock, pre.contend, scan, pre.expired);
+  settleDeadHolder(lock, pre.contend, scan, staleMs);
   return takeAfterReclaim(lock, token);
 }
 function acquireRepoLock(gitCommonDir, opts = {}) {
   const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
   const scanner = opts.scanner ?? scanInLockGit;
   const token = lockToken();
-  const cache = { at: 0, scan: null };
+  const cache = { at: 0, scan: null, token: null };
   for (let i = 0; i <= retries; i++) {
     const release = attemptSync(lock, token, staleMs, scope, scanner, cache);
     if (release) return release;
@@ -3098,7 +3103,7 @@ async function acquireRepoLockAsync(gitCommonDir, opts = {}) {
   const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
   const scanner = opts.scanner ?? scanInLockGitAsync;
   const token = lockToken();
-  const cache = { at: 0, scan: null };
+  const cache = { at: 0, scan: null, token: null };
   for (let i = 0; i <= retries; i++) {
     const release = await attemptAsync(lock, token, staleMs, scope, scanner, cache);
     if (release) return release;
@@ -6258,6 +6263,7 @@ function isImplemented(mode) {
 }
 export {
   AGENT_INSTRUCTION_NAMES,
+  BUSY_BACKSTOP_FACTOR,
   CI_EVIDENCE_BOTH_REASON,
   CI_EVIDENCE_LIMITS,
   CI_EVIDENCE_SECTION_TITLE,

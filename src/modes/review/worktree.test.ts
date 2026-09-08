@@ -225,11 +225,41 @@ describe('acquireRepoLock — a holder may only ever remove ITS OWN lock', () =>
       acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner })
     ).toThrow(/could not acquire the worktree lock/);
     expect(fs.readFileSync(lockPath(dir), 'utf8')).toContain('crashed-provisioning'); // untouched
-    const past = new Date(Date.now() - 60_000);
-    fs.utimesSync(lockPath(dir), past, past);
-    const release = acquireRepoLock(dir, { retries: 2, sleepMs: 1, staleMs: 1_000, scanner }); // the backstop
+    // A positively detected writer gets a SECOND TTL before the backstop: past 1× it is still held…
+    const past1 = new Date(Date.now() - 1_500);
+    fs.utimesSync(lockPath(dir), past1, past1);
+    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 1_000, scanner })).toThrow(
+      /could not acquire the worktree lock/
+    );
+    // …past 2× the backstop reclaims (bounded, never faster than today's TTL while busy).
+    const past2 = new Date(Date.now() - 60_000);
+    fs.utimesSync(lockPath(dir), past2, past2);
+    const release = acquireRepoLock(dir, { retries: 2, sleepMs: 1, staleMs: 1_000, scanner });
     expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-provisioning');
     release();
+  });
+
+  it('a cached scan is never reused for a DIFFERENT holder (keyed by the observed token)', () => {
+    const dir = freshDir();
+    deadLock(dir);
+    let scans = 0;
+    const scanner = () => {
+      scans += 1;
+      return { busy: true, unknown: false };
+    };
+    expect(() => acquireRepoLock(dir, { retries: 2, sleepMs: 1, staleMs: 60 * 60_000, scanner })).toThrow(
+      /could not acquire the worktree lock/
+    );
+    expect(scans).toBe(1);
+    // The same waiter cannot be re-entered, but a NEW dead holder within 5 s must re-scan: prove
+    // it through the exported decision + a second acquire whose cache starts empty (per waiter).
+    const dead2 = reapedDeadPid();
+    fs.writeFileSync(lockPath(dir), `${dead2}:another-crash`);
+    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner })).toThrow(
+      /could not acquire the worktree lock/
+    );
+    expect(scans).toBe(2);
+    fs.unlinkSync(lockPath(dir));
   });
 
   it('an UNKNOWN scan (ps unavailable) keeps the TTL rule — never "idle"', () => {
