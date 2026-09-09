@@ -8,7 +8,8 @@ import { openWorktree } from './worktree-run';
 
 // THE RUN-LEVEL LIFECYCLE (spec §1, §9): pre-flight → materialize → (reap). Every failure is a
 // NAMED cause, and a failed open leaves nothing behind. `git` is injected, so the whole taxonomy is
-// exercised without a network, a fork, or a second repo on disk.
+// exercised without a network, a fork, or a second repo on disk. There is no lock: each review
+// materializes into its own private repo, so the failure taxonomy no longer carries `lock-contended`.
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -19,8 +20,6 @@ const err = (error: string) => ({ ok: false as const, error });
 let gitDir: string;
 let repoRoot: string;
 beforeEach(() => {
-  // A REAL directory for `--git-common-dir`: materializeWorktree serializes on an O_EXCL lock
-  // there, and we want the real lock exercised, not stubbed away.
   gitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-gitdir-'));
   repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-repo-'));
 });
@@ -28,7 +27,8 @@ afterEach(() => {
   for (const d of [gitDir, repoRoot]) fs.rmSync(d, { force: true, recursive: true });
 });
 
-// A happy-path git: the checkout IS o/r, the fetch works, and the worktree lands on headSha.
+// A happy-path git: the checkout IS o/r, the fetch works, and the worktree lands on headSha. The
+// `--git-common-dir` points at a real dir with no `objects/`, so no alternates borrow is written.
 function happyGit(overrides: (args: string[]) => ReturnType<GitRun> | null = () => null): {
   calls: string[][];
   git: GitRun;
@@ -70,16 +70,21 @@ describe('openWorktree — the happy path materializes ONE worktree at the recei
     const fetch = calls.find((c) => c.includes('fetch'));
     expect(fetch).toContain('https://github.com/o/r.git');
     expect(fetch).toContain('pull/7/head');
+    // The worktree is added from a PRIVATE bare repo (init --bare), never the shared checkout.
+    expect(calls.find((c) => c.includes('init'))).toContain('--bare');
 
     // The evidence manifest's readable surface: the tracked tree at headSha, keyed by blob SHA.
     expect(session.readableSurface()).toEqual([{ blobSha: 'c'.repeat(40), path: 'src/x.ts' }]);
 
-    // Reap removes the worktree AND prunes the shared .git admin dir; it is idempotent.
+    // Reap removes the owner-only parent (worktree + private repo). It is a pure-fs remove — nothing
+    // was registered in the shared checkout — and idempotent.
+    const parent = path.dirname(session.dir);
+    expect(fs.existsSync(parent)).toBe(true);
     session.reap();
     session.reap();
-    expect(calls.filter((c) => c.includes('remove'))).toHaveLength(1);
-    expect(calls.some((c) => c.includes('prune'))).toBe(true);
-    fs.rmSync(session.dir, { force: true, recursive: true });
+    expect(fs.existsSync(parent)).toBe(false);
+    expect(calls.some((c) => c.includes('remove'))).toBe(false);
+    expect(calls.some((c) => c.includes('prune'))).toBe(false);
   });
 });
 
@@ -129,39 +134,26 @@ describe('openWorktree — the pre-flight fails CLOSED, with a named cause', () 
   });
 
   it('`sha-mismatch`: the worktree resolved to a different commit — ABORT, never review it', () => {
-    const { calls, git } = happyGit((args) =>
+    const { git } = happyGit((args) =>
       args[0] === 'rev-parse' && args[1] === 'HEAD' ? ok('f'.repeat(40)) : null
     );
     const res = open(git);
     expect(isPreflightError(res) && res.kind).toBe('sha-mismatch');
     expect(isPreflightError(res) && res.message).toMatch(/ABORTING/);
-    // A failed materialization leaves nothing behind.
-    expect(calls.some((c) => c.includes('remove'))).toBe(true);
-    expect(calls.some((c) => c.includes('prune'))).toBe(true);
   });
 
-  // `acquireRepoLock` THROWS when a sibling review holds the repo lock past its staleness TTL, and
-  // mkdtemp can throw on a full temp root. openWorktree promises the CLI a named cause on every
-  // failure — the CLI opens the worktree before its try/finally, so a throw escapes as a stack
-  // trace and a bare exit 1 rather than the documented exit 3.
-  it('`lock-contended` / `materialize-failed`: a THROW becomes a named cause, never a stack trace', () => {
-    const { git } = happyGit();
-    const throwing = (message: string) => (): (() => void) => {
-      throw new Error(message);
-    };
-
-    const contended = openWorktree(
-      { baseSha: BASE, headSha: HEAD, pr: 7, prSlug: 'o/r', repoPath: repoRoot },
-      { git, lock: throwing('ensemble-ai: could not acquire the worktree lock at /x after 1200 attempts') }
-    );
-    expect(isPreflightError(contended) && contended.kind).toBe('lock-contended');
-    expect(isPreflightError(contended) && contended.message).toMatch(/another review|worktree lock/);
-
-    const broken = openWorktree(
-      { baseSha: BASE, headSha: HEAD, pr: 7, prSlug: 'o/r', repoPath: repoRoot },
-      { git, lock: throwing('ENOSPC: no space left on device') }
-    );
-    expect(isPreflightError(broken) && broken.kind).toBe('materialize-failed');
-    expect(isPreflightError(broken) && broken.message).toMatch(/ENOSPC/);
+  // `materializeWorktree` RETURNS its git failures, but it can still THROW: the mkdtemp/chmod of the
+  // owner-only parent, the `git init --bare`, or the alternates write can fail on a full or
+  // read-only temp root. openWorktree opens the worktree BEFORE the CLI's try/finally, so a throw
+  // would escape as a stack trace and a bare exit 1 rather than the documented exit 3 — it must be
+  // caught and reported as the named `materialize-failed` cause instead.
+  it('`materialize-failed`: a THROW becomes a named cause, never a stack trace', () => {
+    const { git } = happyGit((args) => {
+      if (args.includes('fetch')) throw new Error('ENOSPC: no space left on device');
+      return null;
+    });
+    const res = open(git);
+    expect(isPreflightError(res) && res.kind).toBe('materialize-failed');
+    expect(isPreflightError(res) && res.message).toMatch(/ENOSPC/);
   });
 });

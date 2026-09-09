@@ -8,7 +8,6 @@ import {
   type PreflightError,
   reapWorktree,
   resolveRepoLocation,
-  WORKTREE_LOCK_ERROR,
   type Worktree,
 } from './worktree';
 
@@ -31,8 +30,9 @@ export interface WorktreeSession {
   // the receipt. Subtracting the stripped set is what keeps the artifact honest: `git ls-tree` reads
   // the COMMIT, which still carries a planted CLAUDE.md that no seat could actually open.
   readableSurface: () => ManifestBlob[];
-  // Idempotent + never throws — reap is best-effort by contract, plus a `git worktree prune` sweep
-  // that self-heals the crash/SIGTERM path on the next run.
+  // Idempotent + never throws — reap is best-effort by contract. It removes the owner-only parent
+  // that holds the worktree AND its private repo; nothing was written into the shared checkout, so
+  // a crash/SIGTERM leaks at most one temp parent (never a shared-`.git` admin entry to prune).
   reap: () => void;
   // The agent-instruction files removed from the checkout before any seat ran. Sorted, repo-relative.
   strippedInstructionFiles: string[];
@@ -51,15 +51,11 @@ export interface OpenWorktreeArgs {
 }
 
 // Fails CLOSED into the named taxonomy: `not-a-repo` · `disallowed-root` · `wrong-repo` ·
-// `no-such-pr` · `auth` · `network` · `sha-mismatch` · `lock-contended` · `materialize-failed`.
-// Never throws, never partially succeeds — a failed materialization has already reaped whatever it
-// created.
+// `no-such-pr` · `auth` · `network` · `sha-mismatch` · `materialize-failed`. Never throws, never
+// partially succeeds — a failed materialization has already reaped whatever it created.
 export function openWorktree(
   args: OpenWorktreeArgs,
-  // `lock` is injected exactly as materializeWorktree injects it — the default IS the per-repo
-  // O_EXCL lock. A test needs the seam to prove the contended path returns a NAMED cause instead
-  // of throwing (the real lock only gives up after its DEFAULT_LOCK_STALE_MS staleness TTL).
-  deps: { git?: GitRun; lock?: (gitCommonDir: string) => () => void } = {}
+  deps: { git?: GitRun } = {}
 ): PreflightError | WorktreeSession {
   const git = deps.git ?? execGit();
   const location = resolveRepoLocation(
@@ -68,24 +64,17 @@ export function openWorktree(
   );
   if (isPreflightError(location)) return location;
 
-  // `materializeWorktree` RETURNS its git failures, but it can still THROW: `acquireRepoLock` gives
-  // up with an Error when a sibling review holds the repo lock past the staleness TTL, and the
-  // mkdtemp/chmod of the worktree parent can fail on a full or read-only temp root. The caller
-  // (cli.ts) opens the worktree BEFORE the try/finally that reaps it, and turns a PreflightError
-  // into a legible exit 3 — a throw here would instead escape as a stack trace and a bare exit 1.
-  // So the "never throws" contract above is enforced, not merely asserted.
+  // `materializeWorktree` RETURNS its git failures, but it can still THROW: the mkdtemp/chmod of the
+  // owner-only parent, the `git init --bare`, or the alternates write can fail on a full or
+  // read-only temp root. The caller (cli.ts) opens the worktree BEFORE the try/finally that reaps
+  // it, and turns a PreflightError into a legible exit 3 — a throw here would instead escape as a
+  // stack trace and a bare exit 1. So the "never throws" contract above is enforced, not asserted.
+  // There is no longer a lock to contend for: each review materializes into its own private repo.
   let made: PreflightError | Worktree;
   try {
-    made = materializeWorktree(
-      { headSha: args.headSha, location, pr: args.pr },
-      { git, ...(deps.lock ? { lock: deps.lock } : {}) }
-    );
+    made = materializeWorktree({ headSha: args.headSha, location, pr: args.pr }, { git });
   } catch (e) {
-    const message = (e as Error).message;
-    return {
-      kind: message.includes(WORKTREE_LOCK_ERROR) ? 'lock-contended' : 'materialize-failed',
-      message,
-    };
+    return { kind: 'materialize-failed', message: (e as Error).message };
   }
   if (isPreflightError(made)) return made;
 
@@ -101,7 +90,7 @@ export function openWorktree(
     reap: () => {
       if (reaped) return;
       reaped = true;
-      reapWorktree(location.repoRoot, made.dir, { git });
+      reapWorktree(made.dir);
     },
     strippedInstructionFiles: made.strippedInstructionFiles,
   };

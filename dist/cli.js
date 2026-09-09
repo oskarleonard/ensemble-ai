@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/cli.ts
-import { execFileSync as execFileSync6 } from "child_process";
+import { execFileSync as execFileSync5 } from "child_process";
 import crypto2 from "crypto";
 import fs23 from "fs";
 import os11 from "os";
@@ -2169,11 +2169,11 @@ async function runBrainstormMode(opts) {
 // src/modes/review/claude.ts
 import fs16 from "fs";
 import os9 from "os";
-import path14 from "path";
+import path13 from "path";
 
 // src/modes/review/history-packet.ts
 import fs15 from "fs";
-import path13 from "path";
+import path12 from "path";
 
 // src/modes/review/ensemble-config.ts
 import fs11 from "fs";
@@ -3095,78 +3095,8 @@ function hunkCodeLines(hunk) {
 }
 
 // src/modes/review/worktree.ts
-import * as childProcess from "child_process";
-import { randomUUID } from "crypto";
 import fs14 from "fs";
-import path12 from "path";
-import { setTimeout as sleepAsync } from "timers/promises";
-import { promisify } from "util";
-
-// src/modes/review/git-exec.ts
-import { execFileSync as execFileSync4 } from "child_process";
 import path11 from "path";
-function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
-  const cmd = configured?.trim();
-  if (!cmd) return "ssh -o BatchMode=yes";
-  const bin = path11.basename(cmd.split(/\s+/)[0]);
-  return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
-}
-function effectiveSshCommand(cwd, cache) {
-  const key = cwd ?? "";
-  if (cache.has(key)) return cache.get(key);
-  let value = process.env.GIT_SSH_COMMAND?.trim() || void 0;
-  if (!value) {
-    try {
-      value = execFileSync4("git", ["config", "--get", "core.sshCommand"], {
-        cwd,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"]
-      }).trim() || void 0;
-    } catch {
-      value = void 0;
-    }
-  }
-  cache.set(key, value);
-  return value;
-}
-function nonInteractiveEnv(configuredSsh) {
-  const ssh = nonInteractiveSshCommand(configuredSsh);
-  return {
-    GIT_ASKPASS: "",
-    GIT_TERMINAL_PROMPT: "0",
-    SSH_ASKPASS: "",
-    // Absent ⇒ git resolves ssh itself, from the user's own GIT_SSH_COMMAND or core.sshCommand.
-    ...ssh ? { GIT_SSH_COMMAND: ssh } : {}
-  };
-}
-var GIT_TIMEOUT_MS = 6e5;
-var GIT_MAX_BUFFER = 64 * 1024 * 1024;
-function execGit() {
-  const sshByCwd = /* @__PURE__ */ new Map();
-  return (args, opts) => {
-    try {
-      const text = execFileSync4("git", args, {
-        cwd: opts?.cwd,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          ...nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)),
-          ...opts?.env ?? {}
-        },
-        maxBuffer: GIT_MAX_BUFFER,
-        timeout: GIT_TIMEOUT_MS
-      });
-      return { ok: true, text };
-    } catch (e) {
-      const err = e;
-      const stderr = err.stderr ? String(err.stderr).trim() : "";
-      return { error: stderr || err.message || "git failed", ok: false };
-    }
-  };
-}
-
-// src/modes/review/worktree.ts
-var WORKTREE_LOCK_ERROR = "could not acquire the worktree lock";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
 }
@@ -3197,18 +3127,18 @@ function allowedRootsFromConfig(configPath) {
   const roots = readEnsembleConfig(configPath).allowedRepoRoots;
   if (!Array.isArray(roots) || roots.length === 0) return null;
   const strs = roots.filter((r) => typeof r === "string" && r.trim().length > 0);
-  return strs.length > 0 ? strs.map((r) => path12.resolve(r)) : null;
+  return strs.length > 0 ? strs.map((r) => path11.resolve(r)) : null;
 }
 function rootAllowed(repoRoot, allowed) {
   if (!allowed) return true;
-  const real = path12.resolve(repoRoot);
+  const real = path11.resolve(repoRoot);
   return allowed.some((root) => {
-    const rel = path12.relative(root, real);
-    return rel === "" || !rel.startsWith("..") && !path12.isAbsolute(rel);
+    const rel = path11.relative(root, real);
+    return rel === "" || !rel.startsWith("..") && !path11.isAbsolute(rel);
   });
 }
 function resolveRepoLocation(args, deps) {
-  const repoPath = path12.resolve(args.repoPath);
+  const repoPath = path11.resolve(args.repoPath);
   const top = deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
   if (!top.ok) {
     return {
@@ -3260,9 +3190,6 @@ var INERT_GIT_CONFIG = [
 ];
 var INERT_ENV = { GIT_LFS_SKIP_SMUDGE: "1" };
 var WORKTREE_PARENT_PREFIX = "ensemble-worktree-";
-function repoLockPath(gitCommonDir) {
-  return path12.join(gitCommonDir, "ensemble-ai-worktree.lock");
-}
 var AGENT_INSTRUCTION_NAMES = ["CLAUDE.md", "AGENTS.md", ".claude"];
 var CURSOR_DIR = ".cursor";
 var CURSOR_RULES = "rules";
@@ -3294,7 +3221,7 @@ function stripAgentInstructions(dir) {
   const removed = [];
   const remove = (rel) => {
     try {
-      fs14.rmSync(path12.join(dir, rel), { force: true, recursive: true });
+      fs14.rmSync(path11.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -3302,7 +3229,7 @@ function stripAgentInstructions(dir) {
   const walk = (rel) => {
     let entries;
     try {
-      entries = fs14.readdirSync(path12.join(dir, rel), { withFileTypes: true });
+      entries = fs14.readdirSync(path11.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -3312,7 +3239,7 @@ function stripAgentInstructions(dir) {
       if (isInstructionName(e.name)) {
         remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
-        if (fs14.existsSync(path12.join(dir, childRel, CURSOR_RULES))) {
+        if (fs14.existsSync(path11.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
         walk(childRel);
@@ -3327,239 +3254,30 @@ function stripAgentInstructions(dir) {
 function isStrippedPath(p, stripped) {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
-function lockToken() {
-  return `${process.pid}:${randomUUID()}`;
+function sharedObjectsDir(repoRoot, git2) {
+  const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
+  if (!common.ok) return null;
+  const objects = path11.resolve(repoRoot, common.text.trim(), "objects");
+  return fs14.existsSync(objects) ? objects : null;
 }
-function removeLockIfOwned(lock, token) {
-  try {
-    if (fs14.readFileSync(lock, "utf8").trim() === token) {
-      fs14.unlinkSync(lock);
-      return true;
-    }
-  } catch {
-  }
-  return false;
-}
-function holderPidFromToken(token) {
-  const m = /^(\d+):/.exec(token);
-  if (!m) return null;
-  const pid = Number(m[1]);
-  return Number.isInteger(pid) && pid > 0 ? pid : null;
-}
-function isHolderDead(pid) {
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch (e) {
-    return e.code === "ESRCH";
-  }
-}
-var IN_LOCK_GIT_SIGNATURE = "core.hooksPath=/dev/null";
-var PS_ARGS = ["-axo", "pid=,ppid=,command="];
-var EXEC_OPTS = { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 5e3 };
-var SCAN_INTERVAL_MS = 5e3;
-var SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
-function sleepSync(ms) {
-  Atomics.wait(SLEEP_BUF, 0, 0, ms);
-}
-function parseProcessTable(psOutput) {
-  const rows = [];
-  for (const line of psOutput.split("\n")) {
-    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
-    if (m) rows.push({ cmd: m[3], pid: Number(m[1]), ppid: Number(m[2]) });
-  }
-  return rows;
-}
-function inLockGitCandidates(table) {
-  return table.filter(
-    (r) => r.pid !== process.pid && /(^|[\s/])git\s/.test(r.cmd) && r.cmd.includes(IN_LOCK_GIT_SIGNATURE)
-  );
-}
-var UNKNOWN_SCAN = { busy: false, unknown: true };
-var scanFailureLogged = false;
-function scanFailed(e) {
-  if (!scanFailureLogged) {
-    scanFailureLogged = true;
-    const why = e instanceof Error ? e.message : String(e);
-    process.stderr.write(
-      `\u26A0 ensemble-ai: could not scan for in-lock git processes (${why}) \u2014 dead-holder reclaim falls back to the TTL
-`
-    );
-  }
-  return UNKNOWN_SCAN;
-}
-function scanInLockGit(_scope) {
-  try {
-    const table = parseProcessTable(childProcess.execFileSync("ps", PS_ARGS, EXEC_OPTS));
-    return { busy: inLockGitCandidates(table).length > 0, unknown: false };
-  } catch (e) {
-    return scanFailed(e);
-  }
-}
-function decideDeadHolder(scan) {
-  return scan.unknown || scan.busy ? "ttl" : "reclaim";
-}
-var DEFAULT_LOCK_STALE_MS = GIT_TIMEOUT_MS + 5 * 6e4;
-function touchLockIfOwned(lock, token) {
-  try {
-    if (fs14.readFileSync(lock, "utf8").trim() !== token) return false;
-    const now = /* @__PURE__ */ new Date();
-    fs14.utimesSync(lock, now, now);
-    return true;
-  } catch {
-    return false;
-  }
-}
-function makeRelease(lock, token) {
-  const release = () => {
-    removeLockIfOwned(lock, token);
-  };
-  return Object.assign(release, { touch: () => touchLockIfOwned(lock, token) });
-}
-function touchLease(release) {
-  release.touch?.();
-}
-function tryCreate(lock, token) {
-  let fd;
-  try {
-    fd = fs14.openSync(lock, fs14.constants.O_CREAT | fs14.constants.O_EXCL | fs14.constants.O_WRONLY, 384);
-  } catch (e) {
-    if (e.code === "EEXIST") return "contended";
-    throw e;
-  }
-  try {
-    fs14.writeSync(fd, token);
-    fs14.closeSync(fd);
-  } catch (we) {
-    try {
-      fs14.closeSync(fd);
-    } catch {
-    }
-    try {
-      fs14.unlinkSync(lock);
-    } catch {
-    }
-    throw we;
-  }
-  return makeRelease(lock, token);
-}
-function readContention(lock) {
-  try {
-    const held = fs14.readFileSync(lock, "utf8").trim();
-    const pid = holderPidFromToken(held);
-    return {
-      age: Date.now() - fs14.statSync(lock).mtimeMs,
-      dead: pid !== null && isHolderDead(pid),
-      held,
-      pid
-    };
-  } catch {
-    return null;
-  }
-}
-function reclaimContended(lock, c, why) {
-  const reclaimed = removeLockIfOwned(lock, c.held);
-  if (reclaimed) process.stderr.write(`\u26A0 ensemble-ai: reclaimed worktree lock at ${lock} \u2014 ${why}
+function writeAlternates(bareRepo, sharedObjects) {
+  const info = path11.join(bareRepo, "objects", "info");
+  fs14.mkdirSync(info, { recursive: true });
+  fs14.writeFileSync(path11.join(info, "alternates"), `${sharedObjects}
 `);
-  return reclaimed;
-}
-function scopeOf(gitCommonDir, repoRoot) {
-  const derived = path12.basename(gitCommonDir) === ".git" ? path12.dirname(gitCommonDir) : gitCommonDir;
-  return { gitCommonDir, repoRoot: repoRoot ?? derived };
-}
-function lockPathAndBudget(gitCommonDir, opts) {
-  const lock = repoLockPath(gitCommonDir);
-  const sleepMs = Math.max(1, opts.sleepMs ?? 500);
-  const staleMs = opts.staleMs ?? DEFAULT_LOCK_STALE_MS;
-  const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
-  return { lock, retries, scope: scopeOf(gitCommonDir, opts.repoRoot), sleepMs, staleMs };
-}
-function lockWedgedError(lock, retries, sleepMs) {
-  return new Error(
-    `ensemble-ai: ${WORKTREE_LOCK_ERROR} at ${lock} after ${retries} attempts (${Math.round(retries * sleepMs / 1e3)}s) \u2014 another review is materializing a worktree in this repo`
-  );
-}
-function takeAfterReclaim(lock, token) {
-  const created = tryCreate(lock, token);
-  return created === "contended" ? null : created;
-}
-function attemptPrelude(lock, token, staleMs) {
-  const created = tryCreate(lock, token);
-  if (created !== "contended") return { settled: created };
-  const c = readContention(lock);
-  if (!c) return { settled: null };
-  if (c.dead) return { contend: c };
-  if (c.age > staleMs) {
-    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? "unknown"})`);
-    return { settled: takeAfterReclaim(lock, token) };
-  }
-  return { settled: null };
-}
-var BUSY_BACKSTOP_FACTOR = 2;
-function settleDeadHolder(lock, c, scan, staleMs) {
-  if (decideDeadHolder(scan) === "reclaim") {
-    reclaimContended(lock, c, `holder pid ${c.pid} was gone and no in-lock git process is running on this host`);
-    return;
-  }
-  const backstop = scan.unknown ? staleMs : BUSY_BACKSTOP_FACTOR * staleMs;
-  if (c.age > backstop) {
-    reclaimContended(
-      lock,
-      c,
-      `holder pid ${c.pid} was gone and the lock aged past ${scan.unknown ? "the TTL" : `${BUSY_BACKSTOP_FACTOR}\xD7 the TTL`} (in-lock git state ${scan.unknown ? "unknown" : "busy"} \u2014 the backstop)`
-    );
-  }
-}
-var fresh = (cache, held) => cache.scan && cache.token === held && Date.now() - cache.at < SCAN_INTERVAL_MS ? cache.scan : null;
-function attemptSync(lock, token, staleMs, scope, scanner, cache) {
-  const pre = attemptPrelude(lock, token, staleMs);
-  if ("settled" in pre) return pre.settled;
-  let scan = fresh(cache, pre.contend.held);
-  if (!scan) {
-    let scanned;
-    try {
-      scanned = scanner(scope);
-    } catch (e) {
-      scanned = scanFailed(e);
-    }
-    if (scanned instanceof Promise) {
-      scanned.catch(() => {
-      });
-      scan = UNKNOWN_SCAN;
-    } else {
-      scan = scanned;
-    }
-    cache.at = Date.now();
-    cache.scan = scan;
-    cache.token = pre.contend.held;
-  }
-  settleDeadHolder(lock, pre.contend, scan, staleMs);
-  return takeAfterReclaim(lock, token);
-}
-function acquireRepoLock(gitCommonDir, opts = {}) {
-  const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
-  const scanner = opts.scanner ?? scanInLockGit;
-  const token = lockToken();
-  const cache = { at: 0, scan: null, token: null };
-  for (let i = 0; i <= retries; i++) {
-    const release = attemptSync(lock, token, staleMs, scope, scanner, cache);
-    if (release) return release;
-    if (i === retries) break;
-    sleepSync(sleepMs);
-  }
-  throw lockWedgedError(lock, retries, sleepMs);
 }
 function materializeWorktree(args, deps) {
   const { location } = args;
-  const common = deps.git(["rev-parse", "--git-common-dir"], { cwd: location.repoRoot });
-  if (!common.ok) {
-    return { kind: "not-a-repo", message: `cannot resolve the git dir of ${location.repoRoot}` };
-  }
-  const gitCommonDir = path12.resolve(location.repoRoot, common.text.trim());
-  const acquire = deps.lock ?? ((dir2) => acquireRepoLock(dir2, { repoRoot: location.repoRoot }));
-  const release = acquire(gitCommonDir);
-  let dir = null;
+  const shared = sharedObjectsDir(location.repoRoot, deps.git);
+  let parent = null;
   try {
+    parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
+    const bare = path11.join(parent, "repo");
+    const init = deps.git([...INERT_GIT_CONFIG, "init", "--bare", bare], { env: INERT_ENV });
+    if (!init.ok) {
+      return { kind: "materialize-failed", message: `git init --bare failed: ${init.error.trim()}` };
+    }
+    if (shared) writeAlternates(bare, shared);
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -3570,28 +3288,26 @@ function materializeWorktree(args, deps) {
         location.fetchUrl,
         `pull/${args.pr}/head`
       ],
-      { cwd: location.repoRoot, env: INERT_ENV }
+      { cwd: bare, env: INERT_ENV }
     );
     if (!fetched.ok) {
-      return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
+      return {
+        kind: classifyGitError(fetched.error),
+        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}`
+      };
     }
-    touchLease(release);
-    const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    dir = path12.join(parent, "head");
+    const dir = path11.join(parent, "head");
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
-      { cwd: location.repoRoot, env: INERT_ENV }
+      { cwd: bare, env: INERT_ENV }
     );
     if (!added.ok) {
       const kind = /invalid reference|not a valid object|unknown revision/i.test(added.error) ? "no-such-pr" : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
-    touchLease(release);
     const head = deps.git(["rev-parse", "HEAD"], { cwd: dir });
     const actual = head.ok ? head.text.trim() : "";
     if (actual !== args.headSha) {
-      reapWorktree(location.repoRoot, dir, deps);
-      dir = null;
       return {
         kind: "sha-mismatch",
         message: `worktree HEAD is ${actual || "(unresolvable)"} but the review is tied to ${args.headSha} \u2014 ABORTING rather than reviewing wrong-SHA evidence`
@@ -3602,33 +3318,21 @@ function materializeWorktree(args, deps) {
       headSha: args.headSha,
       strippedInstructionFiles: stripAgentInstructions(dir)
     };
-    dir = null;
+    parent = null;
     return made;
   } finally {
-    if (dir) reapWorktree(location.repoRoot, dir, deps);
-    release();
+    if (parent) reapParent(parent);
   }
 }
-function reapWorktree(repoRoot, dir, deps) {
+function reapParent(parent) {
+  if (!path11.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    deps.git([...INERT_GIT_CONFIG, "worktree", "remove", "--force", dir], { cwd: repoRoot });
+    fs14.rmSync(parent, { force: true, recursive: true });
   } catch {
   }
-  try {
-    fs14.rmSync(dir, { force: true, recursive: true });
-  } catch {
-  }
-  try {
-    const parent = path12.dirname(dir);
-    if (path12.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
-      fs14.rmSync(parent, { force: true, recursive: true });
-    }
-  } catch {
-  }
-  try {
-    deps.git([...INERT_GIT_CONFIG, "worktree", "prune"], { cwd: repoRoot });
-  } catch {
-  }
+}
+function reapWorktree(dir) {
+  reapParent(path11.dirname(dir));
 }
 
 // src/modes/review/history-packet.ts
@@ -3940,15 +3644,15 @@ function buildHistoryPacket(args) {
   return { bytes, files, shallow: false, truncated };
 }
 function containedPath(root, rel) {
-  const abs = path13.resolve(root, rel);
-  const back = path13.relative(path13.resolve(root), abs);
+  const abs = path12.resolve(root, rel);
+  const back = path12.relative(path12.resolve(root), abs);
   return back !== "" && !escapesRoot(back) ? abs : null;
 }
 function writeHistoryPacket(cwd, files) {
   for (const f of files) {
     const abs = containedPath(cwd, f.path);
     if (!abs) continue;
-    fs15.mkdirSync(path13.dirname(abs), { recursive: true });
+    fs15.mkdirSync(path12.dirname(abs), { recursive: true });
     fs15.writeFileSync(abs, f.contents, { mode: 256 });
   }
 }
@@ -3983,7 +3687,7 @@ function homeReadDenyRules(homeDir) {
   return CLAUDE_READ_TOOLS.map((t) => denyUnder(t, homeDir));
 }
 function isUnder(child, parent) {
-  return !escapesRoot(path14.relative(path14.resolve(parent), path14.resolve(child)));
+  return !escapesRoot(path13.relative(path13.resolve(parent), path13.resolve(child)));
 }
 function buildClaudeReviewArgs(prompt, config, fence = {}) {
   const homeDir = fence.homeDir ?? os9.homedir();
@@ -5369,7 +5073,7 @@ function scanDependencySurface(files) {
 // src/modes/review/receipt.ts
 import fs19 from "fs";
 import os10 from "os";
-import path16 from "path";
+import path15 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -5453,7 +5157,7 @@ function formatEvidenceShortfall(gaps) {
 
 // src/modes/review/holistic-gate.ts
 import fs18 from "fs";
-import path15 from "path";
+import path14 from "path";
 
 // src/modes/review/holistic.ts
 import fs17 from "fs";
@@ -5663,18 +5367,18 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs18.realpathSync(path15.resolve(worktreeDir));
+    root = fs18.realpathSync(path14.resolve(worktreeDir));
   } catch {
     return () => null;
   }
   const inside = (p) => {
-    const rel = path15.relative(root, p);
+    const rel = path14.relative(root, p);
     return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
-      if (!file || file.includes("\0") || path15.isAbsolute(file)) return null;
-      const target = path15.resolve(root, file);
+      if (!file || file.includes("\0") || path14.isAbsolute(file)) return null;
+      const target = path14.resolve(root, file);
       if (!inside(target)) return null;
       const real = fs18.realpathSync(target);
       if (!inside(real)) return null;
@@ -7122,10 +6826,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path16.join(os10.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path15.join(os10.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path16.join(
+  return path15.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -7146,7 +6850,7 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs19.mkdirSync(path16.dirname(file), { recursive: true, mode: 448 });
+  fs19.mkdirSync(path15.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
   fs19.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
   fs19.chmodSync(tmp, 384);
@@ -8640,11 +8344,11 @@ function loadClaudeReviewerSeat(file = VOICES_FILE, flags = {}, warn = () => {
 
 // src/modes/review/regate.ts
 import fs21 from "fs";
-import path17 from "path";
+import path16 from "path";
 function readConventionPathsFromTrail(baseDir, runId) {
   try {
     const raw = JSON.parse(
-      fs21.readFileSync(path17.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
+      fs21.readFileSync(path16.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
     );
     const paths = (raw.files ?? []).filter((f) => f.included === true && typeof f.path === "string").map((f) => f.path);
     return paths.length > 0 ? paths : void 0;
@@ -8690,7 +8394,7 @@ async function runRegate(opts) {
     ...opts.worktree ? { worktree: opts.worktree } : {}
   });
   try {
-    const p = path17.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
+    const p = path16.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
     const existing = fs21.existsSync(p) ? JSON.parse(fs21.readFileSync(p, "utf8")) : {};
     writeTrailFile(
       opts.baseDir,
@@ -8723,7 +8427,7 @@ async function runRegate(opts) {
 
 // src/modes/review/reseat.ts
 import fs22 from "fs";
-import path18 from "path";
+import path17 from "path";
 
 // src/modes/review/evidence-manifest.ts
 var EVIDENCE_MANIFEST_SCHEMA_VERSION = 1;
@@ -8816,7 +8520,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   if (!stored) return { error: `run ${runId} has no review.${seat}.json under ${baseDir}` };
   let parsed;
   try {
-    parsed = JSON.parse(fs22.readFileSync(path18.join(dir, `packet.${seat}.json`), "utf8"));
+    parsed = JSON.parse(fs22.readFileSync(path17.join(dir, `packet.${seat}.json`), "utf8"));
   } catch {
     return { error: `run ${runId} has no readable packet.${seat}.json` };
   }
@@ -8826,7 +8530,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   const packet = parsed;
   let prompt;
   try {
-    prompt = fs22.readFileSync(path18.join(dir, `prompt.${seat}.md`), "utf8");
+    prompt = fs22.readFileSync(path17.join(dir, `prompt.${seat}.md`), "utf8");
   } catch {
     return { error: `run ${runId} has no readable prompt.${seat}.md` };
   }
@@ -8899,7 +8603,7 @@ function readReseatLock(p) {
   return { since, startedMs };
 }
 function acquireReseatLock(baseDir, runId) {
-  const p = path18.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
+  const p = path17.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
   const held = () => `another reseat is already running on run ${runId} (lock ${RESEAT_LOCK_FILE}, since ${readReseatLock(p)?.since ?? "unknown"})`;
   const claim = () => {
     try {
@@ -8933,7 +8637,7 @@ function acquireReseatLock(baseDir, runId) {
 }
 function foldSynthesis(baseDir, runId, patch, log) {
   try {
-    const p = path18.join(reviewDir(baseDir, runId), "claude-synthesis.json");
+    const p = path17.join(reviewDir(baseDir, runId), "claude-synthesis.json");
     const existing = fs22.existsSync(p) ? JSON.parse(fs22.readFileSync(p, "utf8")) : {};
     writeTrailFile(baseDir, runId, "claude-synthesis.json", JSON.stringify(patch(existing), null, 2));
     return true;
@@ -8946,7 +8650,7 @@ function appendEgressDenials(baseDir, runId, denials, log) {
   if (denials.length === 0) return;
   try {
     log(`reseat: \u26A0 egress fence: ${formatEgressDenialCounts(denials)}`);
-    const p = path18.join(reviewDir(baseDir, runId), "egress-denials.json");
+    const p = path17.join(reviewDir(baseDir, runId), "egress-denials.json");
     const prior = fs22.existsSync(p) ? JSON.parse(fs22.readFileSync(p, "utf8")) : [];
     if (!Array.isArray(prior)) {
       log(
@@ -9069,7 +8773,7 @@ async function reseatUnderLock(opts, pre) {
     log
   );
   try {
-    const mp = path18.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
+    const mp = path17.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
     if (fs22.existsSync(mp)) {
       const manifest = JSON.parse(fs22.readFileSync(mp, "utf8"));
       manifest.realizedEvidence = {
@@ -9125,6 +8829,69 @@ async function reseatUnderLock(opts, pre) {
     realized: seatRun.realized,
     review,
     stampWritten
+  };
+}
+
+// src/modes/review/git-exec.ts
+import { execFileSync as execFileSync4 } from "child_process";
+import path18 from "path";
+function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
+  const cmd = configured?.trim();
+  if (!cmd) return "ssh -o BatchMode=yes";
+  const bin = path18.basename(cmd.split(/\s+/)[0]);
+  return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
+}
+function effectiveSshCommand(cwd, cache) {
+  const key = cwd ?? "";
+  if (cache.has(key)) return cache.get(key);
+  let value = process.env.GIT_SSH_COMMAND?.trim() || void 0;
+  if (!value) {
+    try {
+      value = execFileSync4("git", ["config", "--get", "core.sshCommand"], {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"]
+      }).trim() || void 0;
+    } catch {
+      value = void 0;
+    }
+  }
+  cache.set(key, value);
+  return value;
+}
+function nonInteractiveEnv(configuredSsh) {
+  const ssh = nonInteractiveSshCommand(configuredSsh);
+  return {
+    GIT_ASKPASS: "",
+    GIT_TERMINAL_PROMPT: "0",
+    SSH_ASKPASS: "",
+    // Absent ⇒ git resolves ssh itself, from the user's own GIT_SSH_COMMAND or core.sshCommand.
+    ...ssh ? { GIT_SSH_COMMAND: ssh } : {}
+  };
+}
+var GIT_TIMEOUT_MS = 6e5;
+var GIT_MAX_BUFFER = 64 * 1024 * 1024;
+function execGit() {
+  const sshByCwd = /* @__PURE__ */ new Map();
+  return (args, opts) => {
+    try {
+      const text = execFileSync4("git", args, {
+        cwd: opts?.cwd,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ...nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)),
+          ...opts?.env ?? {}
+        },
+        maxBuffer: GIT_MAX_BUFFER,
+        timeout: GIT_TIMEOUT_MS
+      });
+      return { ok: true, text };
+    } catch (e) {
+      const err = e;
+      const stderr = err.stderr ? String(err.stderr).trim() : "";
+      return { error: stderr || err.message || "git failed", ok: false };
+    }
   };
 }
 
@@ -9214,16 +8981,9 @@ function openWorktree(args, deps = {}) {
   if (isPreflightError(location)) return location;
   let made;
   try {
-    made = materializeWorktree(
-      { headSha: args.headSha, location, pr: args.pr },
-      { git: git2, ...deps.lock ? { lock: deps.lock } : {} }
-    );
+    made = materializeWorktree({ headSha: args.headSha, location, pr: args.pr }, { git: git2 });
   } catch (e) {
-    const message = e.message;
-    return {
-      kind: message.includes(WORKTREE_LOCK_ERROR) ? "lock-contended" : "materialize-failed",
-      message
-    };
+    return { kind: "materialize-failed", message: e.message };
   }
   if (isPreflightError(made)) return made;
   let reaped = false;
@@ -9237,7 +8997,7 @@ function openWorktree(args, deps = {}) {
     reap: () => {
       if (reaped) return;
       reaped = true;
-      reapWorktree(location.repoRoot, made.dir, { git: git2 });
+      reapWorktree(made.dir);
     },
     strippedInstructionFiles: made.strippedInstructionFiles
   };
@@ -9752,8 +9512,8 @@ function stageReview(payload, target, deps) {
   if (!head.ok) return { error: `could not read the PR head: ${head.error}`, kind: "gh-failed", ok: false };
   const liveHead = head.text.trim();
   if (!liveHead) return { error: "the PR head SHA came back empty", kind: "unreadable", ok: false };
-  const fresh2 = checkFreshness(deps.reviewedHeadSha, liveHead);
-  if (!fresh2.ok) return { error: fresh2.error, kind: "head-moved", ok: false };
+  const fresh = checkFreshness(deps.reviewedHeadSha, liveHead);
+  if (!fresh.ok) return { error: fresh.error, kind: "head-moved", ok: false };
   const list = run(["api", apiPath(target, "/reviews"), "--paginate"]);
   if (!list.ok) return { error: `could not list PR reviews: ${list.error}`, kind: "gh-failed", ok: false };
   let pending;
@@ -10212,7 +9972,7 @@ function readStdinIfPiped() {
 }
 function capture(cmd, cmdArgs, cwd) {
   try {
-    const text = execFileSync6(cmd, cmdArgs, {
+    const text = execFileSync5(cmd, cmdArgs, {
       cwd,
       encoding: "utf8",
       maxBuffer: 256 * 1024 * 1024,
@@ -10235,7 +9995,7 @@ function capture(cmd, cmdArgs, cwd) {
 }
 function gitToplevel(cwd) {
   try {
-    const top = execFileSync6("git", ["rev-parse", "--show-toplevel"], {
+    const top = execFileSync5("git", ["rev-parse", "--show-toplevel"], {
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"]
@@ -10560,7 +10320,7 @@ function resolveDiffSourceForCommand(values, positionals, cmd, cwd) {
 function ghRunner(cwd) {
   return (args, input) => {
     try {
-      const text = execFileSync6("gh", args, {
+      const text = execFileSync5("gh", args, {
         cwd,
         encoding: "utf8",
         maxBuffer: 16 * 1024 * 1024,
