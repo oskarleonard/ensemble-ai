@@ -2390,10 +2390,17 @@ import { execFileSync as execFileSync4 } from "child_process";
 // src/modes/review/git-exec.ts
 import { execFileSync as execFileSync3 } from "child_process";
 import path9 from "path";
+function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
+  const cmd = configured?.trim();
+  if (!cmd) return "ssh -o BatchMode=yes";
+  const bin = path9.basename(cmd.split(/\s+/)[0]);
+  return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
+}
 var GIT_MAX_BUFFER = 64 * 1024 * 1024;
 var REPO_LOCATION_ENV = [
   "GIT_DIR",
   "GIT_WORK_TREE",
+  "GIT_IMPLICIT_WORK_TREE",
   "GIT_NAMESPACE",
   "GIT_COMMON_DIR",
   "GIT_OBJECT_DIRECTORY",
@@ -2411,7 +2418,9 @@ var REPO_LOCATION_ENV = [
   "GIT_CONFIG",
   "GIT_SHALLOW_FILE",
   "GIT_GRAFT_FILE",
-  "GIT_CONFIG_PARAMETERS"
+  "GIT_CONFIG_PARAMETERS",
+  // Discovery can be stopped short of the private repo by an inherited ceiling — same class.
+  "GIT_CEILING_DIRECTORIES"
 ];
 var CONFIG_INJECTION_ENV_RE = /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/;
 function scrubRepoEnv(env) {
@@ -2574,11 +2583,8 @@ function git(cwd, args, opts) {
   return execFileSync4("git", args, {
     cwd,
     encoding: "utf8",
-    // Scrub the repo-selecting env (GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/…) so an inherited value —
-    // git exports GIT_DIR for every hook it runs — can't make `git diff`, the base/head SHAs, or the
-    // origin URL (the receipt STORE KEY via resolveRepoId) come from a different repo than cwd
-    // (cross-vendor review, claude-f2). cwd is the only repo this reader means.
     env: scrubRepoEnv(process.env),
+    // cwd is the only repo selector — same rule as execGit
     stdio: opts?.quiet ? ["ignore", "pipe", "ignore"] : ["pipe", "pipe", "inherit"]
   });
 }
@@ -2778,6 +2784,9 @@ var INERT_GIT_CONFIG = [
   "gc.auto=0"
 ];
 var INERT_ENV = { GIT_LFS_SKIP_SMUDGE: "1" };
+function objectFormatFlag(headSha) {
+  return `--object-format=${headSha.length === 64 ? "sha256" : "sha1"}`;
+}
 var WORKTREE_PARENT_PREFIX = "ensemble-worktree-";
 var AGENT_INSTRUCTION_NAMES = ["CLAUDE.md", "AGENTS.md", ".claude"];
 var CURSOR_DIR = ".cursor";
@@ -2897,25 +2906,41 @@ function writeAlternates(bareRepo, sharedObjects) {
 `);
 }
 var TRANSPORT_CONFIG_RE = "^(core\\.sshcommand|credential\\.|http\\.|url\\.)";
-function copyTransportConfig(repoRoot, bareRepo, git2) {
-  const effective = git2(["-C", repoRoot, "config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE]);
-  if (!effective.ok) return [];
-  const inheritedRes = git2(["-C", bareRepo, "config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE]);
-  const inherited = new Set(
-    (inheritedRes.ok ? parseConfigList(inheritedRes.text) : []).map(([k, v]) => `${k}
-${v}`)
-  );
-  const added = [];
-  for (const [key, value] of parseConfigList(effective.text)) {
-    if (inherited.has(`${key}
-${value}`)) continue;
-    git2(["-C", bareRepo, "config", "--add", key, value]);
-    added.push(key);
+function missingConfig(want, have) {
+  const pool = have.map(([k, v]) => `${k}
+${v}`);
+  const out = [];
+  for (const [k, v] of want) {
+    const i = pool.indexOf(`${k}
+${v}`);
+    if (i >= 0) pool.splice(i, 1);
+    else out.push([k, v]);
   }
-  return added;
+  return out;
 }
-function scrubTransportConfig(bareRepo, addedKeys, git2) {
-  for (const key of new Set(addedKeys)) git2(["-C", bareRepo, "config", "--unset-all", key]);
+function transportEnv(entries, sshCommand) {
+  const env = {};
+  if (entries.length > 0) {
+    env.GIT_CONFIG_COUNT = String(entries.length);
+    entries.forEach(([k, v], i) => {
+      env[`GIT_CONFIG_KEY_${i}`] = k;
+      env[`GIT_CONFIG_VALUE_${i}`] = v;
+    });
+  }
+  if (sshCommand && !process.env.GIT_SSH_COMMAND) {
+    env.GIT_SSH_COMMAND = nonInteractiveSshCommand(sshCommand) ?? sshCommand;
+  }
+  return env;
+}
+function listTransportConfig(cwd, git2) {
+  const listed = git2(["config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE], { cwd });
+  return listed.ok ? parseConfigList(listed.text) : [];
+}
+function fetchEnv(repoRoot, bare, git2) {
+  const want = listTransportConfig(repoRoot, git2);
+  const missing = missingConfig(want, listTransportConfig(bare, git2));
+  const ssh = want.find(([k]) => k === "core.sshcommand")?.[1];
+  return { ...INERT_ENV, ...transportEnv(missing, ssh) };
 }
 function parseConfigList(text) {
   const out = [];
@@ -2933,12 +2958,14 @@ function materializeWorktree(args, deps) {
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     const bare = path11.join(parent, "repo");
-    const init = deps.git([...INERT_GIT_CONFIG, "init", "--bare", bare], { env: INERT_ENV });
+    const init = deps.git(
+      [...INERT_GIT_CONFIG, "init", "--bare", objectFormatFlag(args.headSha), bare],
+      { env: INERT_ENV }
+    );
     if (!init.ok) {
       return { kind: "materialize-failed", message: `git init --bare failed: ${init.error.trim()}` };
     }
     if (shared) writeAlternates(bare, shared);
-    const carried = copyTransportConfig(location.repoRoot, bare, deps.git);
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -2949,9 +2976,8 @@ function materializeWorktree(args, deps) {
         location.fetchUrl,
         `pull/${args.pr}/head`
       ],
-      { cwd: bare, env: INERT_ENV }
+      { cwd: bare, env: fetchEnv(location.repoRoot, bare, deps.git) }
     );
-    scrubTransportConfig(bare, carried, deps.git);
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
@@ -3038,12 +3064,14 @@ async function materializeWorktreeAsync(args, deps) {
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     const bare = path11.join(parent, "repo");
-    const init = await deps.git([...INERT_GIT_CONFIG, "init", "--bare", bare], { env: INERT_ENV });
+    const init = await deps.git(
+      [...INERT_GIT_CONFIG, "init", "--bare", objectFormatFlag(args.headSha), bare],
+      { env: INERT_ENV }
+    );
     if (!init.ok) {
       return { kind: "materialize-failed", message: `git init --bare failed: ${init.error.trim()}` };
     }
     if (shared) await writeAlternatesAsync(bare, shared);
-    const carried = await copyTransportConfigAsync(location.repoRoot, bare, deps.git);
     const fetched = await deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -3054,9 +3082,8 @@ async function materializeWorktreeAsync(args, deps) {
         location.fetchUrl,
         `pull/${args.pr}/head`
       ],
-      { cwd: bare, env: INERT_ENV }
+      { cwd: bare, env: await fetchEnvAsync(location.repoRoot, bare, deps.git) }
     );
-    await scrubTransportConfigAsync(bare, carried, deps.git);
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
@@ -3108,25 +3135,15 @@ async function writeAlternatesAsync(bareRepo, sharedObjects) {
   await fs12.promises.writeFile(path11.join(info, "alternates"), `${sharedObjects}
 `);
 }
-async function copyTransportConfigAsync(repoRoot, bareRepo, git2) {
-  const effective = await git2(["-C", repoRoot, "config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE]);
-  if (!effective.ok) return [];
-  const inheritedRes = await git2(["-C", bareRepo, "config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE]);
-  const inherited = new Set(
-    (inheritedRes.ok ? parseConfigList(inheritedRes.text) : []).map(([k, v]) => `${k}
-${v}`)
-  );
-  const added = [];
-  for (const [key, value] of parseConfigList(effective.text)) {
-    if (inherited.has(`${key}
-${value}`)) continue;
-    await git2(["-C", bareRepo, "config", "--add", key, value]);
-    added.push(key);
-  }
-  return added;
+async function listTransportConfigAsync(cwd, git2) {
+  const listed = await git2(["config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE], { cwd });
+  return listed.ok ? parseConfigList(listed.text) : [];
 }
-async function scrubTransportConfigAsync(bareRepo, addedKeys, git2) {
-  for (const key of new Set(addedKeys)) await git2(["-C", bareRepo, "config", "--unset-all", key]);
+async function fetchEnvAsync(repoRoot, bare, git2) {
+  const want = await listTransportConfigAsync(repoRoot, git2);
+  const missing = missingConfig(want, await listTransportConfigAsync(bare, git2));
+  const ssh = want.find(([k]) => k === "core.sshcommand")?.[1];
+  return { ...INERT_ENV, ...transportEnv(missing, ssh) };
 }
 async function reapParentAsync(parent) {
   if (!path11.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
@@ -6194,7 +6211,6 @@ export {
   computePolicyHash,
   computePolicyHashAt,
   consult_exports as consult,
-  copyTransportConfig,
   coverageCounts,
   coverageShortfall,
   defaultCodexSandboxPaths,
@@ -6263,6 +6279,7 @@ export {
   materializedDiffClause,
   meetsInlineFloor,
   memoryConventionReader,
+  missingConfig,
   omittedLine,
   oneOf,
   parseConventionCitation,
@@ -6343,7 +6360,6 @@ export {
   scanDiffForSecrets,
   scanTextForSecrets,
   scoreHolisticFixture,
-  scrubTransportConfig,
   section,
   securityClassLabel,
   segmentsWithoutTruncationSplices,
@@ -6355,6 +6371,7 @@ export {
   stripTrailingCommas,
   summarizeCoverage,
   titleCase,
+  transportEnv,
   validateReceiptShape,
   verifyFixtureAnchors,
   verifySiteAtHead,

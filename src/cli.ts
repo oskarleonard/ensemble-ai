@@ -419,6 +419,7 @@ function capture(
     const text = execFileSync(cmd, cmdArgs, {
       cwd,
       encoding: 'utf8',
+      env: scrubRepoEnv(process.env), // git + gh alike: cwd is the only repo selector
       maxBuffer: 256 * 1024 * 1024,
       // stdin closed so `gh` can never sit on an interactive prompt; stderr 'pipe' rather
       // than the sync-exec default, which ALSO mirrors the child's stderr onto ours — every
@@ -445,8 +446,6 @@ function gitToplevel(cwd: string): string | null {
     const top = execFileSync('git', ['rev-parse', '--show-toplevel'], {
       cwd,
       encoding: 'utf8',
-      // Scrub repo-selecting env so an inherited GIT_DIR can't point the trail dir at another repo
-      // (claude-f2); cwd is the only repo this probe means.
       env: scrubRepoEnv(process.env),
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();

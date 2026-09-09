@@ -96,6 +96,7 @@ const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 export const REPO_LOCATION_ENV = [
   'GIT_DIR',
   'GIT_WORK_TREE',
+  'GIT_IMPLICIT_WORK_TREE',
   'GIT_NAMESPACE',
   'GIT_COMMON_DIR',
   'GIT_OBJECT_DIRECTORY',
@@ -114,6 +115,8 @@ export const REPO_LOCATION_ENV = [
   'GIT_SHALLOW_FILE',
   'GIT_GRAFT_FILE',
   'GIT_CONFIG_PARAMETERS',
+  // Discovery can be stopped short of the private repo by an inherited ceiling — same class.
+  'GIT_CEILING_DIRECTORIES',
 ] as const;
 
 // GIT_CONFIG_COUNT + its GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> siblings inject config by count —

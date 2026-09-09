@@ -7,17 +7,17 @@ import { describe, expect, it, vi } from 'vitest';
 import { execGit } from './git-exec';
 import {
   classifyGitError,
-  copyTransportConfig,
   isPreflightError,
   materializeWorktree,
+  missingConfig,
   reapWorktree,
   redactUrlCredentials,
   remoteSlug,
   resolveRepoLocation,
   rootAllowed,
-  scrubTransportConfig,
-  type GitRun,
+  transportEnv,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
+  type GitRun,
 } from './worktree';
 
 // The clause is the in-file half of the instruction fence (the strip closes the FILE half). Since
@@ -414,6 +414,18 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
       { git: realGit }
     );
 
+  // A URL nothing can fetch — unless the checkout's own `url.<file://origin>.insteadOf` rewrites it.
+  // The only honest proof that the checkout's transport config REACHED the fetch: the fetch succeeds.
+  const BOGUS_URL = 'https://bogus.invalid/pr.git';
+  const TRANSPORT_KEYS_RE = '^(core\\.sshcommand|credential\\.|http\\.|url\\.)';
+  const materializeAt = (base: string, consumer: string, headSha: string, fetchUrl: string, git: GitRun = realGit) =>
+    materializeWorktree(
+      { headSha, location: { fetchUrl, repoRoot: consumer, slug: 'o/r' }, pr: 7, worktreeRoot: base },
+      { git }
+    );
+  const persistedTransportKeys = (worktreeDir: string): boolean =>
+    realGit(['-C', path.join(path.dirname(worktreeDir), 'repo'), 'config', '--local', '--get-regexp', TRANSPORT_KEYS_RE]).ok;
+
   it('fetches pull/N/head into a private repo, materializes at the SHA, strips, reaps', () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-realgit-'));
     try {
@@ -444,9 +456,14 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
     try {
       const { headSha, origin } = makeOrigin(base);
       const consumer = makeConsumer(base);
+      // A NON-empty shared store: the consumer already holds the PR head, so the private repo's
+      // borrow is real and the fetch READS the shared objects (an empty store would never exercise
+      // that read — round-2 review, claude-f3).
+      g(consumer, 'fetch', '-q', `file://${origin}`, 'refs/pull/7/head');
       const before = snapshotGitDir(consumer);
       const made = materialize(base, consumer, headSha, origin);
       if (isPreflightError(made)) throw new Error(`materialization failed: ${made.message}`);
+      expect(fs.existsSync(path.join(path.dirname(made.dir), 'repo', 'objects', 'info', 'alternates'))).toBe(true);
       const after = snapshotGitDir(consumer);
       expect(after).toEqual(before); // nothing under the shared .git changed, appeared, or vanished
       expect(fs.existsSync(path.join(consumer, '.git', 'worktrees'))).toBe(false);
@@ -518,24 +535,23 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
       const consumer = makeConsumer(base);
       g(consumer, 'fetch', '-q', `file://${origin}`, 'refs/pull/7/head');
       const altOf = (dir: string) => path.join(path.dirname(dir), 'repo', 'objects', 'info', 'alternates');
-      const bareOf = (dir: string) => path.join(path.dirname(dir), 'repo');
-      // A CI depth-1 `actions/checkout` is BOTH shallow AND carries its token only in repo-local
-      // config: the transport carry must fire even though the borrow is skipped, or the fetch loses
-      // its sole credential and fails as `auth` (the reason the carry is not gated on the borrow).
-      g(consumer, 'config', 'http.https://example.test/.extraHeader', 'Authorization: Basic TOKEN');
+      // A CI depth-1 `actions/checkout` is BOTH shallow AND carries its transport config only in
+      // repo-local config: the carry must reach the fetch even though the borrow is skipped. Proved
+      // the only way a carry can be: the fetch gets a URL that resolves ONLY through the checkout's
+      // own `url.<base>.insteadOf`.
+      g(consumer, 'config', `url.file://${origin}.insteadOf`, BOGUS_URL);
 
       // Shallow: git's own marker for "ancestry I advertise but do not hold". Written the way git
       // writes it, then PROVED to have taken via git's own probe.
       fs.writeFileSync(path.join(consumer, '.git', 'shallow'), `${headSha}\n`);
       expect(g(consumer, 'rev-parse', '--is-shallow-repository')).toBe('true');
-      const shallow = materialize(base, consumer, headSha, origin);
+      const shallow = materializeAt(base, consumer, headSha, BOGUS_URL);
       if (isPreflightError(shallow)) throw new Error(`shallow failed: ${shallow.message}`);
       expect(fs.existsSync(altOf(shallow.dir))).toBe(false);
-      // borrow skipped, but the carry still fired for the fetch — and was SCRUBBED afterwards, so
-      // the token never persists in a temp gitdir a seat's sandbox can read (codex-f1/grok-f1/claude-f1).
-      expect(realGit(['-C', bareOf(shallow.dir), 'config', '--get', 'http.https://example.test/.extraHeader']).ok).toBe(
-        false
-      );
+      // Borrow skipped, yet the bogus URL resolved — the carry reached the fetch — and NOTHING was
+      // written down: the private repo's config holds no transport key.
+      expect(persistedTransportKeys(shallow.dir)).toBe(false);
+      g(consumer, 'config', '--unset', `url.file://${origin}.insteadOf`);
       expect(fs.readFileSync(path.join(shallow.dir, 'src.ts'), 'utf8')).toContain('x = 1');
       // The private repo is complete on its own: history walks past the consumer's cut.
       expect(g(shallow.dir, 'rev-list', '--count', 'HEAD')).toBe('2');
@@ -560,70 +576,60 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
     }
   }, 30_000);
 
-  it("carries transport config for the fetch, then SCRUBS it so no secret persists in a seat-readable temp gitdir", () => {
+  it("hands the checkout's transport config to the fetch PER COMMAND — includeIf'd keys included, global keys not duplicated, nothing written to disk", () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-cfg-'));
+    const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
+    const savedSsh = process.env.GIT_SSH_COMMAND;
     try {
       const { headSha, origin } = makeOrigin(base);
       const consumer = makeConsumer(base);
-      // The load-bearing case git-exec.ts built for (a multi-key checkout), plus a corp insteadOf
-      // and a CI-style per-URL extraHeader. The fetch runs in the (empty) private repo, so without
-      // the carry these are invisible and a by-hand-working fetch classifies as auth/network.
-      g(consumer, 'config', 'core.sshCommand', 'ssh -i /home/me/.ssh/id_work');
-      g(consumer, 'config', 'url.git@github.com:.insteadOf', 'https://github.com/');
+      // Three scopes the private repo cannot see by itself — repo-local (a CI token, the corp
+      // insteadOf), an `includeIf.gitdir`'d file (the multi-account laptop's `ssh -i`) — and, as the
+      // control, a GLOBAL key the private repo DOES see and must therefore not be handed twice.
+      g(consumer, 'config', `url.file://${origin}.insteadOf`, BOGUS_URL);
       g(consumer, 'config', 'http.https://example.test/.extraHeader', 'Authorization: Basic TOKEN');
+      const inc = path.join(base, 'work.inc');
+      fs.writeFileSync(inc, '[core]\n\tsshCommand = ssh -i /home/me/.ssh/id_work\n');
+      const globalCfg = path.join(base, 'gitconfig');
+      fs.writeFileSync(
+        globalCfg,
+        `[http]\n\tproxy = http://proxy.test:3128\n[includeIf "gitdir:consumer/"]\n\tpath = ${inc}\n`
+      );
+      process.env.GIT_CONFIG_GLOBAL = globalCfg;
+      delete process.env.GIT_SSH_COMMAND; // the developer's own env must not pre-empt the checkout's
+      // Sanity: the includeIf applies at the checkout (and only there).
+      expect(g(consumer, 'config', '--get', 'core.sshCommand')).toBe('ssh -i /home/me/.ssh/id_work');
 
+      let fetchEnv: Record<string, string> | undefined;
+      const spy: GitRun = (a, o) => {
+        if (a.includes('fetch')) fetchEnv = o?.env;
+        return realGit(a, o);
+      };
       const before = snapshotGitDir(consumer);
-      const made = materialize(base, consumer, headSha, origin);
+      const made = materializeAt(base, consumer, headSha, BOGUS_URL, spy);
       if (isPreflightError(made)) throw new Error(`materialization failed: ${made.message}`);
       // Reading the checkout's config must not mutate the shared .git.
       expect(snapshotGitDir(consumer)).toEqual(before);
 
-      // SECURITY (codex-f1/grok-f1/claude-f1): the carried secrets must NOT sit on disk in the
-      // private repo's own config after materialize — that file lives under $TMPDIR, which a seat's
-      // sandbox can read. Assert on the config FILE bytes (robust to whatever the dev's global
-      // ~/.gitconfig inherits — the finding is specifically about the temp gitdir on disk).
+      // What the fetch was handed: exactly the keys only the checkout can see, as per-command env,
+      // and the checkout's ssh as a non-interactive GIT_SSH_COMMAND — never the global proxy.
+      const carried = Object.entries(fetchEnv ?? {})
+        .filter(([k]) => k.startsWith('GIT_CONFIG_KEY_'))
+        .map(([, v]) => v)
+        .sort();
+      expect(carried).toEqual(['core.sshcommand', 'http.https://example.test/.extraheader', `url.file://${origin}.insteadof`]);
+      expect(fetchEnv?.GIT_CONFIG_COUNT).toBe('3');
+      expect(fetchEnv?.GIT_SSH_COMMAND).toBe('ssh -i /home/me/.ssh/id_work -o BatchMode=yes');
+      // NOTHING persisted: the private repo's config holds no transport key — and it is still bare.
+      expect(persistedTransportKeys(made.dir)).toBe(false);
       const bare = path.join(path.dirname(made.dir), 'repo');
-      const cfgFile = fs.readFileSync(path.join(bare, 'config'), 'utf8');
-      expect(cfgFile).not.toContain('Authorization: Basic TOKEN');
-      expect(cfgFile).not.toContain('id_work');
-      expect(cfgFile).not.toContain('insteadOf');
-      // The scrub must NOT have flipped the repo's shape: still bare, never a worktree retarget.
-      expect(realGit(['-C', bare, 'config', '--get', 'core.worktree']).ok).toBe(false);
-      const coreBare = realGit(['-C', bare, 'config', '--get', 'core.bare']);
-      expect(coreBare.ok && coreBare.text.trim()).toBe('true');
+      expect(realGit(['-C', bare, 'config', '--get', 'core.bare'])).toMatchObject({ ok: true, text: 'true\n' });
       reapWorktree(made.dir);
     } finally {
-      fs.rmSync(base, { force: true, recursive: true });
-    }
-  }, 30_000);
-
-  it('copyTransportConfig carries non-inherited effective keys; scrubTransportConfig removes exactly those', () => {
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-carry-'));
-    try {
-      const consumer = makeConsumer(base);
-      g(consumer, 'config', 'http.https://example.test/.extraHeader', 'Authorization: Basic TOKEN');
-      g(consumer, 'config', 'core.sshCommand', 'ssh -i /home/me/.ssh/id_work');
-      const bare = path.join(base, 'bare');
-      g(base, 'init', '--bare', bare);
-      const cfg = (key: string) => {
-        const r = realGit(['-C', bare, 'config', '--get', key]);
-        return r.ok ? r.text.trim() : '';
-      };
-
-      const added = copyTransportConfig(consumer, bare, realGit);
-      // The two checkout-local keys the private repo did not already inherit — carried in, so the
-      // fetch authenticates (dedup vs inherited means globals are NOT re-added, so exactly these two).
-      expect(added).toContain('core.sshcommand'); // git canonicalizes the section.name to lower-case
-      expect(added.length).toBeGreaterThanOrEqual(2);
-      expect(cfg('http.https://example.test/.extraHeader')).toBe('Authorization: Basic TOKEN');
-      expect(cfg('core.sshCommand')).toBe('ssh -i /home/me/.ssh/id_work');
-
-      // …then removed the instant they are no longer needed, so no seat ever reads them on disk.
-      scrubTransportConfig(bare, added, realGit);
-      const cfgFile = fs.readFileSync(path.join(bare, 'config'), 'utf8');
-      expect(cfgFile).not.toContain('Authorization: Basic TOKEN');
-      expect(cfgFile).not.toContain('id_work');
-    } finally {
+      if (savedGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
+      if (savedSsh === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = savedSsh;
       fs.rmSync(base, { force: true, recursive: true });
     }
   }, 30_000);
@@ -645,4 +651,43 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
       fs.rmSync(base, { force: true, recursive: true });
     }
   }, 30_000);
+});
+
+
+describe('missingConfig / transportEnv — the per-command transport handoff, as pure functions', () => {
+  it('is a multiset difference: a global multivar already visible to the private repo is not re-applied', () => {
+    const want: Array<[string, string]> = [
+      ['http.extraheader', 'A: 1'],
+      ['http.extraheader', 'A: 1'], // twice at the checkout (global + local, same value)
+      ['http.extraheader', 'B: 2'],
+      ['core.sshcommand', 'ssh -i k'],
+    ];
+    const have: Array<[string, string]> = [['http.extraheader', 'A: 1']]; // global, seen from the private repo
+    expect(missingConfig(want, have)).toEqual([
+      ['http.extraheader', 'A: 1'],
+      ['http.extraheader', 'B: 2'],
+      ['core.sshcommand', 'ssh -i k'],
+    ]);
+    expect(missingConfig([], have)).toEqual([]);
+  });
+
+  it('renders GIT_CONFIG_COUNT/KEY/VALUE, and GIT_SSH_COMMAND only when the user set none', () => {
+    const saved = process.env.GIT_SSH_COMMAND;
+    try {
+      delete process.env.GIT_SSH_COMMAND;
+      expect(transportEnv([['url.x.insteadof', 'y']], 'ssh -i k')).toEqual({
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'url.x.insteadof',
+        GIT_CONFIG_VALUE_0: 'y',
+        GIT_SSH_COMMAND: 'ssh -i k -o BatchMode=yes',
+      });
+      expect(transportEnv([], undefined)).toEqual({});
+      expect(transportEnv([], 'my-ssh-wrapper')).toEqual({ GIT_SSH_COMMAND: 'my-ssh-wrapper' }); // a wrapper is left alone
+      process.env.GIT_SSH_COMMAND = 'ssh -F /env/config';
+      expect(transportEnv([], 'ssh -i k')).toEqual({}); // git itself lets the env win
+    } finally {
+      if (saved === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = saved;
+    }
+  });
 });

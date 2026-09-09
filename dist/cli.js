@@ -2783,6 +2783,7 @@ var GIT_MAX_BUFFER = 64 * 1024 * 1024;
 var REPO_LOCATION_ENV = [
   "GIT_DIR",
   "GIT_WORK_TREE",
+  "GIT_IMPLICIT_WORK_TREE",
   "GIT_NAMESPACE",
   "GIT_COMMON_DIR",
   "GIT_OBJECT_DIRECTORY",
@@ -2800,7 +2801,9 @@ var REPO_LOCATION_ENV = [
   "GIT_CONFIG",
   "GIT_SHALLOW_FILE",
   "GIT_GRAFT_FILE",
-  "GIT_CONFIG_PARAMETERS"
+  "GIT_CONFIG_PARAMETERS",
+  // Discovery can be stopped short of the private repo by an inherited ceiling — same class.
+  "GIT_CEILING_DIRECTORIES"
 ];
 var CONFIG_INJECTION_ENV_RE = /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/;
 function scrubRepoEnv(env) {
@@ -2984,11 +2987,8 @@ function git(cwd, args, opts) {
   return execFileSync4("git", args, {
     cwd,
     encoding: "utf8",
-    // Scrub the repo-selecting env (GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/…) so an inherited value —
-    // git exports GIT_DIR for every hook it runs — can't make `git diff`, the base/head SHAs, or the
-    // origin URL (the receipt STORE KEY via resolveRepoId) come from a different repo than cwd
-    // (cross-vendor review, claude-f2). cwd is the only repo this reader means.
     env: scrubRepoEnv(process.env),
+    // cwd is the only repo selector — same rule as execGit
     stdio: opts?.quiet ? ["ignore", "pipe", "ignore"] : ["pipe", "pipe", "inherit"]
   });
 }
@@ -3288,6 +3288,9 @@ var INERT_GIT_CONFIG = [
   "gc.auto=0"
 ];
 var INERT_ENV = { GIT_LFS_SKIP_SMUDGE: "1" };
+function objectFormatFlag(headSha) {
+  return `--object-format=${headSha.length === 64 ? "sha256" : "sha1"}`;
+}
 var WORKTREE_PARENT_PREFIX = "ensemble-worktree-";
 var AGENT_INSTRUCTION_NAMES = ["CLAUDE.md", "AGENTS.md", ".claude"];
 var CURSOR_DIR = ".cursor";
@@ -3371,25 +3374,41 @@ function writeAlternates(bareRepo, sharedObjects) {
 `);
 }
 var TRANSPORT_CONFIG_RE = "^(core\\.sshcommand|credential\\.|http\\.|url\\.)";
-function copyTransportConfig(repoRoot, bareRepo, git2) {
-  const effective = git2(["-C", repoRoot, "config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE]);
-  if (!effective.ok) return [];
-  const inheritedRes = git2(["-C", bareRepo, "config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE]);
-  const inherited = new Set(
-    (inheritedRes.ok ? parseConfigList(inheritedRes.text) : []).map(([k, v]) => `${k}
-${v}`)
-  );
-  const added = [];
-  for (const [key, value] of parseConfigList(effective.text)) {
-    if (inherited.has(`${key}
-${value}`)) continue;
-    git2(["-C", bareRepo, "config", "--add", key, value]);
-    added.push(key);
+function missingConfig(want, have) {
+  const pool = have.map(([k, v]) => `${k}
+${v}`);
+  const out = [];
+  for (const [k, v] of want) {
+    const i = pool.indexOf(`${k}
+${v}`);
+    if (i >= 0) pool.splice(i, 1);
+    else out.push([k, v]);
   }
-  return added;
+  return out;
 }
-function scrubTransportConfig(bareRepo, addedKeys, git2) {
-  for (const key of new Set(addedKeys)) git2(["-C", bareRepo, "config", "--unset-all", key]);
+function transportEnv(entries, sshCommand) {
+  const env = {};
+  if (entries.length > 0) {
+    env.GIT_CONFIG_COUNT = String(entries.length);
+    entries.forEach(([k, v], i) => {
+      env[`GIT_CONFIG_KEY_${i}`] = k;
+      env[`GIT_CONFIG_VALUE_${i}`] = v;
+    });
+  }
+  if (sshCommand && !process.env.GIT_SSH_COMMAND) {
+    env.GIT_SSH_COMMAND = nonInteractiveSshCommand(sshCommand) ?? sshCommand;
+  }
+  return env;
+}
+function listTransportConfig(cwd, git2) {
+  const listed = git2(["config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE], { cwd });
+  return listed.ok ? parseConfigList(listed.text) : [];
+}
+function fetchEnv(repoRoot, bare, git2) {
+  const want = listTransportConfig(repoRoot, git2);
+  const missing = missingConfig(want, listTransportConfig(bare, git2));
+  const ssh = want.find(([k]) => k === "core.sshcommand")?.[1];
+  return { ...INERT_ENV, ...transportEnv(missing, ssh) };
 }
 function parseConfigList(text) {
   const out = [];
@@ -3407,12 +3426,14 @@ function materializeWorktree(args, deps) {
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     const bare = path12.join(parent, "repo");
-    const init = deps.git([...INERT_GIT_CONFIG, "init", "--bare", bare], { env: INERT_ENV });
+    const init = deps.git(
+      [...INERT_GIT_CONFIG, "init", "--bare", objectFormatFlag(args.headSha), bare],
+      { env: INERT_ENV }
+    );
     if (!init.ok) {
       return { kind: "materialize-failed", message: `git init --bare failed: ${init.error.trim()}` };
     }
     if (shared) writeAlternates(bare, shared);
-    const carried = copyTransportConfig(location.repoRoot, bare, deps.git);
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -3423,9 +3444,8 @@ function materializeWorktree(args, deps) {
         location.fetchUrl,
         `pull/${args.pr}/head`
       ],
-      { cwd: bare, env: INERT_ENV }
+      { cwd: bare, env: fetchEnv(location.repoRoot, bare, deps.git) }
     );
-    scrubTransportConfig(bare, carried, deps.git);
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
@@ -10049,6 +10069,8 @@ function capture(cmd, cmdArgs, cwd) {
     const text = execFileSync5(cmd, cmdArgs, {
       cwd,
       encoding: "utf8",
+      env: scrubRepoEnv(process.env),
+      // git + gh alike: cwd is the only repo selector
       maxBuffer: 256 * 1024 * 1024,
       // stdin closed so `gh` can never sit on an interactive prompt; stderr 'pipe' rather
       // than the sync-exec default, which ALSO mirrors the child's stderr onto ours — every
@@ -10072,8 +10094,6 @@ function gitToplevel(cwd) {
     const top = execFileSync5("git", ["rev-parse", "--show-toplevel"], {
       cwd,
       encoding: "utf8",
-      // Scrub repo-selecting env so an inherited GIT_DIR can't point the trail dir at another repo
-      // (claude-f2); cwd is the only repo this probe means.
       env: scrubRepoEnv(process.env),
       stdio: ["ignore", "pipe", "ignore"]
     }).trim();

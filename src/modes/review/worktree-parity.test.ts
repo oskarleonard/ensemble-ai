@@ -126,21 +126,21 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
       headSha: HEAD_SHA,
       strippedInstructionFiles: [],
     });
-    // The sequence itself, pinned once: common-dir → init --bare → transport-carry read (effective,
-    // then the private repo's inherited config to subtract) → fetch → add → HEAD assert — and the
-    // side-channel halves of the contract: init/fetch/add run with the LFS kill-switch env, fetch/add
-    // run in the PRIVATE bare repo (…/repo), the HEAD assert in the WORKTREE (…/head). The transport
-    // carry runs UNCONDITIONALLY (auth is needed even with no object borrow — here the fake /repo has
-    // no shared store); it added no keys, so there is no `config --unset-all` scrub after the fetch.
+    // The sequence itself, pinned once: common-dir → init --bare (explicit object format) → the two
+    // effective transport-config reads (checkout, then private repo) → fetch → add → HEAD assert —
+    // and the side-channel halves of the contract: init/fetch/add run with the LFS kill-switch env,
+    // fetch/add run in the PRIVATE bare repo (…/repo), the HEAD assert in the WORKTREE (…/head).
+    // The transport reads run UNCONDITIONALLY (auth is needed even with no object borrow — here the
+    // fake /repo has no shared store); nothing they find is ever written into the private repo.
     const flat = syncLog.map((c) => c.args.join(' '));
     expect(flat).toHaveLength(7);
     expect(flat[0]).toBe('rev-parse --git-common-dir');
     expect(flat[1]).toContain('init');
     expect(flat[1]).toContain('--bare');
-    expect(flat[2]).toContain('config');
-    expect(flat[2]).toContain('--get-regexp');
-    expect(flat[3]).toContain('config');
-    expect(flat[3]).toContain('--get-regexp');
+    expect(flat[1]).toContain('--object-format=sha1');
+    expect(flat[2]).toContain('config --null --get-regexp');
+    expect(flat[3]).toContain('config --null --get-regexp');
+    expect(syncLog[3].cwd.endsWith('/repo')).toBe(true); // the private repo's own view
     expect(flat[4]).toContain('fetch');
     expect(flat[5]).toContain('worktree add');
     expect(flat[6]).toBe('rev-parse HEAD');

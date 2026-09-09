@@ -4,6 +4,7 @@ import path from 'node:path';
 import { makeOwnerOnlyTempDir } from '../../core/artifacts';
 
 import { readEnsembleConfig } from './ensemble-config';
+import { nonInteractiveSshCommand } from './git-exec';
 
 // WORKTREE EVIDENCE MODE — materialize the PR head as a detached, read-only worktree of a repo
 // the user ALREADY has cloned, so a seat sees the whole project the way Oskar does manually,
@@ -206,6 +207,15 @@ const INERT_GIT_CONFIG = [
 ];
 
 const INERT_ENV = { GIT_LFS_SKIP_SMUDGE: '1' };
+
+// The private repo's object format, taken from the SHA the review is bound to — a repo has exactly
+// one, so a 64-hex head IS a SHA-256 repo and a 40-hex head a SHA-1 one. Explicit on `git init`,
+// because the default otherwise comes from the USER's `init.defaultObjectFormat` / `GIT_DEFAULT_HASH`,
+// independent of the reviewed repo: a mismatch fails the fetch with `mismatched algorithms` and makes
+// the borrowed store unreadable (cross-vendor review round 2, codex-f4).
+function objectFormatFlag(headSha: string): string {
+  return `--object-format=${headSha.length === 64 ? 'sha256' : 'sha1'}`;
+}
 
 // The owner-only (0700) directory the worktree is created INSIDE. `git worktree add` creates its
 // own directory with the process umask — commonly 0755 — so a worktree placed directly in a shared
@@ -440,62 +450,83 @@ function writeAlternates(bareRepo: string, sharedObjects: string): void {
   fs.writeFileSync(path.join(info, 'alternates'), `${sharedObjects}\n`);
 }
 
-// The fetch now runs in the private bare repo (cwd=bare), whose config is EMPTY — so git, and
-// git-exec's `effectiveSshCommand` probe (which reads `core.sshCommand` at the command's cwd), no
-// longer see the checkout's repo-local transport config. That silently dropped the settings a
-// multi-key checkout (`core.sshCommand = ssh -i ~/.ssh/id_work`), a corp remote
-// (`url.<base>.insteadOf`, `http.<url>.extraHeader`, `http.proxy`), or a CI checkout
-// (`actions/checkout` stores its token as a repo-local `http.<url>.extraHeader`) rely on — a fetch
-// that works by hand in the checkout then failed as `auth`/`network` (cross-vendor review of the
-// original diff: codex-f3 · grok-f1 · claude-f1). Copy an ALLOWLIST of transport keys from the
-// checkout into the private repo before the fetch. NEVER the whole config: `core.bare`,
-// `core.worktree`, `core.repositoryformatversion` would retarget or corrupt the private repo. Keys
-// are multi-value-safe (`http.<url>.extraHeader` recurs) via `--get-regexp` + `--add`, and once
-// `core.sshCommand` lives in the private repo the effectiveSshCommand probe at cwd=bare finds it too.
+// ── Transport config for the private fetch ───────────────────────────────────
 //
-// Read the checkout's EFFECTIVE config (NOT `--local`): the credentials a multi-account checkout
-// actually fetches with commonly live in an `includeIf.gitdir:` block of ~/.gitconfig — a per-URL
-// `extraHeader`, a `core.sshCommand = ssh -i …` — which a `/tmp` bare repo's gitdir does not satisfy
-// and `--local` never sees (cross-vendor review, grok-f2 · codex-f3). But the private repo already
-// INHERITS the user's unconditional global+system config, so copying every effective value would
-// DUPLICATE those inherited multivars (a second Authorization `extraHeader` some servers reject). So
-// SUBTRACT: add only the exact (key,value) pairs the private repo does not already have — includeIf-
-// conditional and repo-local values are carried, inherited globals are left alone. `--null` so a
-// value carrying spaces or newlines survives the parse intact.
+// The fetch runs in the private bare repo, whose config holds NONE of the checkout's repo-local
+// transport settings — a multi-key `core.sshCommand`, a CI token in `http.<url>.extraHeader`, a
+// corp `url.<base>.insteadOf`, a `credential.*` chain — and whose gitdir matches none of the user's
+// `includeIf.gitdir` conditions. Those settings are handed to the fetch PER COMMAND, through git's
+// own `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` env (git ≥ 2.31): they exist in
+// the fetch process for the seconds it runs and are NEVER written to disk. The first cut persisted
+// them in the private repo's config — which parked the checkout's credentials in a temp file the
+// fenced seats can read: the codex profile grants `/private/var`, where `$TMPDIR` lives, a fence this
+// engine documents in so many words (cross-vendor review round 2: codex-f1 · grok-f1 · claude-f1).
+//
+// WHICH settings: the difference between two EFFECTIVE views — `git config` at the checkout (every
+// scope: system, global, `includeIf`, local, worktree) minus `git config` at the private repo (the
+// system + global config as the private repo already sees them). Reading the effective view, not
+// `--local`, is what carries an `includeIf.gitdir`'d key or a `config.worktree` key (round 2:
+// grok-f2 · codex-f3); subtracting the private repo's own view is what keeps a global multivar (a
+// second `extraHeader`, a re-ordered `credential.helper` chain) from being applied twice.
 const TRANSPORT_CONFIG_RE = '^(core\\.sshcommand|credential\\.|http\\.|url\\.)';
-export function copyTransportConfig(repoRoot: string, bareRepo: string, git: GitRun): string[] {
-  const effective = git(['-C', repoRoot, 'config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE]);
-  if (!effective.ok) return []; // exits 1 when no key matches — nothing to carry over
-  const inheritedRes = git(['-C', bareRepo, 'config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE]);
-  const inherited = new Set(
-    (inheritedRes.ok ? parseConfigList(inheritedRes.text) : []).map(([k, v]) => `${k}\n${v}`)
-  );
-  const added: string[] = [];
-  for (const [key, value] of parseConfigList(effective.text)) {
-    if (inherited.has(`${key}\n${value}`)) continue; // already effective in the private repo — no dup
-    git(['-C', bareRepo, 'config', '--add', key, value]);
-    added.push(key);
+type ConfigEntries = Array<[string, string]>;
+
+// Multiset difference, order-preserving: every (key, value) of `want` not matched by one in `have`.
+export function missingConfig(want: ConfigEntries, have: ConfigEntries): ConfigEntries {
+  const pool = have.map(([k, v]) => `${k}\n${v}`);
+  const out: ConfigEntries = [];
+  for (const [k, v] of want) {
+    const i = pool.indexOf(`${k}\n${v}`);
+    if (i >= 0) pool.splice(i, 1);
+    else out.push([k, v]);
   }
-  return added;
+  return out;
 }
 
-// Remove the transport keys copyTransportConfig ADDED, the moment the fetch that needed them
-// returns and BEFORE `worktree add` — so no credential is ever on disk while a seat runs. The
-// private repo lives under $TMPDIR (`/private/var/…`), which a shell-capable seat's sandbox can
-// READ (codex-sandbox.ts) — unlike `$HOME`, where these secrets sat before this design. Leaving
-// them in `<parent>/repo/config` for the review's lifetime would hand the reviewed-PR-content seat
-// the checkout's token (in CI, the workflow's own GITHUB_TOKEN) — cross-vendor HIGH, codex-f1 ·
-// grok-f1 · claude-f1. `--unset-all` clears every value of a key; only the keys we added locally
-// are touched, so inherited global values are untouched.
-export function scrubTransportConfig(bareRepo: string, addedKeys: string[], git: GitRun): void {
-  for (const key of new Set(addedKeys)) git(['-C', bareRepo, 'config', '--unset-all', key]);
+// The per-command env for `entries`, plus `GIT_SSH_COMMAND` when the checkout configures its own
+// ssh: git lets an env GIT_SSH_COMMAND override `core.sshCommand`, and a runner's non-interactive
+// default (git-exec.ts probes `core.sshCommand` at the command's cwd — the private repo, where it is
+// unset) would otherwise win over the checkout's `ssh -i <key>`. The user's OWN env GIT_SSH_COMMAND
+// keeps winning, exactly as git itself decides.
+export function transportEnv(
+  entries: ConfigEntries,
+  sshCommand: string | undefined
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (entries.length > 0) {
+    env.GIT_CONFIG_COUNT = String(entries.length);
+    entries.forEach(([k, v], i) => {
+      env[`GIT_CONFIG_KEY_${i}`] = k;
+      env[`GIT_CONFIG_VALUE_${i}`] = v;
+    });
+  }
+  if (sshCommand && !process.env.GIT_SSH_COMMAND) {
+    env.GIT_SSH_COMMAND = nonInteractiveSshCommand(sshCommand) ?? sshCommand;
+  }
+  return env;
+}
+
+function listTransportConfig(cwd: string, git: GitRun): ConfigEntries {
+  const listed = git(['config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE], { cwd });
+  return listed.ok ? parseConfigList(listed.text) : []; // exits 1 when no key matches
+}
+
+// The env the private fetch runs with: the LFS kill-switch plus the transport settings only the
+// checkout can see. Computed UNCONDITIONALLY, borrow or not — a depth-1 `actions/checkout` is both
+// shallow (no borrow) and token-only-in-local-config, so a fetch that needs auth needs it most exactly
+// when there is nothing to borrow.
+function fetchEnv(repoRoot: string, bare: string, git: GitRun): Record<string, string> {
+  const want = listTransportConfig(repoRoot, git);
+  const missing = missingConfig(want, listTransportConfig(bare, git));
+  const ssh = want.find(([k]) => k === 'core.sshcommand')?.[1];
+  return { ...INERT_ENV, ...transportEnv(missing, ssh) };
 }
 
 // `git config --null --get-regexp` prints each match as `<name>\n<value>\0`; a valueless implicit-
 // boolean key comes as `<name>\0` with no newline. Split on NUL, then on the FIRST newline, so a
 // value that itself contains spaces or newlines is carried faithfully. A valueless key is skipped —
-// `config --add <key>` with no value cannot re-apply it, and no transport key we carry is a bare
-// boolean; the trailing empty split after the final NUL falls out the same way.
+// no transport key we carry is a bare boolean; the trailing empty split after the final NUL falls
+// out the same way.
 function parseConfigList(text: string): Array<[string, string]> {
   const out: Array<[string, string]> = [];
   for (const entry of text.split('\0')) {
@@ -532,16 +563,14 @@ export function materializeWorktree(
     // shared temp root (see WORKTREE_PARENT_PREFIX).
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     const bare = path.join(parent, 'repo');
-    const init = deps.git([...INERT_GIT_CONFIG, 'init', '--bare', bare], { env: INERT_ENV });
+    const init = deps.git(
+      [...INERT_GIT_CONFIG, 'init', '--bare', objectFormatFlag(args.headSha), bare],
+      { env: INERT_ENV }
+    );
     if (!init.ok) {
       return { kind: 'materialize-failed', message: `git init --bare failed: ${init.error.trim()}` };
     }
     if (shared) writeAlternates(bare, shared);
-    // Carry the checkout's transport config UNCONDITIONALLY — the fetch needs auth even when the
-    // store is shallow/partial and not borrowed (a depth-1 `actions/checkout` is both: shallow AND
-    // token-only-in-local-config, so gating the carry on the borrow lost the token exactly when it
-    // was the sole credential — the fetch then failed as `auth`, cross-vendor review of the diff).
-    const carried = copyTransportConfig(location.repoRoot, bare, deps.git);
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -552,11 +581,8 @@ export function materializeWorktree(
         location.fetchUrl,
         `pull/${args.pr}/head`,
       ],
-      { cwd: bare, env: INERT_ENV }
+      { cwd: bare, env: fetchEnv(location.repoRoot, bare, deps.git) }
     );
-    // Scrub the carried credentials the instant the fetch is done — before `worktree add`, long
-    // before any seat runs (even on the failure path: a failed fetch still reaped, never reviewed).
-    scrubTransportConfig(bare, carried, deps.git);
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
@@ -641,9 +667,11 @@ export function reapWorktree(dir: string): void {
 
 // CONTRACT: a consumer's async runner MUST still bound every command (a GIT_TIMEOUT_MS-class
 // timeout) — an unbounded fetch would wedge a review the way the reviewer watchdog exists to prevent —
-// and MUST scrub the repository-selecting env (`scrubRepoEnv` in git-exec.ts): cwd is the only
-// repo selector this materialization means, and an inherited GIT_DIR would point every private
-// command back into the shared `.git`.
+// and MUST scrub the repository-selecting env (`scrubRepoEnv` in git-exec.ts) from the INHERITED
+// env BEFORE applying a command's own `env` — cwd is the only repo selector this materialization
+// means (an inherited GIT_DIR would point every private command back into the shared `.git`), and
+// the fetch's per-command transport config rides in that `env` (scrub first, then apply, as
+// execGit does — a scrub of the merged env would strip it).
 export type GitRunAsync = (
   args: string[],
   opts?: { cwd?: string; env?: Record<string, string> }
@@ -707,13 +735,14 @@ export async function materializeWorktreeAsync(
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     const bare = path.join(parent, 'repo');
-    const init = await deps.git([...INERT_GIT_CONFIG, 'init', '--bare', bare], { env: INERT_ENV });
+    const init = await deps.git(
+      [...INERT_GIT_CONFIG, 'init', '--bare', objectFormatFlag(args.headSha), bare],
+      { env: INERT_ENV }
+    );
     if (!init.ok) {
       return { kind: 'materialize-failed', message: `git init --bare failed: ${init.error.trim()}` };
     }
     if (shared) await writeAlternatesAsync(bare, shared);
-    // Unconditional — same reasoning as the sync twin (auth is needed even without a borrow).
-    const carried = await copyTransportConfigAsync(location.repoRoot, bare, deps.git);
     const fetched = await deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -724,10 +753,8 @@ export async function materializeWorktreeAsync(
         location.fetchUrl,
         `pull/${args.pr}/head`,
       ],
-      { cwd: bare, env: INERT_ENV }
+      { cwd: bare, env: await fetchEnvAsync(location.repoRoot, bare, deps.git) }
     );
-    // Scrub the carried credentials the instant the fetch is done — same contract as the sync twin.
-    await scrubTransportConfigAsync(bare, carried, deps.git);
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
@@ -787,26 +814,21 @@ async function writeAlternatesAsync(bareRepo: string, sharedObjects: string): Pr
   await fs.promises.writeFile(path.join(info, 'alternates'), `${sharedObjects}\n`);
 }
 
-// Async twin of copyTransportConfig — same allowlist, same multi-value handling.
-async function copyTransportConfigAsync(repoRoot: string, bareRepo: string, git: GitRunAsync): Promise<string[]> {
-  const effective = await git(['-C', repoRoot, 'config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE]);
-  if (!effective.ok) return [];
-  const inheritedRes = await git(['-C', bareRepo, 'config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE]);
-  const inherited = new Set(
-    (inheritedRes.ok ? parseConfigList(inheritedRes.text) : []).map(([k, v]) => `${k}\n${v}`)
-  );
-  const added: string[] = [];
-  for (const [key, value] of parseConfigList(effective.text)) {
-    if (inherited.has(`${key}\n${value}`)) continue;
-    await git(['-C', bareRepo, 'config', '--add', key, value]);
-    added.push(key);
-  }
-  return added;
+// Async twins of listTransportConfig / fetchEnv — same two effective views, same difference.
+async function listTransportConfigAsync(cwd: string, git: GitRunAsync): Promise<ConfigEntries> {
+  const listed = await git(['config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE], { cwd });
+  return listed.ok ? parseConfigList(listed.text) : [];
 }
 
-// Async twin of scrubTransportConfig.
-async function scrubTransportConfigAsync(bareRepo: string, addedKeys: string[], git: GitRunAsync): Promise<void> {
-  for (const key of new Set(addedKeys)) await git(['-C', bareRepo, 'config', '--unset-all', key]);
+async function fetchEnvAsync(
+  repoRoot: string,
+  bare: string,
+  git: GitRunAsync
+): Promise<Record<string, string>> {
+  const want = await listTransportConfigAsync(repoRoot, git);
+  const missing = missingConfig(want, await listTransportConfigAsync(bare, git));
+  const ssh = want.find(([k]) => k === 'core.sshcommand')?.[1];
+  return { ...INERT_ENV, ...transportEnv(missing, ssh) };
 }
 
 async function reapParentAsync(parent: string): Promise<void> {
