@@ -3183,8 +3183,10 @@ var INERT_GIT_CONFIG = [
   "-c",
   "filter.lfs.required=false",
   // No detached auto-gc: `git fetch` otherwise forks `git gc --auto --detach`, which is DESIGNED to
-  // outlive its parent and keeps mutating the shared object store after the fetch returns — a writer
-  // the dead-holder scan cannot see (it carries no inert signature) and that the reap never bounds.
+  // outlive its parent. The fetch now runs in the private bare repo, so that gc would keep mutating
+  // (and could still be running when `reapParent` removes) a repo the reap otherwise fully bounds —
+  // a straggler process racing the teardown. Disabling it keeps the private repo's lifetime the
+  // reap's to own.
   "-c",
   "gc.auto=0"
 ];
@@ -3266,6 +3268,23 @@ function writeAlternates(bareRepo, sharedObjects) {
   fs14.writeFileSync(path11.join(info, "alternates"), `${sharedObjects}
 `);
 }
+var TRANSPORT_CONFIG_RE = "^(core\\.sshcommand|credential\\.|http\\.|url\\.)";
+function copyTransportConfig(repoRoot, bareRepo, git2) {
+  const listed = git2(["-C", repoRoot, "config", "--get-regexp", TRANSPORT_CONFIG_RE]);
+  if (!listed.ok) return;
+  for (const [key, value] of parseConfigList(listed.text)) {
+    git2(["-C", bareRepo, "config", "--add", key, value]);
+  }
+}
+function parseConfigList(text) {
+  const out = [];
+  for (const line of text.split("\n")) {
+    const sp = line.indexOf(" ");
+    if (sp < 0) continue;
+    out.push([line.slice(0, sp), line.slice(sp + 1)]);
+  }
+  return out;
+}
 function materializeWorktree(args, deps) {
   const { location } = args;
   const shared = sharedObjectsDir(location.repoRoot, deps.git);
@@ -3277,7 +3296,10 @@ function materializeWorktree(args, deps) {
     if (!init.ok) {
       return { kind: "materialize-failed", message: `git init --bare failed: ${init.error.trim()}` };
     }
-    if (shared) writeAlternates(bare, shared);
+    if (shared) {
+      writeAlternates(bare, shared);
+      copyTransportConfig(location.repoRoot, bare, deps.git);
+    }
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -3324,10 +3346,11 @@ function materializeWorktree(args, deps) {
     if (parent) reapParent(parent);
   }
 }
+var REAP_RM_OPTS = { force: true, maxRetries: 3, recursive: true, retryDelay: 50 };
 function reapParent(parent) {
   if (!path11.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    fs14.rmSync(parent, { force: true, recursive: true });
+    fs14.rmSync(parent, REAP_RM_OPTS);
   } catch {
   }
 }

@@ -509,6 +509,41 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
     }
   }, 30_000);
 
+  it("carries the checkout's repo-local transport config into the private repo, but never core.bare/worktree", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-cfg-'));
+    try {
+      const { headSha, origin } = makeOrigin(base);
+      const consumer = makeConsumer(base);
+      // The load-bearing case git-exec.ts built for (a multi-key checkout), plus a corp insteadOf
+      // and a CI-style per-URL extraHeader. The fetch runs in the (empty) private repo, so without
+      // the carry these are invisible and a by-hand-working fetch classifies as auth/network.
+      g(consumer, 'config', 'core.sshCommand', 'ssh -i /home/me/.ssh/id_work');
+      g(consumer, 'config', 'url.git@github.com:.insteadOf', 'https://github.com/');
+      g(consumer, 'config', 'http.https://example.test/.extraHeader', 'Authorization: Basic TOKEN');
+
+      const before = snapshotGitDir(consumer);
+      const made = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(made)) throw new Error(`materialization failed: ${made.message}`);
+      // Reading the checkout's config must not mutate the shared .git.
+      expect(snapshotGitDir(consumer)).toEqual(before);
+
+      const bare = path.join(path.dirname(made.dir), 'repo');
+      const cfg = (key: string) => {
+        const r = realGit(['-C', bare, 'config', '--get', key]);
+        return r.ok ? r.text.trim() : '';
+      };
+      expect(cfg('core.sshCommand')).toBe('ssh -i /home/me/.ssh/id_work');
+      expect(cfg('url.git@github.com:.insteadOf')).toBe('https://github.com/');
+      expect(cfg('http.https://example.test/.extraHeader')).toBe('Authorization: Basic TOKEN');
+      // The allowlist must NOT drag in repo-shape keys that would retarget/corrupt the private repo.
+      expect(realGit(['-C', bare, 'config', '--get', 'core.worktree']).ok).toBe(false);
+      expect(cfg('core.bare')).toBe('true'); // still a bare repo — the carry did not flip it
+      reapWorktree(made.dir);
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it('the fetch is NOT shallow, so the worktree keeps full history for the history packet', () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-depth-'));
     try {

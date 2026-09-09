@@ -426,6 +426,40 @@ function writeAlternates(bareRepo: string, sharedObjects: string): void {
   fs.writeFileSync(path.join(info, 'alternates'), `${sharedObjects}\n`);
 }
 
+// The fetch now runs in the private bare repo (cwd=bare), whose config is EMPTY — so git, and
+// git-exec's `effectiveSshCommand` probe (which reads `core.sshCommand` at the command's cwd), no
+// longer see the checkout's repo-local transport config. That silently dropped the settings a
+// multi-key checkout (`core.sshCommand = ssh -i ~/.ssh/id_work`), a corp remote
+// (`url.<base>.insteadOf`, `http.<url>.extraHeader`, `http.proxy`), or a CI checkout
+// (`actions/checkout` stores its token as a repo-local `http.<url>.extraHeader`) rely on — a fetch
+// that works by hand in the checkout then failed as `auth`/`network` (cross-vendor review of the
+// original diff: codex-f3 · grok-f1 · claude-f1). Copy an ALLOWLIST of transport keys from the
+// checkout into the private repo before the fetch. NEVER the whole config: `core.bare`,
+// `core.worktree`, `core.repositoryformatversion` would retarget or corrupt the private repo. Keys
+// are multi-value-safe (`http.<url>.extraHeader` recurs) via `--get-regexp` + `--add`, and once
+// `core.sshCommand` lives in the private repo the effectiveSshCommand probe at cwd=bare finds it too.
+const TRANSPORT_CONFIG_RE = '^(core\\.sshcommand|credential\\.|http\\.|url\\.)';
+function copyTransportConfig(repoRoot: string, bareRepo: string, git: GitRun): void {
+  const listed = git(['-C', repoRoot, 'config', '--get-regexp', TRANSPORT_CONFIG_RE]);
+  if (!listed.ok) return; // exits 1 when no key matches — nothing to carry over
+  for (const [key, value] of parseConfigList(listed.text)) {
+    git(['-C', bareRepo, 'config', '--add', key, value]);
+  }
+}
+
+// `git config --get-regexp` prints `<name> <value>` per line; the value is the remainder (it may
+// contain spaces, e.g. an ssh command). A value can't contain a newline for the keys we carry, so
+// splitting on lines is safe.
+function parseConfigList(text: string): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  for (const line of text.split('\n')) {
+    const sp = line.indexOf(' ');
+    if (sp < 0) continue;
+    out.push([line.slice(0, sp), line.slice(sp + 1)]);
+  }
+  return out;
+}
+
 // ── Materialization ────────────────────────────────────────────────────
 
 // Fetch the PR head by EXPLICIT url + ref into a PRIVATE bare repo, add a detached worktree at it,
@@ -456,7 +490,10 @@ export function materializeWorktree(
     if (!init.ok) {
       return { kind: 'materialize-failed', message: `git init --bare failed: ${init.error.trim()}` };
     }
-    if (shared) writeAlternates(bare, shared);
+    if (shared) {
+      writeAlternates(bare, shared);
+      copyTransportConfig(location.repoRoot, bare, deps.git);
+    }
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -518,10 +555,14 @@ export function materializeWorktree(
 // Remove an owner-only worktree parent and everything under it — the detached worktree AND the
 // private bare repo it was added from. NAME-CHECKED on the parent prefix so a caller that hands us
 // an unrelated directory can never make us delete its parent. Never throws — best-effort by contract.
+// Retried: the parent now holds a full checkout AND a fetched object store, so a transient
+// EBUSY/ENOTEMPTY mid-walk (an editor index, an AV scan) that aborted a single rm would leak both
+// (cross-vendor review of the original diff, claude-f2).
+const REAP_RM_OPTS = { force: true, maxRetries: 3, recursive: true, retryDelay: 50 } as const;
 function reapParent(parent: string): void {
   if (!path.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    fs.rmSync(parent, { force: true, recursive: true });
+    fs.rmSync(parent, REAP_RM_OPTS);
   } catch {
     /* best-effort */
   }
@@ -616,7 +657,10 @@ export async function materializeWorktreeAsync(
     if (!init.ok) {
       return { kind: 'materialize-failed', message: `git init --bare failed: ${init.error.trim()}` };
     }
-    if (shared) await writeAlternatesAsync(bare, shared);
+    if (shared) {
+      await writeAlternatesAsync(bare, shared);
+      await copyTransportConfigAsync(location.repoRoot, bare, deps.git);
+    }
     const fetched = await deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -686,10 +730,19 @@ async function writeAlternatesAsync(bareRepo: string, sharedObjects: string): Pr
   await fs.promises.writeFile(path.join(info, 'alternates'), `${sharedObjects}\n`);
 }
 
+// Async twin of copyTransportConfig — same allowlist, same multi-value handling.
+async function copyTransportConfigAsync(repoRoot: string, bareRepo: string, git: GitRunAsync): Promise<void> {
+  const listed = await git(['-C', repoRoot, 'config', '--get-regexp', TRANSPORT_CONFIG_RE]);
+  if (!listed.ok) return;
+  for (const [key, value] of parseConfigList(listed.text)) {
+    await git(['-C', bareRepo, 'config', '--add', key, value]);
+  }
+}
+
 async function reapParentAsync(parent: string): Promise<void> {
   if (!path.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    await fs.promises.rm(parent, { force: true, recursive: true });
+    await fs.promises.rm(parent, REAP_RM_OPTS);
   } catch {
     /* best-effort */
   }
