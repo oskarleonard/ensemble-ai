@@ -197,8 +197,10 @@ const INERT_GIT_CONFIG = [
   '-c', 'filter.lfs.clean=',
   '-c', 'filter.lfs.required=false',
   // No detached auto-gc: `git fetch` otherwise forks `git gc --auto --detach`, which is DESIGNED to
-  // outlive its parent and keeps mutating the shared object store after the fetch returns — a writer
-  // the dead-holder scan cannot see (it carries no inert signature) and that the reap never bounds.
+  // outlive its parent. The fetch now runs in the private bare repo, so that gc would keep mutating
+  // (and could still be running when `reapParent` removes) a repo the reap otherwise fully bounds —
+  // a straggler process racing the teardown. Disabling it keeps the private repo's lifetime the
+  // reap's to own.
   '-c', 'gc.auto=0',
 ];
 
@@ -403,8 +405,12 @@ export function isStrippedPath(p: string, stripped: readonly string[]): boolean 
 // URL-only location, or a repoRoot that no longer resolves) — the fetch then simply brings
 // everything. A READ borrow only: git writes new objects into the private repo, never the shared
 // store, so the shared `.git` is byte-identical after a materialize. Borrowed objects are those
-// reachable from the shared repo's refs; a `gc` there never prunes reachable objects, so a review
-// in flight is safe.
+// reachable from the shared repo's refs at fetch time; a routine `gc` there never prunes reachable
+// objects, so a review in flight is normally safe. The one window this does NOT cover: if a borrowed
+// base object becomes unreachable mid-review (its branch is deleted or force-updated) AND an
+// aggressive `git gc --prune=now` / `git repack -ad` runs in the shared store, that object can be
+// pruned out from under the borrowing worktree — the private repo owns only the PR's own commits,
+// not the borrowed base.
 function sharedObjectsDir(repoRoot: string, git: GitRun): string | null {
   const common = git(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
   if (!common.ok) return null;
