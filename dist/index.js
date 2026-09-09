@@ -3012,7 +3012,10 @@ async function sharedObjectsDirAsync(repoRoot, git2) {
   const common = await git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
   const objects = path10.resolve(repoRoot, common.text.trim(), "objects");
-  return fs12.existsSync(objects) ? objects : null;
+  return fs12.promises.access(objects).then(
+    () => objects,
+    () => null
+  );
 }
 async function writeAlternatesAsync(bareRepo, sharedObjects) {
   const info = path10.join(bareRepo, "objects", "info");

@@ -668,7 +668,10 @@ async function sharedObjectsDirAsync(repoRoot: string, git: GitRunAsync): Promis
   const common = await git(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
   if (!common.ok) return null;
   const objects = path.resolve(repoRoot, common.text.trim(), 'objects');
-  return fs.existsSync(objects) ? objects : null;
+  return fs.promises.access(objects).then(
+    () => objects,
+    () => null,
+  );
 }
 
 async function writeAlternatesAsync(bareRepo: string, sharedObjects: string): Promise<void> {
