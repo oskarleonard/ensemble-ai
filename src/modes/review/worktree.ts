@@ -23,7 +23,8 @@ import { readEnsembleConfig } from './ensemble-config';
 // the shared object store + `worktrees/` admin dir, which forced a per-repo serialization lock. So
 // nothing is written there any more. Each review materializes into its OWN private repo under an
 // owner-only temp parent: `git init --bare`, an `objects/info/alternates` READ-borrow of the shared
-// store (so the fetch still downloads only the delta), `fetch pull/N/head`, then `worktree add` FROM
+// store (so the fetch still downloads only the delta; skipped for a shallow or partial store, which
+// could not serve what it advertises), `fetch pull/N/head`, then `worktree add` FROM
 // that private repo. The shared `.git` is byte-identical afterwards, so N reviews of one repo run in
 // parallel with no lock, no TTL, no waiting. Reap removes the whole parent (worktree + private repo);
 // nothing was registered in the shared checkout, so there is no `git worktree prune` to run there.
@@ -411,11 +412,24 @@ export function isStrippedPath(p: string, stripped: readonly string[]): boolean 
 // aggressive `git gc --prune=now` / `git repack -ad` runs in the shared store, that object can be
 // pruned out from under the borrowing worktree — the private repo owns only the PR's own commits,
 // not the borrowed base.
+//
+// Borrow only from a COMPLETE store. A shallow checkout (`shallow` in the common dir) or a partial
+// clone (`extensions.partialClone` / `remote.<name>.promisor`) advertises refs whose ancestry it
+// does not actually hold: the fetch negotiation would trust those "haves", download only the
+// delta, and the worktree's history reads would then hit objects nobody has (cross-vendor review of
+// the lock removal, codex-f2). Such a store is simply not borrowed — the fetch brings everything,
+// exactly as with no shared checkout at all.
+const PARTIAL_CLONE_CONFIG_RE = '^(extensions\\.partialclone|remote\\..*\\.promisor)$';
+
 function sharedObjectsDir(repoRoot: string, git: GitRun): string | null {
   const common = git(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
   if (!common.ok) return null;
-  const objects = path.resolve(repoRoot, common.text.trim(), 'objects');
-  return fs.existsSync(objects) ? objects : null;
+  const commonDir = path.resolve(repoRoot, common.text.trim());
+  const objects = path.join(commonDir, 'objects');
+  if (!fs.existsSync(objects)) return null;
+  if (fs.existsSync(path.join(commonDir, 'shallow'))) return null;
+  if (git(['config', '--get-regexp', PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
+  return objects;
 }
 
 // Write the alternates borrow into a freshly `git init --bare`'d private repo. `git init` already
@@ -589,7 +603,10 @@ export function reapWorktree(dir: string): void {
 // (nothing else to do while materializing) — this is one protocol with two waiting styles, not a fork.
 
 // CONTRACT: a consumer's async runner MUST still bound every command (a GIT_TIMEOUT_MS-class
-// timeout) — an unbounded fetch would wedge a review the way the reviewer watchdog exists to prevent.
+// timeout) — an unbounded fetch would wedge a review the way the reviewer watchdog exists to prevent —
+// and MUST scrub the repository-selecting env (`scrubRepoEnv` in git-exec.ts): cwd is the only
+// repo selector this materialization means, and an inherited GIT_DIR would point every private
+// command back into the shared `.git`.
 export type GitRunAsync = (
   args: string[],
   opts?: { cwd?: string; env?: Record<string, string> }
@@ -717,11 +734,13 @@ export async function materializeWorktreeAsync(
 async function sharedObjectsDirAsync(repoRoot: string, git: GitRunAsync): Promise<string | null> {
   const common = await git(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
   if (!common.ok) return null;
-  const objects = path.resolve(repoRoot, common.text.trim(), 'objects');
-  return fs.promises.access(objects).then(
-    () => objects,
-    () => null,
-  );
+  const commonDir = path.resolve(repoRoot, common.text.trim());
+  const objects = path.join(commonDir, 'objects');
+  const exists = (p: string): Promise<boolean> => fs.promises.access(p).then(() => true, () => false);
+  if (!(await exists(objects))) return null;
+  if (await exists(path.join(commonDir, 'shallow'))) return null;
+  if ((await git(['config', '--get-regexp', PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot })).ok) return null;
+  return objects;
 }
 
 async function writeAlternatesAsync(bareRepo: string, sharedObjects: string): Promise<void> {

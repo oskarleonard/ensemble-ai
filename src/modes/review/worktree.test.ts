@@ -509,6 +509,45 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
     }
   }, 30_000);
 
+  it('never borrows from a SHALLOW or PARTIAL shared store — the fetch brings everything instead', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-noborrow-'));
+    try {
+      const { headSha, origin } = makeOrigin(base, 2);
+      const consumer = makeConsumer(base);
+      g(consumer, 'fetch', '-q', `file://${origin}`, 'refs/pull/7/head');
+      const altOf = (dir: string) => path.join(path.dirname(dir), 'repo', 'objects', 'info', 'alternates');
+
+      // Shallow: git's own marker for "ancestry I advertise but do not hold". Written the way git
+      // writes it, then PROVED to have taken via git's own probe.
+      fs.writeFileSync(path.join(consumer, '.git', 'shallow'), `${headSha}\n`);
+      expect(g(consumer, 'rev-parse', '--is-shallow-repository')).toBe('true');
+      const shallow = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(shallow)) throw new Error(`shallow failed: ${shallow.message}`);
+      expect(fs.existsSync(altOf(shallow.dir))).toBe(false);
+      expect(fs.readFileSync(path.join(shallow.dir, 'src.ts'), 'utf8')).toContain('x = 1');
+      // The private repo is complete on its own: history walks past the consumer's cut.
+      expect(g(shallow.dir, 'rev-list', '--count', 'HEAD')).toBe('2');
+      reapWorktree(shallow.dir);
+      fs.rmSync(path.join(consumer, '.git', 'shallow'));
+
+      // Partial clone: the config git sets on `clone --filter`. Either spelling is enough.
+      g(consumer, 'config', 'extensions.partialClone', 'origin');
+      const partial = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(partial)) throw new Error(`partial failed: ${partial.message}`);
+      expect(fs.existsSync(altOf(partial.dir))).toBe(false);
+      reapWorktree(partial.dir);
+      g(consumer, 'config', '--unset', 'extensions.partialClone');
+
+      // Complete again ⇒ the borrow is back.
+      const complete = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(complete)) throw new Error(`complete failed: ${complete.message}`);
+      expect(fs.existsSync(altOf(complete.dir))).toBe(true);
+      reapWorktree(complete.dir);
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("carries the checkout's repo-local transport config into the private repo, but never core.bare/worktree", () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-cfg-'));
     try {

@@ -56,6 +56,7 @@ function effectiveSshCommand(cwd: string | undefined, cache: Map<string, string 
         execFileSync('git', ['config', '--get', 'core.sshCommand'], {
           cwd,
           encoding: 'utf8',
+          env: scrubRepoEnv(process.env), // the cwd repo's config — never GIT_DIR's
           stdio: ['ignore', 'pipe', 'ignore'],
         }).trim() || undefined;
     } catch {
@@ -83,6 +84,31 @@ function nonInteractiveEnv(configuredSsh: string | undefined): Record<string, st
 export const GIT_TIMEOUT_MS = 600_000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
+// The env vars git uses to SELECT a repository, scrubbed from every command this runner spawns.
+// `cwd` is the only repo selector the review path means: the pre-flight proves the checkout by its
+// cwd, and the private-repo isolation (worktree.ts) rests on `cwd: bare` — but git lets an inherited
+// `GIT_DIR` / `GIT_COMMON_DIR` / `GIT_OBJECT_DIRECTORY` override cwd, so a runner that copies
+// `process.env` verbatim would let a git hook (hooks export GIT_DIR) or a stray shell export
+// redirect the private `init` / `fetch` / `worktree add` back into the user's shared `.git` —
+// exactly the write the private repo exists to prevent (cross-vendor review of the lock removal,
+// codex-f1). DELETED, never blanked: an empty `GIT_DIR` is still SET, and git reads it as a path.
+// CONSUMER CONTRACT: a consumer's own GitRunAsync must apply the same scrub (reuse this helper).
+export const REPO_LOCATION_ENV = [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_NAMESPACE',
+  'GIT_COMMON_DIR',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_INDEX_FILE',
+] as const;
+
+export function scrubRepoEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  const out = { ...env };
+  for (const key of REPO_LOCATION_ENV) delete out[key];
+  return out;
+}
+
 export function execGit(): GitRun {
   const sshByCwd = new Map<string, string | undefined>();
   return (args, opts) => {
@@ -91,7 +117,7 @@ export function execGit(): GitRun {
         cwd: opts?.cwd,
         encoding: 'utf8',
         env: {
-          ...process.env,
+          ...scrubRepoEnv(process.env),
           ...nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)),
           ...(opts?.env ?? {}),
         },

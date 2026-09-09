@@ -2838,11 +2838,16 @@ async function stripAgentInstructionsAsync(dir) {
 function isStrippedPath(p, stripped) {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
+var PARTIAL_CLONE_CONFIG_RE = "^(extensions\\.partialclone|remote\\..*\\.promisor)$";
 function sharedObjectsDir(repoRoot, git2) {
   const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
-  const objects = path10.resolve(repoRoot, common.text.trim(), "objects");
-  return fs12.existsSync(objects) ? objects : null;
+  const commonDir = path10.resolve(repoRoot, common.text.trim());
+  const objects = path10.join(commonDir, "objects");
+  if (!fs12.existsSync(objects)) return null;
+  if (fs12.existsSync(path10.join(commonDir, "shallow"))) return null;
+  if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
+  return objects;
 }
 function writeAlternates(bareRepo, sharedObjects) {
   const info = path10.join(bareRepo, "objects", "info");
@@ -3037,11 +3042,13 @@ async function materializeWorktreeAsync(args, deps) {
 async function sharedObjectsDirAsync(repoRoot, git2) {
   const common = await git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
-  const objects = path10.resolve(repoRoot, common.text.trim(), "objects");
-  return fs12.promises.access(objects).then(
-    () => objects,
-    () => null
-  );
+  const commonDir = path10.resolve(repoRoot, common.text.trim());
+  const objects = path10.join(commonDir, "objects");
+  const exists = (p) => fs12.promises.access(p).then(() => true, () => false);
+  if (!await exists(objects)) return null;
+  if (await exists(path10.join(commonDir, "shallow"))) return null;
+  if ((await git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot })).ok) return null;
+  return objects;
 }
 async function writeAlternatesAsync(bareRepo, sharedObjects) {
   const info = path10.join(bareRepo, "objects", "info");

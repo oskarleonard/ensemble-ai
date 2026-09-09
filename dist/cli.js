@@ -3256,11 +3256,16 @@ function stripAgentInstructions(dir) {
 function isStrippedPath(p, stripped) {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
+var PARTIAL_CLONE_CONFIG_RE = "^(extensions\\.partialclone|remote\\..*\\.promisor)$";
 function sharedObjectsDir(repoRoot, git2) {
   const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
-  const objects = path11.resolve(repoRoot, common.text.trim(), "objects");
-  return fs14.existsSync(objects) ? objects : null;
+  const commonDir = path11.resolve(repoRoot, common.text.trim());
+  const objects = path11.join(commonDir, "objects");
+  if (!fs14.existsSync(objects)) return null;
+  if (fs14.existsSync(path11.join(commonDir, "shallow"))) return null;
+  if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
+  return objects;
 }
 function writeAlternates(bareRepo, sharedObjects) {
   const info = path11.join(bareRepo, "objects", "info");
@@ -8873,6 +8878,8 @@ function effectiveSshCommand(cwd, cache) {
       value = execFileSync4("git", ["config", "--get", "core.sshCommand"], {
         cwd,
         encoding: "utf8",
+        env: scrubRepoEnv(process.env),
+        // the cwd repo's config — never GIT_DIR's
         stdio: ["ignore", "pipe", "ignore"]
       }).trim() || void 0;
     } catch {
@@ -8894,6 +8901,20 @@ function nonInteractiveEnv(configuredSsh) {
 }
 var GIT_TIMEOUT_MS = 6e5;
 var GIT_MAX_BUFFER = 64 * 1024 * 1024;
+var REPO_LOCATION_ENV = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_NAMESPACE",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_INDEX_FILE"
+];
+function scrubRepoEnv(env) {
+  const out = { ...env };
+  for (const key of REPO_LOCATION_ENV) delete out[key];
+  return out;
+}
 function execGit() {
   const sshByCwd = /* @__PURE__ */ new Map();
   return (args, opts) => {
@@ -8902,7 +8923,7 @@ function execGit() {
         cwd: opts?.cwd,
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...scrubRepoEnv(process.env),
           ...nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)),
           ...opts?.env ?? {}
         },
