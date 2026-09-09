@@ -49,6 +49,10 @@ export * from './modes/review/ci-evidence';
 export * from './modes/review/evidence';
 export * from './modes/review/evidence-manifest';
 export * from './modes/review/worktree';
+// The consumer-runner contract (GitRunAsync): scrub git's repository-selecting env from the
+// INHERITED env before applying a command's own env. Exported so a consumer reuses the engine's
+// list instead of mirroring it (munin-dashboard#227 had to copy it).
+export { REPO_LOCATION_ENV, scrubRepoEnv } from './modes/review/git-exec';
 export * from './modes/review/code-review-seat';
 export * from './modes/review/claude';
 // ── The foreign tail: posting posture · the staged PENDING review · the push fence ─
