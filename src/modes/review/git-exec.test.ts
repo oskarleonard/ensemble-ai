@@ -5,7 +5,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { execGit, nonInteractiveSshCommand } from './git-exec';
+import { execGit, nonInteractiveSshCommand, REPO_LOCATION_ENV, scrubRepoEnv } from './git-exec';
 
 // `GIT_TERMINAL_PROMPT=0` silences GIT's prompts, not ssh's. An ssh remote with a passphrased key
 // prompts on /dev/tty by itself, wedging an unattended pre-flight until the 600s git backstop.
@@ -85,5 +85,53 @@ describe('execGit — honors the user`s core.sshCommand instead of overriding it
     expect(nonInteractiveSshCommand(process.env.GIT_SSH_COMMAND)).toBe(
       'ssh -F /env/config -o BatchMode=yes'
     );
+  });
+});
+
+describe('execGit — cwd is the ONLY repo selector; repository-selecting env is scrubbed', () => {
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    for (const d of dirs.splice(0)) fs.rmSync(d, { force: true, recursive: true });
+  });
+
+  it('scrubRepoEnv deletes every repo-selecting var and keeps the rest', () => {
+    const env: Record<string, string | undefined> = {
+      GIT_SSH_COMMAND: 'ssh',
+      HOME: '/h',
+      ...Object.fromEntries(REPO_LOCATION_ENV.map((k) => [k, '/x'])),
+    };
+    const out = scrubRepoEnv(env);
+    for (const k of REPO_LOCATION_ENV) expect(k in out, k).toBe(false);
+    expect(out).toEqual({ GIT_SSH_COMMAND: 'ssh', HOME: '/h' });
+    expect(env.GIT_DIR, 'the input is not mutated').toBe('/x');
+  });
+
+  it('scrubRepoEnv strips the GIT_CONFIG_COUNT/KEY_n/VALUE_n injection set but keeps the global config vars', () => {
+    const out = scrubRepoEnv({
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.hooksPath',
+      GIT_CONFIG_VALUE_0: '/evil',
+      GIT_CONFIG_GLOBAL: '/h/.gitconfig', // NOT scrubbed — the transport carry inherits global creds
+      HOME: '/h',
+    });
+    expect(out).toEqual({ GIT_CONFIG_GLOBAL: '/h/.gitconfig', HOME: '/h' });
+  });
+
+  // The private-repo isolation rests on `cwd: bare`. A hook-exported or stray GIT_DIR pointing at
+  // ANOTHER repo would otherwise redirect every command — the fetch and `worktree add` included —
+  // into that repo, silently un-doing the isolation.
+  it('a GIT_DIR pointing at another repo does not redirect the command away from cwd', () => {
+    const a = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-gitdir-a-'));
+    const b = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-gitdir-b-'));
+    dirs.push(a, b);
+    execFileSync('git', ['init', '-q'], { cwd: a });
+    execFileSync('git', ['init', '-q'], { cwd: b });
+    vi.stubEnv('GIT_DIR', path.join(b, '.git'));
+
+    const r = execGit()(['rev-parse', '--absolute-git-dir'], { cwd: a });
+    if (!r.ok) throw new Error(r.error);
+    expect(fs.realpathSync(r.text.trim())).toBe(fs.realpathSync(path.join(a, '.git')));
   });
 });

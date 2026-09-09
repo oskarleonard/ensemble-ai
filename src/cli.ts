@@ -105,7 +105,7 @@ import {
 } from './modes/review/profile';
 import { formatEvidenceFooter, SEAT_QUALIFIERS } from './modes/review/seat-evidence';
 import { isPreflightError, redactUrlCredentials } from './modes/review/worktree';
-import { execGit } from './modes/review/git-exec';
+import { execGit, scrubRepoEnv } from './modes/review/git-exec';
 import { checkPinDrift, describePinDrift } from './plumbing/pin-check';
 import {
   buildHistoryPacket,
@@ -419,6 +419,7 @@ function capture(
     const text = execFileSync(cmd, cmdArgs, {
       cwd,
       encoding: 'utf8',
+      env: scrubRepoEnv(process.env), // git + gh alike: cwd is the only repo selector
       maxBuffer: 256 * 1024 * 1024,
       // stdin closed so `gh` can never sit on an interactive prompt; stderr 'pipe' rather
       // than the sync-exec default, which ALSO mirrors the child's stderr onto ours — every
@@ -445,6 +446,7 @@ function gitToplevel(cwd: string): string | null {
     const top = execFileSync('git', ['rev-parse', '--show-toplevel'], {
       cwd,
       encoding: 'utf8',
+      env: scrubRepoEnv(process.env),
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     return top || null;
@@ -1268,9 +1270,10 @@ async function reviewCommand(
     return 3;
   }
 
-  // ONE worktree per run, opened here and reaped in the `finally` below — plus a `git worktree
-  // prune` sweeper inside the reap, which self-heals the crash/SIGTERM path on the next run
-  // (spec §9, grok-f1). Every failure is a NAMED cause, never a generic "git failed".
+  // ONE worktree per run, opened here and reaped in the `finally` below. The reap removes the
+  // owner-only temp parent (worktree + its private repo); nothing is registered in the user's shared
+  // checkout, so there is no `git worktree prune` to run and a crash/SIGTERM leaks at most one temp
+  // parent (spec §9, grok-f1). Every failure is a NAMED cause, never a generic "git failed".
   let worktree: WorktreeSession | null = null;
   if (repoFlag && source.postTarget && source.headShaOverride && source.prBaseSha) {
     console.error(`· materializing the PR head as a read-only worktree of ${repoFlag}…`);

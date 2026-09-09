@@ -1,14 +1,10 @@
-import * as childProcess from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { setTimeout as sleepAsync } from 'node:timers/promises';
-import { promisify } from 'node:util';
 
 import { makeOwnerOnlyTempDir } from '../../core/artifacts';
 
 import { readEnsembleConfig } from './ensemble-config';
-import { GIT_TIMEOUT_MS } from './git-exec';
+import { nonInteractiveSshCommand } from './git-exec';
 
 // WORKTREE EVIDENCE MODE — materialize the PR head as a detached, read-only worktree of a repo
 // the user ALREADY has cloned, so a seat sees the whole project the way Oskar does manually,
@@ -24,10 +20,16 @@ import { GIT_TIMEOUT_MS } from './git-exec';
 //   · tracked files only     — a fresh detached worktree carries no .env / WIP / node_modules
 //   · no deps installed      — seats read code, they do not run it
 //
-// The write into `.git` is the hazard this fleet has scars from: `git worktree add` mutates the
-// SHARED object store + `worktree/` admin dir, so materialization is SERIALIZED per repo by an
-// O_EXCL lock in the repo's common gitdir. Reap is try/finally + a `git worktree prune` sweeper
-// for the crash/SIGTERM paths.
+// This fleet has scars from writing into the user's SHARED `.git`: `git worktree add` there mutates
+// the shared object store + `worktrees/` admin dir, which forced a per-repo serialization lock. So
+// nothing is written there any more. Each review materializes into its OWN private repo under an
+// owner-only temp parent: a HARDLINK CLONE of the shared store (`git clone --bare --local` — linked,
+// not copied, so instant and self-contained; an empty `git init --bare` when the store is shallow,
+// partial, or absent), `fetch pull/N/head` (only the delta: the clone carries the shared refs as
+// negotiation tips), then `worktree add` FROM that private repo. The shared `.git` is byte-identical
+// afterwards, so N reviews of one repo run in parallel with no lock, no TTL, no waiting. Reap removes
+// the whole parent (worktree + private repo); nothing was registered in the shared checkout, so
+// there is no `git worktree prune` to run there.
 
 export type GitRun = (
   args: string[],
@@ -39,10 +41,6 @@ export type GitRun = (
 export type PreflightErrorKind =
   | 'auth'
   | 'disallowed-root'
-  // A sibling review held the per-repo worktree lock past the staleness TTL. Retryable, and NOT a
-  // security claim — distinct from `network` so the operator can tell "another review is running"
-  // from "GitHub is unreachable".
-  | 'lock-contended'
   // The local materialization step itself blew up (a full or read-only temp root, a chmod refusal)
   // — not git, not the network, not the repo's identity.
   | 'materialize-failed'
@@ -51,10 +49,6 @@ export type PreflightErrorKind =
   | 'not-a-repo'
   | 'sha-mismatch'
   | 'wrong-repo';
-
-// The lock-timeout message `acquireRepoLock` throws. Exported so `openWorktree` can tell that
-// distinct, retryable cause apart from any other throw, instead of collapsing both into one.
-export const WORKTREE_LOCK_ERROR = 'could not acquire the worktree lock';
 
 export interface PreflightError {
   kind: PreflightErrorKind;
@@ -206,12 +200,29 @@ const INERT_GIT_CONFIG = [
   '-c', 'filter.lfs.clean=',
   '-c', 'filter.lfs.required=false',
   // No detached auto-gc: `git fetch` otherwise forks `git gc --auto --detach`, which is DESIGNED to
-  // outlive its parent and keeps mutating the shared object store after the fetch returns — a writer
-  // the dead-holder scan cannot see (it carries no inert signature) and that the reap never bounds.
+  // outlive its parent. The fetch now runs in the private bare repo, so that gc would keep mutating
+  // (and could still be running when `reapParent` removes) a repo the reap otherwise fully bounds —
+  // a straggler process racing the teardown. Disabling it keeps the private repo's lifetime the
+  // reap's to own.
   '-c', 'gc.auto=0',
 ];
 
-const INERT_ENV = { GIT_LFS_SKIP_SMUDGE: '1' };
+// GIT_NO_REPLACE_OBJECTS disables git's replace-ref machinery for every command the materialization
+// runs. `git clone --bare --local` copies the shared store's `refs/replace/*` verbatim, and an active
+// replacement would make `git worktree add --detach <headSha>` check out a DIFFERENT tree than the SHA
+// the receipt is tied to — while `rev-parse HEAD` still returns the original SHA, so the HEAD assert
+// passes on wrong content. Neutralizing replace here (the env vector is separately scrubbed in
+// git-exec.ts) means the worktree is always the true object at headSha (cross-vendor review, codex-f2).
+const INERT_ENV = { GIT_LFS_SKIP_SMUDGE: '1', GIT_NO_REPLACE_OBJECTS: '1' };
+
+// The private repo's object format, taken from the SHA the review is bound to — a repo has exactly
+// one, so a 64-hex head IS a SHA-256 repo and a 40-hex head a SHA-1 one. Explicit on `git init`,
+// because the default otherwise comes from the USER's `init.defaultObjectFormat` / `GIT_DEFAULT_HASH`,
+// independent of the reviewed repo: a mismatch fails the fetch with `mismatched algorithms` and makes
+// the shared store's objects unreadable (cross-vendor review round 2, codex-f4).
+function objectFormatFlag(headSha: string): string {
+  return `--object-format=${headSha.length === 64 ? 'sha256' : 'sha1'}`;
+}
 
 // The owner-only (0700) directory the worktree is created INSIDE. `git worktree add` creates its
 // own directory with the process umask — commonly 0755 — so a worktree placed directly in a shared
@@ -223,13 +234,6 @@ const INERT_ENV = { GIT_LFS_SKIP_SMUDGE: '1' };
 // The prefix is load-bearing: `reapWorktree` removes a parent ONLY when it carries this name, so a
 // caller that passes an arbitrary directory can never make the reap delete that directory's parent.
 const WORKTREE_PARENT_PREFIX = 'ensemble-worktree-';
-
-// The per-repo lock file lives in the shared `.git` common dir. ONE derivation of its path, so the
-// acquire, the lease refresh, and the reclaim can never touch different files (a drift would make
-// the lease refresh silently touch nothing).
-function repoLockPath(gitCommonDir: string): string {
-  return path.join(gitCommonDir, 'ensemble-ai-worktree.lock');
-}
 
 export interface Worktree {
   dir: string;
@@ -412,455 +416,200 @@ export function isStrippedPath(p: string, stripped: readonly string[]): boolean 
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
 
-// Serialize per repo: `git worktree add` writes into the SHARED `.git`. O_EXCL create is the
-// lock; a stale lock is reclaimed so a crashed run cannot wedge the repo forever — either
-// because its holder pid is provably DEAD (reclaimed at once) or, for a token with no live/dead
-// signal, because its mtime is older than the TTL. Returns a release function; never throws on
-// release.
+// ── The private object store ─────────────────────────────────────────────────
+
+// A HARDLINK CLONE of the shared checkout's store (`git clone --bare --local`): every object file is
+// linked, not copied — instant and disk-free on one volume; a cross-volume temp dir copies, still
+// correct — so the private repo is SELF-CONTAINED. Two properties follow that a read-only
+// `objects/info/alternates` borrow (the first cut) could not give: a `gc` / `repack` in the shared
+// checkout may delete its pack files at any moment, our links keep the inodes alive, so nothing can
+// be pruned out from under a review in flight; and a fenced seat — which may read the private repo
+// but never `$HOME`, where the shared store lives — can run `git log` / `git blame` over the WHOLE
+// history, not just the PR's own commits (cross-vendor review of the lock removal: round 1 grok-f2,
+// round 2 grok-f3 — the same fork twice; the answer is to stop borrowing, not to harden the borrow).
+// A READ of the shared store only: git links and copies out of it, never writes into it, so the
+// shared `.git` is byte-identical after a materialize.
 //
-// OWNERSHIP IS PROVEN, NOT ASSUMED. A blind `unlink(lock)` on release is unsafe once reclaim
-// exists: holder A stalls past the TTL, B reclaims and takes the lock, A finishes and its
-// release() deletes B's LIVE lock — C then enters while B is mid-`worktree add`, which is the
-// exact concurrent-write corruption this lock exists to prevent. So each holder writes a unique
-// token and only ever removes a lock still carrying ITS token. The same check guards the stale
-// reclaim, so we never unlink a lock that was replaced between our stat and our unlink.
-function lockToken(): string {
-  return `${process.pid}:${randomUUID()}`;
+// Clone only a COMPLETE store. A shallow checkout (`shallow` in the common dir) or a partial clone
+// (`extensions.partialClone` / `remote.<name>.promisor`) advertises refs whose ancestry it does not
+// hold: `clone --local` of a shallow source yields a shallow private repo (verified: git ignores
+// `--local` and copies the `shallow` cut), and the history packet then discards `git log` (round 1,
+// codex-f2). Such a store — like a missing one (a URL-only location, a repoRoot that no longer
+// resolves) — is not cloned: the private repo starts empty (`git init --bare`, in the reviewed repo's
+// object format) and the fetch brings everything.
+const PARTIAL_CLONE_CONFIG_RE = '^(extensions\\.partialclone|remote\\..*\\.promisor)$';
+
+// A store that itself BORROWS objects from another via `objects/info/alternates` (a checkout made
+// with `git clone --shared`/`--reference`) is not self-contained, even though it has an `objects/`
+// dir and is neither shallow nor partial. `git clone --bare --local` of such a source copies the
+// alternates POINTER, not the borrowed objects — so the private repo silently depends on the external
+// pool again, reintroducing both failures the hardlink clone exists to close: a gc/repack of that pool
+// can drop objects mid-review, and a fenced seat that cannot read the pool's path cannot walk history
+// through the pointer. Treat it like a shallow/partial store — start empty and let the fetch fill the
+// private repo (cross-vendor review of the lock removal, codex-f5 · grok-f1).
+const ALTERNATES_REL = path.join('objects', 'info', 'alternates');
+
+// The shared checkout's COMMON dir when its store is complete; null ⇒ the private repo starts empty.
+function completeSharedStore(repoRoot: string, git: GitRun): string | null {
+  const common = git(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
+  if (!common.ok) return null;
+  const commonDir = path.resolve(repoRoot, common.text.trim());
+  if (!fs.existsSync(path.join(commonDir, 'objects'))) return null;
+  if (fs.existsSync(path.join(commonDir, 'shallow'))) return null;
+  if (fs.existsSync(path.join(commonDir, ALTERNATES_REL))) return null;
+  if (git(['config', '--get-regexp', PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
+  return commonDir;
 }
 
-// Returns whether THIS call removed the lock: true only if the file still carried the exact
-// observed token and we unlinked it. A caller that logs a reclaim must gate on this — the token
-// can change between observe and here, and announcing a reclaim that did not happen is the worst
-// possible lie in a lock-debugging log.
-export function removeLockIfOwned(lock: string, token: string): boolean {
-  try {
-    if (fs.readFileSync(lock, 'utf8').trim() === token) {
-      fs.unlinkSync(lock);
-      return true;
-    }
-  } catch {
-    /* gone, or replaced by another holder — either way it is not ours to remove */
+function privateRepoFailure(shared: string | null, error: string): string {
+  return `${shared ? 'git clone --bare --local' : 'git init --bare'} failed: ${error.trim()}`;
+}
+
+// The argv that creates the private repo: a hardlink clone of a complete shared store, else an empty
+// bare repo. Shared as a pure function so the twins cannot drift on it.
+//
+// `-c protocol.file.allow=always` on the clone: `clone --local` uses git's `file` transport, which a
+// user/org gitconfig hardened with `protocol.file.allow=never` (the CVE-2022-39253 mitigation) rejects
+// outright (`fatal: transport 'file' not allowed`), aborting an otherwise-valid worktree review. The
+// source is the user's OWN, already-identity-verified local checkout and this `--bare` clone recurses
+// no submodules, so re-allowing `file` for this one command carries none of the CVE's risk (which is a
+// malicious submodule url during a recursive clone) — cross-vendor review of the lock removal, grok-f2.
+function createPrivateRepoArgs(shared: string | null, bare: string, headSha: string): string[] {
+  return shared
+    ? [...INERT_GIT_CONFIG, '-c', 'protocol.file.allow=always', 'clone', '--quiet', '--bare', '--local', shared, bare]
+    : [...INERT_GIT_CONFIG, 'init', '--bare', objectFormatFlag(headSha), bare];
+}
+
+// ── Transport config for the private fetch ───────────────────────────────────
+//
+// The fetch runs in the private bare repo, whose config holds NONE of the checkout's repo-local
+// transport settings — a multi-key `core.sshCommand`, a CI token in `http.<url>.extraHeader`, a
+// corp `url.<base>.insteadOf`, a `credential.*` chain — and whose gitdir matches none of the user's
+// `includeIf.gitdir` conditions. Those settings are handed to the fetch PER COMMAND, through git's
+// own `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` env (git ≥ 2.31): they exist in
+// the fetch process for the seconds it runs and are NEVER written to disk. The first cut persisted
+// them in the private repo's config — which parked the checkout's credentials in a temp file the
+// fenced seats can read: the codex profile grants `/private/var`, where `$TMPDIR` lives, a fence this
+// engine documents in so many words (cross-vendor review round 2: codex-f1 · grok-f1 · claude-f1).
+//
+// WHICH settings: the difference between two EFFECTIVE views — `git config` at the checkout (every
+// scope: system, global, `includeIf`, local, worktree) minus `git config` at the private repo (the
+// system + global config as the private repo already sees them). Reading the effective view, not
+// `--local`, is what carries an `includeIf.gitdir`'d key or a `config.worktree` key (round 2:
+// grok-f2 · codex-f3); subtracting the private repo's own view is what keeps a global multivar (a
+// second `extraHeader`, a re-ordered `credential.helper` chain) from being applied twice.
+const TRANSPORT_CONFIG_RE = '^(core\\.sshcommand|credential\\.|http\\.|url\\.)';
+type ConfigEntries = Array<[string, string]>;
+
+// Multiset difference, order-preserving: every (key, value) of `want` not matched by one in `have`.
+export function missingConfig(want: ConfigEntries, have: ConfigEntries): ConfigEntries {
+  const pool = have.map(([k, v]) => `${k}\n${v}`);
+  const out: ConfigEntries = [];
+  for (const [k, v] of want) {
+    const i = pool.indexOf(`${k}\n${v}`);
+    if (i >= 0) pool.splice(i, 1);
+    else out.push([k, v]);
   }
-  return false;
+  return out;
 }
 
-// The holder pid a token records (`lockToken()` writes `${pid}:${uuid}`). Returns null for any
-// token that does not begin with a positive-integer pid — a legacy or hand-written token then
-// falls back to the mtime TTL rule instead of being force-reclaimed on a guess.
-export function holderPidFromToken(token: string): number | null {
-  const m = /^(\d+):/.exec(token);
-  if (!m) return null;
-  const pid = Number(m[1]);
-  return Number.isInteger(pid) && pid > 0 ? pid : null;
-}
-
-// Is the process that holds the lock gone? `process.kill(pid, 0)` sends NO signal — it only probes
-// whether the pid is deliverable. ESRCH ⇒ no such process: the holder died mid-hold (the wedge this
-// reclaim exists for), so its lock is a corpse. EPERM ⇒ the pid exists but is owned by another user
-// (a foreign LIVE process, possibly a reused number): treat it as ALIVE and keep the TTL rule —
-// force-reclaiming there could delete a lock a genuinely-running process still holds.
-export function isHolderDead(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch (e) {
-    return (e as NodeJS.ErrnoException).code === 'ESRCH';
+// The per-command env for `entries`, plus `GIT_SSH_COMMAND` when the checkout configures its own
+// ssh: git lets an env GIT_SSH_COMMAND override `core.sshCommand`, and a runner's non-interactive
+// default (git-exec.ts probes `core.sshCommand` at the command's cwd — the private repo, where it is
+// unset) would otherwise win over the checkout's `ssh -i <key>`. The user's OWN env GIT_SSH_COMMAND
+// keeps winning, exactly as git itself decides.
+export function transportEnv(
+  entries: ConfigEntries,
+  sshCommand: string | undefined
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (entries.length > 0) {
+    env.GIT_CONFIG_COUNT = String(entries.length);
+    entries.forEach(([k, v], i) => {
+      env[`GIT_CONFIG_KEY_${i}`] = k;
+      env[`GIT_CONFIG_VALUE_${i}`] = v;
+    });
   }
-}
-
-// ONE acquisition attempt — the whole protocol lives here, shared by the sync and async
-// acquires so they cannot drift: O_EXCL create with the token, and on failure the
-// observe-stale→reclaim sequence. Every fs op is a sub-millisecond metadata call and stays
-// SYNCHRONOUS on purpose, even under the async acquire: keeping read→stat→unlink un-awaited
-// preserves its in-process atomicity for free (no interleave point between observing a stale
-// holder and reclaiming exactly that holder).
-// THE DEAD-HOLDER RECLAIM — THREAT MODEL (declared; review against THESE assumptions):
-//   • What the lock protects: the shared `.git` of ONE repo while this module's child git
-//     processes (`fetch` / `worktree add`, each carrying INERT_GIT_CONFIG) mutate it.
-//   • A dead holder pid does NOT prove the critical section is over: a SIGKILL/OOM'd parent
-//     leaves REPARENTED git children still writing — UNTIMED, since the per-command git timeout
-//     was the parent's execFileSync timer. No fixed grace can bound that.
-//   • Scope: one POSIX host (macOS / Linux) with `ps`. What this module CAN prove from here is only
-//     "no in-lock git (signature) is running anywhere on this host" — so that, and only that,
-//     unlocks the fast path: a dead holder whose lock is IDLE is reclaimed at once. Any in-lock git
-//     anywhere (this repo's orphan, another repo's live review — indistinguishable without pgid
-//     attribution) or an unreadable scan keeps the pre-existing TTL backstop, exactly as before
-//     this change. Nothing is ever signalled or killed from here.
-//   • Out of scope, by declaration: attributing/terminating a specific orphan (needs pgid-in-token
-//     — a separate design), subreapers, container namespaces, cross-host/NFS locks; the path-based
-//     read-then-unlink of the lock file is not atomic across processes (a rename/dir-based lock is
-//     a separate change); pid reuse between a probe and a decision is a sub-second window.
-export interface ProcessRow {
-  cmd: string;
-  pid: number;
-  ppid: number;
-}
-export interface InLockGitScan {
-  busy: boolean; // an in-lock git (signature) is running somewhere on this host
-  unknown: boolean; // the host could not be scanned — the TTL rule
-}
-export interface LockScope {
-  gitCommonDir: string;
-  repoRoot: string;
-}
-export type InLockGitScanner = (scope: LockScope) => InLockGitScan | Promise<InLockGitScan>;
-
-const IN_LOCK_GIT_SIGNATURE = 'core.hooksPath=/dev/null';
-const PS_ARGS = ['-axo', 'pid=,ppid=,command='];
-const EXEC_OPTS = { encoding: 'utf8' as const, maxBuffer: 16 * 1024 * 1024, timeout: 5_000 };
-// A waiter re-scans at most this often while a dead holder's lock stays busy (never a global
-// cache — a stale "idle" could otherwise authorize a later unsafe reclaim; an "idle" answer is
-// acted on at once, so only "busy" is ever reused, and only within one waiter).
-const SCAN_INTERVAL_MS = 5_000;
-const SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
-function sleepSync(ms: number): void {
-  Atomics.wait(SLEEP_BUF, 0, 0, ms);
-}
-
-// Pure parsers over `ps -axo pid=,ppid=,command=` — unit-testable without processes.
-export function parseProcessTable(psOutput: string): ProcessRow[] {
-  const rows: ProcessRow[] = [];
-  for (const line of psOutput.split('\n')) {
-    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
-    if (m) rows.push({ cmd: m[3], pid: Number(m[1]), ppid: Number(m[2]) });
+  if (sshCommand && !process.env.GIT_SSH_COMMAND) {
+    env.GIT_SSH_COMMAND = nonInteractiveSshCommand(sshCommand) ?? sshCommand;
   }
-  return rows;
-}
-// Only a `git` carrying this module's inert-config signature counts; this process itself never
-// does (its own children are parented, not orphaned).
-export function inLockGitCandidates(table: ProcessRow[]): ProcessRow[] {
-  return table.filter(
-    (r) => r.pid !== process.pid && /(^|[\s/])git\s/.test(r.cmd) && r.cmd.includes(IN_LOCK_GIT_SIGNATURE)
-  );
+  return env;
 }
 
-const UNKNOWN_SCAN: InLockGitScan = { busy: false, unknown: true };
-let scanFailureLogged = false;
-function scanFailed(e: unknown): InLockGitScan {
-  if (!scanFailureLogged) {
-    scanFailureLogged = true;
-    const why = e instanceof Error ? e.message : String(e);
-    process.stderr.write(
-      `⚠ ensemble-ai: could not scan for in-lock git processes (${why}) — dead-holder reclaim falls back to the TTL\n`
-    );
+// The checkout's EFFECTIVE `core.sshCommand` from the multi-scope `--get-regexp` listing. git lists
+// every scope's value in file order (system → global → includeIf → local → worktree) and the effective
+// value is the LAST one — exactly why the sibling probe in git-exec.ts uses `config --get` (last-wins).
+// Taking the FIRST match instead exported the lowest-precedence (global) command as GIT_SSH_COMMAND,
+// which then OVERRIDES the repo-local `ssh -i <key>` the multi-account carry exists to preserve — the
+// fetch runs with the wrong key and fails `auth` (cross-vendor review of the lock removal, codex-f4 ·
+// claude-f1).
+export function effectiveSshFrom(entries: ConfigEntries): string | undefined {
+  let value: string | undefined;
+  for (const [k, v] of entries) if (k === 'core.sshcommand') value = v;
+  return value;
+}
+
+function listTransportConfig(cwd: string, git: GitRun): ConfigEntries {
+  const listed = git(['config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE], { cwd });
+  return listed.ok ? parseConfigList(listed.text) : []; // exits 1 when no key matches
+}
+
+// The env the private fetch runs with: the LFS kill-switch plus the transport settings only the
+// checkout can see. Computed UNCONDITIONALLY, clone or not — a depth-1 `actions/checkout` is both
+// shallow (no clone) and token-only-in-local-config, so a fetch that needs auth needs it most exactly
+// when there is nothing to clone.
+function fetchEnv(repoRoot: string, bare: string, git: GitRun): Record<string, string> {
+  const want = listTransportConfig(repoRoot, git);
+  const missing = missingConfig(want, listTransportConfig(bare, git));
+  const ssh = effectiveSshFrom(want);
+  return { ...INERT_ENV, ...transportEnv(missing, ssh) };
+}
+
+// `git config --null --get-regexp` prints each match as `<name>\n<value>\0`; a valueless implicit-
+// boolean key comes as `<name>\0` with no newline. Split on NUL, then on the FIRST newline, so a
+// value that itself contains spaces or newlines is carried faithfully. A valueless key is skipped —
+// no transport key we carry is a bare boolean; the trailing empty split after the final NUL falls
+// out the same way.
+function parseConfigList(text: string): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  for (const entry of text.split('\0')) {
+    const nl = entry.indexOf('\n');
+    if (nl < 0) continue;
+    out.push([entry.slice(0, nl), entry.slice(nl + 1)]);
   }
-  return UNKNOWN_SCAN;
+  return out;
 }
 
-// The live scanners: sync for the sync acquire, non-blocking for the async twin. `scope` is
-// reserved for a future pgid/cwd attribution; this design deliberately ignores it.
-export function scanInLockGit(_scope: LockScope): InLockGitScan {
-  try {
-    const table = parseProcessTable(childProcess.execFileSync('ps', PS_ARGS, EXEC_OPTS));
-    return { busy: inLockGitCandidates(table).length > 0, unknown: false };
-  } catch (e) {
-    return scanFailed(e);
-  }
-}
-export async function scanInLockGitAsync(_scope: LockScope): Promise<InLockGitScan> {
-  try {
-    // Resolved lazily: consumer test suites mock node:child_process without execFile.
-    const ps = await promisify(childProcess.execFile)('ps', PS_ARGS, EXEC_OPTS);
-    return { busy: inLockGitCandidates(parseProcessTable(ps.stdout)).length > 0, unknown: false };
-  } catch (e) {
-    return scanFailed(e);
-  }
-}
+// ── Materialization ────────────────────────────────────────────────────
 
-export type DeadHolderDecision = 'reclaim' | 'ttl';
-export function decideDeadHolder(scan: InLockGitScan): DeadHolderDecision {
-  return scan.unknown || scan.busy ? 'ttl' : 'reclaim';
-}
-
-// The default TTL for a holder that is (or may be) ALIVE. Tied to the per-command git timeout:
-// the holder refreshes its lease after each completed op, so a live holder's lock is never older
-// than ONE op — which git-exec bounds at GIT_TIMEOUT_MS (a consumer's own async runner MUST bound
-// its commands the same way; see GitRunAsync). The TTL therefore clears one op plus margin by
-// construction (the hold-duration invariant, structural instead of a comment).
-export const DEFAULT_LOCK_STALE_MS = GIT_TIMEOUT_MS + 5 * 60_000;
-
-// A lease refresh proves the EXACT token: the holder's release function carries it, so a lock
-// this process no longer holds (released and taken by a sibling) is never re-leased. Best-effort
-// and silent — a missing lock or a refused utimes must never fail the op that just succeeded.
-export type LockRelease = (() => void) & { touch: () => boolean };
-export function touchLockIfOwned(lock: string, token: string): boolean {
-  try {
-    if (fs.readFileSync(lock, 'utf8').trim() !== token) return false;
-    const now = new Date();
-    fs.utimesSync(lock, now, now);
-    return true;
-  } catch {
-    return false;
-  }
-}
-function makeRelease(lock: string, token: string): LockRelease {
-  const release = () => {
-    removeLockIfOwned(lock, token);
-  };
-  return Object.assign(release, { touch: () => touchLockIfOwned(lock, token) });
-}
-// Materialize paths call this after each completed in-lock op; an injected test lock (a bare
-// release function) simply has no lease to refresh.
-function touchLease(release: (() => void) & { touch?: () => boolean }): void {
-  release.touch?.();
-}
-
-// One exclusive-create attempt. Returns the release on success; 'contended' on EEXIST; throws
-// any other errno (ENOENT/EACCES/EROFS are caller bugs, never contention — claude-f4 r2).
-function tryCreate(lock: string, token: string): LockRelease | 'contended' {
-  let fd: number;
-  try {
-    fd = fs.openSync(lock, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return 'contended';
-    throw e;
-  }
-  // ANY failure after the exclusive create — write OR close — must unlink the lock this process
-  // just made, or it strands a lock file with no releaser (r3's unanimous finding).
-  try {
-    fs.writeSync(fd, token);
-    fs.closeSync(fd);
-  } catch (we) {
-    try {
-      fs.closeSync(fd);
-    } catch {
-      /* already closed, or close is what failed — the unlink below is the recovery */
-    }
-    try {
-      fs.unlinkSync(lock);
-    } catch {
-      /* worst case: the stale reclaim gets it */
-    }
-    throw we;
-  }
-  return makeRelease(lock, token);
-}
-
-interface Contention {
-  age: number;
-  dead: boolean;
-  held: string;
-  pid: number | null;
-}
-// What the contended lock says about its holder; null when the holder released meanwhile.
-function readContention(lock: string): Contention | null {
-  try {
-    const held = fs.readFileSync(lock, 'utf8').trim();
-    const pid = holderPidFromToken(held);
-    return {
-      age: Date.now() - fs.statSync(lock).mtimeMs,
-      dead: pid !== null && isHolderDead(pid),
-      held,
-      pid,
-    };
-  } catch {
-    return null;
-  }
-}
-
-// Reclaim ONLY the exact token we observed: removeLockIfOwned re-reads and compares, so if the
-// holder released and a third process took the lock in between, `held` no longer matches and the
-// new lock is left alone. The log fires AFTER the reclaim and only when it actually removed the
-// lock — a write failure can never skip the reclaim, and it never announces a refused one.
-function reclaimContended(lock: string, c: Contention, why: string): boolean {
-  const reclaimed = removeLockIfOwned(lock, c.held);
-  if (reclaimed) process.stderr.write(`⚠ ensemble-ai: reclaimed worktree lock at ${lock} — ${why}\n`);
-  return reclaimed;
-}
-
-export interface LockOpts {
-  // The cwd the in-lock git commands run in (`location.repoRoot`); reserved for a future
-  // attribution design — the materialize paths pass it, this design does not consult it.
-  repoRoot?: string;
-  retries?: number;
-  // Injectable for tests; production uses the live `ps` scanners.
-  scanner?: InLockGitScanner;
-  sleepMs?: number;
-  staleMs?: number;
-}
-
-function scopeOf(gitCommonDir: string, repoRoot?: string): LockScope {
-  const derived = path.basename(gitCommonDir) === '.git' ? path.dirname(gitCommonDir) : gitCommonDir;
-  return { gitCommonDir, repoRoot: repoRoot ?? derived };
-}
-
-function lockPathAndBudget(gitCommonDir: string, opts: LockOpts) {
-  const lock = repoLockPath(gitCommonDir);
-  // Clamped ≥1: `?? 500` is nullish-only, so an explicit sleepMs of 0 slipped through and
-  // made the derived retry budget `Math.ceil(staleMs / 0) = Infinity` — a loop that can
-  // never reach lockWedgedError, spinning at full CPU in the sync acquire (r2, codex-f1).
-  const sleepMs = Math.max(1, opts.sleepMs ?? 500);
-  const staleMs = opts.staleMs ?? DEFAULT_LOCK_STALE_MS;
-  // Wait at least as long as the staleness TTL. A shorter budget could never reach the reclaim
-  // branch, so a sibling holding the lock across a legitimately slow `git fetch` (a large repo,
-  // a cold object store) would throw as "wedged" while it was merely working.
-  //
-  // THE HOLD-DURATION INVARIANT (protocol-wide, both waiting styles): a live holder's lock must
-  // never be reclaimed mid-materialization. It is structural now, not a comment: the holder
-  // refreshes its lease after every completed in-lock op, so the lock's age never exceeds ONE
-  // op, and DEFAULT_LOCK_STALE_MS is derived from that op's git timeout plus margin. A dead
-  // holder is settled by the in-lock git scan above (idle → reclaim now; else the TTL).
-  const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
-  return { lock, retries, scope: scopeOf(gitCommonDir, opts.repoRoot), sleepMs, staleMs };
-}
-
-function lockWedgedError(lock: string, retries: number, sleepMs: number): Error {
-  return new Error(
-    `ensemble-ai: ${WORKTREE_LOCK_ERROR} at ${lock} after ${retries} attempts (${Math.round((retries * sleepMs) / 1000)}s) — another review is materializing a worktree in this repo`
-  );
-}
-
-// After a reclaim the lock is free — take it in THIS attempt rather than leaving it for a next
-// loop iteration that may not exist. A reclaim landing on the final retry would otherwise throw
-// "wedged" over a lock we just freed (code-review f5). A sibling that raced in ahead of us keeps
-// it: the re-create simply comes back contended and the caller waits its turn as before.
-function takeAfterReclaim(lock: string, token: string): LockRelease | null {
-  const created = tryCreate(lock, token);
-  return created === 'contended' ? null : created;
-}
-
-// The shared first half of an attempt: create, else read the holder. A LIVE (or unknown-pid)
-// holder is reclaimed by age alone once past the TTL; a DEAD holder goes through the scan.
-type AttemptPrelude = { settled: LockRelease | null } | { contend: Contention };
-function attemptPrelude(lock: string, token: string, staleMs: number): AttemptPrelude {
-  const created = tryCreate(lock, token);
-  if (created !== 'contended') return { settled: created };
-  const c = readContention(lock);
-  if (!c) return { settled: null };
-  if (c.dead) return { contend: c };
-  if (c.age > staleMs) {
-    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? 'unknown'})`);
-    return { settled: takeAfterReclaim(lock, token) };
-  }
-  return { settled: null };
-}
-
-// The shared dead-holder settle: an IDLE host reclaims at once; busy/unknown keep the TTL, whose
-// backstop reclaims once expired (the pre-existing behaviour — declared above).
-// A POSITIVELY detected writer (busy) is not reclaimed at the first TTL — it gets a second TTL
-// (2 × staleMs) before the backstop fires, so the backstop can never be faster than today's
-// while an in-lock git is visibly running; an unreadable scan keeps today's single TTL.
-export const BUSY_BACKSTOP_FACTOR = 2;
-function settleDeadHolder(lock: string, c: Contention, scan: InLockGitScan, staleMs: number): void {
-  if (decideDeadHolder(scan) === 'reclaim') {
-    reclaimContended(lock, c, `holder pid ${c.pid} was gone and no in-lock git process is running on this host`);
-    return;
-  }
-  const backstop = scan.unknown ? staleMs : BUSY_BACKSTOP_FACTOR * staleMs;
-  if (c.age > backstop) {
-    reclaimContended(
-      lock,
-      c,
-      `holder pid ${c.pid} was gone and the lock aged past ${scan.unknown ? 'the TTL' : `${BUSY_BACKSTOP_FACTOR}× the TTL`} (in-lock git state ${scan.unknown ? 'unknown' : 'busy'} — the backstop)`
-    );
-  }
-}
-
-// Per-waiter scan throttle (see SCAN_INTERVAL_MS).
-interface ScanCache {
-  at: number;
-  scan: InLockGitScan | null;
-  token: string | null; // the holder the scan was taken for — never reused for another holder
-}
-const fresh = (cache: ScanCache, held: string): InLockGitScan | null =>
-  cache.scan && cache.token === held && Date.now() - cache.at < SCAN_INTERVAL_MS ? cache.scan : null;
-
-// One acquire attempt, sync. An injected scanner that answers a Promise cannot be awaited here →
-// treated as unknown (the TTL rule), never as "idle". A settle that reclaimed frees the lock, so
-// it is re-created in-attempt (takeAfterReclaim); one that held leaves it, and the re-create
-// harmlessly comes back contended (null).
-function attemptSync(lock: string, token: string, staleMs: number, scope: LockScope, scanner: InLockGitScanner, cache: ScanCache): LockRelease | null {
-  const pre = attemptPrelude(lock, token, staleMs);
-  if ('settled' in pre) return pre.settled;
-  let scan = fresh(cache, pre.contend.held);
-  if (!scan) {
-    let scanned: InLockGitScan | Promise<InLockGitScan>;
-    try {
-      scanned = scanner(scope);
-    } catch (e) {
-      scanned = scanFailed(e);
-    }
-    if (scanned instanceof Promise) {
-      scanned.catch(() => {});
-      scan = UNKNOWN_SCAN;
-    } else {
-      scan = scanned;
-    }
-    cache.at = Date.now();
-    cache.scan = scan;
-    cache.token = pre.contend.held;
-  }
-  settleDeadHolder(lock, pre.contend, scan, staleMs);
-  return takeAfterReclaim(lock, token);
-}
-
-async function attemptAsync(lock: string, token: string, staleMs: number, scope: LockScope, scanner: InLockGitScanner, cache: ScanCache): Promise<LockRelease | null> {
-  const pre = attemptPrelude(lock, token, staleMs);
-  if ('settled' in pre) return pre.settled;
-  let scan = fresh(cache, pre.contend.held);
-  if (!scan) {
-    try {
-      scan = await scanner(scope);
-    } catch (e) {
-      scan = scanFailed(e);
-    }
-    cache.at = Date.now();
-    cache.scan = scan;
-    cache.token = pre.contend.held;
-  }
-  settleDeadHolder(lock, pre.contend, scan, staleMs);
-  return takeAfterReclaim(lock, token);
-}
-
-export function acquireRepoLock(gitCommonDir: string, opts: LockOpts = {}): LockRelease {
-  const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
-  const scanner = opts.scanner ?? scanInLockGit;
-  const token = lockToken();
-  const cache: ScanCache = { at: 0, scan: null, token: null };
-  for (let i = 0; i <= retries; i++) {
-    const release = attemptSync(lock, token, staleMs, scope, scanner, cache);
-    if (release) return release;
-    if (i === retries) break; // the budget is spent — don't sleep just to throw (r3, grok-f2)
-    sleepSync(sleepMs);
-  }
-  throw lockWedgedError(lock, retries, sleepMs);
-}
-
-export async function acquireRepoLockAsync(gitCommonDir: string, opts: LockOpts = {}): Promise<LockRelease> {
-  const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
-  const scanner = opts.scanner ?? scanInLockGitAsync;
-  const token = lockToken();
-  const cache: ScanCache = { at: 0, scan: null, token: null };
-  for (let i = 0; i <= retries; i++) {
-    const release = await attemptAsync(lock, token, staleMs, scope, scanner, cache);
-    if (release) return release;
-    if (i === retries) break; // the budget is spent — don't sleep just to throw (r3, grok-f2)
-    await sleepAsync(sleepMs);
-  }
-  throw lockWedgedError(lock, retries, sleepMs);
-}
-
-// Fetch the PR head by EXPLICIT url + ref, then add a detached worktree at it, then PROVE the
-// worktree's HEAD is the SHA the receipt is tied to. A mismatch ABORTS and reaps — never
-// proceed on wrong-SHA evidence (spec §9, grok-f1).
+// Fetch the PR head by EXPLICIT url + ref into a PRIVATE bare repo, add a detached worktree at it,
+// then PROVE the worktree's HEAD is the SHA the receipt is tied to. A mismatch ABORTS and reaps —
+// never proceed on wrong-SHA evidence (spec §9, grok-f1). Nothing in the user's shared checkout is
+// ever written: the private repo is a hardlink clone of its store, so N reviews run with no lock.
+//
+// NO --depth: the fetch stays non-shallow so every history READ on the review path keeps working.
+// The history packet runs `git log`/`git blame`/`git log base..head` in the worktree; a `--depth`
+// fetch writes a `shallow` graft that makes `--is-shallow-repository` true, and the packet then
+// SHORT-CIRCUITS to "no history" (history-packet.ts). The hardlink clone keeps the non-shallow
+// fetch cheap — it downloads only the objects the shared store lacks (the PR's own commits), the
+// same economics as the old fetch-into-shared-.git path — and a URL-only location (no shared store)
+// simply fetches the full ancestry, exactly as a clone would.
 export function materializeWorktree(
   args: { headSha: string; location: RepoLocation; pr: number; worktreeRoot?: string },
-  // `lock` is injected so the serialization can be exercised (and stubbed) independently of the
-  // real repo — the default IS the per-repo O_EXCL lock.
-  deps: { git: GitRun; lock?: (gitCommonDir: string) => () => void }
+  deps: { git: GitRun }
 ): PreflightError | Worktree {
   const { location } = args;
-  const common = deps.git(['rev-parse', '--git-common-dir'], { cwd: location.repoRoot });
-  if (!common.ok) {
-    return { kind: 'not-a-repo', message: `cannot resolve the git dir of ${location.repoRoot}` };
-  }
-  const gitCommonDir = path.resolve(location.repoRoot, common.text.trim());
-  // The default acquire is told the REAL command cwd so the scan can attribute this repo's writers;
-  // an injected test lock keeps the bare `(gitCommonDir) => release` seam.
-  const acquire = deps.lock ?? ((dir: string) => acquireRepoLock(dir, { repoRoot: location.repoRoot }));
-  const release = acquire(gitCommonDir);
-  let dir: string | null = null;
+  const shared = completeSharedStore(location.repoRoot, deps.git);
+  let parent: string | null = null;
   try {
+    // git creates the repo + worktree dirs itself, INSIDE an owner-only parent — never directly in a
+    // shared temp root (see WORKTREE_PARENT_PREFIX).
+    parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
+    const bare = path.join(parent, 'repo');
+    const created = deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
+    if (!created.ok) {
+      return { kind: 'materialize-failed', message: privateRepoFailure(shared, created.error) };
+    }
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -871,27 +620,23 @@ export function materializeWorktree(
         location.fetchUrl,
         `pull/${args.pr}/head`,
       ],
-      { cwd: location.repoRoot, env: INERT_ENV }
+      { cwd: bare, env: fetchEnv(location.repoRoot, bare, deps.git) }
     );
     if (!fetched.ok) {
-      return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
+      return {
+        kind: classifyGitError(fetched.error),
+        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`,
+      };
     }
-    // Materialize by SHA, not FETCH_HEAD: the fetch proved the object exists locally, and
-    // checking out the receipt's own headSha removes any window where FETCH_HEAD could have
-    // been rewritten by a concurrent fetch in the shared .git.
-    //
-    // git creates the worktree dir itself, so we hand it a path that does not exist yet — INSIDE
-    // an owner-only parent, never directly in a shared temp root (see WORKTREE_PARENT_PREFIX).
+    // Materialize by SHA, not FETCH_HEAD: the fetch proved the object exists locally, and checking
+    // out the receipt's own headSha removes any window where FETCH_HEAD could have drifted.
     //
     // Do NOT add --no-recurse-submodules here: `git worktree add` rejects it on every git ("unknown
-    // option" — it killed every real materialization until 2026-07-10). The inert posture holds
-    // without it; see the submodule bullet in this file's header.
-    touchLease(release); // lease refresh: the fetch completed, the age clock restarts
-    const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    dir = path.join(parent, 'head');
+    // option"). The inert posture holds without it; see the submodule bullet in this file's header.
+    const dir = path.join(parent, 'head');
     const added = deps.git(
       [...INERT_GIT_CONFIG, 'worktree', 'add', '--detach', dir, args.headSha],
-      { cwd: location.repoRoot, env: INERT_ENV }
+      { cwd: bare, env: INERT_ENV }
     );
     if (!added.ok) {
       const kind = /invalid reference|not a valid object|unknown revision/i.test(added.error)
@@ -899,81 +644,73 @@ export function materializeWorktree(
         : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
-    touchLease(release); // lease refresh: the add completed
-    const head = deps.git(['rev-parse', 'HEAD'], { cwd: dir });
+    const head = deps.git(['rev-parse', 'HEAD'], { cwd: dir, env: INERT_ENV });
     const actual = head.ok ? head.text.trim() : '';
     if (actual !== args.headSha) {
-      reapWorktree(location.repoRoot, dir, deps);
-      dir = null;
       return {
         kind: 'sha-mismatch',
         message: `worktree HEAD is ${actual || '(unresolvable)'} but the review is tied to ${args.headSha} — ABORTING rather than reviewing wrong-SHA evidence`,
       };
     }
     // STRIP AFTER the HEAD assert, BEFORE any seat can run: the assert proves we materialized the
-    // reviewed content, and the strip then removes the PR author's instruction channel from it. The
-    // working tree goes dirty; nothing depends on it being clean (the seats read files, and the
-    // range `git diff <base>...<head>` is a commit range, unaffected by the working tree).
+    // reviewed content, and the strip then removes the PR author's instruction channel from it.
     const made = {
       dir,
       headSha: args.headSha,
       strippedInstructionFiles: stripAgentInstructions(dir),
     };
-    dir = null; // ownership transfers to the caller's try/finally
+    parent = null; // ownership transfers to the caller's reap
     return made;
   } finally {
-    if (dir) reapWorktree(location.repoRoot, dir, deps);
-    release();
+    if (parent) reapParent(parent);
   }
 }
 
-// Reap: remove the worktree, then `prune` so a crash/SIGTERM path (dir gone, admin entry left)
-// self-heals on the next run. Never throws — reap is best-effort by contract.
-export function reapWorktree(repoRoot: string, dir: string, deps: { git: GitRun }): void {
+// ── Reap ──────────────────────────────────────────────────────────────
+
+// Remove an owner-only worktree parent and everything under it — the detached worktree AND the
+// private bare repo it was added from. NAME-CHECKED on the parent prefix so a caller that hands us
+// an unrelated directory can never make us delete its parent. Never throws — best-effort by contract.
+// Retried: the parent now holds a full checkout AND a fetched object store, so a transient
+// EBUSY/ENOTEMPTY mid-walk (an editor index, an AV scan) that aborted a single rm would leak both
+// (cross-vendor review of the original diff, claude-f2).
+const REAP_RM_OPTS = { force: true, maxRetries: 3, recursive: true, retryDelay: 50 } as const;
+function reapParent(parent: string): void {
+  if (!path.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    deps.git([...INERT_GIT_CONFIG, 'worktree', 'remove', '--force', dir], { cwd: repoRoot });
-  } catch {
-    /* best-effort */
-  }
-  try {
-    fs.rmSync(dir, { force: true, recursive: true });
-  } catch {
-    /* best-effort */
-  }
-  // The worktree lives inside the owner-only parent materializeWorktree created. Reap it too, or
-  // every run leaks an empty 0700 dir. NAME-CHECKED: a caller that hands us some other directory
-  // must never be able to make us delete that directory's parent.
-  try {
-    const parent = path.dirname(dir);
-    if (path.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
-      fs.rmSync(parent, { force: true, recursive: true });
-    }
-  } catch {
-    /* best-effort */
-  }
-  try {
-    deps.git([...INERT_GIT_CONFIG, 'worktree', 'prune'], { cwd: repoRoot });
+    fs.rmSync(parent, REAP_RM_OPTS);
   } catch {
     /* best-effort */
   }
 }
 
-// ── Async twins ───────────────────────────────────────────────────────────────────────
+// The session-level reap: given the worktree dir, remove its owner-only parent (worktree + private
+// repo together). Nothing was registered in the shared checkout, so there is no `git worktree prune`
+// to run. Idempotent (the rm is a no-op once the parent is gone) and never throws.
+export function reapWorktree(dir: string): void {
+  reapParent(path.dirname(dir));
+}
+
+// ── Async twins ────────────────────────────────────────────────────────
 //
 // The SAME materialization for a caller that must not block its event loop — a server
 // consumer discovered live (2026-07-17) that the sync path freezes every other request for
 // the length of a large checkout ("Updating files: 100% (760/760)" was the last log line
 // before a ~5-minute total outage). The heavy work always ran in child git processes; the
-// blockage was purely the *Sync spawn wrappers + the busy-wait sleep. These twins swap those
-// for their async forms and change NOTHING else: same step sequence (common-dir → lock →
-// fetch → add → HEAD assert → strip → release), same INERT_GIT_CONFIG/INERT_ENV, same error
-// taxonomy, same lock file via the shared tryCreate + attemptPrelude. worktree-parity.test.ts pins the
-// twins to identical git argv sequences and outcomes, so drift between them is a test
-// failure, not a code-review hope. The sync versions remain the CLI path (nothing else to
-// do while materializing) — this is one protocol with two waiting styles, not a fork.
+// blockage was purely the *Sync spawn wrappers. These twins swap those for their async forms
+// and change NOTHING else: same step sequence (common-dir → init → fetch → add → HEAD assert
+// → strip), same INERT_GIT_CONFIG/INERT_ENV, same error taxonomy, same private-repo isolation.
+// worktree-parity.test.ts pins the twins to identical git argv sequences and outcomes, so drift
+// between them is a test failure, not a code-review hope. The sync versions remain the CLI path
+// (nothing else to do while materializing) — this is one protocol with two waiting styles, not a fork.
 
-// CONTRACT: a consumer's async runner MUST bound every command (a GIT_TIMEOUT_MS-class timeout) —
-// the lock's live-holder TTL is derived from that bound (DEFAULT_LOCK_STALE_MS).
+// CONTRACT: a consumer's async runner MUST still bound every command (a GIT_TIMEOUT_MS-class
+// timeout) — an unbounded fetch would wedge a review the way the reviewer watchdog exists to prevent —
+// and MUST scrub the repository-selecting env (`scrubRepoEnv` in git-exec.ts) from the INHERITED
+// env BEFORE applying a command's own `env` — cwd is the only repo selector this materialization
+// means (an inherited GIT_DIR would point every private command back into the shared `.git`), and
+// the fetch's per-command transport config rides in that `env` (scrub first, then apply, as
+// execGit does — a scrub of the merged env would strip it).
 export type GitRunAsync = (
   args: string[],
   opts?: { cwd?: string; env?: Record<string, string> }
@@ -1024,30 +761,23 @@ export async function resolveRepoLocationAsync(
   };
 }
 
-// Async twin of materializeWorktree. The lock is HELD ACROSS the awaits — that is safe by
-// construction (the lock is a file; a sibling's O_EXCL create fails regardless of what this
-// thread is doing) and it is exactly the md#179 discipline: going async moves the WAITING off
-// the loop, never the fetch+add outside the lock. `release()` stays lexically in the
-// `finally`; a refactor that stores it for "later" would create the orphaned-lock class that
-// async holds get (wrongly) blamed for.
+// Async twin of materializeWorktree — same step sequence, same private-repo isolation, awaited git
+// + awaited fs. No lock: each review materializes into its own private repo, so a server can run N
+// concurrent materializations of one repo with nothing to serialize on.
 export async function materializeWorktreeAsync(
   args: { headSha: string; location: RepoLocation; pr: number; worktreeRoot?: string },
-  deps: {
-    git: GitRunAsync;
-    lock?: (gitCommonDir: string) => Promise<() => void> | (() => void);
-  }
+  deps: { git: GitRunAsync }
 ): Promise<PreflightError | Worktree> {
   const { location } = args;
-  const common = await deps.git(['rev-parse', '--git-common-dir'], { cwd: location.repoRoot });
-  if (!common.ok) {
-    return { kind: 'not-a-repo', message: `cannot resolve the git dir of ${location.repoRoot}` };
-  }
-  const gitCommonDir = path.resolve(location.repoRoot, common.text.trim());
-  // Same as the sync twin: hand the default acquire the real command cwd for attribution.
-  const acquire = deps.lock ?? ((dir: string) => acquireRepoLockAsync(dir, { repoRoot: location.repoRoot }));
-  const release = await acquire(gitCommonDir);
-  let dir: string | null = null;
+  const shared = await completeSharedStoreAsync(location.repoRoot, deps.git);
+  let parent: string | null = null;
   try {
+    parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
+    const bare = path.join(parent, 'repo');
+    const created = await deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
+    if (!created.ok) {
+      return { kind: 'materialize-failed', message: privateRepoFailure(shared, created.error) };
+    }
     const fetched = await deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -1058,18 +788,18 @@ export async function materializeWorktreeAsync(
         location.fetchUrl,
         `pull/${args.pr}/head`,
       ],
-      { cwd: location.repoRoot, env: INERT_ENV }
+      { cwd: bare, env: await fetchEnvAsync(location.repoRoot, bare, deps.git) }
     );
     if (!fetched.ok) {
-      return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
+      return {
+        kind: classifyGitError(fetched.error),
+        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`,
+      };
     }
-    // Materialize by SHA, not FETCH_HEAD — same reasoning as the sync twin above.
-    touchLease(release); // lease refresh: the fetch completed, the age clock restarts
-    const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    dir = path.join(parent, 'head');
+    const dir = path.join(parent, 'head');
     const added = await deps.git(
       [...INERT_GIT_CONFIG, 'worktree', 'add', '--detach', dir, args.headSha],
-      { cwd: location.repoRoot, env: INERT_ENV }
+      { cwd: bare, env: INERT_ENV }
     );
     if (!added.ok) {
       const kind = /invalid reference|not a valid object|unknown revision/i.test(added.error)
@@ -1077,12 +807,9 @@ export async function materializeWorktreeAsync(
         : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
-    touchLease(release); // lease refresh: the add completed
-    const head = await deps.git(['rev-parse', 'HEAD'], { cwd: dir });
+    const head = await deps.git(['rev-parse', 'HEAD'], { cwd: dir, env: INERT_ENV });
     const actual = head.ok ? head.text.trim() : '';
     if (actual !== args.headSha) {
-      await reapWorktreeAsync(location.repoRoot, dir, deps);
-      dir = null;
       return {
         kind: 'sha-mismatch',
         message: `worktree HEAD is ${actual || '(unresolvable)'} but the review is tied to ${args.headSha} — ABORTING rather than reviewing wrong-SHA evidence`,
@@ -1093,46 +820,56 @@ export async function materializeWorktreeAsync(
       headSha: args.headSha,
       strippedInstructionFiles: await stripAgentInstructionsAsync(dir),
     };
-    dir = null; // ownership transfers to the caller's try/finally
+    parent = null;
     return made;
   } finally {
-    if (dir) await reapWorktreeAsync(location.repoRoot, dir, deps);
-    release();
+    if (parent) await reapParentAsync(parent);
   }
 }
 
-// Async twin of reapWorktree — same steps, same best-effort contract, awaited git AND
-// awaited fs: the fallback cleanup is a recursive rm of a full checkout, which is exactly
-// as tree-sized as the git work — an rmSync here would block the loop for the seconds a
-// large tree takes to delete, on the failure path, which is when the server is already
-// having a bad time (cross-vendor review of this diff, codex-f1 — the first cut shipped
-// rmSync and the "no longer blocks the loop" claim was false).
-export async function reapWorktreeAsync(
+// Async twins of the store-probe + reap helpers — awaited fs so the failure path (an rm of a
+// full checkout) never blocks the loop either (cross-vendor review of the sync original, codex-f1:
+// an rmSync here would block the loop for the seconds a large tree takes to delete, on the failure
+// path, which is when the server is already having a bad time).
+async function completeSharedStoreAsync(repoRoot: string, git: GitRunAsync): Promise<string | null> {
+  const common = await git(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
+  if (!common.ok) return null;
+  const commonDir = path.resolve(repoRoot, common.text.trim());
+  const exists = (p: string): Promise<boolean> => fs.promises.access(p).then(() => true, () => false);
+  if (!(await exists(path.join(commonDir, 'objects')))) return null;
+  if (await exists(path.join(commonDir, 'shallow'))) return null;
+  if (await exists(path.join(commonDir, ALTERNATES_REL))) return null;
+  if ((await git(['config', '--get-regexp', PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot })).ok) return null;
+  return commonDir;
+}
+
+// Async twins of listTransportConfig / fetchEnv — same two effective views, same difference.
+async function listTransportConfigAsync(cwd: string, git: GitRunAsync): Promise<ConfigEntries> {
+  const listed = await git(['config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE], { cwd });
+  return listed.ok ? parseConfigList(listed.text) : [];
+}
+
+async function fetchEnvAsync(
   repoRoot: string,
-  dir: string,
-  deps: { git: GitRunAsync }
-): Promise<void> {
+  bare: string,
+  git: GitRunAsync
+): Promise<Record<string, string>> {
+  const want = await listTransportConfigAsync(repoRoot, git);
+  const missing = missingConfig(want, await listTransportConfigAsync(bare, git));
+  const ssh = effectiveSshFrom(want);
+  return { ...INERT_ENV, ...transportEnv(missing, ssh) };
+}
+
+async function reapParentAsync(parent: string): Promise<void> {
+  if (!path.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    await deps.git([...INERT_GIT_CONFIG, 'worktree', 'remove', '--force', dir], { cwd: repoRoot });
+    await fs.promises.rm(parent, REAP_RM_OPTS);
   } catch {
     /* best-effort */
   }
-  try {
-    await fs.promises.rm(dir, { force: true, recursive: true });
-  } catch {
-    /* best-effort */
-  }
-  try {
-    const parent = path.dirname(dir);
-    if (path.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
-      await fs.promises.rm(parent, { force: true, recursive: true });
-    }
-  } catch {
-    /* best-effort */
-  }
-  try {
-    await deps.git([...INERT_GIT_CONFIG, 'worktree', 'prune'], { cwd: repoRoot });
-  } catch {
-    /* best-effort */
-  }
+}
+
+// The async session-level reap — same contract as reapWorktree, awaited fs.
+export async function reapWorktreeAsync(dir: string): Promise<void> {
+  await reapParentAsync(path.dirname(dir));
 }

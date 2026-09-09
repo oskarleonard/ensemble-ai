@@ -1,14 +1,10 @@
-import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import {
-  acquireRepoLock,
-  acquireRepoLockAsync,
-  isHolderDead,
   materializeWorktree,
   materializeWorktreeAsync,
   resolveRepoLocation,
@@ -18,26 +14,15 @@ import {
   type GitRun,
   type GitRunAsync,
   type Worktree,
-  WORKTREE_LOCK_ERROR,
 } from './worktree';
-
-// A pid guaranteed gone: spawnSync waits for and REAPS the child before returning, so the pid
-// names an already-exited process (mirrors the helper in worktree.test.ts — no hard-coded pid).
-function reapedDeadPid(): number {
-  const r = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
-  if (typeof r.pid !== 'number') throw new Error('could not spawn a child to reap for a dead pid');
-  return r.pid;
-}
-
 
 // THE PARITY PIN. The async twins exist so a server consumer can materialize without freezing
 // its event loop (lived 2026-07-17: a sync 760-file checkout on a request path took a prod
 // dashboard dark for ~5 minutes). The design promise is "one protocol, two waiting styles —
-// NOT a fork": same git argv, same step order, same error taxonomy, same lock file. Prose
-// promised concurrency properties in this file before and was WRONG twice; this suite makes
-// the no-drift claim a test failure instead. Every scenario runs the sync twin and the async
-// twin against ONE scripted git and asserts the recorded argv sequences and outcomes are
-// identical.
+// NOT a fork": same git argv, same step order, same error taxonomy, same private-repo isolation.
+// Prose promised properties in this file before and was WRONG twice; this suite makes the
+// no-drift claim a test failure instead. Every scenario runs the sync twin and the async twin
+// against ONE scripted git and asserts the recorded argv sequences and outcomes are identical.
 
 type Scripted = { error?: string; match: (args: string[]) => boolean; text?: string };
 
@@ -110,19 +95,20 @@ function normalizeArgv(log: LoggedCall[]): LoggedCall[] {
 
 async function runBoth(script: Scripted[], worktreeRoot: string) {
   const { async_, asyncLog, sync, syncLog } = scriptedGit(script);
-  const noLock = () => () => {};
   const syncOut = materializeWorktree(
     { headSha: HEAD_SHA, location: LOCATION, pr: 7, worktreeRoot },
-    { git: sync, lock: noLock }
+    { git: sync }
   );
   const asyncOut = await materializeWorktreeAsync(
     { headSha: HEAD_SHA, location: LOCATION, pr: 7, worktreeRoot },
-    { git: async_, lock: noLock }
+    { git: async_ }
   );
   return { asyncLog, asyncOut, syncLog, syncOut };
 }
 
 describe('materializeWorktree twins — identical argv + outcome on every branch', () => {
+  // `--git-common-dir` → `.git`, so completeSharedStore looks for `/repo/.git/objects`, which does not
+  // exist under a fake /repo → no clone → the sequence stays git-only.
   const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'parity-'));
 
   it('success + strip: same sequence, same result shape', async () => {
@@ -140,18 +126,31 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
       headSha: HEAD_SHA,
       strippedInstructionFiles: [],
     });
-    // The sequence itself, pinned once: common-dir → fetch → add → HEAD assert — and the
-    // side-channel halves of the contract: fetch/add run in the repo root with the LFS
-    // kill-switch env; the HEAD assert runs in the WORKTREE, not the repo.
+    // The sequence itself, pinned once: common-dir → init --bare (explicit object format) → the two
+    // effective transport-config reads (checkout, then private repo) → fetch → add → HEAD assert —
+    // and the side-channel halves of the contract: init/fetch/add run with the LFS kill-switch env,
+    // fetch/add run in the PRIVATE bare repo (…/repo), the HEAD assert in the WORKTREE (…/head).
+    // The transport reads run UNCONDITIONALLY (auth is needed even with no clone — here the
+    // fake /repo has no shared store); nothing they find is ever written into the private repo.
     const flat = syncLog.map((c) => c.args.join(' '));
-    expect(flat).toHaveLength(4);
+    expect(flat).toHaveLength(7);
     expect(flat[0]).toBe('rev-parse --git-common-dir');
-    expect(flat[1]).toContain('fetch');
-    expect(flat[2]).toContain('worktree add');
-    expect(flat[3]).toBe('rev-parse HEAD');
-    expect(syncLog[1]).toMatchObject({ cwd: '/repo', lfsSkip: true });
-    expect(syncLog[2]).toMatchObject({ cwd: '/repo', lfsSkip: true });
-    expect(syncLog[3].cwd).toContain('head');
+    expect(flat[1]).toContain('init');
+    expect(flat[1]).toContain('--bare');
+    expect(flat[1]).toContain('--object-format=sha1');
+    expect(flat[2]).toContain('config --null --get-regexp');
+    expect(flat[3]).toContain('config --null --get-regexp');
+    expect(syncLog[3].cwd.endsWith('/repo')).toBe(true); // the private repo's own view
+    expect(flat[4]).toContain('fetch');
+    expect(flat[5]).toContain('worktree add');
+    expect(flat[6]).toBe('rev-parse HEAD');
+    expect(syncLog[1].lfsSkip).toBe(true); // init
+    expect(syncLog[4]).toMatchObject({ lfsSkip: true }); // fetch, in the private repo
+    expect(syncLog[4].cwd).toContain('ensemble-worktree-');
+    expect(syncLog[4].cwd.endsWith('/repo')).toBe(true);
+    expect(syncLog[5]).toMatchObject({ lfsSkip: true }); // worktree add, in the private repo
+    expect(syncLog[5].cwd.endsWith('/repo')).toBe(true);
+    expect(syncLog[6].cwd).toContain('head'); // HEAD assert, in the worktree
   });
 
   it('fetch failure: same error kind, and NEITHER twin reaches worktree add', async () => {
@@ -176,19 +175,17 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
     const { asyncLog, asyncOut, syncLog, syncOut } = await runBoth(script, tmp());
     expect(syncOut).toEqual(asyncOut);
     expect(syncOut).toMatchObject({ kind: 'no-such-pr' });
-    // Full sequence equality — the first cut asserted only non-emptiness here, leaving
-    // the one branch with no cleanup unpinned (grok-f2/claude-f3 on this diff's review).
+    // Full sequence equality — the reap is now a pure-fs remove of the private parent (nothing was
+    // registered in a shared checkout), so no `git worktree remove/prune` appears in either twin.
     expect(normalizeArgv(asyncLog)).toEqual(normalizeArgv(syncLog));
-    // And the cleanup pinned CONCRETELY, like the sha-mismatch case (r3, grok-f3): the
-    // finally-reap runs on add-failure too — remove + prune must both appear.
     for (const log of [syncLog, asyncLog]) {
       const flat = log.map((c) => c.args.join(' '));
-      expect(flat.some((s) => s.includes('worktree remove --force'))).toBe(true);
-      expect(flat.some((s) => s.includes('worktree prune'))).toBe(true);
+      expect(flat.some((s) => s.includes('worktree remove'))).toBe(false);
+      expect(flat.some((s) => s.includes('worktree prune'))).toBe(false);
     }
   });
 
-  it('sha-mismatch: both ABORT and both run the full reap sequence', async () => {
+  it('sha-mismatch: both ABORT and neither runs a git reap (pure-fs parent removal)', async () => {
     const script: Scripted[] = [
       { match: is('rev-parse', '--git-common-dir'), text: '.git' },
       { match: is('rev-parse', 'HEAD'), text: 'b'.repeat(40) },
@@ -198,8 +195,8 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
     expect(syncOut).toMatchObject({ kind: 'sha-mismatch' });
     for (const log of [syncLog, asyncLog]) {
       const flat = log.map((c) => c.args.join(' '));
-      expect(flat.some((s) => s.includes('worktree remove --force'))).toBe(true);
-      expect(flat.some((s) => s.includes('worktree prune'))).toBe(true);
+      expect(flat.some((s) => s.includes('worktree remove'))).toBe(false);
+      expect(flat.some((s) => s.includes('worktree prune'))).toBe(false);
     }
     expect(normalizeArgv(asyncLog)).toEqual(normalizeArgv(syncLog));
   });
@@ -276,154 +273,7 @@ describe('stripAgentInstructions twins', () => {
       expect(fs.existsSync(path.join(dir, 'src', 'keep.ts'))).toBe(true);
       expect(fs.existsSync(path.join(dir, 'CLAUDE.md'))).toBe(false);
       expect(fs.existsSync(path.join(dir, '.cursor', 'CLAUDE.md'))).toBe(false);
+      fs.rmSync(dir, { force: true, recursive: true });
     }
-  });
-});
-
-describe('a post-create failure never strands the lock (r3: the unanimous finding)', () => {
-  // The r2 fix guarded the write and left the trailing closeSync outside the recovery —
-  // the same strand class one line later, caught independently by all three vendors in r3.
-  // Both failure points are pinned: after EITHER throws, the lock file must be GONE (a
-  // stranded file would wedge every later acquire for the full staleMs).
-  it.each([['writeSync'], ['closeSync']] as const)(
-    'fs.%s failure after O_EXCL create unlinks the just-created lock',
-    async (fn) => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'strand-'));
-      const lock = path.join(dir, 'ensemble-ai-worktree.lock');
-      const spy = vi.spyOn(fs, fn).mockImplementationOnce(() => {
-        throw Object.assign(new Error('ENOSPC: fake'), { code: 'ENOSPC' });
-      });
-      try {
-        await expect(
-          acquireRepoLockAsync(dir, { retries: 0, sleepMs: 1 })
-        ).rejects.toThrow('ENOSPC');
-        expect(fs.existsSync(lock)).toBe(false);
-      } finally {
-        spy.mockRestore();
-      }
-      // And the very next acquire succeeds instantly — nothing was stranded.
-      (await acquireRepoLockAsync(dir, { retries: 0, sleepMs: 1 }))();
-    }
-  );
-});
-
-describe('real-lock wiring parity (no injected stub)', () => {
-  it('both twins acquire + RELEASE the real lock around a materialization', async () => {
-    // The other materialize cases inject a no-op lock, so a twin that dropped its lock
-    // wiring entirely would still pass them (r3, claude-f3). Here the scripted git points
-    // git-common-dir at a REAL temp dir and no lock is injected: success requires a real
-    // acquire, and a clean release leaves no lock file behind.
-    const common = fs.mkdtempSync(path.join(os.tmpdir(), 'lockwire-'));
-    const lockFile = path.join(common, 'ensemble-ai-worktree.lock');
-    const script: Scripted[] = [
-      { match: is('rev-parse', '--git-common-dir'), text: common },
-      { match: is('rev-parse', 'HEAD'), text: HEAD_SHA },
-    ];
-    const { async_, sync } = scriptedGit(script);
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'parity-'));
-    const syncOut = materializeWorktree(
-      { headSha: HEAD_SHA, location: LOCATION, pr: 7, worktreeRoot: root },
-      { git: sync }
-    );
-    expect(normalize(syncOut)).toMatchObject({ headSha: HEAD_SHA });
-    expect(fs.existsSync(lockFile)).toBe(false); // released, not stranded
-    const asyncOut = await materializeWorktreeAsync(
-      { headSha: HEAD_SHA, location: LOCATION, pr: 7, worktreeRoot: root },
-      { git: async_ }
-    );
-    expect(normalize(asyncOut)).toMatchObject({ headSha: HEAD_SHA });
-    expect(fs.existsSync(lockFile)).toBe(false);
-  });
-});
-
-describe('the acquire refuses to mistake a caller bug for contention', () => {
-  it('a nonexistent lock dir throws IMMEDIATELY (both styles), never a full-budget hang', async () => {
-    // Hermetic: a fresh mkdtemp parent guarantees the child path cannot pre-exist on the
-    // host (r2, codex-f2 — a fixed tmpdir path is host-state the test doesn't own).
-    const missing = path.join(
-      fs.mkdtempSync(path.join(os.tmpdir(), 'enoent-parity-')),
-      'definitely-missing',
-      'x'
-    );
-    // If these retried as contention they would take retries×sleep — the assertion is that
-    // they throw the real errno at once (claude-f4: a bare catch made every errno look
-    // like a held lock, a multi-minute hang at server defaults — DEFAULT_LOCK_STALE_MS).
-    expect(() => acquireRepoLock(missing, { retries: 1000, sleepMs: 50 })).toThrow(/ENOENT/);
-    await expect(
-      acquireRepoLockAsync(missing, { retries: 1000, sleepMs: 50 })
-    ).rejects.toThrow(/ENOENT/);
-  });
-});
-
-describe('acquireRepoLockAsync — same file, same protocol, loop-friendly wait', () => {
-  const lockDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'lock-parity-'));
-
-  it('holds across awaits: a contender still loses while the holder is mid-await', async () => {
-    const dir = lockDir();
-    const release = await acquireRepoLockAsync(dir, { retries: 2, sleepMs: 5 });
-    // The holder now awaits — the exact window the old comment claimed was unsafe.
-    await new Promise((r) => setTimeout(r, 20));
-    await expect(
-      acquireRepoLockAsync(dir, { retries: 2, sleepMs: 5 })
-    ).rejects.toThrow(WORKTREE_LOCK_ERROR);
-    // And the SYNC acquire loses to an async holder the same way — mixed holders interoperate.
-    expect(() => acquireRepoLock(dir, { retries: 2, sleepMs: 5 })).toThrow(WORKTREE_LOCK_ERROR);
-    release();
-    // Released → immediately acquirable again, by either style.
-    (await acquireRepoLockAsync(dir, { retries: 0, sleepMs: 1 }))();
-    acquireRepoLock(dir, { retries: 0, sleepMs: 1 })();
-  });
-
-  it('reclaims a stale holder exactly like the sync acquire', async () => {
-    const dir = lockDir();
-    const lock = path.join(dir, 'ensemble-ai-worktree.lock');
-    fs.writeFileSync(lock, 'dead-holder');
-    const past = new Date(Date.now() - 60_000);
-    fs.utimesSync(lock, past, past);
-    const release = await acquireRepoLockAsync(dir, { retries: 3, sleepMs: 5, staleMs: 1000 });
-    expect(fs.readFileSync(lock, 'utf8')).not.toBe('dead-holder');
-    release();
-    expect(fs.existsSync(lock)).toBe(false);
-  });
-
-  it('token-owned release: never deletes a lock it no longer owns', async () => {
-    const dir = lockDir();
-    const lock = path.join(dir, 'ensemble-ai-worktree.lock');
-    const release = await acquireRepoLockAsync(dir, { retries: 0, sleepMs: 1 });
-    fs.writeFileSync(lock, 'someone-else'); // simulate a reclaim-and-replace
-    release();
-    expect(fs.readFileSync(lock, 'utf8')).toBe('someone-else');
-  });
-
-  // Parity for the dead-holder reclaim: the async twin must reclaim a lock whose holder pid is
-  // dead REGARDLESS of the TTL, exactly like the sync acquire (worktree.test.ts). Both share
-  // attemptPrelude today, but that shared path is precisely what this suite exists to pin — a
-  // future fork of the EEXIST branch in only one acquire must fail here, not ship green.
-  it('settles a dead holder exactly like the sync acquire: idle host → reclaim; busy → TTL', async () => {
-    const dir = lockDir();
-    const lock = path.join(dir, 'ensemble-ai-worktree.lock');
-    const dead = reapedDeadPid();
-    expect(isHolderDead(dead)).toBe(true); // precondition: the reaped child really is gone
-    fs.writeFileSync(lock, `${dead}:crashed-provisioning`);
-    // Busy (an in-lock git somewhere on the host): held, the TTL rule applies — parity with sync.
-    await expect(
-      acquireRepoLockAsync(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner: async () => ({ busy: true, unknown: false }) })
-    ).rejects.toThrow(/could not acquire the worktree lock/);
-    // Idle: reclaimed at once — through the NON-blocking async path (the scanner answers a Promise).
-    const release = await acquireRepoLockAsync(dir, { retries: 3, sleepMs: 1, staleMs: 60 * 60_000, scanner: async () => ({ busy: false, unknown: false }) });
-    expect(fs.readFileSync(lock, 'utf8')).not.toContain('crashed-provisioning');
-    release();
-    expect(fs.existsSync(lock)).toBe(false);
-  });
-
-  it('waits its turn without blocking: acquires after the holder releases mid-wait', async () => {
-    const dir = lockDir();
-    const release = await acquireRepoLockAsync(dir, { retries: 0, sleepMs: 1 });
-    const contender = acquireRepoLockAsync(dir, { retries: 40, sleepMs: 10 });
-    // Release while the contender is between attempts — only possible to observe because its
-    // wait yields the loop (the sync acquire could never run this timer from the same thread).
-    setTimeout(() => release(), 30);
-    const release2 = await contender;
-    release2();
   });
 });

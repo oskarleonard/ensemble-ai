@@ -54,6 +54,14 @@ describe('renderCodexSandboxProfile FAILS CLOSED on an unsafe read root', () => 
     worktree: '/private/tmp/wt',
   };
 
+  it('denies WRITES on the review parent (worktree + hardlink-cloned private repo) AFTER the tmp write grant', () => {
+    const profile = renderCodexSandboxProfile(ok);
+    const deny = `(deny file-write* (subpath ${JSON.stringify(path.dirname(ok.worktree))}))`;
+    expect(profile).toContain(deny);
+    // Last match wins in SBPL: the deny must FOLLOW the blanket write grant to override it.
+    expect(profile.indexOf(deny)).toBeGreaterThan(profile.indexOf('(allow file-write*'));
+  });
+
   it('renders when every root is safe', () => {
     expect(renderCodexSandboxProfile(ok)).toContain('(deny default)');
   });

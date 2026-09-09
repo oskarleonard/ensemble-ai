@@ -1884,6 +1884,13 @@ function renderCodexSandboxProfile(p) {
 (allow file-read* (subpath ${JSON.stringify(p.worktree)}))
 (allow file-read* (subpath ${JSON.stringify(p.codexHome)}))
 (allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath ${JSON.stringify(SANDBOX_WRITABLE_TMP)}) (subpath "/dev"))
+;; Never WRITE the review's private parent (the worktree AND the private repo beside it). The private
+;; repo is a HARDLINK clone of the user's own object store \u2014 its pack files share inodes with the
+;; user's real .git \u2014 so a write there would reach past the $HOME fence and corrupt the user's repo.
+;; The parent normally sits under the per-user $TMPDIR, which is read-only here anyway; this deny
+;; makes that a property of the profile rather than of TMPDIR (cross-vendor review, claude-f3).
+;; Last match wins in SBPL, so this overrides the /private/tmp write grant above.
+(deny file-write* (subpath ${JSON.stringify(path4.dirname(p.worktree))}))
 (allow network-outbound (remote ip "localhost:${p.proxyPort}") (remote unix-socket (path-literal ${JSON.stringify(MDNS_RESPONDER_SOCKET)})))
 (allow network-inbound (local ip "*:*"))
 `;
@@ -2378,14 +2385,66 @@ function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
 
 // src/modes/review/gate-hunks.ts
 import fs11 from "fs";
-import path9 from "path";
+import path10 from "path";
 
 // src/modes/review/trail-io.ts
 import fs10 from "fs";
 import path8 from "path";
 
 // src/modes/review/diff.ts
+import { execFileSync as execFileSync4 } from "child_process";
+
+// src/modes/review/git-exec.ts
 import { execFileSync as execFileSync3 } from "child_process";
+import path9 from "path";
+function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
+  const cmd = configured?.trim();
+  if (!cmd) return "ssh -o BatchMode=yes";
+  const bin = path9.basename(cmd.split(/\s+/)[0]);
+  return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
+}
+var GIT_MAX_BUFFER = 64 * 1024 * 1024;
+var REPO_LOCATION_ENV = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_IMPLICIT_WORK_TREE",
+  "GIT_NAMESPACE",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_INDEX_FILE",
+  // A repo also selects itself through these, so cwd is not the only selector unless they go too
+  // (cross-vendor review, codex-f2 · claude-f2): GIT_CONFIG forces a single config file — it would
+  // make the private repo's `config --local`/`--get-regexp` read the wrong file and reshape the
+  // effectiveSshCommand probe; GIT_SHALLOW_FILE / GIT_GRAFT_FILE rewrite the object graph (an
+  // inherited GIT_SHALLOW_FILE makes the fully-fetched private repo report itself shallow, so the
+  // history packet discards `git log`/`git blame`); GIT_CONFIG_PARAMETERS injects arbitrary config
+  // that could re-enable `core.hooksPath` or `url.<base>.insteadOf`, defeating the inert 'explicit
+  // URL' posture. NOT GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM — the transport carry relies on the
+  // user's global credentials still being inherited.
+  "GIT_CONFIG",
+  "GIT_SHALLOW_FILE",
+  "GIT_GRAFT_FILE",
+  "GIT_CONFIG_PARAMETERS",
+  // Discovery can be stopped short of the private repo by an inherited ceiling — same class.
+  "GIT_CEILING_DIRECTORIES",
+  // An inherited GIT_REPLACE_REF_BASE reshapes the object graph the same way GIT_SHALLOW_FILE does:
+  // point it at a namespace whose cloned `<base>/<headSha>` ref maps to another commit and `worktree
+  // add` checks out the REPLACEMENT tree while `rev-parse HEAD` still reports the original SHA — the
+  // HEAD assertion then passes on wrong content. Scrubbed here; replace refs carried IN the cloned
+  // store are separately neutralized by GIT_NO_REPLACE_OBJECTS in worktree.ts's INERT_ENV
+  // (cross-vendor review of the lock removal, codex-f2).
+  "GIT_REPLACE_REF_BASE"
+];
+var CONFIG_INJECTION_ENV_RE = /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/;
+function scrubRepoEnv(env) {
+  const out = { ...env };
+  for (const key of REPO_LOCATION_ENV) delete out[key];
+  for (const key of Object.keys(out)) if (CONFIG_INJECTION_ENV_RE.test(key)) delete out[key];
+  return out;
+}
+
+// src/modes/review/diff.ts
 var DEFAULT_COVERAGE_CEILING = 2e5;
 var GENERATED_PATTERNS = [
   /(^|\/)package-lock\.json$/,
@@ -2535,9 +2594,11 @@ function diffDigest(raw) {
   return `sha256:${sha256Hex(canonicalizeDiff(raw))}`;
 }
 function git(cwd, args, opts) {
-  return execFileSync3("git", args, {
+  return execFileSync4("git", args, {
     cwd,
     encoding: "utf8",
+    env: scrubRepoEnv(process.env),
+    // cwd is the only repo selector — same rule as execGit
     stdio: opts?.quiet ? ["ignore", "pipe", "ignore"] : ["pipe", "pipe", "inherit"]
   });
 }
@@ -2641,21 +2702,8 @@ function persistGatePacket(baseDir, runId, input) {
 }
 
 // src/modes/review/worktree.ts
-import * as childProcess from "child_process";
-import { randomUUID } from "crypto";
 import fs12 from "fs";
 import path11 from "path";
-import { setTimeout as sleepAsync } from "timers/promises";
-import { promisify } from "util";
-
-// src/modes/review/git-exec.ts
-import { execFileSync as execFileSync4 } from "child_process";
-import path10 from "path";
-var GIT_TIMEOUT_MS = 6e5;
-var GIT_MAX_BUFFER = 64 * 1024 * 1024;
-
-// src/modes/review/worktree.ts
-var WORKTREE_LOCK_ERROR = "could not acquire the worktree lock";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
 }
@@ -2742,16 +2790,18 @@ var INERT_GIT_CONFIG = [
   "-c",
   "filter.lfs.required=false",
   // No detached auto-gc: `git fetch` otherwise forks `git gc --auto --detach`, which is DESIGNED to
-  // outlive its parent and keeps mutating the shared object store after the fetch returns — a writer
-  // the dead-holder scan cannot see (it carries no inert signature) and that the reap never bounds.
+  // outlive its parent. The fetch now runs in the private bare repo, so that gc would keep mutating
+  // (and could still be running when `reapParent` removes) a repo the reap otherwise fully bounds —
+  // a straggler process racing the teardown. Disabling it keeps the private repo's lifetime the
+  // reap's to own.
   "-c",
   "gc.auto=0"
 ];
-var INERT_ENV = { GIT_LFS_SKIP_SMUDGE: "1" };
-var WORKTREE_PARENT_PREFIX = "ensemble-worktree-";
-function repoLockPath(gitCommonDir) {
-  return path11.join(gitCommonDir, "ensemble-ai-worktree.lock");
+var INERT_ENV = { GIT_LFS_SKIP_SMUDGE: "1", GIT_NO_REPLACE_OBJECTS: "1" };
+function objectFormatFlag(headSha) {
+  return `--object-format=${headSha.length === 64 ? "sha256" : "sha1"}`;
 }
+var WORKTREE_PARENT_PREFIX = "ensemble-worktree-";
 var AGENT_INSTRUCTION_NAMES = ["CLAUDE.md", "AGENTS.md", ".claude"];
 var CURSOR_DIR = ".cursor";
 var CURSOR_RULES = "rules";
@@ -2852,277 +2902,86 @@ async function stripAgentInstructionsAsync(dir) {
 function isStrippedPath(p, stripped) {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
-function lockToken() {
-  return `${process.pid}:${randomUUID()}`;
+var PARTIAL_CLONE_CONFIG_RE = "^(extensions\\.partialclone|remote\\..*\\.promisor)$";
+var ALTERNATES_REL = path11.join("objects", "info", "alternates");
+function completeSharedStore(repoRoot, git2) {
+  const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
+  if (!common.ok) return null;
+  const commonDir = path11.resolve(repoRoot, common.text.trim());
+  if (!fs12.existsSync(path11.join(commonDir, "objects"))) return null;
+  if (fs12.existsSync(path11.join(commonDir, "shallow"))) return null;
+  if (fs12.existsSync(path11.join(commonDir, ALTERNATES_REL))) return null;
+  if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
+  return commonDir;
 }
-function removeLockIfOwned(lock, token) {
-  try {
-    if (fs12.readFileSync(lock, "utf8").trim() === token) {
-      fs12.unlinkSync(lock);
-      return true;
-    }
-  } catch {
+function privateRepoFailure(shared, error) {
+  return `${shared ? "git clone --bare --local" : "git init --bare"} failed: ${error.trim()}`;
+}
+function createPrivateRepoArgs(shared, bare, headSha) {
+  return shared ? [...INERT_GIT_CONFIG, "-c", "protocol.file.allow=always", "clone", "--quiet", "--bare", "--local", shared, bare] : [...INERT_GIT_CONFIG, "init", "--bare", objectFormatFlag(headSha), bare];
+}
+var TRANSPORT_CONFIG_RE = "^(core\\.sshcommand|credential\\.|http\\.|url\\.)";
+function missingConfig(want, have) {
+  const pool = have.map(([k, v]) => `${k}
+${v}`);
+  const out = [];
+  for (const [k, v] of want) {
+    const i = pool.indexOf(`${k}
+${v}`);
+    if (i >= 0) pool.splice(i, 1);
+    else out.push([k, v]);
   }
-  return false;
+  return out;
 }
-function holderPidFromToken(token) {
-  const m = /^(\d+):/.exec(token);
-  if (!m) return null;
-  const pid = Number(m[1]);
-  return Number.isInteger(pid) && pid > 0 ? pid : null;
-}
-function isHolderDead(pid) {
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch (e) {
-    return e.code === "ESRCH";
+function transportEnv(entries, sshCommand) {
+  const env = {};
+  if (entries.length > 0) {
+    env.GIT_CONFIG_COUNT = String(entries.length);
+    entries.forEach(([k, v], i) => {
+      env[`GIT_CONFIG_KEY_${i}`] = k;
+      env[`GIT_CONFIG_VALUE_${i}`] = v;
+    });
   }
-}
-var IN_LOCK_GIT_SIGNATURE = "core.hooksPath=/dev/null";
-var PS_ARGS = ["-axo", "pid=,ppid=,command="];
-var EXEC_OPTS = { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 5e3 };
-var SCAN_INTERVAL_MS = 5e3;
-var SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
-function sleepSync(ms) {
-  Atomics.wait(SLEEP_BUF, 0, 0, ms);
-}
-function parseProcessTable(psOutput) {
-  const rows = [];
-  for (const line of psOutput.split("\n")) {
-    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
-    if (m) rows.push({ cmd: m[3], pid: Number(m[1]), ppid: Number(m[2]) });
+  if (sshCommand && !process.env.GIT_SSH_COMMAND) {
+    env.GIT_SSH_COMMAND = nonInteractiveSshCommand(sshCommand) ?? sshCommand;
   }
-  return rows;
+  return env;
 }
-function inLockGitCandidates(table) {
-  return table.filter(
-    (r) => r.pid !== process.pid && /(^|[\s/])git\s/.test(r.cmd) && r.cmd.includes(IN_LOCK_GIT_SIGNATURE)
-  );
+function effectiveSshFrom(entries) {
+  let value;
+  for (const [k, v] of entries) if (k === "core.sshcommand") value = v;
+  return value;
 }
-var UNKNOWN_SCAN = { busy: false, unknown: true };
-var scanFailureLogged = false;
-function scanFailed(e) {
-  if (!scanFailureLogged) {
-    scanFailureLogged = true;
-    const why = e instanceof Error ? e.message : String(e);
-    process.stderr.write(
-      `\u26A0 ensemble-ai: could not scan for in-lock git processes (${why}) \u2014 dead-holder reclaim falls back to the TTL
-`
-    );
+function listTransportConfig(cwd, git2) {
+  const listed = git2(["config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE], { cwd });
+  return listed.ok ? parseConfigList(listed.text) : [];
+}
+function fetchEnv(repoRoot, bare, git2) {
+  const want = listTransportConfig(repoRoot, git2);
+  const missing = missingConfig(want, listTransportConfig(bare, git2));
+  const ssh = effectiveSshFrom(want);
+  return { ...INERT_ENV, ...transportEnv(missing, ssh) };
+}
+function parseConfigList(text) {
+  const out = [];
+  for (const entry of text.split("\0")) {
+    const nl = entry.indexOf("\n");
+    if (nl < 0) continue;
+    out.push([entry.slice(0, nl), entry.slice(nl + 1)]);
   }
-  return UNKNOWN_SCAN;
-}
-function scanInLockGit(_scope) {
-  try {
-    const table = parseProcessTable(childProcess.execFileSync("ps", PS_ARGS, EXEC_OPTS));
-    return { busy: inLockGitCandidates(table).length > 0, unknown: false };
-  } catch (e) {
-    return scanFailed(e);
-  }
-}
-async function scanInLockGitAsync(_scope) {
-  try {
-    const ps = await promisify(childProcess.execFile)("ps", PS_ARGS, EXEC_OPTS);
-    return { busy: inLockGitCandidates(parseProcessTable(ps.stdout)).length > 0, unknown: false };
-  } catch (e) {
-    return scanFailed(e);
-  }
-}
-function decideDeadHolder(scan) {
-  return scan.unknown || scan.busy ? "ttl" : "reclaim";
-}
-var DEFAULT_LOCK_STALE_MS = GIT_TIMEOUT_MS + 5 * 6e4;
-function touchLockIfOwned(lock, token) {
-  try {
-    if (fs12.readFileSync(lock, "utf8").trim() !== token) return false;
-    const now = /* @__PURE__ */ new Date();
-    fs12.utimesSync(lock, now, now);
-    return true;
-  } catch {
-    return false;
-  }
-}
-function makeRelease(lock, token) {
-  const release = () => {
-    removeLockIfOwned(lock, token);
-  };
-  return Object.assign(release, { touch: () => touchLockIfOwned(lock, token) });
-}
-function touchLease(release) {
-  release.touch?.();
-}
-function tryCreate(lock, token) {
-  let fd;
-  try {
-    fd = fs12.openSync(lock, fs12.constants.O_CREAT | fs12.constants.O_EXCL | fs12.constants.O_WRONLY, 384);
-  } catch (e) {
-    if (e.code === "EEXIST") return "contended";
-    throw e;
-  }
-  try {
-    fs12.writeSync(fd, token);
-    fs12.closeSync(fd);
-  } catch (we) {
-    try {
-      fs12.closeSync(fd);
-    } catch {
-    }
-    try {
-      fs12.unlinkSync(lock);
-    } catch {
-    }
-    throw we;
-  }
-  return makeRelease(lock, token);
-}
-function readContention(lock) {
-  try {
-    const held = fs12.readFileSync(lock, "utf8").trim();
-    const pid = holderPidFromToken(held);
-    return {
-      age: Date.now() - fs12.statSync(lock).mtimeMs,
-      dead: pid !== null && isHolderDead(pid),
-      held,
-      pid
-    };
-  } catch {
-    return null;
-  }
-}
-function reclaimContended(lock, c, why) {
-  const reclaimed = removeLockIfOwned(lock, c.held);
-  if (reclaimed) process.stderr.write(`\u26A0 ensemble-ai: reclaimed worktree lock at ${lock} \u2014 ${why}
-`);
-  return reclaimed;
-}
-function scopeOf(gitCommonDir, repoRoot) {
-  const derived = path11.basename(gitCommonDir) === ".git" ? path11.dirname(gitCommonDir) : gitCommonDir;
-  return { gitCommonDir, repoRoot: repoRoot ?? derived };
-}
-function lockPathAndBudget(gitCommonDir, opts) {
-  const lock = repoLockPath(gitCommonDir);
-  const sleepMs = Math.max(1, opts.sleepMs ?? 500);
-  const staleMs = opts.staleMs ?? DEFAULT_LOCK_STALE_MS;
-  const retries = opts.retries ?? Math.ceil(staleMs / sleepMs);
-  return { lock, retries, scope: scopeOf(gitCommonDir, opts.repoRoot), sleepMs, staleMs };
-}
-function lockWedgedError(lock, retries, sleepMs) {
-  return new Error(
-    `ensemble-ai: ${WORKTREE_LOCK_ERROR} at ${lock} after ${retries} attempts (${Math.round(retries * sleepMs / 1e3)}s) \u2014 another review is materializing a worktree in this repo`
-  );
-}
-function takeAfterReclaim(lock, token) {
-  const created = tryCreate(lock, token);
-  return created === "contended" ? null : created;
-}
-function attemptPrelude(lock, token, staleMs) {
-  const created = tryCreate(lock, token);
-  if (created !== "contended") return { settled: created };
-  const c = readContention(lock);
-  if (!c) return { settled: null };
-  if (c.dead) return { contend: c };
-  if (c.age > staleMs) {
-    reclaimContended(lock, c, `the lock aged past the TTL (holder pid ${c.pid ?? "unknown"})`);
-    return { settled: takeAfterReclaim(lock, token) };
-  }
-  return { settled: null };
-}
-var BUSY_BACKSTOP_FACTOR = 2;
-function settleDeadHolder(lock, c, scan, staleMs) {
-  if (decideDeadHolder(scan) === "reclaim") {
-    reclaimContended(lock, c, `holder pid ${c.pid} was gone and no in-lock git process is running on this host`);
-    return;
-  }
-  const backstop = scan.unknown ? staleMs : BUSY_BACKSTOP_FACTOR * staleMs;
-  if (c.age > backstop) {
-    reclaimContended(
-      lock,
-      c,
-      `holder pid ${c.pid} was gone and the lock aged past ${scan.unknown ? "the TTL" : `${BUSY_BACKSTOP_FACTOR}\xD7 the TTL`} (in-lock git state ${scan.unknown ? "unknown" : "busy"} \u2014 the backstop)`
-    );
-  }
-}
-var fresh = (cache, held) => cache.scan && cache.token === held && Date.now() - cache.at < SCAN_INTERVAL_MS ? cache.scan : null;
-function attemptSync(lock, token, staleMs, scope, scanner, cache) {
-  const pre = attemptPrelude(lock, token, staleMs);
-  if ("settled" in pre) return pre.settled;
-  let scan = fresh(cache, pre.contend.held);
-  if (!scan) {
-    let scanned;
-    try {
-      scanned = scanner(scope);
-    } catch (e) {
-      scanned = scanFailed(e);
-    }
-    if (scanned instanceof Promise) {
-      scanned.catch(() => {
-      });
-      scan = UNKNOWN_SCAN;
-    } else {
-      scan = scanned;
-    }
-    cache.at = Date.now();
-    cache.scan = scan;
-    cache.token = pre.contend.held;
-  }
-  settleDeadHolder(lock, pre.contend, scan, staleMs);
-  return takeAfterReclaim(lock, token);
-}
-async function attemptAsync(lock, token, staleMs, scope, scanner, cache) {
-  const pre = attemptPrelude(lock, token, staleMs);
-  if ("settled" in pre) return pre.settled;
-  let scan = fresh(cache, pre.contend.held);
-  if (!scan) {
-    try {
-      scan = await scanner(scope);
-    } catch (e) {
-      scan = scanFailed(e);
-    }
-    cache.at = Date.now();
-    cache.scan = scan;
-    cache.token = pre.contend.held;
-  }
-  settleDeadHolder(lock, pre.contend, scan, staleMs);
-  return takeAfterReclaim(lock, token);
-}
-function acquireRepoLock(gitCommonDir, opts = {}) {
-  const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
-  const scanner = opts.scanner ?? scanInLockGit;
-  const token = lockToken();
-  const cache = { at: 0, scan: null, token: null };
-  for (let i = 0; i <= retries; i++) {
-    const release = attemptSync(lock, token, staleMs, scope, scanner, cache);
-    if (release) return release;
-    if (i === retries) break;
-    sleepSync(sleepMs);
-  }
-  throw lockWedgedError(lock, retries, sleepMs);
-}
-async function acquireRepoLockAsync(gitCommonDir, opts = {}) {
-  const { lock, retries, scope, sleepMs, staleMs } = lockPathAndBudget(gitCommonDir, opts);
-  const scanner = opts.scanner ?? scanInLockGitAsync;
-  const token = lockToken();
-  const cache = { at: 0, scan: null, token: null };
-  for (let i = 0; i <= retries; i++) {
-    const release = await attemptAsync(lock, token, staleMs, scope, scanner, cache);
-    if (release) return release;
-    if (i === retries) break;
-    await sleepAsync(sleepMs);
-  }
-  throw lockWedgedError(lock, retries, sleepMs);
+  return out;
 }
 function materializeWorktree(args, deps) {
   const { location } = args;
-  const common = deps.git(["rev-parse", "--git-common-dir"], { cwd: location.repoRoot });
-  if (!common.ok) {
-    return { kind: "not-a-repo", message: `cannot resolve the git dir of ${location.repoRoot}` };
-  }
-  const gitCommonDir = path11.resolve(location.repoRoot, common.text.trim());
-  const acquire = deps.lock ?? ((dir2) => acquireRepoLock(dir2, { repoRoot: location.repoRoot }));
-  const release = acquire(gitCommonDir);
-  let dir = null;
+  const shared = completeSharedStore(location.repoRoot, deps.git);
+  let parent = null;
   try {
+    parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
+    const bare = path11.join(parent, "repo");
+    const created = deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
+    if (!created.ok) {
+      return { kind: "materialize-failed", message: privateRepoFailure(shared, created.error) };
+    }
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -3133,28 +2992,26 @@ function materializeWorktree(args, deps) {
         location.fetchUrl,
         `pull/${args.pr}/head`
       ],
-      { cwd: location.repoRoot, env: INERT_ENV }
+      { cwd: bare, env: fetchEnv(location.repoRoot, bare, deps.git) }
     );
     if (!fetched.ok) {
-      return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
+      return {
+        kind: classifyGitError(fetched.error),
+        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
+      };
     }
-    touchLease(release);
-    const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    dir = path11.join(parent, "head");
+    const dir = path11.join(parent, "head");
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
-      { cwd: location.repoRoot, env: INERT_ENV }
+      { cwd: bare, env: INERT_ENV }
     );
     if (!added.ok) {
       const kind = /invalid reference|not a valid object|unknown revision/i.test(added.error) ? "no-such-pr" : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
-    touchLease(release);
-    const head = deps.git(["rev-parse", "HEAD"], { cwd: dir });
+    const head = deps.git(["rev-parse", "HEAD"], { cwd: dir, env: INERT_ENV });
     const actual = head.ok ? head.text.trim() : "";
     if (actual !== args.headSha) {
-      reapWorktree(location.repoRoot, dir, deps);
-      dir = null;
       return {
         kind: "sha-mismatch",
         message: `worktree HEAD is ${actual || "(unresolvable)"} but the review is tied to ${args.headSha} \u2014 ABORTING rather than reviewing wrong-SHA evidence`
@@ -3165,33 +3022,22 @@ function materializeWorktree(args, deps) {
       headSha: args.headSha,
       strippedInstructionFiles: stripAgentInstructions(dir)
     };
-    dir = null;
+    parent = null;
     return made;
   } finally {
-    if (dir) reapWorktree(location.repoRoot, dir, deps);
-    release();
+    if (parent) reapParent(parent);
   }
 }
-function reapWorktree(repoRoot, dir, deps) {
+var REAP_RM_OPTS = { force: true, maxRetries: 3, recursive: true, retryDelay: 50 };
+function reapParent(parent) {
+  if (!path11.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    deps.git([...INERT_GIT_CONFIG, "worktree", "remove", "--force", dir], { cwd: repoRoot });
+    fs12.rmSync(parent, REAP_RM_OPTS);
   } catch {
   }
-  try {
-    fs12.rmSync(dir, { force: true, recursive: true });
-  } catch {
-  }
-  try {
-    const parent = path11.dirname(dir);
-    if (path11.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
-      fs12.rmSync(parent, { force: true, recursive: true });
-    }
-  } catch {
-  }
-  try {
-    deps.git([...INERT_GIT_CONFIG, "worktree", "prune"], { cwd: repoRoot });
-  } catch {
-  }
+}
+function reapWorktree(dir) {
+  reapParent(path11.dirname(dir));
 }
 async function resolveRepoLocationAsync(args, deps) {
   const repoPath = path11.resolve(args.repoPath);
@@ -3229,15 +3075,15 @@ async function resolveRepoLocationAsync(args, deps) {
 }
 async function materializeWorktreeAsync(args, deps) {
   const { location } = args;
-  const common = await deps.git(["rev-parse", "--git-common-dir"], { cwd: location.repoRoot });
-  if (!common.ok) {
-    return { kind: "not-a-repo", message: `cannot resolve the git dir of ${location.repoRoot}` };
-  }
-  const gitCommonDir = path11.resolve(location.repoRoot, common.text.trim());
-  const acquire = deps.lock ?? ((dir2) => acquireRepoLockAsync(dir2, { repoRoot: location.repoRoot }));
-  const release = await acquire(gitCommonDir);
-  let dir = null;
+  const shared = await completeSharedStoreAsync(location.repoRoot, deps.git);
+  let parent = null;
   try {
+    parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
+    const bare = path11.join(parent, "repo");
+    const created = await deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
+    if (!created.ok) {
+      return { kind: "materialize-failed", message: privateRepoFailure(shared, created.error) };
+    }
     const fetched = await deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -3248,28 +3094,26 @@ async function materializeWorktreeAsync(args, deps) {
         location.fetchUrl,
         `pull/${args.pr}/head`
       ],
-      { cwd: location.repoRoot, env: INERT_ENV }
+      { cwd: bare, env: await fetchEnvAsync(location.repoRoot, bare, deps.git) }
     );
     if (!fetched.ok) {
-      return { kind: classifyGitError(fetched.error), message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}` };
+      return {
+        kind: classifyGitError(fetched.error),
+        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
+      };
     }
-    touchLease(release);
-    const parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    dir = path11.join(parent, "head");
+    const dir = path11.join(parent, "head");
     const added = await deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
-      { cwd: location.repoRoot, env: INERT_ENV }
+      { cwd: bare, env: INERT_ENV }
     );
     if (!added.ok) {
       const kind = /invalid reference|not a valid object|unknown revision/i.test(added.error) ? "no-such-pr" : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
-    touchLease(release);
-    const head = await deps.git(["rev-parse", "HEAD"], { cwd: dir });
+    const head = await deps.git(["rev-parse", "HEAD"], { cwd: dir, env: INERT_ENV });
     const actual = head.ok ? head.text.trim() : "";
     if (actual !== args.headSha) {
-      await reapWorktreeAsync(location.repoRoot, dir, deps);
-      dir = null;
       return {
         kind: "sha-mismatch",
         message: `worktree HEAD is ${actual || "(unresolvable)"} but the review is tied to ${args.headSha} \u2014 ABORTING rather than reviewing wrong-SHA evidence`
@@ -3280,33 +3124,42 @@ async function materializeWorktreeAsync(args, deps) {
       headSha: args.headSha,
       strippedInstructionFiles: await stripAgentInstructionsAsync(dir)
     };
-    dir = null;
+    parent = null;
     return made;
   } finally {
-    if (dir) await reapWorktreeAsync(location.repoRoot, dir, deps);
-    release();
+    if (parent) await reapParentAsync(parent);
   }
 }
-async function reapWorktreeAsync(repoRoot, dir, deps) {
+async function completeSharedStoreAsync(repoRoot, git2) {
+  const common = await git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
+  if (!common.ok) return null;
+  const commonDir = path11.resolve(repoRoot, common.text.trim());
+  const exists = (p) => fs12.promises.access(p).then(() => true, () => false);
+  if (!await exists(path11.join(commonDir, "objects"))) return null;
+  if (await exists(path11.join(commonDir, "shallow"))) return null;
+  if (await exists(path11.join(commonDir, ALTERNATES_REL))) return null;
+  if ((await git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot })).ok) return null;
+  return commonDir;
+}
+async function listTransportConfigAsync(cwd, git2) {
+  const listed = await git2(["config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE], { cwd });
+  return listed.ok ? parseConfigList(listed.text) : [];
+}
+async function fetchEnvAsync(repoRoot, bare, git2) {
+  const want = await listTransportConfigAsync(repoRoot, git2);
+  const missing = missingConfig(want, await listTransportConfigAsync(bare, git2));
+  const ssh = effectiveSshFrom(want);
+  return { ...INERT_ENV, ...transportEnv(missing, ssh) };
+}
+async function reapParentAsync(parent) {
+  if (!path11.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    await deps.git([...INERT_GIT_CONFIG, "worktree", "remove", "--force", dir], { cwd: repoRoot });
+    await fs12.promises.rm(parent, REAP_RM_OPTS);
   } catch {
   }
-  try {
-    await fs12.promises.rm(dir, { force: true, recursive: true });
-  } catch {
-  }
-  try {
-    const parent = path11.dirname(dir);
-    if (path11.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) {
-      await fs12.promises.rm(parent, { force: true, recursive: true });
-    }
-  } catch {
-  }
-  try {
-    await deps.git([...INERT_GIT_CONFIG, "worktree", "prune"], { cwd: repoRoot });
-  } catch {
-  }
+}
+async function reapWorktreeAsync(dir) {
+  await reapParentAsync(path11.dirname(dir));
 }
 
 // src/modes/review/history-packet.ts
@@ -5348,8 +5201,8 @@ function stageReview(payload, target, deps) {
   if (!head.ok) return { error: `could not read the PR head: ${head.error}`, kind: "gh-failed", ok: false };
   const liveHead = head.text.trim();
   if (!liveHead) return { error: "the PR head SHA came back empty", kind: "unreadable", ok: false };
-  const fresh2 = checkFreshness(deps.reviewedHeadSha, liveHead);
-  if (!fresh2.ok) return { error: fresh2.error, kind: "head-moved", ok: false };
+  const fresh = checkFreshness(deps.reviewedHeadSha, liveHead);
+  if (!fresh.ok) return { error: fresh.error, kind: "head-moved", ok: false };
   const list = run(["api", apiPath(target, "/reviews"), "--paginate"]);
   if (!list.ok) return { error: `could not list PR reviews: ${list.error}`, kind: "gh-failed", ok: false };
   let pending;
@@ -6263,7 +6116,6 @@ function isImplemented(mode) {
 }
 export {
   AGENT_INSTRUCTION_NAMES,
-  BUSY_BACKSTOP_FACTOR,
   CI_EVIDENCE_BOTH_REASON,
   CI_EVIDENCE_LIMITS,
   CI_EVIDENCE_SECTION_TITLE,
@@ -6282,7 +6134,6 @@ export {
   CORE_WORKTREE_REVIEW_TIMEOUT_MS,
   CRITIQUE_STANCES,
   DEFAULT_COVERAGE_CEILING,
-  DEFAULT_LOCK_STALE_MS,
   DEFAULT_OBJECTIVE,
   DEFAULT_POSTURE,
   DEFAULT_VOICE_TIMEOUT_MS,
@@ -6339,10 +6190,7 @@ export {
   VOICE_ADAPTERS,
   VOICE_DEFAULTS,
   VOICE_IDS,
-  WORKTREE_LOCK_ERROR,
   acquireDiff,
-  acquireRepoLock,
-  acquireRepoLockAsync,
   allowedRootsFromConfig,
   applyHolisticPolicy,
   asRecord2 as asRecord,
@@ -6371,11 +6219,11 @@ export {
   consult_exports as consult,
   coverageCounts,
   coverageShortfall,
-  decideDeadHolder,
   defaultCodexSandboxPaths,
   defaultReceiptStore,
   defuseUntrusted,
   diffDigest,
+  effectiveSshFrom,
   ensureSandboxProfile,
   escapesRoot,
   evaluatePushFence,
@@ -6397,10 +6245,8 @@ export {
   gatherConventions,
   hasDepSurface,
   hasGeneratedHeader,
-  holderPidFromToken,
   holisticCapWasLifted,
   homeReadDenyRules,
-  inLockGitCandidates,
   isCommitSha,
   isConventionsDoc,
   isCoreReviewerId,
@@ -6408,7 +6254,6 @@ export {
   isEnsembleStagedReview,
   isEvidenceClass,
   isEvidenceSeat,
-  isHolderDead,
   isHolisticRecord,
   isImplemented,
   isMode,
@@ -6441,6 +6286,7 @@ export {
   materializedDiffClause,
   meetsInlineFloor,
   memoryConventionReader,
+  missingConfig,
   omittedLine,
   oneOf,
   parseConventionCitation,
@@ -6451,7 +6297,6 @@ export {
   parseHolisticSites,
   parseIdeas,
   parseLsTree,
-  parseProcessTable,
   parsePushContext,
   parseReviewSummaries,
   parseReviewerIds,
@@ -6477,7 +6322,6 @@ export {
   receiptPolicyVersion,
   redactUrlCredentials,
   remoteSlug,
-  removeLockIfOwned,
   renderCodeReviewSeatPrompt,
   renderCodexSandboxProfile,
   renderCritiquePrompt,
@@ -6521,8 +6365,6 @@ export {
   sanitizePathSegment,
   scanDependencySurface,
   scanDiffForSecrets,
-  scanInLockGit,
-  scanInLockGitAsync,
   scanTextForSecrets,
   scoreHolisticFixture,
   section,
@@ -6536,7 +6378,7 @@ export {
   stripTrailingCommas,
   summarizeCoverage,
   titleCase,
-  touchLockIfOwned,
+  transportEnv,
   validateReceiptShape,
   verifyFixtureAnchors,
   verifySiteAtHead,

@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 
 import { sha256Hex } from '../../core/hash';
+import { scrubRepoEnv } from './git-exec';
 
 // Diff acquisition + the canonical-diff content digest + per-file COVERAGE.
 //
@@ -283,6 +284,7 @@ function git(cwd: string, args: string[], opts?: { quiet?: boolean }): string {
   return execFileSync('git', args, {
     cwd,
     encoding: 'utf8',
+    env: scrubRepoEnv(process.env), // cwd is the only repo selector — same rule as execGit
     stdio: opts?.quiet ? ['ignore', 'pipe', 'ignore'] : ['pipe', 'pipe', 'inherit'],
   });
 }

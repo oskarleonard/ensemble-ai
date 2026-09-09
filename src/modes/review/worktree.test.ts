@@ -1,43 +1,25 @@
-import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { execGit, GIT_TIMEOUT_MS } from './git-exec';
+import { execGit } from './git-exec';
 import {
-  acquireRepoLock,
   classifyGitError,
-  decideDeadHolder,
-  DEFAULT_LOCK_STALE_MS,
-  holderPidFromToken,
-  inLockGitCandidates,
-  isHolderDead,
+  effectiveSshFrom,
   isPreflightError,
   materializeWorktree,
-  parseProcessTable,
+  missingConfig,
   reapWorktree,
   redactUrlCredentials,
   remoteSlug,
-  removeLockIfOwned,
   resolveRepoLocation,
   rootAllowed,
-  scanInLockGit,
-  scanInLockGitAsync,
-  type GitRun,
+  transportEnv,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
+  type GitRun,
 } from './worktree';
-
-// A pid that is guaranteed to be gone: spawnSync waits for and REAPS the child before it returns,
-// so the returned pid names a process that has already exited. Used to plant a lock whose holder is
-// dead without hard-coding a pid the OS might actually be running.
-function reapedDeadPid(): number {
-  const r = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
-  if (typeof r.pid !== 'number') throw new Error('could not spawn a child to reap for a dead pid');
-  return r.pid;
-}
-
 
 // The clause is the in-file half of the instruction fence (the strip closes the FILE half). Since
 // the CI evidence section landed, a seat also reads text a CI job PRINTED — the same untrusted
@@ -132,298 +114,6 @@ describe('error taxonomy — a named cause, never a generic git failure', () => 
   });
 });
 
-describe('acquireRepoLock — a holder may only ever remove ITS OWN lock', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-lock-'));
-  afterAll(() => fs.rmSync(tmp, { force: true, recursive: true }));
-
-  const lockPath = (dir: string) => path.join(dir, 'ensemble-ai-worktree.lock');
-
-  const freshDir = () => fs.mkdtempSync(path.join(tmp, 'gitdir-'));
-
-  it('serializes: a second acquire fails once the retry budget is spent', () => {
-    const dir = freshDir();
-    const release = acquireRepoLock(dir);
-    expect(fs.existsSync(lockPath(dir))).toBe(true);
-    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1 })).toThrow(
-      /could not acquire the worktree lock/
-    );
-    release();
-    expect(fs.existsSync(lockPath(dir))).toBe(false);
-  });
-
-  // THE RECLAIM RACE. A stalls past the TTL; B reclaims and takes the lock; A finally releases.
-  // A blind unlink here would delete B's LIVE lock and let a third process in while B is still
-  // writing to the shared .git — exactly the corruption the lock exists to prevent.
-  it("a stalled holder's release() does NOT delete the lock a reclaimer now holds", () => {
-    const dir = freshDir();
-    const releaseA = acquireRepoLock(dir, { staleMs: 0 }); // A holds
-    const tokenA = fs.readFileSync(lockPath(dir), 'utf8');
-
-    // B sees the lock as stale (staleMs 0), reclaims it, and takes it.
-    const releaseB = acquireRepoLock(dir, { retries: 5, sleepMs: 1, staleMs: 0 });
-    const tokenB = fs.readFileSync(lockPath(dir), 'utf8');
-    expect(tokenB).not.toBe(tokenA);
-
-    releaseA(); // the stalled holder wakes up and releases
-    expect(fs.existsSync(lockPath(dir))).toBe(true); // B's lock SURVIVES
-    expect(fs.readFileSync(lockPath(dir), 'utf8')).toBe(tokenB);
-
-    releaseB();
-    expect(fs.existsSync(lockPath(dir))).toBe(false);
-  });
-
-  it('reclaims a genuinely stale lock left by a crashed run', () => {
-    const dir = freshDir();
-    fs.writeFileSync(lockPath(dir), 'crashed-run:deadbeef');
-    const old = Date.now() - 60 * 60_000;
-    fs.utimesSync(lockPath(dir), old / 1000, old / 1000);
-    const release = acquireRepoLock(dir, { retries: 2, sleepMs: 1 });
-    expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-run');
-    release();
-  });
-
-  it('release is idempotent and never throws', () => {
-    const dir = freshDir();
-    const release = acquireRepoLock(dir);
-    release();
-    expect(() => release()).not.toThrow();
-  });
-
-  // A budget shorter than the TTL could never reach the reclaim branch, so a sibling doing a slow
-  // (but healthy) fetch would be reported as wedged.
-  it('waits at least the staleness TTL by default, so the reclaim branch is reachable', () => {
-    const dir = freshDir();
-    const release = acquireRepoLock(dir);
-    expect(() => acquireRepoLock(dir, { retries: 0, sleepMs: 1 })).toThrow(/0s/);
-    release();
-  });
-
-  // THE DEAD-HOLDER RECLAIM (incident 2026-08-31): a provisioning that DIED holding the lock can
-  // never release, so waiting out the full TTL wedges every sibling against a corpse. A dead pid
-  // alone proves nothing (its git child may still be writing, #83 review), so the reclaim asks the
-  // host: no in-lock git running anywhere → reclaim now; busy or unknown → the TTL rule.
-  const deadLock = (dir: string) => {
-    const dead = reapedDeadPid();
-    expect(isHolderDead(dead)).toBe(true); // precondition: the reaped child really is gone
-    fs.writeFileSync(lockPath(dir), `${dead}:crashed-provisioning`); // fresh mtime by construction
-  };
-
-  it('reclaims a dead-pid lock at once when the host runs no in-lock git (fresh mtime, long TTL)', () => {
-    const dir = freshDir();
-    deadLock(dir);
-    const release = acquireRepoLock(dir, { retries: 3, sleepMs: 1, staleMs: 60 * 60_000, scanner: () => ({ busy: false, unknown: false }) });
-    expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-provisioning');
-    release();
-    expect(fs.existsSync(lockPath(dir))).toBe(false);
-  });
-
-  it('holds a dead-pid lock while ANY in-lock git runs on the host — the TTL rule, then its backstop', () => {
-    const dir = freshDir();
-    deadLock(dir);
-    const scanner = () => ({ busy: true, unknown: false });
-    expect(() =>
-      acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner })
-    ).toThrow(/could not acquire the worktree lock/);
-    expect(fs.readFileSync(lockPath(dir), 'utf8')).toContain('crashed-provisioning'); // untouched
-    // A positively detected writer gets a SECOND TTL before the backstop: past 1× it is still held…
-    const past1 = new Date(Date.now() - 1_500);
-    fs.utimesSync(lockPath(dir), past1, past1);
-    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 1_000, scanner })).toThrow(
-      /could not acquire the worktree lock/
-    );
-    // …past 2× the backstop reclaims (bounded, never faster than today's TTL while busy).
-    const past2 = new Date(Date.now() - 60_000);
-    fs.utimesSync(lockPath(dir), past2, past2);
-    const release = acquireRepoLock(dir, { retries: 2, sleepMs: 1, staleMs: 1_000, scanner });
-    expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toContain('crashed-provisioning');
-    release();
-  });
-
-  it('a cached scan is never reused for a DIFFERENT holder (keyed by the observed token)', () => {
-    const dir = freshDir();
-    deadLock(dir);
-    let scans = 0;
-    const scanner = () => {
-      scans += 1;
-      return { busy: true, unknown: false };
-    };
-    expect(() => acquireRepoLock(dir, { retries: 2, sleepMs: 1, staleMs: 60 * 60_000, scanner })).toThrow(
-      /could not acquire the worktree lock/
-    );
-    expect(scans).toBe(1);
-    // The same waiter cannot be re-entered, but a NEW dead holder within 5 s must re-scan: prove
-    // it through the exported decision + a second acquire whose cache starts empty (per waiter).
-    const dead2 = reapedDeadPid();
-    fs.writeFileSync(lockPath(dir), `${dead2}:another-crash`);
-    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner })).toThrow(
-      /could not acquire the worktree lock/
-    );
-    expect(scans).toBe(2);
-    fs.unlinkSync(lockPath(dir));
-  });
-
-  it('an UNKNOWN scan (ps unavailable) keeps the TTL rule — never "idle"', () => {
-    const dir = freshDir();
-    deadLock(dir);
-    expect(() =>
-      acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner: () => ({ busy: false, unknown: true }) })
-    ).toThrow(/could not acquire the worktree lock/);
-    fs.unlinkSync(lockPath(dir));
-  });
-
-  it('the sync acquire treats a Promise-returning scanner as unknown (it cannot await)', () => {
-    const dir = freshDir();
-    deadLock(dir);
-    expect(() =>
-      acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner: async () => ({ busy: false, unknown: false }) })
-    ).toThrow(/could not acquire the worktree lock/);
-    fs.unlinkSync(lockPath(dir));
-  });
-
-  it('the sync acquire swallows a REJECTING async scanner instead of leaking an unhandled rejection', () => {
-    const dir = freshDir();
-    deadLock(dir);
-    expect(() =>
-      acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000, scanner: () => Promise.reject(new Error('boom')) })
-    ).toThrow(/could not acquire the worktree lock/);
-    fs.unlinkSync(lockPath(dir));
-  });
-
-  it('a busy scan is reused within one waiter for a few seconds, not re-forked every retry', () => {
-    const dir = freshDir();
-    deadLock(dir);
-    let scans = 0;
-    const scanner = () => {
-      scans += 1;
-      return ({ busy: true, unknown: false });
-    };
-    expect(() => acquireRepoLock(dir, { retries: 20, sleepMs: 1, staleMs: 60 * 60_000, scanner })).toThrow(
-      /could not acquire the worktree lock/
-    );
-    expect(scans).toBe(1);
-    fs.unlinkSync(lockPath(dir));
-  });
-
-  // The pure classifier behind the live scanners: only a `git` carrying this module's
-  // inert-config signature counts, and never this process itself.
-  it('parseProcessTable / inLockGitCandidates pick out in-lock git by its signature', () => {
-    const sig = 'git -c core.hooksPath=/dev/null -c filter.lfs.smudge= fetch --no-tags origin pull/7/head';
-    const table = parseProcessTable(
-      [
-        `  100     1 ${sig}`,
-        `  101  4242 /usr/local/bin/git -c core.hooksPath=/dev/null worktree add --detach /tmp/x abc`,
-        `  ${process.pid}     1 ${sig}`, // this process → never a candidate
-        '  105     1 /usr/bin/git status', // no signature → ignored
-        '  106     1 node something core.hooksPath=/dev/null', // not git → ignored
-      ].join('\n')
-    );
-    expect(inLockGitCandidates(table).map((r) => r.pid)).toEqual([100, 101]);
-    expect(decideDeadHolder(({ busy: true, unknown: false }))).toBe('ttl');
-    expect(decideDeadHolder(({ busy: false, unknown: true }))).toBe('ttl');
-    expect(decideDeadHolder(({ busy: false, unknown: false }))).toBe('reclaim');
-    expect(parseProcessTable('')).toEqual([]);
-  });
-
-  it('the live scanners run the real ps and answer a scan shape (sync + async)', async () => {
-    const scope = { gitCommonDir: path.join(freshDir(), '.git'), repoRoot: freshDir() };
-    const a = scanInLockGit(scope);
-    expect(typeof a.busy).toBe('boolean');
-    expect(typeof a.unknown).toBe('boolean');
-    const b = await scanInLockGitAsync(scope);
-    expect(typeof b.busy).toBe('boolean');
-  });
-
-  // The lease: the holder refreshes the lock after each completed in-lock op through its own
-  // release handle, which proves the EXACT token — a lock it no longer holds is never re-leased.
-  it('release.touch refreshes the lock only while this exact token holds it', () => {
-    const dir = freshDir();
-    const release = acquireRepoLock(dir);
-    const past = new Date(Date.now() - 60 * 60_000);
-    fs.utimesSync(lockPath(dir), past, past);
-    expect(release.touch()).toBe(true);
-    expect(Date.now() - fs.statSync(lockPath(dir)).mtimeMs).toBeLessThan(10_000);
-    fs.writeFileSync(lockPath(dir), `${process.pid}:someone-else-same-pid`); // same pid, other token
-    fs.utimesSync(lockPath(dir), past, past);
-    expect(release.touch()).toBe(false);
-    expect(Math.abs(fs.statSync(lockPath(dir)).mtimeMs - past.getTime())).toBeLessThan(2_000);
-    fs.unlinkSync(lockPath(dir));
-    expect(release.touch()).toBe(false); // no lock → silent no-op
-  });
-
-  // The hold-duration invariant, structural: a live holder's lock is never older than one git op
-  // (leased per op), and the default TTL clears one op's timeout with margin.
-  it('the default live-holder TTL clears one git op timeout', () => {
-    expect(DEFAULT_LOCK_STALE_MS).toBeGreaterThan(GIT_TIMEOUT_MS);
-  });
-
-  // The mirror case: a LIVE holder keeps the TTL rule. This process is alive, so its lock must not
-  // be reclaimed before the mtime TTL — the acquire waits out its budget and reports wedged.
-  it('does NOT reclaim a lock whose holder pid is alive before the TTL', () => {
-    const dir = freshDir();
-    const live = `${process.pid}:live-holder`; // process.pid is this test runner — alive
-    fs.writeFileSync(lockPath(dir), live);
-    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000 })).toThrow(
-      /could not acquire the worktree lock/
-    );
-    expect(fs.readFileSync(lockPath(dir), 'utf8')).toBe(live); // untouched
-    fs.unlinkSync(lockPath(dir));
-  });
-
-  // A token with no parseable pid gives no life/death signal, so it falls back to the mtime TTL:
-  // fresh ⇒ not reclaimed; aged past the TTL ⇒ reclaimed exactly as before this change.
-  it('a token with no parseable pid falls back to the mtime TTL rule', () => {
-    const dir = freshDir();
-    fs.writeFileSync(lockPath(dir), 'no-pid-here'); // fresh mtime, unparseable pid
-    expect(() => acquireRepoLock(dir, { retries: 1, sleepMs: 1, staleMs: 60 * 60_000 })).toThrow(
-      /could not acquire the worktree lock/
-    );
-    const old = Date.now() - 60 * 60_000;
-    fs.utimesSync(lockPath(dir), old / 1000, old / 1000);
-    const release = acquireRepoLock(dir, { retries: 2, sleepMs: 1, staleMs: 10 * 60_000 });
-    expect(fs.readFileSync(lockPath(dir), 'utf8')).not.toBe('no-pid-here');
-    release();
-  });
-});
-
-describe('holderPidFromToken — the holder pid a lock token records', () => {
-  it('parses the leading pid a real token carries', () => {
-    expect(holderPidFromToken(`${process.pid}:0f1e-2d3c`)).toBe(process.pid);
-  });
-  it('returns null for a token with no leading positive-integer pid', () => {
-    expect(holderPidFromToken('crashed-run:deadbeef')).toBeNull();
-    expect(holderPidFromToken('')).toBeNull();
-    expect(holderPidFromToken('0:x')).toBeNull(); // pid 0 is not a real holder
-  });
-});
-
-describe('isHolderDead — probes a pid without signalling it', () => {
-  it('reports this live process as alive', () => {
-    expect(isHolderDead(process.pid)).toBe(false);
-  });
-  it('reports a reaped child pid as dead', () => {
-    expect(isHolderDead(reapedDeadPid())).toBe(true);
-  });
-});
-
-// The ownership guard is what makes the dead-holder reclaim safe: even after observing a stale
-// token, removeLockIfOwned re-reads the file and removes it ONLY if it still carries that exact
-// token — so a holder that released and a third party's fresh lock are never deleted.
-describe('removeLockIfOwned — a token that changed since observe is never removed', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-owned-'));
-  afterAll(() => fs.rmSync(tmp, { force: true, recursive: true }));
-
-  it('leaves a lock whose token changed between observe and unlink in place', () => {
-    const lock = path.join(tmp, 'ensemble-ai-worktree.lock');
-    fs.writeFileSync(lock, 'reclaimer-token'); // a third party's fresh lock now sits here
-    removeLockIfOwned(lock, 'stale-observed-token'); // we observed a DIFFERENT token
-    expect(fs.existsSync(lock)).toBe(true);
-    expect(fs.readFileSync(lock, 'utf8')).toBe('reclaimer-token');
-    // and it DOES remove a lock still carrying the exact token we observed
-    removeLockIfOwned(lock, 'reclaimer-token');
-    expect(fs.existsSync(lock)).toBe(false);
-  });
-});
-
 describe('allowed-repo-roots (pin 5) — consumer config, never engine-baked', () => {
   it('no configured roots ⇒ the engine declares NO policy ⇒ allow', () => {
     expect(rootAllowed('/anywhere/at/all', null)).toBe(true);
@@ -491,12 +181,12 @@ describe('repo-location pre-flight — fails closed with a legible cause', () =>
   });
 });
 
-describe('materialization hardening — untrusted content is checked out INERT', () => {
+describe('materialization hardening — untrusted content is checked out INERT into a private repo', () => {
   const location = { fetchUrl: 'https://github.com/o/r.git', repoRoot: '/repo', slug: 'o/r' };
   const headSha = 'a'.repeat(40);
 
-  const noLock = () => () => {};
-
+  // A mock git that reports NO shared checkout (`--git-common-dir` → a path with no objects/), so no
+  // clone happens and the materialize proceeds purely through the scripted git.
   function harness(headOut: string) {
     const calls: string[][] = [];
     const git: GitRun = ((args: string[], opts?: { env?: Record<string, string> }) => {
@@ -512,17 +202,32 @@ describe('materialization hardening — untrusted content is checked out INERT',
 
   it('fetches by EXPLICIT url + ref — never assumes `origin` exposes pull/N/head', () => {
     const { calls, git } = harness(headSha);
-    materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git, lock: noLock });
+    materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git });
     const fetch = calls.find((c) => c.includes('fetch'));
     expect(fetch).toContain('https://github.com/o/r.git');
     expect(fetch).toContain('pull/7/head');
     expect(fetch).not.toContain('origin');
+    // Never shallow: the fetch carries no --depth, so history reads keep working (history-packet.ts).
+    expect(fetch).not.toContain('--depth');
+  });
+
+  it('creates the worktree from a PRIVATE bare repo (init --bare), never the shared checkout', () => {
+    const { calls, git } = harness(headSha);
+    const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git });
+    expect(isPreflightError(res)).toBe(false);
+    const init = calls.find((c) => c.includes('init'));
+    expect(init).toContain('--bare');
+    // fetch + worktree add run in the PRIVATE bare repo (…/repo), never in /repo (the shared checkout).
+    const bare = (init as string[])[init!.length - 1];
+    expect(path.basename(bare)).toBe('repo');
+    expect(path.basename(path.dirname(bare)).startsWith('ensemble-worktree-')).toBe(true);
+    reapWorktree((res as { dir: string }).dir);
   });
 
   it('every git call disables hooks and neuters the LFS filters (so .lfsconfig is never honored)', () => {
     const { calls, git } = harness(headSha);
-    materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git, lock: noLock });
-    for (const name of ['fetch', 'worktree']) {
+    const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git });
+    for (const name of ['init', 'fetch', 'worktree']) {
       const call = calls.find((c) => c.includes(name));
       expect(call, name).toContain('core.hooksPath=/dev/null');
       expect(call, name).toContain('filter.lfs.smudge=');
@@ -530,11 +235,12 @@ describe('materialization hardening — untrusted content is checked out INERT',
     }
     const env = calls.find((c) => c[0]?.startsWith('ENV:'));
     expect(env?.[0]).toContain('GIT_LFS_SKIP_SMUDGE');
+    reapWorktree((res as { dir: string }).dir);
   });
 
   it('never recurses submodules on fetch — and never passes the flag to worktree add', () => {
     const { calls, git } = harness(headSha);
-    materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git, lock: noLock });
+    const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git });
     expect(calls.find((c) => c.includes('fetch'))).toContain('--no-recurse-submodules');
     // `git worktree add` REJECTS --no-recurse-submodules on every git version (it is a
     // fetch/clone/checkout flag) — passing it killed every real materialization with
@@ -543,16 +249,49 @@ describe('materialization hardening — untrusted content is checked out INERT',
     expect(calls.find((c) => c.includes('worktree') && c.includes('add'))).not.toContain(
       '--no-recurse-submodules'
     );
+    reapWorktree((res as { dir: string }).dir);
+  });
+
+  // The fetch-failure message interpolates the redacted url AND appends git's OWN stderr, which
+  // echoes the remote (with any inline token) back inside a sentence. Both halves must be redacted,
+  // or the appended stderr leaks the credential into the printed + persisted trail.
+  it('redacts an inline credential echoed by git`s fetch stderr, not just the interpolated url', () => {
+    const secretUrl = 'https://ghp_SECRETTOKEN@github.com/o/r.git';
+    const git: GitRun = ((args: string[]) => {
+      if (args[0] === 'rev-parse' && args[1] === '--git-common-dir') return ok('/repo/.git');
+      if (args.includes('fetch')) {
+        return err(
+          "fatal: could not read Username for 'https://ghp_SECRETTOKEN@github.com': terminal prompts disabled"
+        );
+      }
+      return ok('');
+    }) as GitRun;
+    const res = materializeWorktree(
+      { headSha, location: { ...location, fetchUrl: secretUrl }, pr: 7, worktreeRoot: '/tmp' },
+      { git }
+    );
+    expect(isPreflightError(res)).toBe(true);
+    const message = isPreflightError(res) ? res.message : '';
+    expect(message).not.toContain('SECRETTOKEN');
+    expect(message).not.toContain('ghp_');
   });
 
   it('checks out the receipt`s headSha by SHA and asserts HEAD — a mismatch ABORTS and reaps', () => {
-    const { calls, git } = harness('b'.repeat(40)); // HEAD is NOT headSha
-    const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git, lock: noLock });
-    expect(isPreflightError(res) && res.kind).toBe('sha-mismatch');
-    expect(isPreflightError(res) && res.message).toMatch(/ABORTING/);
-    // reaped: worktree remove + prune both ran
-    expect(calls.some((c) => c.includes('remove'))).toBe(true);
-    expect(calls.some((c) => c.includes('prune'))).toBe(true);
+    const worktreeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-mismatch-'));
+    try {
+      const { git } = harness('b'.repeat(40)); // HEAD is NOT headSha
+      const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot }, { git });
+      expect(isPreflightError(res) && res.kind).toBe('sha-mismatch');
+      expect(isPreflightError(res) && res.message).toMatch(/ABORTING/);
+      // Reaped: the owner-only parent it created is gone (a pure-fs reap — no shared `.git` was
+      // ever touched, so there is no `git worktree prune` to run).
+      const leftovers = fs
+        .readdirSync(worktreeRoot)
+        .filter((n) => n.startsWith('ensemble-worktree-'));
+      expect(leftovers).toEqual([]);
+    } finally {
+      fs.rmSync(worktreeRoot, { force: true, recursive: true });
+    }
   });
 
   // `git worktree add` creates its directory with the process umask — 0755 under the common 022.
@@ -560,7 +299,7 @@ describe('materialization hardening — untrusted content is checked out INERT',
   // of the PR under review to every other local user. The tree must sit inside an owner-only parent.
   it('nests the worktree inside an owner-only (0700) parent, and never pre-creates the tree path', () => {
     const { calls, git } = harness(headSha);
-    const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git, lock: noLock });
+    const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git });
     expect(isPreflightError(res)).toBe(false);
     const dir = (res as { dir: string }).dir;
     const parent = path.dirname(dir);
@@ -569,44 +308,69 @@ describe('materialization hardening — untrusted content is checked out INERT',
     // git is handed a path that does NOT exist — it creates it. No delete-then-recreate race.
     expect(fs.existsSync(dir)).toBe(false);
     expect(calls.find((c) => c.includes('worktree') && c.includes('add'))).toContain(dir);
-    reapWorktree('/repo', dir, { git });
-    expect(fs.existsSync(parent)).toBe(false); // the parent is reaped too, not leaked
+    reapWorktree(dir);
+    expect(fs.existsSync(parent)).toBe(false); // the parent (worktree + private repo) is reaped, not leaked
+    reapWorktree(dir); // idempotent — a second reap never throws
   });
 
   // The name check is the whole safety of reaping a parent: hand reap an unrelated directory and
   // it must not walk up and delete that directory's parent.
   it('reapWorktree removes a parent ONLY when the parent is one of ours', () => {
-    const { git } = harness(headSha);
     const outsider = fs.mkdtempSync(path.join(os.tmpdir(), 'not-ours-'));
     const child = path.join(outsider, 'child');
     fs.mkdirSync(child);
-    reapWorktree('/repo', child, { git });
+    reapWorktree(child);
     expect(fs.existsSync(outsider)).toBe(true); // parent survived
     fs.rmSync(outsider, { force: true, recursive: true });
   });
 
+  it('a git init failure is a `materialize-failed`, never a generic throw', () => {
+    const worktreeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-init-'));
+    try {
+      const git = vi.fn((args: string[]) => {
+        if (args[1] === '--git-common-dir') return ok('/repo/.git');
+        if (args.includes('init')) return err('fatal: could not create work tree dir');
+        return ok('');
+      }) as unknown as GitRun;
+      const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot }, { git });
+      expect(isPreflightError(res) && res.kind).toBe('materialize-failed');
+      const calls = (git as unknown as { mock: { calls: [string[]][] } }).mock.calls;
+      expect(calls.some(([a]) => a.includes('fetch'))).toBe(false); // never fetched after a failed init
+      expect(fs.readdirSync(worktreeRoot).filter((n) => n.startsWith('ensemble-worktree-'))).toEqual(
+        []
+      );
+    } finally {
+      fs.rmSync(worktreeRoot, { force: true, recursive: true });
+    }
+  });
+
   it('a fetch failure maps to the taxonomy and never proceeds to worktree add', () => {
-    const git = vi.fn((args: string[]) => {
-      if (args[1] === '--git-common-dir' || args[0] === 'rev-parse') return ok('/repo/.git');
-      if (args.includes('fetch')) return err("couldn't find remote ref pull/7/head");
-      return ok('');
-    }) as unknown as GitRun;
-    const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git, lock: noLock });
-    expect(isPreflightError(res) && res.kind).toBe('no-such-pr');
-    const calls = (git as unknown as { mock: { calls: [string[]][] } }).mock.calls;
-    expect(calls.some(([a]) => a.includes('worktree') && a.includes('add'))).toBe(false);
+    const worktreeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-fetch-'));
+    try {
+      const git = vi.fn((args: string[]) => {
+        if (args[1] === '--git-common-dir') return ok('/repo/.git');
+        if (args.includes('fetch')) return err("couldn't find remote ref pull/7/head");
+        return ok('');
+      }) as unknown as GitRun;
+      const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot }, { git });
+      expect(isPreflightError(res) && res.kind).toBe('no-such-pr');
+      const calls = (git as unknown as { mock: { calls: [string[]][] } }).mock.calls;
+      expect(calls.some(([a]) => a.includes('worktree') && a.includes('add'))).toBe(false);
+    } finally {
+      fs.rmSync(worktreeRoot, { force: true, recursive: true });
+    }
   });
 });
 
-// ── REAL git, hermetic — the test that would have caught the invalid worktree-add flag ────────
+// ── REAL git, hermetic — the tests that pin the private-repo materialization end to end ────────
 //
-// Every materialization test above scripts GitRun, so an argv git itself rejects (the
-// `--no-recurse-submodules` on `worktree add` that killed every live materialization until
-// 2026-07-10) sails through green. This suite runs the REAL git binary against a local file://
-// origin exposing a refs/pull/N/head ref — no network, no GitHub, one repo, minimal spawns.
+// Every mocked test above scripts GitRun, so an argv git itself rejects sails through green. This
+// suite runs the REAL git binary against a local file:// origin exposing a refs/pull/N/head ref —
+// no network, no GitHub. It proves the private-repo design: the shared checkout is byte-identical
+// afterwards, two materializations of one repo+PR coexist with no lock, a complete shared store is
+// hardlink-cloned (self-contained, gc-proof) and a shallow/partial/missing one is not, the fetch stays non-shallow so
+// history reads work, and the reap removes the whole parent.
 describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)', () => {
-  // The runner the CLI itself injects — so this drives the exact exec seam production uses,
-  // not a lookalike (which would leave `execGit`'s own env hardening unexercised).
   const realGit = execGit();
   // -c flags keep the FIXTURE SETUP hermetic on any machine, whatever the developer's global git
   // config says: no identity prompt, no gpg signing, no `core.hooksPath` pre-commit hook (which
@@ -628,48 +392,384 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
     return r.text.trim();
   };
 
-  it('fetches pull/N/head from a file:// origin, materializes at the SHA, strips, reaps', () => {
+  // A file:// origin with `commits` commits and a refs/pull/7/head at HEAD. Returns { origin, headSha }.
+  function makeOrigin(base: string, commits = 1): { headSha: string; origin: string } {
+    const origin = path.join(base, 'origin');
+    fs.mkdirSync(origin);
+    g(origin, 'init', '-q');
+    for (let i = 0; i < commits; i++) {
+      fs.writeFileSync(path.join(origin, 'src.ts'), `export const x = ${i};\n`);
+      if (i === 0) fs.writeFileSync(path.join(origin, 'CLAUDE.md'), 'planted instruction channel\n');
+      g(origin, 'add', '.');
+      g(origin, 'commit', '-qm', `commit ${i}`);
+    }
+    const headSha = g(origin, 'rev-parse', 'HEAD');
+    g(origin, 'update-ref', 'refs/pull/7/head', headSha);
+    return { headSha, origin };
+  }
+
+  // `init`, NOT `clone`: a clone would copy the head commit in, so `worktree add <sha>` would
+  // succeed even if the fetch argv were broken. Starting empty makes the fetch load-bearing.
+  function makeConsumer(base: string): string {
+    const consumer = path.join(base, 'consumer');
+    fs.mkdirSync(consumer);
+    g(consumer, 'init', '-q');
+    return consumer;
+  }
+
+  // A sorted snapshot of every file under a repo's `.git`, keyed to its bytes — the proof of
+  // "byte-identical" (no new refs, no worktrees/ entry, no lock file appeared or changed).
+  function snapshotGitDir(repoRoot: string): Record<string, string> {
+    const gitDir = path.join(repoRoot, '.git');
+    const out: Record<string, string> = {};
+    const walk = (rel: string): void => {
+      for (const e of fs.readdirSync(path.join(gitDir, rel), { withFileTypes: true })) {
+        const childRel = rel ? `${rel}/${e.name}` : e.name;
+        if (e.isDirectory()) walk(childRel);
+        else out[childRel] = fs.readFileSync(path.join(gitDir, childRel)).toString('base64');
+      }
+    };
+    walk('');
+    return out;
+  }
+
+  const materialize = (base: string, consumer: string, headSha: string, origin: string) =>
+    materializeWorktree(
+      { headSha, location: { fetchUrl: `file://${origin}`, repoRoot: consumer, slug: 'o/r' }, pr: 7, worktreeRoot: base },
+      { git: realGit }
+    );
+
+  // A URL nothing can fetch — unless the checkout's own `url.<file://origin>.insteadOf` rewrites it.
+  // The only honest proof that the checkout's transport config REACHED the fetch: the fetch succeeds.
+  const BOGUS_URL = 'https://bogus.invalid/pr.git';
+  const TRANSPORT_KEYS_RE = '^(core\\.sshcommand|credential\\.|http\\.|url\\.)';
+  const materializeAt = (base: string, consumer: string, headSha: string, fetchUrl: string, git: GitRun = realGit) =>
+    materializeWorktree(
+      { headSha, location: { fetchUrl, repoRoot: consumer, slug: 'o/r' }, pr: 7, worktreeRoot: base },
+      { git }
+    );
+  const bareOf = (worktreeDir: string) => path.join(path.dirname(worktreeDir), 'repo');
+  // A clone (and only a clone) records where it came from; an `init` private repo has no remote.
+  const clonedFromShared = (worktreeDir: string): boolean =>
+    realGit(['-C', bareOf(worktreeDir), 'config', '--get', 'remote.origin.url']).ok;
+  const persistedTransportKeys = (worktreeDir: string): boolean =>
+    realGit(['-C', path.join(path.dirname(worktreeDir), 'repo'), 'config', '--local', '--get-regexp', TRANSPORT_KEYS_RE]).ok;
+
+  it('fetches pull/N/head into a private repo, materializes at the SHA, strips, reaps', () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-realgit-'));
     try {
-      const origin = path.join(base, 'origin');
-      fs.mkdirSync(origin);
-      g(origin, 'init', '-q');
-      fs.writeFileSync(path.join(origin, 'src.ts'), 'export const x = 1;\n');
-      fs.writeFileSync(path.join(origin, 'CLAUDE.md'), 'planted instruction channel\n');
-      g(origin, 'add', '.');
-      g(origin, 'commit', '-qm', 'pr head');
-      const headSha = g(origin, 'rev-parse', 'HEAD');
-      g(origin, 'update-ref', 'refs/pull/7/head', headSha);
+      const { headSha, origin } = makeOrigin(base);
+      const consumer = makeConsumer(base);
+      const made = materialize(base, consumer, headSha, origin);
+      // Throw (not `expect(...); return`): an early `return` on the error path would silently PASS
+      // the test, and this surfaces git's own stderr instead of a bare `true !== false`.
+      if (isPreflightError(made)) throw new Error(`materialization failed: ${made.message}`);
+      expect(made.headSha).toBe(headSha);
+      expect(fs.readFileSync(path.join(made.dir, 'src.ts'), 'utf8')).toContain('x = 0');
+      // The instruction channel was stripped from the real checkout.
+      expect(fs.existsSync(path.join(made.dir, 'CLAUDE.md'))).toBe(false);
+      expect(made.strippedInstructionFiles).toContain('CLAUDE.md');
 
-      // `init`, NOT `clone`: a clone would copy the head commit in, so `worktree add <sha>` would
-      // succeed even if the fetch argv were broken. Starting empty makes the fetch load-bearing —
-      // the object exists locally only because `fetch <url> pull/7/head` really ran.
-      const consumer = path.join(base, 'consumer');
-      fs.mkdirSync(consumer);
-      g(consumer, 'init', '-q');
+      const parent = path.dirname(made.dir);
+      reapWorktree(made.dir);
+      expect(fs.existsSync(made.dir)).toBe(false);
+      expect(fs.existsSync(parent)).toBe(false); // the private repo (a sibling) went with it
+      reapWorktree(made.dir); // idempotent
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
 
-      const made = materializeWorktree(
+  it('leaves the shared checkout`s .git BYTE-IDENTICAL — no new ref, no worktrees/ entry, no lock', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-byteid-'));
+    try {
+      const { headSha, origin } = makeOrigin(base);
+      const consumer = makeConsumer(base);
+      // A NON-empty shared store: the consumer already holds the PR head, so the private repo is a
+      // real clone of it and the fetch negotiates against it (an empty store would never exercise
+      // that read — round-2 review, claude-f3).
+      g(consumer, 'fetch', '-q', `file://${origin}`, 'refs/pull/7/head');
+      const before = snapshotGitDir(consumer);
+      const made = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(made)) throw new Error(`materialization failed: ${made.message}`);
+      expect(clonedFromShared(made.dir)).toBe(true);
+      const after = snapshotGitDir(consumer);
+      expect(after).toEqual(before); // nothing under the shared .git changed, appeared, or vanished
+      expect(fs.existsSync(path.join(consumer, '.git', 'worktrees'))).toBe(false);
+      expect(Object.keys(after).some((p) => p.endsWith('.lock'))).toBe(false);
+      reapWorktree(made.dir);
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it('two materializations of the SAME repo+PR both succeed, coexisting with no lock', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-concurrent-'));
+    try {
+      const { headSha, origin } = makeOrigin(base);
+      const consumer = makeConsumer(base);
+      // B opens while A is still live (unreaped) — there is no lock to serialize on.
+      const a = materialize(base, consumer, headSha, origin);
+      const b = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(a)) throw new Error(`A failed: ${a.message}`);
+      if (isPreflightError(b)) throw new Error(`B failed: ${b.message}`);
+      expect(a.dir).not.toBe(b.dir); // independent private parents
+      expect(fs.readFileSync(path.join(a.dir, 'src.ts'), 'utf8')).toContain('x = 0');
+      expect(fs.readFileSync(path.join(b.dir, 'src.ts'), 'utf8')).toContain('x = 0');
+      reapWorktree(a.dir);
+      reapWorktree(b.dir);
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it('hardlink-clones a complete shared store — self-contained and gc-proof — and starts empty when there is none', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-clone-'));
+    try {
+      const { headSha, origin } = makeOrigin(base);
+      const consumer = makeConsumer(base);
+      g(consumer, 'fetch', '-q', `file://${origin}`, 'refs/pull/7/head'); // the store holds the head
+
+      // Shared store present ⇒ the private repo is a clone of it: no alternates, the head's own object
+      // file present in the private store — LINKED, not copied, when the temp dir shares the volume.
+      const made = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(made)) throw new Error(`with-shared failed: ${made.message}`);
+      expect(clonedFromShared(made.dir)).toBe(true);
+      expect(fs.existsSync(path.join(bareOf(made.dir), 'objects', 'info', 'alternates'))).toBe(false);
+      const rel = path.join('objects', headSha.slice(0, 2), headSha.slice(2));
+      const shared = fs.statSync(path.join(consumer, '.git', rel));
+      const priv = fs.statSync(path.join(bareOf(made.dir), rel));
+      if (shared.dev === priv.dev) expect(priv.nlink).toBeGreaterThanOrEqual(2);
+
+      // GC-PROOF: wipe the shared store entirely — the review in flight must not notice.
+      fs.rmSync(path.join(consumer, '.git', 'objects'), { force: true, recursive: true });
+      expect(g(made.dir, 'rev-list', '--count', 'HEAD')).toBe('1');
+      expect(g(made.dir, 'cat-file', '-t', headSha)).toBe('commit');
+      reapWorktree(made.dir);
+
+      // No shared checkout (repoRoot does not resolve) ⇒ an empty private repo; the fetch brings everything.
+      const noShared = materializeWorktree(
         {
           headSha,
-          location: { fetchUrl: `file://${origin}`, repoRoot: consumer, slug: 'o/r' },
+          location: { fetchUrl: `file://${origin}`, repoRoot: path.join(base, 'nope'), slug: 'o/r' },
           pr: 7,
           worktreeRoot: base,
         },
         { git: realGit }
       );
-      // Throw (not `expect(...); return`): an early `return` on the error path would silently PASS
-      // the test, and this surfaces git's own stderr instead of a bare `true !== false`.
-      if (isPreflightError(made)) throw new Error(`materialization failed: ${made.message}`);
-      expect(made.headSha).toBe(headSha);
-      expect(fs.readFileSync(path.join(made.dir, 'src.ts'), 'utf8')).toContain('x = 1');
-      // The instruction channel was stripped from the real checkout.
-      expect(fs.existsSync(path.join(made.dir, 'CLAUDE.md'))).toBe(false);
-      expect(made.strippedInstructionFiles).toContain('CLAUDE.md');
-
-      reapWorktree(consumer, made.dir, { git: realGit });
-      expect(fs.existsSync(made.dir)).toBe(false);
+      if (isPreflightError(noShared)) throw new Error(`no-shared failed: ${noShared.message}`);
+      expect(clonedFromShared(noShared.dir)).toBe(false);
+      expect(fs.readFileSync(path.join(noShared.dir, 'src.ts'), 'utf8')).toContain('x = 0');
+      reapWorktree(noShared.dir);
     } finally {
       fs.rmSync(base, { force: true, recursive: true });
     }
   }, 30_000);
+
+  it('never clones a SHALLOW or PARTIAL shared store — the private repo starts empty and the fetch brings everything', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-noclone-'));
+    try {
+      const { headSha, origin } = makeOrigin(base, 2);
+      const consumer = makeConsumer(base);
+      g(consumer, 'fetch', '-q', `file://${origin}`, 'refs/pull/7/head');
+      // A CI depth-1 `actions/checkout` is BOTH shallow AND carries its transport config only in
+      // repo-local config: the carry must reach the fetch even though the clone is skipped. Proved
+      // the only way a carry can be: the fetch gets a URL that resolves ONLY through the checkout's
+      // own `url.<base>.insteadOf`.
+      g(consumer, 'config', `url.file://${origin}.insteadOf`, BOGUS_URL);
+
+      // Shallow: git's own marker for "ancestry I advertise but do not hold". Written the way git
+      // writes it, then PROVED to have taken via git's own probe.
+      fs.writeFileSync(path.join(consumer, '.git', 'shallow'), `${headSha}\n`);
+      expect(g(consumer, 'rev-parse', '--is-shallow-repository')).toBe('true');
+      const shallow = materializeAt(base, consumer, headSha, BOGUS_URL);
+      if (isPreflightError(shallow)) throw new Error(`shallow failed: ${shallow.message}`);
+      expect(clonedFromShared(shallow.dir)).toBe(false);
+      expect(g(shallow.dir, 'rev-parse', '--is-shallow-repository')).toBe('false');
+      // Clone skipped, yet the bogus URL resolved — the carry reached the fetch — and NOTHING was
+      // written down: the private repo's config holds no transport key.
+      expect(persistedTransportKeys(shallow.dir)).toBe(false);
+      g(consumer, 'config', '--unset', `url.file://${origin}.insteadOf`);
+      expect(fs.readFileSync(path.join(shallow.dir, 'src.ts'), 'utf8')).toContain('x = 1');
+      // The private repo is complete on its own: history walks past the consumer's cut.
+      expect(g(shallow.dir, 'rev-list', '--count', 'HEAD')).toBe('2');
+      reapWorktree(shallow.dir);
+      fs.rmSync(path.join(consumer, '.git', 'shallow'));
+
+      // Partial clone: the config git sets on `clone --filter`. Either spelling is enough.
+      g(consumer, 'config', 'extensions.partialClone', 'origin');
+      const partial = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(partial)) throw new Error(`partial failed: ${partial.message}`);
+      expect(clonedFromShared(partial.dir)).toBe(false);
+      reapWorktree(partial.dir);
+      g(consumer, 'config', '--unset', 'extensions.partialClone');
+
+      // Complete again ⇒ the clone is back.
+      const complete = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(complete)) throw new Error(`complete failed: ${complete.message}`);
+      expect(clonedFromShared(complete.dir)).toBe(true);
+      reapWorktree(complete.dir);
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  // A store that BORROWS its objects via `objects/info/alternates` (a `git clone --shared`/`--reference`
+  // checkout) has an objects/ dir and is neither shallow nor partial, but `clone --local` of it copies
+  // only the POINTER — the private repo would silently depend on the external pool again. It must be
+  // treated as incomplete: start empty and let the fetch fill it (cross-vendor review, codex-f5 · grok-f1).
+  it('never clones a store that borrows via objects/info/alternates — it starts empty and fetches', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-alternates-'));
+    try {
+      const { headSha, origin } = makeOrigin(base);
+      const consumer = makeConsumer(base);
+      g(consumer, 'fetch', '-q', `file://${origin}`, 'refs/pull/7/head'); // a complete store…
+      // …turned into an alternates-borrowing one: git's own marker for "objects I reach through a
+      // borrowed pool". A `clone --local` of this copies the file, not the objects.
+      fs.writeFileSync(
+        path.join(consumer, '.git', 'objects', 'info', 'alternates'),
+        `${path.join(origin, '.git', 'objects')}\n`
+      );
+      const made = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(made)) throw new Error(`alternates failed: ${made.message}`);
+      // Clone SKIPPED (init path), so the private repo carries no borrowed pointer and is self-contained.
+      expect(clonedFromShared(made.dir)).toBe(false);
+      expect(fs.existsSync(path.join(bareOf(made.dir), 'objects', 'info', 'alternates'))).toBe(false);
+      expect(fs.readFileSync(path.join(made.dir, 'src.ts'), 'utf8')).toContain('x = 0');
+      reapWorktree(made.dir);
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it("hands the checkout's transport config to the fetch PER COMMAND — includeIf'd keys included, global keys not duplicated, nothing written to disk", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-cfg-'));
+    const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
+    const savedSsh = process.env.GIT_SSH_COMMAND;
+    try {
+      const { headSha, origin } = makeOrigin(base);
+      const consumer = makeConsumer(base);
+      // Three scopes the private repo cannot see by itself — repo-local (a CI token, the corp
+      // insteadOf), an `includeIf.gitdir`'d file (the multi-account laptop's `ssh -i`) — and, as the
+      // control, a GLOBAL key the private repo DOES see and must therefore not be handed twice.
+      g(consumer, 'config', `url.file://${origin}.insteadOf`, BOGUS_URL);
+      g(consumer, 'config', 'http.https://example.test/.extraHeader', 'Authorization: Basic TOKEN');
+      const inc = path.join(base, 'work.inc');
+      fs.writeFileSync(inc, '[core]\n\tsshCommand = ssh -i /home/me/.ssh/id_work\n');
+      const globalCfg = path.join(base, 'gitconfig');
+      fs.writeFileSync(
+        globalCfg,
+        `[http]\n\tproxy = http://proxy.test:3128\n[includeIf "gitdir:consumer/"]\n\tpath = ${inc}\n`
+      );
+      process.env.GIT_CONFIG_GLOBAL = globalCfg;
+      delete process.env.GIT_SSH_COMMAND; // the developer's own env must not pre-empt the checkout's
+      // Sanity: the includeIf applies at the checkout (and only there).
+      expect(g(consumer, 'config', '--get', 'core.sshCommand')).toBe('ssh -i /home/me/.ssh/id_work');
+
+      let fetchEnv: Record<string, string> | undefined;
+      const spy: GitRun = (a, o) => {
+        if (a.includes('fetch')) fetchEnv = o?.env;
+        return realGit(a, o);
+      };
+      const before = snapshotGitDir(consumer);
+      const made = materializeAt(base, consumer, headSha, BOGUS_URL, spy);
+      if (isPreflightError(made)) throw new Error(`materialization failed: ${made.message}`);
+      // Reading the checkout's config must not mutate the shared .git.
+      expect(snapshotGitDir(consumer)).toEqual(before);
+
+      // What the fetch was handed: exactly the keys only the checkout can see, as per-command env,
+      // and the checkout's ssh as a non-interactive GIT_SSH_COMMAND — never the global proxy.
+      const carried = Object.entries(fetchEnv ?? {})
+        .filter(([k]) => k.startsWith('GIT_CONFIG_KEY_'))
+        .map(([, v]) => v)
+        .sort();
+      expect(carried).toEqual(['core.sshcommand', 'http.https://example.test/.extraheader', `url.file://${origin}.insteadof`]);
+      expect(fetchEnv?.GIT_CONFIG_COUNT).toBe('3');
+      expect(fetchEnv?.GIT_SSH_COMMAND).toBe('ssh -i /home/me/.ssh/id_work -o BatchMode=yes');
+      // NOTHING persisted: the private repo's config holds no transport key — and it is still bare.
+      expect(persistedTransportKeys(made.dir)).toBe(false);
+      const bare = path.join(path.dirname(made.dir), 'repo');
+      expect(realGit(['-C', bare, 'config', '--get', 'core.bare'])).toMatchObject({ ok: true, text: 'true\n' });
+      reapWorktree(made.dir);
+    } finally {
+      if (savedGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
+      if (savedSsh === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = savedSsh;
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it('the fetch is NOT shallow, so the worktree keeps full history for the history packet', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-depth-'));
+    try {
+      const { headSha, origin } = makeOrigin(base, 3); // three commits of history
+      const consumer = makeConsumer(base);
+      const made = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(made)) throw new Error(`materialization failed: ${made.message}`);
+      // is-shallow must be false — a shallow repo makes history-packet.ts short-circuit to "no history".
+      expect(g(made.dir, 'rev-parse', '--is-shallow-repository')).toBe('false');
+      // and the full ancestry is walkable in the worktree (git log sees all three commits).
+      const log = g(made.dir, 'log', '--oneline');
+      expect(log.split('\n').filter(Boolean)).toHaveLength(3);
+      reapWorktree(made.dir);
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
+});
+
+
+describe('missingConfig / transportEnv — the per-command transport handoff, as pure functions', () => {
+  it('is a multiset difference: a global multivar already visible to the private repo is not re-applied', () => {
+    const want: Array<[string, string]> = [
+      ['http.extraheader', 'A: 1'],
+      ['http.extraheader', 'A: 1'], // twice at the checkout (global + local, same value)
+      ['http.extraheader', 'B: 2'],
+      ['core.sshcommand', 'ssh -i k'],
+    ];
+    const have: Array<[string, string]> = [['http.extraheader', 'A: 1']]; // global, seen from the private repo
+    expect(missingConfig(want, have)).toEqual([
+      ['http.extraheader', 'A: 1'],
+      ['http.extraheader', 'B: 2'],
+      ['core.sshcommand', 'ssh -i k'],
+    ]);
+    expect(missingConfig([], have)).toEqual([]);
+  });
+
+  it('renders GIT_CONFIG_COUNT/KEY/VALUE, and GIT_SSH_COMMAND only when the user set none', () => {
+    const saved = process.env.GIT_SSH_COMMAND;
+    try {
+      delete process.env.GIT_SSH_COMMAND;
+      expect(transportEnv([['url.x.insteadof', 'y']], 'ssh -i k')).toEqual({
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'url.x.insteadof',
+        GIT_CONFIG_VALUE_0: 'y',
+        GIT_SSH_COMMAND: 'ssh -i k -o BatchMode=yes',
+      });
+      expect(transportEnv([], undefined)).toEqual({});
+      expect(transportEnv([], 'my-ssh-wrapper')).toEqual({ GIT_SSH_COMMAND: 'my-ssh-wrapper' }); // a wrapper is left alone
+      process.env.GIT_SSH_COMMAND = 'ssh -F /env/config';
+      expect(transportEnv([], 'ssh -i k')).toEqual({}); // git itself lets the env win
+    } finally {
+      if (saved === undefined) delete process.env.GIT_SSH_COMMAND;
+      else process.env.GIT_SSH_COMMAND = saved;
+    }
+  });
+
+  // `git config --get-regexp` lists a multivar in file order; git's effective value is the LAST.
+  // Taking the first would export the lowest-precedence (global) ssh command and shadow the repo-local
+  // key the carry exists to preserve (cross-vendor review, codex-f4 · claude-f1).
+  it('effectiveSshFrom takes the LAST core.sshcommand — git`s effective value, not the first scope', () => {
+    expect(
+      effectiveSshFrom([
+        ['core.sshcommand', 'ssh -i ~/.ssh/id_personal'], // global (lower precedence)
+        ['http.extraheader', 'A: 1'],
+        ['core.sshcommand', 'ssh -i ~/.ssh/id_work'], // repo-local (wins)
+      ])
+    ).toBe('ssh -i ~/.ssh/id_work');
+    expect(effectiveSshFrom([['core.sshcommand', 'ssh -i only']])).toBe('ssh -i only');
+    expect(effectiveSshFrom([['http.extraheader', 'A: 1']])).toBeUndefined();
+    expect(effectiveSshFrom([])).toBeUndefined();
+  });
 });

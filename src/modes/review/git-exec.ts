@@ -56,6 +56,7 @@ function effectiveSshCommand(cwd: string | undefined, cache: Map<string, string 
         execFileSync('git', ['config', '--get', 'core.sshCommand'], {
           cwd,
           encoding: 'utf8',
+          env: scrubRepoEnv(process.env), // the cwd repo's config — never GIT_DIR's
           stdio: ['ignore', 'pipe', 'ignore'],
         }).trim() || undefined;
     } catch {
@@ -83,19 +84,78 @@ function nonInteractiveEnv(configuredSsh: string | undefined): Record<string, st
 export const GIT_TIMEOUT_MS = 600_000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
+// The env vars git uses to SELECT a repository, scrubbed from every command this runner spawns.
+// `cwd` is the only repo selector the review path means: the pre-flight proves the checkout by its
+// cwd, and the private-repo isolation (worktree.ts) rests on `cwd: bare` — but git lets an inherited
+// `GIT_DIR` / `GIT_COMMON_DIR` / `GIT_OBJECT_DIRECTORY` override cwd, so a runner that copies
+// `process.env` verbatim would let a git hook (hooks export GIT_DIR) or a stray shell export
+// redirect the private `init` / `fetch` / `worktree add` back into the user's shared `.git` —
+// exactly the write the private repo exists to prevent (cross-vendor review of the lock removal,
+// codex-f1). DELETED, never blanked: an empty `GIT_DIR` is still SET, and git reads it as a path.
+// CONSUMER CONTRACT: a consumer's own GitRunAsync must apply the same scrub (reuse this helper).
+export const REPO_LOCATION_ENV = [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_IMPLICIT_WORK_TREE',
+  'GIT_NAMESPACE',
+  'GIT_COMMON_DIR',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_INDEX_FILE',
+  // A repo also selects itself through these, so cwd is not the only selector unless they go too
+  // (cross-vendor review, codex-f2 · claude-f2): GIT_CONFIG forces a single config file — it would
+  // make the private repo's `config --local`/`--get-regexp` read the wrong file and reshape the
+  // effectiveSshCommand probe; GIT_SHALLOW_FILE / GIT_GRAFT_FILE rewrite the object graph (an
+  // inherited GIT_SHALLOW_FILE makes the fully-fetched private repo report itself shallow, so the
+  // history packet discards `git log`/`git blame`); GIT_CONFIG_PARAMETERS injects arbitrary config
+  // that could re-enable `core.hooksPath` or `url.<base>.insteadOf`, defeating the inert 'explicit
+  // URL' posture. NOT GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM — the transport carry relies on the
+  // user's global credentials still being inherited.
+  'GIT_CONFIG',
+  'GIT_SHALLOW_FILE',
+  'GIT_GRAFT_FILE',
+  'GIT_CONFIG_PARAMETERS',
+  // Discovery can be stopped short of the private repo by an inherited ceiling — same class.
+  'GIT_CEILING_DIRECTORIES',
+  // An inherited GIT_REPLACE_REF_BASE reshapes the object graph the same way GIT_SHALLOW_FILE does:
+  // point it at a namespace whose cloned `<base>/<headSha>` ref maps to another commit and `worktree
+  // add` checks out the REPLACEMENT tree while `rev-parse HEAD` still reports the original SHA — the
+  // HEAD assertion then passes on wrong content. Scrubbed here; replace refs carried IN the cloned
+  // store are separately neutralized by GIT_NO_REPLACE_OBJECTS in worktree.ts's INERT_ENV
+  // (cross-vendor review of the lock removal, codex-f2).
+  'GIT_REPLACE_REF_BASE',
+] as const;
+
+// GIT_CONFIG_COUNT + its GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> siblings inject config by count —
+// the same 'explicit URL' / no-hooks bypass as GIT_CONFIG_PARAMETERS, but with no fixed name to
+// list, so they are matched by prefix rather than enumerated.
+const CONFIG_INJECTION_ENV_RE = /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/;
+
+export function scrubRepoEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  const out = { ...env };
+  for (const key of REPO_LOCATION_ENV) delete out[key];
+  for (const key of Object.keys(out)) if (CONFIG_INJECTION_ENV_RE.test(key)) delete out[key];
+  return out;
+}
+
 export function execGit(): GitRun {
   const sshByCwd = new Map<string, string | undefined>();
   return (args, opts) => {
     try {
       const text = execFileSync('git', args, {
         cwd: opts?.cwd,
+        // Read `process.env` LIVE each spawn (a later `HTTPS_PROXY`/`GIT_SSH_COMMAND` must be seen),
+        // but scrub the repo-selectors in place so the env is cloned once, not twice.
         encoding: 'utf8',
-        env: {
-          ...process.env,
-          ...nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)),
-          ...(opts?.env ?? {}),
-        },
+        env: Object.assign(scrubRepoEnv(process.env), nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)), opts?.env ?? {}),
         maxBuffer: GIT_MAX_BUFFER,
+        // Capture git's stderr into `err.stderr` (below) WITHOUT mirroring it onto our own stderr:
+        // execFileSync's default leaves stderr inherited, so it ALSO prints the child's stderr
+        // verbatim — a `https://<token>@host` remote git quotes back on a failed fetch would reach
+        // the operator's terminal + run log unredacted, defeating the message-level redaction in
+        // worktree.ts (cross-vendor review of the lock removal, claude-f2). stdin stays closed so a
+        // git command can never sit on an interactive read.
+        stdio: ['ignore', 'pipe', 'pipe'],
         timeout: GIT_TIMEOUT_MS,
       });
       return { ok: true, text };
