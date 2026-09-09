@@ -207,7 +207,13 @@ const INERT_GIT_CONFIG = [
   '-c', 'gc.auto=0',
 ];
 
-const INERT_ENV = { GIT_LFS_SKIP_SMUDGE: '1' };
+// GIT_NO_REPLACE_OBJECTS disables git's replace-ref machinery for every command the materialization
+// runs. `git clone --bare --local` copies the shared store's `refs/replace/*` verbatim, and an active
+// replacement would make `git worktree add --detach <headSha>` check out a DIFFERENT tree than the SHA
+// the receipt is tied to — while `rev-parse HEAD` still returns the original SHA, so the HEAD assert
+// passes on wrong content. Neutralizing replace here (the env vector is separately scrubbed in
+// git-exec.ts) means the worktree is always the true object at headSha (cross-vendor review, codex-f2).
+const INERT_ENV = { GIT_LFS_SKIP_SMUDGE: '1', GIT_NO_REPLACE_OBJECTS: '1' };
 
 // The private repo's object format, taken from the SHA the review is bound to — a repo has exactly
 // one, so a 64-hex head IS a SHA-256 repo and a 40-hex head a SHA-1 one. Explicit on `git init`,
@@ -433,6 +439,16 @@ export function isStrippedPath(p: string, stripped: readonly string[]): boolean 
 // object format) and the fetch brings everything.
 const PARTIAL_CLONE_CONFIG_RE = '^(extensions\\.partialclone|remote\\..*\\.promisor)$';
 
+// A store that itself BORROWS objects from another via `objects/info/alternates` (a checkout made
+// with `git clone --shared`/`--reference`) is not self-contained, even though it has an `objects/`
+// dir and is neither shallow nor partial. `git clone --bare --local` of such a source copies the
+// alternates POINTER, not the borrowed objects — so the private repo silently depends on the external
+// pool again, reintroducing both failures the hardlink clone exists to close: a gc/repack of that pool
+// can drop objects mid-review, and a fenced seat that cannot read the pool's path cannot walk history
+// through the pointer. Treat it like a shallow/partial store — start empty and let the fetch fill the
+// private repo (cross-vendor review of the lock removal, codex-f5 · grok-f1).
+const ALTERNATES_REL = path.join('objects', 'info', 'alternates');
+
 // The shared checkout's COMMON dir when its store is complete; null ⇒ the private repo starts empty.
 function completeSharedStore(repoRoot: string, git: GitRun): string | null {
   const common = git(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
@@ -440,6 +456,7 @@ function completeSharedStore(repoRoot: string, git: GitRun): string | null {
   const commonDir = path.resolve(repoRoot, common.text.trim());
   if (!fs.existsSync(path.join(commonDir, 'objects'))) return null;
   if (fs.existsSync(path.join(commonDir, 'shallow'))) return null;
+  if (fs.existsSync(path.join(commonDir, ALTERNATES_REL))) return null;
   if (git(['config', '--get-regexp', PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
   return commonDir;
 }
@@ -450,9 +467,16 @@ function privateRepoFailure(shared: string | null, error: string): string {
 
 // The argv that creates the private repo: a hardlink clone of a complete shared store, else an empty
 // bare repo. Shared as a pure function so the twins cannot drift on it.
+//
+// `-c protocol.file.allow=always` on the clone: `clone --local` uses git's `file` transport, which a
+// user/org gitconfig hardened with `protocol.file.allow=never` (the CVE-2022-39253 mitigation) rejects
+// outright (`fatal: transport 'file' not allowed`), aborting an otherwise-valid worktree review. The
+// source is the user's OWN, already-identity-verified local checkout and this `--bare` clone recurses
+// no submodules, so re-allowing `file` for this one command carries none of the CVE's risk (which is a
+// malicious submodule url during a recursive clone) — cross-vendor review of the lock removal, grok-f2.
 function createPrivateRepoArgs(shared: string | null, bare: string, headSha: string): string[] {
   return shared
-    ? [...INERT_GIT_CONFIG, 'clone', '--quiet', '--bare', '--local', shared, bare]
+    ? [...INERT_GIT_CONFIG, '-c', 'protocol.file.allow=always', 'clone', '--quiet', '--bare', '--local', shared, bare]
     : [...INERT_GIT_CONFIG, 'init', '--bare', objectFormatFlag(headSha), bare];
 }
 
@@ -512,6 +536,19 @@ export function transportEnv(
   return env;
 }
 
+// The checkout's EFFECTIVE `core.sshCommand` from the multi-scope `--get-regexp` listing. git lists
+// every scope's value in file order (system → global → includeIf → local → worktree) and the effective
+// value is the LAST one — exactly why the sibling probe in git-exec.ts uses `config --get` (last-wins).
+// Taking the FIRST match instead exported the lowest-precedence (global) command as GIT_SSH_COMMAND,
+// which then OVERRIDES the repo-local `ssh -i <key>` the multi-account carry exists to preserve — the
+// fetch runs with the wrong key and fails `auth` (cross-vendor review of the lock removal, codex-f4 ·
+// claude-f1).
+export function effectiveSshFrom(entries: ConfigEntries): string | undefined {
+  let value: string | undefined;
+  for (const [k, v] of entries) if (k === 'core.sshcommand') value = v;
+  return value;
+}
+
 function listTransportConfig(cwd: string, git: GitRun): ConfigEntries {
   const listed = git(['config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE], { cwd });
   return listed.ok ? parseConfigList(listed.text) : []; // exits 1 when no key matches
@@ -524,7 +561,7 @@ function listTransportConfig(cwd: string, git: GitRun): ConfigEntries {
 function fetchEnv(repoRoot: string, bare: string, git: GitRun): Record<string, string> {
   const want = listTransportConfig(repoRoot, git);
   const missing = missingConfig(want, listTransportConfig(bare, git));
-  const ssh = want.find(([k]) => k === 'core.sshcommand')?.[1];
+  const ssh = effectiveSshFrom(want);
   return { ...INERT_ENV, ...transportEnv(missing, ssh) };
 }
 
@@ -607,7 +644,7 @@ export function materializeWorktree(
         : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
-    const head = deps.git(['rev-parse', 'HEAD'], { cwd: dir });
+    const head = deps.git(['rev-parse', 'HEAD'], { cwd: dir, env: INERT_ENV });
     const actual = head.ok ? head.text.trim() : '';
     if (actual !== args.headSha) {
       return {
@@ -770,7 +807,7 @@ export async function materializeWorktreeAsync(
         : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
-    const head = await deps.git(['rev-parse', 'HEAD'], { cwd: dir });
+    const head = await deps.git(['rev-parse', 'HEAD'], { cwd: dir, env: INERT_ENV });
     const actual = head.ok ? head.text.trim() : '';
     if (actual !== args.headSha) {
       return {
@@ -801,6 +838,7 @@ async function completeSharedStoreAsync(repoRoot: string, git: GitRunAsync): Pro
   const exists = (p: string): Promise<boolean> => fs.promises.access(p).then(() => true, () => false);
   if (!(await exists(path.join(commonDir, 'objects')))) return null;
   if (await exists(path.join(commonDir, 'shallow'))) return null;
+  if (await exists(path.join(commonDir, ALTERNATES_REL))) return null;
   if ((await git(['config', '--get-regexp', PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot })).ok) return null;
   return commonDir;
 }
@@ -818,7 +856,7 @@ async function fetchEnvAsync(
 ): Promise<Record<string, string>> {
   const want = await listTransportConfigAsync(repoRoot, git);
   const missing = missingConfig(want, await listTransportConfigAsync(bare, git));
-  const ssh = want.find(([k]) => k === 'core.sshcommand')?.[1];
+  const ssh = effectiveSshFrom(want);
   return { ...INERT_ENV, ...transportEnv(missing, ssh) };
 }
 

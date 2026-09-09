@@ -2803,7 +2803,14 @@ var REPO_LOCATION_ENV = [
   "GIT_GRAFT_FILE",
   "GIT_CONFIG_PARAMETERS",
   // Discovery can be stopped short of the private repo by an inherited ceiling — same class.
-  "GIT_CEILING_DIRECTORIES"
+  "GIT_CEILING_DIRECTORIES",
+  // An inherited GIT_REPLACE_REF_BASE reshapes the object graph the same way GIT_SHALLOW_FILE does:
+  // point it at a namespace whose cloned `<base>/<headSha>` ref maps to another commit and `worktree
+  // add` checks out the REPLACEMENT tree while `rev-parse HEAD` still reports the original SHA — the
+  // HEAD assertion then passes on wrong content. Scrubbed here; replace refs carried IN the cloned
+  // store are separately neutralized by GIT_NO_REPLACE_OBJECTS in worktree.ts's INERT_ENV
+  // (cross-vendor review of the lock removal, codex-f2).
+  "GIT_REPLACE_REF_BASE"
 ];
 var CONFIG_INJECTION_ENV_RE = /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/;
 function scrubRepoEnv(env) {
@@ -2823,6 +2830,13 @@ function execGit() {
         encoding: "utf8",
         env: Object.assign(scrubRepoEnv(process.env), nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)), opts?.env ?? {}),
         maxBuffer: GIT_MAX_BUFFER,
+        // Capture git's stderr into `err.stderr` (below) WITHOUT mirroring it onto our own stderr:
+        // execFileSync's default leaves stderr inherited, so it ALSO prints the child's stderr
+        // verbatim — a `https://<token>@host` remote git quotes back on a failed fetch would reach
+        // the operator's terminal + run log unredacted, defeating the message-level redaction in
+        // worktree.ts (cross-vendor review of the lock removal, claude-f2). stdin stays closed so a
+        // git command can never sit on an interactive read.
+        stdio: ["ignore", "pipe", "pipe"],
         timeout: GIT_TIMEOUT_MS
       });
       return { ok: true, text };
@@ -3287,7 +3301,7 @@ var INERT_GIT_CONFIG = [
   "-c",
   "gc.auto=0"
 ];
-var INERT_ENV = { GIT_LFS_SKIP_SMUDGE: "1" };
+var INERT_ENV = { GIT_LFS_SKIP_SMUDGE: "1", GIT_NO_REPLACE_OBJECTS: "1" };
 function objectFormatFlag(headSha) {
   return `--object-format=${headSha.length === 64 ? "sha256" : "sha1"}`;
 }
@@ -3357,12 +3371,14 @@ function isStrippedPath(p, stripped) {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
 var PARTIAL_CLONE_CONFIG_RE = "^(extensions\\.partialclone|remote\\..*\\.promisor)$";
+var ALTERNATES_REL = path12.join("objects", "info", "alternates");
 function completeSharedStore(repoRoot, git2) {
   const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
   const commonDir = path12.resolve(repoRoot, common.text.trim());
   if (!fs14.existsSync(path12.join(commonDir, "objects"))) return null;
   if (fs14.existsSync(path12.join(commonDir, "shallow"))) return null;
+  if (fs14.existsSync(path12.join(commonDir, ALTERNATES_REL))) return null;
   if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
   return commonDir;
 }
@@ -3370,7 +3386,7 @@ function privateRepoFailure(shared, error) {
   return `${shared ? "git clone --bare --local" : "git init --bare"} failed: ${error.trim()}`;
 }
 function createPrivateRepoArgs(shared, bare, headSha) {
-  return shared ? [...INERT_GIT_CONFIG, "clone", "--quiet", "--bare", "--local", shared, bare] : [...INERT_GIT_CONFIG, "init", "--bare", objectFormatFlag(headSha), bare];
+  return shared ? [...INERT_GIT_CONFIG, "-c", "protocol.file.allow=always", "clone", "--quiet", "--bare", "--local", shared, bare] : [...INERT_GIT_CONFIG, "init", "--bare", objectFormatFlag(headSha), bare];
 }
 var TRANSPORT_CONFIG_RE = "^(core\\.sshcommand|credential\\.|http\\.|url\\.)";
 function missingConfig(want, have) {
@@ -3399,6 +3415,11 @@ function transportEnv(entries, sshCommand) {
   }
   return env;
 }
+function effectiveSshFrom(entries) {
+  let value;
+  for (const [k, v] of entries) if (k === "core.sshcommand") value = v;
+  return value;
+}
 function listTransportConfig(cwd, git2) {
   const listed = git2(["config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE], { cwd });
   return listed.ok ? parseConfigList(listed.text) : [];
@@ -3406,7 +3427,7 @@ function listTransportConfig(cwd, git2) {
 function fetchEnv(repoRoot, bare, git2) {
   const want = listTransportConfig(repoRoot, git2);
   const missing = missingConfig(want, listTransportConfig(bare, git2));
-  const ssh = want.find(([k]) => k === "core.sshcommand")?.[1];
+  const ssh = effectiveSshFrom(want);
   return { ...INERT_ENV, ...transportEnv(missing, ssh) };
 }
 function parseConfigList(text) {
@@ -3456,7 +3477,7 @@ function materializeWorktree(args, deps) {
       const kind = /invalid reference|not a valid object|unknown revision/i.test(added.error) ? "no-such-pr" : classifyGitError(added.error);
       return { kind, message: `worktree add at ${args.headSha.slice(0, 12)} failed: ${added.error.trim()}` };
     }
-    const head = deps.git(["rev-parse", "HEAD"], { cwd: dir });
+    const head = deps.git(["rev-parse", "HEAD"], { cwd: dir, env: INERT_ENV });
     const actual = head.ok ? head.text.trim() : "";
     if (actual !== args.headSha) {
       return {

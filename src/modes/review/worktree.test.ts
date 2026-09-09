@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { execGit } from './git-exec';
 import {
   classifyGitError,
+  effectiveSshFrom,
   isPreflightError,
   materializeWorktree,
   missingConfig,
@@ -613,6 +614,34 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
     }
   }, 30_000);
 
+  // A store that BORROWS its objects via `objects/info/alternates` (a `git clone --shared`/`--reference`
+  // checkout) has an objects/ dir and is neither shallow nor partial, but `clone --local` of it copies
+  // only the POINTER — the private repo would silently depend on the external pool again. It must be
+  // treated as incomplete: start empty and let the fetch fill it (cross-vendor review, codex-f5 · grok-f1).
+  it('never clones a store that borrows via objects/info/alternates — it starts empty and fetches', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-alternates-'));
+    try {
+      const { headSha, origin } = makeOrigin(base);
+      const consumer = makeConsumer(base);
+      g(consumer, 'fetch', '-q', `file://${origin}`, 'refs/pull/7/head'); // a complete store…
+      // …turned into an alternates-borrowing one: git's own marker for "objects I reach through a
+      // borrowed pool". A `clone --local` of this copies the file, not the objects.
+      fs.writeFileSync(
+        path.join(consumer, '.git', 'objects', 'info', 'alternates'),
+        `${path.join(origin, '.git', 'objects')}\n`
+      );
+      const made = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(made)) throw new Error(`alternates failed: ${made.message}`);
+      // Clone SKIPPED (init path), so the private repo carries no borrowed pointer and is self-contained.
+      expect(clonedFromShared(made.dir)).toBe(false);
+      expect(fs.existsSync(path.join(bareOf(made.dir), 'objects', 'info', 'alternates'))).toBe(false);
+      expect(fs.readFileSync(path.join(made.dir, 'src.ts'), 'utf8')).toContain('x = 0');
+      reapWorktree(made.dir);
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   it("hands the checkout's transport config to the fetch PER COMMAND — includeIf'd keys included, global keys not duplicated, nothing written to disk", () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-cfg-'));
     const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
@@ -726,5 +755,21 @@ describe('missingConfig / transportEnv — the per-command transport handoff, as
       if (saved === undefined) delete process.env.GIT_SSH_COMMAND;
       else process.env.GIT_SSH_COMMAND = saved;
     }
+  });
+
+  // `git config --get-regexp` lists a multivar in file order; git's effective value is the LAST.
+  // Taking the first would export the lowest-precedence (global) ssh command and shadow the repo-local
+  // key the carry exists to preserve (cross-vendor review, codex-f4 · claude-f1).
+  it('effectiveSshFrom takes the LAST core.sshcommand — git`s effective value, not the first scope', () => {
+    expect(
+      effectiveSshFrom([
+        ['core.sshcommand', 'ssh -i ~/.ssh/id_personal'], // global (lower precedence)
+        ['http.extraheader', 'A: 1'],
+        ['core.sshcommand', 'ssh -i ~/.ssh/id_work'], // repo-local (wins)
+      ])
+    ).toBe('ssh -i ~/.ssh/id_work');
+    expect(effectiveSshFrom([['core.sshcommand', 'ssh -i only']])).toBe('ssh -i only');
+    expect(effectiveSshFrom([['http.extraheader', 'A: 1']])).toBeUndefined();
+    expect(effectiveSshFrom([])).toBeUndefined();
   });
 });

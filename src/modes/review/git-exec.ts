@@ -117,6 +117,13 @@ export const REPO_LOCATION_ENV = [
   'GIT_CONFIG_PARAMETERS',
   // Discovery can be stopped short of the private repo by an inherited ceiling — same class.
   'GIT_CEILING_DIRECTORIES',
+  // An inherited GIT_REPLACE_REF_BASE reshapes the object graph the same way GIT_SHALLOW_FILE does:
+  // point it at a namespace whose cloned `<base>/<headSha>` ref maps to another commit and `worktree
+  // add` checks out the REPLACEMENT tree while `rev-parse HEAD` still reports the original SHA — the
+  // HEAD assertion then passes on wrong content. Scrubbed here; replace refs carried IN the cloned
+  // store are separately neutralized by GIT_NO_REPLACE_OBJECTS in worktree.ts's INERT_ENV
+  // (cross-vendor review of the lock removal, codex-f2).
+  'GIT_REPLACE_REF_BASE',
 ] as const;
 
 // GIT_CONFIG_COUNT + its GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> siblings inject config by count —
@@ -142,6 +149,13 @@ export function execGit(): GitRun {
         encoding: 'utf8',
         env: Object.assign(scrubRepoEnv(process.env), nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)), opts?.env ?? {}),
         maxBuffer: GIT_MAX_BUFFER,
+        // Capture git's stderr into `err.stderr` (below) WITHOUT mirroring it onto our own stderr:
+        // execFileSync's default leaves stderr inherited, so it ALSO prints the child's stderr
+        // verbatim — a `https://<token>@host` remote git quotes back on a failed fetch would reach
+        // the operator's terminal + run log unredacted, defeating the message-level redaction in
+        // worktree.ts (cross-vendor review of the lock removal, claude-f2). stdin stays closed so a
+        // git command can never sit on an interactive read.
+        stdio: ['ignore', 'pipe', 'pipe'],
         timeout: GIT_TIMEOUT_MS,
       });
       return { ok: true, text };
