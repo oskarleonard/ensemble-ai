@@ -185,7 +185,7 @@ describe('materialization hardening — untrusted content is checked out INERT i
   const headSha = 'a'.repeat(40);
 
   // A mock git that reports NO shared checkout (`--git-common-dir` → a path with no objects/), so no
-  // alternates are written and the materialize proceeds purely through the scripted git.
+  // clone happens and the materialize proceeds purely through the scripted git.
   function harness(headOut: string) {
     const calls: string[][] = [];
     const git: GitRun = ((args: string[], opts?: { env?: Record<string, string> }) => {
@@ -342,8 +342,8 @@ describe('materialization hardening — untrusted content is checked out INERT i
 // Every mocked test above scripts GitRun, so an argv git itself rejects sails through green. This
 // suite runs the REAL git binary against a local file:// origin exposing a refs/pull/N/head ref —
 // no network, no GitHub. It proves the private-repo design: the shared checkout is byte-identical
-// afterwards, two materializations of one repo+PR coexist with no lock, the alternates borrow is
-// written when a shared store exists and skipped when it does not, the fetch stays non-shallow so
+// afterwards, two materializations of one repo+PR coexist with no lock, a complete shared store is
+// hardlink-cloned (self-contained, gc-proof) and a shallow/partial/missing one is not, the fetch stays non-shallow so
 // history reads work, and the reap removes the whole parent.
 describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)', () => {
   const realGit = execGit();
@@ -423,6 +423,10 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
       { headSha, location: { fetchUrl, repoRoot: consumer, slug: 'o/r' }, pr: 7, worktreeRoot: base },
       { git }
     );
+  const bareOf = (worktreeDir: string) => path.join(path.dirname(worktreeDir), 'repo');
+  // A clone (and only a clone) records where it came from; an `init` private repo has no remote.
+  const clonedFromShared = (worktreeDir: string): boolean =>
+    realGit(['-C', bareOf(worktreeDir), 'config', '--get', 'remote.origin.url']).ok;
   const persistedTransportKeys = (worktreeDir: string): boolean =>
     realGit(['-C', path.join(path.dirname(worktreeDir), 'repo'), 'config', '--local', '--get-regexp', TRANSPORT_KEYS_RE]).ok;
 
@@ -456,14 +460,14 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
     try {
       const { headSha, origin } = makeOrigin(base);
       const consumer = makeConsumer(base);
-      // A NON-empty shared store: the consumer already holds the PR head, so the private repo's
-      // borrow is real and the fetch READS the shared objects (an empty store would never exercise
+      // A NON-empty shared store: the consumer already holds the PR head, so the private repo is a
+      // real clone of it and the fetch negotiates against it (an empty store would never exercise
       // that read — round-2 review, claude-f3).
       g(consumer, 'fetch', '-q', `file://${origin}`, 'refs/pull/7/head');
       const before = snapshotGitDir(consumer);
       const made = materialize(base, consumer, headSha, origin);
       if (isPreflightError(made)) throw new Error(`materialization failed: ${made.message}`);
-      expect(fs.existsSync(path.join(path.dirname(made.dir), 'repo', 'objects', 'info', 'alternates'))).toBe(true);
+      expect(clonedFromShared(made.dir)).toBe(true);
       const after = snapshotGitDir(consumer);
       expect(after).toEqual(before); // nothing under the shared .git changed, appeared, or vanished
       expect(fs.existsSync(path.join(consumer, '.git', 'worktrees'))).toBe(false);
@@ -494,21 +498,31 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
     }
   }, 30_000);
 
-  it('writes the alternates borrow when a shared store exists, and skips it when it does not', () => {
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-alt-'));
+  it('hardlink-clones a complete shared store — self-contained and gc-proof — and starts empty when there is none', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-clone-'));
     try {
       const { headSha, origin } = makeOrigin(base);
       const consumer = makeConsumer(base);
+      g(consumer, 'fetch', '-q', `file://${origin}`, 'refs/pull/7/head'); // the store holds the head
 
-      // Shared store present ⇒ the private repo borrows it read-only.
-      const withShared = materialize(base, consumer, headSha, origin);
-      if (isPreflightError(withShared)) throw new Error(`with-shared failed: ${withShared.message}`);
-      const altPath = path.join(path.dirname(withShared.dir), 'repo', 'objects', 'info', 'alternates');
-      expect(fs.existsSync(altPath)).toBe(true);
-      expect(fs.readFileSync(altPath, 'utf8').trim()).toBe(path.join(consumer, '.git', 'objects'));
-      reapWorktree(withShared.dir);
+      // Shared store present ⇒ the private repo is a clone of it: no alternates, the head's own object
+      // file present in the private store — LINKED, not copied, when the temp dir shares the volume.
+      const made = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(made)) throw new Error(`with-shared failed: ${made.message}`);
+      expect(clonedFromShared(made.dir)).toBe(true);
+      expect(fs.existsSync(path.join(bareOf(made.dir), 'objects', 'info', 'alternates'))).toBe(false);
+      const rel = path.join('objects', headSha.slice(0, 2), headSha.slice(2));
+      const shared = fs.statSync(path.join(consumer, '.git', rel));
+      const priv = fs.statSync(path.join(bareOf(made.dir), rel));
+      if (shared.dev === priv.dev) expect(priv.nlink).toBeGreaterThanOrEqual(2);
 
-      // No shared checkout (repoRoot does not resolve) ⇒ no alternates; the fetch brings everything.
+      // GC-PROOF: wipe the shared store entirely — the review in flight must not notice.
+      fs.rmSync(path.join(consumer, '.git', 'objects'), { force: true, recursive: true });
+      expect(g(made.dir, 'rev-list', '--count', 'HEAD')).toBe('1');
+      expect(g(made.dir, 'cat-file', '-t', headSha)).toBe('commit');
+      reapWorktree(made.dir);
+
+      // No shared checkout (repoRoot does not resolve) ⇒ an empty private repo; the fetch brings everything.
       const noShared = materializeWorktree(
         {
           headSha,
@@ -519,8 +533,7 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
         { git: realGit }
       );
       if (isPreflightError(noShared)) throw new Error(`no-shared failed: ${noShared.message}`);
-      const altPath2 = path.join(path.dirname(noShared.dir), 'repo', 'objects', 'info', 'alternates');
-      expect(fs.existsSync(altPath2)).toBe(false);
+      expect(clonedFromShared(noShared.dir)).toBe(false);
       expect(fs.readFileSync(path.join(noShared.dir, 'src.ts'), 'utf8')).toContain('x = 0');
       reapWorktree(noShared.dir);
     } finally {
@@ -528,15 +541,14 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
     }
   }, 30_000);
 
-  it('never borrows from a SHALLOW or PARTIAL shared store — the fetch brings everything instead', () => {
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-noborrow-'));
+  it('never clones a SHALLOW or PARTIAL shared store — the private repo starts empty and the fetch brings everything', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-noclone-'));
     try {
       const { headSha, origin } = makeOrigin(base, 2);
       const consumer = makeConsumer(base);
       g(consumer, 'fetch', '-q', `file://${origin}`, 'refs/pull/7/head');
-      const altOf = (dir: string) => path.join(path.dirname(dir), 'repo', 'objects', 'info', 'alternates');
       // A CI depth-1 `actions/checkout` is BOTH shallow AND carries its transport config only in
-      // repo-local config: the carry must reach the fetch even though the borrow is skipped. Proved
+      // repo-local config: the carry must reach the fetch even though the clone is skipped. Proved
       // the only way a carry can be: the fetch gets a URL that resolves ONLY through the checkout's
       // own `url.<base>.insteadOf`.
       g(consumer, 'config', `url.file://${origin}.insteadOf`, BOGUS_URL);
@@ -547,8 +559,9 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
       expect(g(consumer, 'rev-parse', '--is-shallow-repository')).toBe('true');
       const shallow = materializeAt(base, consumer, headSha, BOGUS_URL);
       if (isPreflightError(shallow)) throw new Error(`shallow failed: ${shallow.message}`);
-      expect(fs.existsSync(altOf(shallow.dir))).toBe(false);
-      // Borrow skipped, yet the bogus URL resolved — the carry reached the fetch — and NOTHING was
+      expect(clonedFromShared(shallow.dir)).toBe(false);
+      expect(g(shallow.dir, 'rev-parse', '--is-shallow-repository')).toBe('false');
+      // Clone skipped, yet the bogus URL resolved — the carry reached the fetch — and NOTHING was
       // written down: the private repo's config holds no transport key.
       expect(persistedTransportKeys(shallow.dir)).toBe(false);
       g(consumer, 'config', '--unset', `url.file://${origin}.insteadOf`);
@@ -562,14 +575,14 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
       g(consumer, 'config', 'extensions.partialClone', 'origin');
       const partial = materialize(base, consumer, headSha, origin);
       if (isPreflightError(partial)) throw new Error(`partial failed: ${partial.message}`);
-      expect(fs.existsSync(altOf(partial.dir))).toBe(false);
+      expect(clonedFromShared(partial.dir)).toBe(false);
       reapWorktree(partial.dir);
       g(consumer, 'config', '--unset', 'extensions.partialClone');
 
-      // Complete again ⇒ the borrow is back.
+      // Complete again ⇒ the clone is back.
       const complete = materialize(base, consumer, headSha, origin);
       if (isPreflightError(complete)) throw new Error(`complete failed: ${complete.message}`);
-      expect(fs.existsSync(altOf(complete.dir))).toBe(true);
+      expect(clonedFromShared(complete.dir)).toBe(true);
       reapWorktree(complete.dir);
     } finally {
       fs.rmSync(base, { force: true, recursive: true });

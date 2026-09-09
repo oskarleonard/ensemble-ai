@@ -3357,21 +3357,20 @@ function isStrippedPath(p, stripped) {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
 var PARTIAL_CLONE_CONFIG_RE = "^(extensions\\.partialclone|remote\\..*\\.promisor)$";
-function sharedObjectsDir(repoRoot, git2) {
+function completeSharedStore(repoRoot, git2) {
   const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
   const commonDir = path12.resolve(repoRoot, common.text.trim());
-  const objects = path12.join(commonDir, "objects");
-  if (!fs14.existsSync(objects)) return null;
+  if (!fs14.existsSync(path12.join(commonDir, "objects"))) return null;
   if (fs14.existsSync(path12.join(commonDir, "shallow"))) return null;
   if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
-  return objects;
+  return commonDir;
 }
-function writeAlternates(bareRepo, sharedObjects) {
-  const info = path12.join(bareRepo, "objects", "info");
-  fs14.mkdirSync(info, { recursive: true });
-  fs14.writeFileSync(path12.join(info, "alternates"), `${sharedObjects}
-`);
+function privateRepoFailure(shared, error) {
+  return `${shared ? "git clone --bare --local" : "git init --bare"} failed: ${error.trim()}`;
+}
+function createPrivateRepoArgs(shared, bare, headSha) {
+  return shared ? [...INERT_GIT_CONFIG, "clone", "--quiet", "--bare", "--local", shared, bare] : [...INERT_GIT_CONFIG, "init", "--bare", objectFormatFlag(headSha), bare];
 }
 var TRANSPORT_CONFIG_RE = "^(core\\.sshcommand|credential\\.|http\\.|url\\.)";
 function missingConfig(want, have) {
@@ -3421,19 +3420,15 @@ function parseConfigList(text) {
 }
 function materializeWorktree(args, deps) {
   const { location } = args;
-  const shared = sharedObjectsDir(location.repoRoot, deps.git);
+  const shared = completeSharedStore(location.repoRoot, deps.git);
   let parent = null;
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     const bare = path12.join(parent, "repo");
-    const init = deps.git(
-      [...INERT_GIT_CONFIG, "init", "--bare", objectFormatFlag(args.headSha), bare],
-      { env: INERT_ENV }
-    );
-    if (!init.ok) {
-      return { kind: "materialize-failed", message: `git init --bare failed: ${init.error.trim()}` };
+    const created = deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
+    if (!created.ok) {
+      return { kind: "materialize-failed", message: privateRepoFailure(shared, created.error) };
     }
-    if (shared) writeAlternates(bare, shared);
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,

@@ -23,12 +23,13 @@ import { nonInteractiveSshCommand } from './git-exec';
 // This fleet has scars from writing into the user's SHARED `.git`: `git worktree add` there mutates
 // the shared object store + `worktrees/` admin dir, which forced a per-repo serialization lock. So
 // nothing is written there any more. Each review materializes into its OWN private repo under an
-// owner-only temp parent: `git init --bare`, an `objects/info/alternates` READ-borrow of the shared
-// store (so the fetch still downloads only the delta; skipped for a shallow or partial store, which
-// could not serve what it advertises), `fetch pull/N/head`, then `worktree add` FROM
-// that private repo. The shared `.git` is byte-identical afterwards, so N reviews of one repo run in
-// parallel with no lock, no TTL, no waiting. Reap removes the whole parent (worktree + private repo);
-// nothing was registered in the shared checkout, so there is no `git worktree prune` to run there.
+// owner-only temp parent: a HARDLINK CLONE of the shared store (`git clone --bare --local` — linked,
+// not copied, so instant and self-contained; an empty `git init --bare` when the store is shallow,
+// partial, or absent), `fetch pull/N/head` (only the delta: the clone carries the shared refs as
+// negotiation tips), then `worktree add` FROM that private repo. The shared `.git` is byte-identical
+// afterwards, so N reviews of one repo run in parallel with no lock, no TTL, no waiting. Reap removes
+// the whole parent (worktree + private repo); nothing was registered in the shared checkout, so
+// there is no `git worktree prune` to run there.
 
 export type GitRun = (
   args: string[],
@@ -212,7 +213,7 @@ const INERT_ENV = { GIT_LFS_SKIP_SMUDGE: '1' };
 // one, so a 64-hex head IS a SHA-256 repo and a 40-hex head a SHA-1 one. Explicit on `git init`,
 // because the default otherwise comes from the USER's `init.defaultObjectFormat` / `GIT_DEFAULT_HASH`,
 // independent of the reviewed repo: a mismatch fails the fetch with `mismatched algorithms` and makes
-// the borrowed store unreadable (cross-vendor review round 2, codex-f4).
+// the shared store's objects unreadable (cross-vendor review round 2, codex-f4).
 function objectFormatFlag(headSha: string): string {
   return `--object-format=${headSha.length === 64 ? 'sha256' : 'sha1'}`;
 }
@@ -409,45 +410,50 @@ export function isStrippedPath(p: string, stripped: readonly string[]): boolean 
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
 
-// ── Read-only object borrow ───────────────────────────────────────────
+// ── The private object store ─────────────────────────────────────────────────
 
-// Resolve the SHARED checkout's object store so a private review repo can borrow it READ-ONLY via
-// `objects/info/alternates`. Returns null when there is no shared checkout to borrow from (a
-// URL-only location, or a repoRoot that no longer resolves) — the fetch then simply brings
-// everything. A READ borrow only: git writes new objects into the private repo, never the shared
-// store, so the shared `.git` is byte-identical after a materialize. Borrowed objects are those
-// reachable from the shared repo's refs at fetch time; a routine `gc` there never prunes reachable
-// objects, so a review in flight is normally safe. The one window this does NOT cover: if a borrowed
-// base object becomes unreachable mid-review (its branch is deleted or force-updated) AND an
-// aggressive `git gc --prune=now` / `git repack -ad` runs in the shared store, that object can be
-// pruned out from under the borrowing worktree — the private repo owns only the PR's own commits,
-// not the borrowed base.
+// A HARDLINK CLONE of the shared checkout's store (`git clone --bare --local`): every object file is
+// linked, not copied — instant and disk-free on one volume; a cross-volume temp dir copies, still
+// correct — so the private repo is SELF-CONTAINED. Two properties follow that a read-only
+// `objects/info/alternates` borrow (the first cut) could not give: a `gc` / `repack` in the shared
+// checkout may delete its pack files at any moment, our links keep the inodes alive, so nothing can
+// be pruned out from under a review in flight; and a fenced seat — which may read the private repo
+// but never `$HOME`, where the shared store lives — can run `git log` / `git blame` over the WHOLE
+// history, not just the PR's own commits (cross-vendor review of the lock removal: round 1 grok-f2,
+// round 2 grok-f3 — the same fork twice; the answer is to stop borrowing, not to harden the borrow).
+// A READ of the shared store only: git links and copies out of it, never writes into it, so the
+// shared `.git` is byte-identical after a materialize.
 //
-// Borrow only from a COMPLETE store. A shallow checkout (`shallow` in the common dir) or a partial
-// clone (`extensions.partialClone` / `remote.<name>.promisor`) advertises refs whose ancestry it
-// does not actually hold: the fetch negotiation would trust those "haves", download only the
-// delta, and the worktree's history reads would then hit objects nobody has (cross-vendor review of
-// the lock removal, codex-f2). Such a store is simply not borrowed — the fetch brings everything,
-// exactly as with no shared checkout at all.
+// Clone only a COMPLETE store. A shallow checkout (`shallow` in the common dir) or a partial clone
+// (`extensions.partialClone` / `remote.<name>.promisor`) advertises refs whose ancestry it does not
+// hold: `clone --local` of a shallow source yields a shallow private repo (verified: git ignores
+// `--local` and copies the `shallow` cut), and the history packet then discards `git log` (round 1,
+// codex-f2). Such a store — like a missing one (a URL-only location, a repoRoot that no longer
+// resolves) — is not cloned: the private repo starts empty (`git init --bare`, in the reviewed repo's
+// object format) and the fetch brings everything.
 const PARTIAL_CLONE_CONFIG_RE = '^(extensions\\.partialclone|remote\\..*\\.promisor)$';
 
-function sharedObjectsDir(repoRoot: string, git: GitRun): string | null {
+// The shared checkout's COMMON dir when its store is complete; null ⇒ the private repo starts empty.
+function completeSharedStore(repoRoot: string, git: GitRun): string | null {
   const common = git(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
   if (!common.ok) return null;
   const commonDir = path.resolve(repoRoot, common.text.trim());
-  const objects = path.join(commonDir, 'objects');
-  if (!fs.existsSync(objects)) return null;
+  if (!fs.existsSync(path.join(commonDir, 'objects'))) return null;
   if (fs.existsSync(path.join(commonDir, 'shallow'))) return null;
   if (git(['config', '--get-regexp', PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
-  return objects;
+  return commonDir;
 }
 
-// Write the alternates borrow into a freshly `git init --bare`'d private repo. `git init` already
-// created `objects/info`; the mkdir is belt-and-braces. One absolute path, one line.
-function writeAlternates(bareRepo: string, sharedObjects: string): void {
-  const info = path.join(bareRepo, 'objects', 'info');
-  fs.mkdirSync(info, { recursive: true });
-  fs.writeFileSync(path.join(info, 'alternates'), `${sharedObjects}\n`);
+function privateRepoFailure(shared: string | null, error: string): string {
+  return `${shared ? 'git clone --bare --local' : 'git init --bare'} failed: ${error.trim()}`;
+}
+
+// The argv that creates the private repo: a hardlink clone of a complete shared store, else an empty
+// bare repo. Shared as a pure function so the twins cannot drift on it.
+function createPrivateRepoArgs(shared: string | null, bare: string, headSha: string): string[] {
+  return shared
+    ? [...INERT_GIT_CONFIG, 'clone', '--quiet', '--bare', '--local', shared, bare]
+    : [...INERT_GIT_CONFIG, 'init', '--bare', objectFormatFlag(headSha), bare];
 }
 
 // ── Transport config for the private fetch ───────────────────────────────────
@@ -512,9 +518,9 @@ function listTransportConfig(cwd: string, git: GitRun): ConfigEntries {
 }
 
 // The env the private fetch runs with: the LFS kill-switch plus the transport settings only the
-// checkout can see. Computed UNCONDITIONALLY, borrow or not — a depth-1 `actions/checkout` is both
-// shallow (no borrow) and token-only-in-local-config, so a fetch that needs auth needs it most exactly
-// when there is nothing to borrow.
+// checkout can see. Computed UNCONDITIONALLY, clone or not — a depth-1 `actions/checkout` is both
+// shallow (no clone) and token-only-in-local-config, so a fetch that needs auth needs it most exactly
+// when there is nothing to clone.
 function fetchEnv(repoRoot: string, bare: string, git: GitRun): Record<string, string> {
   const want = listTransportConfig(repoRoot, git);
   const missing = missingConfig(want, listTransportConfig(bare, git));
@@ -542,12 +548,12 @@ function parseConfigList(text: string): Array<[string, string]> {
 // Fetch the PR head by EXPLICIT url + ref into a PRIVATE bare repo, add a detached worktree at it,
 // then PROVE the worktree's HEAD is the SHA the receipt is tied to. A mismatch ABORTS and reaps —
 // never proceed on wrong-SHA evidence (spec §9, grok-f1). Nothing in the user's shared checkout is
-// ever written: the private repo borrows its objects read-only, so N reviews run with no lock.
+// ever written: the private repo is a hardlink clone of its store, so N reviews run with no lock.
 //
 // NO --depth: the fetch stays non-shallow so every history READ on the review path keeps working.
 // The history packet runs `git log`/`git blame`/`git log base..head` in the worktree; a `--depth`
 // fetch writes a `shallow` graft that makes `--is-shallow-repository` true, and the packet then
-// SHORT-CIRCUITS to "no history" (history-packet.ts). The alternates borrow keeps the non-shallow
+// SHORT-CIRCUITS to "no history" (history-packet.ts). The hardlink clone keeps the non-shallow
 // fetch cheap — it downloads only the objects the shared store lacks (the PR's own commits), the
 // same economics as the old fetch-into-shared-.git path — and a URL-only location (no shared store)
 // simply fetches the full ancestry, exactly as a clone would.
@@ -556,21 +562,17 @@ export function materializeWorktree(
   deps: { git: GitRun }
 ): PreflightError | Worktree {
   const { location } = args;
-  const shared = sharedObjectsDir(location.repoRoot, deps.git);
+  const shared = completeSharedStore(location.repoRoot, deps.git);
   let parent: string | null = null;
   try {
     // git creates the repo + worktree dirs itself, INSIDE an owner-only parent — never directly in a
     // shared temp root (see WORKTREE_PARENT_PREFIX).
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     const bare = path.join(parent, 'repo');
-    const init = deps.git(
-      [...INERT_GIT_CONFIG, 'init', '--bare', objectFormatFlag(args.headSha), bare],
-      { env: INERT_ENV }
-    );
-    if (!init.ok) {
-      return { kind: 'materialize-failed', message: `git init --bare failed: ${init.error.trim()}` };
+    const created = deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
+    if (!created.ok) {
+      return { kind: 'materialize-failed', message: privateRepoFailure(shared, created.error) };
     }
-    if (shared) writeAlternates(bare, shared);
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -730,19 +732,15 @@ export async function materializeWorktreeAsync(
   deps: { git: GitRunAsync }
 ): Promise<PreflightError | Worktree> {
   const { location } = args;
-  const shared = await sharedObjectsDirAsync(location.repoRoot, deps.git);
+  const shared = await completeSharedStoreAsync(location.repoRoot, deps.git);
   let parent: string | null = null;
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     const bare = path.join(parent, 'repo');
-    const init = await deps.git(
-      [...INERT_GIT_CONFIG, 'init', '--bare', objectFormatFlag(args.headSha), bare],
-      { env: INERT_ENV }
-    );
-    if (!init.ok) {
-      return { kind: 'materialize-failed', message: `git init --bare failed: ${init.error.trim()}` };
+    const created = await deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
+    if (!created.ok) {
+      return { kind: 'materialize-failed', message: privateRepoFailure(shared, created.error) };
     }
-    if (shared) await writeAlternatesAsync(bare, shared);
     const fetched = await deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -792,26 +790,19 @@ export async function materializeWorktreeAsync(
   }
 }
 
-// Async twins of the object-borrow + reap helpers — awaited fs so the failure path (an rm of a
+// Async twins of the store-probe + reap helpers — awaited fs so the failure path (an rm of a
 // full checkout) never blocks the loop either (cross-vendor review of the sync original, codex-f1:
 // an rmSync here would block the loop for the seconds a large tree takes to delete, on the failure
 // path, which is when the server is already having a bad time).
-async function sharedObjectsDirAsync(repoRoot: string, git: GitRunAsync): Promise<string | null> {
+async function completeSharedStoreAsync(repoRoot: string, git: GitRunAsync): Promise<string | null> {
   const common = await git(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
   if (!common.ok) return null;
   const commonDir = path.resolve(repoRoot, common.text.trim());
-  const objects = path.join(commonDir, 'objects');
   const exists = (p: string): Promise<boolean> => fs.promises.access(p).then(() => true, () => false);
-  if (!(await exists(objects))) return null;
+  if (!(await exists(path.join(commonDir, 'objects')))) return null;
   if (await exists(path.join(commonDir, 'shallow'))) return null;
   if ((await git(['config', '--get-regexp', PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot })).ok) return null;
-  return objects;
-}
-
-async function writeAlternatesAsync(bareRepo: string, sharedObjects: string): Promise<void> {
-  const info = path.join(bareRepo, 'objects', 'info');
-  await fs.promises.mkdir(info, { recursive: true });
-  await fs.promises.writeFile(path.join(info, 'alternates'), `${sharedObjects}\n`);
+  return commonDir;
 }
 
 // Async twins of listTransportConfig / fetchEnv — same two effective views, same difference.

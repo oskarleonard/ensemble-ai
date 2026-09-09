@@ -2889,21 +2889,20 @@ function isStrippedPath(p, stripped) {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
 var PARTIAL_CLONE_CONFIG_RE = "^(extensions\\.partialclone|remote\\..*\\.promisor)$";
-function sharedObjectsDir(repoRoot, git2) {
+function completeSharedStore(repoRoot, git2) {
   const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
   const commonDir = path11.resolve(repoRoot, common.text.trim());
-  const objects = path11.join(commonDir, "objects");
-  if (!fs12.existsSync(objects)) return null;
+  if (!fs12.existsSync(path11.join(commonDir, "objects"))) return null;
   if (fs12.existsSync(path11.join(commonDir, "shallow"))) return null;
   if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
-  return objects;
+  return commonDir;
 }
-function writeAlternates(bareRepo, sharedObjects) {
-  const info = path11.join(bareRepo, "objects", "info");
-  fs12.mkdirSync(info, { recursive: true });
-  fs12.writeFileSync(path11.join(info, "alternates"), `${sharedObjects}
-`);
+function privateRepoFailure(shared, error) {
+  return `${shared ? "git clone --bare --local" : "git init --bare"} failed: ${error.trim()}`;
+}
+function createPrivateRepoArgs(shared, bare, headSha) {
+  return shared ? [...INERT_GIT_CONFIG, "clone", "--quiet", "--bare", "--local", shared, bare] : [...INERT_GIT_CONFIG, "init", "--bare", objectFormatFlag(headSha), bare];
 }
 var TRANSPORT_CONFIG_RE = "^(core\\.sshcommand|credential\\.|http\\.|url\\.)";
 function missingConfig(want, have) {
@@ -2953,19 +2952,15 @@ function parseConfigList(text) {
 }
 function materializeWorktree(args, deps) {
   const { location } = args;
-  const shared = sharedObjectsDir(location.repoRoot, deps.git);
+  const shared = completeSharedStore(location.repoRoot, deps.git);
   let parent = null;
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     const bare = path11.join(parent, "repo");
-    const init = deps.git(
-      [...INERT_GIT_CONFIG, "init", "--bare", objectFormatFlag(args.headSha), bare],
-      { env: INERT_ENV }
-    );
-    if (!init.ok) {
-      return { kind: "materialize-failed", message: `git init --bare failed: ${init.error.trim()}` };
+    const created = deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
+    if (!created.ok) {
+      return { kind: "materialize-failed", message: privateRepoFailure(shared, created.error) };
     }
-    if (shared) writeAlternates(bare, shared);
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -3059,19 +3054,15 @@ async function resolveRepoLocationAsync(args, deps) {
 }
 async function materializeWorktreeAsync(args, deps) {
   const { location } = args;
-  const shared = await sharedObjectsDirAsync(location.repoRoot, deps.git);
+  const shared = await completeSharedStoreAsync(location.repoRoot, deps.git);
   let parent = null;
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
     const bare = path11.join(parent, "repo");
-    const init = await deps.git(
-      [...INERT_GIT_CONFIG, "init", "--bare", objectFormatFlag(args.headSha), bare],
-      { env: INERT_ENV }
-    );
-    if (!init.ok) {
-      return { kind: "materialize-failed", message: `git init --bare failed: ${init.error.trim()}` };
+    const created = await deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
+    if (!created.ok) {
+      return { kind: "materialize-failed", message: privateRepoFailure(shared, created.error) };
     }
-    if (shared) await writeAlternatesAsync(bare, shared);
     const fetched = await deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -3118,22 +3109,15 @@ async function materializeWorktreeAsync(args, deps) {
     if (parent) await reapParentAsync(parent);
   }
 }
-async function sharedObjectsDirAsync(repoRoot, git2) {
+async function completeSharedStoreAsync(repoRoot, git2) {
   const common = await git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
   const commonDir = path11.resolve(repoRoot, common.text.trim());
-  const objects = path11.join(commonDir, "objects");
   const exists = (p) => fs12.promises.access(p).then(() => true, () => false);
-  if (!await exists(objects)) return null;
+  if (!await exists(path11.join(commonDir, "objects"))) return null;
   if (await exists(path11.join(commonDir, "shallow"))) return null;
   if ((await git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot })).ok) return null;
-  return objects;
-}
-async function writeAlternatesAsync(bareRepo, sharedObjects) {
-  const info = path11.join(bareRepo, "objects", "info");
-  await fs12.promises.mkdir(info, { recursive: true });
-  await fs12.promises.writeFile(path11.join(info, "alternates"), `${sharedObjects}
-`);
+  return commonDir;
 }
 async function listTransportConfigAsync(cwd, git2) {
   const listed = await git2(["config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE], { cwd });

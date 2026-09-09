@@ -107,8 +107,8 @@ async function runBoth(script: Scripted[], worktreeRoot: string) {
 }
 
 describe('materializeWorktree twins — identical argv + outcome on every branch', () => {
-  // `--git-common-dir` → `.git`, so sharedObjectsDir resolves `/repo/.git/objects`, which does not
-  // exist under a fake /repo → no alternates borrow → the sequence stays git-only.
+  // `--git-common-dir` → `.git`, so completeSharedStore looks for `/repo/.git/objects`, which does not
+  // exist under a fake /repo → no clone → the sequence stays git-only.
   const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'parity-'));
 
   it('success + strip: same sequence, same result shape', async () => {
@@ -130,7 +130,7 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
     // effective transport-config reads (checkout, then private repo) → fetch → add → HEAD assert —
     // and the side-channel halves of the contract: init/fetch/add run with the LFS kill-switch env,
     // fetch/add run in the PRIVATE bare repo (…/repo), the HEAD assert in the WORKTREE (…/head).
-    // The transport reads run UNCONDITIONALLY (auth is needed even with no object borrow — here the
+    // The transport reads run UNCONDITIONALLY (auth is needed even with no clone — here the
     // fake /repo has no shared store); nothing they find is ever written into the private repo.
     const flat = syncLog.map((c) => c.args.join(' '));
     expect(flat).toHaveLength(7);
