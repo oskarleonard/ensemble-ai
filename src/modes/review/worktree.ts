@@ -453,18 +453,42 @@ function writeAlternates(bareRepo: string, sharedObjects: string): void {
 // are multi-value-safe (`http.<url>.extraHeader` recurs) via `--get-regexp` + `--add`, and once
 // `core.sshCommand` lives in the private repo the effectiveSshCommand probe at cwd=bare finds it too.
 //
-// `--local` ONLY: the private repo already inherits the user's system+global config, so re-adding
-// merged (all-scope) values would DUPLICATE every global multivar — a second Authorization
-// `extraHeader`, a re-ordered `credential.helper` chain some servers reject. Only the checkout's
-// repo-local keys (a CI token `extraHeader`, a per-repo `core.sshCommand`) are actually missing from
-// the private repo. `--null` so a value carrying spaces or newlines survives the parse intact.
+// Read the checkout's EFFECTIVE config (NOT `--local`): the credentials a multi-account checkout
+// actually fetches with commonly live in an `includeIf.gitdir:` block of ~/.gitconfig — a per-URL
+// `extraHeader`, a `core.sshCommand = ssh -i …` — which a `/tmp` bare repo's gitdir does not satisfy
+// and `--local` never sees (cross-vendor review, grok-f2 · codex-f3). But the private repo already
+// INHERITS the user's unconditional global+system config, so copying every effective value would
+// DUPLICATE those inherited multivars (a second Authorization `extraHeader` some servers reject). So
+// SUBTRACT: add only the exact (key,value) pairs the private repo does not already have — includeIf-
+// conditional and repo-local values are carried, inherited globals are left alone. `--null` so a
+// value carrying spaces or newlines survives the parse intact.
 const TRANSPORT_CONFIG_RE = '^(core\\.sshcommand|credential\\.|http\\.|url\\.)';
-function copyTransportConfig(repoRoot: string, bareRepo: string, git: GitRun): void {
-  const listed = git(['-C', repoRoot, 'config', '--local', '--null', '--get-regexp', TRANSPORT_CONFIG_RE]);
-  if (!listed.ok) return; // exits 1 when no key matches — nothing to carry over
-  for (const [key, value] of parseConfigList(listed.text)) {
+export function copyTransportConfig(repoRoot: string, bareRepo: string, git: GitRun): string[] {
+  const effective = git(['-C', repoRoot, 'config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE]);
+  if (!effective.ok) return []; // exits 1 when no key matches — nothing to carry over
+  const inheritedRes = git(['-C', bareRepo, 'config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE]);
+  const inherited = new Set(
+    (inheritedRes.ok ? parseConfigList(inheritedRes.text) : []).map(([k, v]) => `${k}\n${v}`)
+  );
+  const added: string[] = [];
+  for (const [key, value] of parseConfigList(effective.text)) {
+    if (inherited.has(`${key}\n${value}`)) continue; // already effective in the private repo — no dup
     git(['-C', bareRepo, 'config', '--add', key, value]);
+    added.push(key);
   }
+  return added;
+}
+
+// Remove the transport keys copyTransportConfig ADDED, the moment the fetch that needed them
+// returns and BEFORE `worktree add` — so no credential is ever on disk while a seat runs. The
+// private repo lives under $TMPDIR (`/private/var/…`), which a shell-capable seat's sandbox can
+// READ (codex-sandbox.ts) — unlike `$HOME`, where these secrets sat before this design. Leaving
+// them in `<parent>/repo/config` for the review's lifetime would hand the reviewed-PR-content seat
+// the checkout's token (in CI, the workflow's own GITHUB_TOKEN) — cross-vendor HIGH, codex-f1 ·
+// grok-f1 · claude-f1. `--unset-all` clears every value of a key; only the keys we added locally
+// are touched, so inherited global values are untouched.
+export function scrubTransportConfig(bareRepo: string, addedKeys: string[], git: GitRun): void {
+  for (const key of new Set(addedKeys)) git(['-C', bareRepo, 'config', '--unset-all', key]);
 }
 
 // `git config --null --get-regexp` prints each match as `<name>\n<value>\0`; a valueless implicit-
@@ -517,7 +541,7 @@ export function materializeWorktree(
     // store is shallow/partial and not borrowed (a depth-1 `actions/checkout` is both: shallow AND
     // token-only-in-local-config, so gating the carry on the borrow lost the token exactly when it
     // was the sole credential — the fetch then failed as `auth`, cross-vendor review of the diff).
-    copyTransportConfig(location.repoRoot, bare, deps.git);
+    const carried = copyTransportConfig(location.repoRoot, bare, deps.git);
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -530,6 +554,9 @@ export function materializeWorktree(
       ],
       { cwd: bare, env: INERT_ENV }
     );
+    // Scrub the carried credentials the instant the fetch is done — before `worktree add`, long
+    // before any seat runs (even on the failure path: a failed fetch still reaped, never reviewed).
+    scrubTransportConfig(bare, carried, deps.git);
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
@@ -686,7 +713,7 @@ export async function materializeWorktreeAsync(
     }
     if (shared) await writeAlternatesAsync(bare, shared);
     // Unconditional — same reasoning as the sync twin (auth is needed even without a borrow).
-    await copyTransportConfigAsync(location.repoRoot, bare, deps.git);
+    const carried = await copyTransportConfigAsync(location.repoRoot, bare, deps.git);
     const fetched = await deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -699,6 +726,8 @@ export async function materializeWorktreeAsync(
       ],
       { cwd: bare, env: INERT_ENV }
     );
+    // Scrub the carried credentials the instant the fetch is done — same contract as the sync twin.
+    await scrubTransportConfigAsync(bare, carried, deps.git);
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
@@ -759,12 +788,25 @@ async function writeAlternatesAsync(bareRepo: string, sharedObjects: string): Pr
 }
 
 // Async twin of copyTransportConfig — same allowlist, same multi-value handling.
-async function copyTransportConfigAsync(repoRoot: string, bareRepo: string, git: GitRunAsync): Promise<void> {
-  const listed = await git(['-C', repoRoot, 'config', '--local', '--null', '--get-regexp', TRANSPORT_CONFIG_RE]);
-  if (!listed.ok) return;
-  for (const [key, value] of parseConfigList(listed.text)) {
+async function copyTransportConfigAsync(repoRoot: string, bareRepo: string, git: GitRunAsync): Promise<string[]> {
+  const effective = await git(['-C', repoRoot, 'config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE]);
+  if (!effective.ok) return [];
+  const inheritedRes = await git(['-C', bareRepo, 'config', '--null', '--get-regexp', TRANSPORT_CONFIG_RE]);
+  const inherited = new Set(
+    (inheritedRes.ok ? parseConfigList(inheritedRes.text) : []).map(([k, v]) => `${k}\n${v}`)
+  );
+  const added: string[] = [];
+  for (const [key, value] of parseConfigList(effective.text)) {
+    if (inherited.has(`${key}\n${value}`)) continue;
     await git(['-C', bareRepo, 'config', '--add', key, value]);
+    added.push(key);
   }
+  return added;
+}
+
+// Async twin of scrubTransportConfig.
+async function scrubTransportConfigAsync(bareRepo: string, addedKeys: string[], git: GitRunAsync): Promise<void> {
+  for (const key of new Set(addedKeys)) await git(['-C', bareRepo, 'config', '--unset-all', key]);
 }
 
 async function reapParentAsync(parent: string): Promise<void> {

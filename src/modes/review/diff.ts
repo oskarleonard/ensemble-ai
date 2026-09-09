@@ -2,6 +2,8 @@ import { execFileSync } from 'node:child_process';
 
 import { sha256Hex } from '../../core/hash';
 
+import { scrubRepoEnv } from './git-exec';
+
 // Diff acquisition + the canonical-diff content digest + per-file COVERAGE.
 //
 // A raw `git diff` has NO intrinsic commit identity, so the manifest records the
@@ -283,6 +285,11 @@ function git(cwd: string, args: string[], opts?: { quiet?: boolean }): string {
   return execFileSync('git', args, {
     cwd,
     encoding: 'utf8',
+    // Scrub the repo-selecting env (GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/…) so an inherited value —
+    // git exports GIT_DIR for every hook it runs — can't make `git diff`, the base/head SHAs, or the
+    // origin URL (the receipt STORE KEY via resolveRepoId) come from a different repo than cwd
+    // (cross-vendor review, claude-f2). cwd is the only repo this reader means.
+    env: scrubRepoEnv(process.env),
     stdio: opts?.quiet ? ['ignore', 'pipe', 'ignore'] : ['pipe', 'pipe', 'inherit'],
   });
 }

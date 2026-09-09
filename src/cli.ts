@@ -105,7 +105,7 @@ import {
 } from './modes/review/profile';
 import { formatEvidenceFooter, SEAT_QUALIFIERS } from './modes/review/seat-evidence';
 import { isPreflightError, redactUrlCredentials } from './modes/review/worktree';
-import { execGit } from './modes/review/git-exec';
+import { execGit, scrubRepoEnv } from './modes/review/git-exec';
 import { checkPinDrift, describePinDrift } from './plumbing/pin-check';
 import {
   buildHistoryPacket,
@@ -445,6 +445,9 @@ function gitToplevel(cwd: string): string | null {
     const top = execFileSync('git', ['rev-parse', '--show-toplevel'], {
       cwd,
       encoding: 'utf8',
+      // Scrub repo-selecting env so an inherited GIT_DIR can't point the trail dir at another repo
+      // (claude-f2); cwd is the only repo this probe means.
+      env: scrubRepoEnv(process.env),
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     return top || null;

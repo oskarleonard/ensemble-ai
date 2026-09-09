@@ -2169,11 +2169,11 @@ async function runBrainstormMode(opts) {
 // src/modes/review/claude.ts
 import fs16 from "fs";
 import os9 from "os";
-import path13 from "path";
+import path14 from "path";
 
 // src/modes/review/history-packet.ts
 import fs15 from "fs";
-import path12 from "path";
+import path13 from "path";
 
 // src/modes/review/ensemble-config.ts
 import fs11 from "fs";
@@ -2193,7 +2193,7 @@ function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
 
 // src/modes/review/gate-hunks.ts
 import fs13 from "fs";
-import path10 from "path";
+import path11 from "path";
 
 // src/modes/review/secret-scan.ts
 var SENSITIVE_PATH_PATTERNS = [
@@ -2731,12 +2731,104 @@ function isFinding(v) {
 }
 
 // src/modes/review/diff.ts
-import { execFileSync as execFileSync3 } from "child_process";
+import { execFileSync as execFileSync4 } from "child_process";
 
 // src/core/hash.ts
 import crypto from "crypto";
 function sha256Hex(input) {
   return crypto.createHash("sha256").update(input, "utf8").digest("hex");
+}
+
+// src/modes/review/git-exec.ts
+import { execFileSync as execFileSync3 } from "child_process";
+import path10 from "path";
+function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
+  const cmd = configured?.trim();
+  if (!cmd) return "ssh -o BatchMode=yes";
+  const bin = path10.basename(cmd.split(/\s+/)[0]);
+  return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
+}
+function effectiveSshCommand(cwd, cache) {
+  const key = cwd ?? "";
+  if (cache.has(key)) return cache.get(key);
+  let value = process.env.GIT_SSH_COMMAND?.trim() || void 0;
+  if (!value) {
+    try {
+      value = execFileSync3("git", ["config", "--get", "core.sshCommand"], {
+        cwd,
+        encoding: "utf8",
+        env: scrubRepoEnv(process.env),
+        // the cwd repo's config — never GIT_DIR's
+        stdio: ["ignore", "pipe", "ignore"]
+      }).trim() || void 0;
+    } catch {
+      value = void 0;
+    }
+  }
+  cache.set(key, value);
+  return value;
+}
+function nonInteractiveEnv(configuredSsh) {
+  const ssh = nonInteractiveSshCommand(configuredSsh);
+  return {
+    GIT_ASKPASS: "",
+    GIT_TERMINAL_PROMPT: "0",
+    SSH_ASKPASS: "",
+    // Absent ⇒ git resolves ssh itself, from the user's own GIT_SSH_COMMAND or core.sshCommand.
+    ...ssh ? { GIT_SSH_COMMAND: ssh } : {}
+  };
+}
+var GIT_TIMEOUT_MS = 6e5;
+var GIT_MAX_BUFFER = 64 * 1024 * 1024;
+var REPO_LOCATION_ENV = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_NAMESPACE",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_INDEX_FILE",
+  // A repo also selects itself through these, so cwd is not the only selector unless they go too
+  // (cross-vendor review, codex-f2 · claude-f2): GIT_CONFIG forces a single config file — it would
+  // make the private repo's `config --local`/`--get-regexp` read the wrong file and reshape the
+  // effectiveSshCommand probe; GIT_SHALLOW_FILE / GIT_GRAFT_FILE rewrite the object graph (an
+  // inherited GIT_SHALLOW_FILE makes the fully-fetched private repo report itself shallow, so the
+  // history packet discards `git log`/`git blame`); GIT_CONFIG_PARAMETERS injects arbitrary config
+  // that could re-enable `core.hooksPath` or `url.<base>.insteadOf`, defeating the inert 'explicit
+  // URL' posture. NOT GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM — the transport carry relies on the
+  // user's global credentials still being inherited.
+  "GIT_CONFIG",
+  "GIT_SHALLOW_FILE",
+  "GIT_GRAFT_FILE",
+  "GIT_CONFIG_PARAMETERS"
+];
+var CONFIG_INJECTION_ENV_RE = /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/;
+function scrubRepoEnv(env) {
+  const out = { ...env };
+  for (const key of REPO_LOCATION_ENV) delete out[key];
+  for (const key of Object.keys(out)) if (CONFIG_INJECTION_ENV_RE.test(key)) delete out[key];
+  return out;
+}
+function execGit() {
+  const sshByCwd = /* @__PURE__ */ new Map();
+  return (args, opts) => {
+    try {
+      const text = execFileSync3("git", args, {
+        cwd: opts?.cwd,
+        // Read `process.env` LIVE each spawn (a later `HTTPS_PROXY`/`GIT_SSH_COMMAND` must be seen),
+        // but scrub the repo-selectors in place so the env is cloned once, not twice.
+        encoding: "utf8",
+        env: Object.assign(scrubRepoEnv(process.env), nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)), opts?.env ?? {}),
+        maxBuffer: GIT_MAX_BUFFER,
+        timeout: GIT_TIMEOUT_MS
+      });
+      return { ok: true, text };
+    } catch (e) {
+      const err = e;
+      const stderr = err.stderr ? String(err.stderr).trim() : "";
+      return { error: stderr || err.message || "git failed", ok: false };
+    }
+  };
 }
 
 // src/modes/review/diff.ts
@@ -2889,9 +2981,14 @@ function diffDigest(raw) {
   return `sha256:${sha256Hex(canonicalizeDiff(raw))}`;
 }
 function git(cwd, args, opts) {
-  return execFileSync3("git", args, {
+  return execFileSync4("git", args, {
     cwd,
     encoding: "utf8",
+    // Scrub the repo-selecting env (GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/…) so an inherited value —
+    // git exports GIT_DIR for every hook it runs — can't make `git diff`, the base/head SHAs, or the
+    // origin URL (the receipt STORE KEY via resolveRepoId) come from a different repo than cwd
+    // (cross-vendor review, claude-f2). cwd is the only repo this reader means.
+    env: scrubRepoEnv(process.env),
     stdio: opts?.quiet ? ["ignore", "pipe", "ignore"] : ["pipe", "pipe", "inherit"]
   });
 }
@@ -2998,7 +3095,7 @@ function readGatePacketHeadSha(baseDir, runId) {
   return raw && typeof raw.headSha === "string" && raw.headSha.trim() && raw.schemaVersion === GATE_PACKET_SCHEMA_VERSION ? raw.headSha : null;
 }
 function readGatePacket(baseDir, runId, expectedHeadSha) {
-  const file = path10.join(reviewDir(baseDir, runId), "packet.gate.json");
+  const file = path11.join(reviewDir(baseDir, runId), "packet.gate.json");
   if (!fs13.existsSync(file)) return { ok: false, reason: "missing" };
   const raw = readTrailJson(baseDir, runId, "packet.gate.json");
   if (raw === null || typeof raw.diff !== "string" || typeof raw.headSha !== "string" || raw.schemaVersion !== GATE_PACKET_SCHEMA_VERSION) {
@@ -3096,7 +3193,7 @@ function hunkCodeLines(hunk) {
 
 // src/modes/review/worktree.ts
 import fs14 from "fs";
-import path11 from "path";
+import path12 from "path";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
 }
@@ -3127,18 +3224,18 @@ function allowedRootsFromConfig(configPath) {
   const roots = readEnsembleConfig(configPath).allowedRepoRoots;
   if (!Array.isArray(roots) || roots.length === 0) return null;
   const strs = roots.filter((r) => typeof r === "string" && r.trim().length > 0);
-  return strs.length > 0 ? strs.map((r) => path11.resolve(r)) : null;
+  return strs.length > 0 ? strs.map((r) => path12.resolve(r)) : null;
 }
 function rootAllowed(repoRoot, allowed) {
   if (!allowed) return true;
-  const real = path11.resolve(repoRoot);
+  const real = path12.resolve(repoRoot);
   return allowed.some((root) => {
-    const rel = path11.relative(root, real);
-    return rel === "" || !rel.startsWith("..") && !path11.isAbsolute(rel);
+    const rel = path12.relative(root, real);
+    return rel === "" || !rel.startsWith("..") && !path12.isAbsolute(rel);
   });
 }
 function resolveRepoLocation(args, deps) {
-  const repoPath = path11.resolve(args.repoPath);
+  const repoPath = path12.resolve(args.repoPath);
   const top = deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
   if (!top.ok) {
     return {
@@ -3223,7 +3320,7 @@ function stripAgentInstructions(dir) {
   const removed = [];
   const remove = (rel) => {
     try {
-      fs14.rmSync(path11.join(dir, rel), { force: true, recursive: true });
+      fs14.rmSync(path12.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -3231,7 +3328,7 @@ function stripAgentInstructions(dir) {
   const walk = (rel) => {
     let entries;
     try {
-      entries = fs14.readdirSync(path11.join(dir, rel), { withFileTypes: true });
+      entries = fs14.readdirSync(path12.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -3241,7 +3338,7 @@ function stripAgentInstructions(dir) {
       if (isInstructionName(e.name)) {
         remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
-        if (fs14.existsSync(path11.join(dir, childRel, CURSOR_RULES))) {
+        if (fs14.existsSync(path12.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
         walk(childRel);
@@ -3260,26 +3357,39 @@ var PARTIAL_CLONE_CONFIG_RE = "^(extensions\\.partialclone|remote\\..*\\.promiso
 function sharedObjectsDir(repoRoot, git2) {
   const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
-  const commonDir = path11.resolve(repoRoot, common.text.trim());
-  const objects = path11.join(commonDir, "objects");
+  const commonDir = path12.resolve(repoRoot, common.text.trim());
+  const objects = path12.join(commonDir, "objects");
   if (!fs14.existsSync(objects)) return null;
-  if (fs14.existsSync(path11.join(commonDir, "shallow"))) return null;
+  if (fs14.existsSync(path12.join(commonDir, "shallow"))) return null;
   if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
   return objects;
 }
 function writeAlternates(bareRepo, sharedObjects) {
-  const info = path11.join(bareRepo, "objects", "info");
+  const info = path12.join(bareRepo, "objects", "info");
   fs14.mkdirSync(info, { recursive: true });
-  fs14.writeFileSync(path11.join(info, "alternates"), `${sharedObjects}
+  fs14.writeFileSync(path12.join(info, "alternates"), `${sharedObjects}
 `);
 }
 var TRANSPORT_CONFIG_RE = "^(core\\.sshcommand|credential\\.|http\\.|url\\.)";
 function copyTransportConfig(repoRoot, bareRepo, git2) {
-  const listed = git2(["-C", repoRoot, "config", "--local", "--null", "--get-regexp", TRANSPORT_CONFIG_RE]);
-  if (!listed.ok) return;
-  for (const [key, value] of parseConfigList(listed.text)) {
+  const effective = git2(["-C", repoRoot, "config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE]);
+  if (!effective.ok) return [];
+  const inheritedRes = git2(["-C", bareRepo, "config", "--null", "--get-regexp", TRANSPORT_CONFIG_RE]);
+  const inherited = new Set(
+    (inheritedRes.ok ? parseConfigList(inheritedRes.text) : []).map(([k, v]) => `${k}
+${v}`)
+  );
+  const added = [];
+  for (const [key, value] of parseConfigList(effective.text)) {
+    if (inherited.has(`${key}
+${value}`)) continue;
     git2(["-C", bareRepo, "config", "--add", key, value]);
+    added.push(key);
   }
+  return added;
+}
+function scrubTransportConfig(bareRepo, addedKeys, git2) {
+  for (const key of new Set(addedKeys)) git2(["-C", bareRepo, "config", "--unset-all", key]);
 }
 function parseConfigList(text) {
   const out = [];
@@ -3296,13 +3406,13 @@ function materializeWorktree(args, deps) {
   let parent = null;
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    const bare = path11.join(parent, "repo");
+    const bare = path12.join(parent, "repo");
     const init = deps.git([...INERT_GIT_CONFIG, "init", "--bare", bare], { env: INERT_ENV });
     if (!init.ok) {
       return { kind: "materialize-failed", message: `git init --bare failed: ${init.error.trim()}` };
     }
     if (shared) writeAlternates(bare, shared);
-    copyTransportConfig(location.repoRoot, bare, deps.git);
+    const carried = copyTransportConfig(location.repoRoot, bare, deps.git);
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -3315,13 +3425,14 @@ function materializeWorktree(args, deps) {
       ],
       { cwd: bare, env: INERT_ENV }
     );
+    scrubTransportConfig(bare, carried, deps.git);
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}`
       };
     }
-    const dir = path11.join(parent, "head");
+    const dir = path12.join(parent, "head");
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
       { cwd: bare, env: INERT_ENV }
@@ -3351,14 +3462,14 @@ function materializeWorktree(args, deps) {
 }
 var REAP_RM_OPTS = { force: true, maxRetries: 3, recursive: true, retryDelay: 50 };
 function reapParent(parent) {
-  if (!path11.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
+  if (!path12.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
     fs14.rmSync(parent, REAP_RM_OPTS);
   } catch {
   }
 }
 function reapWorktree(dir) {
-  reapParent(path11.dirname(dir));
+  reapParent(path12.dirname(dir));
 }
 
 // src/modes/review/history-packet.ts
@@ -3670,15 +3781,15 @@ function buildHistoryPacket(args) {
   return { bytes, files, shallow: false, truncated };
 }
 function containedPath(root, rel) {
-  const abs = path12.resolve(root, rel);
-  const back = path12.relative(path12.resolve(root), abs);
+  const abs = path13.resolve(root, rel);
+  const back = path13.relative(path13.resolve(root), abs);
   return back !== "" && !escapesRoot(back) ? abs : null;
 }
 function writeHistoryPacket(cwd, files) {
   for (const f of files) {
     const abs = containedPath(cwd, f.path);
     if (!abs) continue;
-    fs15.mkdirSync(path12.dirname(abs), { recursive: true });
+    fs15.mkdirSync(path13.dirname(abs), { recursive: true });
     fs15.writeFileSync(abs, f.contents, { mode: 256 });
   }
 }
@@ -3713,7 +3824,7 @@ function homeReadDenyRules(homeDir) {
   return CLAUDE_READ_TOOLS.map((t) => denyUnder(t, homeDir));
 }
 function isUnder(child, parent) {
-  return !escapesRoot(path13.relative(path13.resolve(parent), path13.resolve(child)));
+  return !escapesRoot(path14.relative(path14.resolve(parent), path14.resolve(child)));
 }
 function buildClaudeReviewArgs(prompt, config, fence = {}) {
   const homeDir = fence.homeDir ?? os9.homedir();
@@ -5099,7 +5210,7 @@ function scanDependencySurface(files) {
 // src/modes/review/receipt.ts
 import fs19 from "fs";
 import os10 from "os";
-import path15 from "path";
+import path16 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -5183,7 +5294,7 @@ function formatEvidenceShortfall(gaps) {
 
 // src/modes/review/holistic-gate.ts
 import fs18 from "fs";
-import path14 from "path";
+import path15 from "path";
 
 // src/modes/review/holistic.ts
 import fs17 from "fs";
@@ -5393,18 +5504,18 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs18.realpathSync(path14.resolve(worktreeDir));
+    root = fs18.realpathSync(path15.resolve(worktreeDir));
   } catch {
     return () => null;
   }
   const inside = (p) => {
-    const rel = path14.relative(root, p);
+    const rel = path15.relative(root, p);
     return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
-      if (!file || file.includes("\0") || path14.isAbsolute(file)) return null;
-      const target = path14.resolve(root, file);
+      if (!file || file.includes("\0") || path15.isAbsolute(file)) return null;
+      const target = path15.resolve(root, file);
       if (!inside(target)) return null;
       const real = fs18.realpathSync(target);
       if (!inside(real)) return null;
@@ -6852,10 +6963,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path15.join(os10.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path16.join(os10.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path15.join(
+  return path16.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -6876,7 +6987,7 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs19.mkdirSync(path15.dirname(file), { recursive: true, mode: 448 });
+  fs19.mkdirSync(path16.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
   fs19.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
   fs19.chmodSync(tmp, 384);
@@ -8370,11 +8481,11 @@ function loadClaudeReviewerSeat(file = VOICES_FILE, flags = {}, warn = () => {
 
 // src/modes/review/regate.ts
 import fs21 from "fs";
-import path16 from "path";
+import path17 from "path";
 function readConventionPathsFromTrail(baseDir, runId) {
   try {
     const raw = JSON.parse(
-      fs21.readFileSync(path16.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
+      fs21.readFileSync(path17.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
     );
     const paths = (raw.files ?? []).filter((f) => f.included === true && typeof f.path === "string").map((f) => f.path);
     return paths.length > 0 ? paths : void 0;
@@ -8420,7 +8531,7 @@ async function runRegate(opts) {
     ...opts.worktree ? { worktree: opts.worktree } : {}
   });
   try {
-    const p = path16.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
+    const p = path17.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
     const existing = fs21.existsSync(p) ? JSON.parse(fs21.readFileSync(p, "utf8")) : {};
     writeTrailFile(
       opts.baseDir,
@@ -8453,7 +8564,7 @@ async function runRegate(opts) {
 
 // src/modes/review/reseat.ts
 import fs22 from "fs";
-import path17 from "path";
+import path18 from "path";
 
 // src/modes/review/evidence-manifest.ts
 var EVIDENCE_MANIFEST_SCHEMA_VERSION = 1;
@@ -8546,7 +8657,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   if (!stored) return { error: `run ${runId} has no review.${seat}.json under ${baseDir}` };
   let parsed;
   try {
-    parsed = JSON.parse(fs22.readFileSync(path17.join(dir, `packet.${seat}.json`), "utf8"));
+    parsed = JSON.parse(fs22.readFileSync(path18.join(dir, `packet.${seat}.json`), "utf8"));
   } catch {
     return { error: `run ${runId} has no readable packet.${seat}.json` };
   }
@@ -8556,7 +8667,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   const packet = parsed;
   let prompt;
   try {
-    prompt = fs22.readFileSync(path17.join(dir, `prompt.${seat}.md`), "utf8");
+    prompt = fs22.readFileSync(path18.join(dir, `prompt.${seat}.md`), "utf8");
   } catch {
     return { error: `run ${runId} has no readable prompt.${seat}.md` };
   }
@@ -8629,7 +8740,7 @@ function readReseatLock(p) {
   return { since, startedMs };
 }
 function acquireReseatLock(baseDir, runId) {
-  const p = path17.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
+  const p = path18.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
   const held = () => `another reseat is already running on run ${runId} (lock ${RESEAT_LOCK_FILE}, since ${readReseatLock(p)?.since ?? "unknown"})`;
   const claim = () => {
     try {
@@ -8663,7 +8774,7 @@ function acquireReseatLock(baseDir, runId) {
 }
 function foldSynthesis(baseDir, runId, patch, log) {
   try {
-    const p = path17.join(reviewDir(baseDir, runId), "claude-synthesis.json");
+    const p = path18.join(reviewDir(baseDir, runId), "claude-synthesis.json");
     const existing = fs22.existsSync(p) ? JSON.parse(fs22.readFileSync(p, "utf8")) : {};
     writeTrailFile(baseDir, runId, "claude-synthesis.json", JSON.stringify(patch(existing), null, 2));
     return true;
@@ -8676,7 +8787,7 @@ function appendEgressDenials(baseDir, runId, denials, log) {
   if (denials.length === 0) return;
   try {
     log(`reseat: \u26A0 egress fence: ${formatEgressDenialCounts(denials)}`);
-    const p = path17.join(reviewDir(baseDir, runId), "egress-denials.json");
+    const p = path18.join(reviewDir(baseDir, runId), "egress-denials.json");
     const prior = fs22.existsSync(p) ? JSON.parse(fs22.readFileSync(p, "utf8")) : [];
     if (!Array.isArray(prior)) {
       log(
@@ -8799,7 +8910,7 @@ async function reseatUnderLock(opts, pre) {
     log
   );
   try {
-    const mp = path17.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
+    const mp = path18.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
     if (fs22.existsSync(mp)) {
       const manifest = JSON.parse(fs22.readFileSync(mp, "utf8"));
       manifest.realizedEvidence = {
@@ -8855,83 +8966,6 @@ async function reseatUnderLock(opts, pre) {
     realized: seatRun.realized,
     review,
     stampWritten
-  };
-}
-
-// src/modes/review/git-exec.ts
-import { execFileSync as execFileSync4 } from "child_process";
-import path18 from "path";
-function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
-  const cmd = configured?.trim();
-  if (!cmd) return "ssh -o BatchMode=yes";
-  const bin = path18.basename(cmd.split(/\s+/)[0]);
-  return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
-}
-function effectiveSshCommand(cwd, cache) {
-  const key = cwd ?? "";
-  if (cache.has(key)) return cache.get(key);
-  let value = process.env.GIT_SSH_COMMAND?.trim() || void 0;
-  if (!value) {
-    try {
-      value = execFileSync4("git", ["config", "--get", "core.sshCommand"], {
-        cwd,
-        encoding: "utf8",
-        env: scrubRepoEnv(process.env),
-        // the cwd repo's config — never GIT_DIR's
-        stdio: ["ignore", "pipe", "ignore"]
-      }).trim() || void 0;
-    } catch {
-      value = void 0;
-    }
-  }
-  cache.set(key, value);
-  return value;
-}
-function nonInteractiveEnv(configuredSsh) {
-  const ssh = nonInteractiveSshCommand(configuredSsh);
-  return {
-    GIT_ASKPASS: "",
-    GIT_TERMINAL_PROMPT: "0",
-    SSH_ASKPASS: "",
-    // Absent ⇒ git resolves ssh itself, from the user's own GIT_SSH_COMMAND or core.sshCommand.
-    ...ssh ? { GIT_SSH_COMMAND: ssh } : {}
-  };
-}
-var GIT_TIMEOUT_MS = 6e5;
-var GIT_MAX_BUFFER = 64 * 1024 * 1024;
-var REPO_LOCATION_ENV = [
-  "GIT_DIR",
-  "GIT_WORK_TREE",
-  "GIT_NAMESPACE",
-  "GIT_COMMON_DIR",
-  "GIT_OBJECT_DIRECTORY",
-  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-  "GIT_INDEX_FILE"
-];
-function scrubRepoEnv(env) {
-  const out = { ...env };
-  for (const key of REPO_LOCATION_ENV) delete out[key];
-  return out;
-}
-function execGit() {
-  const sshByCwd = /* @__PURE__ */ new Map();
-  return (args, opts) => {
-    try {
-      const text = execFileSync4("git", args, {
-        cwd: opts?.cwd,
-        // Read `process.env` LIVE each spawn (a later `HTTPS_PROXY`/`GIT_SSH_COMMAND` must be seen),
-        // but scrub the repo-selectors in place so the env is cloned once, not twice.
-        encoding: "utf8",
-        env: Object.assign(scrubRepoEnv(process.env), nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)), opts?.env ?? {}),
-        maxBuffer: GIT_MAX_BUFFER,
-        timeout: GIT_TIMEOUT_MS
-      });
-      return { ok: true, text };
-    } catch (e) {
-      const err = e;
-      const stderr = err.stderr ? String(err.stderr).trim() : "";
-      return { error: stderr || err.message || "git failed", ok: false };
-    }
   };
 }
 
@@ -10038,6 +10072,9 @@ function gitToplevel(cwd) {
     const top = execFileSync5("git", ["rev-parse", "--show-toplevel"], {
       cwd,
       encoding: "utf8",
+      // Scrub repo-selecting env so an inherited GIT_DIR can't point the trail dir at another repo
+      // (claude-f2); cwd is the only repo this probe means.
+      env: scrubRepoEnv(process.env),
       stdio: ["ignore", "pipe", "ignore"]
     }).trim();
     return top || null;

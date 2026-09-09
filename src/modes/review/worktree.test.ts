@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { execGit } from './git-exec';
 import {
   classifyGitError,
+  copyTransportConfig,
   isPreflightError,
   materializeWorktree,
   reapWorktree,
@@ -14,6 +15,7 @@ import {
   remoteSlug,
   resolveRepoLocation,
   rootAllowed,
+  scrubTransportConfig,
   type GitRun,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
 } from './worktree';
@@ -529,9 +531,10 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
       const shallow = materialize(base, consumer, headSha, origin);
       if (isPreflightError(shallow)) throw new Error(`shallow failed: ${shallow.message}`);
       expect(fs.existsSync(altOf(shallow.dir))).toBe(false);
-      // borrow skipped, but the transport config was still carried into the private repo.
-      expect(g(bareOf(shallow.dir), 'config', '--get', 'http.https://example.test/.extraHeader')).toBe(
-        'Authorization: Basic TOKEN'
+      // borrow skipped, but the carry still fired for the fetch — and was SCRUBBED afterwards, so
+      // the token never persists in a temp gitdir a seat's sandbox can read (codex-f1/grok-f1/claude-f1).
+      expect(realGit(['-C', bareOf(shallow.dir), 'config', '--get', 'http.https://example.test/.extraHeader']).ok).toBe(
+        false
       );
       expect(fs.readFileSync(path.join(shallow.dir, 'src.ts'), 'utf8')).toContain('x = 1');
       // The private repo is complete on its own: history walks past the consumer's cut.
@@ -557,7 +560,7 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
     }
   }, 30_000);
 
-  it("carries the checkout's repo-local transport config into the private repo, but never core.bare/worktree", () => {
+  it("carries transport config for the fetch, then SCRUBS it so no secret persists in a seat-readable temp gitdir", () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-cfg-'));
     try {
       const { headSha, origin } = makeOrigin(base);
@@ -575,18 +578,51 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
       // Reading the checkout's config must not mutate the shared .git.
       expect(snapshotGitDir(consumer)).toEqual(before);
 
+      // SECURITY (codex-f1/grok-f1/claude-f1): the carried secrets must NOT sit on disk in the
+      // private repo's own config after materialize — that file lives under $TMPDIR, which a seat's
+      // sandbox can read. Assert on the config FILE bytes (robust to whatever the dev's global
+      // ~/.gitconfig inherits — the finding is specifically about the temp gitdir on disk).
       const bare = path.join(path.dirname(made.dir), 'repo');
+      const cfgFile = fs.readFileSync(path.join(bare, 'config'), 'utf8');
+      expect(cfgFile).not.toContain('Authorization: Basic TOKEN');
+      expect(cfgFile).not.toContain('id_work');
+      expect(cfgFile).not.toContain('insteadOf');
+      // The scrub must NOT have flipped the repo's shape: still bare, never a worktree retarget.
+      expect(realGit(['-C', bare, 'config', '--get', 'core.worktree']).ok).toBe(false);
+      const coreBare = realGit(['-C', bare, 'config', '--get', 'core.bare']);
+      expect(coreBare.ok && coreBare.text.trim()).toBe('true');
+      reapWorktree(made.dir);
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it('copyTransportConfig carries non-inherited effective keys; scrubTransportConfig removes exactly those', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-carry-'));
+    try {
+      const consumer = makeConsumer(base);
+      g(consumer, 'config', 'http.https://example.test/.extraHeader', 'Authorization: Basic TOKEN');
+      g(consumer, 'config', 'core.sshCommand', 'ssh -i /home/me/.ssh/id_work');
+      const bare = path.join(base, 'bare');
+      g(base, 'init', '--bare', bare);
       const cfg = (key: string) => {
         const r = realGit(['-C', bare, 'config', '--get', key]);
         return r.ok ? r.text.trim() : '';
       };
-      expect(cfg('core.sshCommand')).toBe('ssh -i /home/me/.ssh/id_work');
-      expect(cfg('url.git@github.com:.insteadOf')).toBe('https://github.com/');
+
+      const added = copyTransportConfig(consumer, bare, realGit);
+      // The two checkout-local keys the private repo did not already inherit — carried in, so the
+      // fetch authenticates (dedup vs inherited means globals are NOT re-added, so exactly these two).
+      expect(added).toContain('core.sshcommand'); // git canonicalizes the section.name to lower-case
+      expect(added.length).toBeGreaterThanOrEqual(2);
       expect(cfg('http.https://example.test/.extraHeader')).toBe('Authorization: Basic TOKEN');
-      // The allowlist must NOT drag in repo-shape keys that would retarget/corrupt the private repo.
-      expect(realGit(['-C', bare, 'config', '--get', 'core.worktree']).ok).toBe(false);
-      expect(cfg('core.bare')).toBe('true'); // still a bare repo — the carry did not flip it
-      reapWorktree(made.dir);
+      expect(cfg('core.sshCommand')).toBe('ssh -i /home/me/.ssh/id_work');
+
+      // …then removed the instant they are no longer needed, so no seat ever reads them on disk.
+      scrubTransportConfig(bare, added, realGit);
+      const cfgFile = fs.readFileSync(path.join(bare, 'config'), 'utf8');
+      expect(cfgFile).not.toContain('Authorization: Basic TOKEN');
+      expect(cfgFile).not.toContain('id_work');
     } finally {
       fs.rmSync(base, { force: true, recursive: true });
     }

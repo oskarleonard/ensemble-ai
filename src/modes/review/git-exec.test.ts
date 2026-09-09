@@ -108,6 +108,17 @@ describe('execGit — cwd is the ONLY repo selector; repository-selecting env is
     expect(env.GIT_DIR, 'the input is not mutated').toBe('/x');
   });
 
+  it('scrubRepoEnv strips the GIT_CONFIG_COUNT/KEY_n/VALUE_n injection set but keeps the global config vars', () => {
+    const out = scrubRepoEnv({
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.hooksPath',
+      GIT_CONFIG_VALUE_0: '/evil',
+      GIT_CONFIG_GLOBAL: '/h/.gitconfig', // NOT scrubbed — the transport carry inherits global creds
+      HOME: '/h',
+    });
+    expect(out).toEqual({ GIT_CONFIG_GLOBAL: '/h/.gitconfig', HOME: '/h' });
+  });
+
   // The private-repo isolation rests on `cwd: bare`. A hook-exported or stray GIT_DIR pointing at
   // ANOTHER repo would otherwise redirect every command — the fetch and `worktree add` included —
   // into that repo, silently un-doing the isolation.

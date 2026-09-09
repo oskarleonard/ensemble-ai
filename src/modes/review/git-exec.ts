@@ -101,11 +101,30 @@ export const REPO_LOCATION_ENV = [
   'GIT_OBJECT_DIRECTORY',
   'GIT_ALTERNATE_OBJECT_DIRECTORIES',
   'GIT_INDEX_FILE',
+  // A repo also selects itself through these, so cwd is not the only selector unless they go too
+  // (cross-vendor review, codex-f2 · claude-f2): GIT_CONFIG forces a single config file — it would
+  // make the private repo's `config --local`/`--get-regexp` read the wrong file and reshape the
+  // effectiveSshCommand probe; GIT_SHALLOW_FILE / GIT_GRAFT_FILE rewrite the object graph (an
+  // inherited GIT_SHALLOW_FILE makes the fully-fetched private repo report itself shallow, so the
+  // history packet discards `git log`/`git blame`); GIT_CONFIG_PARAMETERS injects arbitrary config
+  // that could re-enable `core.hooksPath` or `url.<base>.insteadOf`, defeating the inert 'explicit
+  // URL' posture. NOT GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM — the transport carry relies on the
+  // user's global credentials still being inherited.
+  'GIT_CONFIG',
+  'GIT_SHALLOW_FILE',
+  'GIT_GRAFT_FILE',
+  'GIT_CONFIG_PARAMETERS',
 ] as const;
+
+// GIT_CONFIG_COUNT + its GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> siblings inject config by count —
+// the same 'explicit URL' / no-hooks bypass as GIT_CONFIG_PARAMETERS, but with no fixed name to
+// list, so they are matched by prefix rather than enumerated.
+const CONFIG_INJECTION_ENV_RE = /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/;
 
 export function scrubRepoEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
   const out = { ...env };
   for (const key of REPO_LOCATION_ENV) delete out[key];
+  for (const key of Object.keys(out)) if (CONFIG_INJECTION_ENV_RE.test(key)) delete out[key];
   return out;
 }
 
