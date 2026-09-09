@@ -1456,6 +1456,13 @@ function renderCodexSandboxProfile(p) {
 (allow file-read* (subpath ${JSON.stringify(p.worktree)}))
 (allow file-read* (subpath ${JSON.stringify(p.codexHome)}))
 (allow file-write* (subpath ${JSON.stringify(p.codexHome)}) (subpath ${JSON.stringify(SANDBOX_WRITABLE_TMP)}) (subpath "/dev"))
+;; Never WRITE the review's private parent (the worktree AND the private repo beside it). The private
+;; repo is a HARDLINK clone of the user's own object store \u2014 its pack files share inodes with the
+;; user's real .git \u2014 so a write there would reach past the $HOME fence and corrupt the user's repo.
+;; The parent normally sits under the per-user $TMPDIR, which is read-only here anyway; this deny
+;; makes that a property of the profile rather than of TMPDIR (cross-vendor review, claude-f3).
+;; Last match wins in SBPL, so this overrides the /private/tmp write grant above.
+(deny file-write* (subpath ${JSON.stringify(path4.dirname(p.worktree))}))
 (allow network-outbound (remote ip "localhost:${p.proxyPort}") (remote unix-socket (path-literal ${JSON.stringify(MDNS_RESPONDER_SOCKET)})))
 (allow network-inbound (local ip "*:*"))
 `;
