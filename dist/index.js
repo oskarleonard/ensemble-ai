@@ -2857,7 +2857,7 @@ function writeAlternates(bareRepo, sharedObjects) {
 }
 var TRANSPORT_CONFIG_RE = "^(core\\.sshcommand|credential\\.|http\\.|url\\.)";
 function copyTransportConfig(repoRoot, bareRepo, git2) {
-  const listed = git2(["-C", repoRoot, "config", "--get-regexp", TRANSPORT_CONFIG_RE]);
+  const listed = git2(["-C", repoRoot, "config", "--local", "--null", "--get-regexp", TRANSPORT_CONFIG_RE]);
   if (!listed.ok) return;
   for (const [key, value] of parseConfigList(listed.text)) {
     git2(["-C", bareRepo, "config", "--add", key, value]);
@@ -2865,10 +2865,10 @@ function copyTransportConfig(repoRoot, bareRepo, git2) {
 }
 function parseConfigList(text) {
   const out = [];
-  for (const line of text.split("\n")) {
-    const sp = line.indexOf(" ");
-    if (sp < 0) continue;
-    out.push([line.slice(0, sp), line.slice(sp + 1)]);
+  for (const entry of text.split("\0")) {
+    const nl = entry.indexOf("\n");
+    if (nl < 0) continue;
+    out.push([entry.slice(0, nl), entry.slice(nl + 1)]);
   }
   return out;
 }
@@ -2883,10 +2883,8 @@ function materializeWorktree(args, deps) {
     if (!init.ok) {
       return { kind: "materialize-failed", message: `git init --bare failed: ${init.error.trim()}` };
     }
-    if (shared) {
-      writeAlternates(bare, shared);
-      copyTransportConfig(location.repoRoot, bare, deps.git);
-    }
+    if (shared) writeAlternates(bare, shared);
+    copyTransportConfig(location.repoRoot, bare, deps.git);
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -2989,10 +2987,8 @@ async function materializeWorktreeAsync(args, deps) {
     if (!init.ok) {
       return { kind: "materialize-failed", message: `git init --bare failed: ${init.error.trim()}` };
     }
-    if (shared) {
-      await writeAlternatesAsync(bare, shared);
-      await copyTransportConfigAsync(location.repoRoot, bare, deps.git);
-    }
+    if (shared) await writeAlternatesAsync(bare, shared);
+    await copyTransportConfigAsync(location.repoRoot, bare, deps.git);
     const fetched = await deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -3057,7 +3053,7 @@ async function writeAlternatesAsync(bareRepo, sharedObjects) {
 `);
 }
 async function copyTransportConfigAsync(repoRoot, bareRepo, git2) {
-  const listed = await git2(["-C", repoRoot, "config", "--get-regexp", TRANSPORT_CONFIG_RE]);
+  const listed = await git2(["-C", repoRoot, "config", "--local", "--null", "--get-regexp", TRANSPORT_CONFIG_RE]);
   if (!listed.ok) return;
   for (const [key, value] of parseConfigList(listed.text)) {
     await git2(["-C", bareRepo, "config", "--add", key, value]);

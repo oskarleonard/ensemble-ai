@@ -516,6 +516,11 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
       const consumer = makeConsumer(base);
       g(consumer, 'fetch', '-q', `file://${origin}`, 'refs/pull/7/head');
       const altOf = (dir: string) => path.join(path.dirname(dir), 'repo', 'objects', 'info', 'alternates');
+      const bareOf = (dir: string) => path.join(path.dirname(dir), 'repo');
+      // A CI depth-1 `actions/checkout` is BOTH shallow AND carries its token only in repo-local
+      // config: the transport carry must fire even though the borrow is skipped, or the fetch loses
+      // its sole credential and fails as `auth` (the reason the carry is not gated on the borrow).
+      g(consumer, 'config', 'http.https://example.test/.extraHeader', 'Authorization: Basic TOKEN');
 
       // Shallow: git's own marker for "ancestry I advertise but do not hold". Written the way git
       // writes it, then PROVED to have taken via git's own probe.
@@ -524,6 +529,10 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
       const shallow = materialize(base, consumer, headSha, origin);
       if (isPreflightError(shallow)) throw new Error(`shallow failed: ${shallow.message}`);
       expect(fs.existsSync(altOf(shallow.dir))).toBe(false);
+      // borrow skipped, but the transport config was still carried into the private repo.
+      expect(g(bareOf(shallow.dir), 'config', '--get', 'http.https://example.test/.extraHeader')).toBe(
+        'Authorization: Basic TOKEN'
+      );
       expect(fs.readFileSync(path.join(shallow.dir, 'src.ts'), 'utf8')).toContain('x = 1');
       // The private repo is complete on its own: history walks past the consumer's cut.
       expect(g(shallow.dir, 'rev-list', '--count', 'HEAD')).toBe('2');

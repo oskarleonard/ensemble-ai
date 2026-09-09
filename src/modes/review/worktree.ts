@@ -452,24 +452,32 @@ function writeAlternates(bareRepo: string, sharedObjects: string): void {
 // `core.worktree`, `core.repositoryformatversion` would retarget or corrupt the private repo. Keys
 // are multi-value-safe (`http.<url>.extraHeader` recurs) via `--get-regexp` + `--add`, and once
 // `core.sshCommand` lives in the private repo the effectiveSshCommand probe at cwd=bare finds it too.
+//
+// `--local` ONLY: the private repo already inherits the user's system+global config, so re-adding
+// merged (all-scope) values would DUPLICATE every global multivar — a second Authorization
+// `extraHeader`, a re-ordered `credential.helper` chain some servers reject. Only the checkout's
+// repo-local keys (a CI token `extraHeader`, a per-repo `core.sshCommand`) are actually missing from
+// the private repo. `--null` so a value carrying spaces or newlines survives the parse intact.
 const TRANSPORT_CONFIG_RE = '^(core\\.sshcommand|credential\\.|http\\.|url\\.)';
 function copyTransportConfig(repoRoot: string, bareRepo: string, git: GitRun): void {
-  const listed = git(['-C', repoRoot, 'config', '--get-regexp', TRANSPORT_CONFIG_RE]);
+  const listed = git(['-C', repoRoot, 'config', '--local', '--null', '--get-regexp', TRANSPORT_CONFIG_RE]);
   if (!listed.ok) return; // exits 1 when no key matches — nothing to carry over
   for (const [key, value] of parseConfigList(listed.text)) {
     git(['-C', bareRepo, 'config', '--add', key, value]);
   }
 }
 
-// `git config --get-regexp` prints `<name> <value>` per line; the value is the remainder (it may
-// contain spaces, e.g. an ssh command). A value can't contain a newline for the keys we carry, so
-// splitting on lines is safe.
+// `git config --null --get-regexp` prints each match as `<name>\n<value>\0`; a valueless implicit-
+// boolean key comes as `<name>\0` with no newline. Split on NUL, then on the FIRST newline, so a
+// value that itself contains spaces or newlines is carried faithfully. A valueless key is skipped —
+// `config --add <key>` with no value cannot re-apply it, and no transport key we carry is a bare
+// boolean; the trailing empty split after the final NUL falls out the same way.
 function parseConfigList(text: string): Array<[string, string]> {
   const out: Array<[string, string]> = [];
-  for (const line of text.split('\n')) {
-    const sp = line.indexOf(' ');
-    if (sp < 0) continue;
-    out.push([line.slice(0, sp), line.slice(sp + 1)]);
+  for (const entry of text.split('\0')) {
+    const nl = entry.indexOf('\n');
+    if (nl < 0) continue;
+    out.push([entry.slice(0, nl), entry.slice(nl + 1)]);
   }
   return out;
 }
@@ -504,10 +512,12 @@ export function materializeWorktree(
     if (!init.ok) {
       return { kind: 'materialize-failed', message: `git init --bare failed: ${init.error.trim()}` };
     }
-    if (shared) {
-      writeAlternates(bare, shared);
-      copyTransportConfig(location.repoRoot, bare, deps.git);
-    }
+    if (shared) writeAlternates(bare, shared);
+    // Carry the checkout's transport config UNCONDITIONALLY — the fetch needs auth even when the
+    // store is shallow/partial and not borrowed (a depth-1 `actions/checkout` is both: shallow AND
+    // token-only-in-local-config, so gating the carry on the borrow lost the token exactly when it
+    // was the sole credential — the fetch then failed as `auth`, cross-vendor review of the diff).
+    copyTransportConfig(location.repoRoot, bare, deps.git);
     const fetched = deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -674,10 +684,9 @@ export async function materializeWorktreeAsync(
     if (!init.ok) {
       return { kind: 'materialize-failed', message: `git init --bare failed: ${init.error.trim()}` };
     }
-    if (shared) {
-      await writeAlternatesAsync(bare, shared);
-      await copyTransportConfigAsync(location.repoRoot, bare, deps.git);
-    }
+    if (shared) await writeAlternatesAsync(bare, shared);
+    // Unconditional — same reasoning as the sync twin (auth is needed even without a borrow).
+    await copyTransportConfigAsync(location.repoRoot, bare, deps.git);
     const fetched = await deps.git(
       [
         ...INERT_GIT_CONFIG,
@@ -751,7 +760,7 @@ async function writeAlternatesAsync(bareRepo: string, sharedObjects: string): Pr
 
 // Async twin of copyTransportConfig — same allowlist, same multi-value handling.
 async function copyTransportConfigAsync(repoRoot: string, bareRepo: string, git: GitRunAsync): Promise<void> {
-  const listed = await git(['-C', repoRoot, 'config', '--get-regexp', TRANSPORT_CONFIG_RE]);
+  const listed = await git(['-C', repoRoot, 'config', '--local', '--null', '--get-regexp', TRANSPORT_CONFIG_RE]);
   if (!listed.ok) return;
   for (const [key, value] of parseConfigList(listed.text)) {
     await git(['-C', bareRepo, 'config', '--add', key, value]);

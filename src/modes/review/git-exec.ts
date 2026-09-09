@@ -115,12 +115,10 @@ export function execGit(): GitRun {
     try {
       const text = execFileSync('git', args, {
         cwd: opts?.cwd,
+        // Read `process.env` LIVE each spawn (a later `HTTPS_PROXY`/`GIT_SSH_COMMAND` must be seen),
+        // but scrub the repo-selectors in place so the env is cloned once, not twice.
         encoding: 'utf8',
-        env: {
-          ...scrubRepoEnv(process.env),
-          ...nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)),
-          ...(opts?.env ?? {}),
-        },
+        env: Object.assign(scrubRepoEnv(process.env), nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)), opts?.env ?? {}),
         maxBuffer: GIT_MAX_BUFFER,
         timeout: GIT_TIMEOUT_MS,
       });
