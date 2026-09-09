@@ -65,10 +65,11 @@ export function openWorktree(
   if (isPreflightError(location)) return location;
 
   // `materializeWorktree` RETURNS its git failures, but it can still THROW: the mkdtemp/chmod of the
-  // owner-only parent, the `git init --bare`, or the alternates write can fail on a full or
-  // read-only temp root. The caller (cli.ts) opens the worktree BEFORE the try/finally that reaps
-  // it, and turns a PreflightError into a legible exit 3 — a throw here would instead escape as a
-  // stack trace and a bare exit 1. So the "never throws" contract above is enforced, not asserted.
+  // owner-only parent, or the `git clone --bare --local` / `git init --bare` that creates the private
+  // repo, can fail on a full or read-only temp root. The caller (cli.ts) opens the worktree BEFORE the
+  // try/finally that reaps it, and turns a PreflightError into a legible exit 3 — a throw here would
+  // instead escape as a stack trace and a bare exit 1. So the "never throws" contract above is
+  // enforced, not asserted.
   // There is no longer a lock to contend for: each review materializes into its own private repo.
   let made: PreflightError | Worktree;
   try {

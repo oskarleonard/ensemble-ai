@@ -1270,9 +1270,10 @@ async function reviewCommand(
     return 3;
   }
 
-  // ONE worktree per run, opened here and reaped in the `finally` below — plus a `git worktree
-  // prune` sweeper inside the reap, which self-heals the crash/SIGTERM path on the next run
-  // (spec §9, grok-f1). Every failure is a NAMED cause, never a generic "git failed".
+  // ONE worktree per run, opened here and reaped in the `finally` below. The reap removes the
+  // owner-only temp parent (worktree + its private repo); nothing is registered in the user's shared
+  // checkout, so there is no `git worktree prune` to run and a crash/SIGTERM leaks at most one temp
+  // parent (spec §9, grok-f1). Every failure is a NAMED cause, never a generic "git failed".
   let worktree: WorktreeSession | null = null;
   if (repoFlag && source.postTarget && source.headShaOverride && source.prBaseSha) {
     console.error(`· materializing the PR head as a read-only worktree of ${repoFlag}…`);

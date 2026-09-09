@@ -251,6 +251,30 @@ describe('materialization hardening — untrusted content is checked out INERT i
     reapWorktree((res as { dir: string }).dir);
   });
 
+  // The fetch-failure message interpolates the redacted url AND appends git's OWN stderr, which
+  // echoes the remote (with any inline token) back inside a sentence. Both halves must be redacted,
+  // or the appended stderr leaks the credential into the printed + persisted trail.
+  it('redacts an inline credential echoed by git`s fetch stderr, not just the interpolated url', () => {
+    const secretUrl = 'https://ghp_SECRETTOKEN@github.com/o/r.git';
+    const git: GitRun = ((args: string[]) => {
+      if (args[0] === 'rev-parse' && args[1] === '--git-common-dir') return ok('/repo/.git');
+      if (args.includes('fetch')) {
+        return err(
+          "fatal: could not read Username for 'https://ghp_SECRETTOKEN@github.com': terminal prompts disabled"
+        );
+      }
+      return ok('');
+    }) as GitRun;
+    const res = materializeWorktree(
+      { headSha, location: { ...location, fetchUrl: secretUrl }, pr: 7, worktreeRoot: '/tmp' },
+      { git }
+    );
+    expect(isPreflightError(res)).toBe(true);
+    const message = isPreflightError(res) ? res.message : '';
+    expect(message).not.toContain('SECRETTOKEN');
+    expect(message).not.toContain('ghp_');
+  });
+
   it('checks out the receipt`s headSha by SHA and asserts HEAD — a mismatch ABORTS and reaps', () => {
     const worktreeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-mismatch-'));
     try {

@@ -2976,7 +2976,7 @@ function materializeWorktree(args, deps) {
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
-        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}`
+        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
     const dir = path11.join(parent, "head");
@@ -3078,7 +3078,7 @@ async function materializeWorktreeAsync(args, deps) {
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
-        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}`
+        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
     const dir = path11.join(parent, "head");

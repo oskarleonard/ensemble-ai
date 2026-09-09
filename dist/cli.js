@@ -3444,7 +3444,7 @@ function materializeWorktree(args, deps) {
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
-        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}`
+        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
     const dir = path12.join(parent, "head");

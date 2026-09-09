@@ -588,7 +588,7 @@ export function materializeWorktree(
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
-        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}`,
+        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`,
       };
     }
     // Materialize by SHA, not FETCH_HEAD: the fetch proved the object exists locally, and checking
@@ -756,7 +756,7 @@ export async function materializeWorktreeAsync(
     if (!fetched.ok) {
       return {
         kind: classifyGitError(fetched.error),
-        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${fetched.error.trim()}`,
+        message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`,
       };
     }
     const dir = path.join(parent, 'head');
