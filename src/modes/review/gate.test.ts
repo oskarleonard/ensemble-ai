@@ -513,6 +513,26 @@ describe('prepareGateFindings — deterministic budgeting (DC1)', () => {
     expect(findings[1]).toMatchObject({ hunkLabel: null, truncated: true }); // budget-dropped
   });
 
+  it('regionShown is FALSE for a finding sharing a big hunk but outside the injected window (codex#f2)', () => {
+    // ONE 40-line hunk. The HIGH finding at line 3 is prioritized first and creates the ±25 window
+    // (body lines ~1..28). Two MEDIUM findings at lines 38/40 share the hunk's H1 label but sit
+    // OUTSIDE that window — their code was never injected, so regionShown must be false even though
+    // hunkLabel is non-null. This is what stops the premise pass clustering on unshown code.
+    const hunks = parsePacketHunks(BIG_FILE('src/big.ts', 'bg'));
+    const reviews = [
+      review('codex', [f({ severity: 'high', evidence: { file: 'src/big.ts', line: 3 } })]),
+      review('grok', [
+        f({ severity: 'medium', evidence: { file: 'src/big.ts', line: 38 } }),
+        f({ id: 'f2', severity: 'medium', evidence: { file: 'src/big.ts', line: 40 } }),
+      ]),
+    ];
+    const { findings } = prepareGateFindings(reviews, hunks);
+    const byId = Object.fromEntries(findings.map((r) => [r.findingId, r]));
+    expect(byId['codex#1']).toMatchObject({ hunkLabel: 'H1', regionShown: true }); // window creator
+    expect(byId['grok#1']).toMatchObject({ hunkLabel: 'H1', regionShown: false }); // shared label, unshown line
+    expect(byId['grok#2']).toMatchObject({ hunkLabel: 'H1', regionShown: false });
+  });
+
   it('an out-of-diff cite yields no hunk (resolved=false)', () => {
     const { findings } = prepareGateFindings(
       [review('codex', [f({ evidence: { file: 'nope.ts', line: 1 } })])],
@@ -1160,3 +1180,51 @@ function BIG_FILE(name: string, marker: string): string {
   const lines = Array.from({ length: 40 }, (_, i) => `+  const ${marker}${i} = ${'x'.repeat(1100)};`);
   return `diff --git a/${name} b/${name}\n--- a/${name}\n+++ b/${name}\n@@ -1,0 +1,40 @@\n${lines.join('\n')}\n`;
 }
+
+// ── The opt-in PREMISE PASS's `simplify` line (--premise, spec §4) ──────────────────────
+describe('parseGateEnvelope + runGate — the premise pass simplify line', () => {
+  const SIMPLIFY = 'Remove the shared worktree lock — one repo per review moots the whole cluster.';
+  const envWithSimplify = JSON.stringify({
+    schemaVersion: 1,
+    synthesis: { agreements: [], bottomLine: 'bl', disagreements: [], simplify: SIMPLIFY },
+    verdicts: [{ findingId: 'codex#1', reason: 'r', verdict: 'agree' }],
+  });
+
+  it('parses synthesis.simplify; an absent field ⇒ empty string', () => {
+    const p = parseGateEnvelope(envWithSimplify);
+    if ('failure' in p) throw new Error('unexpected failure');
+    expect(p.simplify).toBe(SIMPLIFY);
+    const none = parseGateEnvelope(envelope([{ findingId: 'codex#1', reason: 'r', verdict: 'agree' }]));
+    if ('failure' in none) throw new Error('unexpected failure');
+    expect(none.simplify).toBe('');
+  });
+
+  it('runGate surfaces synthesis.simplify ONLY when --premise is on (byte-identical output off)', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-rg-'));
+    persistGatePacket(base, 'r', { diff: DIFF, headSha: HEAD });
+    const reviews = [review('codex', [f()]), review('grok', [f()])];
+    const on = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, premise: true, reviews,
+      run: async () => okRun(envWithSimplify), runId: 'r',
+    });
+    expect(on.synthesis.simplify).toBe(SIMPLIFY);
+    const off = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews,
+      run: async () => okRun(envWithSimplify), runId: 'r',
+    });
+    expect(off.synthesis.simplify).toBeUndefined();
+  });
+
+  it('drops a volunteered simplify when --premise is on but NO cluster fired (codex#f2)', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-rg-'));
+    persistGatePacket(base, 'r', { diff: DIFF, headSha: HEAD });
+    // ONE reviewer ⇒ no cross-vendor cluster ⇒ no premise clause was appended to the prompt. Even with
+    // --premise on, a model-volunteered simplify field must NOT be surfaced (opts.premise ≠ clause fired).
+    const noCluster = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, premise: true,
+      reviews: [review('codex', [f()])],
+      run: async () => okRun(envWithSimplify), runId: 'r',
+    });
+    expect(noCluster.synthesis.simplify).toBeUndefined();
+  });
+});

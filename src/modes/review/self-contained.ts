@@ -281,6 +281,11 @@ export interface ClaudeLayerOptions {
   // ("reviewer = Opus @ high, gate = Fable @ max"). Always a `claude -p` spawn (only model/effort
   // differ). Omitted ⇒ inherits `claudeConfig` (the pre-Phase-3 behavior — one seat for both).
   gateConfig?: VoiceConfig;
+  // The opt-in PREMISE PASS (spec 2026-09-09-review-premise-pass §4, --premise) — DEFAULT OFF. When
+  // on AND the gate's findings cluster on one region, the gate's synthesis gains ONE advisory
+  // `simplify` line (rendered by renderClaudeLayer). Off ⇒ the gate prompt + synthesis output are
+  // byte-identical to today (done-criterion 7).
+  premise?: boolean;
   // The SHADOW gate (audit-only, gate.ts ShadowGateSeat) — a cross-vendor judge over the identical
   // gate prompt, for champion/challenger measurement. Omitted ⇒ nothing changes.
   shadowGate?: ShadowGateSeat;
@@ -571,6 +576,8 @@ export async function runClaudeReviewLayer(
         }
       : {}),
     log,
+    // The opt-in premise pass — off unless the run asked for it (--premise); off ⇒ byte-identical.
+    ...(opts.premise ? { premise: true } : {}),
     reviews: voiceReviews,
     // The vendor-bound gate runner (sol-gate promotion) — absent ⇒ the layer's claude runner,
     // the pre-vendor behavior byte for byte.
@@ -657,6 +664,15 @@ export function claudeLayerHasHigh(layer: ClaudeLayerResult | null): boolean {
 
 // ── Rendering (for the CLI summary) ───────────────────────────────────────────────────
 
+// THE PREMISE PASS advisory `simplify` line (spec §4, --premise), rendered IDENTICALLY wherever a
+// gate synthesis is shown — the full review (renderClaudeLayer) AND the healing commands (regate /
+// reseat), so a --premise heal shows the advisory it re-earned rather than silently swallowing it
+// (codex#f2). Empty ⇒ [] (a flag-off / no-cluster run renders nothing — done-criterion 7).
+export function renderPremiseSimplify(simplify: string | undefined, scrub: (s: string) => string): string[] {
+  if (!simplify) return [];
+  return ['     ⤳ simplify (premise pass — advisory)', `        ${scrub(simplify).slice(0, 500)}`];
+}
+
 // The claude-layer block for stdout: the cold Opus review's findings, then the synthesis
 // (AGREE / DISAGREE / bottom line) and the grounded per-finding verdict tags. Grouped + scannable.
 export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
@@ -721,6 +737,11 @@ export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
     out.push('     → bottom line');
     out.push(`        ${scrub(s.bottomLine).slice(0, 500)}`);
   }
+  // THE PREMISE PASS (spec §4, --premise): the ONE advisory line the gate adds when its findings
+  // cluster on one structure. Present ONLY on a --premise run whose gate returned one — so a
+  // flag-off run renders nothing and the output stays byte-identical (done-criterion 7). Shared with
+  // the healing commands so a --premise regate/reseat shows the same advisory (codex#f2).
+  out.push(...renderPremiseSimplify(s.simplify, scrub));
   // The grounded per-finding verdict TAGS + the gate summary line + the trail marker — the
   // gate's teeth, rendered inline (Phase 1: informational; exit is unchanged).
   out.push(...renderGateVerdicts(result.gateVerdicts, { scrub, trailWritten: result.gateTrailWritten }));

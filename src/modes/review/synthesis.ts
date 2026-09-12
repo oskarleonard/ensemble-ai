@@ -47,6 +47,13 @@ export interface ReviewSynthesis {
   error?: string;
   ok: boolean;
   raw: string | null;
+  // The PREMISE PASS's one advisory line (spec 2026-09-09-review-premise-pass §4, opt-in
+  // `--premise`): when the gate's own findings cluster on one region/mechanism, this NAMES the
+  // shared structure the cluster circles and asks whether removing/simplifying it moots the whole
+  // cluster. Present ONLY when the run was invoked with `--premise` AND the gate returned one — so a
+  // flag-off run leaves it absent and its rendered output is byte-identical to before (done-criterion
+  // 7). Purely advisory: it changes no verdict, gates nothing, and is never posted to a PR.
+  simplify?: string;
   summary: string;
 }
 

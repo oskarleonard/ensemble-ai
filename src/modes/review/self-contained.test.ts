@@ -482,6 +482,62 @@ describe('renderClaudeLayer — grouped, scannable stdout block', () => {
   });
 });
 
+// THE OPT-IN PREMISE PASS end-to-end (spec §4, --premise): with the flag on and a cross-vendor
+// cluster (codex + grok both on src/x.ts), the gate PROMPT carries the fenced paragraph and the
+// rendered OUTPUT carries the advisory `simplify` line; with the flag off, neither does (DC7).
+describe('runClaudeReviewLayer — the premise pass (--premise)', () => {
+  const GATE_WITH_SIMPLIFY = JSON.stringify({
+    schemaVersion: 1,
+    synthesis: {
+      agreements: [],
+      bottomLine: 'fix then merge',
+      disagreements: [],
+      simplify: 'The findings all circle the shared lock; delete it — one repo per review moots the cluster.',
+    },
+    verdicts: [
+      { findingId: 'codex#1', reason: 'confirmed', verdict: 'agree' },
+      { findingId: 'grok#1', reason: 'confirmed', verdict: 'agree' },
+    ],
+  });
+
+  it('FLAG ON + a cross-vendor cluster ⇒ the gate prompt carries the paragraph AND the output shows the simplify line', async () => {
+    const base = tmpTrail();
+    const runId = 'runP';
+    seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    const { calls, run } = makeRunner({ onGate: () => okRun(GATE_WITH_SIMPLIFY) });
+    const res = await runClaudeReviewLayer({
+      baseDir: base, claudeConfig: CFG, coreReviews: [stored('codex'), stored('grok')],
+      expectedHeadSha: HEAD, includeClaudeReviewer: false, premise: true, reviewPrompt: 'P', run, runId,
+    });
+    const gatePrompt = calls.find((c) => c.round === 'gate')?.prompt ?? '';
+    expect(gatePrompt).toContain('Premise pass');
+    // Assert against the CLAUSE, not the whole prompt: the findings block above already carries the
+    // reviewer path, so `toContain('src/x.ts')` on the whole prompt was vacuous AND implied the
+    // opposite of the rule — the clause names clusters by HOST-OWNED ids and must NEVER carry the
+    // reviewer path (claude#f3; mirrors the injection check in gate-prompt.test.ts).
+    const clause = gatePrompt.slice(gatePrompt.indexOf('## Premise pass'));
+    expect(clause).toContain('codex#1 + grok#1');
+    expect(clause).not.toContain('src/x.ts');
+    const text = renderClaudeLayer(res).join('\n');
+    expect(text).toContain('simplify (premise pass');
+    expect(text).toContain('delete it');
+  });
+
+  it('FLAG OFF ⇒ no premise paragraph in the prompt and no simplify line in the output (byte-identical)', async () => {
+    const base = tmpTrail();
+    const runId = 'runQ';
+    seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    const { calls, run } = makeRunner({ onGate: () => okRun(GATE_WITH_SIMPLIFY) });
+    const res = await runClaudeReviewLayer({
+      baseDir: base, claudeConfig: CFG, coreReviews: [stored('codex'), stored('grok')],
+      expectedHeadSha: HEAD, includeClaudeReviewer: false, reviewPrompt: 'P', run, runId,
+    });
+    const gatePrompt = calls.find((c) => c.round === 'gate')?.prompt ?? '';
+    expect(gatePrompt).not.toContain('Premise pass');
+    expect(renderClaudeLayer(res).join('\n')).not.toContain('simplify (premise pass');
+  });
+});
+
 describe('REVIEW-ONLY — the layer writes ONLY to the trail dir', () => {
   it('makes zero writes to a sentinel repo dir; every new file is under the trail', async () => {
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-repo-'));

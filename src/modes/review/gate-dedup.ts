@@ -26,7 +26,7 @@ export interface ClusterInfo {
 // citing one defect often land on DIFFERENT lines of the same hook/function (a real run cited
 // the same localStorage-PII defect at lines 112 and 122). The text-overlap bar below — not this
 // window — is the real guard against merging two different defects that share a file.
-const LINE_WINDOW = 12;
+export const LINE_WINDOW = 12;
 // Minimum token overlap for two proximate findings to be "the same issue". Uses the overlap
 // COEFFICIENT (|A∩B| / min|A|,|B|), not Jaccard: three reviewers describe one defect in very
 // different amounts of prose, so Jaccard (which the longer body drags down) systematically
@@ -48,10 +48,57 @@ function overlapCoefficient(a: Set<string>, b: Set<string>): number {
   return inter / Math.min(a.size, b.size);
 }
 
-function proximate(a: GateVerdictRecord, b: GateVerdictRecord): boolean {
+// The subsystem's ONE proximity rule ("the same region"): same file, and either both file-level or
+// within LINE_WINDOW lines. Shared by the dedup clustering here AND the premise pass's cluster
+// detection (gate-prompt.ts) — one bar, one home (cross-vendor review of #87: grok#f3 · claude#f1).
+export interface RegionRef {
+  file: string;
+  line: number | null;
+}
+export function proximate(a: RegionRef, b: RegionRef): boolean {
   if (a.file !== b.file) return false;
   if (a.line === null || b.line === null) return a.line === null && b.line === null; // both file-level
   return Math.abs(a.line - b.line) <= LINE_WINDOW;
+}
+
+// Connected components over `items`, linking every pair the `connected` predicate joins. Union-find
+// with path compression; "lower id wins" as each set's root keeps the partition deterministic. The
+// subsystem's ONE clustering primitive — shared by the dedup pass here AND the premise pass
+// (gate-prompt.ts), so the algorithm has one home, not two hand-kept-in-sync copies (they had
+// already drifted — one had path compression, the other didn't). Each returned group preserves the
+// INPUT order of its members; group order follows first appearance. Deterministic for a
+// deterministic input (callers that need a canonical member order pre-sort `items`).
+export function connectedComponents<T>(
+  items: T[],
+  id: (t: T) => string,
+  connected: (a: T, b: T) => boolean
+): T[][] {
+  const parent = new Map(items.map((t) => [id(t), id(t)]));
+  const find = (x: string): string => {
+    let root = x;
+    while (parent.get(root) !== root) root = parent.get(root)!;
+    while (parent.get(x) !== root) {
+      const next = parent.get(x)!;
+      parent.set(x, root);
+      x = next;
+    }
+    return root;
+  };
+  for (let i = 0; i < items.length; i++) {
+    for (let j = i + 1; j < items.length; j++) {
+      if (connected(items[i], items[j])) {
+        const ra = find(id(items[i]));
+        const rb = find(id(items[j]));
+        if (ra !== rb) parent.set(ra < rb ? rb : ra, ra < rb ? ra : rb); // lower id wins → deterministic root
+      }
+    }
+  }
+  const groups = new Map<string, T[]>();
+  for (const t of items) {
+    const root = find(id(t));
+    (groups.get(root) ?? groups.set(root, []).get(root)!).push(t);
+  }
+  return [...groups.values()];
 }
 
 // Elect the best-grounded representative: an `agree` outranks a `partial` (fully grounded), then
@@ -76,41 +123,15 @@ export function clusterPostable(records: GateVerdictRecord[]): GateVerdictRecord
   const postable = records.filter((r) => r.postableStatus === 'postable' && !isHolisticRecord(r));
   const tok = new Map(postable.map((r) => [r.findingId, tokens(r)]));
 
-  // Union-find over the postable set: link every pair that is proximate AND text-similar.
-  const parent = new Map(postable.map((r) => [r.findingId, r.findingId]));
-  const find = (x: string): string => {
-    let root = x;
-    while (parent.get(root) !== root) root = parent.get(root)!;
-    while (parent.get(x) !== root) {
-      const next = parent.get(x)!;
-      parent.set(x, root);
-      x = next;
-    }
-    return root;
-  };
-  const union = (a: string, b: string): void => {
-    const ra = find(a);
-    const rb = find(b);
-    if (ra !== rb) parent.set(ra < rb ? rb : ra, ra < rb ? ra : rb); // lower id wins → deterministic root
-  };
-  for (let i = 0; i < postable.length; i++) {
-    for (let j = i + 1; j < postable.length; j++) {
-      const a = postable[i];
-      const b = postable[j];
-      if (proximate(a, b) && overlapCoefficient(tok.get(a.findingId)!, tok.get(b.findingId)!) >= MIN_TOKEN_OVERLAP) {
-        union(a.findingId, b.findingId);
-      }
-    }
-  }
-
-  // Bucket by root, elect a primary per cluster.
-  const clusters = new Map<string, GateVerdictRecord[]>();
-  for (const r of postable) {
-    const root = find(r.findingId);
-    (clusters.get(root) ?? clusters.set(root, []).get(root)!).push(r);
-  }
+  // Cluster the postable set: two findings link when they are proximate AND text-similar (the
+  // text-overlap bar is what tells apart two DIFFERENT defects that happen to sit a few lines apart).
+  const clusters = connectedComponents(
+    postable,
+    (r) => r.findingId,
+    (a, b) => proximate(a, b) && overlapCoefficient(tok.get(a.findingId)!, tok.get(b.findingId)!) >= MIN_TOKEN_OVERLAP
+  );
   const clusterOf = new Map<string, ClusterInfo>();
-  for (const members of clusters.values()) {
+  for (const members of clusters) {
     const primary = members.reduce(better);
     const reviewers = new Set(members.map((m) => m.reviewer));
     const corroborators = members.filter((m) => m.findingId !== primary.findingId).map((m) => m.findingId);

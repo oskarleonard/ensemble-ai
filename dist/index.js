@@ -22,6 +22,11 @@ function parseReviewerIds(raw) {
   return ids.length > 0 ? ids : void 0;
 }
 var SEVERITIES = ["high", "medium", "low"];
+function severityAtLeast(severity, floor) {
+  const s = SEVERITIES.indexOf(severity);
+  const f = SEVERITIES.indexOf(floor);
+  return s >= 0 && f >= 0 && s <= f;
+}
 var CONFIDENCES = ["high", "medium", "low"];
 var TERMINAL_STATES = ["reviewed", "failed-reviewer"];
 
@@ -4938,7 +4943,7 @@ function loadPostingPosture(profile, configPath) {
   return resolvePosture(asRecord2(readEnsembleConfig(configPath).posting)?.[profile]);
 }
 function meetsInlineFloor(severity, floor) {
-  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf(floor);
+  return severityAtLeast(severity, floor);
 }
 
 // src/modes/review/push-fence.ts
@@ -6372,6 +6377,7 @@ export {
   section,
   securityClassLabel,
   segmentsWithoutTruncationSplices,
+  severityAtLeast,
   sha256Hex,
   stageReview,
   stripAgentInstructions,

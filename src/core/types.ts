@@ -63,6 +63,19 @@ export interface ReviewerConfig {
 export const SEVERITIES = ['high', 'medium', 'low'] as const;
 export type Severity = (typeof SEVERITIES)[number];
 
+// Is `severity` at least as severe as `floor`? SEVERITIES is ordered most-severe-first, so a
+// LOWER index is MORE severe. The ONE home for the severity-floor comparison — shared by the
+// posting floor (posting-config `meetsInlineFloor`) and the premise-cluster ≥medium bar
+// (gate-prompt), so the "lower index = more severe" invariant lives in a single place.
+export function severityAtLeast(severity: Severity, floor: Severity): boolean {
+  const s = SEVERITIES.indexOf(severity);
+  const f = SEVERITIES.indexOf(floor);
+  // A value outside the enum (an unchecked JS caller or deserialized JSON, past the type boundary)
+  // meets NO floor: a bare `indexOf(x) <= indexOf(floor)` would rank an unknown severity (-1) ABOVE
+  // 'high', since -1 ≤ every valid index (codex#f3).
+  return s >= 0 && f >= 0 && s <= f;
+}
+
 export const CONFIDENCES = ['high', 'medium', 'low'] as const;
 export type Confidence = (typeof CONFIDENCES)[number];
 

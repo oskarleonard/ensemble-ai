@@ -310,6 +310,9 @@ export interface ReseatOptions {
   // Injected for tests — the gate seat spawn runRegate uses.
   gateRun?: RegateOptions['run'];
   log?: (m: string) => void;
+  // The opt-in PREMISE PASS (--premise) — forwarded to the regate over the union so healing a
+  // failed seat on a --premise run keeps the advisory `simplify` behavior (codex#f1 · claude#f1).
+  premise?: boolean;
   // This seat's sandbox qualification for the NEW worktree. Absent ⇒ packet-mode run.
   qualification?: SeatQualification;
   // Injected for tests — the regate over the union. The default is the real one.
@@ -704,6 +707,7 @@ async function reseatUnderLock(opts: ReseatOptions, pre: ReseatReady): Promise<R
     conventionPaths: opts.conventionPaths ?? readConventionPathsFromTrail(baseDir, runId),
     gateConfig: opts.gateConfig,
     log,
+    ...(opts.premise ? { premise: true } : {}),
     ...(opts.gateRun ? { run: opts.gateRun } : {}),
     runId,
     ...(wt ? { worktree: wt.dir } : {}),

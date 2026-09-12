@@ -8,7 +8,7 @@ import { type RunReviewOpts } from '../../reviewers/codex';
 import { isUsageLimitFailure } from './claude';
 import type { EvidenceClass } from './evidence';
 import { type ClusterInfo, clusterPostable } from './gate-dedup';
-import { renderGatePrompt } from './gate-prompt';
+import { activePremiseClusters, renderGatePrompt } from './gate-prompt';
 import {
   type Hunk,
   type ResolvedHunk,
@@ -178,6 +178,9 @@ const CITATION_CAP = 500;
 // The gate's plain-English summary of a confirmed finding. 280 chars is the CONTRACT (the prompt
 // asks for ≤280), enforced here so a chatty model can't push an essay into the trail or onto a PR.
 const TLDR_CAP = 280;
+// The premise pass's advisory `simplify` line — one or two sentences (spec §4). Generous but a
+// hostile-input bound, like bottomLine's 1000.
+const SIMPLIFY_CAP = 700;
 // Cap a display string to n chars. When it overflows, mark the cut with an ellipsis so a
 // clipped value reads as deliberate rather than a mid-word glitch (the '…' counts toward n).
 function capStr(s: unknown, n: number): string {
@@ -206,6 +209,12 @@ export interface GateFinding {
   hunkCode: string[]; // normalized code lines of the FULL resolved hunk (citation basis; [] if unresolved)
   hunkLabel: string | null; // the injected-hunk label shown in the prompt (null: unresolved or budget-dropped)
   line: number | null;
+  // Was THIS finding's own cited line inside the window actually injected for its hunk? A shared
+  // hunkLabel is not enough: a big hunk injects ONE window around the first prioritized finding, so
+  // a later finding sharing the key can inherit the label yet sit outside the shown slice. Only the
+  // premise pass consumes this (never cluster on code the gate wasn't given — codex#f2). Optional so
+  // the many hand-built GateFinding test literals need not carry it; prepareGateFindings always sets it.
+  regionShown?: boolean;
   resolved: boolean; // a hunk was found for the cite
   reviewer: string; // voiceId
   severity: Severity;
@@ -288,9 +297,15 @@ export function prepareGateFindings(
   );
 
   const injections: GateInjection[] = [];
-  const byKey = new Map<string, GateInjection & { admitted: boolean }>();
+  // winStart/winEnd: the body-index range of the ONE window this key actually injected. A later
+  // finding sharing the key is only "shown" if its OWN cited body index falls inside that range —
+  // a big hunk injects a ±window around the FIRST prioritized finding, so a proximate pair (or a
+  // transitive chain) elsewhere in the same hunk can inherit the label yet sit outside the shown
+  // slice (codex#f2). regionShown captures that, so the premise pass never clusters on unshown code.
+  const byKey = new Map<string, GateInjection & { admitted: boolean; winEnd: number; winStart: number }>();
   const truncatedById = new Set<string>();
   const labelById = new Map<string, string | null>();
+  const regionShownById = new Set<string>();
   let usedBytes = 0;
   for (const rf of order) {
     const res = resolved.get(rf.findingId) ?? null;
@@ -303,6 +318,10 @@ export function prepareGateFindings(
     if (existing) {
       if (existing.truncated || !existing.admitted) truncatedById.add(rf.findingId);
       labelById.set(rf.findingId, existing.admitted ? existing.label : null);
+      // Shown only if this finding's own cited line is inside the window the key actually injected.
+      if (existing.admitted && res.bodyIndex >= existing.winStart && res.bodyIndex < existing.winEnd) {
+        regionShownById.add(rf.findingId);
+      }
       continue;
     }
     const win = windowHunk(res.hunk, res.bodyIndex);
@@ -312,11 +331,12 @@ export function prepareGateFindings(
     const admitted = injections.length === 0 || usedBytes + bytes <= GATE_HUNK_BYTE_BUDGET;
     const label = admitted ? `H${injections.length + 1}` : '';
     const injection: GateInjection = { label, rangeKey: key, text: win.text, truncated: win.truncated };
-    byKey.set(key, { ...injection, admitted });
+    byKey.set(key, { ...injection, admitted, winEnd: win.end, winStart: win.start });
     if (admitted) {
       usedBytes += bytes;
       injections.push(injection);
       labelById.set(rf.findingId, label);
+      regionShownById.add(rf.findingId); // window is centered on this finding's own line
       if (win.truncated) truncatedById.add(rf.findingId);
     } else {
       labelById.set(rf.findingId, null);
@@ -336,6 +356,7 @@ export function prepareGateFindings(
       hunkCode: res ? hunkCodeLines(res.hunk) : [],
       hunkLabel: labelById.get(rf.findingId) ?? null,
       line: rf.line,
+      regionShown: regionShownById.has(rf.findingId),
       resolved: res !== null,
       reviewer: rf.reviewer,
       severity: rf.severity,
@@ -423,6 +444,11 @@ export interface ParsedGateEnvelope {
   agreements: ReturnType<typeof parseAgreements>;
   bottomLine: string;
   disagreements: ReturnType<typeof parseDisagreements>;
+  // The PREMISE PASS's advisory line (opt-in --premise, spec §4). parseGateEnvelope always sets it
+  // ('' when the gate returned none); OPTIONAL on the type so the many hand-built ParsedGateEnvelopes
+  // in tests/consumers need not carry it. The RUN only surfaces it on the synthesis when --premise
+  // was on (runGate), so a flag-off run's output stays byte-identical even if a model volunteered it.
+  simplify?: string;
   verdicts: RawVerdictEntry[];
 }
 
@@ -494,6 +520,7 @@ export function parseGateEnvelope(raw: string): EnvelopeFailure | ParsedGateEnve
     agreements: parseAgreements(synth.agreements),
     bottomLine: capStr(synth.bottomLine, 1000),
     disagreements: parseDisagreements(synth.disagreements),
+    simplify: capStr(synth.simplify, SIMPLIFY_CAP),
     verdicts: parseVerdicts(o.verdicts),
   };
 }
@@ -1199,6 +1226,11 @@ export interface RunGateOptions {
   // supplies only the tree reader + the run's gathered conventions paths.
   holistic?: Omit<HolisticPolicyDeps, 'diffFiles'>;
   log?: (m: string) => void;
+  // The opt-in PREMISE PASS (spec §4, --premise) — default OFF. When on AND the gate's findings
+  // cluster on one region, the prompt gains a fenced advisory paragraph asking for a `simplify`
+  // synthesis line, and the run surfaces that line on the synthesis. OFF ⇒ prompt + synthesis output
+  // are byte-identical to today (done-criterion 7).
+  premise?: boolean;
   reviews: VoiceReview[];
   run: GateRunner;
   runId: string;
@@ -1384,7 +1416,23 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // The prompt teaches `cause: reference-not-found` ONLY when the gate's realized evidence is
   // worktree — the same fact reconcileGateVerdicts requires to HONOR it. Teach and honor together,
   // or the cause is either unreachable (never taught) or unsound (taught to a packet-fed gate).
-  const prompt = renderGatePrompt(findings, injections, opts.gateEvidence ?? 'packet');
+  // Whether the premise clause fires (--premise on AND ≥1 cluster) — the ONE source of truth both
+  // the prompt builder and the output-surfacing share (activePremiseClusters), so the gate surfaces
+  // `simplify` on EXACTLY the condition the clause was shown, never on a field a model volunteered
+  // when no clause appeared (codex#f2: opts.premise alone is not proof it fired). Also drives the log.
+  const premiseCluster = activePremiseClusters(findings, opts);
+  const premiseActive = premiseCluster.length > 0;
+  const prompt = renderGatePrompt(
+    findings,
+    injections,
+    opts.gateEvidence ?? 'packet',
+    // Pass the 4th arg ONLY when premise is on, so the shared prompt (primary + shadow) stays
+    // byte-identical to the 3-arg call on every flag-off run.
+    opts.premise ? { premise: true } : {}
+  );
+  // A --premise run must not leave the reader guessing whether the clause was appended (claude#f3) —
+  // an absent `simplify` otherwise conflates flag-off / no-cluster / cluster-the-gate-declined.
+  if (premiseActive) log(`premise pass: ${premiseCluster.length} cluster(s) — advisory clause appended`);
   log('Gate: grounding findings against the pinned diff hunks — verdict tags…');
   // THE SHADOW GATE — spawned CONCURRENTLY with the primary on the IDENTICAL prompt (property 3),
   // settled inside finalize so wall time is max(primary, shadow), not their sum, and so the CLI
@@ -1514,6 +1562,11 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
       disagreements: parsed.disagreements,
       ok: true,
       raw: res.raw,
+      // The premise pass's advisory line is surfaced ONLY when the clause ACTUALLY fired this run
+      // (--premise on AND a cluster detected) — not on opts.premise alone (codex#f2), and never on a
+      // field a model volunteered when no clause was shown. A flag-off / no-cluster run drops it,
+      // keeping the output byte-identical (done-criterion 7).
+      ...(premiseActive && parsed.simplify ? { simplify: parsed.simplify } : {}),
       summary: '',
     },
     // Corroborate against the SAME completed (ok) reviewers the verdict half tags — reconcile
