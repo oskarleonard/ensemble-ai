@@ -26,7 +26,7 @@ export interface ClusterInfo {
 // citing one defect often land on DIFFERENT lines of the same hook/function (a real run cited
 // the same localStorage-PII defect at lines 112 and 122). The text-overlap bar below — not this
 // window — is the real guard against merging two different defects that share a file.
-const LINE_WINDOW = 12;
+export const LINE_WINDOW = 12;
 // Minimum token overlap for two proximate findings to be "the same issue". Uses the overlap
 // COEFFICIENT (|A∩B| / min|A|,|B|), not Jaccard: three reviewers describe one defect in very
 // different amounts of prose, so Jaccard (which the longer body drags down) systematically
@@ -48,7 +48,14 @@ function overlapCoefficient(a: Set<string>, b: Set<string>): number {
   return inter / Math.min(a.size, b.size);
 }
 
-function proximate(a: GateVerdictRecord, b: GateVerdictRecord): boolean {
+// The subsystem's ONE proximity rule ("the same region"): same file, and either both file-level or
+// within LINE_WINDOW lines. Shared by the dedup clustering here AND the premise pass's cluster
+// detection (gate-prompt.ts) — one bar, one home (cross-vendor review of #87: grok#f3 · claude#f1).
+export interface RegionRef {
+  file: string;
+  line: number | null;
+}
+export function proximate(a: RegionRef, b: RegionRef): boolean {
   if (a.file !== b.file) return false;
   if (a.line === null || b.line === null) return a.line === null && b.line === null; // both file-level
   return Math.abs(a.line - b.line) <= LINE_WINDOW;
