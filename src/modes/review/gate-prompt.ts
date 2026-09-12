@@ -10,7 +10,7 @@ import {
 } from './gate';
 import { HUNK_WINDOW_LINES } from './gate-hunks';
 import { HOLISTIC_SEAT_ID, HOLISTIC_SEVERITY_CAP } from './holistic';
-import { proximate } from './gate-dedup';
+import { connectedComponents, proximate } from './gate-dedup';
 import { isHolisticRecord } from './holistic-gate';
 
 // The hunk-fed GATE prompt. Unlike the old text-only synthesis prompt, the gate sees each
@@ -234,12 +234,10 @@ export interface PremiseCluster {
   reviewers: string[];
 }
 
-// ≥ medium in SEVERITIES (['high','medium','low'] — lower index = more severe). An unrecognized
-// severity (indexOf === -1) is deliberately NOT ≥ medium, so it never clusters.
-const MEDIUM_RANK = SEVERITIES.indexOf('medium');
+// ≥ medium: SEVERITIES is ordered most-severe-first (['high','medium','low']), so "at least medium"
+// is an index ≤ the index of 'medium'. `severity` is typed Severity, so indexOf always finds it.
 function isAtLeastMedium(severity: GateFinding['severity']): boolean {
-  const rank = SEVERITIES.indexOf(severity);
-  return rank !== -1 && rank <= MEDIUM_RANK;
+  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf('medium');
 }
 
 export function premiseClusters(findings: GateFinding[]): PremiseCluster[] {
@@ -258,36 +256,29 @@ export function premiseClusters(findings: GateFinding[]): PremiseCluster[] {
       !!f.file &&
       isAtLeastMedium(f.severity)
   );
-  // Union-find over the eligible set, linking every proximate pair; lower id wins → deterministic.
+  // Link every proximate pair via the subsystem's shared clustering primitive. Sort by id first so
+  // each cluster's member list is in a canonical (id) order; a cluster fires only when it holds ≥2
+  // findings from ≥2 DISTINCT reviewers (the cross-vendor pile-up signal).
   const sorted = [...eligible].sort((a, b) => (a.findingId < b.findingId ? -1 : 1));
-  const parent = new Map(sorted.map((f) => [f.findingId, f.findingId]));
-  const find = (x: string): string => {
-    let root = x;
-    while (parent.get(root) !== root) root = parent.get(root)!;
-    return root;
-  };
-  for (let i = 0; i < sorted.length; i++) {
-    for (let j = i + 1; j < sorted.length; j++) {
-      if (proximate(sorted[i], sorted[j])) {
-        const ra = find(sorted[i].findingId);
-        const rb = find(sorted[j].findingId);
-        if (ra !== rb) parent.set(ra < rb ? rb : ra, ra < rb ? ra : rb);
-      }
-    }
-  }
-  const groups = new Map<string, GateFinding[]>();
-  for (const f of sorted) {
-    const root = find(f.findingId);
-    groups.set(root, [...(groups.get(root) ?? []), f]);
-  }
   const clusters: PremiseCluster[] = [];
-  for (const group of groups.values()) {
+  for (const group of connectedComponents(sorted, (f) => f.findingId, proximate)) {
     const reviewers = [...new Set(group.map((f) => f.reviewer))];
     if (group.length >= 2 && reviewers.length >= 2) {
       clusters.push({ findingIds: group.map((f) => f.findingId), reviewers });
     }
   }
   return clusters.sort((a, b) => (a.findingIds[0] < b.findingIds[0] ? -1 : 1));
+}
+
+// The SINGLE source of truth for "does the premise clause fire this run?": the flag is on AND the
+// host detected ≥1 cross-vendor cluster. Both the prompt builder (appends the clause) and the run
+// (surfaces the `simplify` line) derive their decision from THIS one function — never from two
+// hand-kept-in-sync conditions that could drift if the trigger ever gains a term.
+export function activePremiseClusters(
+  findings: GateFinding[],
+  opts: { premise?: boolean }
+): PremiseCluster[] {
+  return opts.premise ? premiseClusters(findings) : [];
 }
 
 // The PREMISE PASS clause. Appended to the gate prompt ONLY when --premise is on AND the host
@@ -333,7 +324,7 @@ export function renderGatePrompt(
   // to the pre-premise prompt (done-criterion 7).
   opts: { premise?: boolean } = {}
 ): string {
-  const clusters = opts.premise ? premiseClusters(findings) : [];
+  const clusters = activePremiseClusters(findings, opts);
   return `You are the VERIFIED GATE for a multi-model CODE REVIEW. Several AI reviewers each
 reviewed the SAME diff INDEPENDENTLY. You are given, per finding, the reviewer's claim AND the
 EXACT cited diff hunk from the pinned packet the reviewers saw. Review-only: do NOT propose

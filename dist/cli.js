@@ -5747,15 +5747,8 @@ function proximate(a, b) {
   if (a.line === null || b.line === null) return a.line === null && b.line === null;
   return Math.abs(a.line - b.line) <= LINE_WINDOW;
 }
-function better(a, b) {
-  const verdictRank = (r) => r.effectiveVerdict === "agree" ? 0 : 1;
-  const cmp = verdictRank(a) - verdictRank(b) || SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity) || (b.postableBody?.length ?? 0) - (a.postableBody?.length ?? 0) || (a.findingId < b.findingId ? -1 : 1);
-  return cmp <= 0 ? a : b;
-}
-function clusterPostable(records) {
-  const postable = records.filter((r) => r.postableStatus === "postable" && !isHolisticRecord(r));
-  const tok = new Map(postable.map((r) => [r.findingId, tokens(r)]));
-  const parent = new Map(postable.map((r) => [r.findingId, r.findingId]));
+function connectedComponents(items, id, connected) {
+  const parent = new Map(items.map((t) => [id(t), id(t)]));
   const find = (x) => {
     let root = x;
     while (parent.get(root) !== root) root = parent.get(root);
@@ -5766,27 +5759,37 @@ function clusterPostable(records) {
     }
     return root;
   };
-  const union = (a, b) => {
-    const ra = find(a);
-    const rb = find(b);
-    if (ra !== rb) parent.set(ra < rb ? rb : ra, ra < rb ? ra : rb);
-  };
-  for (let i = 0; i < postable.length; i++) {
-    for (let j = i + 1; j < postable.length; j++) {
-      const a = postable[i];
-      const b = postable[j];
-      if (proximate(a, b) && overlapCoefficient(tok.get(a.findingId), tok.get(b.findingId)) >= MIN_TOKEN_OVERLAP) {
-        union(a.findingId, b.findingId);
+  for (let i = 0; i < items.length; i++) {
+    for (let j = i + 1; j < items.length; j++) {
+      if (connected(items[i], items[j])) {
+        const ra = find(id(items[i]));
+        const rb = find(id(items[j]));
+        if (ra !== rb) parent.set(ra < rb ? rb : ra, ra < rb ? ra : rb);
       }
     }
   }
-  const clusters = /* @__PURE__ */ new Map();
-  for (const r of postable) {
-    const root = find(r.findingId);
-    (clusters.get(root) ?? clusters.set(root, []).get(root)).push(r);
+  const groups = /* @__PURE__ */ new Map();
+  for (const t of items) {
+    const root = find(id(t));
+    (groups.get(root) ?? groups.set(root, []).get(root)).push(t);
   }
+  return [...groups.values()];
+}
+function better(a, b) {
+  const verdictRank = (r) => r.effectiveVerdict === "agree" ? 0 : 1;
+  const cmp = verdictRank(a) - verdictRank(b) || SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity) || (b.postableBody?.length ?? 0) - (a.postableBody?.length ?? 0) || (a.findingId < b.findingId ? -1 : 1);
+  return cmp <= 0 ? a : b;
+}
+function clusterPostable(records) {
+  const postable = records.filter((r) => r.postableStatus === "postable" && !isHolisticRecord(r));
+  const tok = new Map(postable.map((r) => [r.findingId, tokens(r)]));
+  const clusters = connectedComponents(
+    postable,
+    (r) => r.findingId,
+    (a, b) => proximate(a, b) && overlapCoefficient(tok.get(a.findingId), tok.get(b.findingId)) >= MIN_TOKEN_OVERLAP
+  );
   const clusterOf = /* @__PURE__ */ new Map();
-  for (const members of clusters.values()) {
+  for (const members of clusters) {
     const primary = members.reduce(better);
     const reviewers = new Set(members.map((m) => m.reviewer));
     const corroborators = members.filter((m) => m.findingId !== primary.findingId).map((m) => m.findingId);
@@ -5942,10 +5945,8 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   state what THIS finding claims that the primary's body does NOT \u2014 the host threads that claim onto
   the primary for the human, so a sharper framing (e.g. one reviewer names the direction that FAILS,
   the other names the direction that wrongly PASSES) is never lost to dedup.${gateEvidence === "worktree" ? WORKTREE_GROUNDING_CLAUSE + REFERENCE_NOT_FOUND_CLAUSE : ""}${hasHolistic ? holisticClause : ""}`;
-var MEDIUM_RANK = SEVERITIES.indexOf("medium");
 function isAtLeastMedium(severity) {
-  const rank = SEVERITIES.indexOf(severity);
-  return rank !== -1 && rank <= MEDIUM_RANK;
+  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf("medium");
 }
 function premiseClusters(findings) {
   const eligible = findings.filter(
@@ -5961,34 +5962,17 @@ function premiseClusters(findings) {
     )
   );
   const sorted = [...eligible].sort((a, b) => a.findingId < b.findingId ? -1 : 1);
-  const parent = new Map(sorted.map((f) => [f.findingId, f.findingId]));
-  const find = (x) => {
-    let root = x;
-    while (parent.get(root) !== root) root = parent.get(root);
-    return root;
-  };
-  for (let i = 0; i < sorted.length; i++) {
-    for (let j = i + 1; j < sorted.length; j++) {
-      if (proximate(sorted[i], sorted[j])) {
-        const ra = find(sorted[i].findingId);
-        const rb = find(sorted[j].findingId);
-        if (ra !== rb) parent.set(ra < rb ? rb : ra, ra < rb ? ra : rb);
-      }
-    }
-  }
-  const groups = /* @__PURE__ */ new Map();
-  for (const f of sorted) {
-    const root = find(f.findingId);
-    groups.set(root, [...groups.get(root) ?? [], f]);
-  }
   const clusters = [];
-  for (const group of groups.values()) {
+  for (const group of connectedComponents(sorted, (f) => f.findingId, proximate)) {
     const reviewers = [...new Set(group.map((f) => f.reviewer))];
     if (group.length >= 2 && reviewers.length >= 2) {
       clusters.push({ findingIds: group.map((f) => f.findingId), reviewers });
     }
   }
   return clusters.sort((a, b) => a.findingIds[0] < b.findingIds[0] ? -1 : 1);
+}
+function activePremiseClusters(findings, opts) {
+  return opts.premise ? premiseClusters(findings) : [];
 }
 function premiseClause(clusters) {
   const list = clusters.map((c) => `  - ${c.findingIds.join(" + ")} (raised by ${c.reviewers.join(", ")})`).join("\n");
@@ -6010,7 +5994,7 @@ This "simplify" line is ADVISORY PROSE only \u2014 it changes NO verdict, gates 
 posted to a PR. If the clustered findings do NOT actually share one structure, OMIT "simplify".`;
 }
 function renderGatePrompt(findings, injections, gateEvidence = "packet", opts = {}) {
-  const clusters = opts.premise ? premiseClusters(findings) : [];
+  const clusters = activePremiseClusters(findings, opts);
   return `You are the VERIFIED GATE for a multi-model CODE REVIEW. Several AI reviewers each
 reviewed the SAME diff INDEPENDENTLY. You are given, per finding, the reviewer's claim AND the
 EXACT cited diff hunk from the pinned packet the reviewers saw. Review-only: do NOT propose
@@ -6963,8 +6947,8 @@ async function runGate(opts) {
   if (healthy.length === 0) {
     return finalize(fallbackReviewSynthesis(opts.reviews), { failure: "gate-failed" }, false);
   }
-  const premiseClusterCount = opts.premise === true ? premiseClusters(findings).length : 0;
-  const premiseActive = premiseClusterCount > 0;
+  const premiseCluster = activePremiseClusters(findings, opts);
+  const premiseActive = premiseCluster.length > 0;
   const prompt = renderGatePrompt(
     findings,
     injections,
@@ -6973,7 +6957,7 @@ async function runGate(opts) {
     // byte-identical to the 3-arg call on every flag-off run.
     opts.premise ? { premise: true } : {}
   );
-  if (premiseActive) log(`premise pass: ${premiseClusterCount} cluster(s) \u2014 advisory clause appended`);
+  if (premiseActive) log(`premise pass: ${premiseCluster.length} cluster(s) \u2014 advisory clause appended`);
   log("Gate: grounding findings against the pinned diff hunks \u2014 verdict tags\u2026");
   if (opts.shadow) {
     if (packetFail) {

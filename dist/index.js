@@ -4118,7 +4118,6 @@ var holisticClause = `
   "conventionCitation": {"file","line","quote"} quoting the project's conventions doc that mandates
   the bypassed pattern. The host verifies that quote too, and checks the file really is a conventions
   doc. There is no way to assert your way past the cap.`;
-var MEDIUM_RANK = SEVERITIES.indexOf("medium");
 
 // src/modes/review/gate-postable.ts
 var FENCE_LINE_RE = /^[ \t]*(`{3,}|~{3,})/m;
