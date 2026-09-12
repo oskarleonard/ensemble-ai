@@ -5979,13 +5979,15 @@ function premiseClause(clusters) {
   return `
 
 ## Premise pass \u2014 is the STRUCTURE the problem? (ADVISORY, opt-in)
-Two or more \u2265medium findings from DIFFERENT reviewers land within a few lines of each other this
-run. Each cluster below is named by its members' finding ids \u2014 look them up in the CLAIMS and HUNKS
-above; nothing here is new evidence:
+Two or more \u2265medium findings from DIFFERENT reviewers cluster in the same region of one file this
+run \u2014 each member sits within a few lines of another in its cluster (a chain of them may span a
+wider range). Each cluster below is named by its members' finding ids \u2014 look them up in the CLAIMS
+and HUNKS above; nothing here is new evidence:
 ${list}
 When findings pile up on one place, the real flaw is often the STRUCTURE itself, not each finding
-on its own. Add ONE extra key to your "synthesis" object \u2014 "simplify": "<one or two sentences>" \u2014
-that:
+on its own. IN ADDITION to the strict schema above \u2014 still respond with the ONE json block, just
+carrying this one extra synthesis key \u2014 add "simplify": "<one or two sentences>" to your
+"synthesis" object that:
   1) NAMES the shared structure or mutable state the cluster keeps circling (at ROOT grain \u2014 the
      thing whose removal would make the whole cluster moot), and
   2) asks the one question: can this structure be simplified, or the shared state removed, so the
