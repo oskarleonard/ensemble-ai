@@ -1194,4 +1194,17 @@ describe('parseGateEnvelope + runGate — the premise pass simplify line', () =>
     });
     expect(off.synthesis.simplify).toBeUndefined();
   });
+
+  it('drops a volunteered simplify when --premise is on but NO cluster fired (codex#f2)', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-rg-'));
+    persistGatePacket(base, 'r', { diff: DIFF, headSha: HEAD });
+    // ONE reviewer ⇒ no cross-vendor cluster ⇒ no premise clause was appended to the prompt. Even with
+    // --premise on, a model-volunteered simplify field must NOT be surfaced (opts.premise ≠ clause fired).
+    const noCluster = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, premise: true,
+      reviews: [review('codex', [f()])],
+      run: async () => okRun(envWithSimplify), runId: 'r',
+    });
+    expect(noCluster.synthesis.simplify).toBeUndefined();
+  });
 });

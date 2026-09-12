@@ -8,7 +8,7 @@ import { type RunReviewOpts } from '../../reviewers/codex';
 import { isUsageLimitFailure } from './claude';
 import type { EvidenceClass } from './evidence';
 import { type ClusterInfo, clusterPostable } from './gate-dedup';
-import { renderGatePrompt } from './gate-prompt';
+import { premiseClusters, renderGatePrompt } from './gate-prompt';
 import {
   type Hunk,
   type ResolvedHunk,
@@ -1398,6 +1398,12 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // The prompt teaches `cause: reference-not-found` ONLY when the gate's realized evidence is
   // worktree — the same fact reconcileGateVerdicts requires to HONOR it. Teach and honor together,
   // or the cause is either unreachable (never taught) or unsound (taught to a packet-fed gate).
+  // The premise clause is appended by renderGatePrompt ONLY when --premise is on AND a cluster fired.
+  // Compute that SAME activation here (same pure fn, same findings ⇒ identical result) so the OUTPUT
+  // surfaces `simplify` on exactly that condition — never on a field a model volunteered when no clause
+  // was shown (codex#f2: opts.premise alone is not proof the clause fired). Also drives the trail log.
+  const premiseClusterCount = opts.premise === true ? premiseClusters(findings).length : 0;
+  const premiseActive = premiseClusterCount > 0;
   const prompt = renderGatePrompt(
     findings,
     injections,
@@ -1406,6 +1412,9 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     // byte-identical to the 3-arg call on every flag-off run.
     opts.premise ? { premise: true } : {}
   );
+  // A --premise run must not leave the reader guessing whether the clause was appended (claude#f3) —
+  // an absent `simplify` otherwise conflates flag-off / no-cluster / cluster-the-gate-declined.
+  if (premiseActive) log(`premise pass: ${premiseClusterCount} cluster(s) — advisory clause appended`);
   log('Gate: grounding findings against the pinned diff hunks — verdict tags…');
   // THE SHADOW GATE — spawned CONCURRENTLY with the primary on the IDENTICAL prompt (property 3),
   // settled inside finalize so wall time is max(primary, shadow), not their sum, and so the CLI
@@ -1535,10 +1544,11 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
       disagreements: parsed.disagreements,
       ok: true,
       raw: res.raw,
-      // The premise pass's advisory line is surfaced ONLY when --premise was on for this run — a
-      // flag-off run drops it even if a model volunteered the field, keeping the output byte-
-      // identical (done-criterion 7).
-      ...(opts.premise && parsed.simplify ? { simplify: parsed.simplify } : {}),
+      // The premise pass's advisory line is surfaced ONLY when the clause ACTUALLY fired this run
+      // (--premise on AND a cluster detected) — not on opts.premise alone (codex#f2), and never on a
+      // field a model volunteered when no clause was shown. A flag-off / no-cluster run drops it,
+      // keeping the output byte-identical (done-criterion 7).
+      ...(premiseActive && parsed.simplify ? { simplify: parsed.simplify } : {}),
       summary: '',
     },
     // Corroborate against the SAME completed (ok) reviewers the verdict half tags — reconcile
