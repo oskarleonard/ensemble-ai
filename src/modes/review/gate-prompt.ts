@@ -230,14 +230,26 @@ export interface PremiseCluster {
   reviewers: string[];
 }
 
-// ≥ medium = severity rank at or above 'medium' in SEVERITIES (['high','medium','low']).
-const CLUSTER_MIN_SEVERITY_RANK = SEVERITIES.indexOf('medium');
+// ≥ medium in SEVERITIES (['high','medium','low'] — lower index = more severe). An unrecognized
+// severity (indexOf === -1) is deliberately NOT ≥ medium, so it never clusters.
+const MEDIUM_RANK = SEVERITIES.indexOf('medium');
+function isAtLeastMedium(severity: GateFinding['severity']): boolean {
+  const rank = SEVERITIES.indexOf(severity);
+  return rank !== -1 && rank <= MEDIUM_RANK;
+}
 
 export function premiseClusters(findings: GateFinding[]): PremiseCluster[] {
   const byFile = new Map<string, GateFinding[]>();
   for (const f of findings) {
+    // The holistic lens is ONE seat that read the whole tree — not a cross-vendor peer, and the HIGH
+    // gate excludes it by construction (gate.ts). A cluster is a CROSS-VENDOR signal, so it must too.
+    if (isHolisticRecord(f)) continue;
+    // Only findings the gate actually GROUNDED to the diff cluster: an out-of-diff cite (resolved
+    // false) keeps its reviewer-CLAIMED file, which may name a region not in this change — clustering
+    // on it would point the premise pass at a file the gate can't see. "Reuses the grounding" (§4).
+    if (!f.resolved) continue;
     if (!f.file) continue; // a finding with no grounded region cannot cluster on one
-    if (SEVERITIES.indexOf(f.severity) > CLUSTER_MIN_SEVERITY_RANK) continue; // below medium
+    if (!isAtLeastMedium(f.severity)) continue; // only ≥ medium findings cluster
     const list = byFile.get(f.file) ?? [];
     list.push(f);
     byFile.set(f.file, list);
@@ -259,8 +271,14 @@ export function premiseClusters(findings: GateFinding[]): PremiseCluster[] {
 // It teaches ONE extra advisory key on the "synthesis" object — "simplify" — asking the one
 // question the premise pass exists for. Advisory only: it changes no verdict and posts nowhere.
 function premiseClause(clusters: PremiseCluster[]): string {
+  // `c.file` is reviewer-controlled (from evidence.file) — scrub + defang it exactly like the
+  // per-finding location line (findingsBlock) so a crafted file can't forge a fence break or smuggle
+  // a directive onto this host-owned line. findingIds/reviewers are host-owned (voiceId#n · ids), safe.
   const regions = clusters
-    .map((c) => `  - ${c.file} — ${c.findingIds.join(', ')} (from ${c.reviewers.join(' + ')})`)
+    .map(
+      (c) =>
+        `  - ${defangFence(scrubControl(c.file))} — ${c.findingIds.join(', ')} (from ${c.reviewers.join(' + ')})`
+    )
     .join('\n');
   return `
 

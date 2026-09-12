@@ -5942,12 +5942,18 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   state what THIS finding claims that the primary's body does NOT \u2014 the host threads that claim onto
   the primary for the human, so a sharper framing (e.g. one reviewer names the direction that FAILS,
   the other names the direction that wrongly PASSES) is never lost to dedup.${gateEvidence === "worktree" ? WORKTREE_GROUNDING_CLAUSE + REFERENCE_NOT_FOUND_CLAUSE : ""}${hasHolistic ? holisticClause : ""}`;
-var CLUSTER_MIN_SEVERITY_RANK = SEVERITIES.indexOf("medium");
+var MEDIUM_RANK = SEVERITIES.indexOf("medium");
+function isAtLeastMedium(severity) {
+  const rank = SEVERITIES.indexOf(severity);
+  return rank !== -1 && rank <= MEDIUM_RANK;
+}
 function premiseClusters(findings) {
   const byFile = /* @__PURE__ */ new Map();
   for (const f of findings) {
+    if (isHolisticRecord(f)) continue;
+    if (!f.resolved) continue;
     if (!f.file) continue;
-    if (SEVERITIES.indexOf(f.severity) > CLUSTER_MIN_SEVERITY_RANK) continue;
+    if (!isAtLeastMedium(f.severity)) continue;
     const list = byFile.get(f.file) ?? [];
     list.push(f);
     byFile.set(f.file, list);
@@ -5962,7 +5968,9 @@ function premiseClusters(findings) {
   return clusters.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
 }
 function premiseClause(clusters) {
-  const regions = clusters.map((c) => `  - ${c.file} \u2014 ${c.findingIds.join(", ")} (from ${c.reviewers.join(" + ")})`).join("\n");
+  const regions = clusters.map(
+    (c) => `  - ${defangFence(scrubControl(c.file))} \u2014 ${c.findingIds.join(", ")} (from ${c.reviewers.join(" + ")})`
+  ).join("\n");
   return `
 
 ## Premise pass \u2014 is the STRUCTURE the problem? (ADVISORY, opt-in)
