@@ -278,7 +278,8 @@ Options:
                         --shadow-gate the shadow REVERSES automatically: a codex gate is shadowed
                         by the anthropic champion, and vice versa
   --premise             opt-in PREMISE PASS: when the gate's own findings CLUSTER on one region
-                        (≥2 ≥medium findings from different reviewers grounded to the same file),
+                        (≥2 ≥medium findings from different reviewers grounded to the same region —
+                        same file AND within a few lines of each other, chained transitively),
                         the synthesis gains ONE advisory \`simplify\` line naming the shared
                         structure and asking whether removing/simplifying it moots the whole
                         cluster. Advisory only — no verdict, exit code, or posted comment changes.
@@ -3232,7 +3233,7 @@ heals retroactively.
 
 Usage:
   ensemble-ai regate [<pr-url>] --out <dir> --run-id <id> [--repo <path>]
-                     [--gate-model <m>] [--gate-effort <e>]
+                     [--gate-model <m>] [--gate-effort <e>] [--premise]
 
   <pr-url>          the SAME GitHub PR URL the original review took — required only with
                     --repo (the worktree re-materialization fetches pull/<N>/head)
@@ -3243,6 +3244,8 @@ Usage:
                     verification). Unavailable/failed → LOUD fallback to packet evidence.
   --gate-model <m>  gate seat pin — same resolution chain as review (flag → voices.json
   --gate-effort <e> \`gate\` entry → the claude voice → built-in default)
+  --premise         re-earn the opt-in advisory premise \`simplify\` line — pass it to heal a
+                    run that was launched with --premise (off ⇒ byte-identical to a plain regate)
 
 Exit: 0 = gate completed (verdicts updated) · 1 = gate failed again (still fail-closed) ·
 3 = usage / missing trail.
@@ -3263,6 +3266,7 @@ async function regateCommand(args: string[]): Promise<number> {
         'gate-model': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
         out: { type: 'string' },
+        premise: { type: 'boolean' },
         repo: { type: 'string' },
         'run-id': { type: 'string' },
       },
@@ -3341,6 +3345,7 @@ async function regateCommand(args: string[]): Promise<number> {
       conventionPaths: readConventionPathsFromTrail(out, runId),
       gateConfig: gateSeat.config,
       log: (m) => console.error(`· ${m}`),
+      ...(values.premise ? { premise: true } : {}),
       runId,
       ...(session ? { worktree: session.dir } : {}),
     });
@@ -3372,7 +3377,7 @@ gate-verdicts.json + claude-synthesis.json in place. No other seat is re-billed.
 Usage:
   ensemble-ai reseat [<pr-url>] --out <dir> --run-id <id> --seat <codex|grok>
                      [--repo <path>] [--gate-model <m>] [--gate-effort <e>]
-                     [--reviewers-file <p>] [--sandbox <profile>]
+                     [--reviewers-file <p>] [--sandbox <profile>] [--premise]
 
   <pr-url>          the SAME GitHub PR URL the original review took — required only with
                     --repo (the worktree re-materialization fetches pull/<N>/head)
@@ -3394,6 +3399,8 @@ Usage:
   --sandbox <p>     override the seat's sandbox profile — it must resolve to the profile the
                     worktree qualification requires (see \`review --sandbox\`); anything else
                     DISqualifies the seat and it re-runs on the packet
+  --premise         forward the opt-in advisory premise \`simplify\` line to the regate over the
+                    union — pass it to heal a run launched with --premise (off ⇒ no premise line)
 
 Not re-run (same as regate): the execution settler, the shadow gate, and the receipt — a healed run
 keeps the receipt its original roster earned.
@@ -3419,6 +3426,7 @@ async function reseatCommand(args: string[]): Promise<number> {
         'gate-model': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
         out: { type: 'string' },
+        premise: { type: 'boolean' },
         repo: { type: 'string' },
         'reviewers-file': { type: 'string' },
         'run-id': { type: 'string' },
@@ -3540,6 +3548,7 @@ async function reseatCommand(args: string[]): Promise<number> {
       // conventionPaths: left to the module, which defaults to THIS run's own trail.
       gateConfig: gateSeat.config,
       log: (m) => console.error(`· ${m}`),
+      ...(values.premise ? { premise: true } : {}),
       ...(session ? { qualification: SEAT_QUALIFIERS[seat]({ config: reviewer, worktree: session.dir }) } : {}),
       reviewer,
       runId,

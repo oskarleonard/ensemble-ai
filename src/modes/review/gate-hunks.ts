@@ -230,6 +230,12 @@ export function resolveFindingHunk(hunks: Hunk[], line: number): ResolvedHunk | 
 export const HUNK_WINDOW_LINES = 25;
 
 export interface WindowedHunk {
+  // The half-open body-index range [start, end) actually included in `text` (excludes the header).
+  // A caller can check whether ANOTHER finding's cited body index falls inside this shown slice —
+  // used so the premise pass never clusters on code that shared a hunk but sat outside the window
+  // that was really injected (gate.ts prepareGateFindings · codex#f2).
+  end: number;
+  start: number;
   text: string;
   truncated: boolean;
 }
@@ -243,7 +249,7 @@ export function windowHunk(
   const end = Math.min(hunk.body.length, bodyIndex + radius + 1);
   const truncated = start > 0 || end < hunk.body.length;
   const slice = hunk.body.slice(start, end);
-  return { text: [hunk.header, ...slice].join('\n'), truncated };
+  return { end, start, text: [hunk.header, ...slice].join('\n'), truncated };
 }
 
 // The whitespace-normalized CODE lines of a hunk — its body lines with the single leading

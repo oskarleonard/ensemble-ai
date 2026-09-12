@@ -117,6 +117,23 @@ describe('runRegate — heal a dead gate from the persisted trail, no reviewer r
     expect(typeof synth.regatedAt).toBe('string');
   });
 
+  it('forwards --premise so a healed run re-earns the advisory clause when findings cluster (codex#f1 · claude#f1)', async () => {
+    // seedRun persists codex + grok both HIGH on src/x.ts:3 → a cross-vendor cluster on one region.
+    const { base, runId } = seedRun();
+    const off: string[] = [];
+    await runRegate({ baseDir: base, gateConfig: CFG, run: async (p) => (off.push(p), okRun(GATE)), runId });
+    expect(off[0]).not.toContain('Premise pass'); // no --premise ⇒ byte-identical to a plain regate
+    const on: string[] = [];
+    await runRegate({
+      baseDir: base,
+      gateConfig: CFG,
+      premise: true,
+      run: async (p) => (on.push(p), okRun(GATE)),
+      runId,
+    });
+    expect(on[0]).toContain('Premise pass'); // --premise threaded through ⇒ the clause is appended
+  });
+
   it('a gate that times out AGAIN stays fail-closed and reports ok:false', async () => {
     const { base, runId } = seedRun();
     const res = await runRegate({

@@ -513,6 +513,26 @@ describe('prepareGateFindings — deterministic budgeting (DC1)', () => {
     expect(findings[1]).toMatchObject({ hunkLabel: null, truncated: true }); // budget-dropped
   });
 
+  it('regionShown is FALSE for a finding sharing a big hunk but outside the injected window (codex#f2)', () => {
+    // ONE 40-line hunk. The HIGH finding at line 3 is prioritized first and creates the ±25 window
+    // (body lines ~1..28). Two MEDIUM findings at lines 38/40 share the hunk's H1 label but sit
+    // OUTSIDE that window — their code was never injected, so regionShown must be false even though
+    // hunkLabel is non-null. This is what stops the premise pass clustering on unshown code.
+    const hunks = parsePacketHunks(BIG_FILE('src/big.ts', 'bg'));
+    const reviews = [
+      review('codex', [f({ severity: 'high', evidence: { file: 'src/big.ts', line: 3 } })]),
+      review('grok', [
+        f({ severity: 'medium', evidence: { file: 'src/big.ts', line: 38 } }),
+        f({ id: 'f2', severity: 'medium', evidence: { file: 'src/big.ts', line: 40 } }),
+      ]),
+    ];
+    const { findings } = prepareGateFindings(reviews, hunks);
+    const byId = Object.fromEntries(findings.map((r) => [r.findingId, r]));
+    expect(byId['codex#1']).toMatchObject({ hunkLabel: 'H1', regionShown: true }); // window creator
+    expect(byId['grok#1']).toMatchObject({ hunkLabel: 'H1', regionShown: false }); // shared label, unshown line
+    expect(byId['grok#2']).toMatchObject({ hunkLabel: 'H1', regionShown: false });
+  });
+
   it('an out-of-diff cite yields no hunk (resolved=false)', () => {
     const { findings } = prepareGateFindings(
       [review('codex', [f({ evidence: { file: 'nope.ts', line: 1 } })])],

@@ -247,12 +247,13 @@ export function premiseClusters(findings: GateFinding[]): PremiseCluster[] {
       // HIGH gate excludes it by construction (gate.ts). A cluster is a CROSS-VENDOR signal, so it
       // must too.
       !isHolisticRecord(f) &&
-      // Only findings the gate actually SEES cluster: an out-of-diff cite (resolved false) keeps its
-      // reviewer-CLAIMED file, and a resolved-but-budget-dropped cite (hunkLabel null) had its hunk
-      // omitted from the prompt — clustering on either would point the premise pass at code the
-      // gate was never given, the state in which a model is likeliest to invent a shared structure.
-      f.resolved &&
-      f.hunkLabel !== null &&
+      // Only findings whose OWN cited region the gate actually SAW cluster. `regionShown` (set by
+      // prepareGateFindings) is stricter than `hunkLabel !== null`: it is false for an out-of-diff
+      // cite, a budget-dropped hunk, AND a finding that merely SHARED a big hunk's label but sat
+      // outside the ±window really injected around the first prioritized finding (codex#f2). Clustering
+      // on any of those would point the premise pass at code the gate was never given — the state in
+      // which a model is likeliest to invent a shared structure.
+      f.regionShown === true &&
       !!f.file &&
       isAtLeastMedium(f.severity)
   );

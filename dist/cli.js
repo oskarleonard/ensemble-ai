@@ -3200,7 +3200,7 @@ function windowHunk(hunk, bodyIndex, radius = HUNK_WINDOW_LINES) {
   const end = Math.min(hunk.body.length, bodyIndex + radius + 1);
   const truncated = start > 0 || end < hunk.body.length;
   const slice = hunk.body.slice(start, end);
-  return { text: [hunk.header, ...slice].join("\n"), truncated };
+  return { end, start, text: [hunk.header, ...slice].join("\n"), truncated };
 }
 function hunkCodeLines(hunk) {
   const out = [];
@@ -5954,11 +5954,13 @@ function premiseClusters(findings) {
       // The holistic lens is ONE seat that read the whole tree — not a cross-vendor peer, and the
       // HIGH gate excludes it by construction (gate.ts). A cluster is a CROSS-VENDOR signal, so it
       // must too.
-      !isHolisticRecord(f) && // Only findings the gate actually SEES cluster: an out-of-diff cite (resolved false) keeps its
-      // reviewer-CLAIMED file, and a resolved-but-budget-dropped cite (hunkLabel null) had its hunk
-      // omitted from the prompt — clustering on either would point the premise pass at code the
-      // gate was never given, the state in which a model is likeliest to invent a shared structure.
-      f.resolved && f.hunkLabel !== null && !!f.file && isAtLeastMedium(f.severity)
+      !isHolisticRecord(f) && // Only findings whose OWN cited region the gate actually SAW cluster. `regionShown` (set by
+      // prepareGateFindings) is stricter than `hunkLabel !== null`: it is false for an out-of-diff
+      // cite, a budget-dropped hunk, AND a finding that merely SHARED a big hunk's label but sat
+      // outside the ±window really injected around the first prioritized finding (codex#f2). Clustering
+      // on any of those would point the premise pass at code the gate was never given — the state in
+      // which a model is likeliest to invent a shared structure.
+      f.regionShown === true && !!f.file && isAtLeastMedium(f.severity)
     )
   );
   const sorted = [...eligible].sort((a, b) => a.findingId < b.findingId ? -1 : 1);
@@ -6396,6 +6398,7 @@ function prepareGateFindings(reviews, packetHunks) {
   const byKey = /* @__PURE__ */ new Map();
   const truncatedById = /* @__PURE__ */ new Set();
   const labelById = /* @__PURE__ */ new Map();
+  const regionShownById = /* @__PURE__ */ new Set();
   let usedBytes = 0;
   for (const rf of order) {
     const res = resolved.get(rf.findingId) ?? null;
@@ -6408,6 +6411,9 @@ function prepareGateFindings(reviews, packetHunks) {
     if (existing) {
       if (existing.truncated || !existing.admitted) truncatedById.add(rf.findingId);
       labelById.set(rf.findingId, existing.admitted ? existing.label : null);
+      if (existing.admitted && res.bodyIndex >= existing.winStart && res.bodyIndex < existing.winEnd) {
+        regionShownById.add(rf.findingId);
+      }
       continue;
     }
     const win = windowHunk(res.hunk, res.bodyIndex);
@@ -6415,11 +6421,12 @@ function prepareGateFindings(reviews, packetHunks) {
     const admitted = injections.length === 0 || usedBytes + bytes <= GATE_HUNK_BYTE_BUDGET;
     const label2 = admitted ? `H${injections.length + 1}` : "";
     const injection = { label: label2, rangeKey: key, text: win.text, truncated: win.truncated };
-    byKey.set(key, { ...injection, admitted });
+    byKey.set(key, { ...injection, admitted, winEnd: win.end, winStart: win.start });
     if (admitted) {
       usedBytes += bytes;
       injections.push(injection);
       labelById.set(rf.findingId, label2);
+      regionShownById.add(rf.findingId);
       if (win.truncated) truncatedById.add(rf.findingId);
     } else {
       labelById.set(rf.findingId, null);
@@ -6438,6 +6445,7 @@ function prepareGateFindings(reviews, packetHunks) {
       hunkCode: res ? hunkCodeLines(res.hunk) : [],
       hunkLabel: labelById.get(rf.findingId) ?? null,
       line: rf.line,
+      regionShown: regionShownById.has(rf.findingId),
       resolved: res !== null,
       reviewer: rf.reviewer,
       severity: rf.severity,
@@ -8643,6 +8651,9 @@ async function runRegate(opts) {
       }
     } : {},
     log,
+    // Re-earn the advisory premise `simplify` line when the healed run asked for it (--premise);
+    // off ⇒ byte-identical to a plain regate.
+    ...opts.premise ? { premise: true } : {},
     reviews,
     run: opts.run ?? runClaudeReviewVoice,
     runId: opts.runId,
@@ -9073,6 +9084,7 @@ async function reseatUnderLock(opts, pre) {
     conventionPaths: opts.conventionPaths ?? readConventionPathsFromTrail(baseDir, runId),
     gateConfig: opts.gateConfig,
     log,
+    ...opts.premise ? { premise: true } : {},
     ...opts.gateRun ? { run: opts.gateRun } : {},
     runId,
     ...wt ? { worktree: wt.dir } : {}
@@ -10055,7 +10067,8 @@ Options:
                         --shadow-gate the shadow REVERSES automatically: a codex gate is shadowed
                         by the anthropic champion, and vice versa
   --premise             opt-in PREMISE PASS: when the gate's own findings CLUSTER on one region
-                        (\u22652 \u2265medium findings from different reviewers grounded to the same file),
+                        (\u22652 \u2265medium findings from different reviewers grounded to the same region \u2014
+                        same file AND within a few lines of each other, chained transitively),
                         the synthesis gains ONE advisory \`simplify\` line naming the shared
                         structure and asking whether removing/simplifying it moots the whole
                         cluster. Advisory only \u2014 no verdict, exit code, or posted comment changes.
@@ -12235,7 +12248,7 @@ heals retroactively.
 
 Usage:
   ensemble-ai regate [<pr-url>] --out <dir> --run-id <id> [--repo <path>]
-                     [--gate-model <m>] [--gate-effort <e>]
+                     [--gate-model <m>] [--gate-effort <e>] [--premise]
 
   <pr-url>          the SAME GitHub PR URL the original review took \u2014 required only with
                     --repo (the worktree re-materialization fetches pull/<N>/head)
@@ -12246,6 +12259,8 @@ Usage:
                     verification). Unavailable/failed \u2192 LOUD fallback to packet evidence.
   --gate-model <m>  gate seat pin \u2014 same resolution chain as review (flag \u2192 voices.json
   --gate-effort <e> \`gate\` entry \u2192 the claude voice \u2192 built-in default)
+  --premise         re-earn the opt-in advisory premise \`simplify\` line \u2014 pass it to heal a
+                    run that was launched with --premise (off \u21D2 byte-identical to a plain regate)
 
 Exit: 0 = gate completed (verdicts updated) \xB7 1 = gate failed again (still fail-closed) \xB7
 3 = usage / missing trail.
@@ -12262,6 +12277,7 @@ async function regateCommand(args) {
         "gate-model": { type: "string" },
         help: { short: "h", type: "boolean" },
         out: { type: "string" },
+        premise: { type: "boolean" },
         repo: { type: "string" },
         "run-id": { type: "string" }
       }
@@ -12333,6 +12349,7 @@ async function regateCommand(args) {
       conventionPaths: readConventionPathsFromTrail(out, runId),
       gateConfig: gateSeat.config,
       log: (m) => console.error(`\xB7 ${m}`),
+      ...values.premise ? { premise: true } : {},
       runId,
       ...session ? { worktree: session.dir } : {}
     });
@@ -12362,7 +12379,7 @@ gate-verdicts.json + claude-synthesis.json in place. No other seat is re-billed.
 Usage:
   ensemble-ai reseat [<pr-url>] --out <dir> --run-id <id> --seat <codex|grok>
                      [--repo <path>] [--gate-model <m>] [--gate-effort <e>]
-                     [--reviewers-file <p>] [--sandbox <profile>]
+                     [--reviewers-file <p>] [--sandbox <profile>] [--premise]
 
   <pr-url>          the SAME GitHub PR URL the original review took \u2014 required only with
                     --repo (the worktree re-materialization fetches pull/<N>/head)
@@ -12384,6 +12401,8 @@ Usage:
   --sandbox <p>     override the seat's sandbox profile \u2014 it must resolve to the profile the
                     worktree qualification requires (see \`review --sandbox\`); anything else
                     DISqualifies the seat and it re-runs on the packet
+  --premise         forward the opt-in advisory premise \`simplify\` line to the regate over the
+                    union \u2014 pass it to heal a run launched with --premise (off \u21D2 no premise line)
 
 Not re-run (same as regate): the execution settler, the shadow gate, and the receipt \u2014 a healed run
 keeps the receipt its original roster earned.
@@ -12405,6 +12424,7 @@ async function reseatCommand(args) {
         "gate-model": { type: "string" },
         help: { short: "h", type: "boolean" },
         out: { type: "string" },
+        premise: { type: "boolean" },
         repo: { type: "string" },
         "reviewers-file": { type: "string" },
         "run-id": { type: "string" },
@@ -12493,6 +12513,7 @@ async function reseatCommand(args) {
       // conventionPaths: left to the module, which defaults to THIS run's own trail.
       gateConfig: gateSeat.config,
       log: (m) => console.error(`\xB7 ${m}`),
+      ...values.premise ? { premise: true } : {},
       ...session ? { qualification: SEAT_QUALIFIERS[seat]({ config: reviewer, worktree: session.dir }) } : {},
       reviewer,
       runId,

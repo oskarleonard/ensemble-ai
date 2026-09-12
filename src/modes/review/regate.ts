@@ -35,6 +35,11 @@ export interface RegateOptions {
   conventionPaths?: string[];
   gateConfig: VoiceConfig;
   log?: (m: string) => void;
+  // The opt-in PREMISE PASS (spec §4, --premise) — off by default, same as the initial pipeline.
+  // On ⇒ a regate whose findings cluster re-earns the advisory `simplify` synthesis line; off ⇒ the
+  // gate prompt + synthesis are byte-identical to a plain regate. Threaded so a --premise run whose
+  // gate died can be HEALED with the same behavior it was launched with (codex#f1 · claude#f1).
+  premise?: boolean;
   // Injected for tests; the default is the real capability-fenced claude spawn.
   run?: typeof runClaudeReviewVoice;
   runId: string;
@@ -109,6 +114,9 @@ export async function runRegate(opts: RegateOptions): Promise<RegateResult> {
         }
       : {}),
     log,
+    // Re-earn the advisory premise `simplify` line when the healed run asked for it (--premise);
+    // off ⇒ byte-identical to a plain regate.
+    ...(opts.premise ? { premise: true } : {}),
     reviews,
     run: opts.run ?? runClaudeReviewVoice,
     runId: opts.runId,

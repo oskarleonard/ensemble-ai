@@ -209,6 +209,12 @@ export interface GateFinding {
   hunkCode: string[]; // normalized code lines of the FULL resolved hunk (citation basis; [] if unresolved)
   hunkLabel: string | null; // the injected-hunk label shown in the prompt (null: unresolved or budget-dropped)
   line: number | null;
+  // Was THIS finding's own cited line inside the window actually injected for its hunk? A shared
+  // hunkLabel is not enough: a big hunk injects ONE window around the first prioritized finding, so
+  // a later finding sharing the key can inherit the label yet sit outside the shown slice. Only the
+  // premise pass consumes this (never cluster on code the gate wasn't given — codex#f2). Optional so
+  // the many hand-built GateFinding test literals need not carry it; prepareGateFindings always sets it.
+  regionShown?: boolean;
   resolved: boolean; // a hunk was found for the cite
   reviewer: string; // voiceId
   severity: Severity;
@@ -291,9 +297,15 @@ export function prepareGateFindings(
   );
 
   const injections: GateInjection[] = [];
-  const byKey = new Map<string, GateInjection & { admitted: boolean }>();
+  // winStart/winEnd: the body-index range of the ONE window this key actually injected. A later
+  // finding sharing the key is only "shown" if its OWN cited body index falls inside that range —
+  // a big hunk injects a ±window around the FIRST prioritized finding, so a proximate pair (or a
+  // transitive chain) elsewhere in the same hunk can inherit the label yet sit outside the shown
+  // slice (codex#f2). regionShown captures that, so the premise pass never clusters on unshown code.
+  const byKey = new Map<string, GateInjection & { admitted: boolean; winEnd: number; winStart: number }>();
   const truncatedById = new Set<string>();
   const labelById = new Map<string, string | null>();
+  const regionShownById = new Set<string>();
   let usedBytes = 0;
   for (const rf of order) {
     const res = resolved.get(rf.findingId) ?? null;
@@ -306,6 +318,10 @@ export function prepareGateFindings(
     if (existing) {
       if (existing.truncated || !existing.admitted) truncatedById.add(rf.findingId);
       labelById.set(rf.findingId, existing.admitted ? existing.label : null);
+      // Shown only if this finding's own cited line is inside the window the key actually injected.
+      if (existing.admitted && res.bodyIndex >= existing.winStart && res.bodyIndex < existing.winEnd) {
+        regionShownById.add(rf.findingId);
+      }
       continue;
     }
     const win = windowHunk(res.hunk, res.bodyIndex);
@@ -315,11 +331,12 @@ export function prepareGateFindings(
     const admitted = injections.length === 0 || usedBytes + bytes <= GATE_HUNK_BYTE_BUDGET;
     const label = admitted ? `H${injections.length + 1}` : '';
     const injection: GateInjection = { label, rangeKey: key, text: win.text, truncated: win.truncated };
-    byKey.set(key, { ...injection, admitted });
+    byKey.set(key, { ...injection, admitted, winEnd: win.end, winStart: win.start });
     if (admitted) {
       usedBytes += bytes;
       injections.push(injection);
       labelById.set(rf.findingId, label);
+      regionShownById.add(rf.findingId); // window is centered on this finding's own line
       if (win.truncated) truncatedById.add(rf.findingId);
     } else {
       labelById.set(rf.findingId, null);
@@ -339,6 +356,7 @@ export function prepareGateFindings(
       hunkCode: res ? hunkCodeLines(res.hunk) : [],
       hunkLabel: labelById.get(rf.findingId) ?? null,
       line: rf.line,
+      regionShown: regionShownById.has(rf.findingId),
       resolved: res !== null,
       reviewer: rf.reviewer,
       severity: rf.severity,
