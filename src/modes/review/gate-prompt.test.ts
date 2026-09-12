@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { ReviewFinding } from '../../core/types';
 
 import { prepareGateFindings } from './gate';
-import { renderGatePrompt } from './gate-prompt';
+import { premiseClusters, renderGatePrompt } from './gate-prompt';
 import { parsePacketHunks } from './gate-hunks';
 import type { VoiceReview } from './synthesis';
 
@@ -203,5 +203,100 @@ describe('renderGatePrompt — premise provenance doctrine + the external-testim
   it('teaches the contract-artifact conflict check ONLY on worktree evidence', () => {
     expect(renderGatePrompt(findings, injections, 'worktree')).toContain('premise-conflict:');
     expect(renderGatePrompt(findings, injections, 'packet')).not.toContain('premise-conflict');
+  });
+});
+
+// THE OPT-IN PREMISE PASS (spec 2026-09-09-review-premise-pass §4, --premise). When findings CLUSTER
+// on one region and the flag is on, a fenced advisory paragraph is APPENDED asking the gate for one
+// extra `simplify` synthesis line. Off (or no cluster) ⇒ the prompt is byte-identical (DC7).
+describe('renderGatePrompt — the opt-in premise pass appends a fenced advisory paragraph', () => {
+  // codex + grok both ground a ≥medium finding to src/x.ts → a cross-vendor cluster on one region.
+  const clustered = prepareGateFindings(
+    [review('codex', [f({ title: 'codex on x' })]), review('grok', [f({ title: 'grok on x' })])],
+    parsePacketHunks(DIFF)
+  );
+
+  it('FLAG OFF ⇒ byte-identical to the pre-premise prompt, even on a clustered fixture (DC7)', () => {
+    const today = renderGatePrompt(clustered.findings, clustered.injections);
+    expect(renderGatePrompt(clustered.findings, clustered.injections, 'packet', {})).toBe(today);
+    expect(renderGatePrompt(clustered.findings, clustered.injections, 'packet', { premise: false })).toBe(today);
+    expect(today).not.toContain('Premise pass');
+    expect(today).not.toContain('"simplify"');
+  });
+
+  it('FLAG ON + a cross-vendor cluster ⇒ the fenced paragraph is APPENDED (additive), naming the region + the simplify key + the one question', () => {
+    const prompt = renderGatePrompt(clustered.findings, clustered.injections, 'packet', { premise: true });
+    expect(prompt).toContain('Premise pass');
+    expect(prompt).toContain('"simplify"');
+    expect(prompt).toContain('src/x.ts');
+    expect(prompt).toContain('codex#1');
+    expect(prompt).toContain('grok#1');
+    expect(prompt).toMatch(/simplified, or the shared state removed/);
+    // ADDITIVE, not a rewrite: the entire flag-off prompt is a prefix of the flag-on one.
+    expect(prompt.startsWith(renderGatePrompt(clustered.findings, clustered.injections))).toBe(true);
+  });
+
+  it('FLAG ON + ONE reviewer only ⇒ no cross-vendor cluster ⇒ NO paragraph (byte-identical)', () => {
+    const single = prepareGateFindings(
+      [review('codex', [f({ title: 'a' }), f({ title: 'b' })])],
+      parsePacketHunks(DIFF)
+    );
+    const prompt = renderGatePrompt(single.findings, single.injections, 'packet', { premise: true });
+    expect(prompt).not.toContain('Premise pass');
+    expect(prompt).toBe(renderGatePrompt(single.findings, single.injections));
+  });
+
+  it('FLAG ON + findings on DIFFERENT files ⇒ no shared region ⇒ NO paragraph', () => {
+    const spread = prepareGateFindings(
+      [
+        review('codex', [f({ title: 'x file' })]),
+        review('grok', [f({ title: 'other file', evidence: { file: 'src/other.ts', line: 9 } })]),
+      ],
+      parsePacketHunks(DIFF)
+    );
+    expect(
+      renderGatePrompt(spread.findings, spread.injections, 'packet', { premise: true })
+    ).not.toContain('Premise pass');
+  });
+
+  it('FLAG ON + a below-medium cluster ⇒ NO trigger (the severity floor is medium)', () => {
+    const low = prepareGateFindings(
+      [
+        review('codex', [f({ title: 'x', severity: 'low' })]),
+        review('grok', [f({ title: 'x2', severity: 'low' })]),
+      ],
+      parsePacketHunks(DIFF)
+    );
+    expect(
+      renderGatePrompt(low.findings, low.injections, 'packet', { premise: true })
+    ).not.toContain('Premise pass');
+  });
+});
+
+describe('premiseClusters — mechanical, reuses the gate grounding (no taxonomy, no scoring)', () => {
+  it('groups ≥2 ≥medium findings from ≥2 vendors on the same file; drops singletons / one-vendor / low', () => {
+    const { findings } = prepareGateFindings(
+      [
+        review('codex', [f({ title: 'x1' }), f({ title: 'low one', severity: 'low' })]),
+        review('grok', [f({ title: 'x2' })]),
+      ],
+      parsePacketHunks(DIFF)
+    );
+    const clusters = premiseClusters(findings);
+    expect(clusters).toHaveLength(1);
+    expect(clusters[0].file).toBe('src/x.ts');
+    expect(clusters[0].reviewers.sort()).toEqual(['codex', 'grok']);
+    expect(clusters[0].findingIds).toContain('codex#1');
+    expect(clusters[0].findingIds).toContain('grok#1');
+    // the low-severity finding is excluded from the cluster
+    expect(clusters[0].findingIds).not.toContain('codex#2');
+  });
+
+  it('returns [] when only one vendor raised the ≥medium findings', () => {
+    const { findings } = prepareGateFindings(
+      [review('codex', [f({ title: 'a' }), f({ title: 'b' })])],
+      parsePacketHunks(DIFF)
+    );
+    expect(premiseClusters(findings)).toEqual([]);
   });
 });

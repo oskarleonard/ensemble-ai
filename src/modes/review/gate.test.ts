@@ -1160,3 +1160,38 @@ function BIG_FILE(name: string, marker: string): string {
   const lines = Array.from({ length: 40 }, (_, i) => `+  const ${marker}${i} = ${'x'.repeat(1100)};`);
   return `diff --git a/${name} b/${name}\n--- a/${name}\n+++ b/${name}\n@@ -1,0 +1,40 @@\n${lines.join('\n')}\n`;
 }
+
+// ── The opt-in PREMISE PASS's `simplify` line (--premise, spec §4) ──────────────────────
+describe('parseGateEnvelope + runGate — the premise pass simplify line', () => {
+  const SIMPLIFY = 'Remove the shared worktree lock — one repo per review moots the whole cluster.';
+  const envWithSimplify = JSON.stringify({
+    schemaVersion: 1,
+    synthesis: { agreements: [], bottomLine: 'bl', disagreements: [], simplify: SIMPLIFY },
+    verdicts: [{ findingId: 'codex#1', reason: 'r', verdict: 'agree' }],
+  });
+
+  it('parses synthesis.simplify; an absent field ⇒ empty string', () => {
+    const p = parseGateEnvelope(envWithSimplify);
+    if ('failure' in p) throw new Error('unexpected failure');
+    expect(p.simplify).toBe(SIMPLIFY);
+    const none = parseGateEnvelope(envelope([{ findingId: 'codex#1', reason: 'r', verdict: 'agree' }]));
+    if ('failure' in none) throw new Error('unexpected failure');
+    expect(none.simplify).toBe('');
+  });
+
+  it('runGate surfaces synthesis.simplify ONLY when --premise is on (byte-identical output off)', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-rg-'));
+    persistGatePacket(base, 'r', { diff: DIFF, headSha: HEAD });
+    const reviews = [review('codex', [f()]), review('grok', [f()])];
+    const on = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, premise: true, reviews,
+      run: async () => okRun(envWithSimplify), runId: 'r',
+    });
+    expect(on.synthesis.simplify).toBe(SIMPLIFY);
+    const off = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews,
+      run: async () => okRun(envWithSimplify), runId: 'r',
+    });
+    expect(off.synthesis.simplify).toBeUndefined();
+  });
+});

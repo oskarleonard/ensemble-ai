@@ -281,6 +281,11 @@ export interface ClaudeLayerOptions {
   // ("reviewer = Opus @ high, gate = Fable @ max"). Always a `claude -p` spawn (only model/effort
   // differ). Omitted ⇒ inherits `claudeConfig` (the pre-Phase-3 behavior — one seat for both).
   gateConfig?: VoiceConfig;
+  // The opt-in PREMISE PASS (spec 2026-09-09-review-premise-pass §4, --premise) — DEFAULT OFF. When
+  // on AND the gate's findings cluster on one region, the gate's synthesis gains ONE advisory
+  // `simplify` line (rendered by renderClaudeLayer). Off ⇒ the gate prompt + synthesis output are
+  // byte-identical to today (done-criterion 7).
+  premise?: boolean;
   // The SHADOW gate (audit-only, gate.ts ShadowGateSeat) — a cross-vendor judge over the identical
   // gate prompt, for champion/challenger measurement. Omitted ⇒ nothing changes.
   shadowGate?: ShadowGateSeat;
@@ -571,6 +576,8 @@ export async function runClaudeReviewLayer(
         }
       : {}),
     log,
+    // The opt-in premise pass — off unless the run asked for it (--premise); off ⇒ byte-identical.
+    ...(opts.premise ? { premise: true } : {}),
     reviews: voiceReviews,
     // The vendor-bound gate runner (sol-gate promotion) — absent ⇒ the layer's claude runner,
     // the pre-vendor behavior byte for byte.
@@ -720,6 +727,13 @@ export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
   if (s.bottomLine) {
     out.push('     → bottom line');
     out.push(`        ${scrub(s.bottomLine).slice(0, 500)}`);
+  }
+  // THE PREMISE PASS (spec §4, --premise): the ONE advisory line the gate adds when its findings
+  // cluster on one structure. Present ONLY on a --premise run whose gate returned one — so a
+  // flag-off run never renders it and this block leaves the output byte-identical (done-criterion 7).
+  if (s.simplify) {
+    out.push('     ⤳ simplify (premise pass — advisory)');
+    out.push(`        ${scrub(s.simplify).slice(0, 500)}`);
   }
   // The grounded per-finding verdict TAGS + the gate summary line + the trail marker — the
   // gate's teeth, rendered inline (Phase 1: informational; exit is unchanged).

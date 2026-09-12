@@ -277,6 +277,12 @@ Options:
                         xhigh). Chain: flag → voices.json \`gate.vendor\` → anthropic. With
                         --shadow-gate the shadow REVERSES automatically: a codex gate is shadowed
                         by the anthropic champion, and vice versa
+  --premise             opt-in PREMISE PASS: when the gate's own findings CLUSTER on one region
+                        (≥2 ≥medium findings from different reviewers grounded to the same file),
+                        the synthesis gains ONE advisory \`simplify\` line naming the shared
+                        structure and asking whether removing/simplifying it moots the whole
+                        cluster. Advisory only — no verdict, exit code, or posted comment changes.
+                        Default OFF; with it off the gate prompt + output are byte-identical
   --shadow-gate         ALSO run the OTHER vendor's judge over the IDENTICAL gate prompt,
                         audit-only (champion/challenger — the direction follows --gate-vendor:
                         an anthropic gate is shadowed by the codex challenger, a codex gate by
@@ -1178,6 +1184,7 @@ async function reviewCommand(
         out: { type: 'string' },
         'post-comment': { type: 'boolean' },
         pr: { type: 'string' },
+        premise: { type: 'boolean' },
         repo: { type: 'string' },
         reviewers: { type: 'string' },
         'run-id': { type: 'string' },
@@ -1682,6 +1689,9 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
           : {}),
         includeClaudeReviewer: true,
         log: (m) => console.error(`· ${m}`),
+        // The opt-in PREMISE PASS (spec §4, --premise) — off by default. When on AND the gate's
+        // findings cluster on one region, the gate's synthesis gains one advisory `simplify` line.
+        ...(values.premise ? { premise: true } : {}),
         // The pinned reviewer-visible diff. Under the capability fence the Anthropic seats have no
         // Bash, so `/code-review` and the lens are HANDED the change instead of deriving it.
         pinnedDiff: result.pinnedDiff,

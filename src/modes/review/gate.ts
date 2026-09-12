@@ -178,6 +178,9 @@ const CITATION_CAP = 500;
 // The gate's plain-English summary of a confirmed finding. 280 chars is the CONTRACT (the prompt
 // asks for ≤280), enforced here so a chatty model can't push an essay into the trail or onto a PR.
 const TLDR_CAP = 280;
+// The premise pass's advisory `simplify` line — one or two sentences (spec §4). Generous but a
+// hostile-input bound, like bottomLine's 1000.
+const SIMPLIFY_CAP = 700;
 // Cap a display string to n chars. When it overflows, mark the cut with an ellipsis so a
 // clipped value reads as deliberate rather than a mid-word glitch (the '…' counts toward n).
 function capStr(s: unknown, n: number): string {
@@ -423,6 +426,11 @@ export interface ParsedGateEnvelope {
   agreements: ReturnType<typeof parseAgreements>;
   bottomLine: string;
   disagreements: ReturnType<typeof parseDisagreements>;
+  // The PREMISE PASS's advisory line (opt-in --premise, spec §4). parseGateEnvelope always sets it
+  // ('' when the gate returned none); OPTIONAL on the type so the many hand-built ParsedGateEnvelopes
+  // in tests/consumers need not carry it. The RUN only surfaces it on the synthesis when --premise
+  // was on (runGate), so a flag-off run's output stays byte-identical even if a model volunteered it.
+  simplify?: string;
   verdicts: RawVerdictEntry[];
 }
 
@@ -494,6 +502,7 @@ export function parseGateEnvelope(raw: string): EnvelopeFailure | ParsedGateEnve
     agreements: parseAgreements(synth.agreements),
     bottomLine: capStr(synth.bottomLine, 1000),
     disagreements: parseDisagreements(synth.disagreements),
+    simplify: capStr(synth.simplify, SIMPLIFY_CAP),
     verdicts: parseVerdicts(o.verdicts),
   };
 }
@@ -1199,6 +1208,11 @@ export interface RunGateOptions {
   // supplies only the tree reader + the run's gathered conventions paths.
   holistic?: Omit<HolisticPolicyDeps, 'diffFiles'>;
   log?: (m: string) => void;
+  // The opt-in PREMISE PASS (spec §4, --premise) — default OFF. When on AND the gate's findings
+  // cluster on one region, the prompt gains a fenced advisory paragraph asking for a `simplify`
+  // synthesis line, and the run surfaces that line on the synthesis. OFF ⇒ prompt + synthesis output
+  // are byte-identical to today (done-criterion 7).
+  premise?: boolean;
   reviews: VoiceReview[];
   run: GateRunner;
   runId: string;
@@ -1384,7 +1398,14 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // The prompt teaches `cause: reference-not-found` ONLY when the gate's realized evidence is
   // worktree — the same fact reconcileGateVerdicts requires to HONOR it. Teach and honor together,
   // or the cause is either unreachable (never taught) or unsound (taught to a packet-fed gate).
-  const prompt = renderGatePrompt(findings, injections, opts.gateEvidence ?? 'packet');
+  const prompt = renderGatePrompt(
+    findings,
+    injections,
+    opts.gateEvidence ?? 'packet',
+    // Pass the 4th arg ONLY when premise is on, so the shared prompt (primary + shadow) stays
+    // byte-identical to the 3-arg call on every flag-off run.
+    opts.premise ? { premise: true } : {}
+  );
   log('Gate: grounding findings against the pinned diff hunks — verdict tags…');
   // THE SHADOW GATE — spawned CONCURRENTLY with the primary on the IDENTICAL prompt (property 3),
   // settled inside finalize so wall time is max(primary, shadow), not their sum, and so the CLI
@@ -1514,6 +1535,10 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
       disagreements: parsed.disagreements,
       ok: true,
       raw: res.raw,
+      // The premise pass's advisory line is surfaced ONLY when --premise was on for this run — a
+      // flag-off run drops it even if a model volunteered the field, keeping the output byte-
+      // identical (done-criterion 7).
+      ...(opts.premise && parsed.simplify ? { simplify: parsed.simplify } : {}),
       summary: '',
     },
     // Corroborate against the SAME completed (ok) reviewers the verdict half tags — reconcile
