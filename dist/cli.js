@@ -29,6 +29,9 @@ function parseReviewerIds(raw) {
   return ids.length > 0 ? ids : void 0;
 }
 var SEVERITIES = ["high", "medium", "low"];
+function severityAtLeast(severity, floor) {
+  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf(floor);
+}
 var CONFIDENCES = ["high", "medium", "low"];
 
 // src/core/artifacts.ts
@@ -5945,9 +5948,6 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   state what THIS finding claims that the primary's body does NOT \u2014 the host threads that claim onto
   the primary for the human, so a sharper framing (e.g. one reviewer names the direction that FAILS,
   the other names the direction that wrongly PASSES) is never lost to dedup.${gateEvidence === "worktree" ? WORKTREE_GROUNDING_CLAUSE + REFERENCE_NOT_FOUND_CLAUSE : ""}${hasHolistic ? holisticClause : ""}`;
-function isAtLeastMedium(severity) {
-  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf("medium");
-}
 function premiseClusters(findings) {
   const eligible = findings.filter(
     (f) => (
@@ -5959,8 +5959,13 @@ function premiseClusters(findings) {
       // cite, a budget-dropped hunk, AND a finding that merely SHARED a big hunk's label but sat
       // outside the ±window really injected around the first prioritized finding (codex#f2). Clustering
       // on any of those would point the premise pass at code the gate was never given — the state in
-      // which a model is likeliest to invent a shared structure.
-      f.regionShown === true && !!f.file && isAtLeastMedium(f.severity)
+      // which a model is likeliest to invent a shared structure. Note regionShown is set only on the
+      // hunk-injected paths (prepareGateFindings), and a hunk resolves only for a line-anchored cite —
+      // so a file-level (line===null) finding never reaches here: the "both file-level" arm of the
+      // shared `proximate` rule is dormant for the premise pass (it stays live for the dedup pass).
+      f.regionShown === true && !!f.file && // ≥ medium — the cross-vendor pile-up bar (spec §4). severityAtLeast (core/types) owns the
+      // "SEVERITIES is most-severe-first, lower index = more severe" invariant.
+      severityAtLeast(f.severity, "medium")
     )
   );
   const sorted = [...eligible].sort((a, b) => a.findingId < b.findingId ? -1 : 1);
@@ -9467,7 +9472,7 @@ function loadPostingPosture(profile, configPath) {
   return resolvePosture(asRecord(readEnsembleConfig(configPath).posting)?.[profile]);
 }
 function meetsInlineFloor(severity, floor) {
-  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf(floor);
+  return severityAtLeast(severity, floor);
 }
 
 // src/modes/review/push-fence.ts

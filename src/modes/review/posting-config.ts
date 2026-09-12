@@ -1,5 +1,5 @@
 import { oneOf } from '../../core/findings';
-import { SEVERITIES, type Severity } from '../../core/types';
+import { SEVERITIES, severityAtLeast, type Severity } from '../../core/types';
 
 import { asRecord, readEnsembleConfig } from './ensemble-config';
 import type { ReviewProfile } from './profile';
@@ -60,8 +60,9 @@ export function loadPostingPosture(profile: ReviewProfile, configPath?: string):
   return resolvePosture(asRecord(readEnsembleConfig(configPath).posting)?.[profile]);
 }
 
-// Is `severity` at least as severe as the floor? SEVERITIES is ordered most-severe-first, so a
-// LOWER index is MORE severe.
+// Is `severity` at least as severe as the posting floor? The domain-named wrapper over the shared
+// `severityAtLeast` (core/types) — kept so the staging call site reads as intent ("meets the inline
+// floor"), while the comparison itself lives in one home.
 export function meetsInlineFloor(severity: Severity, floor: Severity): boolean {
-  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf(floor);
+  return severityAtLeast(severity, floor);
 }

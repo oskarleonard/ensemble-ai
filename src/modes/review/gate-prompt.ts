@@ -1,6 +1,6 @@
 import { evidenceRef } from '../../core/findings';
 import { scrubControl } from '../../core/sanitize';
-import { SEVERITIES } from '../../core/types';
+import { severityAtLeast } from '../../core/types';
 
 import type { EvidenceClass } from './evidence';
 import {
@@ -234,12 +234,6 @@ export interface PremiseCluster {
   reviewers: string[];
 }
 
-// ≥ medium: SEVERITIES is ordered most-severe-first (['high','medium','low']), so "at least medium"
-// is an index ≤ the index of 'medium'. `severity` is typed Severity, so indexOf always finds it.
-function isAtLeastMedium(severity: GateFinding['severity']): boolean {
-  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf('medium');
-}
-
 export function premiseClusters(findings: GateFinding[]): PremiseCluster[] {
   const eligible = findings.filter(
     (f) =>
@@ -252,10 +246,15 @@ export function premiseClusters(findings: GateFinding[]): PremiseCluster[] {
       // cite, a budget-dropped hunk, AND a finding that merely SHARED a big hunk's label but sat
       // outside the ±window really injected around the first prioritized finding (codex#f2). Clustering
       // on any of those would point the premise pass at code the gate was never given — the state in
-      // which a model is likeliest to invent a shared structure.
+      // which a model is likeliest to invent a shared structure. Note regionShown is set only on the
+      // hunk-injected paths (prepareGateFindings), and a hunk resolves only for a line-anchored cite —
+      // so a file-level (line===null) finding never reaches here: the "both file-level" arm of the
+      // shared `proximate` rule is dormant for the premise pass (it stays live for the dedup pass).
       f.regionShown === true &&
       !!f.file &&
-      isAtLeastMedium(f.severity)
+      // ≥ medium — the cross-vendor pile-up bar (spec §4). severityAtLeast (core/types) owns the
+      // "SEVERITIES is most-severe-first, lower index = more severe" invariant.
+      severityAtLeast(f.severity, 'medium')
   );
   // Link every proximate pair via the subsystem's shared clustering primitive. Sort by id first so
   // each cluster's member list is in a canonical (id) order; a cluster fires only when it holds ≥2

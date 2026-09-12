@@ -16,6 +16,9 @@ function parseReviewerIds(raw) {
   return ids.length > 0 ? ids : void 0;
 }
 var SEVERITIES = ["high", "medium", "low"];
+function severityAtLeast(severity, floor) {
+  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf(floor);
+}
 var CONFIDENCES = ["high", "medium", "low"];
 var TERMINAL_STATES = ["reviewed", "failed-reviewer"];
 
@@ -491,6 +494,7 @@ export {
   reviewerVisibleDiff,
   section,
   segmentsWithoutTruncationSplices,
+  severityAtLeast,
   stripTrailingCommas,
   titleCase
 };
