@@ -664,6 +664,15 @@ export function claudeLayerHasHigh(layer: ClaudeLayerResult | null): boolean {
 
 // ── Rendering (for the CLI summary) ───────────────────────────────────────────────────
 
+// THE PREMISE PASS advisory `simplify` line (spec §4, --premise), rendered IDENTICALLY wherever a
+// gate synthesis is shown — the full review (renderClaudeLayer) AND the healing commands (regate /
+// reseat), so a --premise heal shows the advisory it re-earned rather than silently swallowing it
+// (codex#f2). Empty ⇒ [] (a flag-off / no-cluster run renders nothing — done-criterion 7).
+export function renderPremiseSimplify(simplify: string | undefined, scrub: (s: string) => string): string[] {
+  if (!simplify) return [];
+  return ['     ⤳ simplify (premise pass — advisory)', `        ${scrub(simplify).slice(0, 500)}`];
+}
+
 // The claude-layer block for stdout: the cold Opus review's findings, then the synthesis
 // (AGREE / DISAGREE / bottom line) and the grounded per-finding verdict tags. Grouped + scannable.
 export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
@@ -730,11 +739,9 @@ export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
   }
   // THE PREMISE PASS (spec §4, --premise): the ONE advisory line the gate adds when its findings
   // cluster on one structure. Present ONLY on a --premise run whose gate returned one — so a
-  // flag-off run never renders it and this block leaves the output byte-identical (done-criterion 7).
-  if (s.simplify) {
-    out.push('     ⤳ simplify (premise pass — advisory)');
-    out.push(`        ${scrub(s.simplify).slice(0, 500)}`);
-  }
+  // flag-off run renders nothing and the output stays byte-identical (done-criterion 7). Shared with
+  // the healing commands so a --premise regate/reseat shows the same advisory (codex#f2).
+  out.push(...renderPremiseSimplify(s.simplify, scrub));
   // The grounded per-finding verdict TAGS + the gate summary line + the trail marker — the
   // gate's teeth, rendered inline (Phase 1: informational; exit is unchanged).
   out.push(...renderGateVerdicts(result.gateVerdicts, { scrub, trailWritten: result.gateTrailWritten }));

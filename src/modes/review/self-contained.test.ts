@@ -511,7 +511,13 @@ describe('runClaudeReviewLayer — the premise pass (--premise)', () => {
     });
     const gatePrompt = calls.find((c) => c.round === 'gate')?.prompt ?? '';
     expect(gatePrompt).toContain('Premise pass');
-    expect(gatePrompt).toContain('src/x.ts');
+    // Assert against the CLAUSE, not the whole prompt: the findings block above already carries the
+    // reviewer path, so `toContain('src/x.ts')` on the whole prompt was vacuous AND implied the
+    // opposite of the rule — the clause names clusters by HOST-OWNED ids and must NEVER carry the
+    // reviewer path (claude#f3; mirrors the injection check in gate-prompt.test.ts).
+    const clause = gatePrompt.slice(gatePrompt.indexOf('## Premise pass'));
+    expect(clause).toContain('codex#1 + grok#1');
+    expect(clause).not.toContain('src/x.ts');
     const text = renderClaudeLayer(res).join('\n');
     expect(text).toContain('simplify (premise pass');
     expect(text).toContain('delete it');

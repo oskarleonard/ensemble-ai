@@ -55,6 +55,7 @@ import {
   type ClaudeLayerResult,
   claudeModelLabel,
   renderClaudeLayer,
+  renderPremiseSimplify,
   resolveReviewRoster,
   runClaudeReviewLayer,
 } from './modes/review/self-contained';
@@ -3352,6 +3353,9 @@ async function regateCommand(args: string[]): Promise<number> {
     console.log(
       renderGateVerdicts(res.verdicts, { scrub: clean, trailWritten: true }).join('\n')
     );
+    // A --premise regate that re-earned the advisory shows it too — not just the verdicts (codex#f2).
+    const regateSimplify = renderPremiseSimplify(res.synthesis.simplify, clean);
+    if (regateSimplify.length) console.log(regateSimplify.join('\n'));
     console.log(
       res.ok
         ? `\nregate: gate completed over ${res.reviews} voice(s) — verdicts updated in ${out}/${runId}/`
@@ -3571,6 +3575,9 @@ async function reseatCommand(args: string[]): Promise<number> {
       return 1;
     }
     console.log(renderGateVerdicts(res.gate.verdicts, { scrub: clean, trailWritten: true }).join('\n'));
+    // A --premise reseat that re-earned the advisory shows it too — not just the verdicts (codex#f2).
+    const reseatSimplify = renderPremiseSimplify(res.gate.synthesis.simplify, clean);
+    if (reseatSimplify.length) console.log(reseatSimplify.join('\n'));
     console.log(
       res.ok
         ? `\nreseat: ${seat} reviewed (${res.review.findings.length} finding(s), evidence ${res.realized}) — gate completed over ${res.gate.reviews} voice(s); verdicts updated in ${out}/${runId}/`

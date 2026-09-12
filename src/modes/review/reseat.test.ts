@@ -599,6 +599,18 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     expect(captured).toHaveLength(2);
   });
 
+  it('forwards --premise into the regate over the union; omitted ⇒ absent (grok#f3)', async () => {
+    const captured: RegateOptions[] = [];
+    const regate = async (o: RegateOptions): Promise<RegateResult> => { captured.push(o); return REGATE_OK; };
+    const on = seedRun();
+    await runReseat({ adapter: adapterOk, baseDir: on.base, gateConfig: GATE_CFG, premise: true, regate, reviewer: GROK, runId: on.runId, seat: 'grok' });
+    expect(captured[0].premise).toBe(true); // reseat threads --premise so the healed run re-earns the advisory clause
+    const off = seedRun();
+    await runReseat({ adapter: adapterOk, baseDir: off.base, gateConfig: GATE_CFG, regate, reviewer: GROK, runId: off.runId, seat: 'grok' });
+    expect(captured[1].premise).toBeUndefined(); // omitted ⇒ not forwarded (byte-identical to a plain reseat)
+    expect(captured).toHaveLength(2);
+  });
+
   it('refuses a worktree checked out at a DIFFERENT head than the pinned packet', async () => {
     const { base, runId } = seedRun();
     let spawns = 0;

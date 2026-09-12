@@ -397,6 +397,20 @@ describe('premiseClusters — the subsystem proximity rule, not same-file-anywhe
     ).toEqual([['codex#1', 'grok#1']]);
   });
 
+  it('does NOT cluster findings anchored to different line spaces (old-side vs new-side) — claude#f2', () => {
+    // Same file, raw lines within LINE_WINDOW, both ≥medium, both shown, two vendors — but one cite
+    // resolved on the OLD side (a deletion-only hunk) and one on the NEW side: different coordinate
+    // systems, so raw-line proximity is meaningless and they must NOT cluster.
+    expect(
+      premiseClusters([gf({ anchorSide: 'new' }), gf({ findingId: 'grok#1', reviewer: 'grok', line: 5, anchorSide: 'old' })])
+    ).toEqual([]);
+    // control: identical but SAME side ⇒ they DO cluster (proves the anchor-side guard, not the
+    // fixture, is what suppressed the pair above).
+    expect(
+      premiseClusters([gf({ anchorSide: 'new' }), gf({ findingId: 'grok#1', reviewer: 'grok', line: 5, anchorSide: 'new' })]).map((c) => c.findingIds)
+    ).toEqual([['codex#1', 'grok#1']]);
+  });
+
   it('transitive: A near B near C (A far from C) is ONE cluster — the region is the chain, id-sorted', () => {
     const cs = premiseClusters([
       gf({ findingId: 'grok#1', reviewer: 'grok', line: 20 }),

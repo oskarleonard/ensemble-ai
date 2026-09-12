@@ -30,7 +30,9 @@ function parseReviewerIds(raw) {
 }
 var SEVERITIES = ["high", "medium", "low"];
 function severityAtLeast(severity, floor) {
-  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf(floor);
+  const s = SEVERITIES.indexOf(severity);
+  const f = SEVERITIES.indexOf(floor);
+  return s >= 0 && f >= 0 && s <= f;
 }
 var CONFIDENCES = ["high", "medium", "low"];
 
@@ -5969,8 +5971,9 @@ function premiseClusters(findings) {
     )
   );
   const sorted = [...eligible].sort((a, b) => a.findingId < b.findingId ? -1 : 1);
+  const sameRegion = (a, b) => a.anchorSide === b.anchorSide && proximate(a, b);
   const clusters = [];
-  for (const group of connectedComponents(sorted, (f) => f.findingId, proximate)) {
+  for (const group of connectedComponents(sorted, (f) => f.findingId, sameRegion)) {
     const reviewers = [...new Set(group.map((f) => f.reviewer))];
     if (group.length >= 2 && reviewers.length >= 2) {
       clusters.push({ findingIds: group.map((f) => f.findingId), reviewers });
@@ -8341,6 +8344,10 @@ function claudeLayerHasHigh(layer) {
   const cr = layer?.claudeReview;
   return Boolean(cr?.ok && cr.findings.some((f) => f.severity === "high"));
 }
+function renderPremiseSimplify(simplify, scrub) {
+  if (!simplify) return [];
+  return ["     \u2933 simplify (premise pass \u2014 advisory)", `        ${scrub(simplify).slice(0, 500)}`];
+}
 function renderClaudeLayer(result) {
   const out = [];
   const cr = result.claudeReview;
@@ -8399,10 +8406,7 @@ function renderClaudeLayer(result) {
     out.push("     \u2192 bottom line");
     out.push(`        ${scrubControl(s.bottomLine).slice(0, 500)}`);
   }
-  if (s.simplify) {
-    out.push("     \u2933 simplify (premise pass \u2014 advisory)");
-    out.push(`        ${scrubControl(s.simplify).slice(0, 500)}`);
-  }
+  out.push(...renderPremiseSimplify(s.simplify, scrubControl));
   out.push(...renderGateVerdicts(result.gateVerdicts, { scrub: scrubControl, trailWritten: result.gateTrailWritten }));
   if (result.settlements && result.settlements.length > 0) {
     out.push(...renderSettlements(result.settlements, scrubControl));
@@ -12361,6 +12365,8 @@ async function regateCommand(args) {
     console.log(
       renderGateVerdicts(res.verdicts, { scrub: scrubControl, trailWritten: true }).join("\n")
     );
+    const regateSimplify = renderPremiseSimplify(res.synthesis.simplify, scrubControl);
+    if (regateSimplify.length) console.log(regateSimplify.join("\n"));
     console.log(
       res.ok ? `
 regate: gate completed over ${res.reviews} voice(s) \u2014 verdicts updated in ${out}/${runId}/` : "\nregate: the gate FAILED AGAIN \u2014 verdicts remain fail-closed unverified (see stderr for the cause)"
@@ -12538,6 +12544,8 @@ reseat: seat ${seat} FAILED AGAIN \u2014 ${scrubControl(res.review.summary).slic
       return 1;
     }
     console.log(renderGateVerdicts(res.gate.verdicts, { scrub: scrubControl, trailWritten: true }).join("\n"));
+    const reseatSimplify = renderPremiseSimplify(res.gate.synthesis.simplify, scrubControl);
+    if (reseatSimplify.length) console.log(reseatSimplify.join("\n"));
     console.log(
       res.ok ? `
 reseat: ${seat} reviewed (${res.review.findings.length} finding(s), evidence ${res.realized}) \u2014 gate completed over ${res.gate.reviews} voice(s); verdicts updated in ${out}/${runId}/` : `

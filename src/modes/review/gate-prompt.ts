@@ -260,8 +260,16 @@ export function premiseClusters(findings: GateFinding[]): PremiseCluster[] {
   // each cluster's member list is in a canonical (id) order; a cluster fires only when it holds ≥2
   // findings from ≥2 DISTINCT reviewers (the cross-vendor pile-up signal).
   const sorted = [...eligible].sort((a, b) => (a.findingId < b.findingId ? -1 : 1));
+  // Only link findings anchored to the SAME line space: resolveFindingHunk falls back to the OLD
+  // side for a deletion-only hunk (gate.ts anchorSide), so an old-side line and a new-side line are
+  // DIFFERENT coordinate systems — pairing them by raw line number could cluster code hundreds of
+  // lines apart and manufacture exactly the "invent a shared structure" false positive the premise
+  // pass most fears (claude#f2). The dedup pass tolerates this (its text-overlap bar catches the
+  // false merge); the premise pass drops that bar, so it guards the anchor side itself.
+  const sameRegion = (a: GateFinding, b: GateFinding): boolean =>
+    a.anchorSide === b.anchorSide && proximate(a, b);
   const clusters: PremiseCluster[] = [];
-  for (const group of connectedComponents(sorted, (f) => f.findingId, proximate)) {
+  for (const group of connectedComponents(sorted, (f) => f.findingId, sameRegion)) {
     const reviewers = [...new Set(group.map((f) => f.reviewer))];
     if (group.length >= 2 && reviewers.length >= 2) {
       clusters.push({ findingIds: group.map((f) => f.findingId), reviewers });

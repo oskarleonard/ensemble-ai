@@ -23,7 +23,9 @@ function parseReviewerIds(raw) {
 }
 var SEVERITIES = ["high", "medium", "low"];
 function severityAtLeast(severity, floor) {
-  return SEVERITIES.indexOf(severity) <= SEVERITIES.indexOf(floor);
+  const s = SEVERITIES.indexOf(severity);
+  const f = SEVERITIES.indexOf(floor);
+  return s >= 0 && f >= 0 && s <= f;
 }
 var CONFIDENCES = ["high", "medium", "low"];
 var TERMINAL_STATES = ["reviewed", "failed-reviewer"];
