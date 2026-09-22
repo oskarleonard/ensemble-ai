@@ -1901,6 +1901,7 @@ function renderCodexSandboxProfile(p) {
 (allow network-inbound (local ip "*:*"))
 `;
 }
+var SHARED_TEMP_TREES = ["/private/tmp", "/private/var/tmp", "/private/var/folders"];
 var VERIFY_SYSCTL_NAMES = [
   "hw.ncpu",
   "hw.activecpu",
@@ -1930,12 +1931,17 @@ function renderVerifySandboxProfile(p) {
       throw new Error(`ensemble-ai: refusing unsafe verify sandbox root: ${root}`);
     }
   }
-  for (const root of scratch) {
-    if (isUnder(root, os4.homedir())) {
-      throw new Error(`ensemble-ai: verify scratch must be outside your home directory: ${root}`);
-    }
-    if (SYSTEM_READ_ROOTS.some((system) => isUnder(system, root))) {
-      throw new Error(`ensemble-ai: verify scratch cannot be or contain a shared system root: ${root}`);
+  const runDir = path4.dirname(p.worktree);
+  if (isUnder(runDir, os4.homedir())) {
+    throw new Error(`ensemble-ai: verify scratch must be outside your home directory: ${runDir}`);
+  }
+  const shared = [...SYSTEM_READ_ROOTS, ...SHARED_TEMP_TREES, fs6.realpathSync(os4.tmpdir())];
+  if (isUnsafeReadRoot(runDir) || shared.some((root) => isUnder(root, runDir))) {
+    throw new Error(`ensemble-ai: verify run dir must be a dedicated directory, not a shared root: ${runDir}`);
+  }
+  for (const root of [p.tmpDir, p.npmCache]) {
+    if (root === runDir || !isUnder(root, runDir)) {
+      throw new Error(`ensemble-ai: verify scratch must sit inside the run dir ${runDir}: ${root}`);
     }
   }
   if (!Number.isInteger(p.proxyPort) || p.proxyPort < 1 || p.proxyPort > 65535) {
@@ -1957,7 +1963,12 @@ function renderVerifySandboxProfile(p) {
 ;; The test step must reap its worker processes; trusted host processes stay denied.
 (allow signal (target self) (target same-sandbox))
 (allow file-read-metadata)
-(allow file-read* ${sbSubpaths([...SYSTEM_READ_ROOTS, p.nodePrefix, ...scratch])})
+(allow file-read* ${sbSubpaths(SYSTEM_READ_ROOTS)})
+;; Never another run's files: no contents or listings in the shared temp trees (metadata stays, so
+;; path resolution still works), then this run's own dir re-granted. Last match wins only between
+;; rules naming the SAME operations \u2014 a later (allow file-read* \u2026) does not override this deny.
+(deny file-read-data file-read-xattr ${sbSubpaths(SHARED_TEMP_TREES)})
+(allow file-read-data file-read-xattr ${sbSubpaths([p.nodePrefix, runDir])})
 (allow file-write* ${sbSubpaths(scratch)})
 (allow file-write-data (literal "/dev/null"))
 (allow network-outbound (remote ip "localhost:${p.proxyPort}"))

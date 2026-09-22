@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -30,19 +31,33 @@ describe('the verify profile is separate from the read-only reviewer', () => {
     expect(profile).not.toContain('kern.proc');
   });
 
-  it('refuses root/home/relative grants, home scratch writes and shared system scratch', () => {
+  it('reads the system roots and its own run dir, never another run in a shared temp tree', () => {
+    // Order is the rule: SBPL's last match wins, so the deny must sit between the two allows.
+    expect(renderVerifySandboxProfile(paths).match(/^\((allow|deny) file-read.*$/gm)).toEqual([
+      '(allow file-read-metadata)',
+      expect.stringMatching(/^\(allow file-read\* \(subpath "\/usr"\) .*\(subpath "\/private\/tmp"\)/),
+      '(deny file-read-data file-read-xattr (subpath "/private/tmp") (subpath "/private/var/tmp") (subpath "/private/var/folders"))',
+      `(allow file-read-data file-read-xattr (subpath ${JSON.stringify(paths.nodePrefix)}) (subpath "/private/tmp/verify-unique"))`,
+    ]);
+  });
+
+  it('refuses root/home/relative grants, a shared run dir and scratch outside the run dir', () => {
     for (const field of ['worktree', 'tmpDir', 'npmCache', 'nodePrefix'] as const) {
       for (const root of ['/', os.homedir(), 'relative/checkout']) {
         expect(() => renderVerifySandboxProfile({ ...paths, [field]: root })).toThrow();
       }
     }
-    // Inside home, including a child whose name merely starts with `..`.
-    for (const root of [path.join(os.homedir(), '.codex'), path.join(os.homedir(), '..cache')]) {
-      expect(() => renderVerifySandboxProfile({ ...paths, tmpDir: root })).toThrow(/outside your home/);
+    // The run dir (the worktree's parent) is read-granted, so it must be dedicated: not in home —
+    // including a child whose name merely starts with `..` — and neither a shared root nor an
+    // ancestor of one, the operator's own $TMPDIR included.
+    const inRunDir = (runDir: string) => ({ ...paths, worktree: path.join(runDir, 'checkout') });
+    expect(() => renderVerifySandboxProfile(inRunDir(path.join(os.homedir(), '..cache')))).toThrow(/outside your home/);
+    for (const runDir of ['/private/tmp', '/private', '/opt', '/private/var/folders', fs.realpathSync(os.tmpdir())]) {
+      expect(() => renderVerifySandboxProfile(inRunDir(runDir))).toThrow(/dedicated directory/);
     }
-    // A shared system root, or an ancestor whose write grant would cover one.
-    for (const root of ['/private/tmp', '/private', '/opt']) {
-      expect(() => renderVerifySandboxProfile({ ...paths, tmpDir: root })).toThrow(/shared system root/);
+    // Scratch outside the run dir — in home, a shared root, another run — or the run dir itself.
+    for (const root of [path.join(os.homedir(), '.codex'), '/private/tmp', '/private/tmp/verify-other/tmp', '/private/tmp/verify-unique']) {
+      expect(() => renderVerifySandboxProfile({ ...paths, tmpDir: root })).toThrow(/inside the run dir/);
     }
     expect(() => renderVerifySandboxProfile({ ...paths, proxyPort: 0 })).toThrow();
   });

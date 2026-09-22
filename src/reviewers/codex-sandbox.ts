@@ -216,13 +216,22 @@ export function renderCodexSandboxProfile(p: CodexSandboxPaths): string {
 }
 
 export interface VerifySandboxPaths {
-  // All paths must be absolute and realpath-resolved by the trusted host.
+  // All paths must be absolute and realpath-resolved by the trusted host. The worktree's parent is
+  // the run's own directory (the checkout's private repo sits beside it); tmpDir and npmCache must
+  // live inside it too.
   worktree: string;
   nodePrefix: string;
   tmpDir: string;
   npmCache: string;
   proxyPort: number;
 }
+
+// The temp trees inside SYSTEM_READ_ROOTS: the world-shared /tmp and /var/tmp, and every per-user
+// $TMPDIR and cache under /private/var/folders — where other runs' private checkouts and session
+// outputs live. The review seat reads them (its accepted gap, above). A verify build must not: it
+// runs untrusted install scripts that can reach an allowed host (probed: under the review seat's
+// read roots it listed and read the operator's whole $TMPDIR). Only its own run dir is re-granted.
+const SHARED_TEMP_TREES = ['/private/tmp', '/private/var/tmp', '/private/var/folders'];
 
 // Exact names only: a blanket sysctl-read also grants kern.procargs2, which can
 // reveal a trusted parent's environment even when process-info is denied.
@@ -250,7 +259,9 @@ const VERIFY_SYSCTL_NAMES = [
 ];
 
 // A build executes untrusted code, unlike the read-only review seat. Keep its profile
-// separate: writable scratch roots, no operator config, no shared-temp write grant.
+// separate: writable scratch roots, no operator config, no shared-temp read or write grant.
+// Loopback is closed too, except the proxy port: a suite that starts a local server fails
+// closed here, because opening localhost:* would hand the build every local service.
 export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
   const scratch = [p.worktree, p.tmpDir, p.npmCache];
   for (const root of [...scratch, p.nodePrefix]) {
@@ -258,14 +269,20 @@ export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
       throw new Error(`ensemble-ai: refusing unsafe verify sandbox root: ${root}`);
     }
   }
-  // A scratch write grant must cover neither the real home (not even a credential subdirectory)
-  // nor a shared system root — itself or as an ancestor: `/private` would grant `/private/tmp`.
-  for (const root of scratch) {
-    if (isUnder(root, os.homedir())) {
-      throw new Error(`ensemble-ai: verify scratch must be outside your home directory: ${root}`);
-    }
-    if (SYSTEM_READ_ROOTS.some((system) => isUnder(system, root))) {
-      throw new Error(`ensemble-ai: verify scratch cannot be or contain a shared system root: ${root}`);
+  // Everything the build may write, and everything of its own it may read, sits in ONE run dir. It
+  // must be a dedicated per-run directory: not in home, and neither a shared root (system or temp,
+  // the operator's $TMPDIR included) nor an ancestor of one — `/private` would grant `/private/tmp`.
+  const runDir = path.dirname(p.worktree);
+  if (isUnder(runDir, os.homedir())) {
+    throw new Error(`ensemble-ai: verify scratch must be outside your home directory: ${runDir}`);
+  }
+  const shared = [...SYSTEM_READ_ROOTS, ...SHARED_TEMP_TREES, fs.realpathSync(os.tmpdir())];
+  if (isUnsafeReadRoot(runDir) || shared.some((root) => isUnder(root, runDir))) {
+    throw new Error(`ensemble-ai: verify run dir must be a dedicated directory, not a shared root: ${runDir}`);
+  }
+  for (const root of [p.tmpDir, p.npmCache]) {
+    if (root === runDir || !isUnder(root, runDir)) {
+      throw new Error(`ensemble-ai: verify scratch must sit inside the run dir ${runDir}: ${root}`);
     }
   }
   if (!Number.isInteger(p.proxyPort) || p.proxyPort < 1 || p.proxyPort > 65535) {
@@ -287,7 +304,12 @@ export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
 ;; The test step must reap its worker processes; trusted host processes stay denied.
 (allow signal (target self) (target same-sandbox))
 (allow file-read-metadata)
-(allow file-read* ${sbSubpaths([...SYSTEM_READ_ROOTS, p.nodePrefix, ...scratch])})
+(allow file-read* ${sbSubpaths(SYSTEM_READ_ROOTS)})
+;; Never another run's files: no contents or listings in the shared temp trees (metadata stays, so
+;; path resolution still works), then this run's own dir re-granted. Last match wins only between
+;; rules naming the SAME operations — a later (allow file-read* …) does not override this deny.
+(deny file-read-data file-read-xattr ${sbSubpaths(SHARED_TEMP_TREES)})
+(allow file-read-data file-read-xattr ${sbSubpaths([p.nodePrefix, runDir])})
 (allow file-write* ${sbSubpaths(scratch)})
 (allow file-write-data (literal "/dev/null"))
 (allow network-outbound (remote ip "localhost:${p.proxyPort}"))

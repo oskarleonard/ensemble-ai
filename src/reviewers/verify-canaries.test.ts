@@ -72,6 +72,38 @@ describe.skipIf(!codexSandboxSupported())('built verify fence: real sandbox-exec
     expect(result.stdout.trim()).toBe('HOME read EPERM');
   });
 
+  it("denies reading or listing the operator's $TMPDIR and the shared /tmp outside its own run", async () => {
+    const operatorCanary = path.join(fs.realpathSync(os.tmpdir()), `verify-canary-${path.basename(scratch)}`);
+    const sharedCanary = `${scratch}-shared`;
+    try {
+      for (const file of [operatorCanary, sharedCanary]) fs.writeFileSync(file, 'another-run');
+      const result = await probe(`
+        const fs = require('node:fs'), assert = require('node:assert/strict');
+        for (const file of ${JSON.stringify([operatorCanary, sharedCanary])}) assert.throws(() => fs.readFileSync(file), { code: 'EPERM' });
+        for (const dir of ${JSON.stringify([path.dirname(operatorCanary), '/private/tmp'])}) assert.throws(() => fs.readdirSync(dir), { code: 'EPERM' });
+        console.log('shared temp EPERM');
+      `);
+      expect(result.stdout.trim()).toBe('shared temp EPERM');
+    } finally {
+      for (const file of [operatorCanary, sharedCanary]) fs.rmSync(file, { force: true });
+    }
+  });
+
+  it('reads the private repo beside the checkout, in its own run dir', async () => {
+    const repo = path.join(scratch, 'repo');
+    const git = (...args: string[]) =>
+      spawnSync('/usr/bin/git', ['-c', 'user.name=canary', '-c', 'user.email=canary@example.invalid', ...args], { encoding: 'utf8' });
+    expect(git('init', '-q', repo).status).toBe(0);
+    expect(git('-C', repo, 'commit', '-q', '--allow-empty', '-m', 'canary').status).toBe(0);
+    const head = git('-C', repo, 'rev-parse', 'HEAD').stdout.trim();
+    const result = await probe(`
+      process.stdout.write(require('node:child_process').execFileSync('/usr/bin/git', ['-C', ${JSON.stringify(repo)}, 'rev-parse', 'HEAD'], {
+        encoding: 'utf8', env: {...process.env, DEVELOPER_DIR: '/Library/Developer/CommandLineTools', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null'}
+      }));
+    `);
+    expect(result.stdout.trim()).toBe(head);
+  });
+
   it('allows writes in every scratch root and executing a file planted in the checkout', async () => {
     const executable = path.join(roots.worktree, 'executable');
     fs.writeFileSync(executable, '#!/bin/sh\necho scratch-exec-ok\n', { mode: 0o700 });
