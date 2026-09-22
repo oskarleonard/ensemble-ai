@@ -1925,21 +1925,25 @@ var VERIFY_SYSCTL_NAMES = [
   "kern.maxfilesperproc"
 ];
 function renderVerifySandboxProfile(p) {
-  const scratch = [p.worktree, p.tmpDir, p.npmCache];
-  for (const root of [...scratch, p.nodePrefix]) {
+  const [worktree, tmpDir, npmCache, nodePrefix] = [p.worktree, p.tmpDir, p.npmCache, p.nodePrefix].map((root) => {
     if (!path4.isAbsolute(root) || isUnsafeReadRoot(root)) {
       throw new Error(`ensemble-ai: refusing unsafe verify sandbox root: ${root}`);
     }
-  }
-  const runDir = path4.dirname(p.worktree);
+    return path4.resolve(root);
+  });
+  const scratch = [worktree, tmpDir, npmCache];
+  const runDir = path4.dirname(worktree);
   if (isUnder(runDir, os4.homedir())) {
     throw new Error(`ensemble-ai: verify scratch must be outside your home directory: ${runDir}`);
   }
-  const shared = [...SYSTEM_READ_ROOTS, ...SHARED_TEMP_TREES, fs6.realpathSync(os4.tmpdir())];
-  if (isUnsafeReadRoot(runDir) || shared.some((root) => isUnder(root, runDir))) {
+  const tempTrees = [...SHARED_TEMP_TREES, fs6.realpathSync(os4.tmpdir())];
+  if (isUnsafeReadRoot(runDir) || [...SYSTEM_READ_ROOTS, ...tempTrees].some((root) => isUnder(root, runDir))) {
     throw new Error(`ensemble-ai: verify run dir must be a dedicated directory, not a shared root: ${runDir}`);
   }
-  for (const root of [p.tmpDir, p.npmCache]) {
+  if (tempTrees.some((root) => isUnder(root, nodePrefix))) {
+    throw new Error(`ensemble-ai: verify nodePrefix cannot be or contain a shared temp tree: ${nodePrefix}`);
+  }
+  for (const root of [tmpDir, npmCache]) {
     if (root === runDir || !isUnder(root, runDir)) {
       throw new Error(`ensemble-ai: verify scratch must sit inside the run dir ${runDir}: ${root}`);
     }
@@ -1951,7 +1955,7 @@ function renderVerifySandboxProfile(p) {
 (deny default)
 (import "/System/Library/Sandbox/Profiles/dyld-support.sb")
 (allow process-fork)
-(allow process-exec ${sbSubpaths([...SYSTEM_READ_ROOTS, p.worktree, p.nodePrefix])})
+(allow process-exec ${sbSubpaths([...SYSTEM_READ_ROOTS, worktree, nodePrefix])})
 ;; Load-bearing: (deny default) alone leaves process-info open \u2014 verified, without this line a
 ;; sandboxed process lists every pid and reads its parent's path and KERN_PROCARGS2 (its environment).
 (deny process-info*)
@@ -1968,7 +1972,7 @@ function renderVerifySandboxProfile(p) {
 ;; path resolution still works), then this run's own dir re-granted. Last match wins only between
 ;; rules naming the SAME operations \u2014 a later (allow file-read* \u2026) does not override this deny.
 (deny file-read-data file-read-xattr ${sbSubpaths(SHARED_TEMP_TREES)})
-(allow file-read-data file-read-xattr ${sbSubpaths([p.nodePrefix, runDir])})
+(allow file-read-data file-read-xattr ${sbSubpaths([nodePrefix, runDir])})
 (allow file-write* ${sbSubpaths(scratch)})
 (allow file-write-data (literal "/dev/null"))
 (allow network-outbound (remote ip "localhost:${p.proxyPort}"))

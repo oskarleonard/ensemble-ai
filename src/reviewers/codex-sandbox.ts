@@ -218,7 +218,8 @@ export function renderCodexSandboxProfile(p: CodexSandboxPaths): string {
 export interface VerifySandboxPaths {
   // All paths must be absolute and realpath-resolved by the trusted host. The worktree's parent is
   // the run's own directory (the checkout's private repo sits beside it); tmpDir and npmCache must
-  // live inside it too.
+  // live inside it too — and never over that private repo: it can be a hardlink clone of the
+  // operator's object store, and the renderer cannot know its name to refuse it.
   worktree: string;
   nodePrefix: string;
   tmpDir: string;
@@ -263,24 +264,31 @@ const VERIFY_SYSCTL_NAMES = [
 // Loopback is closed too, except the proxy port: a suite that starts a local server fails
 // closed here, because opening localhost:* would hand the build every local service.
 export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
-  const scratch = [p.worktree, p.tmpDir, p.npmCache];
-  for (const root of [...scratch, p.nodePrefix]) {
+  // Validate and render the NORMALIZED paths, so `…/run/` or `…/run/.` cannot pass a check as one
+  // path and reach a rule as another.
+  const [worktree, tmpDir, npmCache, nodePrefix] = [p.worktree, p.tmpDir, p.npmCache, p.nodePrefix].map((root) => {
     if (!path.isAbsolute(root) || isUnsafeReadRoot(root)) {
       throw new Error(`ensemble-ai: refusing unsafe verify sandbox root: ${root}`);
     }
-  }
+    return path.resolve(root);
+  });
+  const scratch = [worktree, tmpDir, npmCache];
   // Everything the build may write, and everything of its own it may read, sits in ONE run dir. It
   // must be a dedicated per-run directory: not in home, and neither a shared root (system or temp,
   // the operator's $TMPDIR included) nor an ancestor of one — `/private` would grant `/private/tmp`.
-  const runDir = path.dirname(p.worktree);
+  const runDir = path.dirname(worktree);
   if (isUnder(runDir, os.homedir())) {
     throw new Error(`ensemble-ai: verify scratch must be outside your home directory: ${runDir}`);
   }
-  const shared = [...SYSTEM_READ_ROOTS, ...SHARED_TEMP_TREES, fs.realpathSync(os.tmpdir())];
-  if (isUnsafeReadRoot(runDir) || shared.some((root) => isUnder(root, runDir))) {
+  const tempTrees = [...SHARED_TEMP_TREES, fs.realpathSync(os.tmpdir())];
+  if (isUnsafeReadRoot(runDir) || [...SYSTEM_READ_ROOTS, ...tempTrees].some((root) => isUnder(root, runDir))) {
     throw new Error(`ensemble-ai: verify run dir must be a dedicated directory, not a shared root: ${runDir}`);
   }
-  for (const root of [p.tmpDir, p.npmCache]) {
+  // nodePrefix is re-granted after the temp-tree deny as well, so it may not reopen one either.
+  if (tempTrees.some((root) => isUnder(root, nodePrefix))) {
+    throw new Error(`ensemble-ai: verify nodePrefix cannot be or contain a shared temp tree: ${nodePrefix}`);
+  }
+  for (const root of [tmpDir, npmCache]) {
     if (root === runDir || !isUnder(root, runDir)) {
       throw new Error(`ensemble-ai: verify scratch must sit inside the run dir ${runDir}: ${root}`);
     }
@@ -292,7 +300,7 @@ export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
 (deny default)
 (import "/System/Library/Sandbox/Profiles/dyld-support.sb")
 (allow process-fork)
-(allow process-exec ${sbSubpaths([...SYSTEM_READ_ROOTS, p.worktree, p.nodePrefix])})
+(allow process-exec ${sbSubpaths([...SYSTEM_READ_ROOTS, worktree, nodePrefix])})
 ;; Load-bearing: (deny default) alone leaves process-info open — verified, without this line a
 ;; sandboxed process lists every pid and reads its parent's path and KERN_PROCARGS2 (its environment).
 (deny process-info*)
@@ -309,7 +317,7 @@ export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
 ;; path resolution still works), then this run's own dir re-granted. Last match wins only between
 ;; rules naming the SAME operations — a later (allow file-read* …) does not override this deny.
 (deny file-read-data file-read-xattr ${sbSubpaths(SHARED_TEMP_TREES)})
-(allow file-read-data file-read-xattr ${sbSubpaths([p.nodePrefix, runDir])})
+(allow file-read-data file-read-xattr ${sbSubpaths([nodePrefix, runDir])})
 (allow file-write* ${sbSubpaths(scratch)})
 (allow file-write-data (literal "/dev/null"))
 (allow network-outbound (remote ip "localhost:${p.proxyPort}"))

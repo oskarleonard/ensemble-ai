@@ -61,4 +61,20 @@ describe('the verify profile is separate from the read-only reviewer', () => {
     }
     expect(() => renderVerifySandboxProfile({ ...paths, proxyPort: 0 })).toThrow();
   });
+
+  it('validates and renders normalized paths, and never lets nodePrefix reopen a temp tree', () => {
+    // A trailing slash or `/.` IS the run dir — refused, not granted as a child of it.
+    for (const root of ['/private/tmp/verify-unique/', '/private/tmp/verify-unique/.']) {
+      expect(() => renderVerifySandboxProfile({ ...paths, tmpDir: root })).toThrow(/inside the run dir/);
+    }
+    const profile = renderVerifySandboxProfile({ ...paths, worktree: `${paths.worktree}/`, tmpDir: `${paths.tmpDir}/./` });
+    expect(profile).toContain(`(subpath ${JSON.stringify(paths.worktree)})`);
+    expect(profile).toContain(`(subpath ${JSON.stringify(paths.tmpDir)})`);
+    expect(profile).not.toMatch(/\/\.?"\)/);
+    // nodePrefix is re-granted after the temp-tree deny, so a prefix covering one would reopen it.
+    for (const nodePrefix of ['/private/tmp', '/private/var', '/private/var/folders', fs.realpathSync(os.tmpdir())]) {
+      expect(() => renderVerifySandboxProfile({ ...paths, nodePrefix })).toThrow(/nodePrefix/);
+    }
+    expect(() => renderVerifySandboxProfile({ ...paths, nodePrefix: '/opt/homebrew' })).not.toThrow();
+  });
 });
