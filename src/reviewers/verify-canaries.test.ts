@@ -36,7 +36,7 @@ describe.skipIf(process.platform !== 'darwin')('built verify fence: real sandbox
     fs.writeFileSync(file, script);
     return exec('/usr/bin/sandbox-exec', ['-f', profile, process.execPath, file], {
       cwd: checkout,
-      env: { PATH: '/usr/bin:/bin' },
+      env: { PATH: '/usr/bin:/bin', TMPDIR: path.join(scratch, 'tmp'), HOME: path.join(scratch, 'tmp') },
       timeout: 10000,
     });
   }
@@ -82,6 +82,17 @@ describe.skipIf(process.platform !== 'darwin')('built verify fence: real sandbox
       console.log('self-title-ok');
     `);
     expect(result.stdout.trim()).toBe('self-title-ok');
+  });
+
+  it('allows the test step to initialize an offline Git fixture through the system toolchain', async () => {
+    const result = await probe(`
+      const out = require('node:child_process').execFileSync('/usr/bin/git', ['init', 'git-fixture'], {
+        encoding: 'utf8', env: {...process.env, DEVELOPER_DIR: '/Library/Developer/CommandLineTools', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null'}
+      });
+      require('node:assert/strict').match(out, /Initialized empty Git repository/);
+      console.log('git-fixture-ok');
+    `);
+    expect(result.stdout.trim()).toBe('git-fixture-ok');
   });
 
   it('allows test workers to terminate their own sandboxed children, not the trusted parent', async () => {
