@@ -1911,6 +1911,9 @@ var VERIFY_SYSCTL_NAMES = [
   "hw.pagesize",
   // Node's allocator aborts at startup without the compatibility page size.
   "hw.pagesize_compat",
+  // uname (and therefore node:os / npm) needs these two exact names.
+  "hw.machine",
+  "kern.ostype",
   "kern.osrelease",
   "kern.osversion",
   "kern.version",

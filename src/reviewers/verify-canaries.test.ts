@@ -65,6 +65,16 @@ describe.skipIf(process.platform !== 'darwin')('built verify fence: real sandbox
     expect(result.stdout.trim()).toBe('HOME read EPERM');
   });
 
+  it('allows Node to load the OS information npm requires', async () => {
+    const result = await probe(`
+      const os = require('node:os'), assert = require('node:assert/strict');
+      assert.equal(os.type(), 'Darwin');
+      assert.ok(os.release());
+      console.log('node:os usable');
+    `);
+    expect(result.stdout.trim()).toBe('node:os usable');
+  });
+
   it('denies a write outside every scratch write root with EPERM', async () => {
     const result = await probe(`
       require('node:assert/strict').throws(() => require('node:fs').writeFileSync(${JSON.stringify(outside)}, 'canary'), { code: 'EPERM' });
