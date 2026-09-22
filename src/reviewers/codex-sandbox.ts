@@ -226,6 +226,28 @@ export interface VerifySandboxPaths {
   proxyPort: number;
 }
 
+// Exact names only: a blanket sysctl-read also grants kern.procargs2, which can
+// reveal a trusted parent's environment even when process-info is denied.
+const VERIFY_SYSCTL_NAMES = [
+  'hw.ncpu',
+  'hw.activecpu',
+  'hw.logicalcpu',
+  'hw.logicalcpu_max',
+  'hw.physicalcpu',
+  'hw.physicalcpu_max',
+  'hw.memsize',
+  'hw.pagesize',
+  // Node's allocator aborts at startup without the compatibility page size.
+  'hw.pagesize_compat',
+  'kern.osrelease',
+  'kern.osversion',
+  'kern.version',
+  'kern.hostname',
+  'kern.boottime',
+  'kern.usrstack',
+  'kern.maxfilesperproc',
+];
+
 // A build executes untrusted code, unlike the read-only review seat. Keep its profile
 // separate: writable scratch roots, no operator config, no shared-temp write grant.
 export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
@@ -253,10 +275,10 @@ export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
 (import "/System/Library/Sandbox/Profiles/dyld-support.sb")
 (allow process-fork)
 (allow process-exec ${sbSubpaths([...SYSTEM_READ_ROOTS, p.worktree, p.nodePrefix])})
-(allow process-info* (target self))
+(deny process-info*)
 (allow file-map-executable)
 (allow ipc-posix-shm*)
-(allow sysctl-read)
+(allow sysctl-read ${VERIFY_SYSCTL_NAMES.map((name) => `(sysctl-name ${JSON.stringify(name)})`).join(' ')})
 (allow signal (target self))
 (allow file-read-metadata)
 (allow file-read* ${sbSubpaths([...SYSTEM_READ_ROOTS, ...roots])})

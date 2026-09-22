@@ -25,6 +25,11 @@ describe('the verify profile is separate from the read-only reviewer', () => {
     expect(profile).not.toContain('(allow mach-lookup)');
     expect(profile).not.toContain('(allow file-write* (subpath "/private/tmp"))');
     expect(profile).not.toContain('bsd.sb');
+    expect(profile).toContain('(deny process-info*)');
+    expect(profile).not.toContain('(allow process-info');
+    expect(profile).not.toContain('(allow sysctl-read)');
+    expect(profile).toContain('(sysctl-name "hw.pagesize_compat")');
+    expect(profile).not.toContain('kern.proc');
   });
 
   it('refuses root/home grants, home scratch writes and shared system scratch', () => {
