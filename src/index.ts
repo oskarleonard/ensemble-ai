@@ -97,3 +97,5 @@ export type {
 
 // ── Mode registry (mode-first) ───────────────────────────────────────────────
 export * from './modes';
+
+export { startEgressProxy, proxyEnv, type EgressProxy, type EgressDenial, type StartEgressProxyOpts } from './core/egress-proxy';

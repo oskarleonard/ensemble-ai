@@ -1900,6 +1900,42 @@ function renderCodexSandboxProfile(p) {
 (allow network-inbound (local ip "*:*"))
 `;
 }
+function renderVerifySandboxProfile(p) {
+  const roots = [p.worktree, p.nodePrefix, p.tmpDir, p.npmCache];
+  for (const root of roots) {
+    if (!path4.isAbsolute(root) || isUnsafeReadRoot(root)) {
+      throw new Error(`ensemble-ai: refusing unsafe verify sandbox root: ${root}`);
+    }
+  }
+  for (const root of [p.worktree, p.tmpDir, p.npmCache]) {
+    const rel = path4.relative(os4.homedir(), path4.resolve(root));
+    if (!rel.startsWith("..") && !path4.isAbsolute(rel)) {
+      throw new Error(`ensemble-ai: verify scratch must be outside your home directory: ${root}`);
+    }
+    if (SYSTEM_READ_ROOTS.some((system) => path4.resolve(root) === system)) {
+      throw new Error(`ensemble-ai: verify scratch cannot be a shared system root: ${root}`);
+    }
+  }
+  if (!Number.isInteger(p.proxyPort) || p.proxyPort < 1 || p.proxyPort > 65535) {
+    throw new Error("ensemble-ai: invalid verify proxy port");
+  }
+  return `(version 1)
+(deny default)
+(import "/System/Library/Sandbox/Profiles/dyld-support.sb")
+(allow process-fork)
+(allow process-exec ${sbSubpaths([...SYSTEM_READ_ROOTS, p.worktree, p.nodePrefix])})
+(allow process-info* (target self))
+(allow file-map-executable)
+(allow ipc-posix-shm*)
+(allow sysctl-read)
+(allow signal (target self))
+(allow file-read-metadata)
+(allow file-read* ${sbSubpaths([...SYSTEM_READ_ROOTS, ...roots])})
+(allow file-write* ${sbSubpaths([p.worktree, p.tmpDir, p.npmCache])})
+(allow file-write-data (literal "/dev/null"))
+(allow network-outbound (remote ip "localhost:${p.proxyPort}"))
+`;
+}
 function codexSandboxSupported(platform = process.platform) {
   return platform === "darwin" && fs6.existsSync("/usr/bin/sandbox-exec");
 }
@@ -6314,6 +6350,7 @@ export {
   persistReview,
   pickSynthesizer,
   planPlacement,
+  proxyEnv,
   readEnsembleConfig,
   readOnlyWorktreeClause,
   readReadableSurface,
@@ -6337,6 +6374,7 @@ export {
   renderReviewPrompt,
   renderSummaryBody,
   renderSynthesisPrompt,
+  renderVerifySandboxProfile,
   repoIdFromSlug,
   resolveBase,
   resolveBin,
@@ -6380,6 +6418,7 @@ export {
   severityAtLeast,
   sha256Hex,
   stageReview,
+  startEgressProxy,
   stripAgentInstructions,
   stripAgentInstructionsAsync,
   stripSecurityTag,
