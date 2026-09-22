@@ -218,7 +218,8 @@ export function renderCodexSandboxProfile(p: CodexSandboxPaths): string {
 export interface VerifySandboxPaths {
   // All paths must be absolute and realpath-resolved by the trusted host. The build reads, writes and
   // executes these three scratch roots and nothing beside them — not the private repo the checkout
-  // was cut from, which can be a hardlink clone of the operator's whole object store.
+  // was cut from, which can be a hardlink clone of the operator's whole object store. So never name
+  // that repo (or a directory holding it) as a scratch root: the renderer cannot know where it is.
   worktree: string;
   nodePrefix: string;
   tmpDir: string;
