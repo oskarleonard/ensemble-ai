@@ -72,6 +72,13 @@ export function escapesRoot(rel: string): boolean {
   return rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
 }
 
+// Is `child` the same path as `parent`, or inside it? Compared on resolved paths with
+// `escapesRoot` as the separator-boundary rule, so every containment check in the engine shares
+// one predicate: `~/..cache` is INSIDE home (a child named `..cache`), not an escape.
+export function isUnder(child: string, parent: string): boolean {
+  return !escapesRoot(path.relative(path.resolve(parent), path.resolve(child)));
+}
+
 // Every engine-owned temp dir is OWNER-ONLY: a shared temp root is world-readable, and these dirs
 // hold the private PR source, a seat's Seatbelt profile, and a seat's reply. `mkdtemp` already
 // promises 0700 — the chmod asserts it rather than trusting the platform's umask. ONE definition,
