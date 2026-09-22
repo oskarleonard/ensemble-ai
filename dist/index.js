@@ -1947,6 +1947,8 @@ function renderVerifySandboxProfile(p) {
 (allow process-fork)
 (allow process-exec ${sbSubpaths([...SYSTEM_READ_ROOTS, p.worktree, p.nodePrefix])})
 (deny process-info*)
+;; npm's install step sets process.title; only its own pidinfo is needed.
+(allow process-info-pidinfo (target self))
 (allow file-map-executable)
 (allow ipc-posix-shm*)
 (allow sysctl-read ${VERIFY_SYSCTL_NAMES.map((name2) => `(sysctl-name ${JSON.stringify(name2)})`).join(" ")})

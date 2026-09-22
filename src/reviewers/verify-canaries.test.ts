@@ -75,6 +75,15 @@ describe.skipIf(process.platform !== 'darwin')('built verify fence: real sandbox
     expect(result.stdout.trim()).toBe('node:os usable');
   });
 
+  it('allows npm to set its own process title', async () => {
+    const result = await probe(`
+      process.title = 'verify-canary';
+      require('node:assert/strict').equal(process.title, 'verify-canary');
+      console.log('self-title-ok');
+    `);
+    expect(result.stdout.trim()).toBe('self-title-ok');
+  });
+
   it('denies a write outside every scratch write root with EPERM', async () => {
     const result = await probe(`
       require('node:assert/strict').throws(() => require('node:fs').writeFileSync(${JSON.stringify(outside)}, 'canary'), { code: 'EPERM' });

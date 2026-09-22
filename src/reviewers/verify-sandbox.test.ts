@@ -26,7 +26,7 @@ describe('the verify profile is separate from the read-only reviewer', () => {
     expect(profile).not.toContain('(allow file-write* (subpath "/private/tmp"))');
     expect(profile).not.toContain('bsd.sb');
     expect(profile).toContain('(deny process-info*)');
-    expect(profile).not.toContain('(allow process-info');
+    expect(profile).toContain('(allow process-info-pidinfo (target self))');
     expect(profile).not.toContain('(allow sysctl-read)');
     expect(profile).toContain('(sysctl-name "hw.pagesize_compat")');
     expect(profile).not.toContain('kern.proc');
@@ -57,6 +57,8 @@ describe('the verify profile is separate from the read-only reviewer', () => {
       const script = path.join(p.worktree, 'probe.cjs');
       fs.writeFileSync(script, `
         const fs = require('node:fs'), net = require('node:net'), assert = require('node:assert/strict');
+        process.title = 'verify-canary';
+        assert.equal(process.title, 'verify-canary');
         assert.equal(require('node:child_process').execFileSync(${JSON.stringify(executable)}, { encoding: 'utf8' }).trim(), 'scratch-exec-ok');
         for (const root of ${JSON.stringify([p.worktree, p.tmpDir, p.npmCache])}) fs.writeFileSync(root + '/allowed', 'ok');
         for (const file of ${JSON.stringify([homeCanary, path.join(p.worktree, 'escape')])}) assert.throws(() => fs.readFileSync(file), { code: 'EPERM' });
