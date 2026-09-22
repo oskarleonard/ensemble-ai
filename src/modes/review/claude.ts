@@ -1,11 +1,10 @@
 import fs from 'node:fs';
 import os from 'node:os';
-import path from 'node:path';
 
 import { resolveClaudeBin } from '../brainstorm/claude';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
-import { escapesRoot, makeOwnerOnlyTempDir } from '../../core/artifacts';
+import { isUnder, makeOwnerOnlyTempDir } from '../../core/artifacts';
 import { runReviewerExec } from '../../core/spawn';
 import { type RunReviewOpts, REVIEW_TIMEOUT_MS } from '../../reviewers/codex';
 
@@ -107,13 +106,6 @@ function denyUnder(tool: string, absDir: string): string {
 // predicate, and the mechanical form of §9's "vendor-auth content cannot reach any model input".
 export function homeReadDenyRules(homeDir: string): string[] {
   return CLAUDE_READ_TOOLS.map((t) => denyUnder(t, homeDir));
-}
-
-// Is `child` inside `parent`? Compared on resolved paths, with the trail's own `escapesRoot` as the
-// separator-boundary rule, so the path-escape predicate cannot drift between here and the writer.
-// An empty rel (child === parent) does not escape, which is what `readRoot === homeDir` must mean.
-function isUnder(child: string, parent: string): boolean {
-  return !escapesRoot(path.relative(path.resolve(parent), path.resolve(child)));
 }
 
 export interface ClaudeSeatFence {

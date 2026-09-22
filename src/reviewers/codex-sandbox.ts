@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { makeOwnerOnlyTempDir } from '../core/artifacts';
+import { isUnder, makeOwnerOnlyTempDir } from '../core/artifacts';
 import type { SandboxProfileRef } from '../modes/review/evidence';
 
 import { CODEX_SOURCE_FENCE_ARGS } from './codex-fence';
@@ -127,10 +127,8 @@ function sbSubpaths(paths: string[]): string {
 // `~/.ssh/id_ed25519`. So every interpolated read root is checked before it reaches a rule.
 export function isUnsafeReadRoot(root: string, home: string = os.homedir()): boolean {
   const r = path.resolve(root);
-  if (r === path.parse(r).root) return true; // "/" — the whole disk
-  const rel = path.relative(r, path.resolve(home));
-  // rel === '' → r IS home; a rel that neither climbs out nor is absolute → r CONTAINS home.
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  // "/" (the whole disk), or a root that IS or CONTAINS home.
+  return r === path.parse(r).root || isUnder(home, r);
 }
 
 export interface CodexSandboxPaths {
@@ -239,13 +237,13 @@ const VERIFY_SYSCTL_NAMES = [
   'hw.pagesize',
   // Node's allocator aborts at startup without the compatibility page size.
   'hw.pagesize_compat',
-  // uname (and therefore node:os / npm) needs these two exact names.
+  // uname(3) reads exactly these five; node:os and npm call it.
   'hw.machine',
-  'kern.ostype',
-  'kern.osrelease',
-  'kern.osversion',
-  'kern.version',
   'kern.hostname',
+  'kern.osrelease',
+  'kern.ostype',
+  'kern.version',
+  'kern.osversion',
   'kern.boottime',
   'kern.usrstack',
   'kern.maxfilesperproc',
@@ -254,30 +252,32 @@ const VERIFY_SYSCTL_NAMES = [
 // A build executes untrusted code, unlike the read-only review seat. Keep its profile
 // separate: writable scratch roots, no operator config, no shared-temp write grant.
 export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
-  const roots = [p.worktree, p.nodePrefix, p.tmpDir, p.npmCache];
-  for (const root of roots) {
+  const scratch = [p.worktree, p.tmpDir, p.npmCache];
+  for (const root of [...scratch, p.nodePrefix]) {
     if (!path.isAbsolute(root) || isUnsafeReadRoot(root)) {
       throw new Error(`ensemble-ai: refusing unsafe verify sandbox root: ${root}`);
     }
   }
-  // Scratch writes must never cover the real home, even a credential subdirectory.
-  for (const root of [p.worktree, p.tmpDir, p.npmCache]) {
-    const rel = path.relative(os.homedir(), path.resolve(root));
-    if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+  // A scratch write grant must cover neither the real home (not even a credential subdirectory)
+  // nor a shared system root — itself or as an ancestor: `/private` would grant `/private/tmp`.
+  for (const root of scratch) {
+    if (isUnder(root, os.homedir())) {
       throw new Error(`ensemble-ai: verify scratch must be outside your home directory: ${root}`);
     }
-    if (SYSTEM_READ_ROOTS.some((system) => path.resolve(root) === system)) {
-      throw new Error(`ensemble-ai: verify scratch cannot be a shared system root: ${root}`);
+    if (SYSTEM_READ_ROOTS.some((system) => isUnder(system, root))) {
+      throw new Error(`ensemble-ai: verify scratch cannot be or contain a shared system root: ${root}`);
     }
   }
   if (!Number.isInteger(p.proxyPort) || p.proxyPort < 1 || p.proxyPort > 65535) {
-    throw new Error('ensemble-ai: invalid verify proxy port');
+    throw new Error(`ensemble-ai: invalid verify proxy port: ${String(p.proxyPort)}`);
   }
   return `(version 1)
 (deny default)
 (import "/System/Library/Sandbox/Profiles/dyld-support.sb")
 (allow process-fork)
 (allow process-exec ${sbSubpaths([...SYSTEM_READ_ROOTS, p.worktree, p.nodePrefix])})
+;; Load-bearing: (deny default) alone leaves process-info open — verified, without this line a
+;; sandboxed process lists every pid and reads its parent's path and KERN_PROCARGS2 (its environment).
 (deny process-info*)
 ;; npm's install step sets process.title; only its own pidinfo is needed.
 (allow process-info-pidinfo (target self))
@@ -287,8 +287,8 @@ export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
 ;; The test step must reap its worker processes; trusted host processes stay denied.
 (allow signal (target self) (target same-sandbox))
 (allow file-read-metadata)
-(allow file-read* ${sbSubpaths([...SYSTEM_READ_ROOTS, ...roots])})
-(allow file-write* ${sbSubpaths([p.worktree, p.tmpDir, p.npmCache])})
+(allow file-read* ${sbSubpaths([...SYSTEM_READ_ROOTS, p.nodePrefix, ...scratch])})
+(allow file-write* ${sbSubpaths(scratch)})
 (allow file-write-data (literal "/dev/null"))
 (allow network-outbound (remote ip "localhost:${p.proxyPort}"))
 `;

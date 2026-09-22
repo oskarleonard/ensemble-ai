@@ -72,13 +72,13 @@ describe('the proxy allows an allowlisted CONNECT and refuses everything else', 
     expect(p.denials).toHaveLength(0);
   });
 
-  // The port pin is half the fence: an allowlisted host reachable on ANY port is an SSH/SMTP relay.
   it('an empty caller allowlist denies every CONNECT', async () => {
     const p = await proxy([]);
     expect(await connect(p.port, 'registry.npmjs.org:443')).toContain('403');
     expect(p.denials).toHaveLength(1);
   });
 
+  // The port pin is half the fence: an allowlisted host reachable on ANY port is an SSH/SMTP relay.
   it('defaults the CONNECT port allowlist to exactly [443]', () => {
     expect(DEFAULT_CONNECT_PORTS).toEqual([443]);
   });

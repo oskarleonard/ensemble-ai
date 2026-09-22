@@ -6,48 +6,48 @@ import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 // Exercise the package consumers install, not just the TypeScript source.
-import { renderVerifySandboxProfile, startEgressProxy } from '../../dist/index.js';
-import { renderVerifySandboxProfile as renderSourceProfile } from './codex-sandbox';
+import { renderVerifySandboxProfile, startEgressProxy, wrapWithSandbox } from '../../dist/index.js';
+import {
+  codexSandboxSupported,
+  renderVerifySandboxProfile as renderSourceProfile,
+  type VerifySandboxPaths,
+} from './codex-sandbox';
 
 const exec = promisify(execFile);
 
-describe.skipIf(process.platform !== 'darwin')('built verify fence: real sandbox-exec canaries', () => {
+describe.skipIf(!codexSandboxSupported())('built verify fence: real sandbox-exec canaries', () => {
   let scratch: string;
-  let checkout: string;
+  let roots: VerifySandboxPaths;
   let profile: string;
   let homeCanary: string;
-  let outside: string;
 
-  function render(proxyPort = 54321) {
-    const roots = {
-      worktree: checkout,
-      nodePrefix: path.dirname(path.dirname(fs.realpathSync(process.execPath))),
-      tmpDir: path.join(scratch, 'tmp'),
-      npmCache: path.join(scratch, 'cache'),
-      proxyPort,
-    };
-    const built = renderVerifySandboxProfile(roots);
-    expect(built, 'rebuild dist before running the canaries').toBe(renderSourceProfile(roots));
-    fs.writeFileSync(profile, built);
+  function render(proxyPort = roots.proxyPort) {
+    fs.writeFileSync(profile, renderVerifySandboxProfile({ ...roots, proxyPort }));
   }
 
   function probe(script: string) {
-    const file = path.join(checkout, 'probe.cjs');
+    const file = path.join(roots.worktree, 'probe.cjs');
     fs.writeFileSync(file, script);
-    return exec('/usr/bin/sandbox-exec', ['-f', profile, process.execPath, file], {
-      cwd: checkout,
-      env: { PATH: '/usr/bin:/bin', TMPDIR: path.join(scratch, 'tmp'), HOME: path.join(scratch, 'tmp') },
+    const sandboxed = wrapWithSandbox(profile, process.execPath, [file]);
+    return exec(sandboxed.bin, sandboxed.args, {
+      cwd: roots.worktree,
+      env: { PATH: '/usr/bin:/bin', TMPDIR: roots.tmpDir, HOME: roots.tmpDir },
       timeout: 10000,
     });
   }
 
   beforeEach(() => {
     scratch = fs.realpathSync(fs.mkdtempSync('/private/tmp/ensemble-verify-canary-'));
-    checkout = path.join(scratch, 'checkout');
+    roots = {
+      worktree: path.join(scratch, 'checkout'),
+      nodePrefix: path.dirname(path.dirname(fs.realpathSync(process.execPath))),
+      tmpDir: path.join(scratch, 'tmp'),
+      npmCache: path.join(scratch, 'cache'),
+      proxyPort: 54321,
+    };
     profile = path.join(scratch, 'verify.sb');
     homeCanary = path.join(os.homedir(), `.verify-canary-${path.basename(scratch)}`);
-    outside = path.join(scratch, 'outside');
-    for (const dir of [checkout, path.join(scratch, 'tmp'), path.join(scratch, 'cache')]) fs.mkdirSync(dir);
+    for (const dir of [roots.worktree, roots.tmpDir, roots.npmCache]) fs.mkdirSync(dir);
     render();
   });
 
@@ -56,13 +56,32 @@ describe.skipIf(process.platform !== 'darwin')('built verify fence: real sandbox
     fs.rmSync(homeCanary, { force: true });
   });
 
-  it('denies a HOME read with EPERM', async () => {
+  it('the built package renders exactly the source profile (run `npm run build` if not)', () => {
+    expect(renderVerifySandboxProfile(roots)).toBe(renderSourceProfile(roots));
+  });
+
+  it('denies HOME reads with EPERM, directly and through a scratch symlink', async () => {
     fs.writeFileSync(homeCanary, 'only-a-test-canary');
+    const escape = path.join(roots.worktree, 'escape');
+    fs.symlinkSync(homeCanary, escape);
     const result = await probe(`
-      require('node:assert/strict').throws(() => require('node:fs').readFileSync(${JSON.stringify(homeCanary)}), { code: 'EPERM' });
+      const fs = require('node:fs'), assert = require('node:assert/strict');
+      for (const file of ${JSON.stringify([homeCanary, escape])}) assert.throws(() => fs.readFileSync(file), { code: 'EPERM' });
       console.log('HOME read EPERM');
     `);
     expect(result.stdout.trim()).toBe('HOME read EPERM');
+  });
+
+  it('allows writes in every scratch root and executing a file planted in the checkout', async () => {
+    const executable = path.join(roots.worktree, 'executable');
+    fs.writeFileSync(executable, '#!/bin/sh\necho scratch-exec-ok\n', { mode: 0o700 });
+    const result = await probe(`
+      const fs = require('node:fs'), assert = require('node:assert/strict');
+      for (const root of ${JSON.stringify([roots.worktree, roots.tmpDir, roots.npmCache])}) fs.writeFileSync(root + '/allowed', 'ok');
+      assert.equal(require('node:child_process').execFileSync(${JSON.stringify(executable)}, { encoding: 'utf8' }).trim(), 'scratch-exec-ok');
+      console.log('scratch write+exec ok');
+    `);
+    expect(result.stdout.trim()).toBe('scratch write+exec ok');
   });
 
   it('allows Node to load the OS information npm requires', async () => {
@@ -107,6 +126,7 @@ describe.skipIf(process.platform !== 'darwin')('built verify fence: real sandbox
   });
 
   it('denies a write outside every scratch write root with EPERM', async () => {
+    const outside = path.join(scratch, 'outside');
     const result = await probe(`
       require('node:assert/strict').throws(() => require('node:fs').writeFileSync(${JSON.stringify(outside)}, 'canary'), { code: 'EPERM' });
       console.log('outside-scratch write EPERM');
@@ -115,33 +135,38 @@ describe.skipIf(process.platform !== 'darwin')('built verify fence: real sandbox
     expect(fs.existsSync(outside)).toBe(false);
   });
 
-  it('denies KERN_PROCARGS2 for the trusted parent and never returns its canary', async () => {
-    const source = path.join(checkout, 'procargs.c');
-    const binary = path.join(checkout, 'procargs');
+  it("denies the trusted parent's KERN_PROCARGS2 and process info, and never returns its canary", async () => {
+    const source = path.join(roots.worktree, 'procargs.c');
+    const binary = path.join(roots.worktree, 'procargs');
+    // Prints what the fence let through and exits 0: the test asserts the line, so a regression
+    // fails on a readable diff rather than on an opaque exit status.
     fs.writeFileSync(source, `
       #include <sys/sysctl.h>
       #include <errno.h>
+      #include <libproc.h>
       #include <stdio.h>
       #include <stdlib.h>
       #include <string.h>
       int main(int argc, char **argv) {
         if (argc != 2) return 2;
-        int mib[3] = {CTL_KERN, KERN_PROCARGS2, atoi(argv[1])};
-        char buf[1000000] = {0}; size_t len = sizeof(buf);
+        int pid = atoi(argv[1]);
+        int mib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
+        static char buf[1000000];
+        size_t len = sizeof(buf);
         int result = sysctl(mib, 3, buf, &len, NULL, 0), error = errno;
         const char *canary = "VERIFY_ONLY_CANARY=ok";
-        int found = 0;
-        for (size_t i = 0; i + strlen(canary) <= sizeof(buf); i++)
-          if (!memcmp(buf + i, canary, strlen(canary))) found = 1;
-        printf("sysctl-result=%d errno=%d canary=%d\\n", result, error, found);
-        return result == -1 && error == EPERM && found == 0 ? 0 : 1;
+        int found = memmem(buf, sizeof(buf), canary, strlen(canary)) != NULL;
+        char exe[PROC_PIDPATHINFO_MAXSIZE];
+        int pidpath = proc_pidpath(pid, exe, sizeof(exe));
+        printf("sysctl-result=%d errno=%d canary=%d pidpath=%d\\n", result, error, found, pidpath);
+        return 0;
       }
     `);
     const compile = spawnSync('/usr/bin/cc', [source, '-o', binary], { encoding: 'utf8' });
     expect(compile.status, compile.stderr).toBe(0);
     // The fresh trusted parent has ONLY a harmless canary + PATH. Never query
     // the test worker's actual environment or any unrelated process.
-    const parent = path.join(checkout, 'parent.cjs');
+    const parent = path.join(roots.worktree, 'parent.cjs');
     fs.writeFileSync(parent, `
       const { spawnSync } = require('node:child_process');
       const result = spawnSync('/usr/bin/sandbox-exec', ['-f', ${JSON.stringify(profile)}, ${JSON.stringify(binary)}, String(process.pid)], {
@@ -152,9 +177,18 @@ describe.skipIf(process.platform !== 'darwin')('built verify fence: real sandbox
       process.exit(result.status ?? 2);
     `);
     const result = await exec(process.execPath, [parent], {
-      cwd: checkout, env: { PATH: '/usr/bin:/bin', VERIFY_ONLY_CANARY: 'ok' }, timeout: 15000,
+      cwd: roots.worktree, env: { PATH: '/usr/bin:/bin', VERIFY_ONLY_CANARY: 'ok' }, timeout: 15000,
     });
-    expect(result.stdout.trim()).toBe('sysctl-result=-1 errno=1 canary=0');
+    expect(result.stdout.trim()).toBe('sysctl-result=-1 errno=1 canary=0 pidpath=0');
+  });
+
+  it('denies a direct outbound socket with EPERM', async () => {
+    const result = await probe(`
+      const socket = require('node:net').connect(443, '1.1.1.1');
+      socket.on('connect', () => { console.log('direct socket CONNECTED'); process.exit(0); });
+      socket.on('error', (e) => console.log('direct socket ' + e.code));
+    `);
+    expect(result.stdout.trim()).toBe('direct socket EPERM');
   });
 
   it('refuses and logs an off-allowlist CONNECT from the fenced child', async () => {

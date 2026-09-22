@@ -33,6 +33,15 @@ export * from './reviewers/claude';
 export * from './reviewers/registry';
 // The ensemble-owned codex sandbox wrapper (worktree evidence, macOS Seatbelt).
 export * from './reviewers/codex-sandbox';
+// The host-allowlist CONNECT proxy a Seatbelt profile pins egress to. Exported so a consumer
+// running a command under the verify profile (the dashboard's host verify) fences it the same way.
+export {
+  proxyEnv,
+  startEgressProxy,
+  type EgressDenial,
+  type EgressProxy,
+  type StartEgressProxyOpts,
+} from './core/egress-proxy';
 
 // ── The review MODE: diff acquisition · secret-scan · the content-tied receipt ─
 export * from './modes/review';
@@ -97,5 +106,3 @@ export type {
 
 // ── Mode registry (mode-first) ───────────────────────────────────────────────
 export * from './modes';
-
-export { startEgressProxy, proxyEnv, type EgressProxy, type EgressDenial, type StartEgressProxyOpts } from './core/egress-proxy';

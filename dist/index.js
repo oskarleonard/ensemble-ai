@@ -1323,6 +1323,9 @@ function reviewDir(baseDir, runId) {
 function escapesRoot(rel) {
   return rel === ".." || rel.startsWith(`..${path3.sep}`) || path3.isAbsolute(rel);
 }
+function isUnder(child, parent) {
+  return !escapesRoot(path3.relative(path3.resolve(parent), path3.resolve(child)));
+}
 function makeOwnerOnlyTempDir(prefix, root = os2.tmpdir()) {
   const dir = fs3.mkdtempSync(path3.join(root, prefix));
   fs3.chmodSync(dir, 448);
@@ -1835,9 +1838,7 @@ function sbSubpaths(paths) {
 }
 function isUnsafeReadRoot(root, home = os4.homedir()) {
   const r = path4.resolve(root);
-  if (r === path4.parse(r).root) return true;
-  const rel = path4.relative(r, path4.resolve(home));
-  return rel === "" || !rel.startsWith("..") && !path4.isAbsolute(rel);
+  return r === path4.parse(r).root || isUnder(home, r);
 }
 function renderCodexSandboxProfile(p) {
   for (const [name2, root] of [
@@ -1911,41 +1912,42 @@ var VERIFY_SYSCTL_NAMES = [
   "hw.pagesize",
   // Node's allocator aborts at startup without the compatibility page size.
   "hw.pagesize_compat",
-  // uname (and therefore node:os / npm) needs these two exact names.
+  // uname(3) reads exactly these five; node:os and npm call it.
   "hw.machine",
-  "kern.ostype",
-  "kern.osrelease",
-  "kern.osversion",
-  "kern.version",
   "kern.hostname",
+  "kern.osrelease",
+  "kern.ostype",
+  "kern.version",
+  "kern.osversion",
   "kern.boottime",
   "kern.usrstack",
   "kern.maxfilesperproc"
 ];
 function renderVerifySandboxProfile(p) {
-  const roots = [p.worktree, p.nodePrefix, p.tmpDir, p.npmCache];
-  for (const root of roots) {
+  const scratch = [p.worktree, p.tmpDir, p.npmCache];
+  for (const root of [...scratch, p.nodePrefix]) {
     if (!path4.isAbsolute(root) || isUnsafeReadRoot(root)) {
       throw new Error(`ensemble-ai: refusing unsafe verify sandbox root: ${root}`);
     }
   }
-  for (const root of [p.worktree, p.tmpDir, p.npmCache]) {
-    const rel = path4.relative(os4.homedir(), path4.resolve(root));
-    if (!rel.startsWith("..") && !path4.isAbsolute(rel)) {
+  for (const root of scratch) {
+    if (isUnder(root, os4.homedir())) {
       throw new Error(`ensemble-ai: verify scratch must be outside your home directory: ${root}`);
     }
-    if (SYSTEM_READ_ROOTS.some((system) => path4.resolve(root) === system)) {
-      throw new Error(`ensemble-ai: verify scratch cannot be a shared system root: ${root}`);
+    if (SYSTEM_READ_ROOTS.some((system) => isUnder(system, root))) {
+      throw new Error(`ensemble-ai: verify scratch cannot be or contain a shared system root: ${root}`);
     }
   }
   if (!Number.isInteger(p.proxyPort) || p.proxyPort < 1 || p.proxyPort > 65535) {
-    throw new Error("ensemble-ai: invalid verify proxy port");
+    throw new Error(`ensemble-ai: invalid verify proxy port: ${String(p.proxyPort)}`);
   }
   return `(version 1)
 (deny default)
 (import "/System/Library/Sandbox/Profiles/dyld-support.sb")
 (allow process-fork)
 (allow process-exec ${sbSubpaths([...SYSTEM_READ_ROOTS, p.worktree, p.nodePrefix])})
+;; Load-bearing: (deny default) alone leaves process-info open \u2014 verified, without this line a
+;; sandboxed process lists every pid and reads its parent's path and KERN_PROCARGS2 (its environment).
 (deny process-info*)
 ;; npm's install step sets process.title; only its own pidinfo is needed.
 (allow process-info-pidinfo (target self))
@@ -1955,8 +1957,8 @@ function renderVerifySandboxProfile(p) {
 ;; The test step must reap its worker processes; trusted host processes stay denied.
 (allow signal (target self) (target same-sandbox))
 (allow file-read-metadata)
-(allow file-read* ${sbSubpaths([...SYSTEM_READ_ROOTS, ...roots])})
-(allow file-write* ${sbSubpaths([p.worktree, p.tmpDir, p.npmCache])})
+(allow file-read* ${sbSubpaths([...SYSTEM_READ_ROOTS, p.nodePrefix, ...scratch])})
+(allow file-write* ${sbSubpaths(scratch)})
 (allow file-write-data (literal "/dev/null"))
 (allow network-outbound (remote ip "localhost:${p.proxyPort}"))
 `;
@@ -2399,7 +2401,6 @@ async function runGrokReview(prompt, config, opts = {}) {
 // src/modes/review/claude.ts
 import fs14 from "fs";
 import os8 from "os";
-import path13 from "path";
 
 // src/modes/brainstorm/claude.ts
 function resolveClaudeBin() {
@@ -2552,9 +2553,9 @@ function hasGeneratedHeader(section2) {
   }
   return false;
 }
-function classifyFileKind(path18, isBinary, section2 = "") {
+function classifyFileKind(path17, isBinary, section2 = "") {
   if (isBinary) return "binary";
-  if (GENERATED_PATTERNS.some((re) => re.test(path18))) return "generated";
+  if (GENERATED_PATTERNS.some((re) => re.test(path17))) return "generated";
   return section2 && hasGeneratedHeader(section2) ? "generated" : "source";
 }
 var TEST_PATTERNS = [
@@ -2566,8 +2567,8 @@ var TEST_PATTERNS = [
   /Tests?\.(java|kt|swift|cs|scala)$/,
   /\.bats$/
 ];
-function isTestPath(path18) {
-  return TEST_PATTERNS.some((re) => re.test(path18));
+function isTestPath(path17) {
+  return TEST_PATTERNS.some((re) => re.test(path17));
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -2585,7 +2586,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path18 = pathOfSection(section2);
+    const path17 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -2596,8 +2597,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path18, isBinary, section2),
-      path: path18,
+      kind: classifyFileKind(path17, isBinary, section2),
+      path: path17,
       raw: section2,
       removed
     };
@@ -3292,9 +3293,6 @@ function denyUnder(tool, absDir) {
 function homeReadDenyRules(homeDir) {
   return CLAUDE_READ_TOOLS.map((t) => denyUnder(t, homeDir));
 }
-function isUnder(child, parent) {
-  return !escapesRoot(path13.relative(path13.resolve(parent), path13.resolve(child)));
-}
 function buildClaudeReviewArgs(prompt, config, fence = {}) {
   const homeDir = fence.homeDir ?? os8.homedir();
   if (fence.readRoot && isUnder(fence.readRoot, homeDir)) {
@@ -3588,7 +3586,7 @@ function hasDepSurface(r) {
 // src/modes/review/receipt.ts
 import fs18 from "fs";
 import os10 from "os";
-import path16 from "path";
+import path15 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -3675,7 +3673,7 @@ function formatEvidenceShortfall(gaps) {
 
 // src/modes/review/holistic-gate.ts
 import fs17 from "fs";
-import path15 from "path";
+import path14 from "path";
 
 // src/modes/review/holistic.ts
 import fs16 from "fs";
@@ -3683,7 +3681,7 @@ import fs16 from "fs";
 // src/modes/brainstorm/voices.ts
 import fs15 from "fs";
 import os9 from "os";
-import path14 from "path";
+import path13 from "path";
 
 // src/modes/brainstorm/types.ts
 var VOICE_IDS = ["codex", "grok", "claude"];
@@ -3741,7 +3739,7 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), o),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), o)
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path14.join(os9.homedir(), ".ensemble-ai", "voices.json");
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path13.join(os9.homedir(), ".ensemble-ai", "voices.json");
 function str2(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
@@ -3984,18 +3982,18 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs17.realpathSync(path15.resolve(worktreeDir));
+    root = fs17.realpathSync(path14.resolve(worktreeDir));
   } catch {
     return () => null;
   }
   const inside = (p) => {
-    const rel = path15.relative(root, p);
+    const rel = path14.relative(root, p);
     return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
-      if (!file || file.includes("\0") || path15.isAbsolute(file)) return null;
-      const target = path15.resolve(root, file);
+      if (!file || file.includes("\0") || path14.isAbsolute(file)) return null;
+      const target = path14.resolve(root, file);
       if (!inside(target)) return null;
       const real = fs17.realpathSync(target);
       if (!inside(real)) return null;
@@ -4212,10 +4210,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path16.join(os10.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path15.join(os10.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path16.join(
+  return path15.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -4236,7 +4234,7 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs18.mkdirSync(path16.dirname(file), { recursive: true, mode: 448 });
+  fs18.mkdirSync(path15.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
   fs18.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
   fs18.chmodSync(tmp, 384);
@@ -5311,7 +5309,7 @@ function stageReview(payload, target, deps) {
 
 // src/modes/review/holistic-fixture.ts
 import fs19 from "fs";
-import path17 from "path";
+import path16 from "path";
 function anchor(v, where) {
   const e = v ?? {};
   if (typeof e.file !== "string" || typeof e.line !== "number" || typeof e.symbol !== "string")
@@ -5319,7 +5317,7 @@ function anchor(v, where) {
   return { file: e.file, line: e.line, symbol: e.symbol };
 }
 function loadHolisticFixture(dir) {
-  const raw = JSON.parse(fs19.readFileSync(path17.join(dir, "expectations.json"), "utf8"));
+  const raw = JSON.parse(fs19.readFileSync(path16.join(dir, "expectations.json"), "utf8"));
   const positives = Array.isArray(raw.plantedPositives) ? raw.plantedPositives : [];
   const misses = Array.isArray(raw.nearMisses) ? raw.nearMisses : [];
   if (positives.length === 0 || misses.length === 0)
@@ -5352,7 +5350,7 @@ function verifyFixtureAnchors(dir, fixture) {
   const check = (a, label2) => {
     let lines;
     try {
-      lines = fs19.readFileSync(path17.join(dir, a.file), "utf8").split(/\r?\n/);
+      lines = fs19.readFileSync(path16.join(dir, a.file), "utf8").split(/\r?\n/);
     } catch {
       broken.push(`${label2}: ${a.file} is unreadable`);
       return;
@@ -6332,6 +6330,7 @@ export {
   isStrippedPath,
   isTestPath,
   isTransientApiErrorReply,
+  isUnder,
   isUnsafeReadRoot,
   isUsageLimitFailure,
   isUsageLimitReply,
