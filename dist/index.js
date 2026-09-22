@@ -1951,11 +1951,12 @@ function renderVerifySandboxProfile(p) {
   if (!Number.isInteger(p.proxyPort) || p.proxyPort < 1 || p.proxyPort > 65535) {
     throw new Error(`ensemble-ai: invalid verify proxy port: ${String(p.proxyPort)}`);
   }
+  const execRoots = SYSTEM_READ_ROOTS.filter((root) => !SHARED_TEMP_TREES.some((tree) => isUnder(tree, root)));
   return `(version 1)
 (deny default)
 (import "/System/Library/Sandbox/Profiles/dyld-support.sb")
 (allow process-fork)
-(allow process-exec ${sbSubpaths([...SYSTEM_READ_ROOTS, worktree, nodePrefix])})
+(allow process-exec ${sbSubpaths([...execRoots, nodePrefix, runDir])})
 ;; Load-bearing: (deny default) alone leaves process-info open \u2014 verified, without this line a
 ;; sandboxed process lists every pid and reads its parent's path and KERN_PROCARGS2 (its environment).
 (deny process-info*)

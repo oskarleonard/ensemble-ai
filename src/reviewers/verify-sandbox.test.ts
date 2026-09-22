@@ -41,6 +41,15 @@ describe('the verify profile is separate from the read-only reviewer', () => {
     ]);
   });
 
+  it('executes only from toolchain roots, the node install and its own run dir', () => {
+    const [exec] = renderVerifySandboxProfile(paths).match(/^\(allow process-exec.*$/gm) ?? [];
+    expect(exec).toContain('(subpath "/usr")');
+    expect(exec).toContain(`(subpath ${JSON.stringify(paths.nodePrefix)})`);
+    expect(exec).toContain('(subpath "/private/tmp/verify-unique")');
+    expect(exec).not.toContain('(subpath "/private/tmp")');
+    expect(exec).not.toContain('(subpath "/private/var")');
+  });
+
   it('refuses root/home/relative grants, a shared run dir and scratch outside the run dir', () => {
     for (const field of ['worktree', 'tmpDir', 'npmCache', 'nodePrefix'] as const) {
       for (const root of ['/', os.homedir(), 'relative/checkout']) {

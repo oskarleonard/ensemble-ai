@@ -89,6 +89,28 @@ describe.skipIf(!codexSandboxSupported())('built verify fence: real sandbox-exec
     }
   });
 
+  it("never executes another run's binary from a shared temp tree, only from its own run dir", async () => {
+    const source = path.join(scratch, 'hello.c');
+    fs.writeFileSync(source, '#include <stdio.h>\nint main(void) { puts("ran"); return 0; }\n');
+    const own = path.join(roots.tmpDir, 'own-binary');
+    const others = [path.join(fs.realpathSync(os.tmpdir()), `verify-exec-${path.basename(scratch)}`), `${scratch}-exec`];
+    try {
+      for (const binary of [own, ...others]) {
+        const compile = spawnSync('/usr/bin/cc', [source, '-o', binary], { encoding: 'utf8' });
+        expect(compile.status, compile.stderr).toBe(0);
+      }
+      const result = await probe(`
+        const { spawnSync } = require('node:child_process'), assert = require('node:assert/strict');
+        assert.equal(spawnSync(${JSON.stringify(own)}, { encoding: 'utf8' }).stdout.trim(), 'ran');
+        for (const binary of ${JSON.stringify(others)}) assert.equal(spawnSync(binary).error?.code, 'EPERM');
+        console.log('own-run exec only');
+      `);
+      expect(result.stdout.trim()).toBe('own-run exec only');
+    } finally {
+      for (const binary of others) fs.rmSync(binary, { force: true });
+    }
+  });
+
   it('reads the private repo beside the checkout, in its own run dir', async () => {
     const repo = path.join(scratch, 'repo');
     const git = (...args: string[]) =>

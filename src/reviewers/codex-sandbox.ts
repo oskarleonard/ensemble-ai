@@ -263,6 +263,8 @@ const VERIFY_SYSCTL_NAMES = [
 // separate: writable scratch roots, no operator config, no shared-temp read or write grant.
 // Loopback is closed too, except the proxy port: a suite that starts a local server fails
 // closed here, because opening localhost:* would hand the build every local service.
+// Residue, stated: file METADATA stays readable everywhere (path resolution needs it), so a build
+// can learn that a file in HOME exists and its size and mode — never its contents.
 export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
   // Validate and render the NORMALIZED paths, so `…/run/` or `…/run/.` cannot pass a check as one
   // path and reach a rule as another.
@@ -296,11 +298,15 @@ export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
   if (!Number.isInteger(p.proxyPort) || p.proxyPort < 1 || p.proxyPort > 65535) {
     throw new Error(`ensemble-ai: invalid verify proxy port: ${String(p.proxyPort)}`);
   }
+  // Execution follows the same line as reads: never out of a shared temp tree (probed: a Mach-O in
+  // /private/tmp or $TMPDIR still ran with its contents unreadable), only the toolchain roots, the
+  // node install and this run's own dir.
+  const execRoots = SYSTEM_READ_ROOTS.filter((root) => !SHARED_TEMP_TREES.some((tree) => isUnder(tree, root)));
   return `(version 1)
 (deny default)
 (import "/System/Library/Sandbox/Profiles/dyld-support.sb")
 (allow process-fork)
-(allow process-exec ${sbSubpaths([...SYSTEM_READ_ROOTS, worktree, nodePrefix])})
+(allow process-exec ${sbSubpaths([...execRoots, nodePrefix, runDir])})
 ;; Load-bearing: (deny default) alone leaves process-info open — verified, without this line a
 ;; sandboxed process lists every pid and reads its parent's path and KERN_PROCARGS2 (its environment).
 (deny process-info*)
