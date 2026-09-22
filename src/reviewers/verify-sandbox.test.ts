@@ -31,50 +31,49 @@ describe('the verify profile is separate from the read-only reviewer', () => {
     expect(profile).not.toContain('kern.proc');
   });
 
-  it('reads the system roots and its own run dir, never another run in a shared temp tree', () => {
+  it('reads the system roots and its own scratch roots, never another run in a shared temp tree', () => {
     // Order is the rule: SBPL's last match wins, so the deny must sit between the two allows.
     expect(renderVerifySandboxProfile(paths).match(/^\((allow|deny) file-read.*$/gm)).toEqual([
       '(allow file-read-metadata)',
       expect.stringMatching(/^\(allow file-read\* \(subpath "\/usr"\) .*\(subpath "\/private\/tmp"\)/),
       '(deny file-read-data file-read-xattr (subpath "/private/tmp") (subpath "/private/var/tmp") (subpath "/private/var/folders"))',
-      `(allow file-read-data file-read-xattr (subpath ${JSON.stringify(paths.nodePrefix)}) (subpath "/private/tmp/verify-unique"))`,
+      `(allow file-read-data file-read-xattr ${[paths.nodePrefix, paths.worktree, paths.tmpDir, paths.npmCache].map((root) => `(subpath ${JSON.stringify(root)})`).join(' ')})`,
     ]);
   });
 
-  it('executes only from toolchain roots, the node install and its own run dir', () => {
+  it('executes only from toolchain roots, the node install and its scratch roots', () => {
     const [exec] = renderVerifySandboxProfile(paths).match(/^\(allow process-exec.*$/gm) ?? [];
     expect(exec).toContain('(subpath "/usr")');
     expect(exec).toContain(`(subpath ${JSON.stringify(paths.nodePrefix)})`);
-    expect(exec).toContain('(subpath "/private/tmp/verify-unique")');
+    expect(exec).toContain(`(subpath ${JSON.stringify(paths.npmCache)})`);
+    expect(exec).not.toContain('(subpath "/private/tmp/verify-unique")');
     expect(exec).not.toContain('(subpath "/private/tmp")');
     expect(exec).not.toContain('(subpath "/private/var")');
   });
 
-  it('refuses root/home/relative grants, a shared run dir and scratch outside the run dir', () => {
+  it('refuses root/home/relative grants, scratch in home, and shared roots as scratch', () => {
     for (const field of ['worktree', 'tmpDir', 'npmCache', 'nodePrefix'] as const) {
       for (const root of ['/', os.homedir(), 'relative/checkout']) {
         expect(() => renderVerifySandboxProfile({ ...paths, [field]: root })).toThrow();
       }
     }
-    // The run dir (the worktree's parent) is read-granted, so it must be dedicated: not in home —
-    // including a child whose name merely starts with `..` — and neither a shared root nor an
-    // ancestor of one, the operator's own $TMPDIR included.
-    const inRunDir = (runDir: string) => ({ ...paths, worktree: path.join(runDir, 'checkout') });
-    expect(() => renderVerifySandboxProfile(inRunDir(path.join(os.homedir(), '..cache')))).toThrow(/outside your home/);
-    for (const runDir of ['/private/tmp', '/private', '/opt', '/private/var/folders', fs.realpathSync(os.tmpdir())]) {
-      expect(() => renderVerifySandboxProfile(inRunDir(runDir))).toThrow(/dedicated directory/);
-    }
-    // Scratch outside the run dir — in home, a shared root, another run — or the run dir itself.
-    for (const root of [path.join(os.homedir(), '.codex'), '/private/tmp', '/private/tmp/verify-other/tmp', '/private/tmp/verify-unique']) {
-      expect(() => renderVerifySandboxProfile({ ...paths, tmpDir: root })).toThrow(/inside the run dir/);
+    for (const field of ['worktree', 'tmpDir', 'npmCache'] as const) {
+      // Inside home — including a child whose name merely starts with `..`.
+      for (const root of [path.join(os.homedir(), '.codex'), path.join(os.homedir(), '..cache')]) {
+        expect(() => renderVerifySandboxProfile({ ...paths, [field]: root })).toThrow(/outside your home/);
+      }
+      // A shared root or an ancestor of one, the operator's own $TMPDIR included.
+      for (const root of ['/private/tmp', '/private', '/opt', '/private/var/folders', fs.realpathSync(os.tmpdir())]) {
+        expect(() => renderVerifySandboxProfile({ ...paths, [field]: root })).toThrow(/dedicated directory/);
+      }
     }
     expect(() => renderVerifySandboxProfile({ ...paths, proxyPort: 0 })).toThrow();
   });
 
   it('validates and renders normalized paths, and never lets nodePrefix reopen a temp tree', () => {
-    // A trailing slash or `/.` IS the run dir — refused, not granted as a child of it.
-    for (const root of ['/private/tmp/verify-unique/', '/private/tmp/verify-unique/.']) {
-      expect(() => renderVerifySandboxProfile({ ...paths, tmpDir: root })).toThrow(/inside the run dir/);
+    // Normalized BEFORE validation: `/private/tmp/` and `/private/tmp/.` are still `/private/tmp`.
+    for (const root of ['/private/tmp/', '/private/tmp/.']) {
+      expect(() => renderVerifySandboxProfile({ ...paths, tmpDir: root })).toThrow(/dedicated directory/);
     }
     const profile = renderVerifySandboxProfile({ ...paths, worktree: `${paths.worktree}/`, tmpDir: `${paths.tmpDir}/./` });
     expect(profile).toContain(`(subpath ${JSON.stringify(paths.worktree)})`);

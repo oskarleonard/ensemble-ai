@@ -89,7 +89,7 @@ describe.skipIf(!codexSandboxSupported())('built verify fence: real sandbox-exec
     }
   });
 
-  it("never executes another run's binary from a shared temp tree, only from its own run dir", async () => {
+  it("never executes another run's binary from a shared temp tree, only from its own scratch roots", async () => {
     const source = path.join(scratch, 'hello.c');
     fs.writeFileSync(source, '#include <stdio.h>\nint main(void) { puts("ran"); return 0; }\n');
     const own = path.join(roots.tmpDir, 'own-binary');
@@ -111,19 +111,19 @@ describe.skipIf(!codexSandboxSupported())('built verify fence: real sandbox-exec
     }
   });
 
-  it('reads the private repo beside the checkout, in its own run dir', async () => {
+  it('never reads the private repo beside the checkout — only its own scratch roots', async () => {
     const repo = path.join(scratch, 'repo');
     const git = (...args: string[]) =>
       spawnSync('/usr/bin/git', ['-c', 'user.name=canary', '-c', 'user.email=canary@example.invalid', ...args], { encoding: 'utf8' });
     expect(git('init', '-q', repo).status).toBe(0);
     expect(git('-C', repo, 'commit', '-q', '--allow-empty', '-m', 'canary').status).toBe(0);
-    const head = git('-C', repo, 'rev-parse', 'HEAD').stdout.trim();
     const result = await probe(`
-      process.stdout.write(require('node:child_process').execFileSync('/usr/bin/git', ['-C', ${JSON.stringify(repo)}, 'rev-parse', 'HEAD'], {
-        encoding: 'utf8', env: {...process.env, DEVELOPER_DIR: '/Library/Developer/CommandLineTools', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null'}
-      }));
+      const fs = require('node:fs'), assert = require('node:assert/strict');
+      assert.throws(() => fs.readFileSync(${JSON.stringify(path.join(repo, '.git', 'HEAD'))}), { code: 'EPERM' });
+      assert.throws(() => fs.readdirSync(${JSON.stringify(path.join(repo, '.git', 'objects'))}), { code: 'EPERM' });
+      console.log('private repo EPERM');
     `);
-    expect(result.stdout.trim()).toBe(head);
+    expect(result.stdout.trim()).toBe('private repo EPERM');
   });
 
   it('allows writes in every scratch root and executing a file planted in the checkout', async () => {
@@ -143,6 +143,8 @@ describe.skipIf(!codexSandboxSupported())('built verify fence: real sandbox-exec
       const os = require('node:os'), assert = require('node:assert/strict');
       assert.equal(os.type(), 'Darwin');
       assert.ok(os.release());
+      // Worker pools and node-gyp size themselves by os.cpus(); it is empty without the CPU model.
+      assert.ok(os.cpus().length > 0 && os.cpus()[0].model);
       console.log('node:os usable');
     `);
     expect(result.stdout.trim()).toBe('node:os usable');

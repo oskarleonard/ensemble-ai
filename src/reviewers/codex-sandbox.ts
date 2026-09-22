@@ -216,10 +216,9 @@ export function renderCodexSandboxProfile(p: CodexSandboxPaths): string {
 }
 
 export interface VerifySandboxPaths {
-  // All paths must be absolute and realpath-resolved by the trusted host. The worktree's parent is
-  // the run's own directory (the checkout's private repo sits beside it); tmpDir and npmCache must
-  // live inside it too — and never over that private repo: it can be a hardlink clone of the
-  // operator's object store, and the renderer cannot know its name to refuse it.
+  // All paths must be absolute and realpath-resolved by the trusted host. The build reads, writes and
+  // executes these three scratch roots and nothing beside them — not the private repo the checkout
+  // was cut from, which can be a hardlink clone of the operator's whole object store.
   worktree: string;
   nodePrefix: string;
   tmpDir: string;
@@ -231,7 +230,7 @@ export interface VerifySandboxPaths {
 // $TMPDIR and cache under /private/var/folders — where other runs' private checkouts and session
 // outputs live. The review seat reads them (its accepted gap, above). A verify build must not: it
 // runs untrusted install scripts that can reach an allowed host (probed: under the review seat's
-// read roots it listed and read the operator's whole $TMPDIR). Only its own run dir is re-granted.
+// read roots it listed and read the operator's whole $TMPDIR). Only its own scratch roots are re-granted.
 const SHARED_TEMP_TREES = ['/private/tmp', '/private/var/tmp', '/private/var/folders'];
 
 // Exact names only: a blanket sysctl-read also grants kern.procargs2, which can
@@ -257,6 +256,9 @@ const VERIFY_SYSCTL_NAMES = [
   'kern.boottime',
   'kern.usrstack',
   'kern.maxfilesperproc',
+  // os.cpus() is empty without the model name (worker pools and node-gyp size by it); os.loadavg().
+  'machdep.cpu.brand_string',
+  'vm.loadavg',
 ];
 
 // A build executes untrusted code, unlike the read-only review seat. Keep its profile
@@ -275,38 +277,34 @@ export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
     return path.resolve(root);
   });
   const scratch = [worktree, tmpDir, npmCache];
-  // Everything the build may write, and everything of its own it may read, sits in ONE run dir. It
-  // must be a dedicated per-run directory: not in home, and neither a shared root (system or temp,
-  // the operator's $TMPDIR included) nor an ancestor of one — `/private` would grant `/private/tmp`.
-  const runDir = path.dirname(worktree);
-  if (isUnder(runDir, os.homedir())) {
-    throw new Error(`ensemble-ai: verify scratch must be outside your home directory: ${runDir}`);
-  }
   const tempTrees = [...SHARED_TEMP_TREES, fs.realpathSync(os.tmpdir())];
-  if (isUnsafeReadRoot(runDir) || [...SYSTEM_READ_ROOTS, ...tempTrees].some((root) => isUnder(root, runDir))) {
-    throw new Error(`ensemble-ai: verify run dir must be a dedicated directory, not a shared root: ${runDir}`);
+  // Each scratch root is read, written and executed, so each must be a dedicated directory: not in
+  // home, and neither a shared root (system or temp, the operator's $TMPDIR included) nor an
+  // ancestor of one — `/private` would grant `/private/tmp`.
+  for (const root of scratch) {
+    if (isUnder(root, os.homedir())) {
+      throw new Error(`ensemble-ai: verify scratch must be outside your home directory: ${root}`);
+    }
+    if ([...SYSTEM_READ_ROOTS, ...tempTrees].some((shared) => isUnder(shared, root))) {
+      throw new Error(`ensemble-ai: verify scratch must be a dedicated directory, not a shared root: ${root}`);
+    }
   }
   // nodePrefix is re-granted after the temp-tree deny as well, so it may not reopen one either.
   if (tempTrees.some((root) => isUnder(root, nodePrefix))) {
     throw new Error(`ensemble-ai: verify nodePrefix cannot be or contain a shared temp tree: ${nodePrefix}`);
-  }
-  for (const root of [tmpDir, npmCache]) {
-    if (root === runDir || !isUnder(root, runDir)) {
-      throw new Error(`ensemble-ai: verify scratch must sit inside the run dir ${runDir}: ${root}`);
-    }
   }
   if (!Number.isInteger(p.proxyPort) || p.proxyPort < 1 || p.proxyPort > 65535) {
     throw new Error(`ensemble-ai: invalid verify proxy port: ${String(p.proxyPort)}`);
   }
   // Execution follows the same line as reads: never out of a shared temp tree (probed: a Mach-O in
   // /private/tmp or $TMPDIR still ran with its contents unreadable), only the toolchain roots, the
-  // node install and this run's own dir.
+  // node install and the scratch roots.
   const execRoots = SYSTEM_READ_ROOTS.filter((root) => !SHARED_TEMP_TREES.some((tree) => isUnder(tree, root)));
   return `(version 1)
 (deny default)
 (import "/System/Library/Sandbox/Profiles/dyld-support.sb")
 (allow process-fork)
-(allow process-exec ${sbSubpaths([...execRoots, nodePrefix, runDir])})
+(allow process-exec ${sbSubpaths([...execRoots, nodePrefix, ...scratch])})
 ;; Load-bearing: (deny default) alone leaves process-info open — verified, without this line a
 ;; sandboxed process lists every pid and reads its parent's path and KERN_PROCARGS2 (its environment).
 (deny process-info*)
@@ -320,10 +318,11 @@ export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
 (allow file-read-metadata)
 (allow file-read* ${sbSubpaths(SYSTEM_READ_ROOTS)})
 ;; Never another run's files: no contents or listings in the shared temp trees (metadata stays, so
-;; path resolution still works), then this run's own dir re-granted. Last match wins only between
-;; rules naming the SAME operations — a later (allow file-read* …) does not override this deny.
+;; path resolution still works), then only the node install and this run's scratch roots re-granted.
+;; Last match wins only between rules naming the SAME operations — a later (allow file-read* …)
+;; does not override this deny.
 (deny file-read-data file-read-xattr ${sbSubpaths(SHARED_TEMP_TREES)})
-(allow file-read-data file-read-xattr ${sbSubpaths([nodePrefix, runDir])})
+(allow file-read-data file-read-xattr ${sbSubpaths([nodePrefix, ...scratch])})
 (allow file-write* ${sbSubpaths(scratch)})
 (allow file-write-data (literal "/dev/null"))
 (allow network-outbound (remote ip "localhost:${p.proxyPort}"))
