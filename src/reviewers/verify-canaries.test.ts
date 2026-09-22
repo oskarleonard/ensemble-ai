@@ -84,6 +84,17 @@ describe.skipIf(process.platform !== 'darwin')('built verify fence: real sandbox
     expect(result.stdout.trim()).toBe('self-title-ok');
   });
 
+  it('allows test workers to terminate their own sandboxed children, not the trusted parent', async () => {
+    const result = await probe(`
+      const assert = require('node:assert/strict');
+      assert.throws(() => process.kill(process.ppid, 0), { code: 'EPERM' });
+      const child = require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 2000)']);
+      child.on('spawn', () => child.kill('SIGTERM'));
+      child.on('exit', (code, signal) => { assert.equal(signal, 'SIGTERM'); console.log('sandbox-child-only'); });
+    `);
+    expect(result.stdout.trim()).toBe('sandbox-child-only');
+  });
+
   it('denies a write outside every scratch write root with EPERM', async () => {
     const result = await probe(`
       require('node:assert/strict').throws(() => require('node:fs').writeFileSync(${JSON.stringify(outside)}, 'canary'), { code: 'EPERM' });

@@ -284,7 +284,8 @@ export function renderVerifySandboxProfile(p: VerifySandboxPaths): string {
 (allow file-map-executable)
 (allow ipc-posix-shm*)
 (allow sysctl-read ${VERIFY_SYSCTL_NAMES.map((name) => `(sysctl-name ${JSON.stringify(name)})`).join(' ')})
-(allow signal (target self))
+;; The test step must reap its worker processes; trusted host processes stay denied.
+(allow signal (target self) (target same-sandbox))
 (allow file-read-metadata)
 (allow file-read* ${sbSubpaths([...SYSTEM_READ_ROOTS, ...roots])})
 (allow file-write* ${sbSubpaths([p.worktree, p.tmpDir, p.npmCache])})
