@@ -2,7 +2,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { REVIEWER_IDS, type ReviewerConfig, type ReviewerId } from './types';
+import {
+  parseSeatWindow,
+  REVIEWER_IDS,
+  type ReviewerConfig,
+  type ReviewerId,
+} from './types';
 
 // Reviewers are CONFIG, not a hardcode — one JSON file controls every
 // cross-vendor reviewer, editable by hand or an agent; adding a third vendor
@@ -73,6 +78,14 @@ export function parseReviewers(
     // the object entirely when neither the override nor the default supplies one,
     // so a junk value can never weaken a reviewer that has no sandbox concept.
     const sandbox = str(r.sandbox, REVIEWER_DEFAULTS[id].sandbox ?? '');
+    // The two off-switches are the ONE case where config may subtract a seat, so they
+    // are read STRICTLY: `enabled` only when it is a literal boolean, `disabledUntil`
+    // only when it is an ISO instant carrying its zone (parseSeatWindow). Anything else
+    // drops the field and the seat stays ON — the same "junk can never silently disable
+    // a reviewer" rule as the rest of this parse, now that disabling is a thing config
+    // can legitimately say.
+    const enabled = typeof r.enabled === 'boolean' ? r.enabled : undefined;
+    const disabledUntil = parseSeatWindow(r.disabledUntil);
     out[id] = {
       cmd: str(r.cmd, REVIEWER_DEFAULTS[id].cmd),
       effort: str(r.effort, REVIEWER_DEFAULTS[id].effort),
@@ -80,6 +93,8 @@ export function parseReviewers(
       model: str(r.model, REVIEWER_DEFAULTS[id].model),
       vendor: str(r.vendor, REVIEWER_DEFAULTS[id].vendor),
       ...(sandbox ? { sandbox } : {}),
+      ...(disabledUntil === undefined ? {} : { disabledUntil }),
+      ...(enabled === undefined ? {} : { enabled }),
     };
   }
   return out;

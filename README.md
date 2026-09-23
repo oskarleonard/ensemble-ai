@@ -356,6 +356,23 @@ Every seat is **config, not a hardcode** — two JSON files under `~/.ensemble-a
 }
 ```
 
+- **Switching a seat OFF** — two independent fields, the one case where config may *subtract* a
+  seat. `"enabled": false` is the **indefinite** switch (off until an operator edits the file back);
+  `"disabledUntil": "2026-09-29T00:00:00Z"` is a **quota window** — the seat is off while `now <
+  disabledUntil` and comes back **by itself** once it passes, so losing a vendor to a usage limit is
+  one date and no restore step. A seat is off when either applies. Both are read STRICTLY — a
+  literal boolean, and an ISO 8601 date-time **carrying its zone** (`Z` or `±HH:MM`). Anything else
+  drops the field and the seat stays **on**: the junk-can-never-disable-a-seat rule above, extended
+  to the forms `Date.parse` would otherwise wave through (`2027`, `9/29/2026`, the impossible
+  `2027-02-30`, and a zone-less `2026-09-29T00:00:00`, which would mean two different moments on two
+  hosts). `enabledReviewerIds(config, now)` is the ONE owner of "which seats are on" — on **both**
+  entries (`ensemble-ai` and the browser-safe `ensemble-ai/contracts`, since it is pure), so a UI
+  greys a seat with the same rule a fan-out drops it by. Switch every seat off and it returns `[]`:
+  that is the FACT that no seat is on, and a consumer must read it **fail-closed** (nobody reviewed
+  the diff), never as a vacuously satisfied required-seat set. The `ensemble-ai` CLI's own fan-out
+  does not read it yet, so `ensemble-ai review` still runs every seat you name and `ensemble-ai
+  config` prints them all.
+
 **`~/.ensemble-ai/voices.json`** — the Claude **voices** (`claude` = the brainstorm/consult voice **and** the cold-Opus review reviewer) plus the **`gate`** seat (the verified-gate synthesizer). The gate takes **`model`, `effort`, and `vendor` only** — the spawn is always one of the two FENCED runners, picked by `vendor` (anthropic = `claude -p` under plan-mode + write-tool deny, the default; codex = the sandboxed, egress-fenced codex runner), so a `cmd` key on the `gate` seat is **ignored + warned** (the read-only posture can't be configured away). This makes "reviewer = Opus @ high, **gate = Fable @ max**" expressible:
 
 ```json
