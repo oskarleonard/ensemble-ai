@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
+import { listReviewers, parseReviewers, REVIEWER_DEFAULTS } from './reviewers';
+// The seat-switch predicate lives on the PURE contracts module (a UI imports it without
+// pulling node:fs); this file exercises it over configs the file parse produced.
 import {
   enabledReviewerIds,
-  listReviewers,
-  parseReviewers,
-  REVIEWER_DEFAULTS,
-} from './reviewers';
-import type { ReviewerConfig, ReviewerId } from './types';
+  type ReviewerConfig,
+  type ReviewerId,
+} from './types';
 
 describe('parseReviewers', () => {
   it('returns the baked default (codex · gpt-5.5 · xhigh) when config is absent', () => {
@@ -100,6 +101,18 @@ describe('parseReviewers — the seat off-switches', () => {
     expect(enabledReviewerIds(r)).toContain('codex');
   });
 
+  it('drops a window that is not an instant, so it cannot mean two things on two hosts', () => {
+    // A zone-less date-time is read in the HOST's timezone by Date.parse — the same
+    // file would end the window at a different moment on the dashboard than on a laptop.
+    const r = parseReviewers({
+      codex: { disabledUntil: '2026-09-29T00:00:00' },
+      grok: { disabledUntil: '2027' },
+    });
+    expect(r.codex.disabledUntil).toBeUndefined();
+    expect(r.grok.disabledUntil).toBeUndefined();
+    expect(enabledReviewerIds(r)).toEqual(['codex', 'grok', 'claude']);
+  });
+
   it('keeps enabled:true explicitly (an operator switching a seat back on)', () => {
     expect(parseReviewers({ grok: { enabled: true } }).grok.enabled).toBe(true);
   });
@@ -149,6 +162,14 @@ describe('enabledReviewerIds — the one owner of which seats are on', () => {
     expect(enabledReviewerIds(r, now)).toEqual(['grok', 'claude']);
   });
 
+  it('reads a window with an explicit offset as the INSTANT it names', () => {
+    // 02:00+02:00 IS 00:00Z — the seat is back on at that instant and not a moment before,
+    // on every host, because the offset (not the host's timezone) pins it.
+    const r = parseReviewers({ codex: { disabledUntil: '2026-09-29T02:00:00+02:00' } });
+    expect(enabledReviewerIds(r, new Date('2026-09-28T23:59:59Z'))).not.toContain('codex');
+    expect(enabledReviewerIds(r, new Date('2026-09-29T00:00:00Z'))).toContain('codex');
+  });
+
   it('can switch off more than one seat', () => {
     const r = parseReviewers({
       codex: { enabled: false },
@@ -157,15 +178,28 @@ describe('enabledReviewerIds — the one owner of which seats are on', () => {
     expect(enabledReviewerIds(r, now)).toEqual(['claude']);
   });
 
-  // The two shapes parseReviewers can never produce — only a consumer that hand-builds
-  // a config reaches them. Pinned here because the predicate leans on it: neither an
-  // unparseable window nor a missing entry may read as an off-switch.
-  it('ignores an unparseable disabledUntil a hand-built config carried', () => {
-    const r: Record<ReviewerId, ReviewerConfig> = {
+  it('returns [] when every seat is off — the FACT of no seats, never a clean bill', () => {
+    // A consumer whose required-seat set is this list must treat [] as fail-closed: no
+    // reviewer looked at the diff. Pinned so the empty case can never arrive unnoticed.
+    const r = parseReviewers({
+      claude: { enabled: false },
+      codex: { enabled: false },
+      grok: { disabledUntil: '2026-09-29T00:00:00Z' },
+    });
+    expect(enabledReviewerIds(r, now)).toEqual([]);
+  });
+
+  // The shapes parseReviewers can never produce — only a consumer that hand-builds a
+  // config reaches them. Pinned here because the predicate leans on it: neither a window
+  // the file parse would have dropped nor a missing entry may read as an off-switch.
+  it('ignores a disabledUntil a hand-built config carried that the file parse would drop', () => {
+    const hand = (disabledUntil: string): Record<ReviewerId, ReviewerConfig> => ({
       ...REVIEWER_DEFAULTS,
-      codex: { ...REVIEWER_DEFAULTS.codex, disabledUntil: 'next tuesday' },
-    };
-    expect(enabledReviewerIds(r, now)).toContain('codex');
+      codex: { ...REVIEWER_DEFAULTS.codex, disabledUntil },
+    });
+    expect(enabledReviewerIds(hand('next tuesday'), now)).toContain('codex');
+    expect(enabledReviewerIds(hand('2026-09-29T00:00:00'), now)).toContain('codex');
+    expect(enabledReviewerIds(hand('2027'), now)).toContain('codex');
   });
 
   it('reads a seat a hand-built config omits entirely as on, not a crash', () => {

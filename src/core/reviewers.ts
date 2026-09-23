@@ -2,7 +2,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { REVIEWER_IDS, type ReviewerConfig, type ReviewerId } from './types';
+import {
+  parseSeatWindow,
+  REVIEWER_IDS,
+  type ReviewerConfig,
+  type ReviewerId,
+} from './types';
 
 // Reviewers are CONFIG, not a hardcode — one JSON file controls every
 // cross-vendor reviewer, editable by hand or an agent; adding a third vendor
@@ -56,15 +61,6 @@ function str(v: unknown, fallback: string): string {
   return typeof v === 'string' && v.trim() ? v.trim() : fallback;
 }
 
-// An ISO instant, or undefined. Junk (a non-string, an unparseable date, nothing at
-// all) is DROPPED rather than kept — a garbled window must never switch a seat off by
-// accident. The value is stored as the operator wrote it (the parse only proves it is
-// a date), so a surface can render the original string.
-function isoInstant(v: unknown): string | undefined {
-  const value = typeof v === 'string' ? v.trim() : '';
-  return Number.isNaN(Date.parse(value)) ? undefined : value;
-}
-
 // Defensive parse: trust only well-formed per-reviewer overrides; anything
 // malformed falls back to the baked default for that id — a junk config can
 // never silently disable a reviewer or inject a bad model string.
@@ -84,11 +80,12 @@ export function parseReviewers(
     const sandbox = str(r.sandbox, REVIEWER_DEFAULTS[id].sandbox ?? '');
     // The two off-switches are the ONE case where config may subtract a seat, so they
     // are read STRICTLY: `enabled` only when it is a literal boolean, `disabledUntil`
-    // only when it parses as a date. Anything else drops the field and the seat stays
-    // ON — the same "junk can never silently disable a reviewer" rule as the rest of
-    // this parse, now that disabling is a thing config can legitimately say.
+    // only when it is an ISO instant carrying its zone (parseSeatWindow). Anything else
+    // drops the field and the seat stays ON — the same "junk can never silently disable
+    // a reviewer" rule as the rest of this parse, now that disabling is a thing config
+    // can legitimately say.
     const enabled = typeof r.enabled === 'boolean' ? r.enabled : undefined;
-    const disabledUntil = isoInstant(r.disabledUntil);
+    const disabledUntil = parseSeatWindow(r.disabledUntil);
     out[id] = {
       cmd: str(r.cmd, REVIEWER_DEFAULTS[id].cmd),
       effort: str(r.effort, REVIEWER_DEFAULTS[id].effort),
@@ -123,28 +120,4 @@ export function resolveReviewer(
 export function listReviewers(file: string = REVIEWERS_FILE): ReviewerConfig[] {
   const all = loadReviewers(file);
   return REVIEWER_IDS.map((id) => all[id]);
-}
-
-// Is ONE seat switched off at `now`? The rule, in one place: a seat is off when it is
-// explicitly `enabled: false` (the indefinite switch) OR it is inside its
-// `disabledUntil` quota window. The window expiring turns the seat back on with no
-// restore step; `enabled: false` does not expire.
-function seatOff(config: ReviewerConfig | undefined, now: Date): boolean {
-  if (config?.enabled === false) return true;
-  // No window, or an unparseable one a hand-built config carried (parseReviewers drops
-  // junk before it can get here), parses to NaN — and every comparison against NaN is
-  // false, so neither can ever read as an off-switch.
-  return now.getTime() < Date.parse(config?.disabledUntil ?? '');
-}
-
-// THE ONE OWNER of "which reviewer seats are on". Every fan-out, every required-seat
-// set, and every UI that greys a seat reads this — a second predicate anywhere would
-// let a fired review and the gate that grades it disagree about who was supposed to
-// run. Returns ids in canonical REVIEWER_IDS order. An operator switching a seat off
-// is NOT a missing reviewer: the set this returns IS the roster the run is judged by.
-export function enabledReviewerIds(
-  config: Record<ReviewerId, ReviewerConfig>,
-  now: Date = new Date()
-): ReviewerId[] {
-  return REVIEWER_IDS.filter((id) => !seatOff(config[id], now));
 }

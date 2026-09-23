@@ -62,13 +62,76 @@ export interface ReviewerConfig {
   // Is this seat switched on? Absent = true (the default for every seat). `false` is
   // the INDEFINITE switch-off — it stays off until an operator edits the file back.
   // The two off-switches are independent: a seat is off when `enabled === false` OR
-  // it is inside its `disabledUntil` window. enabledReviewerIds (core/reviewers) is
-  // the ONE owner of that rule; nothing else may re-derive it.
+  // it is inside its `disabledUntil` window. enabledReviewerIds (just below) is the
+  // ONE owner of that rule; nothing else may re-derive it.
   enabled?: boolean;
   id: ReviewerId;
   model: string;
   sandbox?: string;
   vendor: string;
+}
+
+// ── The seat off-switches ────────────────────────────────────────────────────
+// Both predicates are PURE, so they live beside the type they read instead of in the
+// fs-backed core/reviewers: a UI that greys a switched-off seat imports
+// `ensemble-ai/contracts`, which must never pull `node:fs` into a bundle — and a second
+// copy of the rule, written to keep a bundler happy, is exactly the drift the one-owner
+// rule exists to stop.
+
+// The shape of an INSTANT: a full ISO 8601 date-time carrying its zone (`Z` or ±HH:MM).
+// A zone-less date-time is NOT an instant — Date.parse reads it in the HOST's timezone,
+// so a dashboard and a CLI on two machines would disagree about when a seat comes back —
+// and the looser forms Date.parse also takes (a bare `2027`, `9/29/2026`, `Sep 29 2026`)
+// are junk that must never switch a seat off.
+const ISO_INSTANT =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+// The ONE parse of a seat's `disabledUntil` window: the instant as the operator wrote
+// it, or undefined for anything else. Kept VERBATIM rather than canonicalized — an
+// explicit zone already pins the instant, so rewriting `+02:00` into `Z` would only cost
+// a surface the string it was given. Exported so an operator-facing field can validate a
+// typed window with the SAME rule the config file gets.
+export function parseSeatWindow(v: unknown): string | undefined {
+  const value = typeof v === 'string' ? v.trim() : '';
+  if (!ISO_INSTANT.test(value) || Number.isNaN(Date.parse(value))) return undefined;
+  // Date.parse range-checks the month and the clock but ROLLS an impossible day over
+  // (2027-02-30 reads as 2027-03-02 — two days of seat-off nobody asked for), so the
+  // calendar day is checked here: a date that does not exist is junk, and junk may not
+  // disable a seat.
+  const [year, month, day] = value.slice(0, 10).split('-').map(Number);
+  const asWritten = new Date(Date.UTC(year, month - 1, day));
+  return asWritten.getUTCMonth() === month - 1 && asWritten.getUTCDate() === day
+    ? value
+    : undefined;
+}
+
+// Is ONE seat switched off at `now`? The rule, in one place: a seat is off when it is
+// explicitly `enabled: false` (the indefinite switch) OR it is inside its
+// `disabledUntil` quota window. The window expiring turns the seat back on with no
+// restore step; `enabled: false` does not expire.
+function seatOff(config: ReviewerConfig | undefined, now: Date): boolean {
+  if (config?.enabled === false) return true;
+  // The window goes through the SAME parse the config file gets, so a config built by
+  // hand cannot disable a seat with a string reviewers.json would have dropped. An
+  // absent or rejected window parses to NaN, and every comparison against NaN is false.
+  return now.getTime() < Date.parse(parseSeatWindow(config?.disabledUntil) ?? '');
+}
+
+// THE ONE OWNER of "which reviewer seats are on". Every fan-out, every required-seat
+// set, and every UI that greys a seat reads this — a second predicate anywhere would
+// let a fired review and the gate that grades it disagree about who was supposed to
+// run. Returns ids in canonical REVIEWER_IDS order. An operator switching a seat off
+// is NOT a missing reviewer: the set this returns IS the roster the run is judged by.
+//
+// EMPTY IS A REAL ANSWER: switch every seat off and this returns `[]` — the FACT that
+// no seat is on, never a clean bill. A consumer whose required-seat set is this list
+// MUST treat an empty one as fail-closed (no reviewer looked at the diff), the way an
+// empty `--reviewers` list is refused outright rather than read as "nothing required".
+export function enabledReviewerIds(
+  config: Record<ReviewerId, ReviewerConfig>,
+  now: Date = new Date()
+): ReviewerId[] {
+  return REVIEWER_IDS.filter((id) => !seatOff(config[id], now));
 }
 
 export const SEVERITIES = ['high', 'medium', 'low'] as const;

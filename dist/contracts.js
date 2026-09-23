@@ -15,6 +15,21 @@ function parseReviewerIds(raw) {
   const ids = [...new Set(raw.filter(isReviewerId))];
   return ids.length > 0 ? ids : void 0;
 }
+var ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/;
+function parseSeatWindow(v) {
+  const value = typeof v === "string" ? v.trim() : "";
+  if (!ISO_INSTANT.test(value) || Number.isNaN(Date.parse(value))) return void 0;
+  const [year, month, day] = value.slice(0, 10).split("-").map(Number);
+  const asWritten = new Date(Date.UTC(year, month - 1, day));
+  return asWritten.getUTCMonth() === month - 1 && asWritten.getUTCDate() === day ? value : void 0;
+}
+function seatOff(config, now) {
+  if (config?.enabled === false) return true;
+  return now.getTime() < Date.parse(parseSeatWindow(config?.disabledUntil) ?? "");
+}
+function enabledReviewerIds(config, now = /* @__PURE__ */ new Date()) {
+  return REVIEWER_IDS.filter((id) => !seatOff(config[id], now));
+}
 var SEVERITIES = ["high", "medium", "low"];
 function severityAtLeast(severity, floor) {
   const s = SEVERITIES.indexOf(severity);
@@ -485,6 +500,7 @@ export {
   TERMINAL_STATES,
   TRUNCATION_MARKER_RE,
   assembleCodePacket,
+  enabledReviewerIds,
   evidenceRef,
   extractJsonBlock,
   isCoreReviewerId,
@@ -492,6 +508,7 @@ export {
   oneOf,
   parseFindings,
   parseReviewerIds,
+  parseSeatWindow,
   renderReviewPrompt,
   reviewerVisibleDiff,
   section,

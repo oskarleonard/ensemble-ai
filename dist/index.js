@@ -21,6 +21,21 @@ function parseReviewerIds(raw) {
   const ids = [...new Set(raw.filter(isReviewerId))];
   return ids.length > 0 ? ids : void 0;
 }
+var ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/;
+function parseSeatWindow(v) {
+  const value = typeof v === "string" ? v.trim() : "";
+  if (!ISO_INSTANT.test(value) || Number.isNaN(Date.parse(value))) return void 0;
+  const [year, month, day] = value.slice(0, 10).split("-").map(Number);
+  const asWritten = new Date(Date.UTC(year, month - 1, day));
+  return asWritten.getUTCMonth() === month - 1 && asWritten.getUTCDate() === day ? value : void 0;
+}
+function seatOff(config, now) {
+  if (config?.enabled === false) return true;
+  return now.getTime() < Date.parse(parseSeatWindow(config?.disabledUntil) ?? "");
+}
+function enabledReviewerIds(config, now = /* @__PURE__ */ new Date()) {
+  return REVIEWER_IDS.filter((id) => !seatOff(config[id], now));
+}
 var SEVERITIES = ["high", "medium", "low"];
 function severityAtLeast(severity, floor) {
   const s = SEVERITIES.indexOf(severity);
@@ -1274,10 +1289,6 @@ var REVIEWER_DEFAULTS = {
 function str(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
-function isoInstant(v) {
-  const value = typeof v === "string" ? v.trim() : "";
-  return Number.isNaN(Date.parse(value)) ? void 0 : value;
-}
 function parseReviewers(raw) {
   const out = { ...REVIEWER_DEFAULTS };
   if (!raw || typeof raw !== "object") return out;
@@ -1288,7 +1299,7 @@ function parseReviewers(raw) {
     const r = e;
     const sandbox = str(r.sandbox, REVIEWER_DEFAULTS[id].sandbox ?? "");
     const enabled = typeof r.enabled === "boolean" ? r.enabled : void 0;
-    const disabledUntil = isoInstant(r.disabledUntil);
+    const disabledUntil = parseSeatWindow(r.disabledUntil);
     out[id] = {
       cmd: str(r.cmd, REVIEWER_DEFAULTS[id].cmd),
       effort: str(r.effort, REVIEWER_DEFAULTS[id].effort),
@@ -1315,13 +1326,6 @@ function resolveReviewer(id, file = REVIEWERS_FILE) {
 function listReviewers(file = REVIEWERS_FILE) {
   const all = loadReviewers(file);
   return REVIEWER_IDS.map((id) => all[id]);
-}
-function seatOff(config, now) {
-  if (config?.enabled === false) return true;
-  return now.getTime() < Date.parse(config?.disabledUntil ?? "");
-}
-function enabledReviewerIds(config, now = /* @__PURE__ */ new Date()) {
-  return REVIEWER_IDS.filter((id) => !seatOff(config[id], now));
 }
 
 // src/core/artifacts.ts
@@ -6399,6 +6403,7 @@ export {
   parseReviewSummaries,
   parseReviewerIds,
   parseReviewers,
+  parseSeatWindow,
   parseSynthesis,
   parseTrailerIds,
   parseVoiceIds,
