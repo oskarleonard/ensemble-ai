@@ -1274,6 +1274,11 @@ var REVIEWER_DEFAULTS = {
 function str(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
+function isoInstant(v) {
+  if (typeof v !== "string" || !v.trim()) return void 0;
+  const value = v.trim();
+  return Number.isNaN(Date.parse(value)) ? void 0 : value;
+}
 function parseReviewers(raw) {
   const out = { ...REVIEWER_DEFAULTS };
   if (!raw || typeof raw !== "object") return out;
@@ -1283,13 +1288,17 @@ function parseReviewers(raw) {
     if (!e || typeof e !== "object") continue;
     const r = e;
     const sandbox = str(r.sandbox, REVIEWER_DEFAULTS[id].sandbox ?? "");
+    const enabled = typeof r.enabled === "boolean" ? r.enabled : void 0;
+    const disabledUntil = isoInstant(r.disabledUntil);
     out[id] = {
       cmd: str(r.cmd, REVIEWER_DEFAULTS[id].cmd),
       effort: str(r.effort, REVIEWER_DEFAULTS[id].effort),
       id,
       model: str(r.model, REVIEWER_DEFAULTS[id].model),
       vendor: str(r.vendor, REVIEWER_DEFAULTS[id].vendor),
-      ...sandbox ? { sandbox } : {}
+      ...sandbox ? { sandbox } : {},
+      ...disabledUntil ? { disabledUntil } : {},
+      ...enabled === void 0 ? {} : { enabled }
     };
   }
   return out;
@@ -1307,6 +1316,16 @@ function resolveReviewer(id, file = REVIEWERS_FILE) {
 function listReviewers(file = REVIEWERS_FILE) {
   const all = loadReviewers(file);
   return REVIEWER_IDS.map((id) => all[id]);
+}
+function seatOff(config, now) {
+  if (!config) return false;
+  if (config.enabled === false) return true;
+  if (!config.disabledUntil) return false;
+  const until = Date.parse(config.disabledUntil);
+  return !Number.isNaN(until) && now.getTime() < until;
+}
+function enabledReviewerIds(config, now = /* @__PURE__ */ new Date()) {
+  return REVIEWER_IDS.filter((id) => !seatOff(config[id], now));
 }
 
 // src/core/artifacts.ts
@@ -6305,6 +6324,7 @@ export {
   defuseUntrusted,
   diffDigest,
   effectiveSshFrom,
+  enabledReviewerIds,
   ensureSandboxProfile,
   escapesRoot,
   evaluatePushFence,

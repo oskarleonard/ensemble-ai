@@ -53,7 +53,18 @@ export function parseReviewerIds(raw: unknown): ReviewerId[] | undefined {
 // the work). Codex bakes its own `-s read-only` and ignores this field.
 export interface ReviewerConfig {
   cmd: string;
+  // An ISO instant this seat stays switched OFF until — a QUOTA WINDOW. The seat is
+  // off while now < disabledUntil and comes back BY ITSELF once it passes, so an
+  // operator who loses a vendor to a usage limit writes one date and never has to
+  // remember a restore step. Absent = no window.
+  disabledUntil?: string;
   effort: string;
+  // Is this seat switched on? Absent = true (the default for every seat). `false` is
+  // the INDEFINITE switch-off — it stays off until an operator edits the file back.
+  // The two off-switches are independent: a seat is off when `enabled === false` OR
+  // it is inside its `disabledUntil` window. enabledReviewerIds (core/reviewers) is
+  // the ONE owner of that rule; nothing else may re-derive it.
+  enabled?: boolean;
   id: ReviewerId;
   model: string;
   sandbox?: string;

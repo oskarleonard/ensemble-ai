@@ -774,6 +774,11 @@ var REVIEWER_DEFAULTS = {
 function str(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
+function isoInstant(v) {
+  if (typeof v !== "string" || !v.trim()) return void 0;
+  const value = v.trim();
+  return Number.isNaN(Date.parse(value)) ? void 0 : value;
+}
 function parseReviewers(raw) {
   const out = { ...REVIEWER_DEFAULTS };
   if (!raw || typeof raw !== "object") return out;
@@ -783,13 +788,17 @@ function parseReviewers(raw) {
     if (!e || typeof e !== "object") continue;
     const r = e;
     const sandbox = str(r.sandbox, REVIEWER_DEFAULTS[id].sandbox ?? "");
+    const enabled = typeof r.enabled === "boolean" ? r.enabled : void 0;
+    const disabledUntil = isoInstant(r.disabledUntil);
     out[id] = {
       cmd: str(r.cmd, REVIEWER_DEFAULTS[id].cmd),
       effort: str(r.effort, REVIEWER_DEFAULTS[id].effort),
       id,
       model: str(r.model, REVIEWER_DEFAULTS[id].model),
       vendor: str(r.vendor, REVIEWER_DEFAULTS[id].vendor),
-      ...sandbox ? { sandbox } : {}
+      ...sandbox ? { sandbox } : {},
+      ...disabledUntil ? { disabledUntil } : {},
+      ...enabled === void 0 ? {} : { enabled }
     };
   }
   return out;
