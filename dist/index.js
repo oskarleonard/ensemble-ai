@@ -1275,8 +1275,7 @@ function str(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
 function isoInstant(v) {
-  if (typeof v !== "string" || !v.trim()) return void 0;
-  const value = v.trim();
+  const value = typeof v === "string" ? v.trim() : "";
   return Number.isNaN(Date.parse(value)) ? void 0 : value;
 }
 function parseReviewers(raw) {
@@ -1297,7 +1296,7 @@ function parseReviewers(raw) {
       model: str(r.model, REVIEWER_DEFAULTS[id].model),
       vendor: str(r.vendor, REVIEWER_DEFAULTS[id].vendor),
       ...sandbox ? { sandbox } : {},
-      ...disabledUntil ? { disabledUntil } : {},
+      ...disabledUntil === void 0 ? {} : { disabledUntil },
       ...enabled === void 0 ? {} : { enabled }
     };
   }
@@ -1318,11 +1317,8 @@ function listReviewers(file = REVIEWERS_FILE) {
   return REVIEWER_IDS.map((id) => all[id]);
 }
 function seatOff(config, now) {
-  if (!config) return false;
-  if (config.enabled === false) return true;
-  if (!config.disabledUntil) return false;
-  const until = Date.parse(config.disabledUntil);
-  return !Number.isNaN(until) && now.getTime() < until;
+  if (config?.enabled === false) return true;
+  return now.getTime() < Date.parse(config?.disabledUntil ?? "");
 }
 function enabledReviewerIds(config, now = /* @__PURE__ */ new Date()) {
   return REVIEWER_IDS.filter((id) => !seatOff(config[id], now));

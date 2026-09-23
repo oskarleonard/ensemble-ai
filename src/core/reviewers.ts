@@ -56,13 +56,12 @@ function str(v: unknown, fallback: string): string {
   return typeof v === 'string' && v.trim() ? v.trim() : fallback;
 }
 
-// An ISO instant, or undefined. Junk (a non-string, an unparseable date) is DROPPED
-// rather than kept — a garbled window must never switch a seat off by accident. The
-// value is stored as the operator wrote it (the parse only proves it is a date), so
-// a surface can render the original string.
+// An ISO instant, or undefined. Junk (a non-string, an unparseable date, nothing at
+// all) is DROPPED rather than kept — a garbled window must never switch a seat off by
+// accident. The value is stored as the operator wrote it (the parse only proves it is
+// a date), so a surface can render the original string.
 function isoInstant(v: unknown): string | undefined {
-  if (typeof v !== 'string' || !v.trim()) return undefined;
-  const value = v.trim();
+  const value = typeof v === 'string' ? v.trim() : '';
   return Number.isNaN(Date.parse(value)) ? undefined : value;
 }
 
@@ -97,7 +96,7 @@ export function parseReviewers(
       model: str(r.model, REVIEWER_DEFAULTS[id].model),
       vendor: str(r.vendor, REVIEWER_DEFAULTS[id].vendor),
       ...(sandbox ? { sandbox } : {}),
-      ...(disabledUntil ? { disabledUntil } : {}),
+      ...(disabledUntil === undefined ? {} : { disabledUntil }),
       ...(enabled === undefined ? {} : { enabled }),
     };
   }
@@ -131,13 +130,11 @@ export function listReviewers(file: string = REVIEWERS_FILE): ReviewerConfig[] {
 // `disabledUntil` quota window. The window expiring turns the seat back on with no
 // restore step; `enabled: false` does not expire.
 function seatOff(config: ReviewerConfig | undefined, now: Date): boolean {
-  if (!config) return false;
-  if (config.enabled === false) return true;
-  if (!config.disabledUntil) return false;
-  const until = Date.parse(config.disabledUntil);
-  // An unparseable value here can only come from a caller that built the config by
-  // hand (parseReviewers drops it) — refuse to read it as an off-switch.
-  return !Number.isNaN(until) && now.getTime() < until;
+  if (config?.enabled === false) return true;
+  // No window, or an unparseable one a hand-built config carried (parseReviewers drops
+  // junk before it can get here), parses to NaN — and every comparison against NaN is
+  // false, so neither can ever read as an off-switch.
+  return now.getTime() < Date.parse(config?.disabledUntil ?? '');
 }
 
 // THE ONE OWNER of "which reviewer seats are on". Every fan-out, every required-seat

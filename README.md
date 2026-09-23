@@ -356,6 +356,17 @@ Every seat is **config, not a hardcode** — two JSON files under `~/.ensemble-a
 }
 ```
 
+- **Switching a seat OFF** — two independent fields, the one case where config may *subtract* a
+  seat. `"enabled": false` is the **indefinite** switch (off until an operator edits the file back);
+  `"disabledUntil": "<ISO instant>"` is a **quota window** — the seat is off while `now <
+  disabledUntil` and comes back **by itself** once it passes, so losing a vendor to a usage limit is
+  one date and no restore step. A seat is off when either applies. Both are read STRICTLY (a literal
+  boolean; a string that parses as a date) — anything else drops the field and the seat stays **on**,
+  the junk-can-never-disable-a-seat rule above, preserved. `enabledReviewerIds(config, now)` is the
+  ONE owner of "which seats are on" and is exported for **library** consumers (the dashboard's
+  fan-out, its required-seat set, its UI); the `ensemble-ai` CLI's own fan-out does not read it yet,
+  so `ensemble-ai review` still runs every seat you name and `ensemble-ai config` prints them all.
+
 **`~/.ensemble-ai/voices.json`** — the Claude **voices** (`claude` = the brainstorm/consult voice **and** the cold-Opus review reviewer) plus the **`gate`** seat (the verified-gate synthesizer). The gate takes **`model`, `effort`, and `vendor` only** — the spawn is always one of the two FENCED runners, picked by `vendor` (anthropic = `claude -p` under plan-mode + write-tool deny, the default; codex = the sandboxed, egress-fenced codex runner), so a `cmd` key on the `gate` seat is **ignored + warned** (the read-only posture can't be configured away). This makes "reviewer = Opus @ high, **gate = Fable @ max**" expressible:
 
 ```json

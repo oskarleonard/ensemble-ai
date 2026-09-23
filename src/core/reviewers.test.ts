@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { enabledReviewerIds, listReviewers, parseReviewers } from './reviewers';
+import {
+  enabledReviewerIds,
+  listReviewers,
+  parseReviewers,
+  REVIEWER_DEFAULTS,
+} from './reviewers';
+import type { ReviewerConfig, ReviewerId } from './types';
 
 describe('parseReviewers', () => {
   it('returns the baked default (codex · gpt-5.5 · xhigh) when config is absent', () => {
@@ -149,5 +155,24 @@ describe('enabledReviewerIds — the one owner of which seats are on', () => {
       grok: { disabledUntil: '2026-09-29T00:00:00Z' },
     });
     expect(enabledReviewerIds(r, now)).toEqual(['claude']);
+  });
+
+  // The two shapes parseReviewers can never produce — only a consumer that hand-builds
+  // a config reaches them. Pinned here because the predicate leans on it: neither an
+  // unparseable window nor a missing entry may read as an off-switch.
+  it('ignores an unparseable disabledUntil a hand-built config carried', () => {
+    const r: Record<ReviewerId, ReviewerConfig> = {
+      ...REVIEWER_DEFAULTS,
+      codex: { ...REVIEWER_DEFAULTS.codex, disabledUntil: 'next tuesday' },
+    };
+    expect(enabledReviewerIds(r, now)).toContain('codex');
+  });
+
+  it('reads a seat a hand-built config omits entirely as on, not a crash', () => {
+    const r = { ...REVIEWER_DEFAULTS, codex: undefined } as unknown as Record<
+      ReviewerId,
+      ReviewerConfig
+    >;
+    expect(enabledReviewerIds(r, now)).toEqual(['codex', 'grok', 'claude']);
   });
 });
