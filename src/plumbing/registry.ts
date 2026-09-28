@@ -5,7 +5,7 @@
 // mutation. The CLI does the file I/O (which config files exist) and hands the
 // resolved rosters + paths here.
 
-import type { ReviewerConfig } from '../core/types';
+import { REVIEWER_IDS, type ReviewerConfig, type ReviewerId } from '../core/types';
 import type { VoiceConfig } from '../modes/brainstorm/types';
 import type { SeatSource } from '../modes/review/gate-seat';
 
@@ -23,9 +23,18 @@ export interface GateSeatView {
 }
 
 export interface RegistryView {
+  // The seats that are ON right now — `enabledReviewerIds` resolved at print time, the ONE
+  // owner of the off-switch rule, so a consumer that fans out through the CLI (rather than the
+  // library) can read the roster here instead of re-deriving it from `disabledUntil` itself.
+  enabledReviewerIds: ReviewerId[];
   // The review-synthesis GATE (resolved from the voices.json `gate` seat → claude voice → Opus).
   gate: GateSeatView;
-  // The review/security reviewer roster (from reviewers.json or baked defaults).
+  // Every seat that is OFF, with its quota window when that is what holds it off. `until` is
+  // null for an indefinite `enabled: false` (an `enabled: false` seat that also carries a date
+  // reports null too — the date is not what the switch honours). Same rule as the fan-out.
+  offSeats: OffSeat[];
+  // The review/security reviewer roster (from reviewers.json or baked defaults) — EVERY
+  // configured seat, on or off; `enabledReviewerIds` is what tells the two apart.
   reviewers: ReviewerConfig[];
   reviewersFile: string;
   reviewersFileExists: boolean;
@@ -35,12 +44,32 @@ export interface RegistryView {
   voicesFileExists: boolean;
 }
 
-// One agent row: `id     vendor · model @ effort[ · sandbox <name>]`. Shared by the
+export interface OffSeat {
+  id: ReviewerId;
+  until: string | null;
+}
+
+// The off seats, derived from ONE parsed config by the same predicate the fan-out uses —
+// never a second reading of `enabled`/`disabledUntil`.
+export function offSeatsOf(
+  config: Record<ReviewerId, ReviewerConfig>,
+  enabled: readonly ReviewerId[]
+): OffSeat[] {
+  const on = new Set<ReviewerId>(enabled);
+  return REVIEWER_IDS.filter((id) => !on.has(id)).map((id) => {
+    const c = config[id];
+    const until = c?.enabled === false ? null : (c?.disabledUntil ?? null);
+    return { id, until };
+  });
+}
+
+// One agent row: `id     vendor · model @ effort[ · sandbox <name>][ · OFF …]`. Shared by the
 // reviewer + voice sections so both render identically (a VoiceConfig is
-// structurally a ReviewerConfig — same fields).
-function agentLine(c: ReviewerConfig | VoiceConfig): string {
+// structurally a ReviewerConfig — same fields). Only reviewer rows can carry an OFF note.
+function agentLine(c: ReviewerConfig | VoiceConfig, off?: OffSeat): string {
   const sandbox = c.sandbox ? ` · sandbox ${c.sandbox}` : '';
-  return `    ${c.id.padEnd(7)} ${c.vendor} · ${c.model} @ ${c.effort}${sandbox}`;
+  const offNote = off ? (off.until ? ` · OFF until ${off.until}` : ' · OFF (enabled: false)') : '';
+  return `    ${c.id.padEnd(7)} ${c.vendor} · ${c.model} @ ${c.effort}${sandbox}${offNote}`;
 }
 
 function sourceNote(file: string, exists: boolean): string {
@@ -56,7 +85,12 @@ export function renderRegistry(view: RegistryView): string {
   out.push('');
   out.push('  review · security  (reviewers — the other vendor arbitrated by Munin)');
   out.push(`    config: ${sourceNote(view.reviewersFile, view.reviewersFileExists)}`);
-  for (const r of view.reviewers) out.push(agentLine(r));
+  for (const r of view.reviewers)
+    out.push(agentLine(r, view.offSeats.find((o) => o.id === r.id)));
+  if (view.offSeats.length > 0)
+    out.push(
+      `    on right now: ${view.enabledReviewerIds.length > 0 ? view.enabledReviewerIds.join(', ') : 'NONE — every seat is switched off'}`
+    );
   out.push('');
   out.push('  brainstorm · consult  (voices — Claude joins; no independence concern)');
   out.push(`    config: ${sourceNote(view.voicesFile, view.voicesFileExists)}`);

@@ -372,8 +372,12 @@ Every seat is **config, not a hardcode** — two JSON files under `~/.ensemble-a
   greys a seat with the same rule a fan-out drops it by. Switch every seat off and it returns `[]`:
   that is the FACT that no seat is on, and a consumer must read it **fail-closed** (nobody reviewed
   the diff), never as a vacuously satisfied required-seat set. The `ensemble-ai` CLI's own fan-out
-  does not read it yet, so `ensemble-ai review` still runs every seat you name and `ensemble-ai
-  config` prints them all.
+  does not read it yet, so `ensemble-ai review` still runs every seat you name. `ensemble-ai config`
+  prints every seat and marks the off ones (`· OFF until <instant>` / `· OFF (enabled: false)`), and
+  **`config --json` carries `enabledReviewerIds`** (resolved at print time by that one owner) plus
+  **`offSeats`** (`[{ id, until }]`, `until` null for an indefinite `enabled: false`) — so a consumer
+  that fans out through the CLI reads the roster there and passes `--reviewers` with the seats that
+  are on, instead of re-deriving the rule from the file.
 
 **`~/.ensemble-ai/voices.json`** — the Claude **voices** (`claude` = the brainstorm/consult voice **and** the cold-Opus review reviewer) plus the **`gate`** seat (the verified-gate synthesizer). The gate takes **`model`, `effort`, and `vendor` only** — the spawn is always one of the two FENCED runners, picked by `vendor` (anthropic = `claude -p` under plan-mode + write-tool deny, the default; codex = the sandboxed, egress-fenced codex runner), so a `cmd` key on the `gate` seat is **ignored + warned** (the read-only posture can't be configured away). This makes "reviewer = Opus @ high, **gate = Fable @ max**" expressible:
 

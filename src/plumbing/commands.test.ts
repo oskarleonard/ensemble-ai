@@ -53,6 +53,35 @@ describe('reviewers / config command', () => {
     expect(parsed.reviewersFileExists).toBe(false);
   });
 
+  it('--json carries the resolved enabled set + the off seats from a reviewers.json with switches', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-switch-'));
+    const reviewersFile = path.join(dir, 'reviewers.json');
+    fs.writeFileSync(
+      reviewersFile,
+      JSON.stringify({
+        codex: { enabled: false, model: 'gpt-5.5' },
+        grok: { disabledUntil: '2099-01-01T00:00:00Z', model: 'grok-4.5' },
+      })
+    );
+    const code = await main(['config', '--json', '--reviewers-file', reviewersFile, '--voices-file', '/nope.json']);
+    expect(code).toBe(0);
+    const parsed = JSON.parse(logged);
+    expect(parsed.enabledReviewerIds).toEqual(['claude']);
+    expect(parsed.offSeats).toEqual([
+      { id: 'codex', until: null },
+      { id: 'grok', until: '2099-01-01T00:00:00Z' },
+    ]);
+    // Every configured seat is still listed — the roster is the registry, on or off.
+    expect(parsed.reviewers.map((r: { id: string }) => r.id)).toEqual(['codex', 'grok', 'claude']);
+  });
+
+  it('--json with no switches: every seat on, offSeats empty', async () => {
+    await main(['config', '--json', '--reviewers-file', '/nope.json', '--voices-file', '/nope.json']);
+    const parsed = JSON.parse(logged);
+    expect(parsed.enabledReviewerIds).toEqual(['codex', 'grok', 'claude']);
+    expect(parsed.offSeats).toEqual([]);
+  });
+
   it('surfaces the resolved GATE seat (model · effort · source) from a voices.json fixture', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-gate-'));
     const voicesFile = path.join(dir, 'voices.json');
