@@ -256,6 +256,13 @@ Options:
                         packet (PR path only; default ON — a green job's warning that wraps an
                         error is exactly the evidence a seat never gathers on its own)
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
+  --optional-reviewers <ids>  cross-vendor core seats (codex/grok) whose FAILURE must not fail the
+                        run: a listed seat that crashes, times out or returns nothing is reported
+                        LOUDLY on stderr and the review stands on the seats that completed (exit
+                        0/4; --stage/--post-comment allowed). At least one reviewer must still
+                        complete, the claude producer stays required whenever it is on the roster,
+                        and no receipt is minted for a run with a failed seat, listed or not.
+                        Default: none — every seat is required and a failed seat is exit 1
   --strict-high         force STRICT: EVERY HIGH gates (exit 4), even one the gate dismissed —
                         overrides the provenance default (use for untrusted diffs / CI)
   --gate-dismissals     opt a FOREIGN diff (--pr/URL/stdin/--diff-file) INTO the gate's
@@ -327,8 +334,8 @@ default ONLY for LOCAL diffs (--working-tree/--staged/branch — the trusted sel
 STRICT for FOREIGN provenance (--pr/URL/stdin/--diff-file), where every HIGH gates. --strict-high
 forces STRICT anywhere; --gate-dismissals opts foreign provenance in. Dismissed HIGHs print loudly.
 
-Exit codes: 0 = completed, no gating HIGH (or gate disabled) · 1 = a reviewer failed
-(crash/timeout/no-parse) · 2 = blocked by the secret-scan · 3 = usage / no diff ·
+Exit codes: 0 = completed, no gating HIGH (or gate disabled) · 1 = a REQUIRED reviewer failed
+(crash/timeout/no-parse — see --optional-reviewers) · 2 = blocked by the secret-scan · 3 = usage / no diff ·
 4 = completed with a HIGH the gate did NOT dismiss (disable with --no-fail-on-high).`;
 
 const SECURITY_USAGE = `ensemble-ai security — adversarial SECURITY audit of a diff with ALL reviewers.
@@ -1076,6 +1083,8 @@ function reviewExitCode(opts: {
   cmd: string;
   highGate: ReturnType<typeof resolveHighGate>;
   noFailOnHigh: boolean;
+  // Core seats the CALLER accepts losing (`--optional-reviewers`, validated against the roster).
+  optionalReviewers: readonly ReviewerId[];
   result: ReviewModeResult;
 }): number {
   const {
@@ -1085,17 +1094,28 @@ function reviewExitCode(opts: {
     cmd,
     highGate,
     noFailOnHigh,
+    optionalReviewers,
     result,
   } = opts;
   // 2 = the diff was secret-scan BLOCKED — a hard stop; no trustworthy review ran, so it
   // outranks everything below.
   if (result.blocked) return 2;
-  // 1 = a reviewer failed to complete (crash / timeout / no parse) — the review is
-  // not trustworthy, so this outranks the findings gate below.
-  const allReviewed =
-    result.reviews.length > 0 &&
-    result.reviews.every((r) => r.terminalState === 'reviewed');
-  if (!allReviewed) return 1;
+  // 1 = a REQUIRED reviewer failed to complete (crash / timeout / no parse) — the review is
+  // not trustworthy, so this outranks the findings gate below. A seat the caller listed in
+  // `--optional-reviewers` is exempt: its failure is printed loudly and the run stands on the
+  // seats that completed. Born of incident 2026-09-28: one vendor's usage balance ran dry, and
+  // every review died on that single seat while the other core seat, the claude producer, the
+  // lens and the gate had all completed — the operator could not post one verified finding.
+  // Matching is by the persisted `reviewerId`; a review without one cannot be claimed optional.
+  const isOptional = (r: StoredReview): boolean =>
+    r.reviewerId !== undefined && optionalReviewers.includes(r.reviewerId);
+  const dead = result.reviews.filter((r) => r.terminalState !== 'reviewed');
+  if (result.reviews.length === 0 || dead.some((r) => !isOptional(r))) return 1;
+  for (const r of dead) {
+    console.error(
+      `ensemble-ai ${cmd}: ⚠ optional reviewer ${r.reviewerId} failed (${clean(r.summary).slice(0, 200)}) — the run continues WITHOUT it; this is NOT a full ${result.reviews.length + (claudeLayerExpected ? 1 : 0)}-reviewer pass`
+    );
+  }
   // The cold Opus (claude) reviewer is DEFAULT-ON — a THIRD reviewer, not an optional
   // extra. If it was in the roster but did NOT complete, the review is INCOMPLETE.
   // `--no-fail-on-high` does NOT suppress this — it only gates HIGH findings.
@@ -1112,6 +1132,15 @@ function reviewExitCode(opts: {
       );
       return 1;
     }
+  }
+  // A run must stand on at least ONE completed reviewer: with every core seat optional and every
+  // one of them dead, "nothing required failed" is not "something reviewed" — the gate judged an
+  // empty roster. Exit 1, never a clean 0 for a change no reviewer saw.
+  if (dead.length === result.reviews.length && !claudeLayerExpected) {
+    console.error(
+      `ensemble-ai ${cmd}: no reviewer completed — every optional seat failed and no other reviewer ran; review INCOMPLETE`
+    );
+    return 1;
   }
   // 4 = the findings GATE: a completed review surfaced a HIGH — from ANY of the three reviewers
   // (codex + grok + the cold Opus voice). The gate's DISMISS-ONLY authority may drop a HIGH ONLY
@@ -1182,6 +1211,7 @@ async function reviewCommand(
         'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
         'no-settle': { type: 'boolean' },
+        'optional-reviewers': { type: 'string' },
         'verify-confirmed': { type: 'boolean' },
         out: { type: 'string' },
         'post-comment': { type: 'boolean' },
@@ -1370,6 +1400,12 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // an explicit list threads the resolved core subset.
   const reviewers: ReviewerId[] | undefined =
     requestedReviewers === undefined ? undefined : roster.core;
+  // `--optional-reviewers`: the core seats whose failure the caller accepts (reviewExitCode).
+  // Fail closed on the list itself — an unknown id, a non-core id (the claude producer is never
+  // optional: it is the one reviewer an operator with no vendor credit still has), or a seat
+  // `--reviewers` left off this run is a usage error, never a silent no-op.
+  const optionalReviewers = resolveOptionalReviewers(values['optional-reviewers'], roster.core, cmd);
+  if ('code' in optionalReviewers) return optionalReviewers.code;
   const runId = typeof values['run-id'] === 'string' ? values['run-id'] : genRunId();
   // The trail BASE dir. `--out` overrides; otherwise repo-local when reviewing the cwd
   // repo's OWN diff, else a temp dir (resolveTrailBase — the diff-source-keyed fence).
@@ -1892,6 +1928,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
     cmd,
     highGate,
     noFailOnHigh: Boolean(values['no-fail-on-high']),
+    optionalReviewers,
     result,
   });
 
@@ -2497,6 +2534,37 @@ function parseReviewerList(
     return { code: 3 };
   }
   return parseReviewerIds(requested) as ReviewerId[];
+}
+
+// Parse `--optional-reviewers` (review/security): the CORE seats whose failure must not fail the
+// run. Only codex/grok qualify — the claude producer is the reviewer of last resort and is never
+// optional — and every listed seat must be on the run's resolved core roster, else the flag would
+// describe a seat that never runs. Absent → none (every seat required, the pre-flag contract).
+export function resolveOptionalReviewers(
+  raw: string | boolean | undefined,
+  rosterCore: readonly ReviewerId[],
+  cmd: string
+): ReviewerId[] | { code: number } {
+  if (typeof raw !== 'string') return [];
+  const ids = [...new Set(raw.split(',').map((s) => s.trim()).filter(Boolean))];
+  const nonCore = ids.filter((id) => !isCoreReviewerId(id));
+  if (ids.length === 0 || nonCore.length > 0) {
+    console.error(
+      `ensemble-ai ${cmd}: --optional-reviewers "${raw}" ${
+        ids.length === 0 ? 'is empty' : `names ${nonCore.join(', ')}`
+      } — only the cross-vendor core seats can be optional (${CORE_REVIEWER_IDS.join(', ')}); the claude producer is always required`
+    );
+    return { code: 3 };
+  }
+  const core = ids as ReviewerId[];
+  const offRoster = core.filter((id) => !rosterCore.includes(id));
+  if (offRoster.length > 0) {
+    console.error(
+      `ensemble-ai ${cmd}: --optional-reviewers names ${offRoster.join(', ')}, which --reviewers left off this run's roster (${rosterCore.join(', ')})`
+    );
+    return { code: 3 };
+  }
+  return core;
 }
 
 // Parse a fail-closed `--reviewers` list. Unlike review mode (where absent → undefined →

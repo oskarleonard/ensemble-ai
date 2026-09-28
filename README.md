@@ -56,11 +56,13 @@ ensemble-ai review --diff-file change.diff
 ensemble-ai review --reviewers codex,grok --out ./review-trail
 ```
 
-Options: `--base <ref>` · `--reviewers <ids>` · `--out <dir>` · `--sandbox <profile>` · `--allow-sensitive` · `--ceiling <bytes>` · `--cwd <dir>` · `--run-id <id>`.
+Options: `--base <ref>` · `--reviewers <ids>` · `--optional-reviewers <ids>` · `--out <dir>` · `--sandbox <profile>` · `--allow-sensitive` · `--ceiling <bytes>` · `--cwd <dir>` · `--run-id <id>`.
 
 The **trail** defaults to a repo-local `.ensemble-ai/reviews/<run-id>/` when you're reviewing the current repo's own diff (it's gitignored, discoverable beside the code); a URL-PR / raw-diff / stdin review, or a non-repo cwd, falls back to an OS temp dir so a diff from a *different* repo never writes into your cwd. Override the base with `--out <dir>`. Trail + receipt files are written owner-only (`0600`). The `review input`, `receipt:`, and `trail:` paths are printed on **stdout**.
 
-**Exit codes** (execution status, not a gate verdict): `0` = the review completed (even *with* findings) · `1` = a reviewer failed (crash / timeout / no parse) · `2` = blocked by the diff secret-scan · `3` = usage / no diff.
+**Exit codes** (execution status, not a gate verdict): `0` = the review completed (even *with* findings) · `1` = a **required** reviewer failed (crash / timeout / no parse) · `2` = blocked by the diff secret-scan · `3` = usage / no diff.
+
+**Optional seats — `--optional-reviewers <ids>`.** By default every seat on the roster must complete, or the run is exit `1` and nothing can be staged or posted. A vendor whose usage balance runs dry (incident 2026-09-28) then kills *every* review on that one seat, while the other core seat, the claude producer, the lens and the gate all completed. Listing a core seat (`codex` and/or `grok`) as optional changes exactly one thing: that seat's failure is printed **loudly** on stderr and in the per-seat block, and the run stands on the seats that completed — exit `0`/`4` as earned, `--stage`/`--post-comment` allowed, the gate judging the healthy voices as it already did. What does not change: the claude producer stays required whenever it is on the roster (it is never optional), at least one reviewer must still complete (every optional seat dead with nothing else on the roster is exit `1`), and **no receipt is minted** for a run with a failed seat, listed or not — the receipt is a fact about every required reviewer completing, and a degraded run is not that. `reseat` heals such a run exactly as it heals a failed one.
 
 ### The verified gate — dismiss-only exit authority (exit 4)
 

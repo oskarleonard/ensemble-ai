@@ -10062,6 +10062,13 @@ Options:
                         packet (PR path only; default ON \u2014 a green job's warning that wraps an
                         error is exactly the evidence a seat never gathers on its own)
   --no-fail-on-high     do NOT exit non-zero when a HIGH finding is present
+  --optional-reviewers <ids>  cross-vendor core seats (codex/grok) whose FAILURE must not fail the
+                        run: a listed seat that crashes, times out or returns nothing is reported
+                        LOUDLY on stderr and the review stands on the seats that completed (exit
+                        0/4; --stage/--post-comment allowed). At least one reviewer must still
+                        complete, the claude producer stays required whenever it is on the roster,
+                        and no receipt is minted for a run with a failed seat, listed or not.
+                        Default: none \u2014 every seat is required and a failed seat is exit 1
   --strict-high         force STRICT: EVERY HIGH gates (exit 4), even one the gate dismissed \u2014
                         overrides the provenance default (use for untrusted diffs / CI)
   --gate-dismissals     opt a FOREIGN diff (--pr/URL/stdin/--diff-file) INTO the gate's
@@ -10133,8 +10140,8 @@ default ONLY for LOCAL diffs (--working-tree/--staged/branch \u2014 the trusted 
 STRICT for FOREIGN provenance (--pr/URL/stdin/--diff-file), where every HIGH gates. --strict-high
 forces STRICT anywhere; --gate-dismissals opts foreign provenance in. Dismissed HIGHs print loudly.
 
-Exit codes: 0 = completed, no gating HIGH (or gate disabled) \xB7 1 = a reviewer failed
-(crash/timeout/no-parse) \xB7 2 = blocked by the secret-scan \xB7 3 = usage / no diff \xB7
+Exit codes: 0 = completed, no gating HIGH (or gate disabled) \xB7 1 = a REQUIRED reviewer failed
+(crash/timeout/no-parse \u2014 see --optional-reviewers) \xB7 2 = blocked by the secret-scan \xB7 3 = usage / no diff \xB7
 4 = completed with a HIGH the gate did NOT dismiss (disable with --no-fail-on-high).`;
 var SECURITY_USAGE = `ensemble-ai security \u2014 adversarial SECURITY audit of a diff with ALL reviewers.
 
@@ -10628,11 +10635,18 @@ function reviewExitCode(opts) {
     cmd,
     highGate,
     noFailOnHigh,
+    optionalReviewers,
     result
   } = opts;
   if (result.blocked) return 2;
-  const allReviewed = result.reviews.length > 0 && result.reviews.every((r) => r.terminalState === "reviewed");
-  if (!allReviewed) return 1;
+  const isOptional = (r) => r.reviewerId !== void 0 && optionalReviewers.includes(r.reviewerId);
+  const dead = result.reviews.filter((r) => r.terminalState !== "reviewed");
+  if (result.reviews.length === 0 || dead.some((r) => !isOptional(r))) return 1;
+  for (const r of dead) {
+    console.error(
+      `ensemble-ai ${cmd}: \u26A0 optional reviewer ${r.reviewerId} failed (${scrubControl(r.summary).slice(0, 200)}) \u2014 the run continues WITHOUT it; this is NOT a full ${result.reviews.length + (claudeLayerExpected ? 1 : 0)}-reviewer pass`
+    );
+  }
   if (claudeLayerExpected) {
     const claudeReviewed = claudeLayer?.claudeReview?.ok === true;
     if (!claudeReviewed) {
@@ -10642,6 +10656,12 @@ function reviewExitCode(opts) {
       );
       return 1;
     }
+  }
+  if (dead.length === result.reviews.length && !claudeLayerExpected) {
+    console.error(
+      `ensemble-ai ${cmd}: no reviewer completed \u2014 every optional seat failed and no other reviewer ran; review INCOMPLETE`
+    );
+    return 1;
   }
   if (!noFailOnHigh && (hasHighFinding(result.reviews) || claudeLayerHasHigh(claudeLayer))) {
     const detectedHighIds = [];
@@ -10695,6 +10715,7 @@ async function reviewCommand(args, profile = "code") {
         "no-conventions": { type: "boolean" },
         "no-fail-on-high": { type: "boolean" },
         "no-settle": { type: "boolean" },
+        "optional-reviewers": { type: "string" },
         "verify-confirmed": { type: "boolean" },
         out: { type: "string" },
         "post-comment": { type: "boolean" },
@@ -10793,6 +10814,8 @@ async function runReviewPipeline(input) {
     return 3;
   }
   const reviewers = requestedReviewers === void 0 ? void 0 : roster.core;
+  const optionalReviewers = resolveOptionalReviewers(values["optional-reviewers"], roster.core, cmd);
+  if ("code" in optionalReviewers) return optionalReviewers.code;
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
   const out = typeof values.out === "string" ? path18.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
@@ -11135,6 +11158,7 @@ async function runReviewPipeline(input) {
     cmd,
     highGate,
     noFailOnHigh: Boolean(values["no-fail-on-high"]),
+    optionalReviewers,
     result
   });
   if (postComment && source.postTarget && (exitCode === 0 || exitCode === 4)) {
@@ -11645,6 +11669,26 @@ function parseReviewerList(raw, cmd) {
     return { code: 3 };
   }
   return parseReviewerIds(requested);
+}
+function resolveOptionalReviewers(raw, rosterCore, cmd) {
+  if (typeof raw !== "string") return [];
+  const ids = [...new Set(raw.split(",").map((s) => s.trim()).filter(Boolean))];
+  const nonCore = ids.filter((id) => !isCoreReviewerId(id));
+  if (ids.length === 0 || nonCore.length > 0) {
+    console.error(
+      `ensemble-ai ${cmd}: --optional-reviewers "${raw}" ${ids.length === 0 ? "is empty" : `names ${nonCore.join(", ")}`} \u2014 only the cross-vendor core seats can be optional (${CORE_REVIEWER_IDS.join(", ")}); the claude producer is always required`
+    );
+    return { code: 3 };
+  }
+  const core = ids;
+  const offRoster = core.filter((id) => !rosterCore.includes(id));
+  if (offRoster.length > 0) {
+    console.error(
+      `ensemble-ai ${cmd}: --optional-reviewers names ${offRoster.join(", ")}, which --reviewers left off this run's roster (${rosterCore.join(", ")})`
+    );
+    return { code: 3 };
+  }
+  return core;
 }
 function parseRequiredReviewers(raw, cmd, defaultIds) {
   return raw === void 0 ? [...defaultIds] : parseReviewerList(raw, cmd);
@@ -12816,5 +12860,6 @@ if (isEntrypoint(import.meta.url)) {
 export {
   main,
   parseRequiredReviewers,
+  resolveOptionalReviewers,
   resolveTrailBase
 };
