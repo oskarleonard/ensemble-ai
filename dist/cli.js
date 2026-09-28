@@ -36,6 +36,13 @@ function parseSeatWindow(v) {
   const asWritten = new Date(Date.UTC(year, month - 1, day));
   return asWritten.getUTCMonth() === month - 1 && asWritten.getUTCDate() === day ? value : void 0;
 }
+function seatOff(config, now) {
+  if (config?.enabled === false) return true;
+  return now.getTime() < Date.parse(parseSeatWindow(config?.disabledUntil) ?? "");
+}
+function enabledReviewerIds(config, now = /* @__PURE__ */ new Date()) {
+  return REVIEWER_IDS.filter((id) => !seatOff(config[id], now));
+}
 var SEVERITIES = ["high", "medium", "low"];
 function severityAtLeast(severity, floor) {
   const s = SEVERITIES.indexOf(severity);
@@ -815,10 +822,6 @@ function loadReviewers(file = REVIEWERS_FILE) {
 }
 function resolveReviewer(id, file = REVIEWERS_FILE) {
   return loadReviewers(file)[id] ?? REVIEWER_DEFAULTS[id];
-}
-function listReviewers(file = REVIEWERS_FILE) {
-  const all = loadReviewers(file);
-  return REVIEWER_IDS.map((id) => all[id]);
 }
 
 // src/core/sanitize.ts
@@ -9848,9 +9851,18 @@ function renderPacketPreview(acquired, preview, opts) {
 }
 
 // src/plumbing/registry.ts
-function agentLine(c) {
+function offSeatsOf(config, enabled) {
+  const on = new Set(enabled);
+  return REVIEWER_IDS.filter((id) => !on.has(id)).map((id) => {
+    const c = config[id];
+    const until = c?.enabled === false ? null : c?.disabledUntil ?? null;
+    return { id, until };
+  });
+}
+function agentLine(c, off) {
   const sandbox = c.sandbox ? ` \xB7 sandbox ${c.sandbox}` : "";
-  return `    ${c.id.padEnd(7)} ${c.vendor} \xB7 ${c.model} @ ${c.effort}${sandbox}`;
+  const offNote = off ? off.until ? ` \xB7 OFF until ${off.until}` : " \xB7 OFF (enabled: false)" : "";
+  return `    ${c.id.padEnd(7)} ${c.vendor} \xB7 ${c.model} @ ${c.effort}${sandbox}${offNote}`;
 }
 function sourceNote(file, exists) {
   return exists ? file : `${file} \u2014 not present, using baked defaults`;
@@ -9862,7 +9874,12 @@ function renderRegistry(view) {
   out.push("");
   out.push("  review \xB7 security  (reviewers \u2014 the other vendor arbitrated by Munin)");
   out.push(`    config: ${sourceNote(view.reviewersFile, view.reviewersFileExists)}`);
-  for (const r of view.reviewers) out.push(agentLine(r));
+  for (const r of view.reviewers)
+    out.push(agentLine(r, view.offSeats.find((o) => o.id === r.id)));
+  if (view.offSeats.length > 0)
+    out.push(
+      `    on right now: ${view.enabledReviewerIds.length > 0 ? view.enabledReviewerIds.join(", ") : "NONE \u2014 every seat is switched off"}`
+    );
   out.push("");
   out.push("  brainstorm \xB7 consult  (voices \u2014 Claude joins; no independence concern)");
   out.push(`    config: ${sourceNote(view.voicesFile, view.voicesFileExists)}`);
@@ -11963,7 +11980,10 @@ async function reviewersCommand(args) {
   const reviewersFile = typeof values["reviewers-file"] === "string" ? path18.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
   const voicesFile = typeof values["voices-file"] === "string" ? path18.resolve(values["voices-file"]) : VOICES_FILE;
   const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`\xB7 ${m}`));
+  const reviewersConfig = loadReviewers(reviewersFile);
+  const enabledIds = enabledReviewerIds(reviewersConfig);
   const view = {
+    enabledReviewerIds: enabledIds,
     gate: {
       effort: gateSeat.config.effort,
       effortSource: gateSeat.effortSource,
@@ -11972,7 +11992,8 @@ async function reviewersCommand(args) {
       vendor: gateSeat.vendor,
       vendorSource: gateSeat.vendorSource
     },
-    reviewers: listReviewers(reviewersFile),
+    offSeats: offSeatsOf(reviewersConfig, enabledIds),
+    reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,
     reviewersFileExists: fs23.existsSync(reviewersFile),
     voices: listVoices(voicesFile),

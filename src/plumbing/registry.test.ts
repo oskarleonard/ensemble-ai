@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { ReviewerConfig } from '../core/types';
 import type { VoiceConfig } from '../modes/brainstorm/types';
 
-import { renderRegistry, type RegistryView } from './registry';
+import { offSeatsOf, renderRegistry, type RegistryView } from './registry';
 
 const reviewers: ReviewerConfig[] = [
   { cmd: 'codex', effort: 'xhigh', id: 'codex', model: 'gpt-5.5', vendor: 'openai' },
@@ -17,7 +17,9 @@ const voices: VoiceConfig[] = [
 
 function view(over: Partial<RegistryView> = {}): RegistryView {
   return {
+    enabledReviewerIds: ['codex', 'grok'],
     gate: { effort: 'default', effortSource: 'default', model: 'default', modelSource: 'default' },
+    offSeats: [],
     reviewers,
     reviewersFile: '/home/x/.ensemble-ai/reviewers.json',
     reviewersFileExists: true,
@@ -28,7 +30,55 @@ function view(over: Partial<RegistryView> = {}): RegistryView {
   };
 }
 
+describe('offSeatsOf', () => {
+  const cfg = {
+    claude: { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' },
+    codex: { cmd: 'codex', effort: 'xhigh', enabled: false, id: 'codex', model: 'gpt-5.5', vendor: 'openai' },
+    grok: { cmd: 'grok', disabledUntil: '2099-01-01T00:00:00Z', effort: 'high', id: 'grok', model: 'grok-4.5', vendor: 'xai' },
+  } as const;
+
+  it('lists every seat the enabled set leaves out, with its window only when the window holds it off', () => {
+    expect(offSeatsOf(cfg, ['claude'])).toEqual([
+      { id: 'codex', until: null },
+      { id: 'grok', until: '2099-01-01T00:00:00Z' },
+    ]);
+  });
+
+  it('an enabled:false seat that also carries a date reports null — the date is not what holds it off', () => {
+    const both = { ...cfg, codex: { ...cfg.codex, disabledUntil: '2099-01-01T00:00:00Z' } };
+    expect(offSeatsOf(both, ['claude', 'grok'])).toEqual([{ id: 'codex', until: null }]);
+  });
+
+  it('nothing off → empty', () => {
+    expect(offSeatsOf(cfg, ['codex', 'grok', 'claude'])).toEqual([]);
+  });
+});
+
 describe('renderRegistry', () => {
+  it('marks a switched-off seat on its own row and prints who is on', () => {
+    const out = renderRegistry(
+      view({
+        enabledReviewerIds: ['codex'],
+        offSeats: [{ id: 'grok', until: '2099-01-01T00:00:00Z' }],
+      })
+    );
+    expect(out).toContain('grok    xai · grok-4.5 @ high · sandbox ensemble-review · OFF until 2099-01-01T00:00:00Z');
+    expect(out).toContain('on right now: codex');
+    expect(out).not.toContain('codex   openai · gpt-5.5 @ xhigh · OFF');
+  });
+
+  it('an indefinite switch says so, and an all-off roster says NONE', () => {
+    const out = renderRegistry(
+      view({ enabledReviewerIds: [], offSeats: [{ id: 'codex', until: null }, { id: 'grok', until: null }] })
+    );
+    expect(out).toContain('OFF (enabled: false)');
+    expect(out).toContain('on right now: NONE — every seat is switched off');
+  });
+
+  it('with every seat on, the roster block is byte-identical to before (no "on right now" line)', () => {
+    expect(renderRegistry(view())).not.toContain('on right now');
+  });
+
   it('lists every reviewer + voice with vendor · model · effort', () => {
     const out = renderRegistry(view());
     // reviewers

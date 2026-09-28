@@ -16,10 +16,11 @@ import {
 } from './core/conventions';
 import { isEntrypoint } from './core/entrypoint';
 import { evidenceRef, SEVERITY_LABEL, SEVERITY_ORDER } from './core/findings';
-import { listReviewers, loadReviewers, resolveReviewer, REVIEWERS_FILE } from './core/reviewers';
+import { loadReviewers, resolveReviewer, REVIEWERS_FILE } from './core/reviewers';
 import { scrubControl as clean } from './core/sanitize';
 import {
   CORE_REVIEWER_IDS,
+  enabledReviewerIds,
   isCoreReviewerId,
   isReviewerId,
   parseReviewerIds,
@@ -151,7 +152,7 @@ import {
   renderConventionManifest,
   renderPacketPreview,
 } from './plumbing/diff-preview';
-import { renderRegistry, type RegistryView } from './plumbing/registry';
+import { offSeatsOf, renderRegistry, type RegistryView } from './plumbing/registry';
 import {
   formatReceipt,
   formatVerify,
@@ -2922,7 +2923,12 @@ async function reviewersCommand(args: string[]): Promise<number> {
   // The gate seat resolves from the SAME voices.json (no run flags here — `config` is a read-only
   // view, so source ∈ {file, default}); a junk/`cmd`-bearing entry warns loudly on stderr.
   const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`· ${m}`));
+  // ONE parse of reviewers.json feeds the roster, the enabled set and the off list, so the
+  // three cannot disagree about a `disabledUntil` boundary crossing between two reads.
+  const reviewersConfig = loadReviewers(reviewersFile);
+  const enabledIds = enabledReviewerIds(reviewersConfig);
   const view: RegistryView = {
+    enabledReviewerIds: enabledIds,
     gate: {
       effort: gateSeat.config.effort,
       effortSource: gateSeat.effortSource,
@@ -2931,7 +2937,8 @@ async function reviewersCommand(args: string[]): Promise<number> {
       vendor: gateSeat.vendor,
       vendorSource: gateSeat.vendorSource,
     },
-    reviewers: listReviewers(reviewersFile),
+    offSeats: offSeatsOf(reviewersConfig, enabledIds),
+    reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,
     reviewersFileExists: fs.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
