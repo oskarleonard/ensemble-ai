@@ -143,6 +143,107 @@ describe('exit code', () => {
   });
 });
 
+describe('--optional-reviewers (a listed core seat may die without failing the run)', () => {
+  const synthesis = {
+    agreements: [], bottomLine: 'ok', by: 'claude', degraded: false,
+    disagreements: [], ok: true, raw: null, summary: 's',
+  };
+
+  it('a listed seat that FAILED does not trip exit 1 — the run stands on the seats that completed', async () => {
+    mockRun.mockResolvedValue(
+      result({
+        reviews: [storedReview('codex', 'reviewed', 2, 'medium'), storedReview('grok', 'failed-reviewer')],
+      })
+    );
+    expect(await main(['review', '--working-tree', '--optional-reviewers', 'grok'])).toBe(0);
+    const err = vi.mocked(console.error).mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(err).toMatch(/optional reviewer grok failed/);
+  });
+
+  it('a HIGH from a seat that completed still gates (exit 4) when the optional seat died', async () => {
+    mockRun.mockResolvedValue(
+      result({
+        reviews: [storedReview('codex', 'reviewed', 1, 'high'), storedReview('grok', 'failed-reviewer')],
+      })
+    );
+    expect(await main(['review', '--working-tree', '--optional-reviewers', 'grok'])).toBe(4);
+    expect(
+      await main(['review', '--working-tree', '--optional-reviewers', 'grok', '--no-fail-on-high'])
+    ).toBe(0);
+  });
+
+  it('an UNLISTED seat failure is still exit 1 — the flag exempts only the seats it names', async () => {
+    mockRun.mockResolvedValue(
+      result({
+        reviews: [storedReview('codex', 'failed-reviewer'), storedReview('grok', 'reviewed')],
+      })
+    );
+    expect(await main(['review', '--working-tree', '--optional-reviewers', 'grok'])).toBe(1);
+  });
+
+  it('every optional seat dead and no other reviewer ran → exit 1, never a clean 0', async () => {
+    // No pinned prompt → the claude layer is not expected, so nothing reviewed at all.
+    mockRun.mockResolvedValue(
+      result({
+        reviews: [storedReview('codex', 'failed-reviewer'), storedReview('grok', 'failed-reviewer')],
+      })
+    );
+    expect(await main(['review', '--working-tree', '--optional-reviewers', 'codex,grok'])).toBe(1);
+  });
+
+  it('every optional seat dead but the claude producer completed → the run stands on claude (exit 0)', async () => {
+    mockRun.mockResolvedValue(
+      result({
+        prompt: 'PINNED',
+        reviews: [storedReview('codex', 'failed-reviewer'), storedReview('grok', 'failed-reviewer')],
+      })
+    );
+    mockLayer.mockResolvedValue({
+      claudeReview: { findings: [], ok: true, summary: 'clean', voiceId: 'claude' },
+      gateTrailWritten: true,
+      gateVerdicts: [],
+      modelLabel: 'opus',
+      synthesis,
+    });
+    expect(await main(['review', '--working-tree', '--optional-reviewers', 'codex,grok'])).toBe(0);
+  });
+
+  it('a FAILED claude producer is still exit 1 even with every core seat optional', async () => {
+    mockRun.mockResolvedValue(
+      result({ prompt: 'PINNED', reviews: [storedReview('codex', 'reviewed'), storedReview('grok', 'failed-reviewer')] })
+    );
+    mockLayer.mockResolvedValue({
+      claudeReview: { findings: [], ok: false, summary: 'claude produced no output', voiceId: 'claude' },
+      gateTrailWritten: true,
+      gateVerdicts: [],
+      modelLabel: 'opus',
+      synthesis,
+    });
+    expect(await main(['review', '--working-tree', '--optional-reviewers', 'codex,grok'])).toBe(1);
+  });
+
+  it('the claude producer can never be listed optional → exit 3, no review fired', async () => {
+    expect(await main(['review', '--working-tree', '--optional-reviewers', 'claude'])).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+
+  it('an unknown id, an empty list, or a seat --reviewers left off the roster → exit 3', async () => {
+    expect(await main(['review', '--working-tree', '--optional-reviewers', 'gemini'])).toBe(3);
+    expect(await main(['review', '--working-tree', '--optional-reviewers', ' , '])).toBe(3);
+    expect(
+      await main(['review', '--working-tree', '--reviewers', 'codex', '--optional-reviewers', 'grok'])
+    ).toBe(3);
+    expect(mockRun).not.toHaveBeenCalled();
+  });
+
+  it('absent → every seat required: a dead seat is exit 1 exactly as before', async () => {
+    mockRun.mockResolvedValue(
+      result({ reviews: [storedReview('codex', 'reviewed'), storedReview('grok', 'failed-reviewer')] })
+    );
+    expect(await main(['review', '--working-tree'])).toBe(1);
+  });
+});
+
 describe('mode dispatch + usage', () => {
   it('--help prints usage and exits 0 (no review fired)', async () => {
     expect(await main(['--help'])).toBe(0);
