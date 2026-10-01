@@ -66,20 +66,23 @@ afterEach(() => {
 });
 
 describe('readGrokLoginExpiry', () => {
-  it('returns ONLY a date — no credential field crosses the reader', () => {
+  it('returns ONLY dates — no credential field crosses the reader', () => {
     writeAuth({ 'https://auth.x.ai::a': entry('2026-10-01T07:12:01.872380Z') });
     const expiry = readGrokLoginExpiry(file);
-    expect(expiry).toBeInstanceOf(Date);
-    expect(expiry?.toISOString()).toBe('2026-10-01T07:12:01.872Z');
+    expect(expiry?.earliest).toBeInstanceOf(Date);
+    expect(expiry?.earliest.toISOString()).toBe('2026-10-01T07:12:01.872Z');
+    expect(expiry?.latest.toISOString()).toBe('2026-10-01T07:12:01.872Z');
     expect(JSON.stringify(expiry)).not.toMatch(/SECRET|someone@|Oidc|user-1/);
   });
 
-  it('takes the EARLIEST expiry across issuer entries', () => {
+  it('spans the EARLIEST and the LATEST expiry across issuer entries', () => {
     writeAuth({
       'https://auth.x.ai::a': entry('2026-10-01T07:12:01.872380Z'),
       'https://other.example::b': entry('2026-10-01T03:00:00.000000+00:00'),
     });
-    expect(readGrokLoginExpiry(file)?.toISOString()).toBe('2026-10-01T03:00:00.000Z');
+    const expiry = readGrokLoginExpiry(file);
+    expect(expiry?.earliest.toISOString()).toBe('2026-10-01T03:00:00.000Z');
+    expect(expiry?.latest.toISOString()).toBe('2026-10-01T07:12:01.872Z');
   });
 
   it('is null for a missing file, a non-JSON file, and entries with no usable expires_at', () => {
@@ -124,6 +127,16 @@ describe('ensureGrokLogin', () => {
     expect(path.dirname(run.cwd)).toBe(path.resolve(os.tmpdir()));
     expect(fs.existsSync(run.cwd)).toBe(false);
     expect(run.timeoutMs).toBeGreaterThan(0);
+  });
+
+  // A legacy entry grok never refreshes must not refuse every seat while the live login holds — but
+  // its short expiry still buys the one refresh, in case it is the login grok actually uses.
+  it('passes on the live login when a stale entry the refresh never touches stays short', async () => {
+    const stale = { 'https://legacy.example::old': entry(iso(NOW - 3 * 24 * 60 * MIN)) };
+    writeAuth({ ...stale, 'https://auth.x.ai::a': entry(iso(NOW + 5 * 60 * MIN)) });
+    const r = runner();
+    await expect(ensureGrokLogin(opts(r.run))).resolves.toBeUndefined();
+    expect(r.runs).toHaveLength(1);
   });
 
   it('throws the distinct error when the refresh does not extend the login — and never retries', async () => {

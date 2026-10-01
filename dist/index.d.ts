@@ -832,7 +832,10 @@ declare function isGrokLoginExpiryFailure(failWhy: string | undefined): boolean;
 declare class GrokLoginExpiryError extends Error {
     constructor(message: string);
 }
-declare function readGrokLoginExpiry(file?: string): Date | null;
+declare function readGrokLoginExpiry(file?: string): {
+    earliest: Date;
+    latest: Date;
+} | null;
 interface GrokModelsRun {
     args: string[];
     bin: string;

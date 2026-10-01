@@ -2260,15 +2260,16 @@ function readGrokLoginExpiry(file = GROK_AUTH_FILE) {
     return null;
   }
   if (typeof parsed !== "object" || parsed === null) return null;
-  let earliest = null;
+  const expiries = [];
   for (const entry of Object.values(parsed)) {
     if (typeof entry !== "object" || entry === null) continue;
     const expiresAt = entry.expires_at;
     if (typeof expiresAt !== "string") continue;
     const ms = Date.parse(expiresAt);
-    if (Number.isFinite(ms) && (earliest === null || ms < earliest)) earliest = ms;
+    if (Number.isFinite(ms)) expiries.push(ms);
   }
-  return earliest === null ? null : new Date(earliest);
+  if (expiries.length === 0) return null;
+  return { earliest: new Date(Math.min(...expiries)), latest: new Date(Math.max(...expiries)) };
 }
 async function runGrokModels(run) {
   await runReviewerExec({ ...run, capture: "stdout", stderrLimit: 1e3 });
@@ -2279,7 +2280,7 @@ async function ensureGrokLogin(opts) {
   const marginMs = opts.marginMs ?? GROK_LOGIN_MARGIN_MS;
   const needMs = opts.deadlineMs + marginMs;
   const before = readGrokLoginExpiry(file);
-  if (!before || before.getTime() - now() >= needMs) return;
+  if (!before || before.earliest.getTime() - now() >= needMs) return;
   const cwd = fs8.mkdtempSync(path6.join(os6.tmpdir(), "grok-login-"));
   try {
     await (opts.runModels ?? runGrokModels)({
@@ -2293,12 +2294,12 @@ async function ensureGrokLogin(opts) {
   } finally {
     fs8.rmSync(cwd, { force: true, recursive: true });
   }
-  const after = readGrokLoginExpiry(file);
+  const after = readGrokLoginExpiry(file)?.latest;
   if (after && after.getTime() - now() >= needMs) return;
   const deadline = new Date(now() + opts.deadlineMs).toISOString();
   const margin = `${Math.round(marginMs / 6e4)}-min margin`;
   throw new GrokLoginExpiryError(
-    after && after.getTime() > before.getTime() ? `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: even the freshly refreshed login (expires ${after.toISOString()}) ends before the seat's deadline (${deadline}) plus a ${margin} \u2014 the seat's timeout is longer than a grok login lives; shorten it.` : `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: the login expires ${(after ?? before).toISOString()}, before the seat's deadline (${deadline}) plus a ${margin}, and a refresh outside the sandbox did not extend it \u2014 run \`grok\` once to sign in, then re-run the review.`
+    after && after.getTime() > before.latest.getTime() ? `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: even the freshly refreshed login (expires ${after.toISOString()}) ends before the seat's deadline (${deadline}) plus a ${margin} \u2014 the seat's timeout is longer than a grok login lives; shorten it.` : `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: the login expires ${(after ?? before.latest).toISOString()}, before the seat's deadline (${deadline}) plus a ${margin}, and a refresh outside the sandbox did not extend it \u2014 run \`grok\` once to sign in, then re-run the review.`
   );
 }
 
