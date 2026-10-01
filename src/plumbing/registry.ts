@@ -105,10 +105,10 @@ export function renderRegistry(view: RegistryView): string {
   out.push(`    config: ${sourceNote(view.voicesFile, view.voicesFileExists)}`);
   for (const v of view.voices) out.push(agentLine(v));
   out.push('');
-  // The GATE (synthesis) seat — always claude -p; {model, effort} from the voices.json `gate`
-  // entry → the claude voice → the built-in Opus default. Sources shown so it's clear WHERE the
+  // The GATE (synthesis) seat — claude -p unless `gate.vendor` says codex; {model, effort} from the
+  // voices.json `gate` entry → the claude voice → the built-in Opus default, and its own `advisor`. Sources shown so it's clear WHERE the
   // resolved model/effort came from (flag/file/default) — the standing "which config" legibility.
-  out.push('  review synthesis  (the verified GATE — always claude -p; {model,effort} only)');
+  out.push('  review synthesis  (the verified GATE — claude -p unless gate.vendor is codex; {model,effort,advisor})');
   out.push(
     `    ${'gate'.padEnd(7)} ${view.gate.vendor ?? 'anthropic'} · ${view.gate.model} @ ${view.gate.effort}${advisorNote(view.gate.advisor)}  · source model:${view.gate.modelSource} · effort:${view.gate.effortSource}${view.gate.vendor && view.gate.vendor !== 'anthropic' ? ` · vendor:${view.gate.vendorSource ?? 'default'}` : ''}`
   );

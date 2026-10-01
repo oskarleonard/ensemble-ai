@@ -1471,6 +1471,7 @@ function persistReview(baseDir, input) {
       manifest: manifestOf(input.packet)
     },
     reviewer: {
+      ...input.reviewer.advisor === void 0 ? {} : { advisor: input.reviewer.advisor },
       effort: input.reviewer.effort,
       model: input.reviewer.model,
       vendor: input.reviewer.vendor

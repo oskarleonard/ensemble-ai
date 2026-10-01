@@ -263,7 +263,9 @@ export interface StoredReview {
   diagnostics?: SeatDiagnostics;
   findings: ReviewFinding[];
   packet: { complete: boolean; manifest: ManifestEntry[] };
-  reviewer: { effort: string; model: string; vendor: string };
+  // `advisor` is the Claude seat's stated advisor (a model id or "off"), recorded beside the model
+  // it advised; absent when the seat inherited the operator's settings (see ReviewerConfig.advisor).
+  reviewer: { advisor?: string; effort: string; model: string; vendor: string };
   reviewerId?: ReviewerId;
   runId: string;
   summary: string;

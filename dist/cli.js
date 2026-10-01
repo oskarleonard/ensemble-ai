@@ -187,6 +187,7 @@ function persistReview(baseDir, input) {
       manifest: manifestOf(input.packet)
     },
     reviewer: {
+      ...input.reviewer.advisor === void 0 ? {} : { advisor: input.reviewer.advisor },
       effort: input.reviewer.effort,
       model: input.reviewer.model,
       vendor: input.reviewer.vendor
@@ -10077,7 +10078,7 @@ function renderRegistry(view) {
   out.push(`    config: ${sourceNote(view.voicesFile, view.voicesFileExists)}`);
   for (const v of view.voices) out.push(agentLine(v));
   out.push("");
-  out.push("  review synthesis  (the verified GATE \u2014 always claude -p; {model,effort} only)");
+  out.push("  review synthesis  (the verified GATE \u2014 claude -p unless gate.vendor is codex; {model,effort,advisor})");
   out.push(
     `    ${"gate".padEnd(7)} ${view.gate.vendor ?? "anthropic"} \xB7 ${view.gate.model} @ ${view.gate.effort}${advisorNote(view.gate.advisor)}  \xB7 source model:${view.gate.modelSource} \xB7 effort:${view.gate.effortSource}${view.gate.vendor && view.gate.vendor !== "anthropic" ? ` \xB7 vendor:${view.gate.vendorSource ?? "default"}` : ""}`
   );
