@@ -3,17 +3,16 @@ import fs from 'node:fs';
 
 const binCache = new Map<string, string>();
 
-// Resolve a vendor CLI binary by name. An explicitly set env override is
-// AUTHORITATIVE: a set, non-empty `opts.envVar` returns that path if it exists and
-// THROWS if it does not — it never falls through to the candidates, the cache or
-// PATH, because an override is a pin (e.g. a canaried CLI copy) and silently
-// running a different binary is the opposite of what the pin is for. Unset or
-// empty → reviewer CLIs (codex, grok) live in places a bare/non-login env can't
-// see (nvm, ~/.local/bin), so resolution tries caller-supplied candidate paths,
-// then the login shell's PATH (`zsh -ic`), memoized by name (stable for the
-// process lifetime). The override path is never memoized — a stat per call is
-// nothing, and a throw must re-check. Throws if nothing resolves — a missing
-// reviewer CLI should fail loud, not silently skip the review.
+// Resolve a vendor CLI binary by name. A set, non-empty `opts.envVar` override is
+// AUTHORITATIVE: its path is returned if it exists and THROWS if it does not — never
+// falling through to the cache, the candidates or PATH, because an override is a pin
+// (e.g. a canaried CLI copy) and silently running another binary defeats it. It is
+// never memoized, so a throw re-checks on the next call. Without an override, reviewer
+// CLIs (codex, grok) live in places a bare/non-login env can't see (nvm,
+// ~/.local/bin), so resolution tries caller-supplied candidate paths, then the login
+// shell's PATH (`zsh -ic`), memoized by name (stable for the process lifetime).
+// Throws if nothing resolves — a missing reviewer CLI should fail loud, not silently
+// skip the review.
 export function resolveBin(
   name: string,
   opts: { candidates?: string[]; envVar?: string } = {}
