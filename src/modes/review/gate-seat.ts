@@ -118,11 +118,14 @@ function resolveField(
 // PURE: resolve the gate seat from the raw voices.json object + flag overrides. Emits warnings
 // through `warn` — a junk / `cmd`-bearing entry warns and falls through, never disabling the seat.
 // The one throw: an invalid `gate.advisor` on an anthropic gate (the advisor reaches its spawn).
+// `parseAdvisor` is that throw's one seam: `config`, the diagnosis, passes a parse that keeps the
+// value as written, so the row shows it beside the resolved vendor/model/effort.
 // Deterministic, so it is unit-tested directly for done-criterion 6.
 export function resolveGateSeat(
   raw: unknown,
   flags: GateSeatFlags,
-  warn: (m: string) => void
+  warn: (m: string) => void,
+  parseAdvisor: typeof parseSeatAdvisor = parseSeatAdvisor
 ): GateSeat {
   const root = plainObject(raw) ?? {};
 
@@ -175,7 +178,7 @@ export function resolveGateSeat(
   // in either direction — and is validated only then; anywhere else it is ignored loudly, like `cmd`.
   const advisorApplies = entryVendor === 'anthropic' && vendor === 'anthropic';
   const gateAdvisor =
-    gate && advisorApplies ? parseSeatAdvisor(gate.advisor, 'voices.json gate') : undefined;
+    gate && advisorApplies ? parseAdvisor(gate.advisor, 'voices.json gate') : undefined;
   if (gate && gate.advisor !== undefined && !advisorApplies)
     warn(
       `gate seat: \`advisor\` is ignored — it is a Claude-seat setting, and this gate (or its entry) is codex (got ${JSON.stringify(gate.advisor)}; not validated)`,
@@ -298,16 +301,18 @@ function readVoicesRaw(
 
 // Read + resolve the gate seat from a voices.json file (default ~/.ensemble-ai/voices.json). A
 // missing / unreadable / invalid file → an empty raw → the built-in default seat. Never throws on
-// the FILE; an invalid `advisor` on an anthropic gate throws (resolveGateSeat).
+// the FILE; an invalid `advisor` on an anthropic gate throws (resolveGateSeat, via `parseAdvisor`).
 export function loadGateSeat(
   file: string = VOICES_FILE,
   flags: GateSeatFlags = {},
   warn: (m: string) => void = () => {},
+  parseAdvisor: typeof parseSeatAdvisor = parseSeatAdvisor
 ): GateSeat {
   return resolveGateSeat(
     readVoicesRaw(file, warn, 'gate seat', 'using the claude voice / built-in default'),
     flags,
-    warn
+    warn,
+    parseAdvisor
   );
 }
 

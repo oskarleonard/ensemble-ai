@@ -12,9 +12,10 @@ import type { SeatSource } from '../modes/review/gate-seat';
 // The review-synthesis GATE seat, resolved for display: model/effort + where each came from
 // (flag/file/default). Always a `claude -p` spawn, so no cmd/sandbox/vendor variance to show.
 export interface GateSeatView {
-  // The anthropic gate's own advisor (a model id or "off"); absent = inherits the operator's
-  // ~/.claude/settings.json. Same field the claude voice row carries.
-  advisor?: string;
+  // The anthropic gate's own advisor AS WRITTEN (a model id or "off"; absent = inherits the
+  // operator's ~/.claude/settings.json). Carried like the claude voice row's: a value the rule
+  // rejects is kept and the row marks it, beside the seat's other resolved fields.
+  advisor?: unknown;
   effort: string;
   effortSource: SeatSource;
   model: string;
@@ -25,11 +26,12 @@ export interface GateSeatView {
   vendorSource?: SeatSource;
 }
 
-// The gate seat could not resolve: its `advisor` is invalid, so every command that spawns the gate
-// refuses. `config` is the diagnosis, so the refusal (seat-named, carrying the bad value) is what
-// the gate row shows — the view never throws.
-export interface GateSeatRefusal {
-  error: string;
+// The holistic LENS seat (`review --holistic --repo`), resolved for display: model/effort through
+// its own chain, and its advisor carried as written the same way. Always a `claude -p` spawn.
+export interface HolisticSeatView {
+  advisor?: unknown;
+  effort: string;
+  model: string;
 }
 
 export interface RegistryView {
@@ -38,7 +40,9 @@ export interface RegistryView {
   // library) can read the roster here instead of re-deriving it from `disabledUntil` itself.
   enabledReviewerIds: ReviewerId[];
   // The review-synthesis GATE (resolved from the voices.json `gate` seat → claude voice → Opus).
-  gate: GateSeatView | GateSeatRefusal;
+  gate: GateSeatView;
+  // The holistic lens (from the voices.json `holistic` entry → the built-in opus @ high).
+  holistic: HolisticSeatView;
   // Every seat that is OFF, with its quota window when that is what holds it off. `until` is
   // null for an indefinite `enabled: false` (an `enabled: false` seat that also carries a date
   // reports null too — the date is not what the switch honours). Same rule as the fan-out.
@@ -92,8 +96,7 @@ function advisorNote(advisor: unknown): string {
   return ` · advisor ${JSON.stringify(advisor)} (INVALID — a command that runs this seat refuses it)`;
 }
 
-function gateLine(gate: GateSeatView | GateSeatRefusal): string {
-  if ('error' in gate) return `    ${'gate'.padEnd(7)} INVALID — ${gate.error}`;
+function gateLine(gate: GateSeatView): string {
   return `    ${'gate'.padEnd(7)} ${gate.vendor ?? 'anthropic'} · ${gate.model} @ ${gate.effort}${advisorNote(gate.advisor)}  · source model:${gate.modelSource} · effort:${gate.effortSource}${gate.vendor && gate.vendor !== 'anthropic' ? ` · vendor:${gate.vendorSource ?? 'default'}` : ''}`;
 }
 
@@ -127,6 +130,11 @@ export function renderRegistry(view: RegistryView): string {
   // standing "which config" legibility.
   out.push('  review synthesis  (the verified GATE — claude -p unless gate.vendor is codex; {model,effort,advisor})');
   out.push(gateLine(view.gate));
+  out.push('');
+  out.push('  holistic lens  (review --holistic --repo — always claude -p; {model,effort,advisor})');
+  out.push(
+    `    holistic anthropic · ${view.holistic.model} @ ${view.holistic.effort}${advisorNote(view.holistic.advisor)}`
+  );
   out.push('');
   return out.join('\n');
 }
