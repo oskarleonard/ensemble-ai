@@ -29,14 +29,17 @@ vi.mock('./modes/review/self-contained', async (importActual) => ({
 }));
 
 import { main, toCommentGateSeat } from './cli';
-import { runReviewMode } from './modes/review';
+import { runReviewMode, type ReviewModeResult } from './modes/review';
 import { VOICE_DEFAULTS } from './modes/brainstorm/voices';
+import { runClaudeReviewLayer } from './modes/review/self-contained';
 
 const mockRun = vi.mocked(runReviewMode);
+const mockLayer = vi.mocked(runClaudeReviewLayer);
 const stderr = (): string => vi.mocked(console.error).mock.calls.map((c) => c.join(' ')).join('\n');
 
 beforeEach(() => {
   mockRun.mockReset();
+  mockLayer.mockReset();
   voiceCalls.length = 0;
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -49,16 +52,47 @@ afterAll(() => {
 });
 
 describe('review — an invalid Anthropic-seat advisor fails BEFORE the core fan-out (nothing billed)', () => {
-  it.each([
-    ['claude', {}],
-    ['gate', {}],
-    ['holistic', { holistic: true }],
-  ])('voices.json %s.advisor: exit 3, the seat named, runReviewMode never called', async (seat, o) => {
+  // The holistic lens refuses only on a run that can spawn it — with worktree evidence; that case
+  // lives beside the worktree harness (cli.worktree.test.ts).
+  it.each(['claude', 'gate'])('voices.json %s.advisor: exit 3, the seat named, runReviewMode never called', async (seat) => {
     fs.writeFileSync(VOICES, JSON.stringify({ [seat]: { advisor: 'Not A Model' } }));
-    const argv = ['review', '--working-tree', ...('holistic' in o ? ['--holistic'] : [])];
-    expect(await main(argv)).toBe(3);
+    expect(await main(['review', '--working-tree'])).toBe(3);
     expect(mockRun).not.toHaveBeenCalled();
     expect(stderr()).toContain(`voices.json ${seat} seat: \`advisor\``);
+  });
+
+  it('`--holistic` without `--repo` never spawns the lens, so its advisor is not read — the review runs and the skip stays loud', async () => {
+    fs.writeFileSync(VOICES, JSON.stringify({ holistic: { advisor: 'Not A Model' } }));
+    // A built packet (`prompt`), so the claude layer is expected and receives the lens request.
+    mockRun.mockResolvedValue({
+      acquired: {
+        baseRef: null,
+        baseSha: null,
+        canonicalDigest: 'sha256:x',
+        coverage: { files: [], includedBytes: 0, includedFiles: 0, omittedFiles: 0, totalBytes: 0, totalFiles: 0 },
+        diff: '',
+        files: [],
+        headSha: 'h'.repeat(40),
+        mode: 'working-tree',
+        rawDiff: '',
+        repoId: 'o/r',
+      },
+      blocked: false,
+      prompt: 'the packet',
+      reviews: [],
+      secretScan: { blocked: false, inlineSecrets: [], overridden: false, sensitivePaths: [] },
+    } as unknown as ReviewModeResult);
+    mockLayer.mockRejectedValue(new Error('layer reached'));
+    await main(['review', '--working-tree', '--holistic']);
+    expect(mockRun).toHaveBeenCalledOnce();
+    expect(stderr()).not.toContain('holistic seat: `advisor`');
+    // The request still reaches the layer (its presence is what renders the loud skip), with no
+    // seat config: the run has no worktree, so the lens seat was never resolved.
+    expect(mockLayer).toHaveBeenCalledOnce();
+    const opts = mockLayer.mock.calls[0][0];
+    expect(opts.holistic).toBeDefined();
+    expect(opts.holistic).not.toHaveProperty('config');
+    expect(opts.worktree).toBeUndefined();
   });
 
   it('`--no-claude` runs no Anthropic seat, so it reads none of their advisors', async () => {

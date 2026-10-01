@@ -695,6 +695,47 @@ describe('runClaudeReviewLayer — worktree producer timeout default', () => {
   });
 });
 
+describe('the holistic request without a resolved seat config', () => {
+  const layer = (runId: string, worktree?: string) => {
+    const base = tmpTrail();
+    seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    const prompts: string[] = [];
+    const run = async (prompt: string): Promise<VoiceRunResult> => {
+      prompts.push(prompt);
+      return okRun(prompt.includes('VERIFIED GATE') ? GATE : CLAUDE_REVIEW);
+    };
+    return {
+      prompts,
+      result: runClaudeReviewLayer({
+        baseDir: base,
+        claudeConfig: CFG,
+        coreReviews: [stored('codex'), stored('grok')],
+        expectedHeadSha: HEAD,
+        holistic: { baseSha: 'BASESHA1' },
+        includeClaudeReviewer: true,
+        pinnedDiff: GATE_DIFF,
+        reviewPrompt: 'REVIEW PROMPT PAYLOAD',
+        run,
+        runId,
+        ...(worktree ? { worktree } : {}),
+      }),
+    };
+  };
+
+  it('packet mode: the request alone renders the loud skip — the lens never needed a seat', async () => {
+    const r = await layer('holistic-no-config-packet').result;
+    expect(r.holisticReview).toBeNull();
+    expect(r.holisticSkipped).toMatch(/NO worktree evidence/);
+  });
+
+  it('worktree mode: a caller that did not resolve the seat is refused before the lens spawns', async () => {
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-wt-'));
+    const { prompts, result } = layer('holistic-no-config-worktree', wt);
+    await expect(result).rejects.toThrow(/needs the resolved lens seat/);
+    expect(prompts.filter((p) => p.includes('HOLISTIC / ARCHITECTURE lens'))).toEqual([]);
+  });
+});
+
 // ── The execution settler in the layer — default ON, worktree-gated, loud skip ─────────
 
 describe('the execution settler stage — gate-tagged findings settled by running', () => {

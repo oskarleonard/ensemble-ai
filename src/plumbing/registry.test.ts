@@ -19,6 +19,7 @@ function view(over: Partial<RegistryView> = {}): RegistryView {
   return {
     enabledReviewerIds: ['codex', 'grok'],
     gate: { effort: 'default', effortSource: 'default', model: 'default', modelSource: 'default' },
+    holistic: { effort: 'high', model: 'opus' },
     offSeats: [],
     reviewers,
     reviewersFile: '/home/x/.ensemble-ai/reviewers.json',
@@ -121,5 +122,38 @@ describe('renderRegistry', () => {
       .find((l) => l.trimStart().startsWith('gate'))!;
     expect(gateLine).toContain('anthropic · default @ default');
     expect(gateLine).toContain('model:default · effort:default');
+  });
+
+  it('an invalid gate advisor marks only the advisor — the resolved vendor, model, effort and sources stay', () => {
+    const gateLine = renderRegistry(
+      view({ gate: { advisor: null, effort: 'max', effortSource: 'file', model: 'fable', modelSource: 'file' } })
+    )
+      .split('\n')
+      .find((l) => l.trimStart().startsWith('gate'))!;
+    expect(gateLine).toContain('anthropic · fable @ max · advisor null (INVALID');
+    expect(gateLine).toContain('source model:file · effort:file');
+  });
+});
+
+describe('renderRegistry — the holistic lens row', () => {
+  const holisticLine = (holistic: RegistryView['holistic']): string =>
+    renderRegistry(view({ holistic }))
+      .split('\n')
+      .find((l) => l.startsWith('    holistic '))!;
+
+  it('a valid advisor is shown beside the lens model and effort', () => {
+    expect(holisticLine({ advisor: 'claude-fable-5-1', effort: 'max', model: 'fable' })).toBe(
+      '    holistic anthropic · fable @ max · advisor claude-fable-5-1'
+    );
+  });
+
+  it('an absent advisor shows nothing (the lens inherits the operator setting)', () => {
+    expect(holisticLine({ effort: 'high', model: 'opus' })).toBe('    holistic anthropic · opus @ high');
+  });
+
+  it('an invalid advisor is shown as written and marked, the model and effort kept', () => {
+    expect(holisticLine({ advisor: 7, effort: 'high', model: 'opus' })).toBe(
+      '    holistic anthropic · opus @ high · advisor 7 (INVALID — a command that runs this seat refuses it)'
+    );
   });
 });
