@@ -1,6 +1,10 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
-import { listReviewers, parseReviewers, REVIEWER_DEFAULTS } from './reviewers';
+import { listReviewers, loadReviewers, parseReviewers, REVIEWER_DEFAULTS } from './reviewers';
 // The seat-switch predicate lives on the PURE contracts module (a UI imports it without
 // pulling node:fs); this file exercises it over configs the file parse produced.
 import {
@@ -208,5 +212,42 @@ describe('enabledReviewerIds — the one owner of which seats are on', () => {
       ReviewerConfig
     >;
     expect(enabledReviewerIds(r, now)).toEqual(['codex', 'grok', 'claude']);
+  });
+});
+
+describe('parseReviewers — the claude seat\'s advisor', () => {
+  it('absent ⇒ no advisor key (the seat inherits the operator settings)', () => {
+    expect(parseReviewers({ claude: { model: 'opus' } }).claude).not.toHaveProperty('advisor');
+    expect(REVIEWER_DEFAULTS.claude).not.toHaveProperty('advisor');
+  });
+
+  it('carries a valid model id and "off" on the claude seat', () => {
+    expect(parseReviewers({ claude: { advisor: 'claude-fable-5-1' } }).claude.advisor).toBe('claude-fable-5-1');
+    expect(parseReviewers({ claude: { advisor: 'off' } }).claude.advisor).toBe('off');
+  });
+
+  it('an invalid advisor THROWS naming the seat — never a silent fallback to inheriting', () => {
+    for (const advisor of [null, '', 'Claude Opus', 7]) {
+      expect(() => parseReviewers({ claude: { advisor } })).toThrow(/reviewers\.json claude seat: `advisor`/);
+    }
+  });
+
+  it('only the claude seat reads it — an advisor key on codex/grok is an ignored unknown key', () => {
+    const out = parseReviewers({ codex: { advisor: 'NOT VALIDATED' }, grok: { advisor: 'off' } });
+    expect(out.codex).not.toHaveProperty('advisor');
+    expect(out.grok).not.toHaveProperty('advisor');
+  });
+
+  it('loadReviewers lets the advisor error through (only the READ falls back to defaults)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-advisor-'));
+    const file = path.join(dir, 'reviewers.json');
+    try {
+      fs.writeFileSync(file, JSON.stringify({ claude: { advisor: 'Opus!' } }));
+      expect(() => loadReviewers(file)).toThrow(/reviewers\.json claude seat: `advisor`/);
+      fs.writeFileSync(file, '{ not json');
+      expect(loadReviewers(file)).toEqual(REVIEWER_DEFAULTS);
+    } finally {
+      fs.rmSync(dir, { force: true, recursive: true });
+    }
   });
 });

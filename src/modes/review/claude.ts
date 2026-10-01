@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 
-import { resolveClaudeBin } from '../brainstorm/claude';
+import { claudeAdvisorArgs, resolveClaudeBin } from '../brainstorm/claude';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 import { isUnder, makeOwnerOnlyTempDir } from '../../core/artifacts';
@@ -123,14 +123,18 @@ export interface ClaudeSeatFence {
 // nothing until the end, so a fixed deadline was the only (work-killing) option. The final reply
 // is the `type:"result"` event's `result` field (extractStreamResult); the embedded ```json
 // findings block is then parsed from it exactly as before. Capability fence documented at the top
-// of this file. Honors the voice config's model/effort so a CONFIGURED Claude model runs.
+// of this file. Honors the voice config's model/effort/advisor so a CONFIGURED Claude model runs.
 //
 // `--disallowedTools` is variadic, so it goes LAST — nothing may follow it. `--add-dir` is variadic
-// too, so it is always followed immediately by `--strict-mcp-config`.
+// too, so it is always followed immediately by `--strict-mcp-config`. The advisor's `--settings`
+// sits between `--effort` and `--disallowedTools`, where it breaks neither. It is NOT a fence change
+// (no version bump): the settings object carries `advisorModel` alone, built in code — no config
+// value can add a permission, a tool, or an MCP server through it.
 //
 // THROWS when the read root lives inside the home directory: the home deny would then also deny the
 // worktree, and a seat that silently reviewed nothing is exactly the fail-open this fence exists to
-// prevent. Callers turn the throw into a loud, failed seat.
+// prevent. THROWS, too, on an invalid `advisor` (claudeAdvisorArgs). Callers turn the throw into a
+// loud, failed seat.
 export function buildClaudeReviewArgs(
   prompt: string,
   config?: VoiceConfig,
@@ -149,6 +153,7 @@ export function buildClaudeReviewArgs(
     args.push('--model', config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort))
     args.push('--effort', config.effort);
+  args.push(...claudeAdvisorArgs(config));
   args.push('--disallowedTools', ...CLAUDE_REVIEW_DENIED_TOOLS, ...homeReadDenyRules(homeDir));
   return args;
 }

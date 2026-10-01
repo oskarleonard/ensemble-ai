@@ -1,3 +1,7 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import { VOICE_IDS } from './types';
@@ -40,5 +44,26 @@ describe('parseVoices', () => {
 describe('loadVoices', () => {
   it('falls back to defaults when the file is missing/unreadable', () => {
     expect(loadVoices('/no/such/voices.json')).toEqual(VOICE_DEFAULTS);
+  });
+});
+
+describe('parseVoices / loadVoices — the claude voice\'s advisor', () => {
+  it('carries a model id or "off" on the claude voice; absent stays absent', () => {
+    expect(parseVoices({ claude: { advisor: 'claude-opus-5-5' } }).claude.advisor).toBe('claude-opus-5-5');
+    expect(parseVoices({ claude: { advisor: 'off' } }).claude.advisor).toBe('off');
+    expect(parseVoices({ claude: { model: 'opus' } }).claude).not.toHaveProperty('advisor');
+    expect(parseVoices({ codex: { advisor: 'off' } }).codex).not.toHaveProperty('advisor');
+  });
+
+  it('an invalid advisor throws naming the seat, and loadVoices does not swallow it', () => {
+    expect(() => parseVoices({ claude: { advisor: null } })).toThrow(/voices\.json claude seat: `advisor`/);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-advisor-'));
+    const file = path.join(dir, 'voices.json');
+    try {
+      fs.writeFileSync(file, JSON.stringify({ claude: { advisor: 'OFF' } }));
+      expect(() => loadVoices(file)).toThrow(/voices\.json claude seat: `advisor`/);
+    } finally {
+      fs.rmSync(dir, { force: true, recursive: true });
+    }
   });
 });

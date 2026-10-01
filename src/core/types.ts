@@ -52,6 +52,10 @@ export function parseReviewerIds(raw: unknown): ReviewerId[] | undefined {
 // boundary is the kernel, not tool-denial (a reviewer must provably never mutate
 // the work). Codex bakes its own `-s read-only` and ignores this field.
 export interface ReviewerConfig {
+  // The Claude seat's ADVISOR model — a model id, or "off". Absent = the seat inherits
+  // whatever the operator's ~/.claude/settings.json says. Read only on the claude seat;
+  // parseSeatAdvisor (below) is the one rule.
+  advisor?: string;
   cmd: string;
   // An ISO instant this seat stays switched OFF until — a QUOTA WINDOW. The seat is
   // off while now < disabledUntil and comes back BY ITSELF once it passes, so an
@@ -103,6 +107,30 @@ export function parseSeatWindow(v: unknown): string | undefined {
   return asWritten.getUTCMonth() === month - 1 && asWritten.getUTCDate() === day
     ? value
     : undefined;
+}
+
+// ── The Claude seat's advisor ────────────────────────────────────────────────
+// A headless `claude -p` seat silently inherits `advisorModel` from the operator's
+// ~/.claude/settings.json. The `advisor` field makes it explicit config, in exactly
+// three states: a model id (that advisor), "off" (no advisor, even when the operator's
+// settings enable one), or ABSENT (inherit — the key omitted, never null). Probed on
+// Claude Code 2.1.286 (2026-10-01): a `--settings` advisorModel overrides the user
+// setting, the empty string disables it, and null falls back to the user setting —
+// so null is not a spelling of any state here, and is rejected.
+export const ADVISOR_OFF = 'off';
+export const ADVISOR_MODEL_RE = /^[a-z0-9][a-z0-9.-]*$/;
+
+// The ONE parse of a seat's `advisor`: undefined when absent, the value when it is "off"
+// or a model id, and a THROW naming the seat for anything else. Unlike the other seat
+// fields, junk does not fall back to a default: the only fallback is "inherit the
+// operator's setting", which is exactly the accident this field exists to end. Pure and
+// exported on both entries, so a UI validates a typed value with the same rule.
+export function parseSeatAdvisor(v: unknown, seat: string): string | undefined {
+  if (v === undefined) return undefined;
+  if (v === ADVISOR_OFF || (typeof v === 'string' && ADVISOR_MODEL_RE.test(v))) return v;
+  throw new Error(
+    `ensemble-ai: ${seat} seat: \`advisor\` must be "${ADVISOR_OFF}" or a model id matching ${ADVISOR_MODEL_RE.source} (omit the key to inherit the operator's setting) — got ${JSON.stringify(v) ?? String(v)}`
+  );
 }
 
 // Is ONE seat switched off at `now`? The rule, in one place: a seat is off when it is

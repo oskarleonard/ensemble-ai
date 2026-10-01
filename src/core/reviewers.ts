@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  parseSeatAdvisor,
   parseSeatWindow,
   REVIEWER_IDS,
   type ReviewerConfig,
@@ -64,6 +65,12 @@ function str(v: unknown, fallback: string): string {
 // Defensive parse: trust only well-formed per-reviewer overrides; anything
 // malformed falls back to the baked default for that id — a junk config can
 // never silently disable a reviewer or inject a bad model string.
+//
+// THE ONE EXCEPTION is the claude seat's `advisor`: an invalid value THROWS
+// (parseSeatAdvisor, naming the seat) instead of falling back, because its only
+// fallback is "inherit the operator's settings" — the silent accident the field
+// exists to end. Only the claude seat reads it; another seat's `advisor` key is
+// an unknown key like any other.
 export function parseReviewers(
   raw: unknown
 ): Record<ReviewerId, ReviewerConfig> {
@@ -86,7 +93,9 @@ export function parseReviewers(
     // can legitimately say.
     const enabled = typeof r.enabled === 'boolean' ? r.enabled : undefined;
     const disabledUntil = parseSeatWindow(r.disabledUntil);
+    const advisor = id === 'claude' ? parseSeatAdvisor(r.advisor, `reviewers.json ${id}`) : undefined;
     out[id] = {
+      ...(advisor === undefined ? {} : { advisor }),
       cmd: str(r.cmd, REVIEWER_DEFAULTS[id].cmd),
       effort: str(r.effort, REVIEWER_DEFAULTS[id].effort),
       id,
@@ -100,14 +109,19 @@ export function parseReviewers(
   return out;
 }
 
+// A missing / unreadable / malformed-JSON file → the baked defaults. Only the READ
+// is caught: an invalid claude `advisor` throws out of parseReviewers and reaches
+// the caller (see above).
 export function loadReviewers(
   file: string = REVIEWERS_FILE
 ): Record<ReviewerId, ReviewerConfig> {
+  let raw: unknown;
   try {
-    return parseReviewers(JSON.parse(fs.readFileSync(file, 'utf8')));
+    raw = JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch {
     return { ...REVIEWER_DEFAULTS };
   }
+  return parseReviewers(raw);
 }
 
 export function resolveReviewer(

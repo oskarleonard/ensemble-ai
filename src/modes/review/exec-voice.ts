@@ -1,5 +1,5 @@
 import { runReviewerExec } from '../../core/spawn';
-import { resolveClaudeBin } from '../brainstorm/claude';
+import { claudeAdvisorArgs, resolveClaudeBin } from '../brainstorm/claude';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
@@ -35,7 +35,8 @@ import {
 // fan-out channel (Agent/Task — one exec seat is ONE conversation; a subagent multiplies
 // subscription burn) and the web tools (experiments are local; research is the reviewers' job)
 // off. Bash/Read/Write/Edit stay: they are the whole point. No home-read deny and no neutral cwd —
-// see the operator-decision block above. `--disallowedTools` is variadic, so it goes LAST.
+// see the operator-decision block above. The seat's advisor rides `--settings` (claudeAdvisorArgs)
+// like every other claude seat. `--disallowedTools` is variadic, so it goes LAST.
 export function buildClaudeExecArgs(prompt: string, config?: VoiceConfig): string[] {
   const args = [
     '-p',
@@ -49,6 +50,7 @@ export function buildClaudeExecArgs(prompt: string, config?: VoiceConfig): strin
   ];
   if (config?.model && config.model !== 'default') args.push('--model', config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort)) args.push('--effort', config.effort);
+  args.push(...claudeAdvisorArgs(config));
   args.push('--disallowedTools', 'Agent', 'Task', 'WebFetch', 'WebSearch');
   return args;
 }

@@ -342,3 +342,50 @@ describe('resolveGateSeat — vendor axis (anthropic default · codex = the shad
     expect(warnings.some((w) => w.includes('`cmd` is ignored'))).toBe(true);
   });
 });
+
+describe('the advisor on the gate + claude reviewer seats — own entry only, never inherited', () => {
+  const settingsOf = (args: string[]): unknown =>
+    args.includes('--settings') ? JSON.parse(args[args.indexOf('--settings') + 1]) : undefined;
+
+  it('the gate reads its OWN `gate.advisor` and the argv carries it', () => {
+    const { seat } = resolve({ gate: { advisor: 'claude-fable-5-1', model: 'opus' } });
+    expect(seat.config.advisor).toBe('claude-fable-5-1');
+    expect(settingsOf(buildClaudeReviewArgs('P', seat.config))).toEqual({ advisorModel: 'claude-fable-5-1' });
+    expect(resolve({ gate: { advisor: 'off' } }).seat.config.advisor).toBe('off');
+  });
+
+  it('NO gate → claude inheritance: a claude-entry advisor leaves the gate inheriting the operator setting', () => {
+    const { seat } = resolve({ claude: { advisor: 'off', model: 'opus' }, gate: { model: 'fable' } });
+    expect(seat.config).not.toHaveProperty('advisor');
+    expect(gateArgv({ claude: { advisor: 'off' } })).toEqual(DEFAULT_ARGV);
+  });
+
+  it('a codex gate ignores the advisor LOUDLY, and a re-vendoring flag never carries it across', () => {
+    const codex = resolve({ gate: { advisor: 'off', vendor: 'codex' } });
+    expect(codex.seat.vendor).toBe('codex');
+    expect(codex.seat.config).not.toHaveProperty('advisor');
+    expect(codex.warnings.some((w) => w.includes('`advisor` is ignored'))).toBe(true);
+    // A codex-scoped entry with an advisor, flagged back to anthropic: still not applied.
+    const flagged = resolve({ gate: { advisor: 'off', vendor: 'codex' } }, { vendor: 'anthropic' });
+    expect(flagged.seat.vendor).toBe('anthropic');
+    expect(flagged.seat.config).not.toHaveProperty('advisor');
+    // An anthropic entry with an advisor, flagged to codex: ignored, loudly.
+    const toCodex = resolve({ gate: { advisor: 'fable' } }, { vendor: 'codex' });
+    expect(toCodex.seat.config).not.toHaveProperty('advisor');
+    expect(toCodex.warnings.some((w) => w.includes('`advisor` is ignored'))).toBe(true);
+  });
+
+  it('an invalid gate advisor throws naming the seat — on the codex path too (validation is total)', () => {
+    expect(() => resolve({ gate: { advisor: null } })).toThrow(/voices\.json gate seat: `advisor`/);
+    expect(() => resolve({ gate: { advisor: 'Fable', vendor: 'codex' } })).toThrow(/voices\.json gate seat/);
+  });
+
+  it('the claude REVIEWER seat carries the `claude` entry\'s advisor; absent stays absent', () => {
+    const seat = resolveClaudeReviewerSeat({ claude: { advisor: 'claude-opus-5-5' } }, {}, () => {});
+    expect(seat.config.advisor).toBe('claude-opus-5-5');
+    expect(resolveClaudeReviewerSeat({}, {}, () => {}).config).not.toHaveProperty('advisor');
+    expect(() => resolveClaudeReviewerSeat({ claude: { advisor: '' } }, {}, () => {})).toThrow(
+      /voices\.json claude seat: `advisor`/
+    );
+  });
+});

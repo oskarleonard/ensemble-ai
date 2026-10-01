@@ -1,5 +1,6 @@
 import { resolveBin } from '../../core/bin';
 import { runReviewerExec } from '../../core/spawn';
+import { ADVISOR_OFF, parseSeatAdvisor } from '../../core/types';
 import {
   type CodexReviewResult,
   REVIEW_TIMEOUT_MS,
@@ -17,6 +18,21 @@ export function resolveClaudeBin(): string {
   return resolveBin('claude', { envVar: 'CLAUDE_BIN' });
 }
 
+// PURE: the advisor half of EVERY `claude` invocation this engine builds (review seat,
+// brainstorm/consult voice, execution seat) — one owner, so the three can never spell it
+// differently. Absent → no flag (the seat inherits the operator's settings). A model id →
+// `--settings {"advisorModel":"<id>"}`; "off" → `{"advisorModel":""}`, the value that
+// DISABLES the advisor even when the operator's settings enable one (null would NOT — it
+// falls back to the user setting, so it is never emitted). Built with JSON.stringify,
+// never concatenation. The value goes through parseSeatAdvisor again because a consumer
+// can hand a runner a config it built itself, without the file parse: an invalid value
+// THROWS here rather than reaching the CLI.
+export function claudeAdvisorArgs(config?: { advisor?: string; id: string }): string[] {
+  const advisor = parseSeatAdvisor(config?.advisor, config?.id ?? 'claude');
+  if (advisor === undefined) return [];
+  return ['--settings', JSON.stringify({ advisorModel: advisor === ADVISOR_OFF ? '' : advisor })];
+}
+
 // Claude's `--effort` accepts these levels; the 'default' sentinel (or anything
 // else) means "leave it to the CLI default", so the flag is omitted rather than
 // passed as an invalid value.
@@ -29,12 +45,13 @@ const CLAUDE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 // needs none, and a tool-less voice is provably READ-ONLY — it cannot read, write, or
 // execute anything even if the topic or file context tries to prompt-inject it, giving
 // Claude the same read-only guarantee codex (`-s read-only`) and grok (OS sandbox)
-// carry. Honors the voice config's model/effort so a CONFIGURED Claude model actually
-// runs (not merely printed in progress). Encoded as DATA so a unit test pins it.
+// carry. Honors the voice config's model/effort/advisor so a CONFIGURED Claude model
+// actually runs (not merely printed in progress). Encoded as DATA so a unit test pins it.
 export function buildClaudeVoiceArgs(prompt: string, config?: VoiceConfig): string[] {
   const args = ['-p', prompt, '--output-format', 'text', '--tools', ''];
   if (config?.model && config.model !== 'default') args.push('--model', config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort)) args.push('--effort', config.effort);
+  args.push(...claudeAdvisorArgs(config));
   return args;
 }
 

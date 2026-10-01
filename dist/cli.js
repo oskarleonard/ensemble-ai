@@ -36,6 +36,15 @@ function parseSeatWindow(v) {
   const asWritten = new Date(Date.UTC(year, month - 1, day));
   return asWritten.getUTCMonth() === month - 1 && asWritten.getUTCDate() === day ? value : void 0;
 }
+var ADVISOR_OFF = "off";
+var ADVISOR_MODEL_RE = /^[a-z0-9][a-z0-9.-]*$/;
+function parseSeatAdvisor(v, seat) {
+  if (v === void 0) return void 0;
+  if (v === ADVISOR_OFF || typeof v === "string" && ADVISOR_MODEL_RE.test(v)) return v;
+  throw new Error(
+    `ensemble-ai: ${seat} seat: \`advisor\` must be "${ADVISOR_OFF}" or a model id matching ${ADVISOR_MODEL_RE.source} (omit the key to inherit the operator's setting) \u2014 got ${JSON.stringify(v) ?? String(v)}`
+  );
+}
 function seatOff(config, now) {
   if (config?.enabled === false) return true;
   return now.getTime() < Date.parse(parseSeatWindow(config?.disabledUntil) ?? "");
@@ -800,7 +809,9 @@ function parseReviewers(raw) {
     const sandbox = str(r.sandbox, REVIEWER_DEFAULTS[id].sandbox ?? "");
     const enabled = typeof r.enabled === "boolean" ? r.enabled : void 0;
     const disabledUntil = parseSeatWindow(r.disabledUntil);
+    const advisor = id === "claude" ? parseSeatAdvisor(r.advisor, `reviewers.json ${id}`) : void 0;
     out[id] = {
+      ...advisor === void 0 ? {} : { advisor },
       cmd: str(r.cmd, REVIEWER_DEFAULTS[id].cmd),
       effort: str(r.effort, REVIEWER_DEFAULTS[id].effort),
       id,
@@ -814,11 +825,13 @@ function parseReviewers(raw) {
   return out;
 }
 function loadReviewers(file = REVIEWERS_FILE) {
+  let raw;
   try {
-    return parseReviewers(JSON.parse(fs4.readFileSync(file, "utf8")));
+    raw = JSON.parse(fs4.readFileSync(file, "utf8"));
   } catch {
     return { ...REVIEWER_DEFAULTS };
   }
+  return parseReviewers(raw);
 }
 function resolveReviewer(id, file = REVIEWERS_FILE) {
   return loadReviewers(file)[id] ?? REVIEWER_DEFAULTS[id];
@@ -2073,11 +2086,17 @@ async function runGrokReview(prompt, config, opts = {}) {
 function resolveClaudeBin() {
   return resolveBin("claude", { envVar: "CLAUDE_BIN" });
 }
+function claudeAdvisorArgs(config) {
+  const advisor = parseSeatAdvisor(config?.advisor, config?.id ?? "claude");
+  if (advisor === void 0) return [];
+  return ["--settings", JSON.stringify({ advisorModel: advisor === ADVISOR_OFF ? "" : advisor })];
+}
 var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
 function buildClaudeVoiceArgs(prompt, config) {
   const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
   if (config?.model && config.model !== "default") args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
+  args.push(...claudeAdvisorArgs(config));
   return args;
 }
 function runClaudeVoice(prompt, config, opts = {}) {
@@ -2150,7 +2169,9 @@ function parseVoices(raw) {
     if (!e || typeof e !== "object") continue;
     const r = e;
     const sandbox = str3(r.sandbox, VOICE_DEFAULTS[id].sandbox ?? "");
+    const advisor = id === "claude" ? parseSeatAdvisor(r.advisor, `voices.json ${id}`) : void 0;
     out[id] = {
+      ...advisor === void 0 ? {} : { advisor },
       cmd: str3(r.cmd, VOICE_DEFAULTS[id].cmd),
       effort: str3(r.effort, VOICE_DEFAULTS[id].effort),
       id,
@@ -2162,11 +2183,13 @@ function parseVoices(raw) {
   return out;
 }
 function loadVoices(file = VOICES_FILE) {
+  let raw;
   try {
-    return parseVoices(JSON.parse(fs11.readFileSync(file, "utf8")));
+    raw = JSON.parse(fs11.readFileSync(file, "utf8"));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
+  return parseVoices(raw);
 }
 function listVoices(file = VOICES_FILE) {
   const all = loadVoices(file);
@@ -4046,6 +4069,7 @@ function buildClaudeReviewArgs(prompt, config, fence = {}) {
     args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS2.has(config.effort))
     args.push("--effort", config.effort);
+  args.push(...claudeAdvisorArgs(config));
   args.push("--disallowedTools", ...CLAUDE_REVIEW_DENIED_TOOLS, ...homeReadDenyRules(homeDir));
   return args;
 }
@@ -4226,6 +4250,7 @@ function buildClaudeExecArgs(prompt, config) {
   ];
   if (config?.model && config.model !== "default") args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS2.has(config.effort)) args.push("--effort", config.effort);
+  args.push(...claudeAdvisorArgs(config));
   args.push("--disallowedTools", "Agent", "Task", "WebFetch", "WebSearch");
   return args;
 }
@@ -5521,6 +5546,7 @@ function resolveHolisticSeat(raw, flags = {}, warn = () => {
     warn("holistic seat: `cmd` is ignored \u2014 the lens is always a `claude -p` spawn (read-only plan mode + write-tool deny-list); remove it");
   }
   const model = nonEmptyStr(flags.model) || entry && nonEmptyStr(entry.model) || HOLISTIC_DEFAULTS.model;
+  const advisor = entry ? parseSeatAdvisor(entry.advisor, "voices.json holistic") : void 0;
   const flagEffort = nonEmptyStr(flags.effort);
   if (flagEffort && !CLAUDE_EFFORTS2.has(flagEffort))
     warn(
@@ -5539,7 +5565,7 @@ function resolveHolisticSeat(raw, flags = {}, warn = () => {
         );
     }
   }
-  return { ...VOICE_DEFAULTS.claude, effort, model };
+  return { ...VOICE_DEFAULTS.claude, ...advisor === void 0 ? {} : { advisor }, effort, model };
 }
 function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
 }) {
@@ -8613,6 +8639,7 @@ function resolveGateSeat(raw, flags, warn) {
       );
   }
   const claude = plainObject(root.claude);
+  const gateAdvisor = gate ? parseSeatAdvisor(gate.advisor, "voices.json gate") : void 0;
   if (gate && "cmd" in gate)
     warn(
       "gate seat: `cmd` is ignored \u2014 the gate spawn is always one of the two FENCED runners, picked by `vendor`; remove it"
@@ -8635,6 +8662,11 @@ function resolveGateSeat(raw, flags, warn) {
     }
   }
   const entryVendor = fileVendor && GATE_VENDORS.has(fileVendor) ? fileVendor : "anthropic";
+  const advisorApplies = gateAdvisor !== void 0 && entryVendor === "anthropic" && vendor === "anthropic";
+  if (gateAdvisor !== void 0 && !advisorApplies)
+    warn(
+      `gate seat: \`advisor\` is ignored \u2014 it is a Claude-seat setting, and this gate (or its entry) is codex`
+    );
   if (gate && entryVendor !== vendor && (nonEmptyStr3(gate.model) || nonEmptyStr3(gate.effort))) {
     warn(
       `gate seat: the \`gate\` entry is ${entryVendor}-scoped \u2014 its model/effort do not apply to the ${vendor} gate (falling to the ${vendor} defaults)`
@@ -8699,8 +8731,13 @@ function resolveGateSeat(raw, flags, warn) {
   return {
     // The anthropic gate IS the claude binary with a swapped model/effort — source its identity
     // (cmd/id/vendor) from the one canonical claude voice so it can't drift from it, overriding
-    // only the two fields the gate seat configures.
-    config: { ...VOICE_DEFAULTS.claude, effort, model },
+    // only the fields the gate seat configures. The advisor is the gate entry's own (advisorApplies).
+    config: {
+      ...VOICE_DEFAULTS.claude,
+      ...advisorApplies ? { advisor: gateAdvisor } : {},
+      effort,
+      model
+    },
     effortSource,
     modelSource,
     vendor,
@@ -8754,11 +8791,17 @@ function resolveClaudeReviewerSeat(raw, flags, warn) {
   };
   const model = pick("model", nonEmptyStr3(flags.model), () => true, CLAUDE_REVIEWER_SEAT_DEFAULTS.model);
   const effort = pick("effort", effortFlagOk ? flagEffort : null, isKnownEffort, CLAUDE_REVIEWER_SEAT_DEFAULTS.effort);
+  const advisor = claude ? parseSeatAdvisor(claude.advisor, "voices.json claude") : void 0;
   return {
     // Identity (cmd/id/vendor) from the one canonical claude voice, like the gate — only
     // model/effort are configurable; the capability fence is not. The REVIEWER seat has no
     // vendor axis: it is the ONE Claude producer by definition (spec §3).
-    config: { ...VOICE_DEFAULTS.claude, effort: effort.value, model: model.value },
+    config: {
+      ...VOICE_DEFAULTS.claude,
+      ...advisor === void 0 ? {} : { advisor },
+      effort: effort.value,
+      model: model.value
+    },
     effortSource: effort.source,
     modelSource: model.source,
     vendor: "anthropic",
@@ -10008,7 +10051,10 @@ function offSeatsOf(config, enabled) {
 function agentLine(c, off) {
   const sandbox = c.sandbox ? ` \xB7 sandbox ${c.sandbox}` : "";
   const offNote = off ? off.until ? ` \xB7 OFF until ${off.until}` : " \xB7 OFF (enabled: false)" : "";
-  return `    ${c.id.padEnd(7)} ${c.vendor} \xB7 ${c.model} @ ${c.effort}${sandbox}${offNote}`;
+  return `    ${c.id.padEnd(7)} ${c.vendor} \xB7 ${c.model} @ ${c.effort}${advisorNote(c.advisor)}${sandbox}${offNote}`;
+}
+function advisorNote(advisor) {
+  return advisor === void 0 ? "" : ` \xB7 advisor ${advisor}`;
 }
 function sourceNote(file, exists) {
   return exists ? file : `${file} \u2014 not present, using baked defaults`;
@@ -10033,7 +10079,7 @@ function renderRegistry(view) {
   out.push("");
   out.push("  review synthesis  (the verified GATE \u2014 always claude -p; {model,effort} only)");
   out.push(
-    `    ${"gate".padEnd(7)} ${view.gate.vendor ?? "anthropic"} \xB7 ${view.gate.model} @ ${view.gate.effort}  \xB7 source model:${view.gate.modelSource} \xB7 effort:${view.gate.effortSource}${view.gate.vendor && view.gate.vendor !== "anthropic" ? ` \xB7 vendor:${view.gate.vendorSource ?? "default"}` : ""}`
+    `    ${"gate".padEnd(7)} ${view.gate.vendor ?? "anthropic"} \xB7 ${view.gate.model} @ ${view.gate.effort}${advisorNote(view.gate.advisor)}  \xB7 source model:${view.gate.modelSource} \xB7 effort:${view.gate.effortSource}${view.gate.vendor && view.gate.vendor !== "anthropic" ? ` \xB7 vendor:${view.gate.vendorSource ?? "default"}` : ""}`
   );
   out.push("");
   return out.join("\n");
@@ -12093,8 +12139,8 @@ Usage:
   ensemble-ai config    [options]      (alias)
 
 Prints the review/security reviewers (from reviewers.json) and the brainstorm/
-consult voices (from voices.json) \u2014 id \xB7 vendor \xB7 model \xB7 effort \xB7 sandbox \u2014 plus
-which config file each came from (or "baked defaults"). No mutation.
+consult voices (from voices.json) \u2014 id \xB7 vendor \xB7 model \xB7 effort \xB7 advisor \xB7 sandbox \u2014
+plus which config file each came from (or "baked defaults"). No mutation.
 
 Options:
   --reviewers-file <path>   reviewers config (default ~/.ensemble-ai/reviewers.json)
@@ -12131,6 +12177,7 @@ async function reviewersCommand(args) {
   const view = {
     enabledReviewerIds: enabledIds,
     gate: {
+      ...gateSeat.config.advisor === void 0 ? {} : { advisor: gateSeat.config.advisor },
       effort: gateSeat.config.effort,
       effortSource: gateSeat.effortSource,
       model: gateSeat.config.model,

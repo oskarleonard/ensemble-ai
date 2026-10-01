@@ -16,7 +16,7 @@ It's the portable engine behind a cross-vendor *code review* workflow: give it a
 | `ensemble-ai consult "<q>"` (alias `ask`) | Cross-vendor Q&A: each voice answers independently → one synthesizes AGREE (confident) vs DIVERGE (look closer) + a bottom line. | `--file <p>` · `--critique` · `--voices <ids>` · `--synthesizer <id>` · `--json` |
 | `ensemble-ai receipt verify\|show` | The content-tied gate primitive: `verify` exits 0 iff the current diff is reviewed & current; `show` pretty-prints a receipt. | `--strict`/`--require-artifacts` · `--trail <dir>` · `--store <dir>` · `--staged` · `--working-tree` · `--reviewers <ids>` · **`--repo <dir>`** (ask for worktree evidence) · `--accept-degraded` |
 | `ensemble-ai push-fence --pr <N\|url>` | The **fix tail's** fence: exit 0 iff you own the PR's head ref; exit 5 = REFUSED (fork / no push access) → stage a pending review instead. Never pushes, never routes. | `--pr <N\|url>` · `--cwd <dir>` |
-| `ensemble-ai reviewers` (alias `config`) | Print the **resolved** seats — reviewers (`reviewers.json`) + voices (`voices.json`): id · vendor · model · effort · sandbox + source file. Read-only. | `--json` · `--reviewers-file <p>` · `--voices-file <p>` |
+| `ensemble-ai reviewers` (alias `config`) | Print the **resolved** seats — reviewers (`reviewers.json`) + voices (`voices.json`): id · vendor · model · effort · advisor · sandbox + source file. Read-only. | `--json` · `--reviewers-file <p>` · `--voices-file <p>` |
 | `ensemble-ai diff [<pr-url>]` | Cost-preview / debug: the exact packet the reviewers WOULD get (identity + coverage + prompt size) — no vendor called. | same diff sources as `review` · `--profile code\|security` · `--full` · `--json` |
 | `ensemble-ai pin-check` | Is your **pinned** ensemble-ai current with `main`? Compares the checkout's commit against `origin/main` and reports the drift (`current` / `STALE — N behind` / `ahead` / `diverged`), so a consumer's own doctor/health check catches a silently-stale pin instead of running the old engine unnoticed. Exit 0 = current/ahead, 3 = stale/diverged, 1 = error. | `--repo <dir>` · `--pin <ref>` · `--main-ref <ref>` · `--no-fetch` · `--json` |
 | **Claude skills** | Slash wrappers: `/ensemble-ai-review` · `/ensemble-ai-security` · `/ensemble-ai-brainstorm` · `/ensemble-ai-consult` (thin) + **`/ensemble-ai-review-fix`** — the pre-PR ritual (simplify → review → fix the gate verdicts → re-review → offer a PR). | installed per config dir via `entrypoints/install.sh` |
@@ -349,7 +349,7 @@ serialized by an `O_EXCL` `reseat.lock` in the trail dir) — where nothing was 
 
 ### Configuring the seats — `reviewers.json` and `voices.json`
 
-Every seat is **config, not a hardcode** — two JSON files under `~/.ensemble-ai/` (each env-overridable: `ENSEMBLE_REVIEWERS_FILE` / `ENSEMBLE_VOICES_FILE`). Run `ensemble-ai config` (alias of `ensemble-ai reviewers`) to print the **resolved** seats — id · vendor · model · effort · sandbox, plus which file each came from — so what you see is exactly what the modes run. Neither file needs to exist; a missing or junk entry falls back to the baked default (a bad config can never silently disable a seat).
+Every seat is **config, not a hardcode** — two JSON files under `~/.ensemble-ai/` (each env-overridable: `ENSEMBLE_REVIEWERS_FILE` / `ENSEMBLE_VOICES_FILE`). Run `ensemble-ai config` (alias of `ensemble-ai reviewers`) to print the **resolved** seats — id · vendor · model · effort · advisor · sandbox, plus which file each came from — so what you see is exactly what the modes run. Neither file needs to exist; a missing or junk entry falls back to the baked default (a bad config can never silently disable a seat) — with one exception, a Claude seat's invalid `advisor`, which is an error (below).
 
 **`~/.ensemble-ai/reviewers.json`** — the cross-vendor **reviewers** (Codex + Grok), the diff-facing lenses:
 
@@ -396,6 +396,23 @@ Every seat is **config, not a hardcode** — two JSON files under `~/.ensemble-a
 - **Claude REVIEWER seat:** `--claude-model <m>` / `--claude-effort <e>` → the `claude` entry → the **baked `opus @ max`**. Unlike the gate, this chain never ends at the `'default'` sentinel: a headless seat must not inherit the operator's interactive CLI default (a `/model` switch to Fable minutes before a fire once burned the Fable cap and failed the leg as "review INCOMPLETE").
 - **Holistic lens seat:** `--holistic-model <m>` / `--holistic-effort <e>` → the `holistic` entry → the baked **`opus @ high`** (the lens is single-seat, MED-capped, and runs a bounded three-class search — max bought little over high). Read only when `--holistic` is on; same junk-config-never-disables-a-seat posture as the gate.
 - **Shadow gate (audit-only):** `--shadow-gate` runs the **codex seat's model** (default effort `xhigh`, `--shadow-gate-effort` overrides) over the *identical* rendered gate prompt — champion/challenger for a possible cross-vendor gate. Its verdicts go through the same host reconcile + clustering and land in `shadow-gate-codex-verdicts.json` (+ raw transcript) with a per-finding comparison vs the authoritative gate; `authoritative: false` is stamped in. Synthesis, posting, dismissals, and the exit code never read it, a shadow failure never touches the run, and a comparison is computed only when the primary actually judged (a fail-closed primary's host-forced verdicts are not a judgment). On a packet-fail run the shadow is skipped loudly — nothing can be grounded for either judge.
+- **A Claude seat's ADVISOR — explicit, never inherited by accident.** Without it, every headless `claude -p` seat silently uses whatever `advisorModel` the operator's `~/.claude/settings.json` sets. An optional **`advisor`** key on a Claude seat states it instead — on the `claude` entry of `reviewers.json` (the registry peer) and on the `claude`, `gate`, and `holistic` entries of `voices.json`:
+
+  ```json
+  {
+    "claude":   { "model": "opus", "effort": "max", "advisor": "claude-fable-5-1" },
+    "gate":     { "model": "fable", "effort": "max", "advisor": "off" },
+    "holistic": { "model": "opus", "effort": "high" }
+  }
+  ```
+
+  | `advisor` | the seat's `claude` invocation gets | effect |
+  |---|---|---|
+  | a model id (`claude-opus-5-5`, `fable`, …) | `--settings '{"advisorModel":"<id>"}'` | that advisor, overriding the operator's setting |
+  | `"off"` | `--settings '{"advisorModel":""}'` | **no advisor**, even when the operator's settings enable one |
+  | key absent | no flag | inherits the operator's settings (the behavior before this field) |
+
+  Each seat reads its **own** entry only — there is no gate → claude inheritance for `advisor` (unlike model/effort), so "inherit the operator's setting" stays spellable on every seat. It applies to every `claude` invocation the engine builds: the review seat, the brainstorm/consult voice, and the execution seat (settler · prober). Validated **at config load**: `"off"` or a model id matching `^[a-z0-9][a-z0-9.-]*$`; anything else — including `null` (omit the key to inherit) — is an **error naming the seat**, never a silent fallback, because the only fallback would be the inheritance the field exists to end. A codex gate ignores `advisor` with a warning. `ensemble-ai config` shows it on each row (`· advisor <x>`) and **`config --json` carries it** on the `reviewers`/`voices` entries and on `gate.advisor` (absent = inherits). Library consumers that launch `claude` themselves use the same two exports: `parseSeatAdvisor` (the rule, also on `ensemble-ai/contracts`) and `claudeAdvisorArgs` (the argv).
 - **Capability floor:** keep the gate at least as capable as your strongest reviewer. A weak gate mostly returns `unverified` — *safe but toothless* (it can't dismiss what it can't ground), which the gate summary line flags with **`gate teeth did not engage — consider a stronger gate model`**. That notice is the runtime signal that the seat is under-powered for the diff.
 
 ### Brainstorm

@@ -35,6 +35,9 @@ export function parseVoiceIds(raw: unknown): VoiceId[] | undefined {
 // sandbox profile (grok). Structurally a ReviewerConfig (a voice run IS a read-only
 // agent run with a prompt), kept as DATA so a model is swappable without a code edit.
 export interface VoiceConfig {
+  // The claude seat's advisor model — a model id or "off"; absent = inherit the operator's
+  // setting. Same field and rule as ReviewerConfig.advisor (core/types parseSeatAdvisor).
+  advisor?: string;
   cmd: string;
   effort: string;
   id: VoiceId;

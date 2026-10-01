@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { R as ReviewerId } from './types-CqveYXfa.js';
+import { R as ReviewerId } from './types-B5aErYCE.js';
 
 declare function resolveTrailBase(gitRoot: string | null, localRepoTrail: boolean): string;
 declare function resolveOptionalReviewers(raw: string | boolean | undefined, rosterCore: readonly ReviewerId[], cmd: string): ReviewerId[] | {

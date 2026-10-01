@@ -34,3 +34,16 @@ describe('the exec-voice argv — unfenced where the review seats are fenced, an
     expect(bare).not.toContain('--effort');
   });
 });
+
+describe('the exec-voice argv — the advisor rides --settings like every claude seat', () => {
+  it('absent → no --settings; a model id / "off" → advisorModel, before the variadic --disallowedTools', () => {
+    expect(buildClaudeExecArgs('PROMPT', CFG)).not.toContain('--settings');
+    for (const [advisor, advisorModel] of [['claude-fable-5-1', 'claude-fable-5-1'], ['off', '']]) {
+      const args = buildClaudeExecArgs('PROMPT', { ...CFG, advisor });
+      const at = args.indexOf('--settings');
+      expect(JSON.parse(args[at + 1])).toEqual({ advisorModel });
+      expect(at).toBeLessThan(args.indexOf('--disallowedTools'));
+      expect(args.slice(args.indexOf('--disallowedTools') + 1)).toEqual(['Agent', 'Task', 'WebFetch', 'WebSearch']);
+    }
+  });
+});

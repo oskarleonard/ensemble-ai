@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import type { ReviewerConfig } from '../../core/types';
+import { parseSeatAdvisor, type ReviewerConfig } from '../../core/types';
 import {
   type CodexReviewResult,
   type RunReviewOpts,
@@ -91,7 +91,8 @@ function str(v: unknown, fallback: string): string {
 
 // Defensive parse: trust only well-formed per-voice overrides; anything malformed
 // falls back to the baked default for that id, so a junk config can never silently
-// disable a voice or inject a bad model string. Mirrors core/reviewers parseReviewers.
+// disable a voice or inject a bad model string. Mirrors core/reviewers parseReviewers —
+// including its one exception: an invalid claude `advisor` THROWS, naming the seat.
 export function parseVoices(raw: unknown): Record<VoiceId, VoiceConfig> {
   const out: Record<VoiceId, VoiceConfig> = { ...VOICE_DEFAULTS };
   if (!raw || typeof raw !== 'object') return out;
@@ -101,7 +102,9 @@ export function parseVoices(raw: unknown): Record<VoiceId, VoiceConfig> {
     if (!e || typeof e !== 'object') continue;
     const r = e as Record<string, unknown>;
     const sandbox = str(r.sandbox, VOICE_DEFAULTS[id].sandbox ?? '');
+    const advisor = id === 'claude' ? parseSeatAdvisor(r.advisor, `voices.json ${id}`) : undefined;
     out[id] = {
+      ...(advisor === undefined ? {} : { advisor }),
       cmd: str(r.cmd, VOICE_DEFAULTS[id].cmd),
       effort: str(r.effort, VOICE_DEFAULTS[id].effort),
       id,
@@ -113,14 +116,18 @@ export function parseVoices(raw: unknown): Record<VoiceId, VoiceConfig> {
   return out;
 }
 
+// A missing / unreadable / malformed-JSON file → the baked defaults. Only the READ is
+// caught: an invalid claude `advisor` throws out of parseVoices and reaches the caller.
 export function loadVoices(
   file: string = VOICES_FILE
 ): Record<VoiceId, VoiceConfig> {
+  let raw: unknown;
   try {
-    return parseVoices(JSON.parse(fs.readFileSync(file, 'utf8')));
+    raw = JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
+  return parseVoices(raw);
 }
 
 export function listVoices(file: string = VOICES_FILE): VoiceConfig[] {

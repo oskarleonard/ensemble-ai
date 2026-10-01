@@ -12,6 +12,9 @@ import type { SeatSource } from '../modes/review/gate-seat';
 // The review-synthesis GATE seat, resolved for display: model/effort + where each came from
 // (flag/file/default). Always a `claude -p` spawn, so no cmd/sandbox/vendor variance to show.
 export interface GateSeatView {
+  // The anthropic gate's own advisor (a model id or "off"); absent = inherits the operator's
+  // ~/.claude/settings.json. Same field the claude reviewer/voice rows carry.
+  advisor?: string;
   effort: string;
   effortSource: SeatSource;
   model: string;
@@ -63,13 +66,19 @@ export function offSeatsOf(
   });
 }
 
-// One agent row: `id     vendor · model @ effort[ · sandbox <name>][ · OFF …]`. Shared by the
-// reviewer + voice sections so both render identically (a VoiceConfig is
+// One agent row: `id     vendor · model @ effort[ · advisor <x>][ · sandbox <name>][ · OFF …]`.
+// Shared by the reviewer + voice sections so both render identically (a VoiceConfig is
 // structurally a ReviewerConfig — same fields). Only reviewer rows can carry an OFF note.
 function agentLine(c: ReviewerConfig | VoiceConfig, off?: OffSeat): string {
   const sandbox = c.sandbox ? ` · sandbox ${c.sandbox}` : '';
   const offNote = off ? (off.until ? ` · OFF until ${off.until}` : ' · OFF (enabled: false)') : '';
-  return `    ${c.id.padEnd(7)} ${c.vendor} · ${c.model} @ ${c.effort}${sandbox}${offNote}`;
+  return `    ${c.id.padEnd(7)} ${c.vendor} · ${c.model} @ ${c.effort}${advisorNote(c.advisor)}${sandbox}${offNote}`;
+}
+
+// ` · advisor <model|off>` when a Claude seat states one; nothing when it inherits the operator's
+// settings (absent), so an unconfigured registry renders exactly as before.
+function advisorNote(advisor: string | undefined): string {
+  return advisor === undefined ? '' : ` · advisor ${advisor}`;
 }
 
 function sourceNote(file: string, exists: boolean): string {
@@ -101,7 +110,7 @@ export function renderRegistry(view: RegistryView): string {
   // resolved model/effort came from (flag/file/default) — the standing "which config" legibility.
   out.push('  review synthesis  (the verified GATE — always claude -p; {model,effort} only)');
   out.push(
-    `    ${'gate'.padEnd(7)} ${view.gate.vendor ?? 'anthropic'} · ${view.gate.model} @ ${view.gate.effort}  · source model:${view.gate.modelSource} · effort:${view.gate.effortSource}${view.gate.vendor && view.gate.vendor !== 'anthropic' ? ` · vendor:${view.gate.vendorSource ?? 'default'}` : ''}`
+    `    ${'gate'.padEnd(7)} ${view.gate.vendor ?? 'anthropic'} · ${view.gate.model} @ ${view.gate.effort}${advisorNote(view.gate.advisor)}  · source model:${view.gate.modelSource} · effort:${view.gate.effortSource}${view.gate.vendor && view.gate.vendor !== 'anthropic' ? ` · vendor:${view.gate.vendorSource ?? 'default'}` : ''}`
   );
   out.push('');
   return out.join('\n');

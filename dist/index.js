@@ -29,6 +29,15 @@ function parseSeatWindow(v) {
   const asWritten = new Date(Date.UTC(year, month - 1, day));
   return asWritten.getUTCMonth() === month - 1 && asWritten.getUTCDate() === day ? value : void 0;
 }
+var ADVISOR_OFF = "off";
+var ADVISOR_MODEL_RE = /^[a-z0-9][a-z0-9.-]*$/;
+function parseSeatAdvisor(v, seat) {
+  if (v === void 0) return void 0;
+  if (v === ADVISOR_OFF || typeof v === "string" && ADVISOR_MODEL_RE.test(v)) return v;
+  throw new Error(
+    `ensemble-ai: ${seat} seat: \`advisor\` must be "${ADVISOR_OFF}" or a model id matching ${ADVISOR_MODEL_RE.source} (omit the key to inherit the operator's setting) \u2014 got ${JSON.stringify(v) ?? String(v)}`
+  );
+}
 function seatOff(config, now) {
   if (config?.enabled === false) return true;
   return now.getTime() < Date.parse(parseSeatWindow(config?.disabledUntil) ?? "");
@@ -1300,7 +1309,9 @@ function parseReviewers(raw) {
     const sandbox = str(r.sandbox, REVIEWER_DEFAULTS[id].sandbox ?? "");
     const enabled = typeof r.enabled === "boolean" ? r.enabled : void 0;
     const disabledUntil = parseSeatWindow(r.disabledUntil);
+    const advisor = id === "claude" ? parseSeatAdvisor(r.advisor, `reviewers.json ${id}`) : void 0;
     out[id] = {
+      ...advisor === void 0 ? {} : { advisor },
       cmd: str(r.cmd, REVIEWER_DEFAULTS[id].cmd),
       effort: str(r.effort, REVIEWER_DEFAULTS[id].effort),
       id,
@@ -1314,11 +1325,13 @@ function parseReviewers(raw) {
   return out;
 }
 function loadReviewers(file = REVIEWERS_FILE) {
+  let raw;
   try {
-    return parseReviewers(JSON.parse(fs2.readFileSync(file, "utf8")));
+    raw = JSON.parse(fs2.readFileSync(file, "utf8"));
   } catch {
     return { ...REVIEWER_DEFAULTS };
   }
+  return parseReviewers(raw);
 }
 function resolveReviewer(id, file = REVIEWERS_FILE) {
   return loadReviewers(file)[id] ?? REVIEWER_DEFAULTS[id];
@@ -2590,11 +2603,17 @@ import os9 from "os";
 function resolveClaudeBin() {
   return resolveBin("claude", { envVar: "CLAUDE_BIN" });
 }
+function claudeAdvisorArgs(config) {
+  const advisor = parseSeatAdvisor(config?.advisor, config?.id ?? "claude");
+  if (advisor === void 0) return [];
+  return ["--settings", JSON.stringify({ advisorModel: advisor === ADVISOR_OFF ? "" : advisor })];
+}
 var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
 function buildClaudeVoiceArgs(prompt, config) {
   const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
   if (config?.model && config.model !== "default") args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
+  args.push(...claudeAdvisorArgs(config));
   return args;
 }
 function runClaudeVoice(prompt, config, opts = {}) {
@@ -3491,6 +3510,7 @@ function buildClaudeReviewArgs(prompt, config, fence = {}) {
     args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS2.has(config.effort))
     args.push("--effort", config.effort);
+  args.push(...claudeAdvisorArgs(config));
   args.push("--disallowedTools", ...CLAUDE_REVIEW_DENIED_TOOLS, ...homeReadDenyRules(homeDir));
   return args;
 }
@@ -3936,7 +3956,9 @@ function parseVoices(raw) {
     if (!e || typeof e !== "object") continue;
     const r = e;
     const sandbox = str2(r.sandbox, VOICE_DEFAULTS[id].sandbox ?? "");
+    const advisor = id === "claude" ? parseSeatAdvisor(r.advisor, `voices.json ${id}`) : void 0;
     out[id] = {
+      ...advisor === void 0 ? {} : { advisor },
       cmd: str2(r.cmd, VOICE_DEFAULTS[id].cmd),
       effort: str2(r.effort, VOICE_DEFAULTS[id].effort),
       id,
@@ -3948,11 +3970,13 @@ function parseVoices(raw) {
   return out;
 }
 function loadVoices(file = VOICES_FILE) {
+  let raw;
   try {
-    return parseVoices(JSON.parse(fs16.readFileSync(file, "utf8")));
+    raw = JSON.parse(fs16.readFileSync(file, "utf8"));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
+  return parseVoices(raw);
 }
 function listVoices(file = VOICES_FILE) {
   const all = loadVoices(file);
@@ -3977,6 +4001,7 @@ function resolveHolisticSeat(raw, flags = {}, warn = () => {
     warn("holistic seat: `cmd` is ignored \u2014 the lens is always a `claude -p` spawn (read-only plan mode + write-tool deny-list); remove it");
   }
   const model = nonEmptyStr(flags.model) || entry && nonEmptyStr(entry.model) || HOLISTIC_DEFAULTS.model;
+  const advisor = entry ? parseSeatAdvisor(entry.advisor, "voices.json holistic") : void 0;
   const flagEffort = nonEmptyStr(flags.effort);
   if (flagEffort && !CLAUDE_EFFORTS2.has(flagEffort))
     warn(
@@ -3995,7 +4020,7 @@ function resolveHolisticSeat(raw, flags = {}, warn = () => {
         );
     }
   }
-  return { ...VOICE_DEFAULTS.claude, effort, model };
+  return { ...VOICE_DEFAULTS.claude, ...advisor === void 0 ? {} : { advisor }, effort, model };
 }
 function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
 }) {
@@ -6363,6 +6388,8 @@ function isImplemented(mode) {
   return IMPLEMENTED_MODES.includes(mode);
 }
 export {
+  ADVISOR_MODEL_RE,
+  ADVISOR_OFF,
   AGENT_INSTRUCTION_NAMES,
   CI_EVIDENCE_BOTH_REASON,
   CI_EVIDENCE_LIMITS,
@@ -6467,6 +6494,7 @@ export {
   classifyGitError,
   classifyPending,
   classifySecurityFinding,
+  claudeAdvisorArgs,
   claudeWorktreePromptSuffix,
   codexSandboxSupported,
   computeCoverage,
@@ -6562,6 +6590,7 @@ export {
   parseReviewSummaries,
   parseReviewerIds,
   parseReviewers,
+  parseSeatAdvisor,
   parseSeatWindow,
   parseSynthesis,
   parseTrailerIds,

@@ -2881,8 +2881,8 @@ Usage:
   ensemble-ai config    [options]      (alias)
 
 Prints the review/security reviewers (from reviewers.json) and the brainstorm/
-consult voices (from voices.json) — id · vendor · model · effort · sandbox — plus
-which config file each came from (or "baked defaults"). No mutation.
+consult voices (from voices.json) — id · vendor · model · effort · advisor · sandbox —
+plus which config file each came from (or "baked defaults"). No mutation.
 
 Options:
   --reviewers-file <path>   reviewers config (default ~/.ensemble-ai/reviewers.json)
@@ -2930,6 +2930,7 @@ async function reviewersCommand(args: string[]): Promise<number> {
   const view: RegistryView = {
     enabledReviewerIds: enabledIds,
     gate: {
+      ...(gateSeat.config.advisor === undefined ? {} : { advisor: gateSeat.config.advisor }),
       effort: gateSeat.config.effort,
       effortSource: gateSeat.effortSource,
       model: gateSeat.config.model,
