@@ -53,9 +53,10 @@ export interface GateSeatFlags {
 }
 
 export interface GateSeat {
-  // A VoiceConfig for the spawn — `config.advisor` is the seat's own-entry advisor (absent =
-  // inherit the operator's settings); always absent on a codex gate: id/cmd/vendor pinned to the RESOLVED vendor's canonical seat
+  // A VoiceConfig for the spawn: id/cmd/vendor pinned to the RESOLVED vendor's canonical seat
   // (`cmd` is never honored from config — the runner binding is code), model/effort resolved.
+  // `config.advisor` is the gate entry's own advisor (absent = inherit the operator's settings),
+  // always absent on a codex gate.
   config: VoiceConfig;
   effortSource: SeatSource;
   modelSource: SeatSource;
