@@ -1513,42 +1513,38 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   let anthropicSeats: { claude: GateSeat; gate: GateSeat; holistic?: VoiceConfig } | null = null;
   if (roster.claude) {
     const warn = (m: string) => console.error(`· ${m}`);
-    try {
-      anthropicSeats = {
-        claude: loadClaudeReviewerSeat(
-          VOICES_FILE,
-          {
-            effort: typeof values['claude-effort'] === 'string' ? values['claude-effort'] : undefined,
-            model: typeof values['claude-model'] === 'string' ? values['claude-model'] : undefined,
-          },
-          warn
-        ),
-        gate: loadGateSeat(
-          VOICES_FILE,
-          {
-            effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
-            model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
-            vendor: typeof values['gate-vendor'] === 'string' ? values['gate-vendor'] : undefined,
-          },
-          warn
-        ),
-        ...(values.holistic
-          ? {
-              holistic: loadHolisticSeat(
-                VOICES_FILE,
-                {
-                  effort: typeof values['holistic-effort'] === 'string' ? values['holistic-effort'] : undefined,
-                  model: typeof values['holistic-model'] === 'string' ? values['holistic-model'] : undefined,
-                },
-                warn
-              ),
-            }
-          : {}),
-      };
-    } catch (e) {
-      console.error(`ensemble-ai ${cmd}: ${(e as Error).message}`);
-      return 3;
-    }
+    anthropicSeats = loadSeatsOrRefuse(() => ({
+      claude: loadClaudeReviewerSeat(
+        VOICES_FILE,
+        {
+          effort: typeof values['claude-effort'] === 'string' ? values['claude-effort'] : undefined,
+          model: typeof values['claude-model'] === 'string' ? values['claude-model'] : undefined,
+        },
+        warn
+      ),
+      gate: loadGateSeat(
+        VOICES_FILE,
+        {
+          effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+          model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+          vendor: typeof values['gate-vendor'] === 'string' ? values['gate-vendor'] : undefined,
+        },
+        warn
+      ),
+      ...(values.holistic
+        ? {
+            holistic: loadHolisticSeat(
+              VOICES_FILE,
+              {
+                effort: typeof values['holistic-effort'] === 'string' ? values['holistic-effort'] : undefined,
+                model: typeof values['holistic-model'] === 'string' ? values['holistic-model'] : undefined,
+              },
+              warn
+            ),
+          }
+        : {}),
+    }));
+    if (!anthropicSeats) return 3;
   }
 
   let result: ReviewModeResult;
@@ -3352,6 +3348,20 @@ Exit: 0 = gate completed (verdicts updated) · 1 = gate failed again (still fail
 3 = usage / missing trail.
 `;
 
+// The seat loaders THROW on an invalid Claude-seat `advisor` (core/types parseSeatAdvisor). Every
+// command resolves its seats before any spawn, so that throw is a config refusal: the seat-named
+// message and exit 3 (nothing billed) — never the stack trace and exit 1 the top-level handler
+// would make of it. Null = refused; the caller returns 3. The message is printed as thrown: it
+// already carries the `ensemble-ai:` prefix and names the seat.
+function loadSeatsOrRefuse<T>(load: () => T): T | null {
+  try {
+    return load();
+  } catch (e) {
+    console.error((e as Error).message);
+    return null;
+  }
+}
+
 // regate: heal a run whose gate died without re-running any reviewer. The trail is the
 // contract (the gate reads reviews + packet from disk by design), so this command is a
 // thin wrapper: resolve the seat, optionally re-materialize the head, call runRegate.
@@ -3397,18 +3407,21 @@ async function regateCommand(args: string[]): Promise<number> {
     return 3;
   }
 
-  const gateSeat = loadGateSeat(
-    VOICES_FILE,
-    {
-      effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
-      model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
-      // This path binds the claude runner only — pin the chain to anthropic so a voices.json
-      // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
-      // death). The codex gate is a `review` feature; wiring it here is a separate change.
-      vendor: 'anthropic',
-    },
-    (m) => console.error(`· ${m}`)
+  const gateSeat = loadSeatsOrRefuse(() =>
+    loadGateSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+        model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+        // This path binds the claude runner only — pin the chain to anthropic so a voices.json
+        // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
+        // death). The codex gate is a `review` feature; wiring it here is a separate change.
+        vendor: 'anthropic',
+      },
+      (m) => console.error(`· ${m}`)
+    )
   );
+  if (!gateSeat) return 3;
 
   // Worktree evidence is opt-in and best-effort: a refused/failed materialization
   // degrades LOUDLY to packet grounding — a regate is never lost to a worktree problem.
@@ -3578,19 +3591,24 @@ async function reseatCommand(args: string[]): Promise<number> {
 
   const reviewersFile = typeof values['reviewers-file'] === 'string' ? values['reviewers-file'] : REVIEWERS_FILE;
   const sandbox = typeof values.sandbox === 'string' ? values.sandbox : undefined;
-  const reviewer: ReviewerConfig = { ...loadReviewers(reviewersFile)[seat], ...(sandbox ? { sandbox } : {}) };
-  const gateSeat = loadGateSeat(
-    VOICES_FILE,
-    {
-      effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
-      model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
-      // This path binds the claude runner only — pin the chain to anthropic so a voices.json
-      // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
-      // death). The codex gate is a `review` feature; wiring it here is a separate change.
-      vendor: 'anthropic',
-    },
-    (m) => console.error(`· ${m}`)
+  const reviewers = loadSeatsOrRefuse(() => loadReviewers(reviewersFile));
+  if (!reviewers) return 3;
+  const reviewer: ReviewerConfig = { ...reviewers[seat], ...(sandbox ? { sandbox } : {}) };
+  const gateSeat = loadSeatsOrRefuse(() =>
+    loadGateSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+        model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+        // This path binds the claude runner only — pin the chain to anthropic so a voices.json
+        // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
+        // death). The codex gate is a `review` feature; wiring it here is a separate change.
+        vendor: 'anthropic',
+      },
+      (m) => console.error(`· ${m}`)
+    )
   );
+  if (!gateSeat) return 3;
 
   // Worktree evidence is opt-in and best-effort, exactly like regate.
   let session: WorktreeSession | null = null;
@@ -3819,30 +3837,36 @@ async function probeCommand(rest: string[]): Promise<number> {
 
   // The prober seat resolves exactly like the review producer: flags → voices.json `claude`
   // entry → the built-in opus @ max (gate-seat.ts owns the chain and the why).
-  const seat = loadClaudeReviewerSeat(
-    VOICES_FILE,
-    {
-      effort: typeof values['claude-effort'] === 'string' ? values['claude-effort'] : undefined,
-      model: typeof values['claude-model'] === 'string' ? values['claude-model'] : undefined,
-    },
-    (m) => console.error(`· ${m}`)
+  const seat = loadSeatsOrRefuse(() =>
+    loadClaudeReviewerSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values['claude-effort'] === 'string' ? values['claude-effort'] : undefined,
+        model: typeof values['claude-model'] === 'string' ? values['claude-model'] : undefined,
+      },
+      (m) => console.error(`· ${m}`)
+    )
   );
+  if (!seat) return 3;
   // The GATE seat resolves INDEPENDENTLY of the prober (same chain as the review pipeline's gate):
   // `--gate-model`/`--gate-effort` → the voices.json `gate` entry → the built-in default. Independent
   // selection is the whole point — the gate that refutes a defect should be able to be a DIFFERENT
   // model than the one that found it, for real cross-model adjudication.
-  const gateSeat = loadGateSeat(
-    VOICES_FILE,
-    {
-      effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
-      model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
-      // This path binds the claude runner only — pin the chain to anthropic so a voices.json
-      // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
-      // death). The codex gate is a `review` feature; wiring it here is a separate change.
-      vendor: 'anthropic',
-    },
-    (m) => console.error(`· ${m}`)
+  const gateSeat = loadSeatsOrRefuse(() =>
+    loadGateSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+        model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+        // This path binds the claude runner only — pin the chain to anthropic so a voices.json
+        // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
+        // death). The codex gate is a `review` feature; wiring it here is a separate change.
+        vendor: 'anthropic',
+      },
+      (m) => console.error(`· ${m}`)
+    )
   );
+  if (!gateSeat) return 3;
 
   console.error(`· materializing the PR head as a disposable worktree of ${repoFlag}…`);
   const opened = openWorktree({

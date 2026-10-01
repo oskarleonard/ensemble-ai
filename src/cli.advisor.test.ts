@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // VOICES_FILE is read from the env once, at import — point it at a private file BEFORE the CLI loads.
@@ -52,5 +54,20 @@ describe('review — an invalid Anthropic-seat advisor fails BEFORE the core fan
     expect(await main(['review', '--working-tree', '--no-claude'])).toBe(3);
     expect(mockRun).toHaveBeenCalledOnce();
     expect(stderr()).not.toContain('advisor');
+  });
+});
+
+describe('regate — an invalid gate advisor is a pre-spawn refusal (exit 3), not a crash', () => {
+  it('names the seat and exits 3 before any gate spawn', async () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-cli-advisor-'));
+    try {
+      fs.mkdirSync(path.join(out, 'r1'));
+      fs.writeFileSync(path.join(out, 'r1', 'packet.gate.json'), JSON.stringify({ headSha: 'a'.repeat(40), schemaVersion: 2 }));
+      fs.writeFileSync(VOICES, JSON.stringify({ gate: { advisor: '' } }));
+      expect(await main(['regate', '--out', out, '--run-id', 'r1'])).toBe(3);
+      expect(stderr()).toContain('ensemble-ai: voices.json gate seat: `advisor`');
+    } finally {
+      fs.rmSync(out, { force: true, recursive: true });
+    }
   });
 });
