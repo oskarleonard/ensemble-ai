@@ -450,11 +450,12 @@ export async function runGrokReview(
     }
   }
   // ONCE THE FENCE IS UP IT COMES DOWN ON EVERY PATH. `ensureSandboxProfile` writes a file and
-  // `runReviewerExec` can reject (grok's bin now resolves before the fence goes up) — either of
-  // those, on the old `.then()`-only teardown, left the proxy's listening server and its sockets
-  // open. The CLI sets `process.exitCode` rather than calling `process.exit()`, so a leaked handle
-  // keeps the event loop alive and the run never exits. `finally` is what makes that unreachable —
-  // the same guarantee codex's `.finally(cleanup)` already had.
+  // `runReviewerExec` can reject (`resolveGrokBin`, which throws when grok is not installed or a set
+  // GROK_BIN is missing, now runs before the fence goes up) — either of those, on the old
+  // `.then()`-only teardown, left the proxy's listening server and its sockets open. The CLI sets
+  // `process.exitCode` rather than calling `process.exit()`, so a leaked handle keeps the event loop
+  // alive and the run never exits. `finally` is what makes that unreachable — the same guarantee
+  // codex's `.finally(cleanup)` already had.
   let cwd: string | undefined;
   try {
     ensureSandboxProfile(sandbox);
