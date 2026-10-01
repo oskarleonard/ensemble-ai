@@ -1,7 +1,7 @@
 import { writeTrailFile } from '../../core/artifacts';
 import { extractJsonBlock } from '../../core/findings';
 import { SEVERITIES, type Severity } from '../../core/types';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig, VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { runClaudeExecVoice } from './exec-voice';
@@ -315,9 +315,51 @@ export type ProbeRunner = (
   opts: { onSpawn?: (kill: () => void) => void; timeoutMs: number; worktree: string }
 ) => Promise<VoiceRunResult>;
 
+// A Claude seat as probe-report.json records it: the model and effort it ran at, and its stated
+// advisor beside them — absent when the seat inherited the operator's settings, so "off" and inherit
+// stay distinguishable (the rule every Claude seat artifact follows).
+export interface ProbeSeatRecord {
+  advisor?: string;
+  effort: string;
+  model: string;
+}
+
+export function probeSeatRecord(config: ResolvedVoiceConfig): ProbeSeatRecord {
+  return {
+    ...(config.advisor === undefined ? {} : { advisor: config.advisor }),
+    effort: config.effort,
+    model: config.model,
+  };
+}
+
+// The same record as the probe's stderr line spells it — the advisor beside model/effort, as on the
+// posted gate seat line.
+export function probeSeatLabel(seat: ProbeSeatRecord): string {
+  return `anthropic/${seat.model} @ ${seat.effort}${seat.advisor === undefined ? '' : ` · advisor ${seat.advisor}`}`;
+}
+
+// probe-report.json, from ONE serializer for both of its writers — runProbe, then the gate's rewrite —
+// so the gate's write carries the prober's seat and the head forward instead of re-deriving them.
+export function probeReportJson(fields: {
+  gate?: ProbeSeatRecord;
+  headSha?: string;
+  prober: ProbeSeatRecord;
+  report: ProbeReport;
+  runId: string;
+}): string {
+  const { gate, headSha, prober, report, runId } = fields;
+  return JSON.stringify(
+    { ...(gate ? { gate } : {}), ...(headSha ? { headSha } : {}), prober, report, runId },
+    null,
+    2
+  );
+}
+
 export interface RunProbeOptions {
   baseDir: string;
-  config: VoiceConfig;
+  // The prober seat as resolved up front (its advisor already validated) — it also lands in
+  // probe-report.json as `prober`.
+  config: ResolvedVoiceConfig;
   // The PR head the worktree is detached at — persisted into probe-report.json so a poster can
   // refuse to anchor receipts from commit A onto a PR whose head moved to B (the same
   // stale-anchor protection the review's freshReviewedHead gives its findings).
@@ -374,11 +416,12 @@ export async function runProbe(opts: RunProbeOptions): Promise<ProbeRunResult> {
       opts.baseDir,
       opts.runId,
       'probe-report.json',
-      JSON.stringify(
-        { ...(opts.headSha ? { headSha: opts.headSha } : {}), report: parsed.report, runId: opts.runId },
-        null,
-        2
-      )
+      probeReportJson({
+        ...(opts.headSha ? { headSha: opts.headSha } : {}),
+        prober: probeSeatRecord(opts.config),
+        report: parsed.report,
+        runId: opts.runId,
+      })
     );
   } catch (e) {
     log(`  · probe: probe-report.json FAILED to write (${(e as Error).message}) — continuing`);

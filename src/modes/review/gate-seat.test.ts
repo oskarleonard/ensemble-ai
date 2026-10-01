@@ -344,7 +344,7 @@ describe('resolveGateSeat — vendor axis (anthropic default · codex = the shad
   });
 });
 
-describe('the advisor on the gate + claude reviewer seats — own entry only, never inherited', () => {
+describe('the advisor on the gate + claude reviewer seats — own entry only, never inherited (one re-vendoring exception)', () => {
   const settingsOf = (args: string[]): unknown =>
     args.includes('--settings') ? JSON.parse(args[args.indexOf('--settings') + 1]) : undefined;
 
@@ -366,10 +366,12 @@ describe('the advisor on the gate + claude reviewer seats — own entry only, ne
     expect(codex.seat.vendor).toBe('codex');
     expect(codex.seat.config).not.toHaveProperty('advisor');
     expect(codex.warnings.some((w) => w.includes('`advisor` is ignored'))).toBe(true);
-    // A codex-scoped entry with an advisor, flagged back to anthropic: still not applied.
+    // A codex-scoped entry with an advisor, flagged back to anthropic: its own advisor is still not
+    // applied — and with no `claude` entry advisor, the gate inherits.
     const flagged = resolve({ gate: { advisor: 'off', vendor: 'codex' } }, { vendor: 'anthropic' });
     expect(flagged.seat.vendor).toBe('anthropic');
     expect(flagged.seat.config).not.toHaveProperty('advisor');
+    expect(flagged.warnings.some((w) => w.includes('codex-scoped `gate` entry is ignored'))).toBe(true);
     // An anthropic entry with an advisor, flagged to codex: ignored, loudly.
     const toCodex = resolve({ gate: { advisor: 'fable' } }, { vendor: 'codex' });
     expect(toCodex.seat.config).not.toHaveProperty('advisor');
@@ -384,6 +386,39 @@ describe('the advisor on the gate + claude reviewer seats — own entry only, ne
     expect(codex.warnings.some((w) => w.includes('`advisor` is ignored') && w.includes('"Fable"'))).toBe(true);
     const flagged = resolve({ gate: { advisor: null } }, { vendor: 'codex' });
     expect(flagged.seat.vendor).toBe('codex');
+  });
+
+  // THE ONE EXCEPTION: a codex-scoped `gate` entry re-vendored to an anthropic gate (a flag, or
+  // regate/reseat/probe pinning anthropic) takes its advisor from the `claude` entry — the one
+  // advisor home for claude spawns — so "off" is spellable there and a typo refuses up front.
+  it("a codex-scoped entry re-vendored to anthropic takes the `claude` entry's advisor, validated", () => {
+    const off = resolve({ claude: { advisor: 'off' }, gate: { vendor: 'codex' } }, { vendor: 'anthropic' });
+    expect(off.seat.vendor).toBe('anthropic');
+    expect(off.seat.config.advisor).toBe('off');
+    expect(settingsOf(buildClaudeReviewArgs('P', off.seat.config))).toEqual({ advisorModel: '' });
+    // The entry's own advisor is ignored loudly; the claude entry's wins.
+    const both = resolve(
+      { claude: { advisor: 'claude-fable-5-1' }, gate: { advisor: 'off', vendor: 'codex' } },
+      { vendor: 'anthropic' }
+    );
+    expect(both.seat.config.advisor).toBe('claude-fable-5-1');
+    expect(both.warnings.some((w) => w.includes('its advisor comes from the `claude` entry'))).toBe(true);
+    // No claude advisor → the gate inherits, as before.
+    const none = resolve({ claude: { model: 'opus' }, gate: { vendor: 'codex' } }, { vendor: 'anthropic' });
+    expect(none.seat.config).not.toHaveProperty('advisor');
+    // Invalid → throws naming the `claude` entry, where the bad value lives.
+    expect(() => resolve({ claude: { advisor: null }, gate: { vendor: 'codex' } }, { vendor: 'anthropic' })).toThrow(
+      /voices\.json claude seat: `advisor`/
+    );
+  });
+
+  it('the exception is one-way and scoped: the claude entry never reaches an anthropic-scoped or a codex gate', () => {
+    // A codex gate (no flag): the claude entry's advisor is neither applied nor validated.
+    const codex = resolve({ claude: { advisor: null }, gate: { vendor: 'codex' } });
+    expect(codex.seat.vendor).toBe('codex');
+    expect(codex.seat.config).not.toHaveProperty('advisor');
+    // No gate entry at all: still inherit (no gate → claude inheritance).
+    expect(resolve({ claude: { advisor: 'off' } }, { vendor: 'anthropic' }).seat.config).not.toHaveProperty('advisor');
   });
 
   it('the claude REVIEWER seat carries the `claude` entry\'s advisor; absent stays absent', () => {

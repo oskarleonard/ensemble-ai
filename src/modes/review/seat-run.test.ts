@@ -292,4 +292,24 @@ describe('a seat persists its run diagnostics and progress stream beside the rep
     await worktreeSeat(adapter);
     expect(fs.existsSync(path.join(reviewDir(out, base.runId), 'grok-stream.jsonl'))).toBe(false);
   });
+
+  // The pre-flight's warnings are persisted on their OWN diagnostics field — and the no-findings
+  // summary, which quotes the HEAD of stderrTail, shows the seat's own failure, not a warning.
+  it("persists pre-flight warnings beside the stderr tail, and the summary quotes the seat's own failure", async () => {
+    const warning = 'the widened login refresh failed — x. The seat proceeds; the login may expire during it.';
+    const { adapter } = stubAdapter([{ ...empty('error: model grok-9 not found'), preflightWarnings: [warning] }]);
+    const seat = await worktreeSeat(adapter);
+    expect(seat.review.terminalState).toBe('failed-reviewer');
+    expect(seat.review.summary).toBe('The grok reviewer produced no parseable findings: error: model grok-9 not found');
+    expect(seat.review.diagnostics?.stderrTail).toBe('error: model grok-9 not found');
+    expect(seat.review.diagnostics?.preflightWarnings).toEqual([warning]);
+    const stored = JSON.parse(fs.readFileSync(path.join(reviewDir(out, base.runId), 'review.grok.json'), 'utf8'));
+    expect(stored.diagnostics.preflightWarnings).toEqual([warning]);
+  });
+
+  it('a seat with no pre-flight warning records no field', async () => {
+    const { adapter } = stubAdapter([reviewed()]);
+    const seat = await worktreeSeat(adapter);
+    expect(seat.review.diagnostics).not.toHaveProperty('preflightWarnings');
+  });
 });

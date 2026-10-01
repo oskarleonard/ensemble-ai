@@ -1226,8 +1226,9 @@ function resolveBin(name2, opts = {}) {
   if (override) {
     const bin = path4.resolve(override);
     if (fs5.existsSync(bin)) return bin;
+    const shown = bin === override ? override : `${override} (resolved to ${bin})`;
     throw new Error(
-      `${opts.envVar}=${override} does not exist \u2014 unset it to use the default resolution`
+      `${opts.envVar}=${shown} does not exist \u2014 unset it to use the default resolution`
     );
   }
   const cached = binCache.get(name2);
@@ -1770,6 +1771,25 @@ var GrokLoginExpiryError = class extends Error {
     this.name = "GrokLoginExpiryError";
   }
 };
+var GROK_PREFLIGHT_CANCELLED_WHY = "the grok login pre-flight was cancelled (the seat was told to stop) \u2014 the seat never spawned";
+var GrokPreflightCancelledError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "GrokPreflightCancelledError";
+  }
+};
+function trackSeatCancel(onSpawn) {
+  let cancelled = false;
+  return {
+    cancelled: () => cancelled,
+    ...onSpawn ? {
+      onSpawn: (kill) => onSpawn(() => {
+        cancelled = true;
+        kill();
+      })
+    } : {}
+  };
+}
 async function runGrokModels(run) {
   const { error, exitCode, raw, stderrTail, timedOut } = await runReviewerExec({
     ...run,
@@ -1799,7 +1819,7 @@ function statusOf(run) {
 function describeRun(run) {
   if ("failed" in run) return `failed (${run.failed}) \u2014 the run never started`;
   const line = firstLine(run);
-  const what = run.timedOut ? `did not finish within ${run.timeoutMs / 1e3} s` : line ? `printed "${line.slice(0, 200)}"` : "printed no status line";
+  const what = run.timedOut ? `did not finish within ${run.timeoutMs / 1e3} s` : run.exitCode === null ? "was ended by a signal the pre-flight did not send" : line ? `printed "${line.slice(0, 200)}"` : "printed no status line";
   const stderr = run.stderrTail.slice(-GROK_MODELS_STDERR_LIMIT).replace(/\s+/g, " ").trim();
   return `${what} (exit code ${run.exitCode ?? "none"}; stderr ${stderr ? `"${stderr}"` : "empty"})`;
 }
@@ -1835,19 +1855,22 @@ async function decide(opts, cwd, proceed) {
   const models = async (env) => {
     const timeoutMs = Math.min(GROK_LOGIN_REFRESH_TIMEOUT_MS, remainingMs());
     if (timeoutMs <= 0) return { failed: "the seat's time budget is spent" };
+    let run;
     try {
-      const run = await runModels({
+      const result = await runModels({
         args: ["--sandbox", "off", "models"],
         bin: opts.bin,
         cwd,
         env,
-        ...opts.onSpawn ? { onSpawn: opts.onSpawn } : {},
+        ...opts.cancel?.onSpawn ? { onSpawn: opts.cancel.onSpawn } : {},
         timeoutMs
       });
-      return { ...run, timeoutMs };
+      run = { ...result, timeoutMs };
     } catch (e) {
-      return { failed: errorText(e) };
+      run = { failed: errorText(e) };
     }
+    if (opts.cancel?.cancelled()) throw new GrokPreflightCancelledError(GROK_PREFLIGHT_CANCELLED_WHY);
+    return run;
   };
   const windowSecs = Math.ceil((remainingMs() + (opts.marginMs ?? GROK_LOGIN_MARGIN_MS)) / 1e3);
   const refresh = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: String(windowSecs), GROK_SANDBOX: void 0 });
@@ -2012,32 +2035,44 @@ async function runGrokReview(prompt, config, opts = {}) {
   }
   const bin = resolveGrokBin();
   const deadlineAt = Date.now() + timeoutMs;
-  let preflightNote;
+  const cancel = trackSeatCancel(opts.onSpawn);
+  let warnings;
   try {
-    const warnings = await ensureGrokLogin({ bin, deadlineAt, onSpawn: opts.onSpawn });
-    preflightNote = warnings.map(grokLoginWarningLine).join("");
+    warnings = await ensureGrokLogin({ bin, cancel, deadlineAt });
   } catch (e) {
-    if (!(e instanceof GrokLoginExpiryError)) throw e;
+    if (!(e instanceof GrokLoginExpiryError) && !(e instanceof GrokPreflightCancelledError)) throw e;
     return { failWhy: e.message, ok: false, raw: null, stderrTail: e.message, timedOut: false };
   }
-  const seatStderrLimit = Math.max(1, GROK_SEAT_STDERR_LIMIT - preflightNote.length);
-  const seatTimeoutMs = deadlineAt - Date.now();
-  if (seatTimeoutMs <= 0) {
+  const preflight = warnings.length > 0 ? { preflightWarnings: warnings } : {};
+  const budgetSpent = () => {
     const failWhy = `the grok login pre-flight spent the seat's whole ${Math.round(timeoutMs / 1e3)} s budget \u2014 the seat never spawned`;
-    return { failWhy, ok: false, raw: null, stderrTail: `${preflightNote}${failWhy}`, timedOut: true, timedOutReason: "absolute" };
-  }
+    return { ...preflight, failWhy, ok: false, raw: null, stderrTail: failWhy, timedOut: true, timedOutReason: "absolute" };
+  };
+  const cancelled = () => ({
+    ...preflight,
+    failWhy: GROK_PREFLIGHT_CANCELLED_WHY,
+    ok: false,
+    raw: null,
+    stderrTail: GROK_PREFLIGHT_CANCELLED_WHY,
+    timedOut: false
+  });
+  if (cancel.cancelled()) return cancelled();
+  if (deadlineAt - Date.now() <= 0) return budgetSpent();
   let proxy;
   if (worktreeCwd) {
     try {
       proxy = await startSeatEgressProxy("grok");
     } catch (e) {
-      return { ok: false, raw: null, stderrTail: `${preflightNote}${egressStartFailure("grok", e)}`, timedOut: false };
+      return { ...preflight, ok: false, raw: null, stderrTail: egressStartFailure("grok", e), timedOut: false };
     }
   }
   let cwd;
   try {
     ensureSandboxProfile(sandbox);
     cwd = worktreeCwd ?? fs10.mkdtempSync(path8.join(os7.tmpdir(), "grok-review-"));
+    if (cancel.cancelled()) return cancelled();
+    const seatTimeoutMs = deadlineAt - Date.now();
+    if (seatTimeoutMs <= 0) return budgetSpent();
     const { raw, stderrTail, timedOut, timedOutReason } = await runReviewerExec({
       args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
       bin,
@@ -2047,8 +2082,10 @@ async function runGrokReview(prompt, config, opts = {}) {
       // (spawn.ts), and grok's NDJSON now flows throughout the work — so this reclaims a WEDGED
       // seat in 15 min while `timeoutMs` above stands back as a pure runaway backstop.
       inactivityTimeoutMs: GROK_INACTIVITY_TIMEOUT_MS,
-      onSpawn: opts.onSpawn,
-      stderrLimit: seatStderrLimit,
+      onSpawn: cancel.onSpawn,
+      stderrLimit: GROK_SEAT_STDERR_LIMIT,
+      // What is left of the ONE deadline at the moment the seat spawns — after the pre-flight AND the
+      // egress proxy's start, so neither is ever added on top of the caller's budget.
       timeoutMs: seatTimeoutMs
     });
     const stream = raw ? parseGrokStream(raw) : null;
@@ -2065,8 +2102,9 @@ async function runGrokReview(prompt, config, opts = {}) {
         failWhy: `the liveness watchdog cut it after ${Math.round(GROK_INACTIVITY_TIMEOUT_MS / 6e4)} min of silence`
       } : {},
       ok: text !== null,
+      ...preflight,
       raw: text,
-      stderrTail: `${preflightNote}${stderrTail}`,
+      stderrTail,
       // The bounded NDJSON tail: a reclaimed seat leaves a record of what it was doing, not just
       // "it timed out". Cut on a line boundary — the trail persists it as .jsonl.
       ...raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
@@ -4522,6 +4560,24 @@ function parseProbeReport(raw) {
   }
   return { report: { probes, summary: capStr(o.summary, PROBE_SUMMARY_CAP) }, warnings };
 }
+function probeSeatRecord(config) {
+  return {
+    ...config.advisor === void 0 ? {} : { advisor: config.advisor },
+    effort: config.effort,
+    model: config.model
+  };
+}
+function probeSeatLabel(seat) {
+  return `anthropic/${seat.model} @ ${seat.effort}${seat.advisor === void 0 ? "" : ` \xB7 advisor ${seat.advisor}`}`;
+}
+function probeReportJson(fields) {
+  const { gate, headSha, prober, report, runId } = fields;
+  return JSON.stringify(
+    { ...gate ? { gate } : {}, ...headSha ? { headSha } : {}, prober, report, runId },
+    null,
+    2
+  );
+}
 async function runProbe(opts) {
   const log = opts.log ?? (() => {
   });
@@ -4554,11 +4610,12 @@ async function runProbe(opts) {
       opts.baseDir,
       opts.runId,
       "probe-report.json",
-      JSON.stringify(
-        { ...opts.headSha ? { headSha: opts.headSha } : {}, report: parsed.report, runId: opts.runId },
-        null,
-        2
-      )
+      probeReportJson({
+        ...opts.headSha ? { headSha: opts.headSha } : {},
+        prober: probeSeatRecord(opts.config),
+        report: parsed.report,
+        runId: opts.runId
+      })
     );
   } catch (e) {
     log(`  \xB7 probe: probe-report.json FAILED to write (${e.message}) \u2014 continuing`);
@@ -4766,11 +4823,13 @@ async function runProbeGate(opts) {
       opts.baseDir,
       opts.runId,
       "probe-report.json",
-      JSON.stringify(
-        { ...opts.headSha ? { headSha: opts.headSha } : {}, report, runId: opts.runId },
-        null,
-        2
-      )
+      probeReportJson({
+        gate: probeSeatRecord(opts.config),
+        ...opts.headSha ? { headSha: opts.headSha } : {},
+        prober: opts.prober,
+        report,
+        runId: opts.runId
+      })
     );
   } catch (e) {
     log(`  \xB7 probe-gate: probe-report.json rewrite FAILED (${e.message}) \u2014 verdicts are in stdout only`);
@@ -7642,6 +7701,7 @@ function seatDiagnostics(result, timing) {
     elapsedMs: timing.endedAt - timing.startedAt,
     endedAt: new Date(timing.endedAt).toISOString(),
     ...result.failWhy ? { failWhy: result.failWhy } : {},
+    ...result.preflightWarnings?.length ? { preflightWarnings: [...result.preflightWarnings] } : {},
     startedAt: new Date(timing.startedAt).toISOString(),
     stderrTail: result.stderrTail.trim().slice(-2e3),
     ...result.timedOutReason ? { timedOutReason: result.timedOutReason } : {}
@@ -8673,11 +8733,12 @@ function resolveGateSeat(raw, flags, warn, parseAdvisor = parseSeatAdvisor) {
     }
   }
   const entryVendor = fileVendor && GATE_VENDORS.has(fileVendor) ? fileVendor : "anthropic";
-  const advisorApplies = entryVendor === "anthropic" && vendor === "anthropic";
-  const gateAdvisor = gate && advisorApplies ? parseAdvisor(gate.advisor, "voices.json gate") : void 0;
-  if (gate && gate.advisor !== void 0 && !advisorApplies)
+  const gateEntryAdvisor = entryVendor === "anthropic" && vendor === "anthropic";
+  const claudeEntryAdvisor = entryVendor !== "anthropic" && vendor === "anthropic";
+  const gateAdvisor = gateEntryAdvisor ? gate ? parseAdvisor(gate.advisor, "voices.json gate") : void 0 : claudeEntryAdvisor && claude ? parseAdvisor(claude.advisor, "voices.json claude") : void 0;
+  if (gate && gate.advisor !== void 0 && !gateEntryAdvisor)
     warn(
-      `gate seat: \`advisor\` is ignored \u2014 it is a Claude-seat setting, and this gate (or its entry) is codex (got ${JSON.stringify(gate.advisor)}; not validated)`
+      claudeEntryAdvisor ? `gate seat: \`advisor\` on the codex-scoped \`gate\` entry is ignored on this anthropic gate \u2014 its advisor comes from the \`claude\` entry (got ${JSON.stringify(gate.advisor)}; not validated)` : `gate seat: \`advisor\` is ignored \u2014 it is a Claude-seat setting, and this gate is codex (got ${JSON.stringify(gate.advisor)}; not validated)`
     );
   if (gate && entryVendor !== vendor && (nonEmptyStr3(gate.model) || nonEmptyStr3(gate.effort))) {
     warn(
@@ -8743,7 +8804,7 @@ function resolveGateSeat(raw, flags, warn, parseAdvisor = parseSeatAdvisor) {
   return {
     // The anthropic gate IS the claude binary with a swapped model/effort — source its identity
     // (cmd/id/vendor) from the one canonical claude voice so it can't drift from it, overriding
-    // only the fields the gate seat configures. The advisor is the gate entry's own (advisorApplies).
+    // only the fields the gate seat configures. The advisor is the one resolved above.
     config: {
       ...VOICE_DEFAULTS.claude,
       ...gateAdvisor === void 0 ? {} : { advisor: gateAdvisor },
@@ -11064,7 +11125,6 @@ async function runReviewPipeline(input) {
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
   const out = typeof values.out === "string" ? path20.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
-  clearReusedRunTrail(out, trailDir);
   const ceiling = positiveCeiling(
     typeof values.ceiling === "string" ? values.ceiling : void 0,
     cmd
@@ -11140,6 +11200,7 @@ async function runReviewPipeline(input) {
     }));
     if (!anthropicSeats) return 3;
   }
+  clearReusedRunTrail(out, trailDir);
   let result;
   try {
     result = await runReviewMode({
@@ -13073,8 +13134,9 @@ async function probeCommand(rest) {
       headSha: acquired.headSha,
       worktree: worktree.dir
     });
+    const proberSeat = probeSeatRecord(seat.config);
     console.error(
-      `\xB7 prober (anthropic/${seat.config.model} @ ${seat.config.effort}), gate (anthropic/${gateSeat.config.model} @ ${gateSeat.config.effort}) \u2014 probing ${source.postTarget.repoSlug}#${source.postTarget.pr} by running it (worktree ${worktree.dir})\u2026`
+      `\xB7 prober (${probeSeatLabel(proberSeat)}), gate (${probeSeatLabel(probeSeatRecord(gateSeat.config))}) \u2014 probing ${source.postTarget.repoSlug}#${source.postTarget.pr} by running it (worktree ${worktree.dir})\u2026`
     );
     const res = await runProbe({
       baseDir: out,
@@ -13096,6 +13158,7 @@ async function probeCommand(rest) {
       config: gateSeat.config,
       headSha: acquired.headSha,
       log: (m) => console.error(m),
+      prober: proberSeat,
       report,
       runId,
       worktree: worktree.dir

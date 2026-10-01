@@ -23,8 +23,11 @@ export function resolveBin(
     // Absolute, so the path checked here is the one spawned from the seat's own cwd.
     const bin = path.resolve(override);
     if (fs.existsSync(bin)) return bin;
+    // A value that resolved elsewhere (relative, `~`, a trailing `/..`) names the path actually
+    // checked too — the raw value alone hides where the lookup went.
+    const shown = bin === override ? override : `${override} (resolved to ${bin})`;
     throw new Error(
-      `${opts.envVar}=${override} does not exist — unset it to use the default resolution`
+      `${opts.envVar}=${shown} does not exist — unset it to use the default resolution`
     );
   }
   const cached = binCache.get(name);

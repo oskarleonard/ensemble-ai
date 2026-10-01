@@ -5,7 +5,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { reviewDir } from '../../core/artifacts';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig } from '../brainstorm/types';
 
 import {
   MAX_PROBES_PARSED,
@@ -13,6 +13,8 @@ import {
   probeCounts,
   PROBE_RECEIPT_CAP,
   PROBE_TIMEOUT_MS,
+  probeSeatLabel,
+  probeSeatRecord,
   renderProbePrompt,
   renderProbeReport,
   resolveProbeExit,
@@ -21,7 +23,7 @@ import {
 } from './probe';
 import { PROBE_KINDS } from './probe';
 
-const CFG: VoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
+const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
 
 const PROMPT_ARGS = {
   baseSha: 'BASE1',
@@ -256,6 +258,33 @@ describe('runProbe — the stage end-to-end (injected runner)', () => {
     }
     const trail = JSON.parse(fs.readFileSync(path.join(dir, 'probe-report.json'), 'utf8'));
     expect(trail.report.probes[0].receipt).toContain('IMMUTABLE');
+    // The prober's seat, advisor absent: it inherited the operator's settings.
+    expect(trail.prober).toEqual({ effort: 'max', model: 'opus' });
+    expect(trail).not.toHaveProperty('gate');
+  });
+
+  it("the probe's stderr line spells a seat's advisor beside model/effort, and omits it when inherited", () => {
+    expect(probeSeatLabel(probeSeatRecord({ ...CFG, advisor: 'claude-fable-5-1' }))).toBe(
+      'anthropic/opus @ max · advisor claude-fable-5-1'
+    );
+    expect(probeSeatLabel(probeSeatRecord({ ...CFG, advisor: 'off' }))).toBe('anthropic/opus @ max · advisor off');
+    expect(probeSeatLabel(probeSeatRecord(CFG))).toBe('anthropic/opus @ max');
+  });
+
+  it("records the prober's stated advisor beside its model/effort in probe-report.json", async () => {
+    const base = tmp();
+    await runProbe({
+      baseDir: base,
+      config: { ...CFG, advisor: 'off' },
+      headSha: 'HEADP',
+      prompt: 'PROBE PROMPT',
+      run: async () => ({ ok: true, raw: REPLY, stderrTail: '', timedOut: false }),
+      runId: 'probe-adv',
+      worktree: '/tmp/wt',
+    });
+    const trail = JSON.parse(fs.readFileSync(path.join(reviewDir(base, 'probe-adv'), 'probe-report.json'), 'utf8'));
+    expect(trail.prober).toEqual({ advisor: 'off', effort: 'max', model: 'opus' });
+    expect(trail.headSha).toBe('HEADP');
   });
 
   it('a throwing spawn is spawned:false with a named cause', async () => {

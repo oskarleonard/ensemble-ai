@@ -61,6 +61,11 @@ export interface CodexReviewResult {
   // Callers prefer this over the generic timed-out/no-output wording when present.
   failWhy?: string;
   ok: boolean;
+  // The grok login pre-flight's warnings (grok-login.ts), one message each — a field of their own,
+  // never mixed into stderrTail, so a summary quoting the head of the seat's stderr shows the seat's
+  // own failure. seatDiagnostics persists them. Absent when the pre-flight raised none, and on every
+  // seat that has no pre-flight.
+  preflightWarnings?: readonly string[];
   raw: string | null; // the reviewer's full reply (read from the -o file)
   stderrTail: string;
   // The bounded tail of codex's `--json` progress stream — what the seat was doing last.

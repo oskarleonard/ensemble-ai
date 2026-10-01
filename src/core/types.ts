@@ -291,6 +291,8 @@ export interface SeatDiagnostics {
   elapsedMs: number;
   endedAt: string;
   failWhy?: string;
+  // The seat's pre-flight warnings (today: grok's login pre-flight), kept apart from `stderrTail`.
+  preflightWarnings?: string[];
   startedAt: string;
   stderrTail: string;
   timedOutReason?: 'absolute' | 'inactivity';

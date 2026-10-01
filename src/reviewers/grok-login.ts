@@ -10,7 +10,12 @@ import { runReviewerExec } from '../core/spawn';
 // THE CONTRACT — the declared threat model this module is built and reviewed against:
 //   · It may REFUSE a seat only when two runs that exited 0 both report grok's not-authenticated line.
 //   · Every other outcome PROCEEDS, and its warning is RECORDED in the seat's result (ensureGrokLogin
-//     returns it; runGrokReview prepends it to the seat's stderrTail).
+//     returns it; runGrokReview carries it on the result's own `preflightWarnings` field, never in
+//     the seat's stderrTail).
+//   · One outcome ABORTS without refusing on the login: the seat's cancel — the kill the seat's
+//     cancel handle was handed was actually called. The seat was told to stop, so it never spawns.
+//     A run some OTHER signal ended (a grok panic's SIGABRT, the OS's memory kill) is a crash, and
+//     proceeds with a warning like any other unreadable run.
 //   · It never adds more than the seat's own time budget allows: both runs spend from the seat's one
 //     deadline, and the seat spawns with only what is left. (A run cut at its cap settles after the
 //     shared spawn's kill grace — the same grace the seat's own backstop carries, not pre-flight time.)
@@ -85,6 +90,20 @@ export class GrokLoginExpiryError extends Error {
   }
 }
 
+// A cancel that lands during the pre-flight reaches only the `grok models` child (the seat's cancel
+// handle holds the latest spawn's kill). Without this the pre-flight would read the killed run as one
+// more unreadable answer and the seat would spawn after its run was cancelled. Not a login failure:
+// the message never starts with GROK_LOGIN_EXPIRY_FAIL_PREFIX, so no consumer swaps the chair for it.
+export const GROK_PREFLIGHT_CANCELLED_WHY =
+  'the grok login pre-flight was cancelled (the seat was told to stop) — the seat never spawned';
+
+export class GrokPreflightCancelledError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GrokPreflightCancelledError';
+  }
+}
+
 export interface GrokModelsRun {
   args: string[];
   bin: string;
@@ -96,8 +115,34 @@ export interface GrokModelsRun {
   timeoutMs: number;
 }
 
+// The seat's cancel handle, wrapped so the seat KNOWS it was cancelled: `cancelled()` turns true only
+// when a kill handed out through `onSpawn` is actually called — never inferred from how a child died,
+// and still true when the child it reached had already exited (a cancel between the last models run
+// and the seat's spawn).
+export interface SeatCancel {
+  cancelled: () => boolean;
+  onSpawn?: (kill: () => void) => void;
+}
+
+export function trackSeatCancel(onSpawn: ((kill: () => void) => void) | undefined): SeatCancel {
+  let cancelled = false;
+  return {
+    cancelled: () => cancelled,
+    ...(onSpawn
+      ? {
+          onSpawn: (kill: () => void) =>
+            onSpawn(() => {
+              cancelled = true;
+              kill();
+            }),
+        }
+      : {}),
+  };
+}
+
 export interface GrokModelsResult {
-  // null when a signal ended the run (the watchdog's kill) or it never reported one.
+  // null when a signal ended the run — the watchdog's kill (`timedOut`), the seat's cancel or a crash
+  // — or it never reported one.
   exitCode: number | null;
   stderrTail: string;
   stdout: string | null;
@@ -126,13 +171,14 @@ export interface EnsureGrokLoginOpts {
   // the seat after them. The refresh window covers what is left of it.
   deadlineAt: number;
   marginMs?: number;
-  // The seat's cancel handle, handed each models run's kill.
-  onSpawn?: (kill: () => void) => void;
+  // The seat's tracked cancel handle (trackSeatCancel): handed each models run's kill, and read after
+  // each run.
+  cancel?: SeatCancel;
   runModels?: GrokModelsRunner;
   warn?: (message: string) => void;
 }
 
-// A warning as one stderr line — the live notice and the line a seat's stderrTail records.
+// A warning as one stderr line — the live notice. The seat's record keeps the bare message.
 export function grokLoginWarningLine(message: string): string {
   return `⚠ ensemble-ai grok pre-flight: ${message}\n`;
 }
@@ -141,8 +187,7 @@ function warnToStderr(message: string): void {
   process.stderr.write(grokLoginWarningLine(message));
 }
 
-// An error as warning text — bounded like the status line, so no thrown message can outgrow the
-// stderr room a seat leaves for the warning.
+// An error as warning text — bounded like the status line, so a thrown message stays one readable line.
 function errorText(e: unknown): string {
   return (e instanceof Error ? e.message : String(e)).slice(0, 200);
 }
@@ -169,7 +214,9 @@ function describeRun(run: ModelsRun): string {
   const line = firstLine(run);
   const what = run.timedOut
     ? `did not finish within ${run.timeoutMs / 1000} s`
-    : line
+    : run.exitCode === null
+      ? 'was ended by a signal the pre-flight did not send'
+      : line
       ? `printed "${line.slice(0, 200)}"`
       : 'printed no status line';
   const stderr = run.stderrTail.slice(-GROK_MODELS_STDERR_LIMIT).replace(/\s+/g, ' ').trim();
@@ -188,7 +235,8 @@ function isAuthenticated(status: string | undefined): boolean {
 // Run grok's own refresh outside the sandbox, sized to the seat, then read grok's status line.
 // Resolves — with the warnings it raised, each also announced through `warn` — when the seat may
 // spawn; throws GrokLoginExpiryError, whose message starts with GROK_LOGIN_EXPIRY_FAIL_PREFIX, only
-// when two runs that exited 0 both say grok is not authenticated.
+// when two runs that exited 0 both say grok is not authenticated; throws GrokPreflightCancelledError
+// when the seat's cancel was called during a models run.
 export async function ensureGrokLogin(opts: EnsureGrokLoginOpts): Promise<string[]> {
   const warn = opts.warn ?? warnToStderr;
   const proceed = 'the seat proceeds; its backstop owns a login that cannot last';
@@ -225,19 +273,24 @@ async function decide(opts: EnsureGrokLoginOpts, cwd: string, proceed: string): 
     // Each run is capped by what is left of the seat's budget, never only by its own minute.
     const timeoutMs = Math.min(GROK_LOGIN_REFRESH_TIMEOUT_MS, remainingMs());
     if (timeoutMs <= 0) return { failed: "the seat's time budget is spent" };
+    let run: ModelsRun;
     try {
-      const run = await runModels({
+      const result = await runModels({
         args: ['--sandbox', 'off', 'models'],
         bin: opts.bin,
         cwd,
         env,
-        ...(opts.onSpawn ? { onSpawn: opts.onSpawn } : {}),
+        ...(opts.cancel?.onSpawn ? { onSpawn: opts.cancel.onSpawn } : {}),
         timeoutMs,
       });
-      return { ...run, timeoutMs };
+      run = { ...result, timeoutMs };
     } catch (e) {
-      return { failed: errorText(e) };
+      run = { failed: errorText(e) };
     }
+    // The seat's cancel was called: abort. Outside the try above, so it can never be read as one more
+    // failed run that proceeds. Any other signal death is a crash — it falls through and proceeds.
+    if (opts.cancel?.cancelled()) throw new GrokPreflightCancelledError(GROK_PREFLIGHT_CANCELLED_WHY);
+    return run;
   };
 
   const windowSecs = Math.ceil((remainingMs() + (opts.marginMs ?? GROK_LOGIN_MARGIN_MS)) / 1000);

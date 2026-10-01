@@ -5,9 +5,9 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { reviewDir } from '../../core/artifacts';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig } from '../brainstorm/types';
 
-import type { ProbeRecord, ProbeReport } from './probe';
+import { type ProbeRecord, type ProbeReport, probeSeatRecord } from './probe';
 import {
   attachGateVerdicts,
   parseProbeGateVerdicts,
@@ -16,7 +16,9 @@ import {
   selectGateTargets,
 } from './probe-gate';
 
-const CFG: VoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
+const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
+// The prober seat runProbe recorded — what the gate's rewrite carries forward.
+const PROBER = probeSeatRecord({ ...CFG, advisor: 'claude-fable-5-1', effort: 'high' });
 
 function probe(over: Partial<ProbeRecord> = {}): ProbeRecord {
   return {
@@ -122,7 +124,7 @@ describe('runProbeGate — the stage end-to-end (injected runner)', () => {
 
   it('does nothing when there are no broke findings', async () => {
     const r = report([probe({ outcome: 'held', severity: null })]);
-    const out = await runProbeGate({ baseDir: tmp(), config: CFG, report: r, run: async () => { throw new Error('must not spawn'); }, runId: 'g0', worktree: '/tmp/wt' });
+    const out = await runProbeGate({ baseDir: tmp(), config: CFG, prober: PROBER, report: r, run: async () => { throw new Error('must not spawn'); }, runId: 'g0', worktree: '/tmp/wt' });
     expect(out.ran).toBe(false);
     expect(out.report).toBe(r);
   });
@@ -133,6 +135,7 @@ describe('runProbeGate — the stage end-to-end (injected runner)', () => {
     const out = await runProbeGate({
       baseDir: base,
       config: CFG,
+      prober: PROBER,
       report: report([probe()]),
       run: async () => ({ ok: true, raw: reply, stderrTail: '', timedOut: false }),
       runId: 'g1',
@@ -151,6 +154,7 @@ describe('runProbeGate — the stage end-to-end (injected runner)', () => {
       baseDir: base,
       config: CFG,
       headSha: 'HEADX',
+      prober: PROBER,
       report: report([probe()]),
       run: async () => ({ ok: true, raw: reply, stderrTail: '', timedOut: false }),
       runId: 'g9',
@@ -171,6 +175,7 @@ describe('runProbeGate — the stage end-to-end (injected runner)', () => {
     const out = await runProbeGate({
       baseDir: tmp(),
       config: CFG,
+      prober: PROBER,
       report: report([probe()]),
       run: async () => ({ failWhy: 'timed out', ok: false, raw: null, stderrTail: '', timedOut: true }),
       runId: 'g2',
@@ -178,5 +183,40 @@ describe('runProbeGate — the stage end-to-end (injected runner)', () => {
     });
     expect(out.report.probes[0].gate?.verdict).toBe('inconclusive');
     expect(out.report.probes[0].gate?.reason).toContain('did not complete');
+  });
+
+  // The rewrite carries the prober's seat forward and records the gate's own beside it — model,
+  // effort and the stated advisor; an inheriting seat has NO advisor key ("off" ≠ inherit).
+  it('the rewritten probe-report.json records the prober and the gate seats, advisor beside model/effort', async () => {
+    const base = tmp();
+    const reply = '```json\n' + JSON.stringify({ verdicts: [{ citation: { file: 'x.go', line: 1 }, id: 'p1', reason: 'by contract', verdict: 'refuted' }] }) + '\n```';
+    await runProbeGate({
+      baseDir: base,
+      config: { ...CFG, advisor: 'off', model: 'fable' },
+      headSha: 'HEADX',
+      prober: PROBER,
+      report: report([probe()]),
+      run: async () => ({ ok: true, raw: reply, stderrTail: '', timedOut: false }),
+      runId: 'g3',
+      worktree: '/tmp/wt',
+    });
+    const trail = JSON.parse(fs.readFileSync(path.join(reviewDir(base, 'g3'), 'probe-report.json'), 'utf8'));
+    expect(trail.prober).toEqual({ advisor: 'claude-fable-5-1', effort: 'high', model: 'opus' });
+    expect(trail.gate).toEqual({ advisor: 'off', effort: 'max', model: 'fable' });
+    expect(trail.headSha).toBe('HEADX');
+
+    const inherit = tmp();
+    await runProbeGate({
+      baseDir: inherit,
+      config: CFG,
+      prober: probeSeatRecord(CFG),
+      report: report([probe()]),
+      run: async () => ({ ok: true, raw: reply, stderrTail: '', timedOut: false }),
+      runId: 'g4',
+      worktree: '/tmp/wt',
+    });
+    const plain = JSON.parse(fs.readFileSync(path.join(reviewDir(inherit, 'g4'), 'probe-report.json'), 'utf8'));
+    expect(plain.gate).toEqual({ effort: 'max', model: 'opus' });
+    expect(plain.prober).not.toHaveProperty('advisor');
   });
 });
