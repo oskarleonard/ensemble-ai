@@ -1558,8 +1558,9 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // whatever `review.<id>.json` is on disk, blind to which run wrote it). A fresh /
   // auto-generated run id has no dir to clear. This is a RECURSIVE delete of a path that
   // carries user-influenced input (`--run-id`), so it is fenced hard — see clearReusedRunTrail.
-  // It runs AFTER every refusal above (the usage checks, the up-front seat resolution): a run
-  // refused with exit 3 never deletes the old trail of the run id it reused.
+  // It runs AFTER every refusal above this line (the usage checks, the up-front seat resolution):
+  // none of those deletes the old trail of the run id it reused. Refusals inside the review itself
+  // (a base ref that cannot be resolved, a secret-scan block) come after the clear.
   clearReusedRunTrail(out, trailDir);
 
   let result: ReviewModeResult;

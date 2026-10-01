@@ -8,12 +8,14 @@ import {
   GROK_LOGIN_EXPIRY_FAIL_PREFIX,
   GROK_STATUS_API_KEY,
   GROK_STATUS_NOT_AUTHENTICATED,
+  GROK_PREFLIGHT_CANCELLED_WHY,
   GrokLoginExpiryError,
   grokLoginWarningLine,
   GrokPreflightCancelledError,
   type GrokModelsResult,
   type GrokModelsRun,
   isGrokLoginExpiryFailure,
+  trackSeatCancel,
 } from './grok-login';
 
 const MIN = 60_000;
@@ -80,9 +82,14 @@ function runner(...answers: Answer[]) {
 }
 
 async function preflight(...answers: Answer[]) {
+  return preflightWith({}, ...answers);
+}
+
+async function preflightWith(opts: { cancel?: ReturnType<typeof trackSeatCancel> }, ...answers: Answer[]) {
   const r = runner(...answers);
   const warn = vi.fn();
   const outcome = ensureGrokLogin({
+    ...opts,
     bin: '/opt/grok/bin/grok-pinned',
     deadlineAt: NOW + BUDGET_MS,
     marginMs: MARGIN_MS,
@@ -195,11 +202,11 @@ describe("ensureGrokLogin — the seat's time budget", () => {
   });
 
   it("hands the seat's cancel handle to every models run", async () => {
-    const onSpawn = vi.fn();
+    const cancel = trackSeatCancel(vi.fn());
     const r = runner(answered(GROK_STATUS_NOT_AUTHENTICATED), answered(LOGGED_IN));
-    await ensureGrokLogin({ bin: 'grok', deadlineAt: NOW + BUDGET_MS, onSpawn, runModels: r.run, warn: vi.fn() });
+    await ensureGrokLogin({ bin: 'grok', cancel, deadlineAt: NOW + BUDGET_MS, runModels: r.run, warn: vi.fn() });
     expect(r.runs).toHaveLength(2);
-    expect(r.runs.every((run) => run.onSpawn === onSpawn)).toBe(true);
+    expect(r.runs.every((run) => run.onSpawn === cancel.onSpawn)).toBe(true);
   });
 });
 
@@ -283,7 +290,8 @@ describe('ensureGrokLogin — the real runner', () => {
       const warn = vi.fn();
       const kills: Array<() => void> = [];
       const started = performance.now();
-      const run = ensureGrokLogin({ bin, deadlineAt: NOW + BUDGET_MS, onSpawn: (kill) => kills.push(kill), warn });
+      const cancel = trackSeatCancel((kill) => kills.push(kill));
+      const run = ensureGrokLogin({ bin, cancel, deadlineAt: NOW + BUDGET_MS, warn });
       await vi.waitFor(() => expect(kills).toHaveLength(1));
       kills[0]?.();
       const err: unknown = await run.catch((e: unknown) => e);
@@ -297,22 +305,63 @@ describe('ensureGrokLogin — the real runner', () => {
     }
   });
 
-  // The rule, on a stubbed runner: a run a signal ended (exit code null) that its watchdog did NOT
-  // cut aborts — on the refresh run and on the confirm run alike — and the temp cwd is still removed.
+  // A crash is not a cancel: a grok that dies on a signal nobody sent through the seat's handle —
+  // here its own SIGABRT, the shape of a panic — proceeds with a warning, never aborts the seat.
+  it('a run a signal ended that the seat did not send (SIGABRT) proceeds with a warning', async () => {
+    const { bin, dir } = standInGrok(`echo 'thread main panicked' >&2\nkill -ABRT $$`);
+    try {
+      const warn = vi.fn();
+      const cancel = trackSeatCancel(vi.fn());
+      const warning = await oneWarning(ensureGrokLogin({ bin, cancel, deadlineAt: NOW + BUDGET_MS, warn }), warn);
+      expect(warning).toBe(
+        '`grok models` was ended by a signal the pre-flight did not send (exit code none; stderr "thread main panicked") — the seat proceeds; its backstop owns a login that cannot last'
+      );
+      expect(cancel.cancelled()).toBe(false);
+    } finally {
+      fs.rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  let kills: Array<() => void> = [];
+  beforeEach(() => {
+    kills = [];
+  });
+
+  // The rule, on a stubbed runner: only the seat's handed kill being CALLED aborts — on the refresh
+  // run and on the confirm run alike — and the temp cwd is still removed. A run that died on a signal
+  // with no call proceeds.
+  const cancelledRun = (cancel: ReturnType<typeof trackSeatCancel>): Answer => () => {
+    cancel.onSpawn?.(() => {});
+    // The caller cancels — the kill it holds is the one the models run just handed out.
+    kills.at(-1)?.();
+    return answered('', { exitCode: null, stdout: null });
+  };
   it.each([
-    ['the refresh run', [answered('', { exitCode: null, stdout: null })]],
-    ['the confirm run', [answered(GROK_STATUS_NOT_AUTHENTICATED), answered('', { exitCode: null, stdout: null })]],
-  ])('a signal-killed %s that did not time out aborts the seat with a non-login reason', async (_which, answers) => {
-    const { outcome, r, warn } = await preflight(...answers);
+    ['the refresh run', (c: ReturnType<typeof trackSeatCancel>) => [cancelledRun(c)]],
+    ['the confirm run', (c: ReturnType<typeof trackSeatCancel>) => [answered(GROK_STATUS_NOT_AUTHENTICATED), cancelledRun(c)]],
+  ])("a cancel through the seat's handle during %s aborts the seat with a non-login reason", async (_which, answersFor) => {
+    const cancel = trackSeatCancel((kill) => kills.push(kill));
+    const answers = answersFor(cancel);
+    const { outcome, r, warn } = await preflightWith({ cancel }, ...answers);
     const err: unknown = await outcome.catch((e: unknown) => e);
     expect(err).toBeInstanceOf(GrokPreflightCancelledError);
-    expect((err as Error).message).toBe(
-      'the grok login pre-flight was cancelled (a signal ended its `grok models` run) — the seat never spawned'
-    );
+    expect((err as Error).message).toBe(GROK_PREFLIGHT_CANCELLED_WHY);
     expect(isGrokLoginExpiryFailure((err as Error).message)).toBe(false);
     expect(r.runs).toHaveLength(answers.length);
     expect(warn).not.toHaveBeenCalled();
     expect(fs.existsSync(r.runs[0]?.cwd ?? '')).toBe(false);
+  });
+
+  it.each([
+    ['the refresh run', [answered('', { exitCode: null, stdout: null })]],
+    ['the confirm run', [answered(GROK_STATUS_NOT_AUTHENTICATED), answered('', { exitCode: null, stdout: null })]],
+  ])('a signal-killed %s with no cancel called proceeds with a warning', async (_which, answers) => {
+    const cancel = trackSeatCancel((kill) => kills.push(kill));
+    const { outcome, r, warn } = await preflightWith({ cancel }, ...answers);
+    const warning = await oneWarning(outcome, warn);
+    expect(warning).toContain('was ended by a signal the pre-flight did not send (exit code none; stderr empty)');
+    expect(warning).toMatch(/the seat proceeds; its backstop owns a login that cannot last$/);
+    expect(r.runs).toHaveLength(answers.length);
   });
 });
 

@@ -26,6 +26,7 @@ import {
   GROK_LOGIN_EXPIRY_FAIL_PREFIX,
   GROK_STATUS_NOT_AUTHENTICATED,
   GrokLoginExpiryError,
+  GROK_PREFLIGHT_CANCELLED_WHY,
   GrokPreflightCancelledError,
   isGrokLoginExpiryFailure,
 } from './grok-login';
@@ -652,7 +653,12 @@ describe('runGrokReview — the login pre-flight runs before anything spawns', (
       const onSpawn = vi.fn();
       const run = runGrokReview('p', CONFIG, { onSpawn, timeoutMs: 10_000 });
       await vi.waitFor(() => expect(spawned).toHaveBeenCalled());
-      expect(preflight).toHaveBeenCalledWith({ bin: 'grok', deadlineAt: NOW + 10_000, onSpawn });
+      const tracked = { cancel: expect.objectContaining({ cancelled: expect.any(Function) }) };
+      expect(preflight).toHaveBeenCalledWith({ bin: 'grok', deadlineAt: NOW + 10_000, ...tracked });
+      // The handle the pre-flight got wraps the caller's: its kill reaches the caller, and so does
+      // the seat's own.
+      expect(preflight.mock.calls[0]?.[0].cancel?.onSpawn).toEqual(expect.any(Function));
+      expect(onSpawn).toHaveBeenCalledTimes(1);
       child?.emit('exit');
       await run;
       // No explicit timeout: the worktree seat's 60-min backstop is the deadline the refresh covers.
@@ -664,7 +670,11 @@ describe('runGrokReview — the login pre-flight runs before anything spawns', (
       preflight.mockRejectedValueOnce(new GrokLoginExpiryError(`${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: x`));
       const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
       const refused = await runGrokReview('p', CONFIG, { worktree: wt });
-      expect(preflight).toHaveBeenCalledWith({ bin: 'grok', deadlineAt: NOW + GROK_WORKTREE_REVIEW_TIMEOUT_MS });
+      expect(preflight).toHaveBeenCalledWith({
+        bin: 'grok',
+        cancel: expect.objectContaining({ cancelled: expect.any(Function) }),
+        deadlineAt: NOW + GROK_WORKTREE_REVIEW_TIMEOUT_MS,
+      });
       expect(refused).toMatchObject({ ok: false });
       expect(vi.mocked(startSeatEgressProxy)).not.toHaveBeenCalled(); // no proxy was ever started
       expect(spawned).not.toHaveBeenCalled();
@@ -795,7 +805,7 @@ describe('runGrokReview — the login pre-flight runs before anything spawns', (
     const proxy = vi.mocked(startSeatEgressProxy);
     spawned.mockClear();
     proxy.mockClear();
-    const why = 'the grok login pre-flight was cancelled (a signal ended its `grok models` run) — the seat never spawned';
+    const why = GROK_PREFLIGHT_CANCELLED_WHY;
     vi.mocked(ensureGrokLogin).mockRejectedValueOnce(new GrokPreflightCancelledError(why));
     const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
     try {
@@ -805,6 +815,88 @@ describe('runGrokReview — the login pre-flight runs before anything spawns', (
       expect(proxy).not.toHaveBeenCalled();
       expect(spawned).not.toHaveBeenCalled();
     } finally {
+      fs.rmSync(wt, { force: true, recursive: true });
+    }
+  });
+
+  // A CANCEL AFTER THE LAST MODELS RUN EXITED reaches an already-exited child — nothing dies, so
+  // nothing in the pre-flight can see it. The tracked handle still knows: the seat never spawns,
+  // whether the cancel lands before the proxy starts or while it is starting.
+  it.each([
+    ['before the proxy starts', 'preflight'],
+    ['while the proxy is starting', 'proxy'],
+  ] as const)('a cancel %s (after the last models run exited) ends the seat before it spawns', async (_when, at) => {
+    const spawned = vi.mocked(spawn);
+    const proxy = vi.mocked(startSeatEgressProxy);
+    spawned.mockClear();
+    proxy.mockClear();
+    const kills: Array<() => void> = [];
+    const close = vi.fn();
+    vi.mocked(ensureGrokLogin).mockImplementationOnce(async ({ cancel }) => {
+      cancel?.onSpawn?.(() => {}); // the models run spawned, answered and exited
+      if (at === 'preflight') kills.at(-1)?.();
+      return [];
+    });
+    if (at === 'proxy') {
+      proxy.mockImplementationOnce(async () => {
+        kills.at(-1)?.();
+        return { allowHosts: [], close, denials: [], port: 1, url: 'http://127.0.0.1:1' };
+      });
+    }
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
+    try {
+      const result = await runGrokReview('p', CONFIG, { onSpawn: (kill) => kills.push(kill), worktree: wt });
+      expect(result).toEqual({
+        failWhy: GROK_PREFLIGHT_CANCELLED_WHY,
+        ok: false,
+        raw: null,
+        stderrTail: GROK_PREFLIGHT_CANCELLED_WHY,
+        timedOut: false,
+      });
+      expect(spawned).not.toHaveBeenCalled();
+      expect(kills).toHaveLength(1); // the seat never registered a kill of its own
+      if (at === 'preflight') expect(proxy).not.toHaveBeenCalled();
+      else expect(close).toHaveBeenCalledTimes(1); // the fence still comes down
+    } finally {
+      fs.rmSync(wt, { force: true, recursive: true });
+    }
+  });
+
+  // THE BUDGET IS RE-CHECKED ON THE SPAWN LINE: a proxy start that spends the rest of it must not
+  // hand the spawn a timeout of zero or less (Node's TimeoutNegativeWarning and a 1-ms kill recorded
+  // as a generic timeout) — the seat never spawns, under the budget-spent failWhy.
+  it('a proxy start that spends the rest of the budget: the seat never spawns, and its failWhy says why', async () => {
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    vi.useFakeTimers();
+    const warnings: string[] = [];
+    const onWarning = (w: Error) => warnings.push(w.name);
+    process.on('warning', onWarning);
+    const close = vi.fn();
+    vi.mocked(ensureGrokLogin).mockImplementationOnce(async () => {
+      vi.setSystemTime(Date.now() + 4_000); // the models runs took 4 s
+      return [];
+    });
+    vi.mocked(startSeatEgressProxy).mockImplementationOnce(async () => {
+      vi.setSystemTime(Date.now() + 7_000); // the proxy took 7 s — 1 s past the deadline
+      return { allowHosts: [], close, denials: [], port: 1, url: 'http://127.0.0.1:1' };
+    });
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
+    try {
+      const result = await runGrokReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt });
+      expect(spawned).not.toHaveBeenCalled();
+      expect(result).toEqual({
+        failWhy: "the grok login pre-flight spent the seat's whole 10 s budget — the seat never spawned",
+        ok: false,
+        raw: null,
+        stderrTail: "the grok login pre-flight spent the seat's whole 10 s budget — the seat never spawned",
+        timedOut: true,
+        timedOutReason: 'absolute',
+      });
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(warnings).not.toContain('TimeoutNegativeWarning');
+    } finally {
+      process.off('warning', onWarning);
       fs.rmSync(wt, { force: true, recursive: true });
     }
   });
