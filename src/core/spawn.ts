@@ -4,7 +4,8 @@ import os from 'node:os';
 
 import { resolveBin } from './bin';
 
-// Env override, then the login shell's PATH (codex lives in the nvm bin).
+// CODEX_BIN when set (authoritative — a missing path throws), else the login
+// shell's PATH (codex lives in the nvm bin).
 export function resolveCodexBin(): string {
   return resolveBin('codex', { envVar: 'CODEX_BIN' });
 }

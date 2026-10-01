@@ -36,6 +36,8 @@ npm i github:oskarleonard/ensemble-ai
 
 The package has **zero runtime dependencies** (node built-ins only) and ships a prebuilt `dist/`, so a git install needs no build step. Reviewers are invoked via their own CLIs (`codex`, `grok`) — install + authenticate those separately.
 
+Each vendor CLI is located by its env override when one is set — `CODEX_BIN`, `GROK_BIN`, `CLAUDE_BIN`. **An explicitly set override is authoritative:** if the path exists it is used; if it does not, the seat fails closed with an error naming the variable and the path (`GROK_BIN=/x/y does not exist — unset it to use the default resolution`) — it never falls back to another copy. So point an override at a path you control, not one an updater can prune. Unset or empty, resolution tries the default location (`~/.grok/bin/grok` for grok), then the login shell's `PATH`.
+
 ## Usage
 
 ```sh

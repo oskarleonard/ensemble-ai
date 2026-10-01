@@ -1508,13 +1508,16 @@ import { execFileSync as execFileSync2 } from "child_process";
 import fs4 from "fs";
 var binCache = /* @__PURE__ */ new Map();
 function resolveBin(name2, opts = {}) {
+  const override = opts.envVar ? process.env[opts.envVar] : void 0;
+  if (override) {
+    if (fs4.existsSync(override)) return override;
+    throw new Error(
+      `${opts.envVar}=${override} does not exist \u2014 unset it to use the default resolution`
+    );
+  }
   const cached = binCache.get(name2);
   if (cached) return cached;
-  const candidates = [
-    opts.envVar ? process.env[opts.envVar] : void 0,
-    ...opts.candidates ?? []
-  ].filter((c) => Boolean(c));
-  for (const c of candidates) {
+  for (const c of opts.candidates ?? []) {
     if (fs4.existsSync(c)) {
       binCache.set(name2, c);
       return c;
