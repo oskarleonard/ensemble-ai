@@ -137,6 +137,35 @@ describe('runReviewerExec — env', () => {
   });
 });
 
+// The run's own facts beside its reply: the exit code it reported, and a spawn that never started.
+describe('runReviewerExec — exit code and spawn error', () => {
+  it('reports the exit code', async () => {
+    const res = await runReviewerExec({
+      args: ['-c', 'echo out; exit 3'],
+      bin: '/bin/sh',
+      capture: 'stdout',
+      stderrLimit: 500,
+      timeoutMs: 20_000,
+    });
+    expect(res.raw).toBe('out');
+    expect(res.exitCode).toBe(3);
+    expect(res.error).toBeUndefined();
+  });
+
+  it('surfaces a bin that cannot be spawned as `error`, not as an empty reply alone', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spawn-noexec-'));
+    try {
+      const bin = path.join(dir, 'tool');
+      fs.writeFileSync(bin, '#!/bin/sh\necho hi\n', { mode: 0o644 });
+      const res = await runReviewerExec({ args: [], bin, capture: 'stdout', stderrLimit: 500, timeoutMs: 20_000 });
+      expect(res.raw).toBeNull();
+      expect((res.error as NodeJS.ErrnoException | undefined)?.code).toBe('EACCES');
+    } finally {
+      fs.rmSync(dir, { force: true, recursive: true });
+    }
+  });
+});
+
 // An outfile seat that ALSO streams progress on stdout (codex `--json` + `-o`): the stream drives
 // the liveness watchdog and is kept as a bounded diagnostic tail; the reply still comes from -o.
 describe('runReviewerExec — stream liveness beside an outfile reply', () => {

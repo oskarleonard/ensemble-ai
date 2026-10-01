@@ -663,8 +663,9 @@ describe('runGrokReview — the login pre-flight runs before anything spawns', (
     fs.rmSync(wt, { force: true, recursive: true });
   });
 
-  // The REAL pre-flight against the fake spawn: the one spawn is `grok models`, grok answers that it
-  // is not authenticated, and the worktree seat is refused before its egress proxy could start.
+  // The REAL pre-flight against the fake spawn: the only spawns are `grok models` — the refresh, then
+  // the confirm — grok answers both that it is not authenticated, and the worktree seat is refused
+  // before its egress proxy could start.
   it('a not-authenticated grok refuses the seat before it spawns and before the proxy starts', async () => {
     const actual = await vi.importActual<typeof import('./grok-login')>('./grok-login');
     vi.mocked(ensureGrokLogin).mockImplementationOnce(actual.ensureGrokLogin);
@@ -677,12 +678,16 @@ describe('runGrokReview — the login pre-flight runs before anything spawns', (
     await vi.waitFor(() => expect(spawned).toHaveBeenCalledTimes(1));
     expect(spawned.mock.calls[0]?.[1]).toEqual(['--sandbox', 'off', 'models']);
     child?.stdout.emit('data', Buffer.from(`${GROK_STATUS_NOT_AUTHENTICATED}\n\nDefault model: grok-4.6\n`));
-    child?.emit('close');
+    child?.emit('close', 0);
+    await vi.waitFor(() => expect(spawned).toHaveBeenCalledTimes(2));
+    expect(spawned.mock.calls[1]?.[1]).toEqual(['--sandbox', 'off', 'models']);
+    child?.stdout.emit('data', Buffer.from(`${GROK_STATUS_NOT_AUTHENTICATED}\n`));
+    child?.emit('close', 0);
     const result = await run;
     expect(result.ok).toBe(false);
     expect(result.failWhy).toMatch(new RegExp(`^${GROK_LOGIN_EXPIRY_FAIL_PREFIX}`));
     expect(result.failWhy).toContain(`"${GROK_STATUS_NOT_AUTHENTICATED}"`);
-    expect(spawned).toHaveBeenCalledTimes(1); // the models run only — the seat never spawned
+    expect(spawned).toHaveBeenCalledTimes(2); // the two models runs only — the seat never spawned
     expect(proxy).not.toHaveBeenCalled();
     fs.rmSync(wt, { force: true, recursive: true });
   });

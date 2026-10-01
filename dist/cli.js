@@ -1333,6 +1333,8 @@ function runReviewerExec(opts) {
       });
     }
     let exitDrain = null;
+    let exitCode;
+    let error;
     const settle = () => {
       if (settled) return;
       settled = true;
@@ -1354,6 +1356,8 @@ function runReviewerExec(opts) {
         }
       }
       resolve({
+        ...error ? { error } : {},
+        ...exitCode !== void 0 ? { exitCode } : {},
         raw,
         stderrTail,
         ...streamStdout ? { streamTail: boundedStreamTail(streamTail, streamLimit) } : {},
@@ -1362,14 +1366,19 @@ function runReviewerExec(opts) {
       });
     };
     const backstop = setTimeout(settle, timeoutMs + KILL_GRACE_MS + 5e3);
-    child.on(
-      "exit",
-      pipeStdout ? () => {
-        exitDrain = setTimeout(settle, EXIT_DRAIN_GRACE_MS);
-      } : settle
-    );
-    child.on("close", settle);
-    child.on("error", settle);
+    child.on("exit", (code2) => {
+      exitCode = code2;
+      if (pipeStdout) exitDrain = setTimeout(settle, EXIT_DRAIN_GRACE_MS);
+      else settle();
+    });
+    child.on("close", (code2) => {
+      if (exitCode === void 0) exitCode = code2;
+      settle();
+    });
+    child.on("error", (e) => {
+      error = e;
+      settle();
+    });
   });
 }
 
@@ -1736,6 +1745,7 @@ import os6 from "os";
 import path7 from "path";
 var GROK_LOGIN_MARGIN_MS = 3e5;
 var GROK_LOGIN_REFRESH_TIMEOUT_MS = 6e4;
+var GROK_MODELS_STDERR_LIMIT = 500;
 var GROK_STATUS_LOGGED_IN = "You are logged in with grok.com.";
 var GROK_STATUS_API_KEY = "You are using XAI_API_KEY.";
 var GROK_STATUS_NOT_AUTHENTICATED = "You are not authenticated.";
@@ -1747,52 +1757,87 @@ var GrokLoginExpiryError = class extends Error {
   }
 };
 async function runGrokModels(run) {
-  const { raw, timedOut } = await runReviewerExec({ ...run, capture: "stdout", stderrLimit: 1e3 });
-  return { stdout: raw, timedOut };
+  const { error, exitCode, raw, stderrTail, timedOut } = await runReviewerExec({
+    ...run,
+    capture: "stdout",
+    stderrLimit: GROK_MODELS_STDERR_LIMIT
+  });
+  if (error) throw error;
+  return { exitCode: exitCode ?? null, stderrTail, stdout: raw, timedOut };
 }
 function warnToStderr(message) {
   process.stderr.write(`\u26A0 ensemble-ai grok pre-flight: ${message}
 `);
 }
+function errorText(e) {
+  return e instanceof Error ? e.message : String(e);
+}
+function statusOf(run) {
+  if ("failed" in run || run.timedOut) return void 0;
+  return run.stdout?.split("\n").find((line) => line.trim())?.trim();
+}
+function describeRun(run) {
+  if ("failed" in run) return `failed (${run.failed}) \u2014 the run never started`;
+  const status = statusOf(run);
+  const what = run.timedOut ? `did not finish within ${GROK_LOGIN_REFRESH_TIMEOUT_MS / 1e3} s` : status ? `printed "${status.slice(0, 200)}"` : "printed no status line";
+  const stderr = run.stderrTail.slice(-GROK_MODELS_STDERR_LIMIT).replace(/\s+/g, " ").trim();
+  return `${what} (exit code ${run.exitCode ?? "none"}; stderr ${stderr ? `"${stderr}"` : "empty"})`;
+}
+function isLoggedIn(status) {
+  return status === GROK_STATUS_LOGGED_IN || status === GROK_STATUS_API_KEY;
+}
 async function ensureGrokLogin(opts) {
-  const marginMs = opts.marginMs ?? GROK_LOGIN_MARGIN_MS;
   const warn = opts.warn ?? warnToStderr;
   const proceed = "the seat proceeds; its backstop owns a login that cannot last";
-  const cwd = fs9.mkdtempSync(path7.join(os6.tmpdir(), "grok-login-"));
-  let result;
+  let cwd;
   try {
-    result = await (opts.runModels ?? runGrokModels)({
-      args: ["--sandbox", "off", "models"],
-      bin: opts.bin,
-      cwd,
-      env: {
-        GROK_AUTH_EARLY_INVALIDATION_SECS: String(Math.ceil((opts.deadlineMs + marginMs) / 1e3)),
-        GROK_SANDBOX: void 0
-      },
-      timeoutMs: GROK_LOGIN_REFRESH_TIMEOUT_MS
-    });
+    cwd = fs9.mkdtempSync(path7.join(os6.tmpdir(), "grok-login-"));
   } catch (e) {
-    warn(`\`grok models\` failed (${e instanceof Error ? e.message : String(e)}) \u2014 ${proceed}`);
+    warn(`could not create a temp cwd for \`grok models\` (${errorText(e)}) \u2014 ${proceed}`);
     return;
+  }
+  try {
+    await decide(opts, cwd, warn, proceed);
   } finally {
     try {
       fs9.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
   }
-  if (result.timedOut) {
-    warn(`\`grok models\` did not finish within ${GROK_LOGIN_REFRESH_TIMEOUT_MS / 1e3} s \u2014 ${proceed}`);
+}
+async function decide(opts, cwd, warn, proceed) {
+  const runModels = opts.runModels ?? runGrokModels;
+  const models = async (env) => {
+    try {
+      return await runModels({
+        args: ["--sandbox", "off", "models"],
+        bin: opts.bin,
+        cwd,
+        env,
+        timeoutMs: GROK_LOGIN_REFRESH_TIMEOUT_MS
+      });
+    } catch (e) {
+      return { failed: errorText(e) };
+    }
+  };
+  const windowSecs = Math.ceil((opts.deadlineMs + (opts.marginMs ?? GROK_LOGIN_MARGIN_MS)) / 1e3);
+  const refresh = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: String(windowSecs), GROK_SANDBOX: void 0 });
+  const status = statusOf(refresh);
+  if (isLoggedIn(status)) return;
+  if (status !== GROK_STATUS_NOT_AUTHENTICATED) {
+    warn(`\`grok models\` ${describeRun(refresh)} \u2014 ${proceed}`);
     return;
   }
-  const status = result.stdout?.split("\n").find((line) => line.trim())?.trim();
-  if (status === GROK_STATUS_NOT_AUTHENTICATED) {
+  const confirm = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: void 0, GROK_SANDBOX: void 0 });
+  const confirmed = statusOf(confirm);
+  if (confirmed === GROK_STATUS_NOT_AUTHENTICATED) {
     throw new GrokLoginExpiryError(
-      `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: grok reports "${status}" \u2014 run \`grok\` once to sign in, then re-run the review.`
+      `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: grok reports "${confirmed}" \u2014 run \`grok\` once to sign in, then re-run the review.`
     );
   }
-  if (status === GROK_STATUS_LOGGED_IN || status === GROK_STATUS_API_KEY) return;
+  const refreshed = `the refresh run (window ${windowSecs} s) ${describeRun(refresh)}`;
   warn(
-    status ? `\`grok models\` printed an unrecognised status line ("${status.slice(0, 200)}") \u2014 ${proceed}` : `\`grok models\` printed no status line \u2014 ${proceed}`
+    isLoggedIn(confirmed) ? `the widened login refresh failed \u2014 ${refreshed}, but grok's cached login is still valid; the confirm run ${describeRun(confirm)}. The seat proceeds; the login may expire during it.` : `${refreshed}; the confirm run ${describeRun(confirm)} \u2014 ${proceed}`
   );
 }
 

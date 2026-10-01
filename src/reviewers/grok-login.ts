@@ -24,9 +24,14 @@ import { runReviewerExec } from '../core/spawn';
 //
 // What decides the seat is grok's OWN first stdout line from that run (1.0.44, all exit 0):
 //   "You are logged in with grok.com." · "You are using XAI_API_KEY." · "You are not authenticated."
-// Only the last refuses the seat. A run that fails, hangs, or prints anything else PROCEEDS with a
-// warning: the seat's backstop owns that case, as it always did — failing every seat on a line we
-// cannot read would trade one outage for another.
+// Only the last can refuse the seat, and only once CONFIRMED: a proactive refresh that fails — two
+// pre-flights racing grok's refresh single-flight, an auth-server blip — also prints it while the
+// cached session is still valid. So a not-authenticated line is re-asked once with grok's default
+// window (GROK_AUTH_EARLY_INVALIDATION_SECS removed, so the widened refresh is not retried), and the
+// seat is refused only if that run says it too. A confirm run that reads logged in proceeds with a
+// warning that the widened refresh failed. A run that fails, hangs, or prints anything else PROCEEDS with a warning
+// quoting its exit code and stderr tail: the seat's backstop owns that case, as it always did —
+// failing every seat on a line we cannot read would trade one outage for another.
 //
 // What this module never does: read grok's private credential files (ruling 92adf3b2 — grok, not
 // us, owns its login state), widen the review sandbox, or implement an OAuth refresh itself.
@@ -38,6 +43,9 @@ export const GROK_LOGIN_MARGIN_MS = 300_000;
 // `grok models` is a catalog listing — seconds of work, a refresh included. A minute bounds a hung
 // one; it is killed and the seat proceeds on the backstop.
 const GROK_LOGIN_REFRESH_TIMEOUT_MS = 60_000;
+
+// The stderr kept from a models run and quoted in a warning — its tail, so the last error shows.
+const GROK_MODELS_STDERR_LIMIT = 500;
 
 // grok's status lines, verbatim — the first line `grok models` prints.
 export const GROK_STATUS_LOGGED_IN = 'You are logged in with grok.com.';
@@ -70,6 +78,9 @@ export interface GrokModelsRun {
 }
 
 export interface GrokModelsResult {
+  // null when a signal ended the run (the watchdog's kill) or it never reported one.
+  exitCode: number | null;
+  stderrTail: string;
   stdout: string | null;
   timedOut: boolean;
 }
@@ -78,8 +89,15 @@ export type GrokModelsRunner = (run: GrokModelsRun) => Promise<GrokModelsResult>
 
 // The real `grok models`: the shared watchdog'd, group-killed spawn, its stdout returned.
 async function runGrokModels(run: GrokModelsRun): Promise<GrokModelsResult> {
-  const { raw, timedOut } = await runReviewerExec({ ...run, capture: 'stdout', stderrLimit: 1_000 });
-  return { stdout: raw, timedOut };
+  const { error, exitCode, raw, stderrTail, timedOut } = await runReviewerExec({
+    ...run,
+    capture: 'stdout',
+    stderrLimit: GROK_MODELS_STDERR_LIMIT,
+  });
+  // A binary that could not be spawned never ran — surface that, never read it as a run that
+  // printed nothing.
+  if (error) throw error;
+  return { exitCode: exitCode ?? null, stderrTail, stdout: raw, timedOut };
 }
 
 export interface EnsureGrokLoginOpts {
@@ -96,32 +114,54 @@ function warnToStderr(message: string): void {
   process.stderr.write(`⚠ ensemble-ai grok pre-flight: ${message}\n`);
 }
 
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+// One models run: its result, or the error it failed with (a spawn that never started).
+type ModelsRun = GrokModelsResult | { failed: string };
+
+// grok's status line — undefined for a run that failed or hung, whose output is not an answer.
+function statusOf(run: ModelsRun): string | undefined {
+  if ('failed' in run || run.timedOut) return undefined;
+  return run.stdout?.split('\n').find((line) => line.trim())?.trim();
+}
+
+// What a run did, for a warning: why its line does not decide, then its exit code and stderr tail.
+function describeRun(run: ModelsRun): string {
+  if ('failed' in run) return `failed (${run.failed}) — the run never started`;
+  const status = statusOf(run);
+  const what = run.timedOut
+    ? `did not finish within ${GROK_LOGIN_REFRESH_TIMEOUT_MS / 1000} s`
+    : status
+      ? `printed "${status.slice(0, 200)}"`
+      : 'printed no status line';
+  const stderr = run.stderrTail.slice(-GROK_MODELS_STDERR_LIMIT).replace(/\s+/g, ' ').trim();
+  return `${what} (exit code ${run.exitCode ?? 'none'}; stderr ${stderr ? `"${stderr}"` : 'empty'})`;
+}
+
+function isLoggedIn(status: string | undefined): boolean {
+  return status === GROK_STATUS_LOGGED_IN || status === GROK_STATUS_API_KEY;
+}
+
 // Run grok's own refresh outside the sandbox, sized to the seat, then read grok's status line.
 // Resolves when the seat may spawn; throws GrokLoginExpiryError — whose message starts with
-// GROK_LOGIN_EXPIRY_FAIL_PREFIX — only when grok says it is not authenticated.
+// GROK_LOGIN_EXPIRY_FAIL_PREFIX — only when grok says it is not authenticated, twice.
 export async function ensureGrokLogin(opts: EnsureGrokLoginOpts): Promise<void> {
-  const marginMs = opts.marginMs ?? GROK_LOGIN_MARGIN_MS;
   const warn = opts.warn ?? warnToStderr;
   const proceed = 'the seat proceeds; its backstop owns a login that cannot last';
 
   // A fresh temp cwd: `grok models` must not pick up a project's `.grok/` config from wherever the
-  // consumer happens to run.
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-login-'));
-  let result: GrokModelsResult;
+  // consumer happens to run. Failing to make one is not a reason to fail the seat.
+  let cwd: string;
   try {
-    result = await (opts.runModels ?? runGrokModels)({
-      args: ['--sandbox', 'off', 'models'],
-      bin: opts.bin,
-      cwd,
-      env: {
-        GROK_AUTH_EARLY_INVALIDATION_SECS: String(Math.ceil((opts.deadlineMs + marginMs) / 1000)),
-        GROK_SANDBOX: undefined,
-      },
-      timeoutMs: GROK_LOGIN_REFRESH_TIMEOUT_MS,
-    });
+    cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-login-'));
   } catch (e) {
-    warn(`\`grok models\` failed (${e instanceof Error ? e.message : String(e)}) — ${proceed}`);
+    warn(`could not create a temp cwd for \`grok models\` (${errorText(e)}) — ${proceed}`);
     return;
+  }
+  try {
+    await decide(opts, cwd, warn, proceed);
   } finally {
     try {
       fs.rmSync(cwd, { force: true, recursive: true });
@@ -129,21 +169,51 @@ export async function ensureGrokLogin(opts: EnsureGrokLoginOpts): Promise<void> 
       // throwaway dir — best-effort cleanup; it never decides the seat
     }
   }
+}
 
-  if (result.timedOut) {
-    warn(`\`grok models\` did not finish within ${GROK_LOGIN_REFRESH_TIMEOUT_MS / 1000} s — ${proceed}`);
+async function decide(
+  opts: EnsureGrokLoginOpts,
+  cwd: string,
+  warn: (message: string) => void,
+  proceed: string
+): Promise<void> {
+  const runModels = opts.runModels ?? runGrokModels;
+  const models = async (env: Record<string, string | undefined>): Promise<ModelsRun> => {
+    try {
+      return await runModels({
+        args: ['--sandbox', 'off', 'models'],
+        bin: opts.bin,
+        cwd,
+        env,
+        timeoutMs: GROK_LOGIN_REFRESH_TIMEOUT_MS,
+      });
+    } catch (e) {
+      return { failed: errorText(e) };
+    }
+  };
+
+  const windowSecs = Math.ceil((opts.deadlineMs + (opts.marginMs ?? GROK_LOGIN_MARGIN_MS)) / 1000);
+  const refresh = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: String(windowSecs), GROK_SANDBOX: undefined });
+  const status = statusOf(refresh);
+  if (isLoggedIn(status)) return;
+  if (status !== GROK_STATUS_NOT_AUTHENTICATED) {
+    warn(`\`grok models\` ${describeRun(refresh)} — ${proceed}`);
     return;
   }
-  const status = result.stdout?.split('\n').find((line) => line.trim())?.trim();
-  if (status === GROK_STATUS_NOT_AUTHENTICATED) {
+
+  // The confirm run: grok's default window, so it reads the cached session instead of retrying the
+  // widened refresh that just failed.
+  const confirm = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: undefined, GROK_SANDBOX: undefined });
+  const confirmed = statusOf(confirm);
+  if (confirmed === GROK_STATUS_NOT_AUTHENTICATED) {
     throw new GrokLoginExpiryError(
-      `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: grok reports "${status}" — run \`grok\` once to sign in, then re-run the review.`
+      `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: grok reports "${confirmed}" — run \`grok\` once to sign in, then re-run the review.`
     );
   }
-  if (status === GROK_STATUS_LOGGED_IN || status === GROK_STATUS_API_KEY) return;
+  const refreshed = `the refresh run (window ${windowSecs} s) ${describeRun(refresh)}`;
   warn(
-    status
-      ? `\`grok models\` printed an unrecognised status line ("${status.slice(0, 200)}") — ${proceed}`
-      : `\`grok models\` printed no status line — ${proceed}`
+    isLoggedIn(confirmed)
+      ? `the widened login refresh failed — ${refreshed}, but grok's cached login is still valid; the confirm run ${describeRun(confirm)}. The seat proceeds; the login may expire during it.`
+      : `${refreshed}; the confirm run ${describeRun(confirm)} — ${proceed}`
   );
 }

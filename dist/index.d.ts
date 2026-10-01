@@ -140,6 +140,10 @@ interface ReviewerExecOpts {
 }
 declare function boundedStreamTail(tail: string, limit: number): string;
 interface ReviewerExecResult {
+    /** The child's `'error'` event, when one fired — most often a binary that could not be spawned (ENOENT, EACCES). */
+    error?: Error;
+    /** The child's exit code: null when a signal ended it, absent when it never exited before settle. */
+    exitCode?: number | null;
     /** The reply (the -o file, or accumulated stdout) — or null if none produced. */
     raw: string | null;
     stderrTail: string;
@@ -844,6 +848,8 @@ interface GrokModelsRun {
     timeoutMs: number;
 }
 interface GrokModelsResult {
+    exitCode: number | null;
+    stderrTail: string;
     stdout: string | null;
     timedOut: boolean;
 }
