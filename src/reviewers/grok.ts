@@ -10,7 +10,7 @@ import type { SandboxProfileRef } from '../modes/review/evidence';
 
 import { type CodexReviewResult, type RunReviewOpts } from './codex';
 import { egressStartFailure, startSeatEgressProxy } from './egress-seat';
-import { ensureGrokLogin, GrokLoginExpiryError, grokLoginWarningLine } from './grok-login';
+import { ensureGrokLogin, GrokLoginExpiryError, GrokPreflightCancelledError } from './grok-login';
 
 // GROK NOW HAS A LIVENESS SIGNAL, and these three numbers are what that bought.
 //
@@ -409,8 +409,9 @@ export async function runGrokReview(
   // a login that expires mid-review parks it on 401s until the backstop. Run grok's own refresh
   // OUTSIDE the sandbox first, sized to this seat's deadline, through the same binary the seat
   // spawns; if grok then says it is not authenticated, fail NOW with a failWhy every consumer reads
-  // — never spawn a seat doomed to hang. Before the proxy starts, so a refused seat leaves no fence
-  // to tear down.
+  // — never spawn a seat doomed to hang. A cancel that lands during the pre-flight ends the seat the
+  // same way, under its own (non-login) failWhy. Before the proxy starts, so a refused or cancelled
+  // seat leaves no fence to tear down.
   //
   // ONE DEADLINE for the whole adapter call: the pre-flight spends from the seat's own budget, never
   // on top of it — a voice with a short timeout must not first wait out two minute-long models runs —
@@ -418,23 +419,20 @@ export async function runGrokReview(
   // children as well as the seat's.
   const bin = resolveGrokBin();
   const deadlineAt = Date.now() + timeoutMs;
-  let preflightNote: string;
+  let warnings: string[];
   try {
-    const warnings = await ensureGrokLogin({ bin, deadlineAt, onSpawn: opts.onSpawn });
-    preflightNote = warnings.map(grokLoginWarningLine).join('');
+    warnings = await ensureGrokLogin({ bin, deadlineAt, onSpawn: opts.onSpawn });
   } catch (e) {
-    if (!(e instanceof GrokLoginExpiryError)) throw e;
+    if (!(e instanceof GrokLoginExpiryError) && !(e instanceof GrokPreflightCancelledError)) throw e;
     return { failWhy: e.message, ok: false, raw: null, stderrTail: e.message, timedOut: false };
   }
-  // The pre-flight's warnings LEAD the seat's stderrTail, so they reach the consumer's trail. The
-  // trail keeps the LAST GROK_SEAT_STDERR_LIMIT chars (seat-run seatDiagnostics), so the seat keeps
-  // only the room the note leaves — a full seat tail would otherwise push the warning out of the
-  // record. (A warning quotes at most 200 chars of status or error and 500 of stderr per run, so it fits.)
-  const seatStderrLimit = Math.max(1, GROK_SEAT_STDERR_LIMIT - preflightNote.length);
-  const seatTimeoutMs = deadlineAt - Date.now();
-  if (seatTimeoutMs <= 0) {
+  // The pre-flight's warnings ride their OWN result field, on every return below — never prepended
+  // to stderrTail, whose head the trail's summaries quote (seat-run): there a warning would stand in
+  // for the seat's own failure.
+  const preflight = warnings.length > 0 ? { preflightWarnings: warnings } : {};
+  if (deadlineAt - Date.now() <= 0) {
     const failWhy = `the grok login pre-flight spent the seat's whole ${Math.round(timeoutMs / 1000)} s budget — the seat never spawned`;
-    return { failWhy, ok: false, raw: null, stderrTail: `${preflightNote}${failWhy}`, timedOut: true, timedOutReason: 'absolute' };
+    return { ...preflight, failWhy, ok: false, raw: null, stderrTail: failWhy, timedOut: true, timedOutReason: 'absolute' };
   }
   // PACKET-MODE VERIFICATION (packet-f1, 2026-07-10) — the codex packet fence (buildCodexReviewArgs)
   // has NO grok counterpart, and this documents why, verified rather than assumed (the task: verify,
@@ -468,7 +466,7 @@ export async function runGrokReview(
     try {
       proxy = await startSeatEgressProxy('grok');
     } catch (e) {
-      return { ok: false, raw: null, stderrTail: `${preflightNote}${egressStartFailure('grok', e)}`, timedOut: false };
+      return { ...preflight, ok: false, raw: null, stderrTail: egressStartFailure('grok', e), timedOut: false };
     }
   }
   // ONCE THE FENCE IS UP IT COMES DOWN ON EVERY PATH. `ensureSandboxProfile` writes a file and
@@ -492,8 +490,10 @@ export async function runGrokReview(
       // seat in 15 min while `timeoutMs` above stands back as a pure runaway backstop.
       inactivityTimeoutMs: GROK_INACTIVITY_TIMEOUT_MS,
       onSpawn: opts.onSpawn,
-      stderrLimit: seatStderrLimit,
-      timeoutMs: seatTimeoutMs,
+      stderrLimit: GROK_SEAT_STDERR_LIMIT,
+      // What is left of the ONE deadline at the moment the seat spawns — after the pre-flight AND the
+      // egress proxy's start, so neither is ever added on top of the caller's budget.
+      timeoutMs: deadlineAt - Date.now(),
     });
     const stream = raw ? parseGrokStream(raw) : null;
     // The reply is the stream's `result` line. The legacy envelope is tried ONLY when the stdout was
@@ -518,8 +518,9 @@ export async function runGrokReview(
           }
         : {}),
       ok: text !== null,
+      ...preflight,
       raw: text,
-      stderrTail: `${preflightNote}${stderrTail}`,
+      stderrTail,
       // The bounded NDJSON tail: a reclaimed seat leaves a record of what it was doing, not just
       // "it timed out". Cut on a line boundary — the trail persists it as .jsonl.
       ...(raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {}),

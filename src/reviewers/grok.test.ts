@@ -26,6 +26,8 @@ import {
   GROK_LOGIN_EXPIRY_FAIL_PREFIX,
   GROK_STATUS_NOT_AUTHENTICATED,
   GrokLoginExpiryError,
+  GrokPreflightCancelledError,
+  isGrokLoginExpiryFailure,
 } from './grok-login';
 import type { ReviewerConfig } from '../core/types';
 
@@ -743,16 +745,18 @@ describe('runGrokReview — the login pre-flight runs before anything spawns', (
     expect(spawned).not.toHaveBeenCalled();
     expect(result).toMatchObject({ ok: false, raw: null, timedOut: true, timedOutReason: 'absolute' });
     expect(result.failWhy).toBe("the grok login pre-flight spent the seat's whole 10 s budget — the seat never spawned");
-    expect(result.stderrTail).toBe(
-      `⚠ ensemble-ai grok pre-flight: \`grok models\` did not finish within 10 s (exit code none; stderr empty) — the seat proceeds\n${result.failWhy}`
-    );
+    // The warning rides its own field; stderrTail is the failure alone.
+    expect(result.stderrTail).toBe(result.failWhy);
+    expect(result.preflightWarnings).toEqual([
+      '`grok models` did not finish within 10 s (exit code none; stderr empty) — the seat proceeds',
+    ]);
   });
 
-  // THE WARNING IS RECORDED: it leads the seat's stderrTail, so the trail carries it — and it survives
-  // the trail's last-2000-chars cut (seat-run seatDiagnostics) even under a full seat stderr.
-  it("the pre-flight's warning leads the seat's stderrTail and survives the trail's tail cut", async () => {
+  // THE WARNING IS RECORDED ON ITS OWN FIELD: never in stderrTail, whose HEAD the trail's summaries
+  // quote (seat-run) — so a failed seat's summary shows the seat's own failure, not the warning, and
+  // a full seat stderr keeps its whole room.
+  it("the pre-flight's warning rides `preflightWarnings`, and stderrTail is only the seat's own", async () => {
     const warning = 'the widened login refresh failed — x. The seat proceeds; the login may expire during it.';
-    const note = `⚠ ensemble-ai grok pre-flight: ${warning}\n`;
     vi.mocked(ensureGrokLogin).mockResolvedValueOnce([warning]);
     const quiet = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
     await untilSpawned();
@@ -761,17 +765,76 @@ describe('runGrokReview — the login pre-flight runs before anything spawns', (
     child?.emit('close');
     const ok = await quiet;
     expect(ok.ok).toBe(true);
-    expect(ok.stderrTail).toBe(`${note}seat noise`);
+    expect(ok.stderrTail).toBe('seat noise');
+    expect(ok.preflightWarnings).toEqual([warning]);
 
     vi.mocked(ensureGrokLogin).mockResolvedValueOnce([warning]);
-    const noisy = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    const failed = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
     await untilSpawned();
-    child?.stderr.emit('data', Buffer.from('y'.repeat(5_000)));
+    child?.stderr.emit('data', Buffer.from(`error: model grok-9 not found\n${'y'.repeat(5_000)}`));
     child?.emit('close');
-    const { stderrTail } = await noisy;
-    expect(stderrTail.length).toBeLessThanOrEqual(2_000);
-    expect(stderrTail.trim().slice(-2_000).startsWith(note)).toBe(true);
-    expect(stderrTail.endsWith('y')).toBe(true);
+    const result = await failed;
+    expect(result.ok).toBe(false);
+    expect(result.preflightWarnings).toEqual([warning]);
+    // The adapter's whole 2000-char room is the seat's own stderr — no reservation for a note.
+    expect(result.stderrTail).toBe('y'.repeat(2_000));
+    expect(result.stderrTail).not.toContain('pre-flight');
+  });
+
+  it('a pre-flight that raised no warning leaves the field absent', async () => {
+    const run = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
+    child?.emit('close');
+    expect(await run).not.toHaveProperty('preflightWarnings');
+  });
+
+  // A CANCEL DURING THE PRE-FLIGHT reaches only the `grok models` child; the seat must not spawn after
+  // it. Its failWhy is NOT a login failure — a consumer must never swap the chair for a cancel.
+  it('a cancelled pre-flight ends the seat before the proxy and the spawn, under a non-login failWhy', async () => {
+    const spawned = vi.mocked(spawn);
+    const proxy = vi.mocked(startSeatEgressProxy);
+    spawned.mockClear();
+    proxy.mockClear();
+    const why = 'the grok login pre-flight was cancelled (a signal ended its `grok models` run) — the seat never spawned';
+    vi.mocked(ensureGrokLogin).mockRejectedValueOnce(new GrokPreflightCancelledError(why));
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
+    try {
+      const result = await runGrokReview('p', CONFIG, { worktree: wt });
+      expect(result).toEqual({ failWhy: why, ok: false, raw: null, stderrTail: why, timedOut: false });
+      expect(isGrokLoginExpiryFailure(result.failWhy)).toBe(false);
+      expect(proxy).not.toHaveBeenCalled();
+      expect(spawned).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(wt, { force: true, recursive: true });
+    }
+  });
+
+  // THE SEAT'S TIMEOUT IS TAKEN AT THE SPAWN: the egress proxy's start comes out of the same deadline
+  // as the pre-flight. A stand-in proxy (no loopback listen) that takes 3 s to start.
+  it("the proxy's start time comes out of the seat's budget too — the timeout is taken at the spawn", async () => {
+    vi.useFakeTimers();
+    vi.mocked(ensureGrokLogin).mockImplementationOnce(async () => {
+      vi.setSystemTime(Date.now() + 4_000); // the models runs took 4 s
+      return [];
+    });
+    vi.mocked(startSeatEgressProxy).mockImplementationOnce(async () => {
+      vi.setSystemTime(Date.now() + 3_000); // the proxy took 3 s to start
+      return { allowHosts: [], close: () => {}, denials: [], port: 1, url: 'http://127.0.0.1:1' };
+    });
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
+    try {
+      const run = runGrokReview('p', CONFIG, { timeoutMs: 10_000, worktree: wt });
+      await untilSpawned();
+      expect(child).not.toBeNull();
+      vi.advanceTimersByTime(2_999);
+      expect(child?.kills).toEqual([]);
+      vi.advanceTimersByTime(1);
+      expect(child?.kills[0]).toBe('SIGTERM'); // at 3 s — the 10 s budget minus 4 s pre-flight and 3 s proxy
+      child?.emit('close');
+      await expect(run).resolves.toMatchObject({ ok: false, timedOut: true, timedOutReason: 'absolute' });
+    } finally {
+      fs.rmSync(wt, { force: true, recursive: true });
+    }
   });
 });
 

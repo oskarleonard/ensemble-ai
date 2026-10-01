@@ -1526,8 +1526,9 @@ function resolveBin(name2, opts = {}) {
   if (override) {
     const bin = path4.resolve(override);
     if (fs4.existsSync(bin)) return bin;
+    const shown = bin === override ? override : `${override} (resolved to ${bin})`;
     throw new Error(
-      `${opts.envVar}=${override} does not exist \u2014 unset it to use the default resolution`
+      `${opts.envVar}=${shown} does not exist \u2014 unset it to use the default resolution`
     );
   }
   const cached = binCache.get(name2);
@@ -2283,6 +2284,12 @@ var GrokLoginExpiryError = class extends Error {
     this.name = "GrokLoginExpiryError";
   }
 };
+var GrokPreflightCancelledError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "GrokPreflightCancelledError";
+  }
+};
 async function runGrokModels(run) {
   const { error, exitCode, raw, stderrTail, timedOut } = await runReviewerExec({
     ...run,
@@ -2348,8 +2355,9 @@ async function decide(opts, cwd, proceed) {
   const models = async (env) => {
     const timeoutMs = Math.min(GROK_LOGIN_REFRESH_TIMEOUT_MS, remainingMs());
     if (timeoutMs <= 0) return { failed: "the seat's time budget is spent" };
+    let run;
     try {
-      const run = await runModels({
+      run = await runModels({
         args: ["--sandbox", "off", "models"],
         bin: opts.bin,
         cwd,
@@ -2357,10 +2365,15 @@ async function decide(opts, cwd, proceed) {
         ...opts.onSpawn ? { onSpawn: opts.onSpawn } : {},
         timeoutMs
       });
-      return { ...run, timeoutMs };
     } catch (e) {
       return { failed: errorText(e) };
     }
+    if (run.exitCode === null && !run.timedOut) {
+      throw new GrokPreflightCancelledError(
+        "the grok login pre-flight was cancelled (a signal ended its `grok models` run) \u2014 the seat never spawned"
+      );
+    }
+    return { ...run, timeoutMs };
   };
   const windowSecs = Math.ceil((remainingMs() + (opts.marginMs ?? GROK_LOGIN_MARGIN_MS)) / 1e3);
   const refresh = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: String(windowSecs), GROK_SANDBOX: void 0 });
@@ -2525,26 +2538,24 @@ async function runGrokReview(prompt, config, opts = {}) {
   }
   const bin = resolveGrokBin();
   const deadlineAt = Date.now() + timeoutMs;
-  let preflightNote;
+  let warnings;
   try {
-    const warnings = await ensureGrokLogin({ bin, deadlineAt, onSpawn: opts.onSpawn });
-    preflightNote = warnings.map(grokLoginWarningLine).join("");
+    warnings = await ensureGrokLogin({ bin, deadlineAt, onSpawn: opts.onSpawn });
   } catch (e) {
-    if (!(e instanceof GrokLoginExpiryError)) throw e;
+    if (!(e instanceof GrokLoginExpiryError) && !(e instanceof GrokPreflightCancelledError)) throw e;
     return { failWhy: e.message, ok: false, raw: null, stderrTail: e.message, timedOut: false };
   }
-  const seatStderrLimit = Math.max(1, GROK_SEAT_STDERR_LIMIT - preflightNote.length);
-  const seatTimeoutMs = deadlineAt - Date.now();
-  if (seatTimeoutMs <= 0) {
+  const preflight = warnings.length > 0 ? { preflightWarnings: warnings } : {};
+  if (deadlineAt - Date.now() <= 0) {
     const failWhy = `the grok login pre-flight spent the seat's whole ${Math.round(timeoutMs / 1e3)} s budget \u2014 the seat never spawned`;
-    return { failWhy, ok: false, raw: null, stderrTail: `${preflightNote}${failWhy}`, timedOut: true, timedOutReason: "absolute" };
+    return { ...preflight, failWhy, ok: false, raw: null, stderrTail: failWhy, timedOut: true, timedOutReason: "absolute" };
   }
   let proxy;
   if (worktreeCwd) {
     try {
       proxy = await startSeatEgressProxy("grok");
     } catch (e) {
-      return { ok: false, raw: null, stderrTail: `${preflightNote}${egressStartFailure("grok", e)}`, timedOut: false };
+      return { ...preflight, ok: false, raw: null, stderrTail: egressStartFailure("grok", e), timedOut: false };
     }
   }
   let cwd;
@@ -2561,8 +2572,10 @@ async function runGrokReview(prompt, config, opts = {}) {
       // seat in 15 min while `timeoutMs` above stands back as a pure runaway backstop.
       inactivityTimeoutMs: GROK_INACTIVITY_TIMEOUT_MS,
       onSpawn: opts.onSpawn,
-      stderrLimit: seatStderrLimit,
-      timeoutMs: seatTimeoutMs
+      stderrLimit: GROK_SEAT_STDERR_LIMIT,
+      // What is left of the ONE deadline at the moment the seat spawns — after the pre-flight AND the
+      // egress proxy's start, so neither is ever added on top of the caller's budget.
+      timeoutMs: deadlineAt - Date.now()
     });
     const stream = raw ? parseGrokStream(raw) : null;
     const text = !raw || !stream ? null : stream.events === 0 && !/^\s*\{\s*"type"\s*:/.test(raw) ? extractGrokText(raw) : stream.text;
@@ -2578,8 +2591,9 @@ async function runGrokReview(prompt, config, opts = {}) {
         failWhy: `the liveness watchdog cut it after ${Math.round(GROK_INACTIVITY_TIMEOUT_MS / 6e4)} min of silence`
       } : {},
       ok: text !== null,
+      ...preflight,
       raw: text,
-      stderrTail: `${preflightNote}${stderrTail}`,
+      stderrTail,
       // The bounded NDJSON tail: a reclaimed seat leaves a record of what it was doing, not just
       // "it timed out". Cut on a line boundary — the trail persists it as .jsonl.
       ...raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
@@ -4764,6 +4778,7 @@ function seatDiagnostics(result, timing) {
     elapsedMs: timing.endedAt - timing.startedAt,
     endedAt: new Date(timing.endedAt).toISOString(),
     ...result.failWhy ? { failWhy: result.failWhy } : {},
+    ...result.preflightWarnings?.length ? { preflightWarnings: [...result.preflightWarnings] } : {},
     startedAt: new Date(timing.startedAt).toISOString(),
     stderrTail: result.stderrTail.trim().slice(-2e3),
     ...result.timedOutReason ? { timedOutReason: result.timedOutReason } : {}
@@ -6434,6 +6449,7 @@ export {
   GROK_STATUS_NOT_AUTHENTICATED,
   GROK_WORKTREE_REVIEW_TIMEOUT_MS,
   GrokLoginExpiryError,
+  GrokPreflightCancelledError,
   HARNESS_SEATS,
   HOLISTIC_DEFAULTS,
   HOLISTIC_MIN_ANCHOR_NONWS,

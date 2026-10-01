@@ -55,9 +55,21 @@ describe('resolveBin — an explicitly set override is authoritative', () => {
     expect(resolveBin('t9', { envVar: 'T9_BIN' })).toBe(existing);
     vi.stubEnv('T9_BIN', 't9');
     expect(() => resolveBin('t9', { candidates: [candidate], envVar: 'T9_BIN' })).toThrow(
-      'T9_BIN=t9 does not exist'
+      `T9_BIN=t9 (resolved to ${path.join(dir, 't9')}) does not exist — unset it to use the default resolution`
     );
     expect(execFileSyncMock).not.toHaveBeenCalled();
+  });
+
+  it('names the resolved path only when it differs from the raw value', () => {
+    // Concatenated, not path.join'd — join would normalize the `..` away.
+    const missing = `${dir}/gone/../gone-cli`;
+    vi.stubEnv('T10_BIN', missing);
+    expect(() => resolveBin('t10', { envVar: 'T10_BIN' })).toThrow(
+      `T10_BIN=${missing} (resolved to ${path.join(dir, 'gone-cli')}) does not exist`
+    );
+    const absolute = path.join(dir, 'absent-cli');
+    vi.stubEnv('T10_BIN', absolute);
+    expect(() => resolveBin('t10', { envVar: 'T10_BIN' })).toThrow(/^T10_BIN=\S+ does not exist/);
   });
 
   it('a throw is never memoized — the next call re-checks the override', () => {

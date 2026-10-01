@@ -10,6 +10,7 @@ import {
   GROK_STATUS_NOT_AUTHENTICATED,
   GrokLoginExpiryError,
   grokLoginWarningLine,
+  GrokPreflightCancelledError,
   type GrokModelsResult,
   type GrokModelsRun,
   isGrokLoginExpiryFailure,
@@ -274,8 +275,9 @@ describe('ensureGrokLogin — the real runner', () => {
   });
 
   // A cancel arriving mid-pre-flight: the kill handle the seat's caller holds is the models child's,
-  // so the cancel ends it at once — not after its minute — and a killed run decides nothing.
-  it("a cancel through the seat's handle kills the pre-flight's child", async () => {
+  // so the cancel ends it at once — not after its minute — and the pre-flight ABORTS the seat: the
+  // seat's later spawn would register a kill nobody calls, so it must never start.
+  it("a cancel through the seat's handle kills the pre-flight's child and aborts the seat", async () => {
     const { bin, dir } = standInGrok(`sleep 30\necho '${GROK_STATUS_NOT_AUTHENTICATED}'`);
     try {
       const warn = vi.fn();
@@ -284,12 +286,33 @@ describe('ensureGrokLogin — the real runner', () => {
       const run = ensureGrokLogin({ bin, deadlineAt: NOW + BUDGET_MS, onSpawn: (kill) => kills.push(kill), warn });
       await vi.waitFor(() => expect(kills).toHaveLength(1));
       kills[0]?.();
-      const warning = await oneWarning(run, warn);
+      const err: unknown = await run.catch((e: unknown) => e);
       expect(performance.now() - started).toBeLessThan(10_000);
-      expect(warning).toMatch(/^`grok models` printed no status line \(exit code none; stderr empty\) — the seat proceeds/);
+      expect(err).toBeInstanceOf(GrokPreflightCancelledError);
+      expect(isGrokLoginExpiryFailure((err as Error).message)).toBe(false);
+      expect(kills).toHaveLength(1); // no confirm run after the cancel
+      expect(warn).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(dir, { force: true, recursive: true });
     }
+  });
+
+  // The rule, on a stubbed runner: a run a signal ended (exit code null) that its watchdog did NOT
+  // cut aborts — on the refresh run and on the confirm run alike — and the temp cwd is still removed.
+  it.each([
+    ['the refresh run', [answered('', { exitCode: null, stdout: null })]],
+    ['the confirm run', [answered(GROK_STATUS_NOT_AUTHENTICATED), answered('', { exitCode: null, stdout: null })]],
+  ])('a signal-killed %s that did not time out aborts the seat with a non-login reason', async (_which, answers) => {
+    const { outcome, r, warn } = await preflight(...answers);
+    const err: unknown = await outcome.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GrokPreflightCancelledError);
+    expect((err as Error).message).toBe(
+      'the grok login pre-flight was cancelled (a signal ended its `grok models` run) — the seat never spawned'
+    );
+    expect(isGrokLoginExpiryFailure((err as Error).message)).toBe(false);
+    expect(r.runs).toHaveLength(answers.length);
+    expect(warn).not.toHaveBeenCalled();
+    expect(fs.existsSync(r.runs[0]?.cwd ?? '')).toBe(false);
   });
 });
 
@@ -437,7 +460,7 @@ describe('ensureGrokLogin — anything unreadable proceeds with a warning', () =
 });
 
 describe('grokLoginWarningLine', () => {
-  it('is the one stderr line a warning becomes — live and in the seat record', () => {
+  it('is the one live stderr line a warning becomes', () => {
     expect(grokLoginWarningLine('x')).toBe('⚠ ensemble-ai grok pre-flight: x\n');
   });
 });

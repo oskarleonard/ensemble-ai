@@ -33,6 +33,8 @@ import {
 import { runBrainstormMode } from './modes/brainstorm';
 import { listVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
+  probeSeatLabel,
+  probeSeatRecord,
   renderProbePrompt,
   renderProbeReport,
   resolveProbeExit,
@@ -1427,13 +1429,6 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       ? path.resolve(values.out)
       : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
-  // Scope this run's trail to THIS run. If the run dir already exists — an explicitly
-  // REUSED `--run-id` — clear it first, so STALE review files from a prior run with the
-  // same id can't be read back into the synthesis (loadVoiceReviewsFromTrail reads
-  // whatever `review.<id>.json` is on disk, blind to which run wrote it). A fresh /
-  // auto-generated run id has no dir to clear. This is a RECURSIVE delete of a path that
-  // carries user-influenced input (`--run-id`), so it is fenced hard — see clearReusedRunTrail.
-  clearReusedRunTrail(out, trailDir);
   const ceiling = positiveCeiling(
     typeof values.ceiling === 'string' ? values.ceiling : undefined,
     cmd
@@ -1556,6 +1551,16 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
     }));
     if (!anthropicSeats) return 3;
   }
+
+  // Scope this run's trail to THIS run. If the run dir already exists — an explicitly
+  // REUSED `--run-id` — clear it first, so STALE review files from a prior run with the
+  // same id can't be read back into the synthesis (loadVoiceReviewsFromTrail reads
+  // whatever `review.<id>.json` is on disk, blind to which run wrote it). A fresh /
+  // auto-generated run id has no dir to clear. This is a RECURSIVE delete of a path that
+  // carries user-influenced input (`--run-id`), so it is fenced hard — see clearReusedRunTrail.
+  // It runs AFTER every refusal above (the usage checks, the up-front seat resolution): a run
+  // refused with exit 3 never deletes the old trail of the run id it reused.
+  clearReusedRunTrail(out, trailDir);
 
   let result: ReviewModeResult;
   try {
@@ -3947,8 +3952,11 @@ async function probeCommand(rest: string[]): Promise<number> {
       headSha: acquired.headSha,
       worktree: worktree.dir,
     });
+    // Each seat's record — model, effort and its stated advisor (absent = inherited) — feeds both
+    // this line and probe-report.json, so the two cannot disagree.
+    const proberSeat = probeSeatRecord(seat.config);
     console.error(
-      `· prober (anthropic/${seat.config.model} @ ${seat.config.effort}), gate (anthropic/${gateSeat.config.model} @ ${gateSeat.config.effort}) — probing ${source.postTarget.repoSlug}#${source.postTarget.pr} by running it (worktree ${worktree.dir})…`
+      `· prober (${probeSeatLabel(proberSeat)}), gate (${probeSeatLabel(probeSeatRecord(gateSeat.config))}) — probing ${source.postTarget.repoSlug}#${source.postTarget.pr} by running it (worktree ${worktree.dir})…`
     );
     const res = await runProbe({
       baseDir: out,
@@ -3973,6 +3981,7 @@ async function probeCommand(rest: string[]): Promise<number> {
       config: gateSeat.config,
       headSha: acquired.headSha,
       log: (m) => console.error(m),
+      prober: proberSeat,
       report,
       runId,
       worktree: worktree.dir,

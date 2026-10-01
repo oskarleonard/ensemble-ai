@@ -107,6 +107,51 @@ describe('review — an invalid Anthropic-seat advisor fails BEFORE the core fan
   });
 });
 
+// A REUSED `--run-id` clears that run's old trail — but only once the run is past every refusal: a
+// usage error or an invalid seat advisor (exit 3) must leave the old trail exactly as it was.
+describe('review — a refused `--run-id` reuse never deletes the old trail', () => {
+  const reusedTrail = (): { out: string; sentinel: string } => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-cli-reuse-'));
+    fs.mkdirSync(path.join(out, 'r1'));
+    const sentinel = path.join(out, 'r1', 'review.codex.json');
+    fs.writeFileSync(sentinel, '{}');
+    return { out, sentinel };
+  };
+
+  it.each([
+    ['an invalid claude advisor', { claude: { advisor: 'Not A Model' } }, [] as string[]],
+    ['an invalid gate advisor', { gate: { advisor: null } }, [] as string[]],
+    ['a bad --ceiling', {}, ['--ceiling', '0']],
+    ['a bad --convention-cap', {}, ['--convention-cap', 'x']],
+  ])('%s: exit 3 and the reused trail survives', async (_why, voices, flags) => {
+    const { out, sentinel } = reusedTrail();
+    try {
+      fs.writeFileSync(VOICES, JSON.stringify(voices));
+      expect(await main(['review', '--working-tree', '--out', out, '--run-id', 'r1', ...flags])).toBe(3);
+      expect(mockRun).not.toHaveBeenCalled();
+      expect(fs.existsSync(sentinel)).toBe(true);
+    } finally {
+      fs.rmSync(out, { force: true, recursive: true });
+    }
+  });
+
+  it('a run that reaches the engine still clears the reused trail first', async () => {
+    const { out, sentinel } = reusedTrail();
+    try {
+      fs.writeFileSync(VOICES, JSON.stringify({}));
+      mockRun.mockImplementation(async () => {
+        expect(fs.existsSync(sentinel)).toBe(false); // cleared BEFORE the engine reads the trail
+        throw new Error('engine reached');
+      });
+      expect(await main(['review', '--working-tree', '--out', out, '--run-id', 'r1'])).toBe(3);
+      expect(mockRun).toHaveBeenCalledOnce();
+      expect(fs.existsSync(sentinel)).toBe(false);
+    } finally {
+      fs.rmSync(out, { force: true, recursive: true });
+    }
+  });
+});
+
 describe('regate — an invalid gate advisor is a pre-spawn refusal (exit 3), not a crash', () => {
   it('names the seat and exits 3 before any gate spawn', async () => {
     const out = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-cli-advisor-'));
@@ -116,6 +161,21 @@ describe('regate — an invalid gate advisor is a pre-spawn refusal (exit 3), no
       fs.writeFileSync(VOICES, JSON.stringify({ gate: { advisor: '' } }));
       expect(await main(['regate', '--out', out, '--run-id', 'r1'])).toBe(3);
       expect(stderr()).toContain('ensemble-ai: voices.json gate seat: `advisor`');
+    } finally {
+      fs.rmSync(out, { force: true, recursive: true });
+    }
+  });
+
+  // regate pins its gate to anthropic. A codex-scoped `gate` entry does not apply to that claude
+  // spawn, so its advisor comes from the `claude` entry — validated up front like any spawned seat.
+  it('a codex-scoped gate entry: the claude entry\'s advisor is the one checked, before any gate spawn', async () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-cli-advisor-'));
+    try {
+      fs.mkdirSync(path.join(out, 'r1'));
+      fs.writeFileSync(path.join(out, 'r1', 'packet.gate.json'), JSON.stringify({ headSha: 'a'.repeat(40), schemaVersion: 2 }));
+      fs.writeFileSync(VOICES, JSON.stringify({ claude: { advisor: null }, gate: { advisor: 'off', vendor: 'codex' } }));
+      expect(await main(['regate', '--out', out, '--run-id', 'r1'])).toBe(3);
+      expect(stderr()).toContain('ensemble-ai: voices.json claude seat: `advisor`');
     } finally {
       fs.rmSync(out, { force: true, recursive: true });
     }

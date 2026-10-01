@@ -104,12 +104,14 @@ function timedOutSummary(result: CodexReviewResult, timing: SeatTiming): string 
 
 // The seat's run FACTS for the trail, written for every attempt. The stderr tail is the noise
 // channel bounded by the adapter (2000 chars) — kept here rather than dropped, because on a
-// timeout it is the only text the seat left behind.
+// timeout it is the only text the seat left behind. Pre-flight warnings ride their own field, so
+// the summaries below (which quote the head of stderrTail) never show a warning in the seat's place.
 function seatDiagnostics(result: CodexReviewResult, timing: SeatTiming): SeatDiagnostics {
   return {
     elapsedMs: timing.endedAt - timing.startedAt,
     endedAt: new Date(timing.endedAt).toISOString(),
     ...(result.failWhy ? { failWhy: result.failWhy } : {}),
+    ...(result.preflightWarnings?.length ? { preflightWarnings: [...result.preflightWarnings] } : {}),
     startedAt: new Date(timing.startedAt).toISOString(),
     stderrTail: result.stderrTail.trim().slice(-2000),
     ...(result.timedOutReason ? { timedOutReason: result.timedOutReason } : {}),

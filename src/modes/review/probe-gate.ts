@@ -1,6 +1,6 @@
 import { writeTrailFile } from '../../core/artifacts';
 import { extractJsonBlock } from '../../core/findings';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig, VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { runClaudeExecVoice } from './exec-voice';
@@ -9,6 +9,9 @@ import {
   type ProbeGateVerdict,
   type ProbeRecord,
   type ProbeReport,
+  probeReportJson,
+  type ProbeSeatRecord,
+  probeSeatRecord,
   renderProbeReport,
 } from './probe';
 
@@ -191,12 +194,17 @@ export type ProbeGateRunner = (
 
 export interface RunProbeGateOptions {
   baseDir: string;
-  config: VoiceConfig;
+  // The gate seat as resolved up front (its advisor already validated) — recorded as `gate` in the
+  // rewritten probe-report.json.
+  config: ResolvedVoiceConfig;
   // The PR head runProbe persisted into probe-report.json. The gate's rewrite of that file must
   // carry it forward — omitting it here silently dropped the stale-anchor protection the field
   // exists for (a poster could no longer refuse receipts from a moved head).
   headSha?: string;
   log?: (m: string) => void;
+  // The prober's seat record runProbe persisted — carried forward by the rewrite for the same reason
+  // as `headSha`. Required, so the rewrite can never silently drop it.
+  prober: ProbeSeatRecord;
   report: ProbeReport;
   run?: ProbeGateRunner;
   runId: string;
@@ -262,11 +270,13 @@ export async function runProbeGate(opts: RunProbeGateOptions): Promise<ProbeGate
       opts.baseDir,
       opts.runId,
       'probe-report.json',
-      JSON.stringify(
-        { ...(opts.headSha ? { headSha: opts.headSha } : {}), report, runId: opts.runId },
-        null,
-        2
-      ),
+      probeReportJson({
+        gate: probeSeatRecord(opts.config),
+        ...(opts.headSha ? { headSha: opts.headSha } : {}),
+        prober: opts.prober,
+        report,
+        runId: opts.runId,
+      }),
     );
   } catch (e) {
     log(`  · probe-gate: probe-report.json rewrite FAILED (${(e as Error).message}) — verdicts are in stdout only`);
