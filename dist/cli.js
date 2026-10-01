@@ -8829,6 +8829,15 @@ function loadClaudeReviewerSeat(file = VOICES_FILE, flags = {}, warn = () => {
     warn
   );
 }
+function shadowChampionConfig(claudeSeat, effort, warn) {
+  const shadowEffort = nonEmptyStr3(effort);
+  if (shadowEffort === null) return claudeSeat.config;
+  if (CLAUDE_EFFORTS2.has(shadowEffort)) return { ...claudeSeat.config, effort: shadowEffort };
+  warn(
+    `shadow gate: --shadow-gate-effort "${shadowEffort}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 keeping the claude seat's ${claudeSeat.config.effort}`
+  );
+  return claudeSeat.config;
+}
 
 // src/modes/review/regate.ts
 import fs22 from "fs";
@@ -11254,18 +11263,17 @@ async function runReviewPipeline(input) {
         // The SHADOW gate (audit-only): always the OTHER vendor's judge, so the comparison stays
         // champion-vs-challenger whichever seat holds the gate. anthropic primary ⇒ the codex
         // challenger shadows (reviewer-configured model @ xhigh — the seat we would adopt);
-        // codex primary ⇒ the anthropic CHAMPION shadows (resolved through the claude chain, NOT
-        // the gate entry — that entry now describes the codex seat). Each runner binds its own
+        // codex primary ⇒ the anthropic CHAMPION shadows (the claude reviewer seat resolved up front,
+        // NOT the gate entry — that entry now describes the codex seat — and never a mid-run re-read
+        // of voices.json; shadowChampionConfig applies only the shadow effort). Each runner binds its own
         // sandbox + egress fence; gate.ts owns fail-soft and never-authoritative.
         ...values["shadow-gate"] ? {
           shadowGate: gateSeat.vendor === "codex" ? {
-            config: loadClaudeReviewerSeat(
-              VOICES_FILE,
-              {
-                effort: typeof values["shadow-gate-effort"] === "string" && values["shadow-gate-effort"].trim() ? values["shadow-gate-effort"].trim() : void 0
-              },
+            config: shadowChampionConfig(
+              claudeSeat,
+              typeof values["shadow-gate-effort"] === "string" ? values["shadow-gate-effort"] : void 0,
               (m) => console.error(`\xB7 ${m}`)
-            ).config,
+            ),
             run: (p, c, o) => runClaudeReviewVoice(p, c, o)
           } : {
             config: {

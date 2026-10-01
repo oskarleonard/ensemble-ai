@@ -405,3 +405,21 @@ export function loadClaudeReviewerSeat(
     warn
   );
 }
+
+// The anthropic CHAMPION that shadows a codex gate (`--shadow-gate`): the claude reviewer seat the
+// run already resolved up front, with only `--shadow-gate-effort` applied on top. It never re-reads
+// voices.json — a mid-run edit can neither throw inside the layer (an advisor turned invalid) nor
+// change what was validated. An effort outside CLAUDE_EFFORTS is ignored + warned, like every link.
+export function shadowChampionConfig(
+  claudeSeat: GateSeat,
+  effort: string | undefined,
+  warn: (m: string) => void
+): ResolvedVoiceConfig {
+  const shadowEffort = nonEmptyStr(effort);
+  if (shadowEffort === null) return claudeSeat.config;
+  if (CLAUDE_EFFORTS.has(shadowEffort)) return { ...claudeSeat.config, effort: shadowEffort };
+  warn(
+    `shadow gate: --shadow-gate-effort "${shadowEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — keeping the claude seat's ${claudeSeat.config.effort}`
+  );
+  return claudeSeat.config;
+}

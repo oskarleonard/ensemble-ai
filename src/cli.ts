@@ -77,7 +77,7 @@ import { runClaudeReviewVoice } from './modes/review/claude';
 import { runCodexReview } from './reviewers/codex';
 import { REVIEW_ADAPTERS } from './reviewers/registry';
 import { readGatePacketHeadSha } from './modes/review/gate-hunks';
-import { type GateSeat, loadClaudeReviewerSeat, loadGateSeat } from './modes/review/gate-seat';
+import { type GateSeat, loadClaudeReviewerSeat, loadGateSeat, shadowChampionConfig } from './modes/review/gate-seat';
 import { readConventionPathsFromTrail, runRegate } from './modes/review/regate';
 import { checkReseat, ReseatLockedError, reseatRefusal, runReseat } from './modes/review/reseat';
 import { loadHolisticSeat } from './modes/review/holistic';
@@ -1731,23 +1731,19 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         // The SHADOW gate (audit-only): always the OTHER vendor's judge, so the comparison stays
         // champion-vs-challenger whichever seat holds the gate. anthropic primary ⇒ the codex
         // challenger shadows (reviewer-configured model @ xhigh — the seat we would adopt);
-        // codex primary ⇒ the anthropic CHAMPION shadows (resolved through the claude chain, NOT
-        // the gate entry — that entry now describes the codex seat). Each runner binds its own
+        // codex primary ⇒ the anthropic CHAMPION shadows (the claude reviewer seat resolved up front,
+        // NOT the gate entry — that entry now describes the codex seat — and never a mid-run re-read
+        // of voices.json; shadowChampionConfig applies only the shadow effort). Each runner binds its own
         // sandbox + egress fence; gate.ts owns fail-soft and never-authoritative.
         ...(values['shadow-gate']
           ? {
               shadowGate: (gateSeat.vendor === 'codex'
                 ? {
-                    config: loadClaudeReviewerSeat(
-                      VOICES_FILE,
-                      {
-                        effort:
-                          typeof values['shadow-gate-effort'] === 'string' && values['shadow-gate-effort'].trim()
-                            ? values['shadow-gate-effort'].trim()
-                            : undefined,
-                      },
+                    config: shadowChampionConfig(
+                      claudeSeat,
+                      typeof values['shadow-gate-effort'] === 'string' ? values['shadow-gate-effort'] : undefined,
                       (m) => console.error(`· ${m}`)
-                    ).config,
+                    ),
                     run: (p, c, o) => runClaudeReviewVoice(p, c, o),
                   }
                 : {

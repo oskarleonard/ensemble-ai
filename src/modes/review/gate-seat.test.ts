@@ -6,6 +6,7 @@ import {
   type GateSeatFlags,
   resolveClaudeReviewerSeat,
   resolveGateSeat,
+  shadowChampionConfig,
 } from './gate-seat';
 
 // Collect warnings so a test can assert both the resolved seat AND that the fall-back was LOUD.
@@ -392,5 +393,42 @@ describe('the advisor on the gate + claude reviewer seats — own entry only, ne
     expect(() => resolveClaudeReviewerSeat({ claude: { advisor: '' } }, {}, () => {})).toThrow(
       /voices\.json claude seat: `advisor`/
     );
+  });
+});
+
+describe('shadowChampionConfig — a codex gate is shadowed by the claude seat resolved UP FRONT', () => {
+  it('builds the champion from the up-front config; a mid-run voices.json edit neither throws nor changes it', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { loadClaudeReviewerSeat } = await import('./gate-seat');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ea-shadow-champion-'));
+    const file = path.join(dir, 'voices.json');
+    fs.writeFileSync(file, JSON.stringify({ claude: { advisor: 'off', effort: 'high', model: 'sonnet' } }));
+    const seat = loadClaudeReviewerSeat(file, { model: 'fable' });
+    const upFront = structuredClone(seat.config);
+
+    // Mid-run: the entry changes model AND gains an advisor that no longer validates. Re-reading
+    // the file here (the old path) would throw inside the layer.
+    fs.writeFileSync(file, JSON.stringify({ claude: { advisor: null, effort: 'low', model: 'haiku' } }));
+    expect(() => loadClaudeReviewerSeat(file)).toThrow(/voices\.json claude seat: `advisor`/);
+
+    const warnings: string[] = [];
+    const champion = shadowChampionConfig(seat, 'xhigh', (m) => warnings.push(m));
+    expect(champion).toEqual({ ...upFront, effort: 'xhigh' });
+    expect(champion.model).toBe('fable');
+    expect(champion.advisor).toBe('off');
+    expect(seat.config).toEqual(upFront);
+    expect(warnings).toEqual([]);
+    fs.rmSync(dir, { force: true, recursive: true });
+  });
+
+  it('no shadow effort keeps the seat config as resolved; an unknown one warns and keeps the seat effort', () => {
+    const seat = resolveClaudeReviewerSeat({ claude: { effort: 'high' } }, {}, () => {});
+    expect(shadowChampionConfig(seat, undefined, () => {})).toEqual(seat.config);
+    expect(shadowChampionConfig(seat, '  ', () => {})).toEqual(seat.config);
+    const warnings: string[] = [];
+    expect(shadowChampionConfig(seat, 'ultra', (m) => warnings.push(m))).toEqual(seat.config);
+    expect(warnings.some((w) => w.includes('--shadow-gate-effort "ultra" is not a known effort'))).toBe(true);
   });
 });
