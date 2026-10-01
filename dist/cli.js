@@ -11070,6 +11070,44 @@ async function runReviewPipeline(input) {
     }
   }
   const ciText = ciEvidenceUnavailable ? void 0 : ciEvidence;
+  let anthropicSeats = null;
+  if (roster.claude) {
+    const warn = (m) => console.error(`\xB7 ${m}`);
+    try {
+      anthropicSeats = {
+        claude: loadClaudeReviewerSeat(
+          VOICES_FILE,
+          {
+            effort: typeof values["claude-effort"] === "string" ? values["claude-effort"] : void 0,
+            model: typeof values["claude-model"] === "string" ? values["claude-model"] : void 0
+          },
+          warn
+        ),
+        gate: loadGateSeat(
+          VOICES_FILE,
+          {
+            effort: typeof values["gate-effort"] === "string" ? values["gate-effort"] : void 0,
+            model: typeof values["gate-model"] === "string" ? values["gate-model"] : void 0,
+            vendor: typeof values["gate-vendor"] === "string" ? values["gate-vendor"] : void 0
+          },
+          warn
+        ),
+        ...values.holistic ? {
+          holistic: loadHolisticSeat(
+            VOICES_FILE,
+            {
+              effort: typeof values["holistic-effort"] === "string" ? values["holistic-effort"] : void 0,
+              model: typeof values["holistic-model"] === "string" ? values["holistic-model"] : void 0
+            },
+            warn
+          )
+        } : {}
+      };
+    } catch (e) {
+      console.error(`ensemble-ai ${cmd}: ${e.message}`);
+      return 3;
+    }
+  }
   let result;
   try {
     result = await runReviewMode({
@@ -11123,24 +11161,9 @@ async function runReviewPipeline(input) {
       "\xB7 shadow gate: requested, but the gate itself will not run on this invocation (--no-claude / blocked diff / no packet) \u2014 nothing to shadow"
     );
   }
-  if (claudeLayerExpected && result.prompt) {
-    const claudeSeat = loadClaudeReviewerSeat(
-      VOICES_FILE,
-      {
-        effort: typeof values["claude-effort"] === "string" ? values["claude-effort"] : void 0,
-        model: typeof values["claude-model"] === "string" ? values["claude-model"] : void 0
-      },
-      (m) => console.error(`\xB7 ${m}`)
-    );
-    gateSeat = loadGateSeat(
-      VOICES_FILE,
-      {
-        effort: typeof values["gate-effort"] === "string" ? values["gate-effort"] : void 0,
-        model: typeof values["gate-model"] === "string" ? values["gate-model"] : void 0,
-        vendor: typeof values["gate-vendor"] === "string" ? values["gate-vendor"] : void 0
-      },
-      (m) => console.error(`\xB7 ${m}`)
-    );
+  if (claudeLayerExpected && result.prompt && anthropicSeats) {
+    const claudeSeat = anthropicSeats.claude;
+    gateSeat = anthropicSeats.gate;
     if (gateSeat.vendor === "codex")
       console.error(
         `\xB7 gate seat: CODEX (${gateSeat.config.model} @ ${gateSeat.config.effort}) \u2014 the fenced codex runner judges; the anthropic gate is off this run${values["shadow-gate"] ? " (shadowing as the audit-only champion)" : ""}`
@@ -11194,21 +11217,7 @@ async function runReviewPipeline(input) {
         // The HOLISTIC lens (spec §4) — off unless asked for, and it runs ONLY with worktree
         // evidence: `--holistic` without `--repo` is a LOUD skip, never a packet-evidence
         // architecture claim (resolveHolisticPlan owns that ruling).
-        ...values.holistic ? {
-          holistic: {
-            baseSha: layerBaseSha,
-            // Same resolution chain as the reviewer/gate seats: flag → voices.json
-            // `holistic` entry → the built-in default (opus @ high).
-            config: loadHolisticSeat(
-              VOICES_FILE,
-              {
-                effort: typeof values["holistic-effort"] === "string" ? values["holistic-effort"] : void 0,
-                model: typeof values["holistic-model"] === "string" ? values["holistic-model"] : void 0
-              },
-              (m) => console.error(`\xB7 ${m}`)
-            )
-          }
-        } : {},
+        ...anthropicSeats.holistic ? { holistic: { baseSha: layerBaseSha, config: anthropicSeats.holistic } } : {},
         // The GATE runner binds to the RESOLVED vendor in code — config alone can never point
         // the gate at an unfenced spawn. anthropic (default) keeps the layer's claude runner;
         // codex is the same fenced runner the shadow trial proved.
