@@ -1633,6 +1633,8 @@ function runReviewerExec(opts) {
       });
     }
     let exitDrain = null;
+    let exitCode;
+    let error;
     const settle = () => {
       if (settled) return;
       settled = true;
@@ -1654,6 +1656,8 @@ function runReviewerExec(opts) {
         }
       }
       resolve({
+        ...error ? { error } : {},
+        ...exitCode !== void 0 ? { exitCode } : {},
         raw,
         stderrTail,
         ...streamStdout ? { streamTail: boundedStreamTail(streamTail, streamLimit) } : {},
@@ -1662,14 +1666,19 @@ function runReviewerExec(opts) {
       });
     };
     const backstop = setTimeout(settle, timeoutMs + KILL_GRACE_MS + 5e3);
-    child.on(
-      "exit",
-      pipeStdout ? () => {
-        exitDrain = setTimeout(settle, EXIT_DRAIN_GRACE_MS);
-      } : settle
-    );
-    child.on("close", settle);
-    child.on("error", settle);
+    child.on("exit", (code) => {
+      exitCode = code;
+      if (pipeStdout) exitDrain = setTimeout(settle, EXIT_DRAIN_GRACE_MS);
+      else settle();
+    });
+    child.on("close", (code) => {
+      if (exitCode === void 0) exitCode = code;
+      settle();
+    });
+    child.on("error", (e) => {
+      error = e;
+      settle();
+    });
   });
 }
 
@@ -2236,14 +2245,133 @@ function runCodexReview(prompt, config, opts = {}) {
 }
 
 // src/reviewers/grok.ts
+import fs9 from "fs";
+import os7 from "os";
+import path8 from "path";
+
+// src/reviewers/grok-login.ts
 import fs8 from "fs";
 import os6 from "os";
 import path7 from "path";
+var GROK_LOGIN_MARGIN_MS = 3e5;
+var GROK_LOGIN_REFRESH_TIMEOUT_MS = 6e4;
+var GROK_MODELS_STDERR_LIMIT = 500;
+var GROK_STATUS_LOGGED_IN_PREFIX = "You are logged in with ";
+var GROK_STATUS_AUTHENTICATED_VIA_PREFIX = "You are authenticated via ";
+var GROK_STATUS_API_KEY = "You are using XAI_API_KEY.";
+var GROK_STATUS_NOT_AUTHENTICATED = "You are not authenticated.";
+var GROK_LOGIN_EXPIRY_FAIL_PREFIX = "grok login expires before this review can finish";
+function isGrokLoginExpiryFailure(failWhy) {
+  return failWhy?.startsWith(GROK_LOGIN_EXPIRY_FAIL_PREFIX) ?? false;
+}
+var GrokLoginExpiryError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "GrokLoginExpiryError";
+  }
+};
+async function runGrokModels(run) {
+  const { error, exitCode, raw, stderrTail, timedOut } = await runReviewerExec({
+    ...run,
+    capture: "stdout",
+    stderrLimit: GROK_MODELS_STDERR_LIMIT
+  });
+  if (error) throw error;
+  return { exitCode: exitCode ?? null, stderrTail, stdout: raw, timedOut };
+}
+function grokLoginWarningLine(message) {
+  return `\u26A0 ensemble-ai grok pre-flight: ${message}
+`;
+}
+function warnToStderr(message) {
+  process.stderr.write(grokLoginWarningLine(message));
+}
+function errorText(e) {
+  return (e instanceof Error ? e.message : String(e)).slice(0, 200);
+}
+function firstLine(run) {
+  return run.stdout?.split("\n").find((line) => line.trim())?.trim();
+}
+function statusOf(run) {
+  if ("failed" in run || run.timedOut || run.exitCode !== 0) return void 0;
+  return firstLine(run);
+}
+function describeRun(run) {
+  if ("failed" in run) return `failed (${run.failed}) \u2014 the run never started`;
+  const line = firstLine(run);
+  const what = run.timedOut ? `did not finish within ${run.timeoutMs / 1e3} s` : line ? `printed "${line.slice(0, 200)}"` : "printed no status line";
+  const stderr = run.stderrTail.slice(-GROK_MODELS_STDERR_LIMIT).replace(/\s+/g, " ").trim();
+  return `${what} (exit code ${run.exitCode ?? "none"}; stderr ${stderr ? `"${stderr}"` : "empty"})`;
+}
+function isAuthenticated(status) {
+  return status !== void 0 && (status === GROK_STATUS_API_KEY || status.startsWith(GROK_STATUS_LOGGED_IN_PREFIX) || status.startsWith(GROK_STATUS_AUTHENTICATED_VIA_PREFIX));
+}
+async function ensureGrokLogin(opts) {
+  const warn = opts.warn ?? warnToStderr;
+  const proceed = "the seat proceeds; its backstop owns a login that cannot last";
+  const warned = (message) => {
+    warn(message);
+    return [message];
+  };
+  let cwd;
+  try {
+    cwd = fs8.mkdtempSync(path7.join(os6.tmpdir(), "grok-login-"));
+  } catch (e) {
+    return warned(`could not create a temp cwd for \`grok models\` (${errorText(e)}) \u2014 ${proceed}`);
+  }
+  try {
+    const warning = await decide(opts, cwd, proceed);
+    return warning ? warned(warning) : [];
+  } finally {
+    try {
+      fs8.rmSync(cwd, { force: true, recursive: true });
+    } catch {
+    }
+  }
+}
+async function decide(opts, cwd, proceed) {
+  const runModels = opts.runModels ?? runGrokModels;
+  const remainingMs = () => opts.deadlineAt - Date.now();
+  const models = async (env) => {
+    const timeoutMs = Math.min(GROK_LOGIN_REFRESH_TIMEOUT_MS, remainingMs());
+    if (timeoutMs <= 0) return { failed: "the seat's time budget is spent" };
+    try {
+      const run = await runModels({
+        args: ["--sandbox", "off", "models"],
+        bin: opts.bin,
+        cwd,
+        env,
+        ...opts.onSpawn ? { onSpawn: opts.onSpawn } : {},
+        timeoutMs
+      });
+      return { ...run, timeoutMs };
+    } catch (e) {
+      return { failed: errorText(e) };
+    }
+  };
+  const windowSecs = Math.ceil((remainingMs() + (opts.marginMs ?? GROK_LOGIN_MARGIN_MS)) / 1e3);
+  const refresh = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: String(windowSecs), GROK_SANDBOX: void 0 });
+  const status = statusOf(refresh);
+  if (isAuthenticated(status)) return void 0;
+  if (status !== GROK_STATUS_NOT_AUTHENTICATED) return `\`grok models\` ${describeRun(refresh)} \u2014 ${proceed}`;
+  const confirm = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: "0", GROK_SANDBOX: void 0 });
+  const confirmed = statusOf(confirm);
+  if (confirmed === GROK_STATUS_NOT_AUTHENTICATED) {
+    throw new GrokLoginExpiryError(
+      `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: grok reports "${confirmed}" \u2014 run \`grok\` once to sign in, then re-run the review.`
+    );
+  }
+  const refreshed = `the refresh run (window ${windowSecs} s) ${describeRun(refresh)}`;
+  return isAuthenticated(confirmed) ? `the widened login refresh failed \u2014 ${refreshed}, but grok's cached login is still valid; the confirm run ${describeRun(confirm)}. The seat proceeds; the login may expire during it.` : `${refreshed}; the confirm run ${describeRun(confirm)} \u2014 ${proceed}`;
+}
+
+// src/reviewers/grok.ts
 var GROK_PACKET_REVIEW_TIMEOUT_MS = 18e5;
 var GROK_WORKTREE_REVIEW_TIMEOUT_MS = 36e5;
 var GROK_INACTIVITY_TIMEOUT_MS = 9e5;
 var GROK_STREAM_TAIL_LIMIT = 1e5;
-var GROK_BIN_CANDIDATES = [path7.join(os6.homedir(), ".grok", "bin", "grok")];
+var GROK_SEAT_STDERR_LIMIT = 2e3;
+var GROK_BIN_CANDIDATES = [path8.join(os7.homedir(), ".grok", "bin", "grok")];
 function resolveGrokBin() {
   return resolveBin("grok", {
     candidates: GROK_BIN_CANDIDATES,
@@ -2286,19 +2414,19 @@ function replaceReviewSection(content) {
   const after = lines.slice(to).join("\n").replace(/^\n+/, "");
   return [before, REVIEW_PROFILE.trimEnd(), after].filter((s) => s.length > 0).join("\n\n") + "\n";
 }
-function ensureSandboxProfile(profile, file = path7.join(os6.homedir(), ".grok", "sandbox.toml")) {
+function ensureSandboxProfile(profile, file = path8.join(os7.homedir(), ".grok", "sandbox.toml")) {
   if (BUILTIN_SANDBOXES.has(profile) || profile !== REVIEW_PROFILE_NAME) return;
   try {
-    const existing = fs8.existsSync(file) ? fs8.readFileSync(file, "utf8") : "";
+    const existing = fs9.existsSync(file) ? fs9.readFileSync(file, "utf8") : "";
     if (existing.includes(REVIEW_PROFILE_BLOCK)) return;
-    fs8.mkdirSync(path7.dirname(file), { recursive: true });
+    fs9.mkdirSync(path8.dirname(file), { recursive: true });
     const updated = existing.includes(REVIEW_PROFILE_HEADER) ? replaceReviewSection(existing) : null;
     const content = updated ?? (existing.trim() ? `${existing.trimEnd()}
 
 ${REVIEW_PROFILE}` : REVIEW_PROFILE);
     const tmp = `${file}.tmp`;
-    fs8.writeFileSync(tmp, content);
-    fs8.renameSync(tmp, file);
+    fs9.writeFileSync(tmp, content);
+    fs9.renameSync(tmp, file);
   } catch {
   }
 }
@@ -2382,21 +2510,37 @@ async function runGrokReview(prompt, config, opts = {}) {
       timedOut: false
     };
   }
+  const bin = resolveGrokBin();
+  const deadlineAt = Date.now() + timeoutMs;
+  let preflightNote;
+  try {
+    const warnings = await ensureGrokLogin({ bin, deadlineAt, onSpawn: opts.onSpawn });
+    preflightNote = warnings.map(grokLoginWarningLine).join("");
+  } catch (e) {
+    if (!(e instanceof GrokLoginExpiryError)) throw e;
+    return { failWhy: e.message, ok: false, raw: null, stderrTail: e.message, timedOut: false };
+  }
+  const seatStderrLimit = Math.max(1, GROK_SEAT_STDERR_LIMIT - preflightNote.length);
+  const seatTimeoutMs = deadlineAt - Date.now();
+  if (seatTimeoutMs <= 0) {
+    const failWhy = `the grok login pre-flight spent the seat's whole ${Math.round(timeoutMs / 1e3)} s budget \u2014 the seat never spawned`;
+    return { failWhy, ok: false, raw: null, stderrTail: `${preflightNote}${failWhy}`, timedOut: true, timedOutReason: "absolute" };
+  }
   let proxy;
   if (worktreeCwd) {
     try {
       proxy = await startSeatEgressProxy("grok");
     } catch (e) {
-      return { ok: false, raw: null, stderrTail: egressStartFailure("grok", e), timedOut: false };
+      return { ok: false, raw: null, stderrTail: `${preflightNote}${egressStartFailure("grok", e)}`, timedOut: false };
     }
   }
   let cwd;
   try {
     ensureSandboxProfile(sandbox);
-    cwd = worktreeCwd ?? fs8.mkdtempSync(path7.join(os6.tmpdir(), "grok-review-"));
+    cwd = worktreeCwd ?? fs9.mkdtempSync(path8.join(os7.tmpdir(), "grok-review-"));
     const { raw, stderrTail, timedOut, timedOutReason } = await runReviewerExec({
       args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
-      bin: resolveGrokBin(),
+      bin,
       capture: "stdout",
       ...proxy ? { env: proxyEnv(proxy.url) } : {},
       // THE LIVENESS WATCHDOG. Under `capture: 'stdout'` the accumulated stdout IS what resets it
@@ -2404,8 +2548,8 @@ async function runGrokReview(prompt, config, opts = {}) {
       // seat in 15 min while `timeoutMs` above stands back as a pure runaway backstop.
       inactivityTimeoutMs: GROK_INACTIVITY_TIMEOUT_MS,
       onSpawn: opts.onSpawn,
-      stderrLimit: 2e3,
-      timeoutMs
+      stderrLimit: seatStderrLimit,
+      timeoutMs: seatTimeoutMs
     });
     const stream = raw ? parseGrokStream(raw) : null;
     const text = !raw || !stream ? null : stream.events === 0 && !/^\s*\{\s*"type"\s*:/.test(raw) ? extractGrokText(raw) : stream.text;
@@ -2422,7 +2566,7 @@ async function runGrokReview(prompt, config, opts = {}) {
       } : {},
       ok: text !== null,
       raw: text,
-      stderrTail,
+      stderrTail: `${preflightNote}${stderrTail}`,
       // The bounded NDJSON tail: a reclaimed seat leaves a record of what it was doing, not just
       // "it timed out". Cut on a line boundary — the trail persists it as .jsonl.
       ...raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
@@ -2432,15 +2576,15 @@ async function runGrokReview(prompt, config, opts = {}) {
   } finally {
     proxy?.close();
     try {
-      if (!worktreeCwd && cwd) fs8.rmSync(cwd, { force: true, recursive: true });
+      if (!worktreeCwd && cwd) fs9.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
   }
 }
 
 // src/modes/review/claude.ts
-import fs14 from "fs";
-import os8 from "os";
+import fs15 from "fs";
+import os9 from "os";
 
 // src/modes/brainstorm/claude.ts
 function resolveClaudeBin() {
@@ -2471,43 +2615,43 @@ function runClaudeVoice(prompt, config, opts = {}) {
 }
 
 // src/modes/review/history-packet.ts
-import fs13 from "fs";
-import path13 from "path";
+import fs14 from "fs";
+import path14 from "path";
 
 // src/modes/review/ensemble-config.ts
-import fs9 from "fs";
-import os7 from "os";
-import path8 from "path";
-var ENSEMBLE_CONFIG_PATH = path8.join(os7.homedir(), ".ensemble-ai", "config.json");
+import fs10 from "fs";
+import os8 from "os";
+import path9 from "path";
+var ENSEMBLE_CONFIG_PATH = path9.join(os8.homedir(), ".ensemble-ai", "config.json");
 function asRecord2(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : null;
 }
 function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
   try {
-    return asRecord2(JSON.parse(fs9.readFileSync(configPath, "utf8"))) ?? {};
+    return asRecord2(JSON.parse(fs10.readFileSync(configPath, "utf8"))) ?? {};
   } catch {
     return {};
   }
 }
 
 // src/modes/review/gate-hunks.ts
-import fs11 from "fs";
-import path11 from "path";
+import fs12 from "fs";
+import path12 from "path";
 
 // src/modes/review/trail-io.ts
-import fs10 from "fs";
-import path9 from "path";
+import fs11 from "fs";
+import path10 from "path";
 
 // src/modes/review/diff.ts
 import { execFileSync as execFileSync4 } from "child_process";
 
 // src/modes/review/git-exec.ts
 import { execFileSync as execFileSync3 } from "child_process";
-import path10 from "path";
+import path11 from "path";
 function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
   const cmd = configured?.trim();
   if (!cmd) return "ssh -o BatchMode=yes";
-  const bin = path10.basename(cmd.split(/\s+/)[0]);
+  const bin = path11.basename(cmd.split(/\s+/)[0]);
   return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
 }
 var GIT_MAX_BUFFER = 64 * 1024 * 1024;
@@ -2593,9 +2737,9 @@ function hasGeneratedHeader(section2) {
   }
   return false;
 }
-function classifyFileKind(path18, isBinary, section2 = "") {
+function classifyFileKind(path19, isBinary, section2 = "") {
   if (isBinary) return "binary";
-  if (GENERATED_PATTERNS.some((re) => re.test(path18))) return "generated";
+  if (GENERATED_PATTERNS.some((re) => re.test(path19))) return "generated";
   return section2 && hasGeneratedHeader(section2) ? "generated" : "source";
 }
 var TEST_PATTERNS = [
@@ -2607,8 +2751,8 @@ var TEST_PATTERNS = [
   /Tests?\.(java|kt|swift|cs|scala)$/,
   /\.bats$/
 ];
-function isTestPath(path18) {
-  return TEST_PATTERNS.some((re) => re.test(path18));
+function isTestPath(path19) {
+  return TEST_PATTERNS.some((re) => re.test(path19));
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -2626,7 +2770,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path18 = pathOfSection(section2);
+    const path19 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -2637,8 +2781,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path18, isBinary, section2),
-      path: path18,
+      kind: classifyFileKind(path19, isBinary, section2),
+      path: path19,
       raw: section2,
       removed
     };
@@ -2809,8 +2953,8 @@ function persistGatePacket(baseDir, runId, input) {
 }
 
 // src/modes/review/worktree.ts
-import fs12 from "fs";
-import path12 from "path";
+import fs13 from "fs";
+import path13 from "path";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
 }
@@ -2841,18 +2985,18 @@ function allowedRootsFromConfig(configPath) {
   const roots = readEnsembleConfig(configPath).allowedRepoRoots;
   if (!Array.isArray(roots) || roots.length === 0) return null;
   const strs = roots.filter((r) => typeof r === "string" && r.trim().length > 0);
-  return strs.length > 0 ? strs.map((r) => path12.resolve(r)) : null;
+  return strs.length > 0 ? strs.map((r) => path13.resolve(r)) : null;
 }
 function rootAllowed(repoRoot, allowed) {
   if (!allowed) return true;
-  const real = path12.resolve(repoRoot);
+  const real = path13.resolve(repoRoot);
   return allowed.some((root) => {
-    const rel = path12.relative(root, real);
-    return rel === "" || !rel.startsWith("..") && !path12.isAbsolute(rel);
+    const rel = path13.relative(root, real);
+    return rel === "" || !rel.startsWith("..") && !path13.isAbsolute(rel);
   });
 }
 function resolveRepoLocation(args, deps) {
-  const repoPath = path12.resolve(args.repoPath);
+  const repoPath = path13.resolve(args.repoPath);
   const top = deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
   if (!top.ok) {
     return {
@@ -2940,7 +3084,7 @@ function stripAgentInstructions(dir) {
   const removed = [];
   const remove = (rel) => {
     try {
-      fs12.rmSync(path12.join(dir, rel), { force: true, recursive: true });
+      fs13.rmSync(path13.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -2948,7 +3092,7 @@ function stripAgentInstructions(dir) {
   const walk = (rel) => {
     let entries;
     try {
-      entries = fs12.readdirSync(path12.join(dir, rel), { withFileTypes: true });
+      entries = fs13.readdirSync(path13.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -2958,7 +3102,7 @@ function stripAgentInstructions(dir) {
       if (isInstructionName(e.name)) {
         remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
-        if (fs12.existsSync(path12.join(dir, childRel, CURSOR_RULES))) {
+        if (fs13.existsSync(path13.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
         walk(childRel);
@@ -2974,7 +3118,7 @@ async function stripAgentInstructionsAsync(dir) {
   const removed = [];
   const remove = async (rel) => {
     try {
-      await fs12.promises.rm(path12.join(dir, rel), { force: true, recursive: true });
+      await fs13.promises.rm(path13.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -2982,7 +3126,7 @@ async function stripAgentInstructionsAsync(dir) {
   const walk = async (rel) => {
     let entries;
     try {
-      entries = await fs12.promises.readdir(path12.join(dir, rel), { withFileTypes: true });
+      entries = await fs13.promises.readdir(path13.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -2993,7 +3137,7 @@ async function stripAgentInstructionsAsync(dir) {
         await remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
         try {
-          await fs12.promises.access(path12.join(dir, childRel, CURSOR_RULES));
+          await fs13.promises.access(path13.join(dir, childRel, CURSOR_RULES));
           await remove(`${childRel}/${CURSOR_RULES}`);
         } catch {
         }
@@ -3010,14 +3154,14 @@ function isStrippedPath(p, stripped) {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
 var PARTIAL_CLONE_CONFIG_RE = "^(extensions\\.partialclone|remote\\..*\\.promisor)$";
-var ALTERNATES_REL = path12.join("objects", "info", "alternates");
+var ALTERNATES_REL = path13.join("objects", "info", "alternates");
 function completeSharedStore(repoRoot, git2) {
   const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
-  const commonDir = path12.resolve(repoRoot, common.text.trim());
-  if (!fs12.existsSync(path12.join(commonDir, "objects"))) return null;
-  if (fs12.existsSync(path12.join(commonDir, "shallow"))) return null;
-  if (fs12.existsSync(path12.join(commonDir, ALTERNATES_REL))) return null;
+  const commonDir = path13.resolve(repoRoot, common.text.trim());
+  if (!fs13.existsSync(path13.join(commonDir, "objects"))) return null;
+  if (fs13.existsSync(path13.join(commonDir, "shallow"))) return null;
+  if (fs13.existsSync(path13.join(commonDir, ALTERNATES_REL))) return null;
   if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
   return commonDir;
 }
@@ -3084,7 +3228,7 @@ function materializeWorktree(args, deps) {
   let parent = null;
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    const bare = path12.join(parent, "repo");
+    const bare = path13.join(parent, "repo");
     const created = deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
     if (!created.ok) {
       return { kind: "materialize-failed", message: privateRepoFailure(shared, created.error) };
@@ -3107,7 +3251,7 @@ function materializeWorktree(args, deps) {
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
-    const dir = path12.join(parent, "head");
+    const dir = path13.join(parent, "head");
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
       { cwd: bare, env: INERT_ENV }
@@ -3137,17 +3281,17 @@ function materializeWorktree(args, deps) {
 }
 var REAP_RM_OPTS = { force: true, maxRetries: 3, recursive: true, retryDelay: 50 };
 function reapParent(parent) {
-  if (!path12.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
+  if (!path13.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    fs12.rmSync(parent, REAP_RM_OPTS);
+    fs13.rmSync(parent, REAP_RM_OPTS);
   } catch {
   }
 }
 function reapWorktree(dir) {
-  reapParent(path12.dirname(dir));
+  reapParent(path13.dirname(dir));
 }
 async function resolveRepoLocationAsync(args, deps) {
-  const repoPath = path12.resolve(args.repoPath);
+  const repoPath = path13.resolve(args.repoPath);
   const top = await deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
   if (!top.ok) {
     return {
@@ -3186,7 +3330,7 @@ async function materializeWorktreeAsync(args, deps) {
   let parent = null;
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    const bare = path12.join(parent, "repo");
+    const bare = path13.join(parent, "repo");
     const created = await deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
     if (!created.ok) {
       return { kind: "materialize-failed", message: privateRepoFailure(shared, created.error) };
@@ -3209,7 +3353,7 @@ async function materializeWorktreeAsync(args, deps) {
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
-    const dir = path12.join(parent, "head");
+    const dir = path13.join(parent, "head");
     const added = await deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
       { cwd: bare, env: INERT_ENV }
@@ -3240,11 +3384,11 @@ async function materializeWorktreeAsync(args, deps) {
 async function completeSharedStoreAsync(repoRoot, git2) {
   const common = await git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
-  const commonDir = path12.resolve(repoRoot, common.text.trim());
-  const exists = (p) => fs12.promises.access(p).then(() => true, () => false);
-  if (!await exists(path12.join(commonDir, "objects"))) return null;
-  if (await exists(path12.join(commonDir, "shallow"))) return null;
-  if (await exists(path12.join(commonDir, ALTERNATES_REL))) return null;
+  const commonDir = path13.resolve(repoRoot, common.text.trim());
+  const exists = (p) => fs13.promises.access(p).then(() => true, () => false);
+  if (!await exists(path13.join(commonDir, "objects"))) return null;
+  if (await exists(path13.join(commonDir, "shallow"))) return null;
+  if (await exists(path13.join(commonDir, ALTERNATES_REL))) return null;
   if ((await git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot })).ok) return null;
   return commonDir;
 }
@@ -3259,14 +3403,14 @@ async function fetchEnvAsync(repoRoot, bare, git2) {
   return { ...INERT_ENV, ...transportEnv(missing, ssh) };
 }
 async function reapParentAsync(parent) {
-  if (!path12.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
+  if (!path13.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    await fs12.promises.rm(parent, REAP_RM_OPTS);
+    await fs13.promises.rm(parent, REAP_RM_OPTS);
   } catch {
   }
 }
 async function reapWorktreeAsync(dir) {
-  await reapParentAsync(path12.dirname(dir));
+  await reapParentAsync(path13.dirname(dir));
 }
 
 // src/modes/review/history-packet.ts
@@ -3291,16 +3435,16 @@ function historyPacketHasData(packet) {
 var FIELD_SEP = "";
 var LOG_FORMAT = `--format=%h${FIELD_SEP}%at${FIELD_SEP}%an${FIELD_SEP}%s`;
 function containedPath(root, rel) {
-  const abs = path13.resolve(root, rel);
-  const back = path13.relative(path13.resolve(root), abs);
+  const abs = path14.resolve(root, rel);
+  const back = path14.relative(path14.resolve(root), abs);
   return back !== "" && !escapesRoot(back) ? abs : null;
 }
 function writeHistoryPacket(cwd, files) {
   for (const f of files) {
     const abs = containedPath(cwd, f.path);
     if (!abs) continue;
-    fs13.mkdirSync(path13.dirname(abs), { recursive: true });
-    fs13.writeFileSync(abs, f.contents, { mode: 256 });
+    fs14.mkdirSync(path14.dirname(abs), { recursive: true });
+    fs14.writeFileSync(abs, f.contents, { mode: 256 });
   }
 }
 
@@ -3334,7 +3478,7 @@ function homeReadDenyRules(homeDir) {
   return CLAUDE_READ_TOOLS.map((t) => denyUnder(t, homeDir));
 }
 function buildClaudeReviewArgs(prompt, config, fence = {}) {
-  const homeDir = fence.homeDir ?? os8.homedir();
+  const homeDir = fence.homeDir ?? os9.homedir();
   if (fence.readRoot && isUnder(fence.readRoot, homeDir)) {
     throw new Error(
       `ensemble-ai: refusing to fence a Claude seat whose read root (${fence.readRoot}) is inside the home directory (${homeDir}) \u2014 the home-read deny would also deny the worktree. Point TMPDIR outside $HOME.`
@@ -3488,7 +3632,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
     }
   } finally {
     try {
-      fs14.rmSync(cwd, { force: true, recursive: true });
+      fs15.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
   }
@@ -3624,9 +3768,9 @@ function hasDepSurface(r) {
 }
 
 // src/modes/review/receipt.ts
-import fs18 from "fs";
-import os10 from "os";
-import path16 from "path";
+import fs19 from "fs";
+import os11 from "os";
+import path17 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -3712,16 +3856,16 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/holistic-gate.ts
-import fs17 from "fs";
-import path15 from "path";
+import fs18 from "fs";
+import path16 from "path";
 
 // src/modes/review/holistic.ts
-import fs16 from "fs";
+import fs17 from "fs";
 
 // src/modes/brainstorm/voices.ts
-import fs15 from "fs";
-import os9 from "os";
-import path14 from "path";
+import fs16 from "fs";
+import os10 from "os";
+import path15 from "path";
 
 // src/modes/brainstorm/types.ts
 var VOICE_IDS = ["codex", "grok", "claude"];
@@ -3779,7 +3923,7 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), o),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), o)
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path14.join(os9.homedir(), ".ensemble-ai", "voices.json");
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path15.join(os10.homedir(), ".ensemble-ai", "voices.json");
 function str2(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
@@ -3805,7 +3949,7 @@ function parseVoices(raw) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs15.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs16.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
@@ -3857,7 +4001,7 @@ function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
 }) {
   let raw = {};
   try {
-    raw = JSON.parse(fs16.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs17.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -4022,24 +4166,24 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs17.realpathSync(path15.resolve(worktreeDir));
+    root = fs18.realpathSync(path16.resolve(worktreeDir));
   } catch {
     return () => null;
   }
   const inside = (p) => {
-    const rel = path15.relative(root, p);
+    const rel = path16.relative(root, p);
     return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
-      if (!file || file.includes("\0") || path15.isAbsolute(file)) return null;
-      const target = path15.resolve(root, file);
+      if (!file || file.includes("\0") || path16.isAbsolute(file)) return null;
+      const target = path16.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs17.realpathSync(target);
+      const real = fs18.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs17.statSync(real);
+      const st = fs18.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs17.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs18.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
@@ -4250,10 +4394,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path16.join(os10.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path17.join(os11.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path16.join(
+  return path17.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -4274,11 +4418,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs18.mkdirSync(path16.dirname(file), { recursive: true, mode: 448 });
+  fs19.mkdirSync(path17.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs18.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs18.chmodSync(tmp, 384);
-  fs18.renameSync(tmp, file);
+  fs19.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs19.chmodSync(tmp, 384);
+  fs19.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -4360,7 +4504,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs18.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs19.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -5348,8 +5492,8 @@ function stageReview(payload, target, deps) {
 }
 
 // src/modes/review/holistic-fixture.ts
-import fs19 from "fs";
-import path17 from "path";
+import fs20 from "fs";
+import path18 from "path";
 function anchor(v, where) {
   const e = v ?? {};
   if (typeof e.file !== "string" || typeof e.line !== "number" || typeof e.symbol !== "string")
@@ -5357,7 +5501,7 @@ function anchor(v, where) {
   return { file: e.file, line: e.line, symbol: e.symbol };
 }
 function loadHolisticFixture(dir) {
-  const raw = JSON.parse(fs19.readFileSync(path17.join(dir, "expectations.json"), "utf8"));
+  const raw = JSON.parse(fs20.readFileSync(path18.join(dir, "expectations.json"), "utf8"));
   const positives = Array.isArray(raw.plantedPositives) ? raw.plantedPositives : [];
   const misses = Array.isArray(raw.nearMisses) ? raw.nearMisses : [];
   if (positives.length === 0 || misses.length === 0)
@@ -5390,7 +5534,7 @@ function verifyFixtureAnchors(dir, fixture) {
   const check = (a, label2) => {
     let lines;
     try {
-      lines = fs19.readFileSync(path17.join(dir, a.file), "utf8").split(/\r?\n/);
+      lines = fs20.readFileSync(path18.join(dir, a.file), "utf8").split(/\r?\n/);
     } catch {
       broken.push(`${label2}: ${a.file} is unreadable`);
       return;
@@ -6251,9 +6395,16 @@ export {
   FINDINGS_INSTRUCTIONS,
   GROK_CLI_SANDBOX,
   GROK_INACTIVITY_TIMEOUT_MS,
+  GROK_LOGIN_EXPIRY_FAIL_PREFIX,
+  GROK_LOGIN_MARGIN_MS,
   GROK_PACKET_REVIEW_TIMEOUT_MS,
   GROK_SANDBOX_PROFILE,
+  GROK_STATUS_API_KEY,
+  GROK_STATUS_AUTHENTICATED_VIA_PREFIX,
+  GROK_STATUS_LOGGED_IN_PREFIX,
+  GROK_STATUS_NOT_AUTHENTICATED,
   GROK_WORKTREE_REVIEW_TIMEOUT_MS,
+  GrokLoginExpiryError,
   HARNESS_SEATS,
   HOLISTIC_DEFAULTS,
   HOLISTIC_MIN_ANCHOR_NONWS,
@@ -6330,6 +6481,7 @@ export {
   diffDigest,
   effectiveSshFrom,
   enabledReviewerIds,
+  ensureGrokLogin,
   ensureSandboxProfile,
   escapesRoot,
   evaluatePushFence,
@@ -6349,6 +6501,7 @@ export {
   formatEvidenceShortfall,
   fsConventionReader,
   gatherConventions,
+  grokLoginWarningLine,
   hasDepSurface,
   hasGeneratedHeader,
   holisticCapWasLifted,
@@ -6360,6 +6513,7 @@ export {
   isEnsembleStagedReview,
   isEvidenceClass,
   isEvidenceSeat,
+  isGrokLoginExpiryFailure,
   isHolisticRecord,
   isImplemented,
   isMode,

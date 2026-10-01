@@ -29,6 +29,8 @@ export * from './core/hash';
 // ── Reviewer adapters (codex · grok) + the adapter registry ──────────────────
 export * from './reviewers/codex';
 export * from './reviewers/grok';
+// The grok login pre-flight — exported so a consumer's sandbox probe refreshes the same way a seat does.
+export * from './reviewers/grok-login';
 export * from './reviewers/claude';
 export * from './reviewers/registry';
 // The ensemble-owned codex sandbox wrapper (worktree evidence, macOS Seatbelt).

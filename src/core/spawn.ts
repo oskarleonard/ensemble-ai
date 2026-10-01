@@ -103,9 +103,11 @@ export interface ReviewerExecOpts {
    * Extra env for the child, merged OVER `process.env`. A fenced seat passes the egress proxy's
    * `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (+ an empty `NO_PROXY`) here — merging over the parent
    * env is what lets `NO_PROXY: ''` OVERRIDE an operator's inherited `NO_PROXY=*`, which would
-   * otherwise let the seat bypass the proxy for exactly the hosts it most wants to reach.
+   * otherwise let the seat bypass the proxy for exactly the hosts it most wants to reach. An
+   * `undefined` value REMOVES the inherited variable (Node's spawn drops undefined entries) — how
+   * the grok login pre-flight runs without the seat's GROK_SANDBOX.
    */
-  env?: Record<string, string>;
+  env?: Record<string, string | undefined>;
   /** Receives the kill handle so a caller (e.g. a cancel) can abort the child. */
   onSpawn?: (kill: () => void) => void;
   /** The -o tempfile the reply is read from, then unlinked. Required for 'outfile'. */
@@ -151,6 +153,10 @@ export function boundedStreamTail(tail: string, limit: number): string {
 }
 
 export interface ReviewerExecResult {
+  /** The child's `'error'` event, when one fired — most often a binary that could not be spawned (ENOENT, EACCES). */
+  error?: Error;
+  /** The child's exit code: null when a signal ended it, absent when it never exited before settle. */
+  exitCode?: number | null;
   /** The reply (the -o file, or accumulated stdout) — or null if none produced. */
   raw: string | null;
   stderrTail: string;
@@ -257,6 +263,8 @@ export function runReviewerExec(
       });
     }
     let exitDrain: ReturnType<typeof setTimeout> | null = null;
+    let exitCode: number | null | undefined;
+    let error: Error | undefined;
     const settle = () => {
       if (settled) return; // exit AND close both fire on a clean run — settle once
       settled = true;
@@ -279,6 +287,8 @@ export function runReviewerExec(
         }
       }
       resolve({
+        ...(error ? { error } : {}),
+        ...(exitCode !== undefined ? { exitCode } : {}),
         raw,
         stderrTail,
         ...(streamStdout ? { streamTail: boundedStreamTail(streamTail, streamLimit) } : {}),
@@ -293,15 +303,18 @@ export function runReviewerExec(
     // delivers its last chunk (`close` is the post-drain event), so defer `exit`
     // briefly for `close`/the final data, falling back via EXIT_DRAIN_GRACE_MS if a
     // held-open pipe never closes.
-    child.on(
-      'exit',
-      pipeStdout
-        ? () => {
-            exitDrain = setTimeout(settle, EXIT_DRAIN_GRACE_MS);
-          }
-        : settle
-    );
-    child.on('close', settle);
-    child.on('error', settle);
+    child.on('exit', (code: number | null) => {
+      exitCode = code;
+      if (pipeStdout) exitDrain = setTimeout(settle, EXIT_DRAIN_GRACE_MS);
+      else settle();
+    });
+    child.on('close', (code: number | null) => {
+      if (exitCode === undefined) exitCode = code;
+      settle();
+    });
+    child.on('error', (e: Error) => {
+      error = e;
+      settle();
+    });
   });
 }
