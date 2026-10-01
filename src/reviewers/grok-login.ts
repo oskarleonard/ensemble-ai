@@ -7,6 +7,15 @@ import { runReviewerExec } from '../core/spawn';
 // THE GROK LOGIN PRE-FLIGHT — a sandboxed grok seat must never START with a login grok itself says
 // is missing, and the login it starts with gets grok's own refresh first.
 //
+// THE CONTRACT — the declared threat model this module is built and reviewed against:
+//   · It may REFUSE a seat only when two runs that exited 0 both report grok's not-authenticated line.
+//   · Every other outcome PROCEEDS, and its warning is RECORDED in the seat's result (ensureGrokLogin
+//     returns it; runGrokReview prepends it to the seat's stderrTail).
+//   · It never adds more than the seat's own time budget allows: both runs spend from the seat's one
+//     deadline, and the seat spawns with only what is left. (A run cut at its cap settles after the
+//     shared spawn's kill grace — the same grace the seat's own backstop carries, not pre-flight time.)
+//   · Anything outside that contract is out of scope.
+//
 // Lived 2026-10-01: grok's OAuth access token lives 6 h. Under `--sandbox ensemble-review` the CLI
 // cannot refresh it — its credential files and their lock are kernel-unwritable there, so its unified
 // log reads `auth lock: … Operation not permitted` → `auth 401` → `auth recovery: credential-less
@@ -18,20 +27,25 @@ import { runReviewerExec } from '../core/spawn';
 //   · it runs unsandboxed — the explicit `--sandbox off` overrides a default profile from grok's
 //     own config as well as an inherited GROK_SANDBOX, which is also stripped from the child env;
 //   · grok refreshes only inside its "early invalidation" window, GROK_AUTH_EARLY_INVALIDATION_SECS
-//     (documented in the CLI, default 300 s). This one run widens it to the seat's deadline plus the
-//     margin, so a login that would expire during the seat is renewed now. Proved live 2026-10-01:
-//     `auth.refresh.success`, `expires_at` +6 h, no inference turn.
+//     (documented in the CLI, default 300 s). This one run widens it to what is left of the seat's
+//     budget plus the margin, so a login that would expire during the seat is renewed now. Proved
+//     live 2026-10-01: `auth.refresh.success`, `expires_at` +6 h, no inference turn.
 //
-// What decides the seat is grok's OWN first stdout line from that run (1.0.44, all exit 0):
-//   "You are logged in with grok.com." · "You are using XAI_API_KEY." · "You are not authenticated."
-// Only the last can refuse the seat, and only once CONFIRMED: a proactive refresh that fails — two
-// pre-flights racing grok's refresh single-flight, an auth-server blip — also prints it while the
-// cached session is still valid. So a not-authenticated line is re-asked once with grok's default
-// window (GROK_AUTH_EARLY_INVALIDATION_SECS removed, so the widened refresh is not retried), and the
-// seat is refused only if that run says it too. A confirm run that reads logged in proceeds with a
-// warning that the widened refresh failed. A run that fails, hangs, or prints anything else PROCEEDS with a warning
-// quoting its exit code and stderr tail: the seat's backstop owns that case, as it always did —
-// failing every seat on a line we cannot read would trade one outage for another.
+// What decides the seat is grok's OWN first stdout line from a run that EXITED 0 — a run that exits
+// nonzero, hangs or never starts does not decide, whatever it printed. grok 1.0.44's authenticated
+// lines: "You are logged in with <provider>." · "You are authenticated via deployment key." ·
+// "You are authenticated via XAI_API_KEY (environment variable)." · "You are using XAI_API_KEY.";
+// the other is "You are not authenticated." Only that last line can refuse the seat, and only once
+// CONFIRMED: a proactive refresh that fails — two pre-flights racing grok's refresh single-flight,
+// an auth-server blip — also prints it while the cached session is still valid. So it is re-asked
+// once with GROK_AUTH_EARLY_INVALIDATION_SECS=0, which grok's docs define as "Disable the proactive
+// buffer: refresh at expiry or on a 401": the confirm run reads the cached session and does not
+// retry the proactive refresh, so it cannot re-enter the race that failed (checked live 2026-10-01:
+// window 0 → logged in, exit 0, no `auth.refresh.*` event). The one case it still refreshes is a
+// token already past its expiry — there the cached session is unusable anyway. A confirm run that
+// reads authenticated proceeds with a warning that the widened refresh failed. Anything else —
+// either run failing, hanging, exiting nonzero or printing an unknown line — PROCEEDS with a warning
+// quoting its exit code and stderr tail: the seat's backstop owns that case, as it always did.
 //
 // What this module never does: read grok's private credential files (ruling 92adf3b2 — grok, not
 // us, owns its login state), widen the review sandbox, or implement an OAuth refresh itself.
@@ -41,14 +55,17 @@ import { runReviewerExec } from '../core/spawn';
 export const GROK_LOGIN_MARGIN_MS = 300_000;
 
 // `grok models` is a catalog listing — seconds of work, a refresh included. A minute bounds a hung
-// one; it is killed and the seat proceeds on the backstop.
+// one — or less, when less of the seat's budget is left; it is killed and the seat proceeds.
 const GROK_LOGIN_REFRESH_TIMEOUT_MS = 60_000;
 
 // The stderr kept from a models run and quoted in a warning — its tail, so the last error shows.
 const GROK_MODELS_STDERR_LIMIT = 500;
 
-// grok's status lines, verbatim — the first line `grok models` prints.
-export const GROK_STATUS_LOGGED_IN = 'You are logged in with grok.com.';
+// grok's status lines — the first line `grok models` prints. The two prefixes are completed by grok
+// ("…with grok.com.", "…via deployment key.", "…via XAI_API_KEY (environment variable)."); every
+// line they start is an authenticated session.
+export const GROK_STATUS_LOGGED_IN_PREFIX = 'You are logged in with ';
+export const GROK_STATUS_AUTHENTICATED_VIA_PREFIX = 'You are authenticated via ';
 export const GROK_STATUS_API_KEY = 'You are using XAI_API_KEY.';
 export const GROK_STATUS_NOT_AUTHENTICATED = 'You are not authenticated.';
 
@@ -74,6 +91,8 @@ export interface GrokModelsRun {
   cwd: string;
   // Merged over the parent env; an `undefined` value removes an inherited variable.
   env: Record<string, string | undefined>;
+  // The seat's cancel handle: a cancel during the pre-flight kills this run's child too.
+  onSpawn?: (kill: () => void) => void;
   timeoutMs: number;
 }
 
@@ -103,53 +122,78 @@ async function runGrokModels(run: GrokModelsRun): Promise<GrokModelsResult> {
 export interface EnsureGrokLoginOpts {
   // The SAME resolved grok binary the seat will spawn — its refresh is the one that counts.
   bin: string;
-  // How long the seat may run from now: its effective absolute timeout.
-  deadlineMs: number;
+  // When the seat's time budget ends (epoch ms) — the ONE deadline both models runs spend from, and
+  // the seat after them. The refresh window covers what is left of it.
+  deadlineAt: number;
   marginMs?: number;
+  // The seat's cancel handle, handed each models run's kill.
+  onSpawn?: (kill: () => void) => void;
   runModels?: GrokModelsRunner;
   warn?: (message: string) => void;
 }
 
+// A warning as one stderr line — the live notice and the line a seat's stderrTail records.
+export function grokLoginWarningLine(message: string): string {
+  return `⚠ ensemble-ai grok pre-flight: ${message}\n`;
+}
+
 function warnToStderr(message: string): void {
-  process.stderr.write(`⚠ ensemble-ai grok pre-flight: ${message}\n`);
+  process.stderr.write(grokLoginWarningLine(message));
 }
 
 function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-// One models run: its result, or the error it failed with (a spawn that never started).
-type ModelsRun = GrokModelsResult | { failed: string };
+// One models run: its result and the cap it ran under, or the error it failed with (a spawn that
+// never started, or no budget left to start it).
+type ModelsRun = (GrokModelsResult & { timeoutMs: number }) | { failed: string };
 
-// grok's status line — undefined for a run that failed or hung, whose output is not an answer.
-function statusOf(run: ModelsRun): string | undefined {
-  if ('failed' in run || run.timedOut) return undefined;
+// The first non-empty stdout line, trimmed — what the run printed, decisive or not.
+function firstLine(run: GrokModelsResult): string | undefined {
   return run.stdout?.split('\n').find((line) => line.trim())?.trim();
+}
+
+// grok's status line — ONLY from a run that exited 0. A run that failed, hung or exited nonzero is
+// not an answer, whatever it printed: it can neither pass, confirm nor refuse the seat.
+function statusOf(run: ModelsRun): string | undefined {
+  if ('failed' in run || run.timedOut || run.exitCode !== 0) return undefined;
+  return firstLine(run);
 }
 
 // What a run did, for a warning: why its line does not decide, then its exit code and stderr tail.
 function describeRun(run: ModelsRun): string {
   if ('failed' in run) return `failed (${run.failed}) — the run never started`;
-  const status = statusOf(run);
+  const line = firstLine(run);
   const what = run.timedOut
-    ? `did not finish within ${GROK_LOGIN_REFRESH_TIMEOUT_MS / 1000} s`
-    : status
-      ? `printed "${status.slice(0, 200)}"`
+    ? `did not finish within ${run.timeoutMs / 1000} s`
+    : line
+      ? `printed "${line.slice(0, 200)}"`
       : 'printed no status line';
   const stderr = run.stderrTail.slice(-GROK_MODELS_STDERR_LIMIT).replace(/\s+/g, ' ').trim();
   return `${what} (exit code ${run.exitCode ?? 'none'}; stderr ${stderr ? `"${stderr}"` : 'empty'})`;
 }
 
-function isLoggedIn(status: string | undefined): boolean {
-  return status === GROK_STATUS_LOGGED_IN || status === GROK_STATUS_API_KEY;
+function isAuthenticated(status: string | undefined): boolean {
+  return (
+    status !== undefined &&
+    (status === GROK_STATUS_API_KEY ||
+      status.startsWith(GROK_STATUS_LOGGED_IN_PREFIX) ||
+      status.startsWith(GROK_STATUS_AUTHENTICATED_VIA_PREFIX))
+  );
 }
 
 // Run grok's own refresh outside the sandbox, sized to the seat, then read grok's status line.
-// Resolves when the seat may spawn; throws GrokLoginExpiryError — whose message starts with
-// GROK_LOGIN_EXPIRY_FAIL_PREFIX — only when grok says it is not authenticated, twice.
-export async function ensureGrokLogin(opts: EnsureGrokLoginOpts): Promise<void> {
+// Resolves — with the warnings it raised, each also announced through `warn` — when the seat may
+// spawn; throws GrokLoginExpiryError, whose message starts with GROK_LOGIN_EXPIRY_FAIL_PREFIX, only
+// when two runs that exited 0 both say grok is not authenticated.
+export async function ensureGrokLogin(opts: EnsureGrokLoginOpts): Promise<string[]> {
   const warn = opts.warn ?? warnToStderr;
   const proceed = 'the seat proceeds; its backstop owns a login that cannot last';
+  const warned = (message: string): string[] => {
+    warn(message);
+    return [message];
+  };
 
   // A fresh temp cwd: `grok models` must not pick up a project's `.grok/` config from wherever the
   // consumer happens to run. Failing to make one is not a reason to fail the seat.
@@ -157,11 +201,11 @@ export async function ensureGrokLogin(opts: EnsureGrokLoginOpts): Promise<void> 
   try {
     cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-login-'));
   } catch (e) {
-    warn(`could not create a temp cwd for \`grok models\` (${errorText(e)}) — ${proceed}`);
-    return;
+    return warned(`could not create a temp cwd for \`grok models\` (${errorText(e)}) — ${proceed}`);
   }
   try {
-    await decide(opts, cwd, warn, proceed);
+    const warning = await decide(opts, cwd, proceed);
+    return warning ? warned(warning) : [];
   } finally {
     try {
       fs.rmSync(cwd, { force: true, recursive: true });
@@ -171,39 +215,38 @@ export async function ensureGrokLogin(opts: EnsureGrokLoginOpts): Promise<void> 
   }
 }
 
-async function decide(
-  opts: EnsureGrokLoginOpts,
-  cwd: string,
-  warn: (message: string) => void,
-  proceed: string
-): Promise<void> {
+// The decision: undefined when the seat proceeds silently, a warning when it proceeds with one.
+async function decide(opts: EnsureGrokLoginOpts, cwd: string, proceed: string): Promise<string | undefined> {
   const runModels = opts.runModels ?? runGrokModels;
+  const remainingMs = () => opts.deadlineAt - Date.now();
   const models = async (env: Record<string, string | undefined>): Promise<ModelsRun> => {
+    // Each run is capped by what is left of the seat's budget, never only by its own minute.
+    const timeoutMs = Math.min(GROK_LOGIN_REFRESH_TIMEOUT_MS, remainingMs());
+    if (timeoutMs <= 0) return { failed: "the seat's time budget is spent" };
     try {
-      return await runModels({
+      const run = await runModels({
         args: ['--sandbox', 'off', 'models'],
         bin: opts.bin,
         cwd,
         env,
-        timeoutMs: GROK_LOGIN_REFRESH_TIMEOUT_MS,
+        ...(opts.onSpawn ? { onSpawn: opts.onSpawn } : {}),
+        timeoutMs,
       });
+      return { ...run, timeoutMs };
     } catch (e) {
       return { failed: errorText(e) };
     }
   };
 
-  const windowSecs = Math.ceil((opts.deadlineMs + (opts.marginMs ?? GROK_LOGIN_MARGIN_MS)) / 1000);
+  const windowSecs = Math.ceil((remainingMs() + (opts.marginMs ?? GROK_LOGIN_MARGIN_MS)) / 1000);
   const refresh = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: String(windowSecs), GROK_SANDBOX: undefined });
   const status = statusOf(refresh);
-  if (isLoggedIn(status)) return;
-  if (status !== GROK_STATUS_NOT_AUTHENTICATED) {
-    warn(`\`grok models\` ${describeRun(refresh)} — ${proceed}`);
-    return;
-  }
+  if (isAuthenticated(status)) return undefined;
+  if (status !== GROK_STATUS_NOT_AUTHENTICATED) return `\`grok models\` ${describeRun(refresh)} — ${proceed}`;
 
-  // The confirm run: grok's default window, so it reads the cached session instead of retrying the
-  // widened refresh that just failed.
-  const confirm = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: undefined, GROK_SANDBOX: undefined });
+  // The confirm run: window 0 — grok refreshes only at expiry or on a 401, so it reads the cached
+  // session instead of retrying the proactive refresh that just failed.
+  const confirm = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: '0', GROK_SANDBOX: undefined });
   const confirmed = statusOf(confirm);
   if (confirmed === GROK_STATUS_NOT_AUTHENTICATED) {
     throw new GrokLoginExpiryError(
@@ -211,9 +254,7 @@ async function decide(
     );
   }
   const refreshed = `the refresh run (window ${windowSecs} s) ${describeRun(refresh)}`;
-  warn(
-    isLoggedIn(confirmed)
-      ? `the widened login refresh failed — ${refreshed}, but grok's cached login is still valid; the confirm run ${describeRun(confirm)}. The seat proceeds; the login may expire during it.`
-      : `${refreshed}; the confirm run ${describeRun(confirm)} — ${proceed}`
-  );
+  return isAuthenticated(confirmed)
+    ? `the widened login refresh failed — ${refreshed}, but grok's cached login is still valid; the confirm run ${describeRun(confirm)}. The seat proceeds; the login may expire during it.`
+    : `${refreshed}; the confirm run ${describeRun(confirm)} — ${proceed}`;
 }

@@ -10,7 +10,7 @@ import type { SandboxProfileRef } from '../modes/review/evidence';
 
 import { type CodexReviewResult, type RunReviewOpts } from './codex';
 import { egressStartFailure, startSeatEgressProxy } from './egress-seat';
-import { ensureGrokLogin, GrokLoginExpiryError } from './grok-login';
+import { ensureGrokLogin, GrokLoginExpiryError, grokLoginWarningLine } from './grok-login';
 
 // GROK NOW HAS A LIVENESS SIGNAL, and these three numbers are what that bought.
 //
@@ -45,6 +45,9 @@ export const GROK_INACTIVITY_TIMEOUT_MS = 900_000; // 15 min of SILENCE
 // Smaller than codex's 1 MB because grok streams per-TOKEN deltas: 100 KB is already thousands of
 // events, and the tail is a post-mortem, not the reply.
 const GROK_STREAM_TAIL_LIMIT = 100_000; // 100 KB
+
+// The seat's stderr tail — the noise channel the trail persists (its last 2000 chars, seat-run).
+const GROK_SEAT_STDERR_LIMIT = 2000;
 
 // The Grok (xAI) review adapter — the second cross-vendor lens beside Codex. It
 // mirrors codex.ts but for the THREE ways grok's CLI differs (verified live
@@ -408,12 +411,30 @@ export async function runGrokReview(
   // spawns; if grok then says it is not authenticated, fail NOW with a failWhy every consumer reads
   // — never spawn a seat doomed to hang. Before the proxy starts, so a refused seat leaves no fence
   // to tear down.
+  //
+  // ONE DEADLINE for the whole adapter call: the pre-flight spends from the seat's own budget, never
+  // on top of it — a voice with a short timeout must not first wait out two minute-long models runs —
+  // and the seat spawns with only what is left. The caller's cancel handle reaches the pre-flight's
+  // children as well as the seat's.
   const bin = resolveGrokBin();
+  const deadlineAt = Date.now() + timeoutMs;
+  let preflightNote: string;
   try {
-    await ensureGrokLogin({ bin, deadlineMs: timeoutMs });
+    const warnings = await ensureGrokLogin({ bin, deadlineAt, onSpawn: opts.onSpawn });
+    preflightNote = warnings.map(grokLoginWarningLine).join('');
   } catch (e) {
     if (!(e instanceof GrokLoginExpiryError)) throw e;
     return { failWhy: e.message, ok: false, raw: null, stderrTail: e.message, timedOut: false };
+  }
+  // The pre-flight's warnings LEAD the seat's stderrTail, so they reach the consumer's trail. The
+  // trail keeps the LAST GROK_SEAT_STDERR_LIMIT chars (seat-run seatDiagnostics), so the seat keeps
+  // only the room the note leaves — a full seat tail would otherwise push the warning out of the
+  // record. (A warning quotes at most 200 chars of status and 500 of stderr per run, so it fits.)
+  const seatStderrLimit = Math.max(1, GROK_SEAT_STDERR_LIMIT - preflightNote.length);
+  const seatTimeoutMs = deadlineAt - Date.now();
+  if (seatTimeoutMs <= 0) {
+    const failWhy = `the grok login pre-flight spent the seat's whole ${Math.round(timeoutMs / 1000)} s budget — the seat never spawned`;
+    return { failWhy, ok: false, raw: null, stderrTail: `${preflightNote}${failWhy}`, timedOut: true, timedOutReason: 'absolute' };
   }
   // PACKET-MODE VERIFICATION (packet-f1, 2026-07-10) — the codex packet fence (buildCodexReviewArgs)
   // has NO grok counterpart, and this documents why, verified rather than assumed (the task: verify,
@@ -447,7 +468,7 @@ export async function runGrokReview(
     try {
       proxy = await startSeatEgressProxy('grok');
     } catch (e) {
-      return { ok: false, raw: null, stderrTail: egressStartFailure('grok', e), timedOut: false };
+      return { ok: false, raw: null, stderrTail: `${preflightNote}${egressStartFailure('grok', e)}`, timedOut: false };
     }
   }
   // ONCE THE FENCE IS UP IT COMES DOWN ON EVERY PATH. `ensureSandboxProfile` writes a file and
@@ -471,8 +492,8 @@ export async function runGrokReview(
       // seat in 15 min while `timeoutMs` above stands back as a pure runaway backstop.
       inactivityTimeoutMs: GROK_INACTIVITY_TIMEOUT_MS,
       onSpawn: opts.onSpawn,
-      stderrLimit: 2000,
-      timeoutMs,
+      stderrLimit: seatStderrLimit,
+      timeoutMs: seatTimeoutMs,
     });
     const stream = raw ? parseGrokStream(raw) : null;
     // The reply is the stream's `result` line. The legacy envelope is tried ONLY when the stdout was
@@ -498,7 +519,7 @@ export async function runGrokReview(
         : {}),
       ok: text !== null,
       raw: text,
-      stderrTail,
+      stderrTail: `${preflightNote}${stderrTail}`,
       // The bounded NDJSON tail: a reclaimed seat leaves a record of what it was doing, not just
       // "it timed out". Cut on a line boundary — the trail persists it as .jsonl.
       ...(raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {}),

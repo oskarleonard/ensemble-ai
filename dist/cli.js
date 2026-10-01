@@ -1746,7 +1746,8 @@ import path7 from "path";
 var GROK_LOGIN_MARGIN_MS = 3e5;
 var GROK_LOGIN_REFRESH_TIMEOUT_MS = 6e4;
 var GROK_MODELS_STDERR_LIMIT = 500;
-var GROK_STATUS_LOGGED_IN = "You are logged in with grok.com.";
+var GROK_STATUS_LOGGED_IN_PREFIX = "You are logged in with ";
+var GROK_STATUS_AUTHENTICATED_VIA_PREFIX = "You are authenticated via ";
 var GROK_STATUS_API_KEY = "You are using XAI_API_KEY.";
 var GROK_STATUS_NOT_AUTHENTICATED = "You are not authenticated.";
 var GROK_LOGIN_EXPIRY_FAIL_PREFIX = "grok login expires before this review can finish";
@@ -1765,39 +1766,49 @@ async function runGrokModels(run) {
   if (error) throw error;
   return { exitCode: exitCode ?? null, stderrTail, stdout: raw, timedOut };
 }
+function grokLoginWarningLine(message) {
+  return `\u26A0 ensemble-ai grok pre-flight: ${message}
+`;
+}
 function warnToStderr(message) {
-  process.stderr.write(`\u26A0 ensemble-ai grok pre-flight: ${message}
-`);
+  process.stderr.write(grokLoginWarningLine(message));
 }
 function errorText(e) {
   return e instanceof Error ? e.message : String(e);
 }
-function statusOf(run) {
-  if ("failed" in run || run.timedOut) return void 0;
+function firstLine(run) {
   return run.stdout?.split("\n").find((line) => line.trim())?.trim();
+}
+function statusOf(run) {
+  if ("failed" in run || run.timedOut || run.exitCode !== 0) return void 0;
+  return firstLine(run);
 }
 function describeRun(run) {
   if ("failed" in run) return `failed (${run.failed}) \u2014 the run never started`;
-  const status = statusOf(run);
-  const what = run.timedOut ? `did not finish within ${GROK_LOGIN_REFRESH_TIMEOUT_MS / 1e3} s` : status ? `printed "${status.slice(0, 200)}"` : "printed no status line";
+  const line = firstLine(run);
+  const what = run.timedOut ? `did not finish within ${run.timeoutMs / 1e3} s` : line ? `printed "${line.slice(0, 200)}"` : "printed no status line";
   const stderr = run.stderrTail.slice(-GROK_MODELS_STDERR_LIMIT).replace(/\s+/g, " ").trim();
   return `${what} (exit code ${run.exitCode ?? "none"}; stderr ${stderr ? `"${stderr}"` : "empty"})`;
 }
-function isLoggedIn(status) {
-  return status === GROK_STATUS_LOGGED_IN || status === GROK_STATUS_API_KEY;
+function isAuthenticated(status) {
+  return status !== void 0 && (status === GROK_STATUS_API_KEY || status.startsWith(GROK_STATUS_LOGGED_IN_PREFIX) || status.startsWith(GROK_STATUS_AUTHENTICATED_VIA_PREFIX));
 }
 async function ensureGrokLogin(opts) {
   const warn = opts.warn ?? warnToStderr;
   const proceed = "the seat proceeds; its backstop owns a login that cannot last";
+  const warned = (message) => {
+    warn(message);
+    return [message];
+  };
   let cwd;
   try {
     cwd = fs9.mkdtempSync(path7.join(os6.tmpdir(), "grok-login-"));
   } catch (e) {
-    warn(`could not create a temp cwd for \`grok models\` (${errorText(e)}) \u2014 ${proceed}`);
-    return;
+    return warned(`could not create a temp cwd for \`grok models\` (${errorText(e)}) \u2014 ${proceed}`);
   }
   try {
-    await decide(opts, cwd, warn, proceed);
+    const warning = await decide(opts, cwd, proceed);
+    return warning ? warned(warning) : [];
   } finally {
     try {
       fs9.rmSync(cwd, { force: true, recursive: true });
@@ -1805,30 +1816,32 @@ async function ensureGrokLogin(opts) {
     }
   }
 }
-async function decide(opts, cwd, warn, proceed) {
+async function decide(opts, cwd, proceed) {
   const runModels = opts.runModels ?? runGrokModels;
+  const remainingMs = () => opts.deadlineAt - Date.now();
   const models = async (env) => {
+    const timeoutMs = Math.min(GROK_LOGIN_REFRESH_TIMEOUT_MS, remainingMs());
+    if (timeoutMs <= 0) return { failed: "the seat's time budget is spent" };
     try {
-      return await runModels({
+      const run = await runModels({
         args: ["--sandbox", "off", "models"],
         bin: opts.bin,
         cwd,
         env,
-        timeoutMs: GROK_LOGIN_REFRESH_TIMEOUT_MS
+        ...opts.onSpawn ? { onSpawn: opts.onSpawn } : {},
+        timeoutMs
       });
+      return { ...run, timeoutMs };
     } catch (e) {
       return { failed: errorText(e) };
     }
   };
-  const windowSecs = Math.ceil((opts.deadlineMs + (opts.marginMs ?? GROK_LOGIN_MARGIN_MS)) / 1e3);
+  const windowSecs = Math.ceil((remainingMs() + (opts.marginMs ?? GROK_LOGIN_MARGIN_MS)) / 1e3);
   const refresh = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: String(windowSecs), GROK_SANDBOX: void 0 });
   const status = statusOf(refresh);
-  if (isLoggedIn(status)) return;
-  if (status !== GROK_STATUS_NOT_AUTHENTICATED) {
-    warn(`\`grok models\` ${describeRun(refresh)} \u2014 ${proceed}`);
-    return;
-  }
-  const confirm = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: void 0, GROK_SANDBOX: void 0 });
+  if (isAuthenticated(status)) return void 0;
+  if (status !== GROK_STATUS_NOT_AUTHENTICATED) return `\`grok models\` ${describeRun(refresh)} \u2014 ${proceed}`;
+  const confirm = await models({ GROK_AUTH_EARLY_INVALIDATION_SECS: "0", GROK_SANDBOX: void 0 });
   const confirmed = statusOf(confirm);
   if (confirmed === GROK_STATUS_NOT_AUTHENTICATED) {
     throw new GrokLoginExpiryError(
@@ -1836,9 +1849,7 @@ async function decide(opts, cwd, warn, proceed) {
     );
   }
   const refreshed = `the refresh run (window ${windowSecs} s) ${describeRun(refresh)}`;
-  warn(
-    isLoggedIn(confirmed) ? `the widened login refresh failed \u2014 ${refreshed}, but grok's cached login is still valid; the confirm run ${describeRun(confirm)}. The seat proceeds; the login may expire during it.` : `${refreshed}; the confirm run ${describeRun(confirm)} \u2014 ${proceed}`
-  );
+  return isAuthenticated(confirmed) ? `the widened login refresh failed \u2014 ${refreshed}, but grok's cached login is still valid; the confirm run ${describeRun(confirm)}. The seat proceeds; the login may expire during it.` : `${refreshed}; the confirm run ${describeRun(confirm)} \u2014 ${proceed}`;
 }
 
 // src/reviewers/grok.ts
@@ -1846,6 +1857,7 @@ var GROK_PACKET_REVIEW_TIMEOUT_MS = 18e5;
 var GROK_WORKTREE_REVIEW_TIMEOUT_MS = 36e5;
 var GROK_INACTIVITY_TIMEOUT_MS = 9e5;
 var GROK_STREAM_TAIL_LIMIT = 1e5;
+var GROK_SEAT_STDERR_LIMIT = 2e3;
 var GROK_BIN_CANDIDATES = [path8.join(os7.homedir(), ".grok", "bin", "grok")];
 function resolveGrokBin() {
   return resolveBin("grok", {
@@ -1986,18 +1998,27 @@ async function runGrokReview(prompt, config, opts = {}) {
     };
   }
   const bin = resolveGrokBin();
+  const deadlineAt = Date.now() + timeoutMs;
+  let preflightNote;
   try {
-    await ensureGrokLogin({ bin, deadlineMs: timeoutMs });
+    const warnings = await ensureGrokLogin({ bin, deadlineAt, onSpawn: opts.onSpawn });
+    preflightNote = warnings.map(grokLoginWarningLine).join("");
   } catch (e) {
     if (!(e instanceof GrokLoginExpiryError)) throw e;
     return { failWhy: e.message, ok: false, raw: null, stderrTail: e.message, timedOut: false };
+  }
+  const seatStderrLimit = Math.max(1, GROK_SEAT_STDERR_LIMIT - preflightNote.length);
+  const seatTimeoutMs = deadlineAt - Date.now();
+  if (seatTimeoutMs <= 0) {
+    const failWhy = `the grok login pre-flight spent the seat's whole ${Math.round(timeoutMs / 1e3)} s budget \u2014 the seat never spawned`;
+    return { failWhy, ok: false, raw: null, stderrTail: `${preflightNote}${failWhy}`, timedOut: true, timedOutReason: "absolute" };
   }
   let proxy;
   if (worktreeCwd) {
     try {
       proxy = await startSeatEgressProxy("grok");
     } catch (e) {
-      return { ok: false, raw: null, stderrTail: egressStartFailure("grok", e), timedOut: false };
+      return { ok: false, raw: null, stderrTail: `${preflightNote}${egressStartFailure("grok", e)}`, timedOut: false };
     }
   }
   let cwd;
@@ -2014,8 +2035,8 @@ async function runGrokReview(prompt, config, opts = {}) {
       // seat in 15 min while `timeoutMs` above stands back as a pure runaway backstop.
       inactivityTimeoutMs: GROK_INACTIVITY_TIMEOUT_MS,
       onSpawn: opts.onSpawn,
-      stderrLimit: 2e3,
-      timeoutMs
+      stderrLimit: seatStderrLimit,
+      timeoutMs: seatTimeoutMs
     });
     const stream = raw ? parseGrokStream(raw) : null;
     const text = !raw || !stream ? null : stream.events === 0 && !/^\s*\{\s*"type"\s*:/.test(raw) ? extractGrokText(raw) : stream.text;
@@ -2032,7 +2053,7 @@ async function runGrokReview(prompt, config, opts = {}) {
       } : {},
       ok: text !== null,
       raw: text,
-      stderrTail,
+      stderrTail: `${preflightNote}${stderrTail}`,
       // The bounded NDJSON tail: a reclaimed seat leaves a record of what it was doing, not just
       // "it timed out". Cut on a line boundary — the trail persists it as .jsonl.
       ...raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
@@ -3701,7 +3722,7 @@ function renderLogLines(text) {
     return `${sha}  ${isoFromEpoch(epoch)}  ${author}  ${subject.join(FIELD_SEP)}`;
   });
 }
-function firstLine(s) {
+function firstLine2(s) {
   return s.trim().split("\n")[0] ?? "";
 }
 function short(sha) {
@@ -3851,7 +3872,7 @@ function isShallow(git2, cwd, notes) {
   const r = git2(["rev-parse", "--is-shallow-repository"], { cwd });
   if (!r.ok) {
     notes.push(
-      `NOTE: ensemble-ai could not determine whether this checkout is shallow (${firstLine(r.error)}) \u2014 the history below was generated anyway, and may be a fragment.`
+      `NOTE: ensemble-ai could not determine whether this checkout is shallow (${firstLine2(r.error)}) \u2014 the history below was generated anyway, and may be a fragment.`
     );
     return false;
   }
@@ -3899,7 +3920,7 @@ function buildHistoryPacket(args) {
         units: lines
       });
     } else {
-      notes.push(`NOTE: no log/${p}.log \u2014 \`git log\` failed (${firstLine(log.error)}).`);
+      notes.push(`NOTE: no log/${p}.log \u2014 \`git log\` failed (${firstLine2(log.error)}).`);
     }
     const ranges = changedLineRanges(hunks.get(p) ?? []);
     if (ranges.length === 0) {
@@ -3929,7 +3950,7 @@ function buildHistoryPacket(args) {
         units: lines
       });
     } else {
-      notes.push(`NOTE: no blame/${p}.blame \u2014 \`git blame\` failed (${firstLine(blame.error)}).`);
+      notes.push(`NOTE: no blame/${p}.blame \u2014 \`git blame\` failed (${firstLine2(blame.error)}).`);
     }
   }
   if (args.baseSha) {
@@ -3947,7 +3968,7 @@ function buildHistoryPacket(args) {
       });
     } else {
       notes.push(
-        `NOTE: no pr-commits.log \u2014 \`git log ${short(args.baseSha)}..${short(args.headSha)}\` failed (${firstLine(prLog.error)}); the base commit is not in this checkout, only the PR head was fetched.`
+        `NOTE: no pr-commits.log \u2014 \`git log ${short(args.baseSha)}..${short(args.headSha)}\` failed (${firstLine2(prLog.error)}); the base commit is not in this checkout, only the PR head was fetched.`
       );
     }
   } else {
@@ -9286,7 +9307,7 @@ function checkPinDrift(opts) {
     } else {
       const f = git2(["fetch", remote.remote, remote.branch], { cwd: repoDir });
       if (f.ok) fetched = true;
-      else note = `fetch failed (${firstLine2(f.error)}); compared against the last-known local ${mainRef}`;
+      else note = `fetch failed (${firstLine3(f.error)}); compared against the last-known local ${mainRef}`;
     }
   }
   const main2 = revParse(git2, repoDir, mainRef);
@@ -9306,7 +9327,7 @@ function checkPinDrift(opts) {
 function short2(sha) {
   return sha.slice(0, 7);
 }
-function firstLine2(s) {
+function firstLine3(s) {
   return s.split("\n")[0].trim();
 }
 function plural(n) {
