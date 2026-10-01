@@ -235,3 +235,11 @@ describe('runHolisticLens — the seat run', () => {
     expect(review.findings).toEqual([]);
   });
 });
+
+describe('resolveHolisticSeat — the lens seat\'s own advisor', () => {
+  it('reads `holistic.advisor` only (no inheritance from the claude entry); invalid throws naming the seat', () => {
+    expect(resolveHolisticSeat({ holistic: { advisor: 'off' } }).advisor).toBe('off');
+    expect(resolveHolisticSeat({ claude: { advisor: 'off' }, holistic: { model: 'opus' } })).not.toHaveProperty('advisor');
+    expect(() => resolveHolisticSeat({ holistic: { advisor: 'opus 5' } })).toThrow(/voices\.json holistic seat: `advisor`/);
+  });
+});

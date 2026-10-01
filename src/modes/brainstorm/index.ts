@@ -15,7 +15,7 @@ import {
   VOICE_IDS,
   type VoiceId,
 } from './types';
-import { loadVoices, VOICE_ADAPTERS, type VoiceRunResult } from './voices';
+import { assertRosterAdvisors, loadVoices, VOICE_ADAPTERS, type VoiceRunResult } from './voices';
 
 // Default per-voice timeout for a brainstorm round (ideation is lighter than an
 // xhigh code audit; the CLI can override). The shared spawn watchdog enforces it.
@@ -234,6 +234,9 @@ export async function runBrainstormMode(
     opts.voices && opts.voices.length > 0 ? opts.voices : [...VOICE_IDS];
   const adapters = opts.adapters ?? VOICE_ADAPTERS;
   const configs = opts.voiceConfigs ?? loadVoices(opts.voicesFile);
+  // The roster's advisors, checked before Round 1 spawns anything: an invalid one on a voice this
+  // run uses refuses the whole run; a voice outside the roster is never read.
+  assertRosterAdvisors(roster, configs, opts.voiceConfigs ? undefined : 'voices.json');
   const timeoutMs = opts.timeoutMs ?? DEFAULT_VOICE_TIMEOUT_MS;
 
   // Round 1 — independent generation (parallel; one voice's failure is isolated).

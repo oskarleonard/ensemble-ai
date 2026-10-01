@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 
 import { persistReview, reviewDir } from '../../core/artifacts';
 import type { ReviewerConfig, ReviewPacket } from '../../core/types';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig, VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { persistGatePacket } from './gate-hunks';
@@ -17,8 +17,8 @@ import { runClaudeReviewLayer } from './self-contained';
 // reconcile. The seat is stubbed (no live model); the worktree is a real directory on disk, so the
 // host's two-site verification runs against real bytes.
 
-const CFG: VoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
-const HOLISTIC_CFG: VoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
+const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
+const HOLISTIC_CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
 const HEAD = 'HEADSHA1';
 const BASE = 'BASESHA1';
 const okRun = (raw: string): VoiceRunResult => ({ ok: true, raw, stderrTail: '', timedOut: false });
@@ -311,6 +311,26 @@ describe('the lens REFUSES packet evidence', () => {
 });
 
 describe('the lens ON — seat, gate, and the host-verified guardrails end to end', () => {
+  it('review.holistic.json records the lens\'s stated advisor beside its review; absent stays absent', async () => {
+    const readLens = (baseDir: string, runId: string) =>
+      JSON.parse(fs.readFileSync(path.join(reviewDir(baseDir, runId), `review.${HOLISTIC_SEAT_ID}.json`), 'utf8'));
+    for (const advisor of ['claude-fable-5-1', undefined]) {
+      const { baseDir, runId } = seed();
+      const wt = seedWorktree();
+      const { run } = makeRunner(true);
+      await runClaudeReviewLayer({
+        ...layerArgs(baseDir, runId, run),
+        holistic: { baseSha: BASE, config: advisor === undefined ? HOLISTIC_CFG : { ...HOLISTIC_CFG, advisor } },
+        worktree: wt,
+      });
+      const lens = readLens(baseDir, runId);
+      if (advisor === undefined) expect(lens).not.toHaveProperty('advisor');
+      else expect(lens.advisor).toBe(advisor);
+      fs.rmSync(baseDir, { force: true, recursive: true });
+      fs.rmSync(wt, { force: true, recursive: true });
+    }
+  });
+
   it('spawns in the worktree, feeds the gate, and posts only what the host verified', async () => {
     const { baseDir, runId } = seed();
     const wt = seedWorktree();

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { isReviewerId, parseReviewerIds, parseSeatWindow, titleCase } from './types';
+import { isReviewerId, parseReviewerIds, parseSeatAdvisor, parseSeatWindow, titleCase } from './types';
 
 describe('isReviewerId', () => {
   it('accepts a known id and rejects everything else', () => {
@@ -87,5 +87,25 @@ describe('parseSeatWindow — the one parse of a disabledUntil window', () => {
     expect(parseSeatWindow(null)).toBeUndefined();
     expect(parseSeatWindow(1790000000000)).toBeUndefined();
     expect(parseSeatWindow('')).toBeUndefined();
+  });
+});
+
+describe('parseSeatAdvisor — a Claude seat\'s advisor: a model id, "off", or absent', () => {
+  it('absent (undefined) is the inherit state — no value', () => {
+    expect(parseSeatAdvisor(undefined, 'voices.json claude')).toBeUndefined();
+  });
+
+  it('accepts "off" and model ids (full ids and the CLI aliases alike)', () => {
+    expect(parseSeatAdvisor('off', 's')).toBe('off');
+    expect(parseSeatAdvisor('claude-fable-5-1', 's')).toBe('claude-fable-5-1');
+    expect(parseSeatAdvisor('claude-opus-5-5', 's')).toBe('claude-opus-5-5');
+    expect(parseSeatAdvisor('fable', 's')).toBe('fable');
+    expect(parseSeatAdvisor('opus-4.8', 's')).toBe('opus-4.8');
+  });
+
+  it('rejects everything else with an error NAMING THE SEAT — null included (null would inherit)', () => {
+    for (const bad of [null, '', ' off', 'OFF', 'Claude-Opus', 'claude opus', '-opus', '.opus', 'opus"}', 'a/b', 42, true, {}, []]) {
+      expect(() => parseSeatAdvisor(bad, 'voices.json gate')).toThrow(/voices\.json gate seat: `advisor` must be "off" or a model id/);
+    }
   });
 });

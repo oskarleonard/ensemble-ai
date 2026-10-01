@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 
 import { reviewDir } from '../../core/artifacts';
 import type { ReviewFinding } from '../../core/types';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import {
@@ -31,7 +31,7 @@ import {
 import { parsePacketHunks, persistGatePacket } from './gate-hunks';
 import type { VoiceReview } from './synthesis';
 
-const CFG: VoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
+const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
 const HEAD = 'HEADSHA';
 const okRun = (raw: string): VoiceRunResult => ({ ok: true, raw, stderrTail: '', timedOut: false });
 const scrub = (s: string): string => s;
@@ -856,7 +856,7 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
 
   // ── The SHADOW gate (audit-only, champion/challenger) ──────────────────────────────
   describe('shadow gate', () => {
-    const SHADOW_CFG: VoiceConfig = { cmd: 'codex', effort: 'xhigh', id: 'codex', model: 'gpt-5.6-sol', vendor: 'openai' };
+    const SHADOW_CFG: ResolvedVoiceConfig = { cmd: 'codex', effort: 'xhigh', id: 'codex', model: 'gpt-5.6-sol', vendor: 'openai' };
     const shadowArtifact = (base: string, runId: string) =>
       JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'shadow-gate-codex-verdicts.json'), 'utf8'));
 
@@ -884,6 +884,34 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
       // identical envelope through the identical reconcile ⇒ full agreement
       expect(art.comparison).toEqual({ compared: 4, disagreements: [], matched: 4 });
       expect(art.verdicts).toHaveLength(4);
+    });
+
+    it('seatMeta records the shadow seat\'s stated advisor — on the judged AND the stub path; absent = inherit', async () => {
+      const CHAMPION: ResolvedVoiceConfig = { ...CFG, advisor: 'off', effort: 'max', model: 'opus' };
+      const judged = seed();
+      await runGate({
+        baseDir: judged.base, config: CFG, expectedHeadSha: HEAD, reviews,
+        run: async () => okRun(goodEnvelope), runId: judged.runId,
+        shadow: { config: CHAMPION, run: async () => okRun(goodEnvelope) },
+      });
+      const read = (base: string, runId: string) =>
+        JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'shadow-gate-claude-verdicts.json'), 'utf8'));
+      expect(read(judged.base, judged.runId).seat).toEqual({ advisor: 'off', effort: 'max', id: 'claude', model: 'opus' });
+      const stubbed = seed();
+      await runGate({
+        baseDir: stubbed.base, config: CFG, expectedHeadSha: HEAD, reviews,
+        run: async () => okRun(goodEnvelope), runId: stubbed.runId,
+        shadow: { config: CHAMPION, run: async () => { throw new Error('spawn died'); } },
+      });
+      expect(read(stubbed.base, stubbed.runId)).toMatchObject({ ok: false, seat: { advisor: 'off' } });
+      // The codex challenger (no advisor) records none — "inherit" is the absent key.
+      const codex = seed();
+      await runGate({
+        baseDir: codex.base, config: CFG, expectedHeadSha: HEAD, reviews,
+        run: async () => okRun(goodEnvelope), runId: codex.runId,
+        shadow: { config: SHADOW_CFG, run: async () => okRun(goodEnvelope) },
+      });
+      expect(shadowArtifact(codex.base, codex.runId).seat).not.toHaveProperty('advisor');
     });
 
     it('records a per-finding disagreement when the judges differ', async () => {

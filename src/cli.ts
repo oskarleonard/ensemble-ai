@@ -45,6 +45,7 @@ import {
   isVoiceId,
   parseVoiceIds,
   VOICE_IDS,
+  type ResolvedVoiceConfig,
   type VoiceId,
 } from './modes/brainstorm/types';
 import { runConsultMode } from './modes/consult';
@@ -76,7 +77,7 @@ import { runClaudeReviewVoice } from './modes/review/claude';
 import { runCodexReview } from './reviewers/codex';
 import { REVIEW_ADAPTERS } from './reviewers/registry';
 import { readGatePacketHeadSha } from './modes/review/gate-hunks';
-import { type GateSeat, loadClaudeReviewerSeat, loadGateSeat } from './modes/review/gate-seat';
+import { type GateSeat, loadClaudeReviewerSeat, loadGateSeat, shadowChampionConfig } from './modes/review/gate-seat';
 import { readConventionPathsFromTrail, runRegate } from './modes/review/regate';
 import { checkReseat, ReseatLockedError, reseatRefusal, runReseat } from './modes/review/reseat';
 import { loadHolisticSeat } from './modes/review/holistic';
@@ -1062,14 +1063,21 @@ function resolveStageTarget(target: PostTarget, gh: GhRunner): StageTarget | nul
 }
 
 // GateSeat → the footer's resolved seat: model/effort with the 'default' sentinel spelled out
-// (a resolved-but-'default' model is the built-in Opus), plus the per-field source for provenance.
-function toCommentGateSeat(seat: GateSeat): CommentGateSeat {
+// (a resolved-but-'default' model is the built-in Opus), the stated advisor (absent = inherited),
+// plus the per-field source for provenance.
+export function toCommentGateSeat(seat: GateSeat): CommentGateSeat {
   // Reuse the reviewer layer's model-label rule (resolve to the configured model, else the
   // built-in `opus`) so the footer's seat model can't drift from the reviewer's own label.
   const model = claudeModelLabel(seat.config);
   const effort =
     seat.config.effort && seat.config.effort !== 'default' ? seat.config.effort : 'default';
-  return { effort, effortSource: seat.effortSource, model, modelSource: seat.modelSource };
+  return {
+    ...(seat.config.advisor === undefined ? {} : { advisor: seat.config.advisor }),
+    effort,
+    effortSource: seat.effortSource,
+    model,
+    modelSource: seat.modelSource,
+  };
 }
 
 // The review's earned exit code, factored out of reviewCommand so `--post-comment` can be GATED
@@ -1490,6 +1498,65 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // reads evidence the engine had already decided not to trust.
   const ciText = ciEvidenceUnavailable ? undefined : ciEvidence;
 
+  // The Anthropic seats (the claude REVIEWER, the GATE, the holistic LENS) resolve from voices.json
+  // HERE, before the paid core fan-out. An invalid `advisor` throws naming the seat (core/types
+  // parseSeatAdvisor), and that must fail the run up front — exit 3, nothing billed — not after
+  // codex/grok have reviewed, nor inside the layer's crash backstop, where a lens typo would take
+  // the claude reviewer and the gate down with it. A seat the run will not spawn is not resolved:
+  // `--no-claude` runs none of them, so reads none, and the lens resolves only with worktree evidence.
+  //
+  // The claude REVIEWER seat resolves like the gate: `--claude-model`/`--claude-effort` → the
+  // voices.json `claude` entry → the built-in opus @ max. gate-seat.ts owns the chain and the WHY:
+  // a headless seat must never inherit the interactive CLI's saved default (the 2026-07-23 fire
+  // inherited a fresh `/model` switch to Fable 5 and the leg died on its cap).
+  //
+  // The GATE (synthesis) seat resolves INDEPENDENTLY of the `claude` reviewer voice: the
+  // voices.json `gate` entry → the `claude` entry (model/effort only) → the built-in Opus default,
+  // with `--gate-model`/`--gate-effort` overriding the file. A `cmd` on the gate seat is ignored
+  // (the gate is always a read-only `claude -p` spawn); a junk entry warns + falls back. Warnings
+  // surface on stderr so a mis-config is loud, never silent.
+  //
+  // The HOLISTIC lens: same chain — flag → voices.json `holistic` entry → the built-in default
+  // (opus @ high). Resolved only when `--holistic` asks for the lens AND the run has a worktree: the
+  // lens never spawns without one (resolveHolisticPlan), so `--holistic` without `--repo` reads no
+  // `holistic` entry and still gets its loud skip from the layer.
+  let anthropicSeats: { claude: GateSeat; gate: GateSeat; holistic?: ResolvedVoiceConfig } | null = null;
+  if (roster.claude) {
+    const warn = (m: string) => console.error(`· ${m}`);
+    anthropicSeats = loadSeatsOrRefuse(() => ({
+      claude: loadClaudeReviewerSeat(
+        VOICES_FILE,
+        {
+          effort: typeof values['claude-effort'] === 'string' ? values['claude-effort'] : undefined,
+          model: typeof values['claude-model'] === 'string' ? values['claude-model'] : undefined,
+        },
+        warn
+      ),
+      gate: loadGateSeat(
+        VOICES_FILE,
+        {
+          effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+          model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+          vendor: typeof values['gate-vendor'] === 'string' ? values['gate-vendor'] : undefined,
+        },
+        warn
+      ),
+      ...(values.holistic && worktree
+        ? {
+            holistic: loadHolisticSeat(
+              VOICES_FILE,
+              {
+                effort: typeof values['holistic-effort'] === 'string' ? values['holistic-effort'] : undefined,
+                model: typeof values['holistic-model'] === 'string' ? values['holistic-model'] : undefined,
+              },
+              warn
+            ),
+          }
+        : {}),
+    }));
+    if (!anthropicSeats) return 3;
+  }
+
   let result: ReviewModeResult;
   try {
     result = await runReviewMode({
@@ -1574,33 +1641,10 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       '· shadow gate: requested, but the gate itself will not run on this invocation (--no-claude / blocked diff / no packet) — nothing to shadow'
     );
   }
-  if (claudeLayerExpected && result.prompt) {
-    // The claude REVIEWER seat resolves like the gate below: `--claude-model`/`--claude-effort`
-    // → the voices.json `claude` entry → the built-in opus @ max. gate-seat.ts owns the chain
-    // and the WHY: a headless seat must never inherit the interactive CLI's saved default (the
-    // 2026-07-23 fire inherited a fresh `/model` switch to Fable 5 and the leg died on its cap).
-    const claudeSeat = loadClaudeReviewerSeat(
-      VOICES_FILE,
-      {
-        effort: typeof values['claude-effort'] === 'string' ? values['claude-effort'] : undefined,
-        model: typeof values['claude-model'] === 'string' ? values['claude-model'] : undefined,
-      },
-      (m) => console.error(`· ${m}`)
-    );
-    // The GATE (synthesis) seat resolves INDEPENDENTLY of the `claude` reviewer voice: the
-    // voices.json `gate` entry → the `claude` entry (model/effort only) → the built-in Opus
-    // default, with `--gate-model`/`--gate-effort` overriding the file. A `cmd` on the gate seat
-    // is ignored (the gate is always a read-only `claude -p` spawn); a junk entry warns + falls
-    // back. Warnings surface on stderr so a mis-config is loud, never silent.
-    gateSeat = loadGateSeat(
-      VOICES_FILE,
-      {
-        effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
-        model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
-        vendor: typeof values['gate-vendor'] === 'string' ? values['gate-vendor'] : undefined,
-      },
-      (m) => console.error(`· ${m}`)
-    );
+  if (claudeLayerExpected && result.prompt && anthropicSeats) {
+    // Resolved above, before the core fan-out (an invalid `advisor` fails the run there).
+    const claudeSeat = anthropicSeats.claude;
+    gateSeat = anthropicSeats.gate;
     if (gateSeat.vendor === 'codex')
       console.error(
         `· gate seat: CODEX (${gateSeat.config.model} @ ${gateSeat.config.effort}) — the fenced codex runner judges; the anthropic gate is off this run${values['shadow-gate'] ? ' (shadowing as the audit-only champion)' : ''}`
@@ -1670,21 +1714,13 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         ...(historyPacket ? { historyPacket } : {}),
         // The HOLISTIC lens (spec §4) — off unless asked for, and it runs ONLY with worktree
         // evidence: `--holistic` without `--repo` is a LOUD skip, never a packet-evidence
-        // architecture claim (resolveHolisticPlan owns that ruling).
+        // architecture claim (resolveHolisticPlan owns that ruling). The request goes in either
+        // way; the seat config only when it resolved, which is exactly when this run has a worktree.
         ...(values.holistic
           ? {
               holistic: {
                 baseSha: layerBaseSha,
-                // Same resolution chain as the reviewer/gate seats: flag → voices.json
-                // `holistic` entry → the built-in default (opus @ high).
-                config: loadHolisticSeat(
-                  VOICES_FILE,
-                  {
-                    effort: typeof values['holistic-effort'] === 'string' ? values['holistic-effort'] : undefined,
-                    model: typeof values['holistic-model'] === 'string' ? values['holistic-model'] : undefined,
-                  },
-                  (m) => console.error(`· ${m}`)
-                ),
+                ...(anthropicSeats.holistic ? { config: anthropicSeats.holistic } : {}),
               },
             }
           : {}),
@@ -1695,23 +1731,19 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         // The SHADOW gate (audit-only): always the OTHER vendor's judge, so the comparison stays
         // champion-vs-challenger whichever seat holds the gate. anthropic primary ⇒ the codex
         // challenger shadows (reviewer-configured model @ xhigh — the seat we would adopt);
-        // codex primary ⇒ the anthropic CHAMPION shadows (resolved through the claude chain, NOT
-        // the gate entry — that entry now describes the codex seat). Each runner binds its own
+        // codex primary ⇒ the anthropic CHAMPION shadows (the claude reviewer seat resolved up front,
+        // NOT the gate entry — that entry now describes the codex seat — and never a mid-run re-read
+        // of voices.json; shadowChampionConfig applies only the shadow effort). Each runner binds its own
         // sandbox + egress fence; gate.ts owns fail-soft and never-authoritative.
         ...(values['shadow-gate']
           ? {
               shadowGate: (gateSeat.vendor === 'codex'
                 ? {
-                    config: loadClaudeReviewerSeat(
-                      VOICES_FILE,
-                      {
-                        effort:
-                          typeof values['shadow-gate-effort'] === 'string' && values['shadow-gate-effort'].trim()
-                            ? values['shadow-gate-effort'].trim()
-                            : undefined,
-                      },
+                    config: shadowChampionConfig(
+                      claudeSeat,
+                      typeof values['shadow-gate-effort'] === 'string' ? values['shadow-gate-effort'] : undefined,
                       (m) => console.error(`· ${m}`)
-                    ).config,
+                    ),
                     run: (p, c, o) => runClaudeReviewVoice(p, c, o),
                   }
                 : {
@@ -2881,8 +2913,8 @@ Usage:
   ensemble-ai config    [options]      (alias)
 
 Prints the review/security reviewers (from reviewers.json) and the brainstorm/
-consult voices (from voices.json) — id · vendor · model · effort · sandbox — plus
-which config file each came from (or "baked defaults"). No mutation.
+consult voices (from voices.json) — id · vendor · model · effort · advisor · sandbox —
+plus which config file each came from (or "baked defaults"). No mutation.
 
 Options:
   --reviewers-file <path>   reviewers config (default ~/.ensemble-ai/reviewers.json)
@@ -2920,9 +2952,22 @@ async function reviewersCommand(args: string[]): Promise<number> {
     typeof values['voices-file'] === 'string'
       ? path.resolve(values['voices-file'])
       : VOICES_FILE;
-  // The gate seat resolves from the SAME voices.json (no run flags here — `config` is a read-only
-  // view, so source ∈ {file, default}); a junk/`cmd`-bearing entry warns loudly on stderr.
-  const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`· ${m}`));
+  // The gate and holistic seats resolve from the SAME voices.json (no run flags here — `config` is a
+  // read-only view, so source ∈ {file, default}); a junk/`cmd`-bearing entry warns loudly on stderr.
+  // Each seat's one throw — an invalid advisor, which every command that spawns the seat refuses —
+  // is replaced by a parse that keeps the value as written: `config` is the diagnosis, so the row
+  // shows the seat's resolved fields and marks only the advisor, as the claude voice row does.
+  const warn = (m: string) => console.error(`· ${m}`);
+  let gateAdvisor: unknown;
+  const gateSeat = loadGateSeat(voicesFile, {}, warn, (v) => {
+    gateAdvisor = v;
+    return undefined;
+  });
+  let holisticAdvisor: unknown;
+  const holisticSeat = loadHolisticSeat(voicesFile, {}, warn, (v) => {
+    holisticAdvisor = v;
+    return undefined;
+  });
   // ONE parse of reviewers.json feeds the roster, the enabled set and the off list, so the
   // three cannot disagree about a `disabledUntil` boundary crossing between two reads.
   const reviewersConfig = loadReviewers(reviewersFile);
@@ -2930,12 +2975,18 @@ async function reviewersCommand(args: string[]): Promise<number> {
   const view: RegistryView = {
     enabledReviewerIds: enabledIds,
     gate: {
+      ...(gateAdvisor === undefined ? {} : { advisor: gateAdvisor }),
       effort: gateSeat.config.effort,
       effortSource: gateSeat.effortSource,
       model: gateSeat.config.model,
       modelSource: gateSeat.modelSource,
       vendor: gateSeat.vendor,
       vendorSource: gateSeat.vendorSource,
+    },
+    holistic: {
+      ...(holisticAdvisor === undefined ? {} : { advisor: holisticAdvisor }),
+      effort: holisticSeat.effort,
+      model: holisticSeat.model,
     },
     offSeats: offSeatsOf(reviewersConfig, enabledIds),
     reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
@@ -3327,6 +3378,21 @@ Exit: 0 = gate completed (verdicts updated) · 1 = gate failed again (still fail
 3 = usage / missing trail.
 `;
 
+// The Anthropic seat resolvers (gate-seat · holistic) THROW on an invalid `advisor` (core/types
+// parseSeatAdvisor) — and a command calls them only for the seats it will spawn, before any spawn,
+// so that throw is a config refusal: the seat-named message and exit 3 (nothing billed) — never the
+// stack trace and exit 1 the top-level handler would make of it. Null = refused; the caller returns
+// 3. The message is printed as thrown: it already carries the `ensemble-ai:` prefix and names the
+// seat. (The whole-file parsers never throw: an unused seat's typo breaks nothing.)
+function loadSeatsOrRefuse<T>(load: () => T): T | null {
+  try {
+    return load();
+  } catch (e) {
+    console.error((e as Error).message);
+    return null;
+  }
+}
+
 // regate: heal a run whose gate died without re-running any reviewer. The trail is the
 // contract (the gate reads reviews + packet from disk by design), so this command is a
 // thin wrapper: resolve the seat, optionally re-materialize the head, call runRegate.
@@ -3372,18 +3438,21 @@ async function regateCommand(args: string[]): Promise<number> {
     return 3;
   }
 
-  const gateSeat = loadGateSeat(
-    VOICES_FILE,
-    {
-      effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
-      model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
-      // This path binds the claude runner only — pin the chain to anthropic so a voices.json
-      // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
-      // death). The codex gate is a `review` feature; wiring it here is a separate change.
-      vendor: 'anthropic',
-    },
-    (m) => console.error(`· ${m}`)
+  const gateSeat = loadSeatsOrRefuse(() =>
+    loadGateSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+        model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+        // This path binds the claude runner only — pin the chain to anthropic so a voices.json
+        // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
+        // death). The codex gate is a `review` feature; wiring it here is a separate change.
+        vendor: 'anthropic',
+      },
+      (m) => console.error(`· ${m}`)
+    )
   );
+  if (!gateSeat) return 3;
 
   // Worktree evidence is opt-in and best-effort: a refused/failed materialization
   // degrades LOUDLY to packet grounding — a regate is never lost to a worktree problem.
@@ -3554,18 +3623,21 @@ async function reseatCommand(args: string[]): Promise<number> {
   const reviewersFile = typeof values['reviewers-file'] === 'string' ? values['reviewers-file'] : REVIEWERS_FILE;
   const sandbox = typeof values.sandbox === 'string' ? values.sandbox : undefined;
   const reviewer: ReviewerConfig = { ...loadReviewers(reviewersFile)[seat], ...(sandbox ? { sandbox } : {}) };
-  const gateSeat = loadGateSeat(
-    VOICES_FILE,
-    {
-      effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
-      model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
-      // This path binds the claude runner only — pin the chain to anthropic so a voices.json
-      // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
-      // death). The codex gate is a `review` feature; wiring it here is a separate change.
-      vendor: 'anthropic',
-    },
-    (m) => console.error(`· ${m}`)
+  const gateSeat = loadSeatsOrRefuse(() =>
+    loadGateSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+        model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+        // This path binds the claude runner only — pin the chain to anthropic so a voices.json
+        // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
+        // death). The codex gate is a `review` feature; wiring it here is a separate change.
+        vendor: 'anthropic',
+      },
+      (m) => console.error(`· ${m}`)
+    )
   );
+  if (!gateSeat) return 3;
 
   // Worktree evidence is opt-in and best-effort, exactly like regate.
   let session: WorktreeSession | null = null;
@@ -3794,30 +3866,36 @@ async function probeCommand(rest: string[]): Promise<number> {
 
   // The prober seat resolves exactly like the review producer: flags → voices.json `claude`
   // entry → the built-in opus @ max (gate-seat.ts owns the chain and the why).
-  const seat = loadClaudeReviewerSeat(
-    VOICES_FILE,
-    {
-      effort: typeof values['claude-effort'] === 'string' ? values['claude-effort'] : undefined,
-      model: typeof values['claude-model'] === 'string' ? values['claude-model'] : undefined,
-    },
-    (m) => console.error(`· ${m}`)
+  const seat = loadSeatsOrRefuse(() =>
+    loadClaudeReviewerSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values['claude-effort'] === 'string' ? values['claude-effort'] : undefined,
+        model: typeof values['claude-model'] === 'string' ? values['claude-model'] : undefined,
+      },
+      (m) => console.error(`· ${m}`)
+    )
   );
+  if (!seat) return 3;
   // The GATE seat resolves INDEPENDENTLY of the prober (same chain as the review pipeline's gate):
   // `--gate-model`/`--gate-effort` → the voices.json `gate` entry → the built-in default. Independent
   // selection is the whole point — the gate that refutes a defect should be able to be a DIFFERENT
   // model than the one that found it, for real cross-model adjudication.
-  const gateSeat = loadGateSeat(
-    VOICES_FILE,
-    {
-      effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
-      model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
-      // This path binds the claude runner only — pin the chain to anthropic so a voices.json
-      // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
-      // death). The codex gate is a `review` feature; wiring it here is a separate change.
-      vendor: 'anthropic',
-    },
-    (m) => console.error(`· ${m}`)
+  const gateSeat = loadSeatsOrRefuse(() =>
+    loadGateSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+        model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+        // This path binds the claude runner only — pin the chain to anthropic so a voices.json
+        // `gate.vendor: codex` can't resolve a codex seat into a claude spawn (unknown-model
+        // death). The codex gate is a `review` feature; wiring it here is a separate change.
+        vendor: 'anthropic',
+      },
+      (m) => console.error(`· ${m}`)
+    )
   );
+  if (!gateSeat) return 3;
 
   console.error(`· materializing the PR head as a disposable worktree of ${repoFlag}…`);
   const opened = openWorktree({

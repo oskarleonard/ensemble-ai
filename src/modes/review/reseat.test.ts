@@ -8,7 +8,7 @@ import { persistReview, reviewDir } from '../../core/artifacts';
 import type { EgressDenial } from '../../core/egress-proxy';
 import { renderReviewPrompt } from '../../core/prompt';
 import type { ReviewerConfig, ReviewPacket } from '../../core/types';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { persistGatePacket } from './gate-hunks';
@@ -246,7 +246,7 @@ describe('the trailing-newline lock the split classifies on', () => {
   });
 });
 
-const GATE_CFG: VoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
+const GATE_CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
 const RUN_HEAD = 'd'.repeat(40);
 const PACKET: ReviewPacket = { complete: true, objective: 'o', pr: 0, repo: 'acme/webapp', sections: [] };
 const GROK: ReviewerConfig = { cmd: 'grok', effort: 'xhigh', id: 'grok', model: 'grok-x', sandbox: 'ensemble-review', vendor: 'xai' };

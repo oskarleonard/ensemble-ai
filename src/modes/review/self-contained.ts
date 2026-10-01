@@ -23,7 +23,7 @@ import {
   type ReviewerId,
 } from '../../core/types';
 import type { RunReviewOpts } from '../../reviewers/codex';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig, VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { resolveCiEvidence } from './ci-evidence';
@@ -140,6 +140,13 @@ export function persistSeatReview(
   writeTrailFile(baseDir, runId, `findings.${seatId}.json`, JSON.stringify(review.findings, null, 2));
   if (raw !== null) writeTrailFile(baseDir, runId, `${seatId}-review.raw.md`, raw);
   writeTrailFile(baseDir, runId, `review.${seatId}.json`, JSON.stringify(review, null, 2));
+}
+
+// An Anthropic seat's review with the advisor its RESOLVED config stated — attached before the
+// persist so the in-memory review and review.<seat>.json are one shape. Absent stays absent (the
+// seat inherited the operator's settings), so the trail tells "off" from inherit.
+function withSeatAdvisor(review: VoiceReview, config: ResolvedVoiceConfig): VoiceReview {
+  return config.advisor === undefined ? review : { ...review, advisor: config.advisor };
 }
 
 // Load every reviewer's review BACK from the trail files (codex/grok via readReviewsForRun,
@@ -268,19 +275,21 @@ export interface ClaudeLayerOptions {
   // The reason a fetch was ATTEMPTED and FAILED, for the same producer: silence would read to it
   // as a PR with no checks, so the failure is rendered as its own loud note instead.
   ciEvidenceUnavailable?: string;
-  claudeConfig: VoiceConfig;
+  claudeConfig: ResolvedVoiceConfig;
   // The run's gathered conventions files (repo-relative). The ONLY docs a holistic finding may
   // cite to lift its MED severity cap — and the gate re-reads the citation out of the tree anyway.
   conventionPaths?: readonly string[];
   // THE HOLISTIC LENS (spec §4) — DEFAULT OFF. Omit it and nothing changes: no seat is spawned, no
   // finding enters the gate, no clause enters the gate prompt, the records are the same objects.
   // Its PRESENCE is the request; present without `worktree` is a LOUD skip (holisticSkipped),
-  // never a packet-evidence run.
-  holistic?: { baseSha: string | null; config: VoiceConfig };
+  // never a packet-evidence run. `config` is the resolved lens seat, owed whenever `worktree` is
+  // passed too: a caller resolves the seat only for a run that can spawn it, so a typo in an
+  // unspawnable lens's advisor never refuses the run.
+  holistic?: { baseSha: string | null; config?: ResolvedVoiceConfig };
   // The GATE (synthesis) seat — its own model/effort, independent of the `claude` REVIEWER above
   // ("reviewer = Opus @ high, gate = Fable @ max"). Always a `claude -p` spawn (only model/effort
   // differ). Omitted ⇒ inherits `claudeConfig` (the pre-Phase-3 behavior — one seat for both).
-  gateConfig?: VoiceConfig;
+  gateConfig?: ResolvedVoiceConfig;
   // The opt-in PREMISE PASS (spec 2026-09-09-review-premise-pass §4, --premise) — DEFAULT OFF. When
   // on AND the gate's findings cluster on one region, the gate's synthesis gains ONE advisory
   // `simplify` line (rendered by renderClaudeLayer). Off ⇒ the gate prompt + synthesis output are
@@ -464,7 +473,7 @@ export async function runClaudeReviewLayer(
       opts.historyPacket
     );
     claudeSpawned = spawned;
-    claudeReview = review;
+    claudeReview = withSeatAdvisor(review, opts.claudeConfig);
     // The trail persist must SUCCEED for the claude voice to count as a complete reviewer:
     // if it fails, the review never reaches the trail (so the disk-read synthesis below
     // silently drops it) and its findings are unverifiable after the run. A completed-but-
@@ -472,12 +481,12 @@ export async function runClaudeReviewLayer(
     // gate treats claude as an INCOMPLETE reviewer (fail-loud), matching a failed core
     // reviewer, instead of exit 0 as if 3 reviewers reviewed. It never crashes the review.
     try {
-      persistSeatReview(opts.baseDir, opts.runId, 'claude', review, raw);
+      persistSeatReview(opts.baseDir, opts.runId, 'claude', claudeReview, raw);
     } catch (e) {
       const why = (e as Error).message;
       log(`  · claude: trail persist FAILED (${why}) — reviewer counted INCOMPLETE`);
       claudeReview = {
-        ...review,
+        ...claudeReview,
         ok: false,
         summary: `claude reviewed but FAILED to persist to the trail (${why}) — not a complete reviewer`,
       };
@@ -518,10 +527,12 @@ export async function runClaudeReviewLayer(
   if (!plan.run) {
     if (plan.skipReason) log(`  · ${plan.skipReason}`);
   } else if (holistic) {
-    log(`  · holistic lens (anthropic/${holistic.config.model} @ ${holistic.config.effort}) reading the whole project…`);
+    if (!holistic.config) throw new Error('holistic lens: a run with worktree evidence needs the resolved lens seat (`holistic.config`)');
+    const lensConfig = holistic.config;
+    log(`  · holistic lens (anthropic/${lensConfig.model} @ ${lensConfig.effort}) reading the whole project…`);
     const { raw, review } = await runHolisticLens({
       baseSha: plan.baseSha,
-      config: holistic.config,
+      config: lensConfig,
       diff: plan.diff,
       headSha: opts.expectedHeadSha,
       ...(opts.historyPacket ? { historyPacket: opts.historyPacket } : {}),
@@ -532,13 +543,13 @@ export async function runClaudeReviewLayer(
       timeoutMs: opts.timeoutMs ?? HOLISTIC_WORKTREE_TIMEOUT_MS,
       worktree: plan.worktree,
     });
-    holisticReview = review;
+    holisticReview = withSeatAdvisor(review, lensConfig);
     try {
-      persistSeatReview(opts.baseDir, opts.runId, HOLISTIC_SEAT_ID, review, raw);
+      persistSeatReview(opts.baseDir, opts.runId, HOLISTIC_SEAT_ID, holisticReview, raw);
     } catch (e) {
       const why = (e as Error).message;
       log(`  · holistic: trail persist FAILED (${why}) — the lens's findings are dropped from this run`);
-      holisticReview = { ...review, findings: [], ok: false, summary: `the holistic lens ran but FAILED to persist to the trail (${why})` };
+      holisticReview = { ...holisticReview, findings: [], ok: false, summary: `the holistic lens ran but FAILED to persist to the trail (${why})` };
     }
     // The rendered markdown is a human-readable artifact, NOT the gate's input — the gate reads
     // review.<id>.json. Its write is best-effort, exactly like review.claude.md above: folding it

@@ -118,6 +118,125 @@ describe('reviewers / config command', () => {
   });
 });
 
+describe('config — a Claude seat\'s advisor is visible', () => {
+  it('--json carries the advisor on the claude voice and the gate — never on a reviewers.json row', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-advisor-'));
+    const reviewersFile = path.join(dir, 'reviewers.json');
+    const voicesFile = path.join(dir, 'voices.json');
+    // ONE advisor home per CLI seat: no CLI spawn reads the reviewers.json claude entry, so its
+    // `advisor` is neither parsed nor displayed.
+    fs.writeFileSync(reviewersFile, JSON.stringify({ claude: { advisor: 'claude-fable-5-1' } }));
+    fs.writeFileSync(
+      voicesFile,
+      JSON.stringify({ claude: { advisor: 'claude-opus-5-5' }, gate: { advisor: 'off', model: 'fable' } })
+    );
+    try {
+      expect(await main(['config', '--json', '--reviewers-file', reviewersFile, '--voices-file', voicesFile])).toBe(0);
+      const parsed = JSON.parse(logged);
+      type Row = { advisor?: string; id: string };
+      const byId = (rows: Row[], id: string): Row => rows.find((r) => r.id === id)!;
+      for (const id of ['claude', 'codex', 'grok']) expect(byId(parsed.reviewers, id)).not.toHaveProperty('advisor');
+      expect(byId(parsed.voices, 'claude').advisor).toBe('claude-opus-5-5');
+      expect(parsed.gate.advisor).toBe('off');
+
+      logged = '';
+      await main(['config', '--reviewers-file', reviewersFile, '--voices-file', voicesFile]);
+      expect(logged).not.toContain('claude-fable-5-1');
+      expect(logged).toContain('· advisor claude-opus-5-5');
+      expect(logged.split('\n').find((l) => l.trimStart().startsWith('gate'))).toContain('· advisor off');
+    } finally {
+      fs.rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  it('no advisor configured ⇒ no advisor key anywhere in --json (absent = inherits)', async () => {
+    await main(['config', '--json', '--reviewers-file', '/nope.json', '--voices-file', '/nope.json']);
+    expect(logged).not.toContain('advisor');
+  });
+
+  it('an invalid advisor is SHOWN, marked invalid — config never throws on it (exit 0)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-advisor-'));
+    const voicesFile = path.join(dir, 'voices.json');
+    fs.writeFileSync(
+      voicesFile,
+      JSON.stringify({ claude: { advisor: 'Opus 5' }, gate: { advisor: null, effort: 'max', model: 'fable' } })
+    );
+    try {
+      expect(await main(['config', '--reviewers-file', '/nope.json', '--voices-file', voicesFile])).toBe(0);
+      const voiceRow = logged.split('\n').find((l) => l.trimStart().startsWith('claude') && l.includes('advisor'));
+      expect(voiceRow).toContain('· advisor "Opus 5" (INVALID');
+      // The gate keeps its resolved vendor, model, effort and sources; only the advisor is marked.
+      const gateRow = logged.split('\n').find((l) => l.trimStart().startsWith('gate'));
+      expect(gateRow).toContain('anthropic · fable @ max · advisor null (INVALID');
+      expect(gateRow).toContain('source model:file · effort:file');
+
+      logged = '';
+      expect(await main(['config', '--json', '--reviewers-file', '/nope.json', '--voices-file', voicesFile])).toBe(0);
+      const parsed = JSON.parse(logged);
+      expect(parsed.voices.find((v: { id: string }) => v.id === 'claude').advisor).toBe('Opus 5');
+      expect(parsed.gate).toEqual({
+        advisor: null, effort: 'max', effortSource: 'file', model: 'fable', modelSource: 'file',
+        vendor: 'anthropic', vendorSource: 'default',
+      });
+    } finally {
+      fs.rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  it('a codex gate ignores its advisor (warned), so config shows none on the gate row', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-advisor-'));
+    const voicesFile = path.join(dir, 'voices.json');
+    fs.writeFileSync(voicesFile, JSON.stringify({ gate: { advisor: 'Opus 5', vendor: 'codex' } }));
+    try {
+      expect(await main(['config', '--json', '--reviewers-file', '/nope.json', '--voices-file', voicesFile])).toBe(0);
+      expect(JSON.parse(logged).gate).not.toHaveProperty('advisor');
+      expect(errored).toContain('`advisor` is ignored');
+    } finally {
+      fs.rmSync(dir, { force: true, recursive: true });
+    }
+  });
+});
+
+describe('config — the holistic lens row', () => {
+  let dir: string;
+  let voicesFile: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-holistic-'));
+    voicesFile = path.join(dir, 'voices.json');
+  });
+  afterEach(() => fs.rmSync(dir, { force: true, recursive: true }));
+
+  const show = async (): Promise<{ json: Record<string, unknown>; row: string | undefined }> => {
+    logged = '';
+    expect(await main(['config', '--json', '--reviewers-file', '/nope.json', '--voices-file', voicesFile])).toBe(0);
+    const json = JSON.parse(logged).holistic as Record<string, unknown>;
+    logged = '';
+    expect(await main(['config', '--reviewers-file', '/nope.json', '--voices-file', voicesFile])).toBe(0);
+    return { json, row: logged.split('\n').find((l) => l.startsWith('    holistic ')) };
+  };
+
+  it('a valid advisor is shown with the lens model and effort it resolved', async () => {
+    fs.writeFileSync(voicesFile, JSON.stringify({ holistic: { advisor: 'off', effort: 'max', model: 'fable' } }));
+    const { json, row } = await show();
+    expect(json).toEqual({ advisor: 'off', effort: 'max', model: 'fable' });
+    expect(row).toBe('    holistic anthropic · fable @ max · advisor off');
+  });
+
+  it('an absent advisor has no key (the lens inherits) — the built-in seat when unconfigured', async () => {
+    fs.writeFileSync(voicesFile, JSON.stringify({}));
+    const { json, row } = await show();
+    expect(json).toEqual({ effort: 'high', model: 'opus' });
+    expect(row).toBe('    holistic anthropic · opus @ high');
+  });
+
+  it('an invalid advisor is shown as written and marked invalid; config still exits 0', async () => {
+    fs.writeFileSync(voicesFile, JSON.stringify({ holistic: { advisor: 'Opus 5', model: 'fable' } }));
+    const { json, row } = await show();
+    expect(json).toEqual({ advisor: 'Opus 5', effort: 'high', model: 'fable' });
+    expect(row).toBe('    holistic anthropic · fable @ high · advisor "Opus 5" (INVALID — a command that runs this seat refuses it)');
+  });
+});
+
 describe('diff command — assembles the packet WITHOUT spawning a reviewer', () => {
   let dir: string;
   let diffFile: string;

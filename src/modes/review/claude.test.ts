@@ -54,6 +54,47 @@ describe('buildClaudeReviewArgs — the capability fence (pinned as data)', () =
   });
 });
 
+describe('buildClaudeReviewArgs — the advisor, explicit and in an order that breaks no invariant', () => {
+  const READ_ROOT = '/var/folders/ab/ensemble-worktree-xyz/head';
+  const HOME = '/Users/somebody';
+  const settingsOf = (args: string[]): unknown => JSON.parse(args[args.indexOf('--settings') + 1]);
+
+  it('absent → no --settings at all (today\'s inherit behavior, byte-identical argv)', () => {
+    const args = buildClaudeReviewArgs('p', CFG({ effort: 'max', model: 'opus' }), { homeDir: HOME, readRoot: READ_ROOT });
+    expect(args).not.toContain('--settings');
+  });
+
+  it('a model id → {"advisorModel":"<id>"}; "off" → {"advisorModel":""}', () => {
+    expect(settingsOf(buildClaudeReviewArgs('p', CFG({ advisor: 'claude-fable-5-1' })))).toEqual({
+      advisorModel: 'claude-fable-5-1',
+    });
+    expect(settingsOf(buildClaudeReviewArgs('p', CFG({ advisor: 'off' })))).toEqual({ advisorModel: '' });
+  });
+
+  for (const advisor of ['claude-opus-5-5', 'off']) {
+    it(`advisor "${advisor}" + a read root: --add-dir is still followed by --strict-mcp-config, --disallowedTools still LAST`, () => {
+      const args = buildClaudeReviewArgs('p', CFG({ advisor, effort: 'max', model: 'opus' }), {
+        homeDir: HOME,
+        readRoot: READ_ROOT,
+      });
+      expect(args[args.indexOf('--add-dir') + 1]).toBe(READ_ROOT);
+      expect(args[args.indexOf('--add-dir') + 2]).toBe('--strict-mcp-config');
+      const settingsAt = args.indexOf('--settings');
+      const deniedAt = args.indexOf('--disallowedTools');
+      expect(settingsAt).toBeGreaterThan(args.indexOf('--effort'));
+      expect(settingsAt).toBeLessThan(deniedAt);
+      // Everything after --disallowedTools is a deny rule — the settings flag never lands in the
+      // variadic tail, where the CLI would read it as a tool name.
+      expect(args.slice(deniedAt + 1).every((a) => !a.startsWith('--'))).toBe(true);
+      expect(args.filter((a) => a === '--settings')).toHaveLength(1);
+    });
+  }
+
+  it('an invalid advisor throws (callers turn it into a loud failed seat)', () => {
+    expect(() => buildClaudeReviewArgs('p', CFG({ advisor: 'Opus Five' }))).toThrow(/`advisor` must be/);
+  });
+});
+
 describe('isTransientApiErrorReply — the 529/429 fast-fail predicate', () => {
   it('matches the observed CLI error lines (529 overloaded, 429, other 5xx)', () => {
     expect(

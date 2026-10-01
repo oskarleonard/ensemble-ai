@@ -6,14 +6,14 @@ import { describe, expect, it } from 'vitest';
 
 import { persistReview, reviewDir } from '../../core/artifacts';
 import type { ReviewerConfig, ReviewerId, ReviewPacket } from '../../core/types';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig, VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { persistGatePacket, readGatePacketHeadSha } from './gate-hunks';
 import { readConventionPathsFromTrail, runRegate } from './regate';
 import { GATE_WORKTREE_TIMEOUT_MS, persistSeatReview } from './self-contained';
 
-const CFG: VoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
+const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
 const HEAD = 'REGATEHEADSHA1';
 const PACKET: ReviewPacket = { complete: true, objective: 'o', pr: 0, repo: 'r', sections: [] };
 

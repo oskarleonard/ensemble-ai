@@ -29,6 +29,18 @@ function parseSeatWindow(v) {
   const asWritten = new Date(Date.UTC(year, month - 1, day));
   return asWritten.getUTCMonth() === month - 1 && asWritten.getUTCDate() === day ? value : void 0;
 }
+var ADVISOR_OFF = "off";
+var ADVISOR_MODEL_RE = /^[a-z0-9][a-z0-9.-]*$/;
+function isSeatAdvisor(v) {
+  return v === ADVISOR_OFF || typeof v === "string" && ADVISOR_MODEL_RE.test(v);
+}
+function parseSeatAdvisor(v, seat) {
+  if (v === void 0) return void 0;
+  if (isSeatAdvisor(v)) return v;
+  throw new Error(
+    `ensemble-ai: ${seat} seat: \`advisor\` must be "${ADVISOR_OFF}" or a model id matching ${ADVISOR_MODEL_RE.source} (omit the key to inherit the operator's setting) \u2014 got ${JSON.stringify(v) ?? String(v)}`
+  );
+}
 function seatOff(config, now) {
   if (config?.enabled === false) return true;
   return now.getTime() < Date.parse(parseSeatWindow(config?.disabledUntil) ?? "");
@@ -1458,6 +1470,7 @@ function persistReview(baseDir, input) {
       manifest: manifestOf(input.packet)
     },
     reviewer: {
+      ...input.reviewer.advisor === void 0 ? {} : { advisor: input.reviewer.advisor },
       effort: input.reviewer.effort,
       model: input.reviewer.model,
       vendor: input.reviewer.vendor
@@ -2590,11 +2603,17 @@ import os9 from "os";
 function resolveClaudeBin() {
   return resolveBin("claude", { envVar: "CLAUDE_BIN" });
 }
+function claudeAdvisorArgs(config) {
+  const advisor = parseSeatAdvisor(config?.advisor, config?.id ?? "claude");
+  if (advisor === void 0) return [];
+  return ["--settings", JSON.stringify({ advisorModel: advisor === ADVISOR_OFF ? "" : advisor })];
+}
 var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
 function buildClaudeVoiceArgs(prompt, config) {
   const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
   if (config?.model && config.model !== "default") args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
+  args.push(...claudeAdvisorArgs(config));
   return args;
 }
 function runClaudeVoice(prompt, config, opts = {}) {
@@ -3491,6 +3510,7 @@ function buildClaudeReviewArgs(prompt, config, fence = {}) {
     args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS2.has(config.effort))
     args.push("--effort", config.effort);
+  args.push(...claudeAdvisorArgs(config));
   args.push("--disallowedTools", ...CLAUDE_REVIEW_DENIED_TOOLS, ...homeReadDenyRules(homeDir));
   return args;
 }
@@ -3937,6 +3957,7 @@ function parseVoices(raw) {
     const r = e;
     const sandbox = str2(r.sandbox, VOICE_DEFAULTS[id].sandbox ?? "");
     out[id] = {
+      ...id === "claude" && r.advisor !== void 0 ? { advisor: r.advisor } : {},
       cmd: str2(r.cmd, VOICE_DEFAULTS[id].cmd),
       effort: str2(r.effort, VOICE_DEFAULTS[id].effort),
       id,
@@ -3954,6 +3975,9 @@ function loadVoices(file = VOICES_FILE) {
     return { ...VOICE_DEFAULTS };
   }
 }
+function assertRosterAdvisors(roster, configs, source) {
+  for (const id of roster) parseSeatAdvisor(configs[id]?.advisor, source ? `${source} ${id}` : id);
+}
 function listVoices(file = VOICES_FILE) {
   const all = loadVoices(file);
   return VOICE_IDS.map((id) => all[id]);
@@ -3967,7 +3991,7 @@ function nonEmptyStr(v) {
   return typeof v === "string" && v.trim() ? v.trim() : null;
 }
 function resolveHolisticSeat(raw, flags = {}, warn = () => {
-}) {
+}, parseAdvisor = parseSeatAdvisor) {
   const root = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const entry = root.holistic && typeof root.holistic === "object" && !Array.isArray(root.holistic) ? root.holistic : null;
   if (root.holistic !== void 0 && !entry) {
@@ -3977,6 +4001,7 @@ function resolveHolisticSeat(raw, flags = {}, warn = () => {
     warn("holistic seat: `cmd` is ignored \u2014 the lens is always a `claude -p` spawn (read-only plan mode + write-tool deny-list); remove it");
   }
   const model = nonEmptyStr(flags.model) || entry && nonEmptyStr(entry.model) || HOLISTIC_DEFAULTS.model;
+  const advisor = entry ? parseAdvisor(entry.advisor, "voices.json holistic") : void 0;
   const flagEffort = nonEmptyStr(flags.effort);
   if (flagEffort && !CLAUDE_EFFORTS2.has(flagEffort))
     warn(
@@ -3995,10 +4020,10 @@ function resolveHolisticSeat(raw, flags = {}, warn = () => {
         );
     }
   }
-  return { ...VOICE_DEFAULTS.claude, effort, model };
+  return { ...VOICE_DEFAULTS.claude, ...advisor === void 0 ? {} : { advisor }, effort, model };
 }
 function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
-}) {
+}, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
     raw = JSON.parse(fs17.readFileSync(file, "utf8"));
@@ -4007,7 +4032,7 @@ function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
       warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
     raw = {};
   }
-  return resolveHolisticSeat(raw, flags, warn);
+  return resolveHolisticSeat(raw, flags, warn, parseAdvisor);
 }
 function resolveHolisticPlan(input) {
   if (!input.requested) return { run: false, skipReason: null };
@@ -5926,6 +5951,7 @@ async function runBrainstormMode(opts) {
   const roster = opts.voices && opts.voices.length > 0 ? opts.voices : [...VOICE_IDS];
   const adapters = opts.adapters ?? VOICE_ADAPTERS;
   const configs = opts.voiceConfigs ?? loadVoices(opts.voicesFile);
+  assertRosterAdvisors(roster, configs, opts.voiceConfigs ? void 0 : "voices.json");
   const timeoutMs = opts.timeoutMs ?? DEFAULT_VOICE_TIMEOUT_MS;
   log(`Round 1 \xB7 independent ideation \u2014 ${roster.length} voice(s): ${roster.join(", ")}`);
   const genPrompt = renderGeneratePrompt(opts.topic, opts.fileContext);
@@ -6312,6 +6338,7 @@ async function runConsultMode(opts) {
   const roster = opts.voices && opts.voices.length > 0 ? opts.voices : [...VOICE_IDS];
   const adapters = opts.adapters ?? VOICE_ADAPTERS;
   const configs = opts.voiceConfigs ?? loadVoices(opts.voicesFile);
+  assertRosterAdvisors(roster, configs, opts.voiceConfigs ? void 0 : "voices.json");
   const timeoutMs = opts.timeoutMs ?? DEFAULT_VOICE_TIMEOUT_MS2;
   log(`Round 1 \xB7 independent answers \u2014 ${roster.length} voice(s): ${roster.join(", ")}`);
   const answerPrompt = renderAnswerPrompt(opts.question, opts.fileContext);
@@ -6363,6 +6390,8 @@ function isImplemented(mode) {
   return IMPLEMENTED_MODES.includes(mode);
 }
 export {
+  ADVISOR_MODEL_RE,
+  ADVISOR_OFF,
   AGENT_INSTRUCTION_NAMES,
   CI_EVIDENCE_BOTH_REASON,
   CI_EVIDENCE_LIMITS,
@@ -6451,6 +6480,7 @@ export {
   applyHolisticPolicy,
   asRecord2 as asRecord,
   assembleCodePacket,
+  assertRosterAdvisors,
   boundedStreamTail,
   buildClaudeReviewArgs,
   buildClaudeVoiceArgs,
@@ -6467,6 +6497,7 @@ export {
   classifyGitError,
   classifyPending,
   classifySecurityFinding,
+  claudeAdvisorArgs,
   claudeWorktreePromptSuffix,
   codexSandboxSupported,
   computeCoverage,
@@ -6522,6 +6553,7 @@ export {
   isRetryableApiStatus,
   isReviewProfile,
   isReviewerId,
+  isSeatAdvisor,
   isStrippedPath,
   isTestPath,
   isTransientApiErrorReply,
@@ -6562,6 +6594,7 @@ export {
   parseReviewSummaries,
   parseReviewerIds,
   parseReviewers,
+  parseSeatAdvisor,
   parseSeatWindow,
   parseSynthesis,
   parseTrailerIds,

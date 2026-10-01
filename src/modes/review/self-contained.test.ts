@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { persistReview, reviewDir } from '../../core/artifacts';
 import type { ReviewerId, StoredReview } from '../../core/types';
 import type { ReviewPacket, ReviewerConfig } from '../../core/types';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig, VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { persistGatePacket } from './gate-hunks';
@@ -24,7 +24,7 @@ import {
   storedToVoiceReview,
 } from './self-contained';
 
-const CFG: VoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
+const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
 const HEAD = 'HEADSHA1';
 
 const okRun = (raw: string): VoiceRunResult => ({ ok: true, raw, stderrTail: '', timedOut: false });
@@ -193,6 +193,32 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, gate 
     expect(JSON.parse(codexJson).findings[0].title).toBe('shared bug');
     // The producer SPAWNED, so the run may attest that it read the worktree.
     expect(res.claudeSpawned).toBe(true);
+  });
+
+  it('review.claude.json records the seat\'s stated advisor — "off" vs absent (inherit) — and the gate prompt never sees it', async () => {
+    const readSeat = (base: string, runId: string) =>
+      JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'review.claude.json'), 'utf8'));
+    for (const [advisor, expected] of [['off', 'off'], [undefined, undefined]] as const) {
+      const base = tmpTrail();
+      const runId = 'run1';
+      seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+      const { calls, run } = makeRunner();
+      const res = await runClaudeReviewLayer({
+        baseDir: base,
+        claudeConfig: advisor === undefined ? CFG : { ...CFG, advisor },
+        coreReviews: [stored('codex'), stored('grok')],
+        expectedHeadSha: HEAD,
+        includeClaudeReviewer: true,
+        reviewPrompt: 'REVIEW PROMPT PAYLOAD',
+        run,
+        runId,
+      });
+      const seat = readSeat(base, runId);
+      if (expected === undefined) expect(seat).not.toHaveProperty('advisor');
+      else expect(seat.advisor).toBe(expected);
+      expect(res.claudeReview?.advisor).toBe(expected);
+      expect(calls.find((c) => c.round === 'gate')?.prompt).not.toContain('"advisor"');
+    }
   });
 
   // `claudeSpawned` is what the run's REALIZED evidence for the `claude` seat is derived from, the
@@ -666,6 +692,47 @@ describe('runClaudeReviewLayer — worktree producer timeout default', () => {
     expect(nonGate[0]).toBe(CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS);
     expect(nonGate[1]).toBe(HOLISTIC_WORKTREE_TIMEOUT_MS);
     expect(gateTimeout).toBe(GATE_WORKTREE_TIMEOUT_MS);
+  });
+});
+
+describe('the holistic request without a resolved seat config', () => {
+  const layer = (runId: string, worktree?: string) => {
+    const base = tmpTrail();
+    seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+    const prompts: string[] = [];
+    const run = async (prompt: string): Promise<VoiceRunResult> => {
+      prompts.push(prompt);
+      return okRun(prompt.includes('VERIFIED GATE') ? GATE : CLAUDE_REVIEW);
+    };
+    return {
+      prompts,
+      result: runClaudeReviewLayer({
+        baseDir: base,
+        claudeConfig: CFG,
+        coreReviews: [stored('codex'), stored('grok')],
+        expectedHeadSha: HEAD,
+        holistic: { baseSha: 'BASESHA1' },
+        includeClaudeReviewer: true,
+        pinnedDiff: GATE_DIFF,
+        reviewPrompt: 'REVIEW PROMPT PAYLOAD',
+        run,
+        runId,
+        ...(worktree ? { worktree } : {}),
+      }),
+    };
+  };
+
+  it('packet mode: the request alone renders the loud skip — the lens never needed a seat', async () => {
+    const r = await layer('holistic-no-config-packet').result;
+    expect(r.holisticReview).toBeNull();
+    expect(r.holisticSkipped).toMatch(/NO worktree evidence/);
+  });
+
+  it('worktree mode: a caller that did not resolve the seat is refused before the lens spawns', async () => {
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-wt-'));
+    const { prompts, result } = layer('holistic-no-config-worktree', wt);
+    await expect(result).rejects.toThrow(/needs the resolved lens seat/);
+    expect(prompts.filter((p) => p.includes('HOLISTIC / ARCHITECTURE lens'))).toEqual([]);
   });
 });
 

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 
-import type { VoiceConfig } from '../brainstorm/types';
+import { parseSeatAdvisor } from '../../core/types';
+import type { ResolvedVoiceConfig } from '../brainstorm/types';
 import { VOICE_DEFAULTS, VOICES_FILE } from '../brainstorm/voices';
 
 import { CLAUDE_EFFORTS } from './claude';
@@ -14,6 +15,15 @@ import { CLAUDE_EFFORTS } from './claude';
 // voices.json `gate` entry → the `claude` entry (model/effort only) → the built-in default (Opus,
 // i.e. the 'default' sentinel → no --model/--effort). A junk entry falls to the next link + a
 // warning — the junk-config-never-disables-a-seat posture reviewers.json already has.
+//
+// THE ADVISOR is the one per-entry field with NO chain and NO fallback: each seat reads `advisor`
+// from its OWN entry only (gate → `gate.advisor`, reviewer → `claude.advisor`), because the field
+// has three states (a model · "off" · absent = inherit the operator's settings) and an inheritance
+// link would leave "inherit" unspellable on a gate whose claude entry says "off". It is validated
+// HERE, at the seat's resolution — callers resolve a seat only when the command will spawn it — and
+// only when it applies (an anthropic gate): an invalid value THROWS naming the seat (core/types
+// parseSeatAdvisor), the one exception to never-throws below. An advisor that does not apply (a
+// codex gate) is ignored with a warning and never validated: it reaches no spawn.
 
 export type SeatSource = 'flag' | 'file' | 'default';
 
@@ -48,7 +58,9 @@ export interface GateSeatFlags {
 export interface GateSeat {
   // A VoiceConfig for the spawn: id/cmd/vendor pinned to the RESOLVED vendor's canonical seat
   // (`cmd` is never honored from config — the runner binding is code), model/effort resolved.
-  config: VoiceConfig;
+  // `config.advisor` is the gate entry's own advisor (absent = inherit the operator's settings),
+  // always absent on a codex gate.
+  config: ResolvedVoiceConfig;
   effortSource: SeatSource;
   modelSource: SeatSource;
   vendor: GateVendor;
@@ -104,12 +116,16 @@ function resolveField(
 }
 
 // PURE: resolve the gate seat from the raw voices.json object + flag overrides. Emits warnings
-// through `warn` (never throws) — a junk / `cmd`-bearing entry warns and falls through, never
-// disabling the seat. Deterministic, so it is unit-tested directly for done-criterion 6.
+// through `warn` — a junk / `cmd`-bearing entry warns and falls through, never disabling the seat.
+// The one throw: an invalid `gate.advisor` on an anthropic gate (the advisor reaches its spawn).
+// `parseAdvisor` is that throw's one seam: `config`, the diagnosis, passes a parse that keeps the
+// value as written, so the row shows it beside the resolved vendor/model/effort.
+// Deterministic, so it is unit-tested directly for done-criterion 6.
 export function resolveGateSeat(
   raw: unknown,
   flags: GateSeatFlags,
-  warn: (m: string) => void
+  warn: (m: string) => void,
+  parseAdvisor: typeof parseSeatAdvisor = parseSeatAdvisor
 ): GateSeat {
   const root = plainObject(raw) ?? {};
 
@@ -157,6 +173,16 @@ export function resolveGateSeat(
   // values warn; the chain falls to the resolved vendor's own defaults.
   const entryVendor: GateVendor =
     fileVendor && GATE_VENDORS.has(fileVendor as GateVendor) ? (fileVendor as GateVendor) : 'anthropic';
+  // The gate's advisor — its OWN entry only (header comment). A Claude-seat setting: it applies only
+  // to an anthropic-scoped entry on an anthropic gate — never carried across a re-vendoring flag,
+  // in either direction — and is validated only then; anywhere else it is ignored loudly, like `cmd`.
+  const advisorApplies = entryVendor === 'anthropic' && vendor === 'anthropic';
+  const gateAdvisor =
+    gate && advisorApplies ? parseAdvisor(gate.advisor, 'voices.json gate') : undefined;
+  if (gate && gate.advisor !== undefined && !advisorApplies)
+    warn(
+      `gate seat: \`advisor\` is ignored — it is a Claude-seat setting, and this gate (or its entry) is codex (got ${JSON.stringify(gate.advisor)}; not validated)`,
+    );
   if (gate && entryVendor !== vendor && (nonEmptyStr(gate.model) || nonEmptyStr(gate.effort))) {
     warn(
       `gate seat: the \`gate\` entry is ${entryVendor}-scoped — its model/effort do not apply to the ${vendor} gate (falling to the ${vendor} defaults)`,
@@ -239,8 +265,13 @@ export function resolveGateSeat(
   return {
     // The anthropic gate IS the claude binary with a swapped model/effort — source its identity
     // (cmd/id/vendor) from the one canonical claude voice so it can't drift from it, overriding
-    // only the two fields the gate seat configures.
-    config: { ...VOICE_DEFAULTS.claude, effort, model },
+    // only the fields the gate seat configures. The advisor is the gate entry's own (advisorApplies).
+    config: {
+      ...VOICE_DEFAULTS.claude,
+      ...(gateAdvisor === undefined ? {} : { advisor: gateAdvisor }),
+      effort,
+      model,
+    },
     effortSource,
     modelSource,
     vendor,
@@ -269,16 +300,19 @@ function readVoicesRaw(
 }
 
 // Read + resolve the gate seat from a voices.json file (default ~/.ensemble-ai/voices.json). A
-// missing / unreadable / invalid file → an empty raw → the built-in default seat (never throws).
+// missing / unreadable / invalid file → an empty raw → the built-in default seat. Never throws on
+// the FILE; an invalid `advisor` on an anthropic gate throws (resolveGateSeat, via `parseAdvisor`).
 export function loadGateSeat(
   file: string = VOICES_FILE,
   flags: GateSeatFlags = {},
   warn: (m: string) => void = () => {},
+  parseAdvisor: typeof parseSeatAdvisor = parseSeatAdvisor
 ): GateSeat {
   return resolveGateSeat(
     readVoicesRaw(file, warn, 'gate seat', 'using the claude voice / built-in default'),
     flags,
-    warn
+    warn,
+    parseAdvisor
   );
 }
 
@@ -337,12 +371,20 @@ export function resolveClaudeReviewerSeat(
 
   const model = pick('model', nonEmptyStr(flags.model), () => true, CLAUDE_REVIEWER_SEAT_DEFAULTS.model);
   const effort = pick('effort', effortFlagOk ? flagEffort : null, isKnownEffort, CLAUDE_REVIEWER_SEAT_DEFAULTS.effort);
+  // The advisor: the `claude` entry's own, no flag and no baked value — absent inherits the
+  // operator's settings; an invalid value throws naming the seat.
+  const advisor = claude ? parseSeatAdvisor(claude.advisor, 'voices.json claude') : undefined;
 
   return {
     // Identity (cmd/id/vendor) from the one canonical claude voice, like the gate — only
     // model/effort are configurable; the capability fence is not. The REVIEWER seat has no
     // vendor axis: it is the ONE Claude producer by definition (spec §3).
-    config: { ...VOICE_DEFAULTS.claude, effort: effort.value, model: model.value },
+    config: {
+      ...VOICE_DEFAULTS.claude,
+      ...(advisor === undefined ? {} : { advisor }),
+      effort: effort.value,
+      model: model.value,
+    },
     effortSource: effort.source,
     modelSource: model.source,
     vendor: 'anthropic',
@@ -350,8 +392,8 @@ export function resolveClaudeReviewerSeat(
   };
 }
 
-// Read + resolve the claude REVIEWER seat from a voices.json file. Same never-throws contract
-// as loadGateSeat.
+// Read + resolve the claude REVIEWER seat from a voices.json file. Same contract as loadGateSeat:
+// never throws on the file; an invalid `advisor` in it throws.
 export function loadClaudeReviewerSeat(
   file: string = VOICES_FILE,
   flags: GateSeatFlags = {},
@@ -362,4 +404,22 @@ export function loadClaudeReviewerSeat(
     flags,
     warn
   );
+}
+
+// The anthropic CHAMPION that shadows a codex gate (`--shadow-gate`): the claude reviewer seat the
+// run already resolved up front, with only `--shadow-gate-effort` applied on top. It never re-reads
+// voices.json — a mid-run edit can neither throw inside the layer (an advisor turned invalid) nor
+// change what was validated. An effort outside CLAUDE_EFFORTS is ignored + warned, like every link.
+export function shadowChampionConfig(
+  claudeSeat: GateSeat,
+  effort: string | undefined,
+  warn: (m: string) => void
+): ResolvedVoiceConfig {
+  const shadowEffort = nonEmptyStr(effort);
+  if (shadowEffort === null) return claudeSeat.config;
+  if (CLAUDE_EFFORTS.has(shadowEffort)) return { ...claudeSeat.config, effort: shadowEffort };
+  warn(
+    `shadow gate: --shadow-gate-effort "${shadowEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — keeping the claude seat's ${claudeSeat.config.effort}`
+  );
+  return claudeSeat.config;
 }

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { reviewDir, writeTrailFile } from '../../core/artifacts';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig } from '../brainstorm/types';
 
 import { runClaudeReviewVoice } from './claude';
 import { type GateVerdictRecord, runGate } from './gate';
@@ -33,7 +33,7 @@ export interface RegateOptions {
   baseDir: string;
   // Best-effort: the run's gathered convention paths (holistic citation-lifting only).
   conventionPaths?: string[];
-  gateConfig: VoiceConfig;
+  gateConfig: ResolvedVoiceConfig;
   log?: (m: string) => void;
   // The opt-in PREMISE PASS (spec §4, --premise) — off by default, same as the initial pipeline.
   // On ⇒ a regate whose findings cluster re-earns the advisory `simplify` synthesis line; off ⇒ the

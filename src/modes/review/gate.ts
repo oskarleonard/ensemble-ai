@@ -1,7 +1,7 @@
 import { writeTrailFile } from '../../core/artifacts';
 import { evidenceRef, extractJsonBlock } from '../../core/findings';
 import { SEVERITIES, type Severity } from '../../core/types';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 import { type RunReviewOpts } from '../../reviewers/codex';
 
@@ -1173,7 +1173,7 @@ export function renderGateVerdicts(
 
 export type GateRunner = (
   prompt: string,
-  config: VoiceConfig,
+  config: ResolvedVoiceConfig,
   opts?: RunReviewOpts
 ) => Promise<VoiceRunResult>;
 
@@ -1196,7 +1196,7 @@ export interface ShadowGateSeat {
   // The shadow judge's seat (typically the codex reviewer's model at a stepped-down effort).
   // The RUNNER binds the vendor spawn (sandbox + egress fence included) — config alone can
   // never point the shadow at an unfenced spawn.
-  config: VoiceConfig;
+  config: ResolvedVoiceConfig;
   run: GateRunner;
 }
 
@@ -1215,7 +1215,7 @@ export interface GateRunResult {
 
 export interface RunGateOptions {
   baseDir: string;
-  config: VoiceConfig;
+  config: ResolvedVoiceConfig;
   expectedHeadSha: string;
   // The gate's REALIZED evidence (default 'packet'). The gate is an EVIDENCE-BEARING ACTOR, not a
   // neutral judge (gate-r3 pin 1): worktree ⇒ it read the PR head and may emit
@@ -1297,7 +1297,14 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
         /* best-effort — audit artifact only */
       }
     };
-    const seatMeta = { effort: seat.effort, id: seat.id, model: seat.model };
+    // The advisor rides beside model/effort when the seat states one (absent = inherited), so the
+    // audit record tells "off" from inherit.
+    const seatMeta = {
+      ...(seat.advisor === undefined ? {} : { advisor: seat.advisor }),
+      effort: seat.effort,
+      id: seat.id,
+      model: seat.model,
+    };
     const stub = (why: string): void => {
       log(`  · shadow gate (${seat.id} · ${seat.model} @ ${seat.effort}): ${why} — audit-only, run unaffected`);
       writeShadow({

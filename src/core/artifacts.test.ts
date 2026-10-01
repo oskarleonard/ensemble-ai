@@ -112,6 +112,33 @@ describe('per-reviewer artifacts', () => {
     expect(fs.readFileSync(path.join(baseDir, runId, 'codex-stream.jsonl'), 'utf8')).toContain('thread.started');
   });
 
+  // A consumer running the claude adapter sets ReviewerConfig.advisor programmatically (reviewers.json
+  // never carries it); persistReview records it beside the model it advised.
+  it('records a programmatic claude seat\'s stated advisor; an inheriting seat records none', () => {
+    const write = (runId: string, advisor?: string) =>
+      persistReview(baseDir, {
+        findings: [],
+        packet: packet(),
+        prompt: 'p',
+        raw: null,
+        reviewer: {
+          cmd: 'claude',
+          effort: 'max',
+          id: 'claude',
+          model: 'opus',
+          vendor: 'anthropic',
+          ...(advisor === undefined ? {} : { advisor }),
+        },
+        runId,
+        summary: 's',
+        terminalState: 'reviewed',
+      });
+    expect(write('run-adv', 'off').reviewer.advisor).toBe('off');
+    const onDisk = JSON.parse(fs.readFileSync(path.join(baseDir, 'run-adv', 'review.claude.json'), 'utf8'));
+    expect(onDisk.reviewer.advisor).toBe('off');
+    expect('advisor' in write('run-inherit').reviewer).toBe(false);
+  });
+
   it('a re-run that produced no reply or stream removes the previous attempt\'s files', () => {
     const runId = 'run-rerun';
     const attempt = (raw: string | null, stream?: string) =>

@@ -1,6 +1,10 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
-import { listReviewers, parseReviewers, REVIEWER_DEFAULTS } from './reviewers';
+import { listReviewers, loadReviewers, parseReviewers, REVIEWER_DEFAULTS } from './reviewers';
 // The seat-switch predicate lives on the PURE contracts module (a UI imports it without
 // pulling node:fs); this file exercises it over configs the file parse produced.
 import {
@@ -208,5 +212,28 @@ describe('enabledReviewerIds — the one owner of which seats are on', () => {
       ReviewerConfig
     >;
     expect(enabledReviewerIds(r, now)).toEqual(['codex', 'grok', 'claude']);
+  });
+});
+
+describe('parseReviewers — reviewers.json carries no advisor', () => {
+  // ONE advisor home per CLI seat: every CLI claude spawn resolves from voices.json, so a
+  // reviewers.json `advisor` is a field nothing spawns from — not read, not displayed, and never
+  // able to break a run (a programmatic consumer sets ReviewerConfig.advisor itself).
+  it('drops an `advisor` key on every seat, valid or not, and never throws', () => {
+    for (const advisor of ['off', 'claude-fable-5-1', null, 'Claude Opus', 7]) {
+      const out = parseReviewers({ claude: { advisor }, codex: { advisor }, grok: { advisor } });
+      for (const id of ['claude', 'codex', 'grok'] as const) expect(out[id]).not.toHaveProperty('advisor');
+    }
+  });
+
+  it('loadReviewers reads a file with an invalid claude advisor without throwing', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-advisor-'));
+    const file = path.join(dir, 'reviewers.json');
+    try {
+      fs.writeFileSync(file, JSON.stringify({ claude: { advisor: 'Opus!' } }));
+      expect(loadReviewers(file)).toEqual(REVIEWER_DEFAULTS);
+    } finally {
+      fs.rmSync(dir, { force: true, recursive: true });
+    }
   });
 });

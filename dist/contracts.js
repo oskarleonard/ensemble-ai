@@ -23,6 +23,18 @@ function parseSeatWindow(v) {
   const asWritten = new Date(Date.UTC(year, month - 1, day));
   return asWritten.getUTCMonth() === month - 1 && asWritten.getUTCDate() === day ? value : void 0;
 }
+var ADVISOR_OFF = "off";
+var ADVISOR_MODEL_RE = /^[a-z0-9][a-z0-9.-]*$/;
+function isSeatAdvisor(v) {
+  return v === ADVISOR_OFF || typeof v === "string" && ADVISOR_MODEL_RE.test(v);
+}
+function parseSeatAdvisor(v, seat) {
+  if (v === void 0) return void 0;
+  if (isSeatAdvisor(v)) return v;
+  throw new Error(
+    `ensemble-ai: ${seat} seat: \`advisor\` must be "${ADVISOR_OFF}" or a model id matching ${ADVISOR_MODEL_RE.source} (omit the key to inherit the operator's setting) \u2014 got ${JSON.stringify(v) ?? String(v)}`
+  );
+}
 function seatOff(config, now) {
   if (config?.enabled === false) return true;
   return now.getTime() < Date.parse(parseSeatWindow(config?.disabledUntil) ?? "");
@@ -486,6 +498,8 @@ ${ask}
 `;
 }
 export {
+  ADVISOR_MODEL_RE,
+  ADVISOR_OFF,
   CI_EVIDENCE_SECTION_TITLE,
   CONFIDENCES,
   CORE_REVIEWER_IDS,
@@ -505,9 +519,11 @@ export {
   extractJsonBlock,
   isCoreReviewerId,
   isReviewerId,
+  isSeatAdvisor,
   oneOf,
   parseFindings,
   parseReviewerIds,
+  parseSeatAdvisor,
   parseSeatWindow,
   renderReviewPrompt,
   reviewerVisibleDiff,

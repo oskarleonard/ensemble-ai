@@ -1,9 +1,9 @@
 import fs from 'node:fs';
 
 import { parseFindings } from '../../core/findings';
-import type { Severity } from '../../core/types';
+import { parseSeatAdvisor, type Severity } from '../../core/types';
 import type { RunReviewOpts } from '../../reviewers/codex';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig, VoiceConfig } from '../brainstorm/types';
 import { VOICE_DEFAULTS, VOICES_FILE } from '../brainstorm/voices';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
@@ -68,12 +68,15 @@ function nonEmptyStr(v: unknown): string | null {
 // and falls to the next (the junk-config-never-disables-a-seat posture the gate seat and
 // reviewers.json already have). The spawn identity (cmd/id/vendor) is sourced from the one
 // canonical claude voice — like the gate seat, neither a flag nor `cmd` can reconfigure the spawn
-// away from a read-only `claude -p`.
+// away from a read-only `claude -p`. The `advisor` is the `holistic` entry's own (absent = inherit
+// the operator's settings); an invalid value THROWS naming the seat, the one non-warning path —
+// through `parseAdvisor`, which `config` swaps for a parse that keeps the value as written.
 export function resolveHolisticSeat(
   raw: unknown,
   flags: HolisticSeatFlags = {},
-  warn: (m: string) => void = () => {}
-): VoiceConfig {
+  warn: (m: string) => void = () => {},
+  parseAdvisor: typeof parseSeatAdvisor = parseSeatAdvisor
+): ResolvedVoiceConfig {
   const root = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const entry =
     root.holistic && typeof root.holistic === 'object' && !Array.isArray(root.holistic)
@@ -87,6 +90,7 @@ export function resolveHolisticSeat(
   }
 
   const model = nonEmptyStr(flags.model) || (entry && nonEmptyStr(entry.model)) || HOLISTIC_DEFAULTS.model;
+  const advisor = entry ? parseAdvisor(entry.advisor, 'voices.json holistic') : undefined;
 
   // Effort: a flag outside the whitelist is ignored + warned (flag/file symmetry — never resolve
   // a value the spawn would drop), then the chain continues at the file link.
@@ -108,16 +112,18 @@ export function resolveHolisticSeat(
         );
     }
   }
-  return { ...VOICE_DEFAULTS.claude, effort, model };
+  return { ...VOICE_DEFAULTS.claude, ...(advisor === undefined ? {} : { advisor }), effort, model };
 }
 
 // Read + resolve the lens seat from voices.json + flag overrides. A missing file is the
-// zero-config case (silent); any other read failure warns before falling back. Never throws.
+// zero-config case (silent); any other read failure warns before falling back. Never throws on
+// the file; an invalid `advisor` in it throws (resolveHolisticSeat, via `parseAdvisor`).
 export function loadHolisticSeat(
   file: string = VOICES_FILE,
   flags: HolisticSeatFlags = {},
-  warn: (m: string) => void = () => {}
-): VoiceConfig {
+  warn: (m: string) => void = () => {},
+  parseAdvisor: typeof parseSeatAdvisor = parseSeatAdvisor
+): ResolvedVoiceConfig {
   let raw: unknown = {};
   try {
     raw = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -126,7 +132,7 @@ export function loadHolisticSeat(
       warn(`holistic seat: could not read \`${file}\` (${(e as Error).message.split('\n')[0]}) — using the built-in default`);
     raw = {};
   }
-  return resolveHolisticSeat(raw, flags, warn);
+  return resolveHolisticSeat(raw, flags, warn, parseAdvisor);
 }
 
 // ── Run plan (default off · worktree or nothing) ──────────────────────────────────────

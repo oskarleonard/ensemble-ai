@@ -9,6 +9,13 @@ import type { WorktreeSession } from './modes/review/worktree-run';
 // mocked, so what is under test is exactly the WIRING — which sources may ask for worktree
 // evidence, what the pre-flight is given, what the engine receives, and that the worktree is
 // reaped on EVERY exit path.
+// VOICES_FILE is read from the env once, at import — point it at a private file BEFORE the CLI
+// loads, so a run with the Claude seats never reads the operator's own voices.json.
+const VOICES = vi.hoisted(() => {
+  const p = `${process.env.TMPDIR ?? '/tmp'}/ensemble-cli-worktree-${process.pid}-voices.json`;
+  process.env.ENSEMBLE_VOICES_FILE = p;
+  return p;
+});
 vi.mock('./modes/review', () => ({ runReviewMode: vi.fn() }));
 vi.mock('./modes/review/worktree-run', () => ({ openWorktree: vi.fn() }));
 vi.mock('node:child_process', () => ({ execFileSync: vi.fn() }));
@@ -99,6 +106,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   fs.rmSync(repoDir, { force: true, recursive: true });
+  fs.rmSync(VOICES, { force: true });
   vi.restoreAllMocks();
 });
 
@@ -169,6 +177,18 @@ describe('`review --pr <url> --repo <dir>` materializes ONE worktree and hands i
     mockRun.mockRejectedValue(new Error('engine exploded'));
     const code = await main(['review', URL, '--repo', repoDir, '--no-claude']);
     expect(code).toBe(3);
+    expect(reaps).toBe(1);
+  });
+});
+
+describe('the holistic lens refuses an invalid advisor only where it can spawn — with worktree evidence', () => {
+  it('`--holistic --repo`: exit 3 naming the seat before the core fan-out, and the worktree is reaped', async () => {
+    fs.writeFileSync(VOICES, JSON.stringify({ holistic: { advisor: 'Not A Model' } }));
+    const code = await main(['review', URL, '--repo', repoDir, '--holistic']);
+    expect(code).toBe(3);
+    expect(mockOpen).toHaveBeenCalledTimes(1);
+    expect(mockRun).not.toHaveBeenCalled();
+    expect(vi.mocked(console.error).mock.calls.flat().join('\n')).toContain('voices.json holistic seat: `advisor`');
     expect(reaps).toBe(1);
   });
 });

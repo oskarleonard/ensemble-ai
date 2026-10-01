@@ -270,6 +270,7 @@ export function persistReview(
       manifest: manifestOf(input.packet),
     },
     reviewer: {
+      ...(input.reviewer.advisor === undefined ? {} : { advisor: input.reviewer.advisor }),
       effort: input.reviewer.effort,
       model: input.reviewer.model,
       vendor: input.reviewer.vendor,

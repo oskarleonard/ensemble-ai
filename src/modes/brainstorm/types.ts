@@ -35,6 +35,12 @@ export function parseVoiceIds(raw: unknown): VoiceId[] | undefined {
 // sandbox profile (grok). Structurally a ReviewerConfig (a voice run IS a read-only
 // agent run with a prompt), kept as DATA so a model is swappable without a code edit.
 export interface VoiceConfig {
+  // The claude seat's advisor model — a model id or "off"; absent = inherit the operator's
+  // setting. `unknown` because a parsed voices.json carries WHATEVER the file says (parseVoices
+  // never throws — `null` or a typo is kept, so `config` can show it marked invalid and a run
+  // that spawns the seat refuses it). The rule (core/types parseSeatAdvisor) is applied where a
+  // seat is about to spawn: its up-front resolution, then claudeAdvisorArgs at the spawn.
+  advisor?: unknown;
   cmd: string;
   effort: string;
   id: VoiceId;
@@ -42,6 +48,11 @@ export interface VoiceConfig {
   sandbox?: string;
   vendor: string;
 }
+
+// A seat config whose advisor has passed parseSeatAdvisor — what the seat resolvers (gate-seat,
+// holistic) return and what the review layer's recording sites read, so a trail records a plain
+// string ("off" vs absent = inherit) with no re-validation.
+export type ResolvedVoiceConfig = VoiceConfig & { advisor?: string };
 
 // One idea — a typed unit so critique + synthesis can reference it stably. `id` is
 // assigned by the orchestrator (e.g. `codex-1`); `voiceId` records its author.
