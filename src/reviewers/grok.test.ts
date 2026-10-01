@@ -20,6 +20,7 @@ import {
   runGrokReview,
 } from './grok';
 import { REVIEW_TIMEOUT_MS } from './codex';
+import { ensureGrokLogin, GROK_LOGIN_EXPIRY_FAIL_PREFIX, GrokLoginExpiryError } from './grok-login';
 import type { ReviewerConfig } from '../core/types';
 
 // The REAL captured stream (grok 1.0.5, `--output-format streaming-messages-json
@@ -50,6 +51,12 @@ vi.mock('node:child_process', async (importOriginal) => ({
   spawn: vi.fn(),
 }));
 vi.mock('../core/bin', () => ({ resolveBin: () => 'grok' }));
+// The login pre-flight reads the operator's real ~/.grok/auth.json and, near expiry, would spend a
+// mocked spawn on `grok models` — so it passes here by default (grok-login.test.ts owns its logic).
+vi.mock('./grok-login', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./grok-login')>()),
+  ensureGrokLogin: vi.fn(async () => undefined),
+}));
 
 type FakeChild = EventEmitter & {
   kill: (sig: string) => void;
@@ -357,9 +364,17 @@ const grokStream = (reply: string): string =>
     }),
   ].join('\n') + '\n';
 
+// runGrokReview awaits its login pre-flight before it spawns, so the fake child appears a few
+// microtasks after the call. Settle only microtasks — some cases run on fake timers, which a
+// timer-based wait would advance.
+async function untilSpawned(): Promise<void> {
+  for (let i = 0; i < 20 && !child; i++) await Promise.resolve();
+}
+
 describe('runGrokReview (stdout capture)', () => {
   it("captures the NDJSON stream from STDOUT (piped) and returns the result line's reply on a clean close", async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
     // stdout MUST be piped for grok (its reply is stdout, not an -o file) — and under
     // `capture: 'stdout'` that same pipe is what resets the liveness watchdog.
     expect(lastOpts.stdio[1]).toBe('pipe');
@@ -375,6 +390,7 @@ describe('runGrokReview (stdout capture)', () => {
 
   it('accumulates chunked stdout before settling', async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
     const stream = grokStream('CHUNKED');
     child?.stdout.emit('data', Buffer.from(stream.slice(0, 60)));
     child?.stdout.emit('data', Buffer.from(stream.slice(60)));
@@ -385,6 +401,7 @@ describe('runGrokReview (stdout capture)', () => {
 
   it('does NOT truncate when exit fires before the final stdout chunk (Codex f4)', async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
     // exit arrives BEFORE the pipe has delivered the rest of the RESULT LINE — settling on exit
     // would read a half-written terminal line, i.e. a seat that answered read as one that never
     // did. The grace defers to close.
@@ -402,6 +419,7 @@ describe('runGrokReview (stdout capture)', () => {
   // heap of half-finished NDJSON, and the ONLY safe reading of it is "no review".
   it('fails closed on a stream cut before its result line — never the raw NDJSON as a "review"', async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
     child?.stdout.emit('data', Buffer.from(CUT_STREAM));
     child?.emit('close');
     const result = await p;
@@ -414,6 +432,7 @@ describe('runGrokReview (stdout capture)', () => {
   // would misread as format-drift and hand parseFindings a JSON fragment as if it were a review.
   it('fails closed on a stream cut inside its FIRST line — not mistaken for the legacy envelope', async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
     child?.stdout.emit('data', Buffer.from(STREAM_LINES[0].slice(0, 40)));
     child?.emit('close');
     const result = await p;
@@ -425,6 +444,7 @@ describe('runGrokReview (stdout capture)', () => {
   // old envelope, which is not a stream at all — so the legacy extractor is allowed to take it.
   it('still reads the OLD json envelope when grok emits no stream at all', async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
     child?.stdout.emit(
       'data',
       Buffer.from(JSON.stringify({ stopReason: 'EndTurn', text: 'LEGACY REVIEW' }))
@@ -437,6 +457,7 @@ describe('runGrokReview (stdout capture)', () => {
 
   it('returns a bounded NDJSON tail so a seat leaves a record of what it was doing', async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
     child?.stdout.emit('data', Buffer.from(grokStream('REVIEW BODY')));
     child?.emit('close');
     const result = await p;
@@ -453,6 +474,7 @@ describe('runGrokReview (stdout capture)', () => {
       },
       { timeoutMs: 20 }
     );
+    await untilSpawned();
     await new Promise((r) => setTimeout(r, 45)); // let the watchdog fire
     expect(child?.kills[0]).toBe('SIGTERM');
     child?.emit('close');
@@ -470,6 +492,7 @@ describe('runGrokReview (stdout capture)', () => {
   it('reclaims a SILENT seat at the liveness bar and says so', async () => {
     vi.useFakeTimers();
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
     // It spoke once, then went quiet — so the rolling bar is armed and reset, not never-started.
     child?.stdout.emit('data', Buffer.from('{"type":"system","subtype":"init"}\n'));
     vi.advanceTimersByTime(GROK_INACTIVITY_TIMEOUT_MS + 1_000);
@@ -489,6 +512,7 @@ describe('runGrokReview (stdout capture)', () => {
   it('a seat that keeps streaming is NEVER cut by the liveness bar', async () => {
     vi.useFakeTimers();
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
     const almost = GROK_INACTIVITY_TIMEOUT_MS - 60_000; // 14 min of quiet, then a heartbeat
     for (let i = 0; i < 2; i++) {
       child?.stdout.emit('data', Buffer.from(`{"type":"stream_event","n":${i}}\n`));
@@ -566,8 +590,8 @@ describe('runGrokReview — the worktree seat is fenced by the egress proxy', ()
     await run;
   });
 
-  // THE TEARDOWN IS UNCONDITIONAL. `ensureSandboxProfile`, `resolveGrokBin` and `runReviewerExec`
-  // all sit between "the proxy is listening" and "the reply came back", and each can throw. On the
+  // THE TEARDOWN IS UNCONDITIONAL. `ensureSandboxProfile` and `runReviewerExec`
+  // both sit between "the proxy is listening" and "the reply came back", and each can throw. On the
   // old `.then()`-only teardown the proxy's listening server survived the throw — and because the
   // CLI sets `process.exitCode` instead of calling `process.exit()`, that live handle kept the
   // event loop alive and the run never exited. Assert the socket is actually GONE, not just that a
@@ -595,6 +619,43 @@ describe('runGrokReview — the worktree seat is fenced by the egress proxy', ()
     } finally {
       fs.rmSync(wt, { force: true, recursive: true });
     }
+  });
+});
+
+// THE LOGIN PRE-FLIGHT. A sandboxed seat cannot refresh its own OAuth token, so it must not start
+// with one that expires before its backstop could cut it. The pre-flight gets the seat's EFFECTIVE
+// deadline, and a refusal is a failed seat named in failWhy — never a spawn, never a rejection.
+describe('runGrokReview — the login pre-flight runs before anything spawns', () => {
+  it('checks the login against the seat\'s effective timeout, through the same resolved bin', async () => {
+    const preflight = vi.mocked(ensureGrokLogin);
+    const spawned = vi.mocked(spawn);
+    preflight.mockClear();
+    spawned.mockClear();
+    const run = runGrokReview('p', CONFIG, { timeoutMs: 10_000 });
+    await vi.waitFor(() => expect(spawned).toHaveBeenCalled());
+    expect(preflight).toHaveBeenCalledWith({ bin: 'grok', deadlineMs: 10_000 });
+    child?.emit('exit');
+    await run;
+    // No explicit timeout: the worktree seat's 60-min backstop is the deadline the login must outlive.
+    preflight.mockClear();
+    spawned.mockClear();
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
+    const wtRun = runGrokReview('p', CONFIG, { worktree: wt });
+    await vi.waitFor(() => expect(spawned).toHaveBeenCalled());
+    expect(preflight).toHaveBeenCalledWith({ bin: 'grok', deadlineMs: GROK_WORKTREE_REVIEW_TIMEOUT_MS });
+    child?.emit('exit');
+    await wtRun;
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  it('fails the seat BEFORE spawn with the distinct failWhy when the login cannot outlive it', async () => {
+    const spawned = vi.mocked(spawn);
+    spawned.mockClear();
+    const why = `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: the login expires soon — run \`grok\` once to sign in`;
+    vi.mocked(ensureGrokLogin).mockRejectedValueOnce(new GrokLoginExpiryError(why));
+    const result = await runGrokReview('p', CONFIG, { timeoutMs: 10_000 });
+    expect(spawned).not.toHaveBeenCalled();
+    expect(result).toEqual({ failWhy: why, ok: false, raw: null, stderrTail: why, timedOut: false });
   });
 });
 

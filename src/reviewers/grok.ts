@@ -10,6 +10,7 @@ import type { SandboxProfileRef } from '../modes/review/evidence';
 
 import { type CodexReviewResult, type RunReviewOpts } from './codex';
 import { egressStartFailure, startSeatEgressProxy } from './egress-seat';
+import { ensureGrokLogin, GrokLoginExpiryError } from './grok-login';
 
 // GROK NOW HAS A LIVENESS SIGNAL, and these three numbers are what that bought.
 //
@@ -401,6 +402,18 @@ export async function runGrokReview(
       timedOut: false,
     };
   }
+  // THE LOGIN PRE-FLIGHT (grok-login.ts): the sandboxed seat cannot refresh its own OAuth token, so
+  // a login that expires mid-review parks it on 401s until the backstop. Refresh it OUTSIDE the
+  // sandbox first, through the same binary the seat spawns; if the login still cannot outlive this
+  // seat's deadline, fail NOW with a failWhy every consumer reads — never spawn a seat doomed to
+  // hang. Before the proxy starts, so a refused seat leaves no fence to tear down.
+  const bin = resolveGrokBin();
+  try {
+    await ensureGrokLogin({ bin, deadlineMs: timeoutMs });
+  } catch (e) {
+    if (!(e instanceof GrokLoginExpiryError)) throw e;
+    return { failWhy: e.message, ok: false, raw: null, stderrTail: e.message, timedOut: false };
+  }
   // PACKET-MODE VERIFICATION (packet-f1, 2026-07-10) — the codex packet fence (buildCodexReviewArgs)
   // has NO grok counterpart, and this documents why, verified rather than assumed (the task: verify,
   // document, change nothing):
@@ -436,8 +449,8 @@ export async function runGrokReview(
       return { ok: false, raw: null, stderrTail: egressStartFailure('grok', e), timedOut: false };
     }
   }
-  // ONCE THE FENCE IS UP IT COMES DOWN ON EVERY PATH. `ensureSandboxProfile` writes a file,
-  // `resolveGrokBin` throws when grok is not installed, and `runReviewerExec` can reject — each of
+  // ONCE THE FENCE IS UP IT COMES DOWN ON EVERY PATH. `ensureSandboxProfile` writes a file and
+  // `runReviewerExec` can reject (grok's bin now resolves before the fence goes up) — either of
   // those, on the old `.then()`-only teardown, left the proxy's listening server and its sockets
   // open. The CLI sets `process.exitCode` rather than calling `process.exit()`, so a leaked handle
   // keeps the event loop alive and the run never exits. `finally` is what makes that unreachable —
@@ -448,7 +461,7 @@ export async function runGrokReview(
     cwd = worktreeCwd ?? fs.mkdtempSync(path.join(os.tmpdir(), 'grok-review-'));
     const { raw, stderrTail, timedOut, timedOutReason } = await runReviewerExec({
       args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
-      bin: resolveGrokBin(),
+      bin,
       capture: 'stdout',
       ...(proxy ? { env: proxyEnv(proxy.url) } : {}),
       // THE LIVENESS WATCHDOG. Under `capture: 'stdout'` the accumulated stdout IS what resets it
