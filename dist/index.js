@@ -2287,7 +2287,7 @@ function warnToStderr(message) {
   process.stderr.write(grokLoginWarningLine(message));
 }
 function errorText(e) {
-  return e instanceof Error ? e.message : String(e);
+  return (e instanceof Error ? e.message : String(e)).slice(0, 200);
 }
 function firstLine(run) {
   return run.stdout?.split("\n").find((line) => line.trim())?.trim();

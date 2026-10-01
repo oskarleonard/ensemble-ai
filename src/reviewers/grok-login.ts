@@ -141,8 +141,10 @@ function warnToStderr(message: string): void {
   process.stderr.write(grokLoginWarningLine(message));
 }
 
+// An error as warning text — bounded like the status line, so no thrown message can outgrow the
+// stderr room a seat leaves for the warning.
 function errorText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
+  return (e instanceof Error ? e.message : String(e)).slice(0, 200);
 }
 
 // One models run: its result and the cap it ran under, or the error it failed with (a spawn that

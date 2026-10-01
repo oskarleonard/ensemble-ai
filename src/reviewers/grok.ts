@@ -429,7 +429,7 @@ export async function runGrokReview(
   // The pre-flight's warnings LEAD the seat's stderrTail, so they reach the consumer's trail. The
   // trail keeps the LAST GROK_SEAT_STDERR_LIMIT chars (seat-run seatDiagnostics), so the seat keeps
   // only the room the note leaves — a full seat tail would otherwise push the warning out of the
-  // record. (A warning quotes at most 200 chars of status and 500 of stderr per run, so it fits.)
+  // record. (A warning quotes at most 200 chars of status or error and 500 of stderr per run, so it fits.)
   const seatStderrLimit = Math.max(1, GROK_SEAT_STDERR_LIMIT - preflightNote.length);
   const seatTimeoutMs = deadlineAt - Date.now();
   if (seatTimeoutMs <= 0) {
