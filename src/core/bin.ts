@@ -1,25 +1,35 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 
 const binCache = new Map<string, string>();
 
-// Resolve a vendor CLI binary by name. Reviewer CLIs (codex, grok) live in places
-// a bare/non-login env can't see (nvm, ~/.local/bin), so resolution tries, in
-// order: an explicit env override, caller-supplied candidate paths, then the
-// login shell's PATH (`zsh -ic`). Memoized by name (resolution is stable for the
-// process lifetime). Throws if nothing resolves — a missing reviewer CLI should
-// fail loud, not silently skip the review.
+// Resolve a vendor CLI binary by name. A set, non-empty `opts.envVar` override is
+// AUTHORITATIVE: its path is returned if it exists and THROWS if it does not — never
+// falling through to the cache, the candidates or PATH, because an override is a pin
+// (e.g. a canaried CLI copy) and silently running another binary defeats it. It is
+// never memoized, so a throw re-checks on the next call. Without an override, reviewer
+// CLIs (codex, grok) live in places a bare/non-login env can't see (nvm,
+// ~/.local/bin), so resolution tries caller-supplied candidate paths, then the login
+// shell's PATH (`zsh -ic`), memoized by name (stable for the process lifetime).
+// Throws if nothing resolves — a missing reviewer CLI should fail loud, not silently
+// skip the review.
 export function resolveBin(
   name: string,
   opts: { candidates?: string[]; envVar?: string } = {}
 ): string {
+  const override = opts.envVar ? process.env[opts.envVar] : undefined;
+  if (override) {
+    // Absolute, so the path checked here is the one spawned from the seat's own cwd.
+    const bin = path.resolve(override);
+    if (fs.existsSync(bin)) return bin;
+    throw new Error(
+      `${opts.envVar}=${override} does not exist — unset it to use the default resolution`
+    );
+  }
   const cached = binCache.get(name);
   if (cached) return cached;
-  const candidates = [
-    opts.envVar ? process.env[opts.envVar] : undefined,
-    ...(opts.candidates ?? []),
-  ].filter((c): c is string => Boolean(c));
-  for (const c of candidates) {
+  for (const c of opts.candidates ?? []) {
     if (fs.existsSync(c)) {
       binCache.set(name, c);
       return c;

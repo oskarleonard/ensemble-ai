@@ -262,8 +262,9 @@ async function runCodexWorktreeReview(
     );
   }
   // Resolve the binary BEFORE anything acquires a temp dir or a socket: resolveCodexBin THROWS when
-  // codex is not installed, and a throw after writeCodexSandboxProfile would strand its owner-only
-  // dir — mkdtemp names are random, so a leaked one is unfindable and nothing can ever clean it up.
+  // codex is not installed or a set CODEX_BIN is missing, and a throw after
+  // writeCodexSandboxProfile would strand its owner-only dir — mkdtemp names are random, so a
+  // leaked one is unfindable and nothing can ever clean it up.
   let bin: string;
   try {
     bin = resolveCodexBin();
