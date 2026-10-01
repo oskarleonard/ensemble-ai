@@ -189,6 +189,14 @@ describe('renderReviewComment', () => {
     expect(body).toMatch(/\[[a-z-]+\] SQL injection in query/);
   });
 
+  it('the gate seat line carries a stated advisor; an inheriting seat shows none (off ≠ inherit)', () => {
+    const off = renderReviewComment(
+      renderInput({ gateSeat: { advisor: 'off', effort: 'high', effortSource: 'flag', model: 'opus', modelSource: 'default' } })
+    );
+    expect(off).toContain('gate seat anthropic/opus @ high · advisor off (model: default, effort: flag)');
+    expect(renderReviewComment(renderInput())).not.toContain('advisor');
+  });
+
   it('omits synthesis + gate sections when the Opus layer did not run (--no-claude)', () => {
     const body = renderReviewComment(renderInput({ claudeLayer: null, gateSeat: null }));
     expect(body).not.toContain('### Synthesis');

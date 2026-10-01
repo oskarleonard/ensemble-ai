@@ -12,19 +12,32 @@ const VOICES = vi.hoisted(() => {
 
 // Mock the engine: the question is only WHETHER the paid core fan-out starts.
 vi.mock('./modes/review', () => ({ runReviewMode: vi.fn() }));
+// The brainstorm/consult voices are mocked adapters (no model turn ever runs): the question is
+// WHICH voices a run spawns, and whether an advisor refusal lands before any of them.
+const voiceCalls = vi.hoisted(() => [] as string[]);
+vi.mock('./modes/brainstorm/voices', async (importActual) => {
+  const actual = await importActual<typeof import('./modes/brainstorm/voices')>();
+  const fake = (id: string) => async () => {
+    voiceCalls.push(id);
+    return { ok: false, raw: null, stderrTail: '', timedOut: false };
+  };
+  return { ...actual, VOICE_ADAPTERS: { claude: fake('claude'), codex: fake('codex'), grok: fake('grok') } };
+});
 vi.mock('./modes/review/self-contained', async (importActual) => ({
   ...(await importActual<typeof import('./modes/review/self-contained')>()),
   runClaudeReviewLayer: vi.fn(),
 }));
 
-import { main } from './cli';
+import { main, toCommentGateSeat } from './cli';
 import { runReviewMode } from './modes/review';
+import { VOICE_DEFAULTS } from './modes/brainstorm/voices';
 
 const mockRun = vi.mocked(runReviewMode);
 const stderr = (): string => vi.mocked(console.error).mock.calls.map((c) => c.join(' ')).join('\n');
 
 beforeEach(() => {
   mockRun.mockReset();
+  voiceCalls.length = 0;
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
 });
@@ -49,7 +62,10 @@ describe('review — an invalid Anthropic-seat advisor fails BEFORE the core fan
   });
 
   it('`--no-claude` runs no Anthropic seat, so it reads none of their advisors', async () => {
-    fs.writeFileSync(VOICES, JSON.stringify({ gate: { advisor: null } }));
+    fs.writeFileSync(
+      VOICES,
+      JSON.stringify({ claude: { advisor: 'Opus 5' }, gate: { advisor: null }, holistic: { advisor: 7 } })
+    );
     mockRun.mockRejectedValue(new Error('engine reached'));
     expect(await main(['review', '--working-tree', '--no-claude'])).toBe(3);
     expect(mockRun).toHaveBeenCalledOnce();
@@ -69,5 +85,47 @@ describe('regate — an invalid gate advisor is a pre-spawn refusal (exit 3), no
     } finally {
       fs.rmSync(out, { force: true, recursive: true });
     }
+  });
+});
+
+describe('brainstorm · consult — only the roster advisors are checked, before any voice spawns', () => {
+  it('`brainstorm --voices codex,grok` runs despite an invalid claude advisor (the voice is unused)', async () => {
+    fs.writeFileSync(VOICES, JSON.stringify({ claude: { advisor: 'Opus 5' } }));
+    const code = await main(['brainstorm', 'a topic', '--voices', 'codex,grok']);
+    expect(code).not.toBe(3);
+    expect(voiceCalls.sort()).toEqual(['codex', 'grok']);
+    expect(stderr()).not.toContain('advisor');
+  });
+
+  it('`brainstorm` with claude in the roster refuses (exit 3) before ANY voice spawns', async () => {
+    fs.writeFileSync(VOICES, JSON.stringify({ claude: { advisor: 'Opus 5' } }));
+    expect(await main(['brainstorm', 'a topic', '--voices', 'codex,claude'])).toBe(3);
+    expect(voiceCalls).toEqual([]);
+    expect(stderr()).toContain('voices.json claude seat: `advisor`');
+  });
+
+  it('`consult` follows the same rule', async () => {
+    fs.writeFileSync(VOICES, JSON.stringify({ claude: { advisor: null } }));
+    expect(await main(['consult', 'a question'])).toBe(3);
+    expect(voiceCalls).toEqual([]);
+    expect(await main(['consult', 'a question', '--voices', 'grok'])).not.toBe(3);
+    expect(voiceCalls).toEqual(['grok']);
+  });
+});
+
+describe('the posted gate seat line records the advisor beside model/effort', () => {
+  const seat = (advisor?: string) => ({
+    config: { ...VOICE_DEFAULTS.claude, ...(advisor === undefined ? {} : { advisor }), effort: 'max', model: 'opus' },
+    effortSource: 'file' as const,
+    modelSource: 'file' as const,
+    vendor: 'anthropic' as const,
+    vendorSource: 'default' as const,
+  });
+
+  it('"off" is recorded; an inheriting seat has NO advisor key — the two stay distinguishable', () => {
+    expect(toCommentGateSeat(seat('off'))).toEqual({
+      advisor: 'off', effort: 'max', effortSource: 'file', model: 'opus', modelSource: 'file',
+    });
+    expect(toCommentGateSeat(seat())).not.toHaveProperty('advisor');
   });
 });

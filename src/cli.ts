@@ -1065,7 +1065,7 @@ function resolveStageTarget(target: PostTarget, gh: GhRunner): StageTarget | nul
 // GateSeat → the footer's resolved seat: model/effort with the 'default' sentinel spelled out
 // (a resolved-but-'default' model is the built-in Opus), the stated advisor (absent = inherited),
 // plus the per-field source for provenance.
-function toCommentGateSeat(seat: GateSeat): CommentGateSeat {
+export function toCommentGateSeat(seat: GateSeat): CommentGateSeat {
   // Reuse the reviewer layer's model-label rule (resolve to the configured model, else the
   // built-in `opus`) so the footer's seat model can't drift from the reviewer's own label.
   const model = claudeModelLabel(seat.config);

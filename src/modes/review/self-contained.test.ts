@@ -195,6 +195,32 @@ describe('runClaudeReviewLayer — 3-reviewer default, per-reviewer files, gate 
     expect(res.claudeSpawned).toBe(true);
   });
 
+  it('review.claude.json records the seat\'s stated advisor — "off" vs absent (inherit) — and the gate prompt never sees it', async () => {
+    const readSeat = (base: string, runId: string) =>
+      JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'review.claude.json'), 'utf8'));
+    for (const [advisor, expected] of [['off', 'off'], [undefined, undefined]] as const) {
+      const base = tmpTrail();
+      const runId = 'run1';
+      seedCoreTrail(base, runId, [stored('codex'), stored('grok')]);
+      const { calls, run } = makeRunner();
+      const res = await runClaudeReviewLayer({
+        baseDir: base,
+        claudeConfig: advisor === undefined ? CFG : { ...CFG, advisor },
+        coreReviews: [stored('codex'), stored('grok')],
+        expectedHeadSha: HEAD,
+        includeClaudeReviewer: true,
+        reviewPrompt: 'REVIEW PROMPT PAYLOAD',
+        run,
+        runId,
+      });
+      const seat = readSeat(base, runId);
+      if (expected === undefined) expect(seat).not.toHaveProperty('advisor');
+      else expect(seat.advisor).toBe(expected);
+      expect(res.claudeReview?.advisor).toBe(expected);
+      expect(calls.find((c) => c.round === 'gate')?.prompt).not.toContain('"advisor"');
+    }
+  });
+
   // `claudeSpawned` is what the run's REALIZED evidence for the `claude` seat is derived from, the
   // same way `gateSpawned` drives the `gate` seat's. A producer whose SPAWN threw (claude is not
   // installed; the capability fence refused an unfenceable read root) read NOTHING — attesting it
