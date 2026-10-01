@@ -403,10 +403,11 @@ export async function runGrokReview(
     };
   }
   // THE LOGIN PRE-FLIGHT (grok-login.ts): the sandboxed seat cannot refresh its own OAuth token, so
-  // a login that expires mid-review parks it on 401s until the backstop. Refresh it OUTSIDE the
-  // sandbox first, through the same binary the seat spawns; if the login still cannot outlive this
-  // seat's deadline, fail NOW with a failWhy every consumer reads — never spawn a seat doomed to
-  // hang. Before the proxy starts, so a refused seat leaves no fence to tear down.
+  // a login that expires mid-review parks it on 401s until the backstop. Run grok's own refresh
+  // OUTSIDE the sandbox first, sized to this seat's deadline, through the same binary the seat
+  // spawns; if grok then says it is not authenticated, fail NOW with a failWhy every consumer reads
+  // — never spawn a seat doomed to hang. Before the proxy starts, so a refused seat leaves no fence
+  // to tear down.
   const bin = resolveGrokBin();
   try {
     await ensureGrokLogin({ bin, deadlineMs: timeoutMs });

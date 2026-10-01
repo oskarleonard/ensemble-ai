@@ -20,7 +20,13 @@ import {
   runGrokReview,
 } from './grok';
 import { REVIEW_TIMEOUT_MS } from './codex';
-import { ensureGrokLogin, GROK_LOGIN_EXPIRY_FAIL_PREFIX, GrokLoginExpiryError } from './grok-login';
+import { startSeatEgressProxy } from './egress-seat';
+import {
+  ensureGrokLogin,
+  GROK_LOGIN_EXPIRY_FAIL_PREFIX,
+  GROK_STATUS_NOT_AUTHENTICATED,
+  GrokLoginExpiryError,
+} from './grok-login';
 import type { ReviewerConfig } from '../core/types';
 
 // The REAL captured stream (grok 1.0.5, `--output-format streaming-messages-json
@@ -51,12 +57,17 @@ vi.mock('node:child_process', async (importOriginal) => ({
   spawn: vi.fn(),
 }));
 vi.mock('../core/bin', () => ({ resolveBin: () => 'grok' }));
-// The login pre-flight reads the operator's real ~/.grok/auth.json and, near expiry, would spend a
-// mocked spawn on `grok models` — so it passes here by default (grok-login.test.ts owns its logic).
+// The login pre-flight runs `grok models` before every seat, which would spend the mocked spawn — so
+// it passes here by default (grok-login.test.ts owns its logic); one case below runs the real one.
 vi.mock('./grok-login', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./grok-login')>()),
   ensureGrokLogin: vi.fn(async () => undefined),
 }));
+// The real egress proxy, wrapped so a case can prove it never started.
+vi.mock('./egress-seat', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./egress-seat')>();
+  return { ...actual, startSeatEgressProxy: vi.fn(actual.startSeatEgressProxy) };
+});
 
 type FakeChild = EventEmitter & {
   kill: (sig: string) => void;
@@ -622,11 +633,11 @@ describe('runGrokReview — the worktree seat is fenced by the egress proxy', ()
   });
 });
 
-// THE LOGIN PRE-FLIGHT. A sandboxed seat cannot refresh its own OAuth token, so it must not start
-// with one that expires before its backstop could cut it. The pre-flight gets the seat's EFFECTIVE
-// deadline, and a refusal is a failed seat named in failWhy — never a spawn, never a rejection.
+// THE LOGIN PRE-FLIGHT. A sandboxed seat cannot refresh its own OAuth token, so grok refreshes it
+// first, sized to the seat's EFFECTIVE deadline, and a grok that says it is not authenticated is a
+// failed seat named in failWhy — never a spawn, never a rejection.
 describe('runGrokReview — the login pre-flight runs before anything spawns', () => {
-  it('checks the login against the seat\'s effective timeout, through the same resolved bin', async () => {
+  it('sizes the refresh to the seat\'s effective timeout, through the same resolved bin', async () => {
     const preflight = vi.mocked(ensureGrokLogin);
     const spawned = vi.mocked(spawn);
     preflight.mockClear();
@@ -636,25 +647,50 @@ describe('runGrokReview — the login pre-flight runs before anything spawns', (
     expect(preflight).toHaveBeenCalledWith({ bin: 'grok', deadlineMs: 10_000 });
     child?.emit('exit');
     await run;
-    // No explicit timeout: the worktree seat's 60-min backstop is the deadline the login must outlive.
+    // No explicit timeout: the worktree seat's 60-min backstop is the deadline the refresh covers.
     // The pre-flight refuses here, so the seat returns before its egress proxy would start — the
     // check provably precedes the fence, and the case needs no loopback listen.
     preflight.mockClear();
     spawned.mockClear();
+    vi.mocked(startSeatEgressProxy).mockClear();
     preflight.mockRejectedValueOnce(new GrokLoginExpiryError(`${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: x`));
     const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
     const refused = await runGrokReview('p', CONFIG, { worktree: wt });
     expect(preflight).toHaveBeenCalledWith({ bin: 'grok', deadlineMs: GROK_WORKTREE_REVIEW_TIMEOUT_MS });
     expect(refused).toMatchObject({ ok: false });
-    expect(refused.egressDenials).toBeUndefined(); // no proxy was ever started
+    expect(vi.mocked(startSeatEgressProxy)).not.toHaveBeenCalled(); // no proxy was ever started
     expect(spawned).not.toHaveBeenCalled();
     fs.rmSync(wt, { force: true, recursive: true });
   });
 
-  it('fails the seat BEFORE spawn with the distinct failWhy when the login cannot outlive it', async () => {
+  // The REAL pre-flight against the fake spawn: the one spawn is `grok models`, grok answers that it
+  // is not authenticated, and the worktree seat is refused before its egress proxy could start.
+  it('a not-authenticated grok refuses the seat before it spawns and before the proxy starts', async () => {
+    const actual = await vi.importActual<typeof import('./grok-login')>('./grok-login');
+    vi.mocked(ensureGrokLogin).mockImplementationOnce(actual.ensureGrokLogin);
+    const spawned = vi.mocked(spawn);
+    const proxy = vi.mocked(startSeatEgressProxy);
+    spawned.mockClear();
+    proxy.mockClear();
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
+    const run = runGrokReview('p', CONFIG, { worktree: wt });
+    await vi.waitFor(() => expect(spawned).toHaveBeenCalledTimes(1));
+    expect(spawned.mock.calls[0]?.[1]).toEqual(['--sandbox', 'off', 'models']);
+    child?.stdout.emit('data', Buffer.from(`${GROK_STATUS_NOT_AUTHENTICATED}\n\nDefault model: grok-4.6\n`));
+    child?.emit('close');
+    const result = await run;
+    expect(result.ok).toBe(false);
+    expect(result.failWhy).toMatch(new RegExp(`^${GROK_LOGIN_EXPIRY_FAIL_PREFIX}`));
+    expect(result.failWhy).toContain(`"${GROK_STATUS_NOT_AUTHENTICATED}"`);
+    expect(spawned).toHaveBeenCalledTimes(1); // the models run only — the seat never spawned
+    expect(proxy).not.toHaveBeenCalled();
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  it('fails the seat BEFORE spawn with the distinct failWhy when grok is not authenticated', async () => {
     const spawned = vi.mocked(spawn);
     spawned.mockClear();
-    const why = `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: the login expires soon — run \`grok\` once to sign in`;
+    const why = `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: grok reports "You are not authenticated." — run \`grok\` once to sign in`;
     vi.mocked(ensureGrokLogin).mockRejectedValueOnce(new GrokLoginExpiryError(why));
     const result = await runGrokReview('p', CONFIG, { timeoutMs: 10_000 });
     expect(spawned).not.toHaveBeenCalled();

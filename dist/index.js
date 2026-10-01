@@ -2244,9 +2244,11 @@ import path8 from "path";
 import fs8 from "fs";
 import os6 from "os";
 import path7 from "path";
-var GROK_AUTH_FILE = path7.join(os6.homedir(), ".grok", "auth.json");
 var GROK_LOGIN_MARGIN_MS = 3e5;
 var GROK_LOGIN_REFRESH_TIMEOUT_MS = 6e4;
+var GROK_STATUS_LOGGED_IN = "You are logged in with grok.com.";
+var GROK_STATUS_API_KEY = "You are using XAI_API_KEY.";
+var GROK_STATUS_NOT_AUTHENTICATED = "You are not authenticated.";
 var GROK_LOGIN_EXPIRY_FAIL_PREFIX = "grok login expires before this review can finish";
 function isGrokLoginExpiryFailure(failWhy) {
   return failWhy?.startsWith(GROK_LOGIN_EXPIRY_FAIL_PREFIX) ?? false;
@@ -2257,56 +2259,53 @@ var GrokLoginExpiryError = class extends Error {
     this.name = "GrokLoginExpiryError";
   }
 };
-function readGrokLoginExpiry(file = GROK_AUTH_FILE) {
-  let parsed;
-  try {
-    parsed = JSON.parse(fs8.readFileSync(file, "utf8"));
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== "object" || parsed === null) return null;
-  const expiries = [];
-  for (const entry of Object.values(parsed)) {
-    if (typeof entry !== "object" || entry === null) continue;
-    const expiresAt = entry.expires_at;
-    if (typeof expiresAt !== "string") continue;
-    const ms = Date.parse(expiresAt);
-    if (Number.isFinite(ms)) expiries.push(ms);
-  }
-  if (expiries.length === 0) return null;
-  return { earliest: new Date(Math.min(...expiries)), latest: new Date(Math.max(...expiries)) };
-}
 async function runGrokModels(run) {
-  await runReviewerExec({ ...run, capture: "stdout", stderrLimit: 1e3 });
+  const { raw, timedOut } = await runReviewerExec({ ...run, capture: "stdout", stderrLimit: 1e3 });
+  return { stdout: raw, timedOut };
+}
+function warnToStderr(message) {
+  process.stderr.write(`\u26A0 ensemble-ai grok pre-flight: ${message}
+`);
 }
 async function ensureGrokLogin(opts) {
-  const file = opts.authFile ?? GROK_AUTH_FILE;
-  const now = opts.now ?? Date.now;
   const marginMs = opts.marginMs ?? GROK_LOGIN_MARGIN_MS;
-  const needMs = opts.deadlineMs + marginMs;
-  const before = readGrokLoginExpiry(file);
-  if (!before || before.earliest.getTime() - now() >= needMs) return;
+  const warn = opts.warn ?? warnToStderr;
+  const proceed = "the seat proceeds; its backstop owns a login that cannot last";
   const cwd = fs8.mkdtempSync(path7.join(os6.tmpdir(), "grok-login-"));
+  let result;
   try {
-    await (opts.runModels ?? runGrokModels)({
-      args: ["models"],
+    result = await (opts.runModels ?? runGrokModels)({
+      args: ["--sandbox", "off", "models"],
       bin: opts.bin,
       cwd,
-      env: { GROK_AUTH_EARLY_INVALIDATION_SECS: String(Math.ceil(needMs / 1e3)) },
+      env: {
+        GROK_AUTH_EARLY_INVALIDATION_SECS: String(Math.ceil((opts.deadlineMs + marginMs) / 1e3)),
+        GROK_SANDBOX: void 0
+      },
       timeoutMs: GROK_LOGIN_REFRESH_TIMEOUT_MS
     });
-  } catch {
+  } catch (e) {
+    warn(`\`grok models\` failed (${e instanceof Error ? e.message : String(e)}) \u2014 ${proceed}`);
+    return;
   } finally {
     try {
       fs8.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
   }
-  const after = readGrokLoginExpiry(file)?.latest;
-  if (after && after.getTime() - now() >= needMs) return;
-  const deadline = new Date(now() + opts.deadlineMs).toISOString();
-  throw new GrokLoginExpiryError(
-    `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: the login expires ${(after ?? before.latest).toISOString()}, before the seat's deadline (${deadline}) plus a ${Math.round(marginMs / 6e4)}-min margin, even after a refresh outside the sandbox \u2014 run \`grok\` once to sign in, then re-run the review; if a fresh sign-in still falls short, the seat's timeout is longer than a grok login lives, so shorten it.`
+  if (result.timedOut) {
+    warn(`\`grok models\` did not finish within ${GROK_LOGIN_REFRESH_TIMEOUT_MS / 1e3} s \u2014 ${proceed}`);
+    return;
+  }
+  const status = result.stdout?.split("\n").find((line) => line.trim())?.trim();
+  if (status === GROK_STATUS_NOT_AUTHENTICATED) {
+    throw new GrokLoginExpiryError(
+      `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: grok reports "${status}" \u2014 run \`grok\` once to sign in, then re-run the review.`
+    );
+  }
+  if (status === GROK_STATUS_LOGGED_IN || status === GROK_STATUS_API_KEY) return;
+  warn(
+    status ? `\`grok models\` printed an unrecognised status line ("${status.slice(0, 200)}") \u2014 ${proceed}` : `\`grok models\` printed no status line \u2014 ${proceed}`
   );
 }
 
@@ -6328,13 +6327,15 @@ export {
   EVIDENCE_MANIFEST_SCHEMA_VERSION,
   EVIDENCE_SEATS,
   FINDINGS_INSTRUCTIONS,
-  GROK_AUTH_FILE,
   GROK_CLI_SANDBOX,
   GROK_INACTIVITY_TIMEOUT_MS,
   GROK_LOGIN_EXPIRY_FAIL_PREFIX,
   GROK_LOGIN_MARGIN_MS,
   GROK_PACKET_REVIEW_TIMEOUT_MS,
   GROK_SANDBOX_PROFILE,
+  GROK_STATUS_API_KEY,
+  GROK_STATUS_LOGGED_IN,
+  GROK_STATUS_NOT_AUTHENTICATED,
   GROK_WORKTREE_REVIEW_TIMEOUT_MS,
   GrokLoginExpiryError,
   HARNESS_SEATS,
@@ -6503,7 +6504,6 @@ export {
   planPlacement,
   proxyEnv,
   readEnsembleConfig,
-  readGrokLoginExpiry,
   readOnlyWorktreeClause,
   readReadableSurface,
   readReceipt,

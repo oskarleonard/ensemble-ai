@@ -1,198 +1,194 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   ensureGrokLogin,
   GROK_LOGIN_EXPIRY_FAIL_PREFIX,
+  GROK_STATUS_API_KEY,
+  GROK_STATUS_LOGGED_IN,
+  GROK_STATUS_NOT_AUTHENTICATED,
   GrokLoginExpiryError,
+  type GrokModelsResult,
   type GrokModelsRun,
   isGrokLoginExpiryFailure,
-  readGrokLoginExpiry,
 } from './grok-login';
 
-// The injected clock: every case runs at this instant.
-const NOW = Date.parse('2026-10-01T01:00:00.000Z');
 const MIN = 60_000;
 const DEADLINE_MS = 30 * MIN; // a packet seat's backstop
 const MARGIN_MS = 5 * MIN;
 
-// grok's live shape (2026-10-01): one entry per issuer, `expires_at` with MICROsecond precision.
-// Every credential-looking field is present so the reader is proven to hand back none of them.
-function entry(expiresAt: unknown): Record<string, unknown> {
-  return {
-    auth_mode: 'Oidc',
-    create_time: '2026-09-30T19:12:01.872380Z',
-    email: 'someone@example.com',
-    expires_at: expiresAt,
-    key: 'SECRET-ACCESS-TOKEN',
-    refresh_token: 'SECRET-REFRESH-TOKEN',
-    user_id: 'user-1',
-  };
-}
+// grok 1.0.44's `models` stdout: its status line, then the catalog.
+const modelsStdout = (status: string): string =>
+  `${status}\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n`;
 
-function iso(ms: number): string {
-  return new Date(ms).toISOString().replace('Z', '380Z'); // 6 fractional digits, like grok writes
-}
-
-let dir: string;
-let file: string;
-
-function writeAuth(entries: Record<string, unknown>): void {
-  fs.writeFileSync(file, JSON.stringify(entries));
-}
-
-// A stubbed `grok models`: records each run, and optionally rewrites auth.json the way grok's own
-// refresh would.
-function runner(onRun?: () => void): { runs: GrokModelsRun[]; run: (r: GrokModelsRun) => Promise<void> } {
+// A stubbed `grok models`: records each run (and whether its cwd existed then), answers with `result`.
+function runner(result: GrokModelsResult | (() => never)) {
   const runs: GrokModelsRun[] = [];
+  const cwdExisted: boolean[] = [];
   return {
-    run: async (r) => {
+    cwdExisted,
+    run: async (r: GrokModelsRun): Promise<GrokModelsResult> => {
       runs.push(r);
-      onRun?.();
+      cwdExisted.push(fs.existsSync(r.cwd));
+      return typeof result === 'function' ? result() : result;
     },
     runs,
   };
 }
 
-beforeEach(() => {
-  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-login-test-'));
-  file = path.join(dir, 'auth.json');
-});
-
-afterEach(() => {
-  fs.rmSync(dir, { force: true, recursive: true });
-});
-
-describe('readGrokLoginExpiry', () => {
-  it('returns ONLY dates — no credential field crosses the reader', () => {
-    writeAuth({ 'https://auth.x.ai::a': entry('2026-10-01T07:12:01.872380Z') });
-    const expiry = readGrokLoginExpiry(file);
-    expect(expiry?.earliest).toBeInstanceOf(Date);
-    expect(expiry?.earliest.toISOString()).toBe('2026-10-01T07:12:01.872Z');
-    expect(expiry?.latest.toISOString()).toBe('2026-10-01T07:12:01.872Z');
-    expect(JSON.stringify(expiry)).not.toMatch(/SECRET|someone@|Oidc|user-1/);
-  });
-
-  it('spans the EARLIEST and the LATEST expiry across issuer entries', () => {
-    writeAuth({
-      'https://auth.x.ai::a': entry('2026-10-01T07:12:01.872380Z'),
-      'https://other.example::b': entry('2026-10-01T03:00:00.000000+00:00'),
-    });
-    const expiry = readGrokLoginExpiry(file);
-    expect(expiry?.earliest.toISOString()).toBe('2026-10-01T03:00:00.000Z');
-    expect(expiry?.latest.toISOString()).toBe('2026-10-01T07:12:01.872Z');
-  });
-
-  it('is null for a missing file, a non-JSON file, and entries with no usable expires_at', () => {
-    expect(readGrokLoginExpiry(path.join(dir, 'absent.json'))).toBeNull();
-    fs.writeFileSync(file, 'not json');
-    expect(readGrokLoginExpiry(file)).toBeNull();
-    writeAuth({ apikey: { auth_mode: 'ApiKey', key: 'SECRET' }, odd: entry(12345), bad: entry('soon') });
-    expect(readGrokLoginExpiry(file)).toBeNull();
-  });
-});
-
-describe('ensureGrokLogin', () => {
-  const opts = (run: (r: GrokModelsRun) => Promise<void>) => ({
-    authFile: file,
-    bin: '/opt/grok-pinned',
+async function preflight(result: GrokModelsResult | (() => never)) {
+  const r = runner(result);
+  const warn = vi.fn();
+  const outcome = ensureGrokLogin({
+    bin: '/opt/grok/bin/grok-pinned',
     deadlineMs: DEADLINE_MS,
     marginMs: MARGIN_MS,
-    now: () => NOW,
-    runModels: run,
+    runModels: r.run,
+    warn,
   });
+  return { outcome, r, warn };
+}
 
-  it('passes a fresh login WITHOUT running `grok models`', async () => {
-    writeAuth({ 'https://auth.x.ai::a': entry(iso(NOW + 5 * 60 * MIN)) });
-    const r = runner();
-    await expect(ensureGrokLogin(opts(r.run))).resolves.toBeUndefined();
-    expect(r.runs).toHaveLength(0);
-  });
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
-  it('refreshes a near-expiry login with ONE unsandboxed `grok models`, and passes once expires_at moved', async () => {
-    writeAuth({ 'https://auth.x.ai::a': entry(iso(NOW + 20 * MIN)) });
-    const r = runner(() => writeAuth({ 'https://auth.x.ai::a': entry(iso(NOW + 6 * 60 * MIN)) }));
-    await expect(ensureGrokLogin(opts(r.run))).resolves.toBeUndefined();
+describe('ensureGrokLogin — the models run', () => {
+  it('runs `grok --sandbox off models` through the seat bin, in a removed temp cwd, sized to the seat', async () => {
+    const { outcome, r } = await preflight({ stdout: modelsStdout(GROK_STATUS_LOGGED_IN), timedOut: false });
+    await expect(outcome).resolves.toBeUndefined();
     expect(r.runs).toHaveLength(1);
     const [run] = r.runs;
-    // The same binary the seat spawns, the bare subcommand — no `--sandbox`, no prompt.
-    expect(run.bin).toBe('/opt/grok-pinned');
-    expect(run.args).toEqual(['models']);
-    // grok's OWN refresh window, widened to the seat's deadline + margin (35 min = 2100 s).
-    expect(run.env).toEqual({ GROK_AUTH_EARLY_INVALIDATION_SECS: '2100' });
-    // A fresh temp cwd, removed afterwards — never the consumer's working directory.
-    expect(run.cwd).not.toBe(process.cwd());
-    expect(path.dirname(run.cwd)).toBe(path.resolve(os.tmpdir()));
-    expect(fs.existsSync(run.cwd)).toBe(false);
-    expect(run.timeoutMs).toBeGreaterThan(0);
+    expect(run?.args).toEqual(['--sandbox', 'off', 'models']);
+    expect(run?.bin).toBe('/opt/grok/bin/grok-pinned');
+    // grok's refresh window widened to the seat's deadline plus the margin: 30 + 5 min.
+    expect(run?.env.GROK_AUTH_EARLY_INVALIDATION_SECS).toBe('2100');
+    // The seat's sandbox is REMOVED from the child env, not set to some other value.
+    expect(Object.keys(run?.env ?? {})).toContain('GROK_SANDBOX');
+    expect(run?.env.GROK_SANDBOX).toBeUndefined();
+    expect(run?.timeoutMs).toBe(60_000);
+    expect(r.cwdExisted).toEqual([true]);
+    expect(fs.existsSync(run?.cwd ?? '')).toBe(false);
+    expect(path.dirname(run?.cwd ?? '')).toBe(os.tmpdir());
   });
 
-  // A legacy entry grok never refreshes must not refuse every seat while the live login holds — but
-  // its short expiry still buys the one refresh, in case it is the login grok actually uses.
-  it('passes on the live login when a stale entry the refresh never touches stays short', async () => {
-    const stale = { 'https://legacy.example::old': entry(iso(NOW - 3 * 24 * 60 * MIN)) };
-    writeAuth({ ...stale, 'https://auth.x.ai::a': entry(iso(NOW + 5 * 60 * MIN)) });
-    const r = runner();
-    await expect(ensureGrokLogin(opts(r.run))).resolves.toBeUndefined();
-    expect(r.runs).toHaveLength(1);
+  it('rounds the window UP to whole seconds', async () => {
+    const r = runner({ stdout: modelsStdout(GROK_STATUS_LOGGED_IN), timedOut: false });
+    await ensureGrokLogin({ bin: 'grok', deadlineMs: 1_001, marginMs: 0, runModels: r.run, warn: vi.fn() });
+    expect(r.runs[0]?.env.GROK_AUTH_EARLY_INVALIDATION_SECS).toBe('2');
   });
 
-  it('throws the distinct error when the refresh does not extend the login — and never retries', async () => {
-    writeAuth({ 'https://auth.x.ai::a': entry(iso(NOW + 20 * MIN)) });
-    const r = runner();
-    const err = await ensureGrokLogin(opts(r.run)).catch((e: unknown) => e);
+  it('runs on EVERY seat — there is no "fresh enough, skip" shortcut', async () => {
+    const r = runner({ stdout: modelsStdout(GROK_STATUS_LOGGED_IN), timedOut: false });
+    for (let i = 0; i < 3; i++) {
+      await ensureGrokLogin({ bin: 'grok', deadlineMs: DEADLINE_MS, runModels: r.run, warn: vi.fn() });
+    }
+    expect(r.runs).toHaveLength(3);
+  });
+});
+
+// The REAL runner (the shared group-killed spawn) against a stand-in grok: proves the env the child
+// actually receives — GROK_SANDBOX gone even though the parent has it, the window set — and its cwd.
+describe('ensureGrokLogin — the real runner', () => {
+  it('the child sees no GROK_SANDBOX, the widened window, the args and a temp cwd', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-login-real-'));
+    try {
+      const bin = path.join(dir, 'grok');
+      const report = path.join(dir, 'report');
+      fs.writeFileSync(
+        bin,
+        `#!/bin/sh\nprintf '%s|%s|%s|%s\\n' "\${GROK_SANDBOX-unset}" "$GROK_AUTH_EARLY_INVALIDATION_SECS" "$*" "$(pwd -P)" > "${report}"\necho '${GROK_STATUS_LOGGED_IN}'\n`,
+        { mode: 0o755 }
+      );
+      vi.stubEnv('GROK_SANDBOX', 'ensemble-review');
+      const warn = vi.fn();
+      await ensureGrokLogin({ bin, deadlineMs: DEADLINE_MS, marginMs: MARGIN_MS, warn });
+      const [sandbox, secs, args, cwd] = fs.readFileSync(report, 'utf8').trim().split('|');
+      expect(sandbox).toBe('unset');
+      expect(secs).toBe('2100');
+      expect(args).toBe('--sandbox off models');
+      expect(path.basename(cwd ?? '')).toMatch(/^grok-login-/);
+      expect(fs.existsSync(cwd ?? '')).toBe(false);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(dir, { force: true, recursive: true });
+    }
+  });
+});
+
+describe("ensureGrokLogin — grok's own status line decides", () => {
+  it('passes, silently, when grok is logged in with grok.com', async () => {
+    const { outcome, warn } = await preflight({ stdout: modelsStdout(GROK_STATUS_LOGGED_IN), timedOut: false });
+    await expect(outcome).resolves.toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('passes, silently, when grok is using XAI_API_KEY', async () => {
+    const { outcome, warn } = await preflight({ stdout: modelsStdout(GROK_STATUS_API_KEY), timedOut: false });
+    await expect(outcome).resolves.toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('refuses the seat when grok is not authenticated — naming the line read and the remedy', async () => {
+    const { outcome } = await preflight({ stdout: modelsStdout(GROK_STATUS_NOT_AUTHENTICATED), timedOut: false });
+    const err: unknown = await outcome.catch((e: unknown) => e);
     expect(err).toBeInstanceOf(GrokLoginExpiryError);
     const message = (err as Error).message;
-    expect(message.startsWith(GROK_LOGIN_EXPIRY_FAIL_PREFIX)).toBe(true);
+    expect(message.startsWith(`${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: `)).toBe(true);
+    expect(message).toContain(`grok reports "${GROK_STATUS_NOT_AUTHENTICATED}"`);
+    expect(message).toContain('run `grok` once to sign in');
     expect(isGrokLoginExpiryFailure(message)).toBe(true);
-    expect(message).toMatch(/run `grok` once to sign in/);
-    expect(message).not.toMatch(/SECRET/);
-    expect(r.runs).toHaveLength(1);
   });
 
-  it('refuses a seat that outlasts even a freshly refreshed login, naming the shorter timeout too', async () => {
-    writeAuth({ 'https://auth.x.ai::a': entry(iso(NOW + 20 * MIN)) });
-    const r = runner(() => writeAuth({ 'https://auth.x.ai::a': entry(iso(NOW + 6 * 60 * MIN)) }));
-    const err = await ensureGrokLogin({ ...opts(r.run), deadlineMs: 7 * 60 * MIN }).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(GrokLoginExpiryError);
-    expect((err as Error).message).toMatch(/expires 2026-10-01T07:00:00\.000Z.* shorten it/);
+  it('reads the first NON-EMPTY line, trimmed', async () => {
+    const { outcome } = await preflight({ stdout: `\n  ${GROK_STATUS_NOT_AUTHENTICATED}  \n`, timedOut: false });
+    await expect(outcome).rejects.toBeInstanceOf(GrokLoginExpiryError);
+  });
+});
+
+// Never fail a seat on a line we cannot read: the seat's backstop owns these, as before the pre-flight.
+describe('ensureGrokLogin — anything unreadable proceeds with a warning', () => {
+  it('a run that HANGS (timed out) proceeds — even if it printed a status first', async () => {
+    const { outcome, warn } = await preflight({
+      stdout: modelsStdout(GROK_STATUS_NOT_AUTHENTICATED),
+      timedOut: true,
+    });
+    await expect(outcome).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toMatch(/did not finish within 60 s — the seat proceeds/);
   });
 
-  it('lets the re-read decide when the refresh run itself throws', async () => {
-    writeAuth({ 'https://auth.x.ai::a': entry(iso(NOW + 20 * MIN)) });
-    const crashing = async () => {
-      writeAuth({ 'https://auth.x.ai::a': entry(iso(NOW + 6 * 60 * MIN)) });
-      throw new Error('killed by the watchdog');
-    };
-    await expect(ensureGrokLogin(opts(crashing))).resolves.toBeUndefined();
-    writeAuth({ 'https://auth.x.ai::a': entry(iso(NOW + 20 * MIN)) });
-    const failing = async () => {
-      throw new Error('grok exploded');
-    };
-    await expect(ensureGrokLogin(opts(failing))).rejects.toBeInstanceOf(GrokLoginExpiryError);
+  it('a run that FAILS (the runner throws) proceeds', async () => {
+    const { outcome, r, warn } = await preflight(() => {
+      throw new Error('spawn ENOENT');
+    });
+    await expect(outcome).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toMatch(/failed \(spawn ENOENT\) — the seat proceeds/);
+    expect(fs.existsSync(r.runs[0]?.cwd ?? '')).toBe(false);
   });
 
-  it('fails closed when the expiring login vanished during the refresh', async () => {
-    writeAuth({ 'https://auth.x.ai::a': entry(iso(NOW + 20 * MIN)) });
-    const r = runner(() => fs.rmSync(file));
-    await expect(ensureGrokLogin(opts(r.run))).rejects.toBeInstanceOf(GrokLoginExpiryError);
+  it('an unrecognised status line proceeds, quoting what was read', async () => {
+    const { outcome, warn } = await preflight({ stdout: modelsStdout('Session expired, please log in.'), timedOut: false });
+    await expect(outcome).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toMatch(/unrecognised status line \("Session expired, please log in\."\)/);
   });
 
-  it('passes with no auth file, and with entries carrying no expires_at (API-key mode)', async () => {
-    const r = runner();
-    await expect(ensureGrokLogin(opts(r.run))).resolves.toBeUndefined();
-    writeAuth({ apikey: { auth_mode: 'ApiKey', key: 'SECRET' } });
-    await expect(ensureGrokLogin(opts(r.run))).resolves.toBeUndefined();
-    expect(r.runs).toHaveLength(0);
+  it('no stdout at all proceeds', async () => {
+    const { outcome, warn } = await preflight({ stdout: null, timedOut: false });
+    await expect(outcome).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toMatch(/printed no status line/);
   });
 });
 
 describe('isGrokLoginExpiryFailure', () => {
-  it('recognizes only the pre-flight failure', () => {
-    expect(isGrokLoginExpiryFailure(`${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: x`)).toBe(true);
-    expect(isGrokLoginExpiryFailure('the liveness watchdog cut it')).toBe(false);
+  it('keys on the prefix only', () => {
+    expect(isGrokLoginExpiryFailure(`${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: grok reports "x"`)).toBe(true);
+    expect(isGrokLoginExpiryFailure('grok usage limit reached')).toBe(false);
     expect(isGrokLoginExpiryFailure(undefined)).toBe(false);
   });
 });

@@ -103,9 +103,11 @@ export interface ReviewerExecOpts {
    * Extra env for the child, merged OVER `process.env`. A fenced seat passes the egress proxy's
    * `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (+ an empty `NO_PROXY`) here — merging over the parent
    * env is what lets `NO_PROXY: ''` OVERRIDE an operator's inherited `NO_PROXY=*`, which would
-   * otherwise let the seat bypass the proxy for exactly the hosts it most wants to reach.
+   * otherwise let the seat bypass the proxy for exactly the hosts it most wants to reach. An
+   * `undefined` value REMOVES the inherited variable (Node's spawn drops undefined entries) — how
+   * the grok login pre-flight runs without the seat's GROK_SANDBOX.
    */
-  env?: Record<string, string>;
+  env?: Record<string, string | undefined>;
   /** Receives the kill handle so a caller (e.g. a cancel) can abort the child. */
   onSpawn?: (kill: () => void) => void;
   /** The -o tempfile the reply is read from, then unlinked. Required for 'outfile'. */

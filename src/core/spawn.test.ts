@@ -117,6 +117,26 @@ describe('runReviewerExec — liveness (inactivity) watchdog', () => {
   });
 });
 
+// `env` merges over the parent's; an `undefined` value is how a caller REMOVES an inherited var.
+describe('runReviewerExec — env', () => {
+  it('sets what is given and removes what is undefined', async () => {
+    vi.stubEnv('ZZ_ENSEMBLE_INHERITED', 'parent');
+    try {
+      const res = await runReviewerExec({
+        args: ['-c', 'echo "${ZZ_ENSEMBLE_INHERITED-unset}|$ZZ_ENSEMBLE_SET"'],
+        bin: '/bin/sh',
+        capture: 'stdout',
+        env: { ZZ_ENSEMBLE_INHERITED: undefined, ZZ_ENSEMBLE_SET: 'child' },
+        stderrLimit: 500,
+        timeoutMs: 20_000,
+      });
+      expect(res.raw).toBe('unset|child');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
 // An outfile seat that ALSO streams progress on stdout (codex `--json` + `-o`): the stream drives
 // the liveness watchdog and is kept as a bounded diagnostic tail; the reply still comes from -o.
 describe('runReviewerExec — stream liveness beside an outfile reply', () => {
