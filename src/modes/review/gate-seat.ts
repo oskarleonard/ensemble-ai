@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 
 import { parseSeatAdvisor } from '../../core/types';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig } from '../brainstorm/types';
 import { VOICE_DEFAULTS, VOICES_FILE } from '../brainstorm/voices';
 
 import { CLAUDE_EFFORTS } from './claude';
@@ -19,8 +19,11 @@ import { CLAUDE_EFFORTS } from './claude';
 // THE ADVISOR is the one per-entry field with NO chain and NO fallback: each seat reads `advisor`
 // from its OWN entry only (gate → `gate.advisor`, reviewer → `claude.advisor`), because the field
 // has three states (a model · "off" · absent = inherit the operator's settings) and an inheritance
-// link would leave "inherit" unspellable on a gate whose claude entry says "off". An invalid value
-// THROWS naming the seat (core/types parseSeatAdvisor) — the one exception to never-throws below.
+// link would leave "inherit" unspellable on a gate whose claude entry says "off". It is validated
+// HERE, at the seat's resolution — callers resolve a seat only when the command will spawn it — and
+// only when it applies (an anthropic gate): an invalid value THROWS naming the seat (core/types
+// parseSeatAdvisor), the one exception to never-throws below. An advisor that does not apply (a
+// codex gate) is ignored with a warning and never validated: it reaches no spawn.
 
 export type SeatSource = 'flag' | 'file' | 'default';
 
@@ -57,7 +60,7 @@ export interface GateSeat {
   // (`cmd` is never honored from config — the runner binding is code), model/effort resolved.
   // `config.advisor` is the gate entry's own advisor (absent = inherit the operator's settings),
   // always absent on a codex gate.
-  config: VoiceConfig;
+  config: ResolvedVoiceConfig;
   effortSource: SeatSource;
   modelSource: SeatSource;
   vendor: GateVendor;
@@ -114,8 +117,8 @@ function resolveField(
 
 // PURE: resolve the gate seat from the raw voices.json object + flag overrides. Emits warnings
 // through `warn` — a junk / `cmd`-bearing entry warns and falls through, never disabling the seat.
-// The one throw: an invalid `gate.advisor` (validated whatever the vendor, so validation is
-// total). Deterministic, so it is unit-tested directly for done-criterion 6.
+// The one throw: an invalid `gate.advisor` on an anthropic gate (the advisor reaches its spawn).
+// Deterministic, so it is unit-tested directly for done-criterion 6.
 export function resolveGateSeat(
   raw: unknown,
   flags: GateSeatFlags,
@@ -133,11 +136,6 @@ export function resolveGateSeat(
       );
   }
   const claude = plainObject(root.claude);
-
-  // The gate's advisor — its OWN entry only (header comment), validated before anything else so a
-  // bad value fails the load on every vendor path. Applied below only when both the entry and the
-  // resolved gate are anthropic; anywhere else it is ignored loudly, like `cmd`.
-  const gateAdvisor = gate ? parseSeatAdvisor(gate.advisor, 'voices.json gate') : undefined;
 
   // `cmd` on the gate seat can't reconfigure the spawn (the runner binding is code) — ignore + warn.
   if (gate && 'cmd' in gate)
@@ -172,12 +170,15 @@ export function resolveGateSeat(
   // values warn; the chain falls to the resolved vendor's own defaults.
   const entryVendor: GateVendor =
     fileVendor && GATE_VENDORS.has(fileVendor as GateVendor) ? (fileVendor as GateVendor) : 'anthropic';
-  // The advisor is a Claude-seat setting: it applies only to an anthropic-scoped entry on an
-  // anthropic gate — never carried across a re-vendoring flag, in either direction.
-  const advisorApplies = gateAdvisor !== undefined && entryVendor === 'anthropic' && vendor === 'anthropic';
-  if (gateAdvisor !== undefined && !advisorApplies)
+  // The gate's advisor — its OWN entry only (header comment). A Claude-seat setting: it applies only
+  // to an anthropic-scoped entry on an anthropic gate — never carried across a re-vendoring flag,
+  // in either direction — and is validated only then; anywhere else it is ignored loudly, like `cmd`.
+  const advisorApplies = entryVendor === 'anthropic' && vendor === 'anthropic';
+  const gateAdvisor =
+    gate && advisorApplies ? parseSeatAdvisor(gate.advisor, 'voices.json gate') : undefined;
+  if (gate && gate.advisor !== undefined && !advisorApplies)
     warn(
-      `gate seat: \`advisor\` is ignored — it is a Claude-seat setting, and this gate (or its entry) is codex`,
+      `gate seat: \`advisor\` is ignored — it is a Claude-seat setting, and this gate (or its entry) is codex (got ${JSON.stringify(gate.advisor)}; not validated)`,
     );
   if (gate && entryVendor !== vendor && (nonEmptyStr(gate.model) || nonEmptyStr(gate.effort))) {
     warn(
@@ -264,7 +265,7 @@ export function resolveGateSeat(
     // only the fields the gate seat configures. The advisor is the gate entry's own (advisorApplies).
     config: {
       ...VOICE_DEFAULTS.claude,
-      ...(advisorApplies ? { advisor: gateAdvisor } : {}),
+      ...(gateAdvisor === undefined ? {} : { advisor: gateAdvisor }),
       effort,
       model,
     },

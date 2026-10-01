@@ -215,36 +215,22 @@ describe('enabledReviewerIds — the one owner of which seats are on', () => {
   });
 });
 
-describe('parseReviewers — the claude seat\'s advisor', () => {
-  it('absent ⇒ no advisor key (the seat inherits the operator settings)', () => {
-    expect(parseReviewers({ claude: { model: 'opus' } }).claude).not.toHaveProperty('advisor');
-    expect(REVIEWER_DEFAULTS.claude).not.toHaveProperty('advisor');
-  });
-
-  it('carries a valid model id and "off" on the claude seat', () => {
-    expect(parseReviewers({ claude: { advisor: 'claude-fable-5-1' } }).claude.advisor).toBe('claude-fable-5-1');
-    expect(parseReviewers({ claude: { advisor: 'off' } }).claude.advisor).toBe('off');
-  });
-
-  it('an invalid advisor THROWS naming the seat — never a silent fallback to inheriting', () => {
-    for (const advisor of [null, '', 'Claude Opus', 7]) {
-      expect(() => parseReviewers({ claude: { advisor } })).toThrow(/reviewers\.json claude seat: `advisor`/);
+describe('parseReviewers — reviewers.json carries no advisor', () => {
+  // ONE advisor home per CLI seat: every CLI claude spawn resolves from voices.json, so a
+  // reviewers.json `advisor` is a field nothing spawns from — not read, not displayed, and never
+  // able to break a run (a programmatic consumer sets ReviewerConfig.advisor itself).
+  it('drops an `advisor` key on every seat, valid or not, and never throws', () => {
+    for (const advisor of ['off', 'claude-fable-5-1', null, 'Claude Opus', 7]) {
+      const out = parseReviewers({ claude: { advisor }, codex: { advisor }, grok: { advisor } });
+      for (const id of ['claude', 'codex', 'grok'] as const) expect(out[id]).not.toHaveProperty('advisor');
     }
   });
 
-  it('only the claude seat reads it — an advisor key on codex/grok is an ignored unknown key', () => {
-    const out = parseReviewers({ codex: { advisor: 'NOT VALIDATED' }, grok: { advisor: 'off' } });
-    expect(out.codex).not.toHaveProperty('advisor');
-    expect(out.grok).not.toHaveProperty('advisor');
-  });
-
-  it('loadReviewers lets the advisor error through (only the READ falls back to defaults)', () => {
+  it('loadReviewers reads a file with an invalid claude advisor without throwing', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-advisor-'));
     const file = path.join(dir, 'reviewers.json');
     try {
       fs.writeFileSync(file, JSON.stringify({ claude: { advisor: 'Opus!' } }));
-      expect(() => loadReviewers(file)).toThrow(/reviewers\.json claude seat: `advisor`/);
-      fs.writeFileSync(file, '{ not json');
       expect(loadReviewers(file)).toEqual(REVIEWER_DEFAULTS);
     } finally {
       fs.rmSync(dir, { force: true, recursive: true });

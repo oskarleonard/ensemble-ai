@@ -45,7 +45,7 @@ import {
   isVoiceId,
   parseVoiceIds,
   VOICE_IDS,
-  type VoiceConfig,
+  type ResolvedVoiceConfig,
   type VoiceId,
 } from './modes/brainstorm/types';
 import { runConsultMode } from './modes/consult';
@@ -1063,14 +1063,21 @@ function resolveStageTarget(target: PostTarget, gh: GhRunner): StageTarget | nul
 }
 
 // GateSeat → the footer's resolved seat: model/effort with the 'default' sentinel spelled out
-// (a resolved-but-'default' model is the built-in Opus), plus the per-field source for provenance.
+// (a resolved-but-'default' model is the built-in Opus), the stated advisor (absent = inherited),
+// plus the per-field source for provenance.
 function toCommentGateSeat(seat: GateSeat): CommentGateSeat {
   // Reuse the reviewer layer's model-label rule (resolve to the configured model, else the
   // built-in `opus`) so the footer's seat model can't drift from the reviewer's own label.
   const model = claudeModelLabel(seat.config);
   const effort =
     seat.config.effort && seat.config.effort !== 'default' ? seat.config.effort : 'default';
-  return { effort, effortSource: seat.effortSource, model, modelSource: seat.modelSource };
+  return {
+    ...(seat.config.advisor === undefined ? {} : { advisor: seat.config.advisor }),
+    effort,
+    effortSource: seat.effortSource,
+    model,
+    modelSource: seat.modelSource,
+  };
 }
 
 // The review's earned exit code, factored out of reviewCommand so `--post-comment` can be GATED
@@ -1510,7 +1517,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   //
   // The HOLISTIC lens: same chain — flag → voices.json `holistic` entry → the built-in default
   // (opus @ high). Resolved only when `--holistic` asks for the lens.
-  let anthropicSeats: { claude: GateSeat; gate: GateSeat; holistic?: VoiceConfig } | null = null;
+  let anthropicSeats: { claude: GateSeat; gate: GateSeat; holistic?: ResolvedVoiceConfig } | null = null;
   if (roster.claude) {
     const warn = (m: string) => console.error(`· ${m}`);
     anthropicSeats = loadSeatsOrRefuse(() => ({
@@ -2941,15 +2948,13 @@ async function reviewersCommand(args: string[]): Promise<number> {
       ? path.resolve(values['voices-file'])
       : VOICES_FILE;
   // The gate seat resolves from the SAME voices.json (no run flags here — `config` is a read-only
-  // view, so source ∈ {file, default}); a junk/`cmd`-bearing entry warns loudly on stderr.
-  const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`· ${m}`));
-  // ONE parse of reviewers.json feeds the roster, the enabled set and the off list, so the
-  // three cannot disagree about a `disabledUntil` boundary crossing between two reads.
-  const reviewersConfig = loadReviewers(reviewersFile);
-  const enabledIds = enabledReviewerIds(reviewersConfig);
-  const view: RegistryView = {
-    enabledReviewerIds: enabledIds,
-    gate: {
+  // view, so source ∈ {file, default}); a junk/`cmd`-bearing entry warns loudly on stderr. Its one
+  // throw — an invalid advisor on an anthropic gate, which every gate-spawning command refuses — is
+  // shown on the gate row instead: `config` is the diagnosis, so it never throws on a bad advisor.
+  let gate: RegistryView['gate'];
+  try {
+    const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`· ${m}`));
+    gate = {
       ...(gateSeat.config.advisor === undefined ? {} : { advisor: gateSeat.config.advisor }),
       effort: gateSeat.config.effort,
       effortSource: gateSeat.effortSource,
@@ -2957,7 +2962,17 @@ async function reviewersCommand(args: string[]): Promise<number> {
       modelSource: gateSeat.modelSource,
       vendor: gateSeat.vendor,
       vendorSource: gateSeat.vendorSource,
-    },
+    };
+  } catch (e) {
+    gate = { error: (e as Error).message };
+  }
+  // ONE parse of reviewers.json feeds the roster, the enabled set and the off list, so the
+  // three cannot disagree about a `disabledUntil` boundary crossing between two reads.
+  const reviewersConfig = loadReviewers(reviewersFile);
+  const enabledIds = enabledReviewerIds(reviewersConfig);
+  const view: RegistryView = {
+    enabledReviewerIds: enabledIds,
+    gate,
     offSeats: offSeatsOf(reviewersConfig, enabledIds),
     reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,
@@ -3348,11 +3363,12 @@ Exit: 0 = gate completed (verdicts updated) · 1 = gate failed again (still fail
 3 = usage / missing trail.
 `;
 
-// The seat loaders THROW on an invalid Claude-seat `advisor` (core/types parseSeatAdvisor). Every
-// command resolves its seats before any spawn, so that throw is a config refusal: the seat-named
-// message and exit 3 (nothing billed) — never the stack trace and exit 1 the top-level handler
-// would make of it. Null = refused; the caller returns 3. The message is printed as thrown: it
-// already carries the `ensemble-ai:` prefix and names the seat.
+// The Anthropic seat resolvers (gate-seat · holistic) THROW on an invalid `advisor` (core/types
+// parseSeatAdvisor) — and a command calls them only for the seats it will spawn, before any spawn,
+// so that throw is a config refusal: the seat-named message and exit 3 (nothing billed) — never the
+// stack trace and exit 1 the top-level handler would make of it. Null = refused; the caller returns
+// 3. The message is printed as thrown: it already carries the `ensemble-ai:` prefix and names the
+// seat. (The whole-file parsers never throw: an unused seat's typo breaks nothing.)
 function loadSeatsOrRefuse<T>(load: () => T): T | null {
   try {
     return load();
@@ -3591,9 +3607,7 @@ async function reseatCommand(args: string[]): Promise<number> {
 
   const reviewersFile = typeof values['reviewers-file'] === 'string' ? values['reviewers-file'] : REVIEWERS_FILE;
   const sandbox = typeof values.sandbox === 'string' ? values.sandbox : undefined;
-  const reviewers = loadSeatsOrRefuse(() => loadReviewers(reviewersFile));
-  if (!reviewers) return 3;
-  const reviewer: ReviewerConfig = { ...reviewers[seat], ...(sandbox ? { sandbox } : {}) };
+  const reviewer: ReviewerConfig = { ...loadReviewers(reviewersFile)[seat], ...(sandbox ? { sandbox } : {}) };
   const gateSeat = loadSeatsOrRefuse(() =>
     loadGateSeat(
       VOICES_FILE,

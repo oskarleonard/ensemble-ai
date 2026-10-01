@@ -45,6 +45,8 @@ export function postTargetFromSelection(sel: DiffSourceSelection): PostTarget | 
 
 // The resolved GATE seat, pre-formatted by the CLI (which owns loadGateSeat), for the footer.
 export interface CommentGateSeat {
+  // The gate's stated advisor (a model id or "off"); absent = it inherited the operator's settings.
+  advisor?: string;
   effort: string;
   effortSource: string;
   model: string;
@@ -262,7 +264,7 @@ export function renderReviewComment(input: RenderCommentInput): string {
     : `receipt none — ${md(receipt.error ?? 'not qualified')}`;
   const seat = input.gateSeat;
   const seatLine = seat
-    ? `gate seat anthropic/${md(seat.model)} @ ${md(seat.effort)} (model: ${seat.modelSource}, effort: ${seat.effortSource})`
+    ? `gate seat anthropic/${md(seat.model)} @ ${md(seat.effort)}${seat.advisor === undefined ? '' : ` · advisor ${md(seat.advisor)}`} (model: ${seat.modelSource}, effort: ${seat.effortSource})`
     : 'gate seat n/a (no gate ran)';
   const completed = receipt.completed.length ? ` · completed: ${receipt.completed.map(md).join(', ')}` : '';
   const evidence = input.evidenceNote ? ` · ${md(input.evidenceNote)}` : '';

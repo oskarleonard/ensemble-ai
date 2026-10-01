@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { parseFindings } from '../../core/findings';
 import { parseSeatAdvisor, type Severity } from '../../core/types';
 import type { RunReviewOpts } from '../../reviewers/codex';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig, VoiceConfig } from '../brainstorm/types';
 import { VOICE_DEFAULTS, VOICES_FILE } from '../brainstorm/voices';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
@@ -74,7 +74,7 @@ export function resolveHolisticSeat(
   raw: unknown,
   flags: HolisticSeatFlags = {},
   warn: (m: string) => void = () => {}
-): VoiceConfig {
+): ResolvedVoiceConfig {
   const root = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const entry =
     root.holistic && typeof root.holistic === 'object' && !Array.isArray(root.holistic)
@@ -120,7 +120,7 @@ export function loadHolisticSeat(
   file: string = VOICES_FILE,
   flags: HolisticSeatFlags = {},
   warn: (m: string) => void = () => {}
-): VoiceConfig {
+): ResolvedVoiceConfig {
   let raw: unknown = {};
   try {
     raw = JSON.parse(fs.readFileSync(file, 'utf8'));

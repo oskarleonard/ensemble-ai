@@ -24,10 +24,11 @@ export function resolveClaudeBin(): string {
 // `--settings {"advisorModel":"<id>"}`; "off" → `{"advisorModel":""}`, the value that
 // DISABLES the advisor even when the operator's settings enable one (null would NOT — it
 // falls back to the user setting, so it is never emitted). Built with JSON.stringify,
-// never concatenation. The value goes through parseSeatAdvisor again because a consumer
-// can hand a runner a config it built itself, without the file parse: an invalid value
-// THROWS here rather than reaching the CLI.
-export function claudeAdvisorArgs(config?: { advisor?: string; id: string }): string[] {
+// never concatenation. This is the SPAWN BACKSTOP: the CLI already refused an invalid value at
+// its up-front seat resolution, but a programmatic consumer (e.g. a dashboard setting
+// ReviewerConfig.advisor) hands a runner a config no resolver saw — so the value goes through
+// parseSeatAdvisor again, and an invalid one THROWS here rather than reaching the CLI.
+export function claudeAdvisorArgs(config?: { advisor?: unknown; id: string }): string[] {
   const advisor = parseSeatAdvisor(config?.advisor, config?.id ?? 'claude');
   if (advisor === undefined) return [];
   return ['--settings', JSON.stringify({ advisorModel: advisor === ADVISOR_OFF ? '' : advisor })];

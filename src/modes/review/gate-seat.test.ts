@@ -375,9 +375,14 @@ describe('the advisor on the gate + claude reviewer seats — own entry only, ne
     expect(toCodex.warnings.some((w) => w.includes('`advisor` is ignored'))).toBe(true);
   });
 
-  it('an invalid gate advisor throws naming the seat — on the codex path too (validation is total)', () => {
+  it('an invalid advisor on an ANTHROPIC gate throws naming the seat; on a codex gate it reaches no spawn, so it only warns', () => {
     expect(() => resolve({ gate: { advisor: null } })).toThrow(/voices\.json gate seat: `advisor`/);
-    expect(() => resolve({ gate: { advisor: 'Fable', vendor: 'codex' } })).toThrow(/voices\.json gate seat/);
+    // Validated only where it applies: a codex gate never spawns claude, so its typo breaks nothing.
+    const codex = resolve({ gate: { advisor: 'Fable', vendor: 'codex' } });
+    expect(codex.seat.config).not.toHaveProperty('advisor');
+    expect(codex.warnings.some((w) => w.includes('`advisor` is ignored') && w.includes('"Fable"'))).toBe(true);
+    const flagged = resolve({ gate: { advisor: null } }, { vendor: 'codex' });
+    expect(flagged.seat.vendor).toBe('codex');
   });
 
   it('the claude REVIEWER seat carries the `claude` entry\'s advisor; absent stays absent', () => {

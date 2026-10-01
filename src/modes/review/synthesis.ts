@@ -13,6 +13,10 @@ import type { ReviewFinding } from '../../core/types';
 // to what the synthesizer needs. Built from a StoredReview (codex/grok) or the
 // claude voice review. `ok` = the voice produced a parseable review.
 export interface VoiceReview {
+  // An Anthropic seat's STATED advisor (a model id or "off"), recorded on its trail artifact
+  // (review.claude.json / review.holistic.json) beside the review; absent = the seat inherited the
+  // operator's settings — so the trail tells "off" from inherit. Never set on codex/grok.
+  advisor?: string;
   findings: ReviewFinding[];
   ok: boolean;
   summary: string;

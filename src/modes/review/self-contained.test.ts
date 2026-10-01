@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { persistReview, reviewDir } from '../../core/artifacts';
 import type { ReviewerId, StoredReview } from '../../core/types';
 import type { ReviewPacket, ReviewerConfig } from '../../core/types';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig, VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { persistGatePacket } from './gate-hunks';
@@ -24,7 +24,7 @@ import {
   storedToVoiceReview,
 } from './self-contained';
 
-const CFG: VoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
+const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
 const HEAD = 'HEADSHA1';
 
 const okRun = (raw: string): VoiceRunResult => ({ ok: true, raw, stderrTail: '', timedOut: false });

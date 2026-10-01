@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 
 import { persistReview, reviewDir } from '../../core/artifacts';
 import type { ReviewerConfig, ReviewPacket } from '../../core/types';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig, VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { persistGatePacket } from './gate-hunks';
@@ -17,8 +17,8 @@ import { runClaudeReviewLayer } from './self-contained';
 // reconcile. The seat is stubbed (no live model); the worktree is a real directory on disk, so the
 // host's two-site verification runs against real bytes.
 
-const CFG: VoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
-const HOLISTIC_CFG: VoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
+const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
+const HOLISTIC_CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
 const HEAD = 'HEADSHA1';
 const BASE = 'BASESHA1';
 const okRun = (raw: string): VoiceRunResult => ({ ok: true, raw, stderrTail: '', timedOut: false });

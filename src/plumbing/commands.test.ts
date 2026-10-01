@@ -119,10 +119,12 @@ describe('reviewers / config command', () => {
 });
 
 describe('config — a Claude seat\'s advisor is visible', () => {
-  it('--json carries the advisor on the reviewers.json claude seat, the claude voice, and the gate', async () => {
+  it('--json carries the advisor on the claude voice and the gate — never on a reviewers.json row', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-advisor-'));
     const reviewersFile = path.join(dir, 'reviewers.json');
     const voicesFile = path.join(dir, 'voices.json');
+    // ONE advisor home per CLI seat: no CLI spawn reads the reviewers.json claude entry, so its
+    // `advisor` is neither parsed nor displayed.
     fs.writeFileSync(reviewersFile, JSON.stringify({ claude: { advisor: 'claude-fable-5-1' } }));
     fs.writeFileSync(
       voicesFile,
@@ -133,14 +135,14 @@ describe('config — a Claude seat\'s advisor is visible', () => {
       const parsed = JSON.parse(logged);
       type Row = { advisor?: string; id: string };
       const byId = (rows: Row[], id: string): Row => rows.find((r) => r.id === id)!;
-      expect(byId(parsed.reviewers, 'claude').advisor).toBe('claude-fable-5-1');
-      expect(byId(parsed.reviewers, 'codex')).not.toHaveProperty('advisor');
+      for (const id of ['claude', 'codex', 'grok']) expect(byId(parsed.reviewers, id)).not.toHaveProperty('advisor');
       expect(byId(parsed.voices, 'claude').advisor).toBe('claude-opus-5-5');
       expect(parsed.gate.advisor).toBe('off');
 
       logged = '';
       await main(['config', '--reviewers-file', reviewersFile, '--voices-file', voicesFile]);
-      expect(logged).toContain('anthropic · opus @ max · advisor claude-fable-5-1');
+      expect(logged).not.toContain('claude-fable-5-1');
+      expect(logged).toContain('· advisor claude-opus-5-5');
       expect(logged.split('\n').find((l) => l.trimStart().startsWith('gate'))).toContain('· advisor off');
     } finally {
       fs.rmSync(dir, { force: true, recursive: true });
@@ -152,14 +154,22 @@ describe('config — a Claude seat\'s advisor is visible', () => {
     expect(logged).not.toContain('advisor');
   });
 
-  it('an invalid advisor fails the load with an error naming the seat', async () => {
+  it('an invalid advisor is SHOWN, marked invalid — config never throws on it (exit 0)', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-advisor-'));
     const voicesFile = path.join(dir, 'voices.json');
-    fs.writeFileSync(voicesFile, JSON.stringify({ gate: { advisor: null } }));
+    fs.writeFileSync(voicesFile, JSON.stringify({ claude: { advisor: 'Opus 5' }, gate: { advisor: null } }));
     try {
-      await expect(
-        main(['config', '--json', '--reviewers-file', '/nope.json', '--voices-file', voicesFile])
-      ).rejects.toThrow(/voices\.json gate seat: `advisor`/);
+      expect(await main(['config', '--reviewers-file', '/nope.json', '--voices-file', voicesFile])).toBe(0);
+      const voiceRow = logged.split('\n').find((l) => l.trimStart().startsWith('claude') && l.includes('advisor'));
+      expect(voiceRow).toContain('· advisor "Opus 5" (INVALID');
+      const gateRow = logged.split('\n').find((l) => l.trimStart().startsWith('gate'));
+      expect(gateRow).toMatch(/gate\s+INVALID — ensemble-ai: voices\.json gate seat: `advisor`.*got null/);
+
+      logged = '';
+      expect(await main(['config', '--json', '--reviewers-file', '/nope.json', '--voices-file', voicesFile])).toBe(0);
+      const parsed = JSON.parse(logged);
+      expect(parsed.voices.find((v: { id: string }) => v.id === 'claude').advisor).toBe('Opus 5');
+      expect(parsed.gate.error).toMatch(/voices\.json gate seat: `advisor`/);
     } finally {
       fs.rmSync(dir, { force: true, recursive: true });
     }

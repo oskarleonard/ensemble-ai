@@ -5,7 +5,7 @@ import { readReview, reviewDir, writeTrailFile } from '../../core/artifacts';
 import type { EgressDenial } from '../../core/egress-proxy';
 import { scrubControl } from '../../core/sanitize';
 import type { CoreReviewerId, ReviewerConfig, ReviewPacket, StoredReview } from '../../core/types';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig } from '../brainstorm/types';
 
 import type { EvidenceClass } from './evidence';
 import { EVIDENCE_MANIFEST_FILE } from './evidence-manifest';
@@ -306,7 +306,7 @@ export interface ReseatOptions {
   adapter: ReviewAdapter;
   baseDir: string;
   conventionPaths?: string[];
-  gateConfig: VoiceConfig;
+  gateConfig: ResolvedVoiceConfig;
   // Injected for tests — the gate seat spawn runRegate uses.
   gateRun?: RegateOptions['run'];
   log?: (m: string) => void;

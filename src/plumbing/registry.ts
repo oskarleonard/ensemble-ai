@@ -5,7 +5,7 @@
 // mutation. The CLI does the file I/O (which config files exist) and hands the
 // resolved rosters + paths here.
 
-import { REVIEWER_IDS, type ReviewerConfig, type ReviewerId } from '../core/types';
+import { isSeatAdvisor, REVIEWER_IDS, type ReviewerConfig, type ReviewerId } from '../core/types';
 import type { VoiceConfig } from '../modes/brainstorm/types';
 import type { SeatSource } from '../modes/review/gate-seat';
 
@@ -13,7 +13,7 @@ import type { SeatSource } from '../modes/review/gate-seat';
 // (flag/file/default). Always a `claude -p` spawn, so no cmd/sandbox/vendor variance to show.
 export interface GateSeatView {
   // The anthropic gate's own advisor (a model id or "off"); absent = inherits the operator's
-  // ~/.claude/settings.json. Same field the claude reviewer/voice rows carry.
+  // ~/.claude/settings.json. Same field the claude voice row carries.
   advisor?: string;
   effort: string;
   effortSource: SeatSource;
@@ -25,13 +25,20 @@ export interface GateSeatView {
   vendorSource?: SeatSource;
 }
 
+// The gate seat could not resolve: its `advisor` is invalid, so every command that spawns the gate
+// refuses. `config` is the diagnosis, so the refusal (seat-named, carrying the bad value) is what
+// the gate row shows — the view never throws.
+export interface GateSeatRefusal {
+  error: string;
+}
+
 export interface RegistryView {
   // The seats that are ON right now — `enabledReviewerIds` resolved at print time, the ONE
   // owner of the off-switch rule, so a consumer that fans out through the CLI (rather than the
   // library) can read the roster here instead of re-deriving it from `disabledUntil` itself.
   enabledReviewerIds: ReviewerId[];
   // The review-synthesis GATE (resolved from the voices.json `gate` seat → claude voice → Opus).
-  gate: GateSeatView;
+  gate: GateSeatView | GateSeatRefusal;
   // Every seat that is OFF, with its quota window when that is what holds it off. `until` is
   // null for an indefinite `enabled: false` (an `enabled: false` seat that also carries a date
   // reports null too — the date is not what the switch honours). Same rule as the fan-out.
@@ -76,9 +83,18 @@ function agentLine(c: ReviewerConfig | VoiceConfig, off?: OffSeat): string {
 }
 
 // ` · advisor <model|off>` when a Claude seat states one; nothing when it inherits the operator's
-// settings (absent), so an unconfigured registry renders exactly as before.
-function advisorNote(advisor: string | undefined): string {
-  return advisor === undefined ? '' : ` · advisor ${advisor}`;
+// settings (absent), so an unconfigured registry renders exactly as before. A value the rule
+// rejects is shown as-is (JSON, so `null` is visibly not "null") and marked: the config parse
+// carries it, and only a command that spawns the seat refuses it.
+function advisorNote(advisor: unknown): string {
+  if (advisor === undefined) return '';
+  if (isSeatAdvisor(advisor)) return ` · advisor ${advisor}`;
+  return ` · advisor ${JSON.stringify(advisor)} (INVALID — a command that runs this seat refuses it)`;
+}
+
+function gateLine(gate: GateSeatView | GateSeatRefusal): string {
+  if ('error' in gate) return `    ${'gate'.padEnd(7)} INVALID — ${gate.error}`;
+  return `    ${'gate'.padEnd(7)} ${gate.vendor ?? 'anthropic'} · ${gate.model} @ ${gate.effort}${advisorNote(gate.advisor)}  · source model:${gate.modelSource} · effort:${gate.effortSource}${gate.vendor && gate.vendor !== 'anthropic' ? ` · vendor:${gate.vendorSource ?? 'default'}` : ''}`;
 }
 
 function sourceNote(file: string, exists: boolean): string {
@@ -106,12 +122,11 @@ export function renderRegistry(view: RegistryView): string {
   for (const v of view.voices) out.push(agentLine(v));
   out.push('');
   // The GATE (synthesis) seat — claude -p unless `gate.vendor` says codex; {model, effort} from the
-  // voices.json `gate` entry → the claude voice → the built-in Opus default, and its own `advisor`. Sources shown so it's clear WHERE the
-  // resolved model/effort came from (flag/file/default) — the standing "which config" legibility.
+  // voices.json `gate` entry → the claude voice → the built-in Opus default, and its own `advisor`.
+  // Sources shown so it's clear WHERE the resolved model/effort came from (flag/file/default) — the
+  // standing "which config" legibility.
   out.push('  review synthesis  (the verified GATE — claude -p unless gate.vendor is codex; {model,effort,advisor})');
-  out.push(
-    `    ${'gate'.padEnd(7)} ${view.gate.vendor ?? 'anthropic'} · ${view.gate.model} @ ${view.gate.effort}${advisorNote(view.gate.advisor)}  · source model:${view.gate.modelSource} · effort:${view.gate.effortSource}${view.gate.vendor && view.gate.vendor !== 'anthropic' ? ` · vendor:${view.gate.vendorSource ?? 'default'}` : ''}`
-  );
+  out.push(gateLine(view.gate));
   out.push('');
   return out.join('\n');
 }

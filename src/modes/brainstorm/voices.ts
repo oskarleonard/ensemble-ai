@@ -11,7 +11,7 @@ import {
 import { runGrokReview } from '../../reviewers/grok';
 
 import { runClaudeVoice } from './claude';
-import { VOICE_IDS, type VoiceConfig, type VoiceId } from './types';
+import { type ResolvedVoiceConfig, VOICE_IDS, type VoiceConfig, type VoiceId } from './types';
 
 // The uniform result every voice adapter returns ({ok, raw, stderrTail, timedOut}),
 // shared with the review adapters — `raw` is the voice's reply, ready for the
@@ -24,7 +24,8 @@ export type VoiceRunResult = CodexReviewResult;
 // audit); grok keeps the deny-by-default `ensemble-review` sandbox (the adapter
 // pins it regardless — a voice still runs read-only from a throwaway cwd). Claude
 // joins as a third voice with no independence concern.
-export const VOICE_DEFAULTS: Record<VoiceId, VoiceConfig> = {
+// Baked defaults state no advisor (every seat inherits until configured) — so they are resolved.
+export const VOICE_DEFAULTS: Record<VoiceId, ResolvedVoiceConfig> = {
   claude: {
     cmd: 'claude',
     effort: 'default',
@@ -91,8 +92,12 @@ function str(v: unknown, fallback: string): string {
 
 // Defensive parse: trust only well-formed per-voice overrides; anything malformed
 // falls back to the baked default for that id, so a junk config can never silently
-// disable a voice or inject a bad model string. Mirrors core/reviewers parseReviewers —
-// including its one exception: an invalid claude `advisor` THROWS, naming the seat.
+// disable a voice or inject a bad model string. Mirrors core/reviewers parseReviewers.
+// NEVER throws. The claude voice's `advisor` is the one field carried AS-IS, valid or not: its
+// only fallback would be "inherit the operator's setting" (the accident the field exists to end),
+// so a bad value is kept for `config` to show marked invalid and for a command that runs the
+// claude voice to refuse (assertRosterAdvisors) — while a command that never runs it is
+// untouched by its typo.
 export function parseVoices(raw: unknown): Record<VoiceId, VoiceConfig> {
   const out: Record<VoiceId, VoiceConfig> = { ...VOICE_DEFAULTS };
   if (!raw || typeof raw !== 'object') return out;
@@ -102,9 +107,8 @@ export function parseVoices(raw: unknown): Record<VoiceId, VoiceConfig> {
     if (!e || typeof e !== 'object') continue;
     const r = e as Record<string, unknown>;
     const sandbox = str(r.sandbox, VOICE_DEFAULTS[id].sandbox ?? '');
-    const advisor = id === 'claude' ? parseSeatAdvisor(r.advisor, `voices.json ${id}`) : undefined;
     out[id] = {
-      ...(advisor === undefined ? {} : { advisor }),
+      ...(id === 'claude' && r.advisor !== undefined ? { advisor: r.advisor } : {}),
       cmd: str(r.cmd, VOICE_DEFAULTS[id].cmd),
       effort: str(r.effort, VOICE_DEFAULTS[id].effort),
       id,
@@ -116,18 +120,27 @@ export function parseVoices(raw: unknown): Record<VoiceId, VoiceConfig> {
   return out;
 }
 
-// A missing / unreadable / malformed-JSON file → the baked defaults. Only the READ is
-// caught: an invalid claude `advisor` throws out of parseVoices and reaches the caller.
 export function loadVoices(
   file: string = VOICES_FILE
 ): Record<VoiceId, VoiceConfig> {
-  let raw: unknown;
   try {
-    raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return parseVoices(JSON.parse(fs.readFileSync(file, 'utf8')));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
-  return parseVoices(raw);
+}
+
+// The up-front check of the voices a brainstorm/consult run WILL spawn (its roster — the
+// synthesizer is always one of them): each one's `advisor` through the one rule, so an invalid
+// value refuses the run before any voice is spawned, naming the seat — and a voice outside the
+// roster is never read. `source` labels the seat (`voices.json` when the configs came from the
+// file). Throws; the CLI turns the throw into exit 3.
+export function assertRosterAdvisors(
+  roster: readonly VoiceId[],
+  configs: Record<VoiceId, VoiceConfig>,
+  source?: string
+): void {
+  for (const id of roster) parseSeatAdvisor(configs[id]?.advisor, source ? `${source} ${id}` : id);
 }
 
 export function listVoices(file: string = VOICES_FILE): VoiceConfig[] {

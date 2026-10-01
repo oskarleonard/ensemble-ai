@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 
 import { reviewDir } from '../../core/artifacts';
 import type { ReviewFinding } from '../../core/types';
-import type { VoiceConfig } from '../brainstorm/types';
+import type { ResolvedVoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import {
@@ -31,7 +31,7 @@ import {
 import { parsePacketHunks, persistGatePacket } from './gate-hunks';
 import type { VoiceReview } from './synthesis';
 
-const CFG: VoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
+const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
 const HEAD = 'HEADSHA';
 const okRun = (raw: string): VoiceRunResult => ({ ok: true, raw, stderrTail: '', timedOut: false });
 const scrub = (s: string): string => s;
@@ -856,7 +856,7 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
 
   // ── The SHADOW gate (audit-only, champion/challenger) ──────────────────────────────
   describe('shadow gate', () => {
-    const SHADOW_CFG: VoiceConfig = { cmd: 'codex', effort: 'xhigh', id: 'codex', model: 'gpt-5.6-sol', vendor: 'openai' };
+    const SHADOW_CFG: ResolvedVoiceConfig = { cmd: 'codex', effort: 'xhigh', id: 'codex', model: 'gpt-5.6-sol', vendor: 'openai' };
     const shadowArtifact = (base: string, runId: string) =>
       JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'shadow-gate-codex-verdicts.json'), 'utf8'));
 
