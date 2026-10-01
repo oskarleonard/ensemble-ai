@@ -38,9 +38,12 @@ function parseSeatWindow(v) {
 }
 var ADVISOR_OFF = "off";
 var ADVISOR_MODEL_RE = /^[a-z0-9][a-z0-9.-]*$/;
+function isSeatAdvisor(v) {
+  return v === ADVISOR_OFF || typeof v === "string" && ADVISOR_MODEL_RE.test(v);
+}
 function parseSeatAdvisor(v, seat) {
   if (v === void 0) return void 0;
-  if (v === ADVISOR_OFF || typeof v === "string" && ADVISOR_MODEL_RE.test(v)) return v;
+  if (isSeatAdvisor(v)) return v;
   throw new Error(
     `ensemble-ai: ${seat} seat: \`advisor\` must be "${ADVISOR_OFF}" or a model id matching ${ADVISOR_MODEL_RE.source} (omit the key to inherit the operator's setting) \u2014 got ${JSON.stringify(v) ?? String(v)}`
   );
@@ -810,9 +813,7 @@ function parseReviewers(raw) {
     const sandbox = str(r.sandbox, REVIEWER_DEFAULTS[id].sandbox ?? "");
     const enabled = typeof r.enabled === "boolean" ? r.enabled : void 0;
     const disabledUntil = parseSeatWindow(r.disabledUntil);
-    const advisor = id === "claude" ? parseSeatAdvisor(r.advisor, `reviewers.json ${id}`) : void 0;
     out[id] = {
-      ...advisor === void 0 ? {} : { advisor },
       cmd: str(r.cmd, REVIEWER_DEFAULTS[id].cmd),
       effort: str(r.effort, REVIEWER_DEFAULTS[id].effort),
       id,
@@ -826,13 +827,11 @@ function parseReviewers(raw) {
   return out;
 }
 function loadReviewers(file = REVIEWERS_FILE) {
-  let raw;
   try {
-    raw = JSON.parse(fs4.readFileSync(file, "utf8"));
+    return parseReviewers(JSON.parse(fs4.readFileSync(file, "utf8")));
   } catch {
     return { ...REVIEWER_DEFAULTS };
   }
-  return parseReviewers(raw);
 }
 function resolveReviewer(id, file = REVIEWERS_FILE) {
   return loadReviewers(file)[id] ?? REVIEWER_DEFAULTS[id];
@@ -2170,9 +2169,8 @@ function parseVoices(raw) {
     if (!e || typeof e !== "object") continue;
     const r = e;
     const sandbox = str3(r.sandbox, VOICE_DEFAULTS[id].sandbox ?? "");
-    const advisor = id === "claude" ? parseSeatAdvisor(r.advisor, `voices.json ${id}`) : void 0;
     out[id] = {
-      ...advisor === void 0 ? {} : { advisor },
+      ...id === "claude" && r.advisor !== void 0 ? { advisor: r.advisor } : {},
       cmd: str3(r.cmd, VOICE_DEFAULTS[id].cmd),
       effort: str3(r.effort, VOICE_DEFAULTS[id].effort),
       id,
@@ -2184,13 +2182,14 @@ function parseVoices(raw) {
   return out;
 }
 function loadVoices(file = VOICES_FILE) {
-  let raw;
   try {
-    raw = JSON.parse(fs11.readFileSync(file, "utf8"));
+    return parseVoices(JSON.parse(fs11.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
-  return parseVoices(raw);
+}
+function assertRosterAdvisors(roster, configs, source) {
+  for (const id of roster) parseSeatAdvisor(configs[id]?.advisor, source ? `${source} ${id}` : id);
 }
 function listVoices(file = VOICES_FILE) {
   const all = loadVoices(file);
@@ -2331,6 +2330,7 @@ async function runBrainstormMode(opts) {
   const roster = opts.voices && opts.voices.length > 0 ? opts.voices : [...VOICE_IDS];
   const adapters = opts.adapters ?? VOICE_ADAPTERS;
   const configs = opts.voiceConfigs ?? loadVoices(opts.voicesFile);
+  assertRosterAdvisors(roster, configs, opts.voiceConfigs ? void 0 : "voices.json");
   const timeoutMs = opts.timeoutMs ?? DEFAULT_VOICE_TIMEOUT_MS;
   log(`Round 1 \xB7 independent ideation \u2014 ${roster.length} voice(s): ${roster.join(", ")}`);
   const genPrompt = renderGeneratePrompt(opts.topic, opts.fileContext);
@@ -5126,6 +5126,7 @@ async function runConsultMode(opts) {
   const roster = opts.voices && opts.voices.length > 0 ? opts.voices : [...VOICE_IDS];
   const adapters = opts.adapters ?? VOICE_ADAPTERS;
   const configs = opts.voiceConfigs ?? loadVoices(opts.voicesFile);
+  assertRosterAdvisors(roster, configs, opts.voiceConfigs ? void 0 : "voices.json");
   const timeoutMs = opts.timeoutMs ?? DEFAULT_VOICE_TIMEOUT_MS2;
   log(`Round 1 \xB7 independent answers \u2014 ${roster.length} voice(s): ${roster.join(", ")}`);
   const answerPrompt = renderAnswerPrompt(opts.question, opts.fileContext);
@@ -7063,7 +7064,12 @@ async function runGate(opts) {
       } catch {
       }
     };
-    const seatMeta = { effort: seat.effort, id: seat.id, model: seat.model };
+    const seatMeta = {
+      ...seat.advisor === void 0 ? {} : { advisor: seat.advisor },
+      effort: seat.effort,
+      id: seat.id,
+      model: seat.model
+    };
     const stub = (why) => {
       log(`  \xB7 shadow gate (${seat.id} \xB7 ${seat.model} @ ${seat.effort}): ${why} \u2014 audit-only, run unaffected`);
       writeShadow({
@@ -8290,6 +8296,9 @@ function persistSeatReview(baseDir, runId, seatId, review, raw) {
   if (raw !== null) writeTrailFile(baseDir, runId, `${seatId}-review.raw.md`, raw);
   writeTrailFile(baseDir, runId, `review.${seatId}.json`, JSON.stringify(review, null, 2));
 }
+function withSeatAdvisor(review, config) {
+  return config.advisor === void 0 ? review : { ...review, advisor: config.advisor };
+}
 function loadVoiceReviewsFromTrail(baseDir, runId) {
   const out = readReviewsForRun(baseDir, runId).map(storedToVoiceReview);
   const claude = reviewJsonFromTrail(baseDir, runId, "review.claude.json");
@@ -8379,14 +8388,14 @@ async function runClaudeReviewLayer(opts) {
       opts.historyPacket
     );
     claudeSpawned = spawned;
-    claudeReview = review;
+    claudeReview = withSeatAdvisor(review, opts.claudeConfig);
     try {
-      persistSeatReview(opts.baseDir, opts.runId, "claude", review, raw);
+      persistSeatReview(opts.baseDir, opts.runId, "claude", claudeReview, raw);
     } catch (e) {
       const why = e.message;
       log(`  \xB7 claude: trail persist FAILED (${why}) \u2014 reviewer counted INCOMPLETE`);
       claudeReview = {
-        ...review,
+        ...claudeReview,
         ok: false,
         summary: `claude reviewed but FAILED to persist to the trail (${why}) \u2014 not a complete reviewer`
       };
@@ -8432,13 +8441,13 @@ async function runClaudeReviewLayer(opts) {
       timeoutMs: opts.timeoutMs ?? HOLISTIC_WORKTREE_TIMEOUT_MS,
       worktree: plan.worktree
     });
-    holisticReview = review;
+    holisticReview = withSeatAdvisor(review, holistic.config);
     try {
-      persistSeatReview(opts.baseDir, opts.runId, HOLISTIC_SEAT_ID, review, raw);
+      persistSeatReview(opts.baseDir, opts.runId, HOLISTIC_SEAT_ID, holisticReview, raw);
     } catch (e) {
       const why = e.message;
       log(`  \xB7 holistic: trail persist FAILED (${why}) \u2014 the lens's findings are dropped from this run`);
-      holisticReview = { ...review, findings: [], ok: false, summary: `the holistic lens ran but FAILED to persist to the trail (${why})` };
+      holisticReview = { ...holisticReview, findings: [], ok: false, summary: `the holistic lens ran but FAILED to persist to the trail (${why})` };
     }
     try {
       writeTrailFile(opts.baseDir, opts.runId, `review.${HOLISTIC_SEAT_ID}.md`, renderReviewMarkdown(review));
@@ -8640,7 +8649,6 @@ function resolveGateSeat(raw, flags, warn) {
       );
   }
   const claude = plainObject(root.claude);
-  const gateAdvisor = gate ? parseSeatAdvisor(gate.advisor, "voices.json gate") : void 0;
   if (gate && "cmd" in gate)
     warn(
       "gate seat: `cmd` is ignored \u2014 the gate spawn is always one of the two FENCED runners, picked by `vendor`; remove it"
@@ -8663,10 +8671,11 @@ function resolveGateSeat(raw, flags, warn) {
     }
   }
   const entryVendor = fileVendor && GATE_VENDORS.has(fileVendor) ? fileVendor : "anthropic";
-  const advisorApplies = gateAdvisor !== void 0 && entryVendor === "anthropic" && vendor === "anthropic";
-  if (gateAdvisor !== void 0 && !advisorApplies)
+  const advisorApplies = entryVendor === "anthropic" && vendor === "anthropic";
+  const gateAdvisor = gate && advisorApplies ? parseSeatAdvisor(gate.advisor, "voices.json gate") : void 0;
+  if (gate && gate.advisor !== void 0 && !advisorApplies)
     warn(
-      `gate seat: \`advisor\` is ignored \u2014 it is a Claude-seat setting, and this gate (or its entry) is codex`
+      `gate seat: \`advisor\` is ignored \u2014 it is a Claude-seat setting, and this gate (or its entry) is codex (got ${JSON.stringify(gate.advisor)}; not validated)`
     );
   if (gate && entryVendor !== vendor && (nonEmptyStr3(gate.model) || nonEmptyStr3(gate.effort))) {
     warn(
@@ -8735,7 +8744,7 @@ function resolveGateSeat(raw, flags, warn) {
     // only the fields the gate seat configures. The advisor is the gate entry's own (advisorApplies).
     config: {
       ...VOICE_DEFAULTS.claude,
-      ...advisorApplies ? { advisor: gateAdvisor } : {},
+      ...gateAdvisor === void 0 ? {} : { advisor: gateAdvisor },
       effort,
       model
     },
@@ -9607,7 +9616,7 @@ function renderReviewComment(input) {
   }
   const receiptLine = receipt.path ? `receipt \`${code(receipt.path)}\`${receipt.digest ? ` (${code(receipt.digest)})` : ""}` : `receipt none \u2014 ${md(receipt.error ?? "not qualified")}`;
   const seat = input.gateSeat;
-  const seatLine = seat ? `gate seat anthropic/${md(seat.model)} @ ${md(seat.effort)} (model: ${seat.modelSource}, effort: ${seat.effortSource})` : "gate seat n/a (no gate ran)";
+  const seatLine = seat ? `gate seat anthropic/${md(seat.model)} @ ${md(seat.effort)}${seat.advisor === void 0 ? "" : ` \xB7 advisor ${md(seat.advisor)}`} (model: ${seat.modelSource}, effort: ${seat.effortSource})` : "gate seat n/a (no gate ran)";
   const completed = receipt.completed.length ? ` \xB7 completed: ${receipt.completed.map(md).join(", ")}` : "";
   const evidence = input.evidenceNote ? ` \xB7 ${md(input.evidenceNote)}` : "";
   out.push("", "---");
@@ -10055,7 +10064,13 @@ function agentLine(c, off) {
   return `    ${c.id.padEnd(7)} ${c.vendor} \xB7 ${c.model} @ ${c.effort}${advisorNote(c.advisor)}${sandbox}${offNote}`;
 }
 function advisorNote(advisor) {
-  return advisor === void 0 ? "" : ` \xB7 advisor ${advisor}`;
+  if (advisor === void 0) return "";
+  if (isSeatAdvisor(advisor)) return ` \xB7 advisor ${advisor}`;
+  return ` \xB7 advisor ${JSON.stringify(advisor)} (INVALID \u2014 a command that runs this seat refuses it)`;
+}
+function gateLine(gate) {
+  if ("error" in gate) return `    ${"gate".padEnd(7)} INVALID \u2014 ${gate.error}`;
+  return `    ${"gate".padEnd(7)} ${gate.vendor ?? "anthropic"} \xB7 ${gate.model} @ ${gate.effort}${advisorNote(gate.advisor)}  \xB7 source model:${gate.modelSource} \xB7 effort:${gate.effortSource}${gate.vendor && gate.vendor !== "anthropic" ? ` \xB7 vendor:${gate.vendorSource ?? "default"}` : ""}`;
 }
 function sourceNote(file, exists) {
   return exists ? file : `${file} \u2014 not present, using baked defaults`;
@@ -10079,9 +10094,7 @@ function renderRegistry(view) {
   for (const v of view.voices) out.push(agentLine(v));
   out.push("");
   out.push("  review synthesis  (the verified GATE \u2014 claude -p unless gate.vendor is codex; {model,effort,advisor})");
-  out.push(
-    `    ${"gate".padEnd(7)} ${view.gate.vendor ?? "anthropic"} \xB7 ${view.gate.model} @ ${view.gate.effort}${advisorNote(view.gate.advisor)}  \xB7 source model:${view.gate.modelSource} \xB7 effort:${view.gate.effortSource}${view.gate.vendor && view.gate.vendor !== "anthropic" ? ` \xB7 vendor:${view.gate.vendorSource ?? "default"}` : ""}`
-  );
+  out.push(gateLine(view.gate));
   out.push("");
   return out.join("\n");
 }
@@ -10835,7 +10848,13 @@ function resolveStageTarget(target, gh) {
 function toCommentGateSeat(seat) {
   const model = claudeModelLabel(seat.config);
   const effort = seat.config.effort && seat.config.effort !== "default" ? seat.config.effort : "default";
-  return { effort, effortSource: seat.effortSource, model, modelSource: seat.modelSource };
+  return {
+    ...seat.config.advisor === void 0 ? {} : { advisor: seat.config.advisor },
+    effort,
+    effortSource: seat.effortSource,
+    model,
+    modelSource: seat.modelSource
+  };
 }
 function reviewExitCode(opts) {
   const {
@@ -12177,12 +12196,10 @@ async function reviewersCommand(args) {
   }
   const reviewersFile = typeof values["reviewers-file"] === "string" ? path20.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
   const voicesFile = typeof values["voices-file"] === "string" ? path20.resolve(values["voices-file"]) : VOICES_FILE;
-  const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`\xB7 ${m}`));
-  const reviewersConfig = loadReviewers(reviewersFile);
-  const enabledIds = enabledReviewerIds(reviewersConfig);
-  const view = {
-    enabledReviewerIds: enabledIds,
-    gate: {
+  let gate;
+  try {
+    const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`\xB7 ${m}`));
+    gate = {
       ...gateSeat.config.advisor === void 0 ? {} : { advisor: gateSeat.config.advisor },
       effort: gateSeat.config.effort,
       effortSource: gateSeat.effortSource,
@@ -12190,7 +12207,15 @@ async function reviewersCommand(args) {
       modelSource: gateSeat.modelSource,
       vendor: gateSeat.vendor,
       vendorSource: gateSeat.vendorSource
-    },
+    };
+  } catch (e) {
+    gate = { error: e.message };
+  }
+  const reviewersConfig = loadReviewers(reviewersFile);
+  const enabledIds = enabledReviewerIds(reviewersConfig);
+  const view = {
+    enabledReviewerIds: enabledIds,
+    gate,
     offSeats: offSeatsOf(reviewersConfig, enabledIds),
     reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,
@@ -12758,9 +12783,7 @@ async function reseatCommand(args) {
   const headSha = pre.headSha;
   const reviewersFile = typeof values["reviewers-file"] === "string" ? values["reviewers-file"] : REVIEWERS_FILE;
   const sandbox = typeof values.sandbox === "string" ? values.sandbox : void 0;
-  const reviewers = loadSeatsOrRefuse(() => loadReviewers(reviewersFile));
-  if (!reviewers) return 3;
-  const reviewer = { ...reviewers[seat], ...sandbox ? { sandbox } : {} };
+  const reviewer = { ...loadReviewers(reviewersFile)[seat], ...sandbox ? { sandbox } : {} };
   const gateSeat = loadSeatsOrRefuse(
     () => loadGateSeat(
       VOICES_FILE,
@@ -13103,5 +13126,6 @@ export {
   main,
   parseRequiredReviewers,
   resolveOptionalReviewers,
-  resolveTrailBase
+  resolveTrailBase,
+  toCommentGateSeat
 };

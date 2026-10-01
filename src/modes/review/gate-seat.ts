@@ -298,7 +298,7 @@ function readVoicesRaw(
 
 // Read + resolve the gate seat from a voices.json file (default ~/.ensemble-ai/voices.json). A
 // missing / unreadable / invalid file → an empty raw → the built-in default seat. Never throws on
-// the FILE; an invalid `advisor` in it throws (resolveGateSeat).
+// the FILE; an invalid `advisor` on an anthropic gate throws (resolveGateSeat).
 export function loadGateSeat(
   file: string = VOICES_FILE,
   flags: GateSeatFlags = {},

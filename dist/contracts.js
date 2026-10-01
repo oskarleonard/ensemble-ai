@@ -25,9 +25,12 @@ function parseSeatWindow(v) {
 }
 var ADVISOR_OFF = "off";
 var ADVISOR_MODEL_RE = /^[a-z0-9][a-z0-9.-]*$/;
+function isSeatAdvisor(v) {
+  return v === ADVISOR_OFF || typeof v === "string" && ADVISOR_MODEL_RE.test(v);
+}
 function parseSeatAdvisor(v, seat) {
   if (v === void 0) return void 0;
-  if (v === ADVISOR_OFF || typeof v === "string" && ADVISOR_MODEL_RE.test(v)) return v;
+  if (isSeatAdvisor(v)) return v;
   throw new Error(
     `ensemble-ai: ${seat} seat: \`advisor\` must be "${ADVISOR_OFF}" or a model id matching ${ADVISOR_MODEL_RE.source} (omit the key to inherit the operator's setting) \u2014 got ${JSON.stringify(v) ?? String(v)}`
   );
@@ -516,6 +519,7 @@ export {
   extractJsonBlock,
   isCoreReviewerId,
   isReviewerId,
+  isSeatAdvisor,
   oneOf,
   parseFindings,
   parseReviewerIds,
