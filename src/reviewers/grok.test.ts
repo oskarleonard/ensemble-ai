@@ -637,14 +637,17 @@ describe('runGrokReview — the login pre-flight runs before anything spawns', (
     child?.emit('exit');
     await run;
     // No explicit timeout: the worktree seat's 60-min backstop is the deadline the login must outlive.
+    // The pre-flight refuses here, so the seat returns before its egress proxy would start — the
+    // check provably precedes the fence, and the case needs no loopback listen.
     preflight.mockClear();
     spawned.mockClear();
+    preflight.mockRejectedValueOnce(new GrokLoginExpiryError(`${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: x`));
     const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-wt-'));
-    const wtRun = runGrokReview('p', CONFIG, { worktree: wt });
-    await vi.waitFor(() => expect(spawned).toHaveBeenCalled());
+    const refused = await runGrokReview('p', CONFIG, { worktree: wt });
     expect(preflight).toHaveBeenCalledWith({ bin: 'grok', deadlineMs: GROK_WORKTREE_REVIEW_TIMEOUT_MS });
-    child?.emit('exit');
-    await wtRun;
+    expect(refused).toMatchObject({ ok: false });
+    expect(refused.egressDenials).toBeUndefined(); // no proxy was ever started
+    expect(spawned).not.toHaveBeenCalled();
     fs.rmSync(wt, { force: true, recursive: true });
   });
 
