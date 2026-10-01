@@ -152,12 +152,12 @@ describe('ensureGrokLogin', () => {
     expect(r.runs).toHaveLength(1);
   });
 
-  it('says the seat outlasts any login when even a refreshed one is too short', async () => {
+  it('refuses a seat that outlasts even a freshly refreshed login, naming the shorter timeout too', async () => {
     writeAuth({ 'https://auth.x.ai::a': entry(iso(NOW + 20 * MIN)) });
     const r = runner(() => writeAuth({ 'https://auth.x.ai::a': entry(iso(NOW + 6 * 60 * MIN)) }));
     const err = await ensureGrokLogin({ ...opts(r.run), deadlineMs: 7 * 60 * MIN }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(GrokLoginExpiryError);
-    expect((err as Error).message).toMatch(/even the freshly refreshed login .* shorten it/);
+    expect((err as Error).message).toMatch(/expires 2026-10-01T07:00:00\.000Z.* shorten it/);
   });
 
   it('lets the re-read decide when the refresh run itself throws', async () => {

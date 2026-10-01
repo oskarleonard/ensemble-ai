@@ -1779,14 +1779,16 @@ async function ensureGrokLogin(opts) {
     });
   } catch {
   } finally {
-    fs9.rmSync(cwd, { force: true, recursive: true });
+    try {
+      fs9.rmSync(cwd, { force: true, recursive: true });
+    } catch {
+    }
   }
   const after = readGrokLoginExpiry(file)?.latest;
   if (after && after.getTime() - now() >= needMs) return;
   const deadline = new Date(now() + opts.deadlineMs).toISOString();
-  const margin = `${Math.round(marginMs / 6e4)}-min margin`;
   throw new GrokLoginExpiryError(
-    after && after.getTime() > before.latest.getTime() ? `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: even the freshly refreshed login (expires ${after.toISOString()}) ends before the seat's deadline (${deadline}) plus a ${margin} \u2014 the seat's timeout is longer than a grok login lives; shorten it.` : `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: the login expires ${(after ?? before.latest).toISOString()}, before the seat's deadline (${deadline}) plus a ${margin}, and a refresh outside the sandbox did not extend it \u2014 run \`grok\` once to sign in, then re-run the review.`
+    `${GROK_LOGIN_EXPIRY_FAIL_PREFIX}: the login expires ${(after ?? before.latest).toISOString()}, before the seat's deadline (${deadline}) plus a ${Math.round(marginMs / 6e4)}-min margin, even after a refresh outside the sandbox \u2014 run \`grok\` once to sign in, then re-run the review; if a fresh sign-in still falls short, the seat's timeout is longer than a grok login lives, so shorten it.`
   );
 }
 
