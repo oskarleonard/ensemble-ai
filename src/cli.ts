@@ -1502,7 +1502,8 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // HERE, before the paid core fan-out. An invalid `advisor` throws naming the seat (core/types
   // parseSeatAdvisor), and that must fail the run up front — exit 3, nothing billed — not after
   // codex/grok have reviewed, nor inside the layer's crash backstop, where a lens typo would take
-  // the claude reviewer and the gate down with it. `--no-claude` runs none of them, so reads none.
+  // the claude reviewer and the gate down with it. A seat the run will not spawn is not resolved:
+  // `--no-claude` runs none of them, so reads none, and the lens resolves only with worktree evidence.
   //
   // The claude REVIEWER seat resolves like the gate: `--claude-model`/`--claude-effort` → the
   // voices.json `claude` entry → the built-in opus @ max. gate-seat.ts owns the chain and the WHY:
@@ -1516,7 +1517,9 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // surface on stderr so a mis-config is loud, never silent.
   //
   // The HOLISTIC lens: same chain — flag → voices.json `holistic` entry → the built-in default
-  // (opus @ high). Resolved only when `--holistic` asks for the lens.
+  // (opus @ high). Resolved only when `--holistic` asks for the lens AND the run has a worktree: the
+  // lens never spawns without one (resolveHolisticPlan), so `--holistic` without `--repo` reads no
+  // `holistic` entry and still gets its loud skip from the layer.
   let anthropicSeats: { claude: GateSeat; gate: GateSeat; holistic?: ResolvedVoiceConfig } | null = null;
   if (roster.claude) {
     const warn = (m: string) => console.error(`· ${m}`);
@@ -1538,7 +1541,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         },
         warn
       ),
-      ...(values.holistic
+      ...(values.holistic && worktree
         ? {
             holistic: loadHolisticSeat(
               VOICES_FILE,
@@ -1711,9 +1714,15 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         ...(historyPacket ? { historyPacket } : {}),
         // The HOLISTIC lens (spec §4) — off unless asked for, and it runs ONLY with worktree
         // evidence: `--holistic` without `--repo` is a LOUD skip, never a packet-evidence
-        // architecture claim (resolveHolisticPlan owns that ruling).
-        ...(anthropicSeats.holistic
-          ? { holistic: { baseSha: layerBaseSha, config: anthropicSeats.holistic } }
+        // architecture claim (resolveHolisticPlan owns that ruling). The request goes in either
+        // way; the seat config only when it resolved, which is exactly when this run has a worktree.
+        ...(values.holistic
+          ? {
+              holistic: {
+                baseSha: layerBaseSha,
+                ...(anthropicSeats.holistic ? { config: anthropicSeats.holistic } : {}),
+              },
+            }
           : {}),
         // The GATE runner binds to the RESOLVED vendor in code — config alone can never point
         // the gate at an unfenced spawn. anthropic (default) keeps the layer's claude runner;
@@ -2947,32 +2956,42 @@ async function reviewersCommand(args: string[]): Promise<number> {
     typeof values['voices-file'] === 'string'
       ? path.resolve(values['voices-file'])
       : VOICES_FILE;
-  // The gate seat resolves from the SAME voices.json (no run flags here — `config` is a read-only
-  // view, so source ∈ {file, default}); a junk/`cmd`-bearing entry warns loudly on stderr. Its one
-  // throw — an invalid advisor on an anthropic gate, which every gate-spawning command refuses — is
-  // shown on the gate row instead: `config` is the diagnosis, so it never throws on a bad advisor.
-  let gate: RegistryView['gate'];
-  try {
-    const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`· ${m}`));
-    gate = {
-      ...(gateSeat.config.advisor === undefined ? {} : { advisor: gateSeat.config.advisor }),
-      effort: gateSeat.config.effort,
-      effortSource: gateSeat.effortSource,
-      model: gateSeat.config.model,
-      modelSource: gateSeat.modelSource,
-      vendor: gateSeat.vendor,
-      vendorSource: gateSeat.vendorSource,
-    };
-  } catch (e) {
-    gate = { error: (e as Error).message };
-  }
+  // The gate and holistic seats resolve from the SAME voices.json (no run flags here — `config` is a
+  // read-only view, so source ∈ {file, default}); a junk/`cmd`-bearing entry warns loudly on stderr.
+  // Each seat's one throw — an invalid advisor, which every command that spawns the seat refuses —
+  // is replaced by a parse that keeps the value as written: `config` is the diagnosis, so the row
+  // shows the seat's resolved fields and marks only the advisor, as the claude voice row does.
+  const warn = (m: string) => console.error(`· ${m}`);
+  let gateAdvisor: unknown;
+  const gateSeat = loadGateSeat(voicesFile, {}, warn, (v) => {
+    gateAdvisor = v;
+    return undefined;
+  });
+  let holisticAdvisor: unknown;
+  const holisticSeat = loadHolisticSeat(voicesFile, {}, warn, (v) => {
+    holisticAdvisor = v;
+    return undefined;
+  });
   // ONE parse of reviewers.json feeds the roster, the enabled set and the off list, so the
   // three cannot disagree about a `disabledUntil` boundary crossing between two reads.
   const reviewersConfig = loadReviewers(reviewersFile);
   const enabledIds = enabledReviewerIds(reviewersConfig);
   const view: RegistryView = {
     enabledReviewerIds: enabledIds,
-    gate,
+    gate: {
+      ...(gateAdvisor === undefined ? {} : { advisor: gateAdvisor }),
+      effort: gateSeat.config.effort,
+      effortSource: gateSeat.effortSource,
+      model: gateSeat.config.model,
+      modelSource: gateSeat.modelSource,
+      vendor: gateSeat.vendor,
+      vendorSource: gateSeat.vendorSource,
+    },
+    holistic: {
+      ...(holisticAdvisor === undefined ? {} : { advisor: holisticAdvisor }),
+      effort: holisticSeat.effort,
+      model: holisticSeat.model,
+    },
     offSeats: offSeatsOf(reviewersConfig, enabledIds),
     reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,

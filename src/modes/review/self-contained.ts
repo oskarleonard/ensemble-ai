@@ -282,8 +282,10 @@ export interface ClaudeLayerOptions {
   // THE HOLISTIC LENS (spec §4) — DEFAULT OFF. Omit it and nothing changes: no seat is spawned, no
   // finding enters the gate, no clause enters the gate prompt, the records are the same objects.
   // Its PRESENCE is the request; present without `worktree` is a LOUD skip (holisticSkipped),
-  // never a packet-evidence run.
-  holistic?: { baseSha: string | null; config: ResolvedVoiceConfig };
+  // never a packet-evidence run. `config` is the resolved lens seat, owed whenever `worktree` is
+  // passed too: a caller resolves the seat only for a run that can spawn it, so a typo in an
+  // unspawnable lens's advisor never refuses the run.
+  holistic?: { baseSha: string | null; config?: ResolvedVoiceConfig };
   // The GATE (synthesis) seat — its own model/effort, independent of the `claude` REVIEWER above
   // ("reviewer = Opus @ high, gate = Fable @ max"). Always a `claude -p` spawn (only model/effort
   // differ). Omitted ⇒ inherits `claudeConfig` (the pre-Phase-3 behavior — one seat for both).
@@ -525,10 +527,12 @@ export async function runClaudeReviewLayer(
   if (!plan.run) {
     if (plan.skipReason) log(`  · ${plan.skipReason}`);
   } else if (holistic) {
-    log(`  · holistic lens (anthropic/${holistic.config.model} @ ${holistic.config.effort}) reading the whole project…`);
+    if (!holistic.config) throw new Error('holistic lens: a run with worktree evidence needs the resolved lens seat (`holistic.config`)');
+    const lensConfig = holistic.config;
+    log(`  · holistic lens (anthropic/${lensConfig.model} @ ${lensConfig.effort}) reading the whole project…`);
     const { raw, review } = await runHolisticLens({
       baseSha: plan.baseSha,
-      config: holistic.config,
+      config: lensConfig,
       diff: plan.diff,
       headSha: opts.expectedHeadSha,
       ...(opts.historyPacket ? { historyPacket: opts.historyPacket } : {}),
@@ -539,7 +543,7 @@ export async function runClaudeReviewLayer(
       timeoutMs: opts.timeoutMs ?? HOLISTIC_WORKTREE_TIMEOUT_MS,
       worktree: plan.worktree,
     });
-    holisticReview = withSeatAdvisor(review, holistic.config);
+    holisticReview = withSeatAdvisor(review, lensConfig);
     try {
       persistSeatReview(opts.baseDir, opts.runId, HOLISTIC_SEAT_ID, holisticReview, raw);
     } catch (e) {
