@@ -5538,7 +5538,7 @@ function nonEmptyStr(v) {
   return typeof v === "string" && v.trim() ? v.trim() : null;
 }
 function resolveHolisticSeat(raw, flags = {}, warn = () => {
-}) {
+}, parseAdvisor = parseSeatAdvisor) {
   const root = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const entry = root.holistic && typeof root.holistic === "object" && !Array.isArray(root.holistic) ? root.holistic : null;
   if (root.holistic !== void 0 && !entry) {
@@ -5548,7 +5548,7 @@ function resolveHolisticSeat(raw, flags = {}, warn = () => {
     warn("holistic seat: `cmd` is ignored \u2014 the lens is always a `claude -p` spawn (read-only plan mode + write-tool deny-list); remove it");
   }
   const model = nonEmptyStr(flags.model) || entry && nonEmptyStr(entry.model) || HOLISTIC_DEFAULTS.model;
-  const advisor = entry ? parseSeatAdvisor(entry.advisor, "voices.json holistic") : void 0;
+  const advisor = entry ? parseAdvisor(entry.advisor, "voices.json holistic") : void 0;
   const flagEffort = nonEmptyStr(flags.effort);
   if (flagEffort && !CLAUDE_EFFORTS2.has(flagEffort))
     warn(
@@ -5570,7 +5570,7 @@ function resolveHolisticSeat(raw, flags = {}, warn = () => {
   return { ...VOICE_DEFAULTS.claude, ...advisor === void 0 ? {} : { advisor }, effort, model };
 }
 function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
-}) {
+}, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
     raw = JSON.parse(fs18.readFileSync(file, "utf8"));
@@ -5579,7 +5579,7 @@ function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
       warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
     raw = {};
   }
-  return resolveHolisticSeat(raw, flags, warn);
+  return resolveHolisticSeat(raw, flags, warn, parseAdvisor);
 }
 function resolveHolisticPlan(input) {
   if (!input.requested) return { run: false, skipReason: null };
@@ -8427,10 +8427,12 @@ async function runClaudeReviewLayer(opts) {
   if (!plan.run) {
     if (plan.skipReason) log(`  \xB7 ${plan.skipReason}`);
   } else if (holistic) {
-    log(`  \xB7 holistic lens (anthropic/${holistic.config.model} @ ${holistic.config.effort}) reading the whole project\u2026`);
+    if (!holistic.config) throw new Error("holistic lens: a run with worktree evidence needs the resolved lens seat (`holistic.config`)");
+    const lensConfig = holistic.config;
+    log(`  \xB7 holistic lens (anthropic/${lensConfig.model} @ ${lensConfig.effort}) reading the whole project\u2026`);
     const { raw, review } = await runHolisticLens({
       baseSha: plan.baseSha,
-      config: holistic.config,
+      config: lensConfig,
       diff: plan.diff,
       headSha: opts.expectedHeadSha,
       ...opts.historyPacket ? { historyPacket: opts.historyPacket } : {},
@@ -8441,7 +8443,7 @@ async function runClaudeReviewLayer(opts) {
       timeoutMs: opts.timeoutMs ?? HOLISTIC_WORKTREE_TIMEOUT_MS,
       worktree: plan.worktree
     });
-    holisticReview = withSeatAdvisor(review, holistic.config);
+    holisticReview = withSeatAdvisor(review, lensConfig);
     try {
       persistSeatReview(opts.baseDir, opts.runId, HOLISTIC_SEAT_ID, holisticReview, raw);
     } catch (e) {
@@ -8638,7 +8640,7 @@ function resolveField(key, flag, gate, claude, warn, accept = () => true) {
   }
   return { source: "default", value: "default" };
 }
-function resolveGateSeat(raw, flags, warn) {
+function resolveGateSeat(raw, flags, warn, parseAdvisor = parseSeatAdvisor) {
   const root = plainObject(raw) ?? {};
   let gate = null;
   if (root.gate !== void 0) {
@@ -8672,7 +8674,7 @@ function resolveGateSeat(raw, flags, warn) {
   }
   const entryVendor = fileVendor && GATE_VENDORS.has(fileVendor) ? fileVendor : "anthropic";
   const advisorApplies = entryVendor === "anthropic" && vendor === "anthropic";
-  const gateAdvisor = gate && advisorApplies ? parseSeatAdvisor(gate.advisor, "voices.json gate") : void 0;
+  const gateAdvisor = gate && advisorApplies ? parseAdvisor(gate.advisor, "voices.json gate") : void 0;
   if (gate && gate.advisor !== void 0 && !advisorApplies)
     warn(
       `gate seat: \`advisor\` is ignored \u2014 it is a Claude-seat setting, and this gate (or its entry) is codex (got ${JSON.stringify(gate.advisor)}; not validated)`
@@ -8766,11 +8768,12 @@ function readVoicesRaw(file, warn, seatLabel, fallbackNote) {
   }
 }
 function loadGateSeat(file = VOICES_FILE, flags = {}, warn = () => {
-}) {
+}, parseAdvisor = parseSeatAdvisor) {
   return resolveGateSeat(
     readVoicesRaw(file, warn, "gate seat", "using the claude voice / built-in default"),
     flags,
-    warn
+    warn,
+    parseAdvisor
   );
 }
 var CLAUDE_REVIEWER_SEAT_DEFAULTS = { effort: "max", model: "opus" };
@@ -10069,7 +10072,6 @@ function advisorNote(advisor) {
   return ` \xB7 advisor ${JSON.stringify(advisor)} (INVALID \u2014 a command that runs this seat refuses it)`;
 }
 function gateLine(gate) {
-  if ("error" in gate) return `    ${"gate".padEnd(7)} INVALID \u2014 ${gate.error}`;
   return `    ${"gate".padEnd(7)} ${gate.vendor ?? "anthropic"} \xB7 ${gate.model} @ ${gate.effort}${advisorNote(gate.advisor)}  \xB7 source model:${gate.modelSource} \xB7 effort:${gate.effortSource}${gate.vendor && gate.vendor !== "anthropic" ? ` \xB7 vendor:${gate.vendorSource ?? "default"}` : ""}`;
 }
 function sourceNote(file, exists) {
@@ -10095,6 +10097,11 @@ function renderRegistry(view) {
   out.push("");
   out.push("  review synthesis  (the verified GATE \u2014 claude -p unless gate.vendor is codex; {model,effort,advisor})");
   out.push(gateLine(view.gate));
+  out.push("");
+  out.push("  holistic lens  (review --holistic --repo \u2014 always claude -p; {model,effort,advisor})");
+  out.push(
+    `    holistic anthropic \xB7 ${view.holistic.model} @ ${view.holistic.effort}${advisorNote(view.holistic.advisor)}`
+  );
   out.push("");
   return out.join("\n");
 }
@@ -11111,7 +11118,7 @@ async function runReviewPipeline(input) {
         },
         warn
       ),
-      ...values.holistic ? {
+      ...values.holistic && worktree ? {
         holistic: loadHolisticSeat(
           VOICES_FILE,
           {
@@ -11232,8 +11239,14 @@ async function runReviewPipeline(input) {
         ...historyPacket ? { historyPacket } : {},
         // The HOLISTIC lens (spec §4) — off unless asked for, and it runs ONLY with worktree
         // evidence: `--holistic` without `--repo` is a LOUD skip, never a packet-evidence
-        // architecture claim (resolveHolisticPlan owns that ruling).
-        ...anthropicSeats.holistic ? { holistic: { baseSha: layerBaseSha, config: anthropicSeats.holistic } } : {},
+        // architecture claim (resolveHolisticPlan owns that ruling). The request goes in either
+        // way; the seat config only when it resolved, which is exactly when this run has a worktree.
+        ...values.holistic ? {
+          holistic: {
+            baseSha: layerBaseSha,
+            ...anthropicSeats.holistic ? { config: anthropicSeats.holistic } : {}
+          }
+        } : {},
         // The GATE runner binds to the RESOLVED vendor in code — config alone can never point
         // the gate at an unfenced spawn. anthropic (default) keeps the layer's claude runner;
         // codex is the same fenced runner the shadow trial proved.
@@ -12196,26 +12209,35 @@ async function reviewersCommand(args) {
   }
   const reviewersFile = typeof values["reviewers-file"] === "string" ? path20.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
   const voicesFile = typeof values["voices-file"] === "string" ? path20.resolve(values["voices-file"]) : VOICES_FILE;
-  let gate;
-  try {
-    const gateSeat = loadGateSeat(voicesFile, {}, (m) => console.error(`\xB7 ${m}`));
-    gate = {
-      ...gateSeat.config.advisor === void 0 ? {} : { advisor: gateSeat.config.advisor },
+  const warn = (m) => console.error(`\xB7 ${m}`);
+  let gateAdvisor;
+  const gateSeat = loadGateSeat(voicesFile, {}, warn, (v) => {
+    gateAdvisor = v;
+    return void 0;
+  });
+  let holisticAdvisor;
+  const holisticSeat = loadHolisticSeat(voicesFile, {}, warn, (v) => {
+    holisticAdvisor = v;
+    return void 0;
+  });
+  const reviewersConfig = loadReviewers(reviewersFile);
+  const enabledIds = enabledReviewerIds(reviewersConfig);
+  const view = {
+    enabledReviewerIds: enabledIds,
+    gate: {
+      ...gateAdvisor === void 0 ? {} : { advisor: gateAdvisor },
       effort: gateSeat.config.effort,
       effortSource: gateSeat.effortSource,
       model: gateSeat.config.model,
       modelSource: gateSeat.modelSource,
       vendor: gateSeat.vendor,
       vendorSource: gateSeat.vendorSource
-    };
-  } catch (e) {
-    gate = { error: e.message };
-  }
-  const reviewersConfig = loadReviewers(reviewersFile);
-  const enabledIds = enabledReviewerIds(reviewersConfig);
-  const view = {
-    enabledReviewerIds: enabledIds,
-    gate,
+    },
+    holistic: {
+      ...holisticAdvisor === void 0 ? {} : { advisor: holisticAdvisor },
+      effort: holisticSeat.effort,
+      model: holisticSeat.model
+    },
     offSeats: offSeatsOf(reviewersConfig, enabledIds),
     reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,

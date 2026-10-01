@@ -3991,7 +3991,7 @@ function nonEmptyStr(v) {
   return typeof v === "string" && v.trim() ? v.trim() : null;
 }
 function resolveHolisticSeat(raw, flags = {}, warn = () => {
-}) {
+}, parseAdvisor = parseSeatAdvisor) {
   const root = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const entry = root.holistic && typeof root.holistic === "object" && !Array.isArray(root.holistic) ? root.holistic : null;
   if (root.holistic !== void 0 && !entry) {
@@ -4001,7 +4001,7 @@ function resolveHolisticSeat(raw, flags = {}, warn = () => {
     warn("holistic seat: `cmd` is ignored \u2014 the lens is always a `claude -p` spawn (read-only plan mode + write-tool deny-list); remove it");
   }
   const model = nonEmptyStr(flags.model) || entry && nonEmptyStr(entry.model) || HOLISTIC_DEFAULTS.model;
-  const advisor = entry ? parseSeatAdvisor(entry.advisor, "voices.json holistic") : void 0;
+  const advisor = entry ? parseAdvisor(entry.advisor, "voices.json holistic") : void 0;
   const flagEffort = nonEmptyStr(flags.effort);
   if (flagEffort && !CLAUDE_EFFORTS2.has(flagEffort))
     warn(
@@ -4023,7 +4023,7 @@ function resolveHolisticSeat(raw, flags = {}, warn = () => {
   return { ...VOICE_DEFAULTS.claude, ...advisor === void 0 ? {} : { advisor }, effort, model };
 }
 function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
-}) {
+}, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
     raw = JSON.parse(fs17.readFileSync(file, "utf8"));
@@ -4032,7 +4032,7 @@ function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
       warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
     raw = {};
   }
-  return resolveHolisticSeat(raw, flags, warn);
+  return resolveHolisticSeat(raw, flags, warn, parseAdvisor);
 }
 function resolveHolisticPlan(input) {
   if (!input.requested) return { run: false, skipReason: null };
