@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 
 const binCache = new Map<string, string>();
 
@@ -19,7 +20,9 @@ export function resolveBin(
 ): string {
   const override = opts.envVar ? process.env[opts.envVar] : undefined;
   if (override) {
-    if (fs.existsSync(override)) return override;
+    // Absolute, so the path checked here is the one spawned from the seat's own cwd.
+    const bin = path.resolve(override);
+    if (fs.existsSync(bin)) return bin;
     throw new Error(
       `${opts.envVar}=${override} does not exist — unset it to use the default resolution`
     );

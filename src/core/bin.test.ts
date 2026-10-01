@@ -28,6 +28,7 @@ afterAll(() => {
 });
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
   execFileSyncMock.mockReset();
 });
 
@@ -44,6 +45,17 @@ describe('resolveBin — an explicitly set override is authoritative', () => {
     vi.stubEnv('T2_BIN', missing);
     expect(() => resolveBin('t2', { candidates: [candidate], envVar: 'T2_BIN' })).toThrow(
       `T2_BIN=${missing} does not exist — unset it to use the default resolution`
+    );
+    expect(execFileSyncMock).not.toHaveBeenCalled();
+  });
+
+  it('a relative override resolves against the caller cwd and returns an absolute path', () => {
+    vi.spyOn(process, 'cwd').mockReturnValue(dir);
+    vi.stubEnv('T9_BIN', './pinned-cli');
+    expect(resolveBin('t9', { envVar: 'T9_BIN' })).toBe(existing);
+    vi.stubEnv('T9_BIN', 't9');
+    expect(() => resolveBin('t9', { candidates: [candidate], envVar: 'T9_BIN' })).toThrow(
+      'T9_BIN=t9 does not exist'
     );
     expect(execFileSyncMock).not.toHaveBeenCalled();
   });

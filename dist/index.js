@@ -1506,11 +1506,13 @@ import os3 from "os";
 // src/core/bin.ts
 import { execFileSync as execFileSync2 } from "child_process";
 import fs4 from "fs";
+import path4 from "path";
 var binCache = /* @__PURE__ */ new Map();
 function resolveBin(name2, opts = {}) {
   const override = opts.envVar ? process.env[opts.envVar] : void 0;
   if (override) {
-    if (fs4.existsSync(override)) return override;
+    const bin = path4.resolve(override);
+    if (fs4.existsSync(bin)) return bin;
     throw new Error(
       `${opts.envVar}=${override} does not exist \u2014 unset it to use the default resolution`
     );
@@ -1680,7 +1682,7 @@ function sha256Hex(input) {
 // src/reviewers/codex.ts
 import fs7 from "fs";
 import os5 from "os";
-import path5 from "path";
+import path6 from "path";
 
 // src/core/egress-proxy.ts
 import http from "http";
@@ -1826,7 +1828,7 @@ var CODEX_SOURCE_FENCE_ARGS = [
 // src/reviewers/codex-sandbox.ts
 import fs6 from "fs";
 import os4 from "os";
-import path4 from "path";
+import path5 from "path";
 var CODEX_SANDBOX_PROFILE = {
   // KERNEL-denied outbound: Seatbelt refuses every direct connection except the one loopback port
   // where the engine's CONNECT proxy enforces the host allowlist (`*:443` and `*:53` verified EPERM).
@@ -1859,8 +1861,8 @@ function sbSubpaths(paths) {
   return paths.map((p) => `(subpath ${JSON.stringify(p)})`).join(" ");
 }
 function isUnsafeReadRoot(root, home = os4.homedir()) {
-  const r = path4.resolve(root);
-  return r === path4.parse(r).root || isUnder(home, r);
+  const r = path5.resolve(root);
+  return r === path5.parse(r).root || isUnder(home, r);
 }
 function renderCodexSandboxProfile(p) {
   for (const [name2, root] of [
@@ -1870,7 +1872,7 @@ function renderCodexSandboxProfile(p) {
   ]) {
     if (isUnsafeReadRoot(root)) {
       throw new Error(
-        `ensemble-ai: refusing to build the codex sandbox profile \u2014 ${name2} resolves to ${path4.resolve(root)}, which is the filesystem root or contains your home directory. Granting it read access would expose every credential on this machine. The codex seat must fall back to the packet.`
+        `ensemble-ai: refusing to build the codex sandbox profile \u2014 ${name2} resolves to ${path5.resolve(root)}, which is the filesystem root or contains your home directory. Granting it read access would expose every credential on this machine. The codex seat must fall back to the packet.`
       );
     }
   }
@@ -1918,7 +1920,7 @@ function renderCodexSandboxProfile(p) {
 ;; The parent normally sits under the per-user $TMPDIR, which is read-only here anyway; this deny
 ;; makes that a property of the profile rather than of TMPDIR (cross-vendor review, claude-f3).
 ;; Last match wins in SBPL, so this overrides the /private/tmp write grant above.
-(deny file-write* (subpath ${JSON.stringify(path4.dirname(p.worktree))}))
+(deny file-write* (subpath ${JSON.stringify(path5.dirname(p.worktree))}))
 (allow network-outbound (remote ip "localhost:${p.proxyPort}") (remote unix-socket (path-literal ${JSON.stringify(MDNS_RESPONDER_SOCKET)})))
 (allow network-inbound (local ip "*:*"))
 `;
@@ -1951,10 +1953,10 @@ var VERIFY_SYSCTL_NAMES = [
 ];
 function renderVerifySandboxProfile(p) {
   const [worktree, tmpDir, npmCache, nodePrefix] = [p.worktree, p.tmpDir, p.npmCache, p.nodePrefix].map((root) => {
-    if (!path4.isAbsolute(root) || isUnsafeReadRoot(root)) {
+    if (!path5.isAbsolute(root) || isUnsafeReadRoot(root)) {
       throw new Error(`ensemble-ai: refusing unsafe verify sandbox root: ${root}`);
     }
-    return path4.resolve(root);
+    return path5.resolve(root);
   });
   const scratch = [worktree, tmpDir, npmCache];
   const tempTrees = [...SHARED_TEMP_TREES, fs6.realpathSync(os4.tmpdir())];
@@ -2007,20 +2009,20 @@ function codexSandboxSupported(platform = process.platform) {
 var QUALIFY_PROBE_PORT = 1;
 function defaultCodexSandboxPaths(worktree, proxyPort) {
   return {
-    codexHome: path4.join(os4.homedir(), ".codex"),
+    codexHome: path5.join(os4.homedir(), ".codex"),
     proxyPort,
     // process.execPath is <prefix>/bin/node → <prefix> covers node AND the codex install that
     // sits beside it in the same nvm/npm prefix. This is only as narrow as the user's install
     // layout: `/bin/node` ⇒ `/` and `~/bin/node` ⇒ `$HOME`. renderCodexSandboxProfile REJECTS
     // those rather than granting them — see isUnsafeReadRoot.
-    nodePrefix: path4.dirname(path4.dirname(fs6.realpathSync(process.execPath))),
+    nodePrefix: path5.dirname(path5.dirname(fs6.realpathSync(process.execPath))),
     worktree: fs6.realpathSync(worktree)
   };
 }
 function writeCodexSandboxProfile(paths) {
   const profile = renderCodexSandboxProfile(paths);
   const dir = makeOwnerOnlyTempDir("ensemble-sb-");
-  const file = path4.join(dir, "ensemble-review-codex.sb");
+  const file = path5.join(dir, "ensemble-review-codex.sb");
   fs6.writeFileSync(file, profile, { mode: 384 });
   fs6.chmodSync(file, 384);
   return {
@@ -2121,7 +2123,7 @@ function buildCodexReviewArgs(config, outFile, prompt) {
   ];
 }
 function reviewOutFile() {
-  return path5.join(
+  return path6.join(
     os5.tmpdir(),
     `codex-review-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
   );
@@ -2135,7 +2137,7 @@ function worktreeReplyFile() {
       } catch {
       }
     },
-    file: path5.join(dir, "reply.md")
+    file: path6.join(dir, "reply.md")
   };
 }
 function refuseWorktree(message) {
@@ -2236,12 +2238,12 @@ function runCodexReview(prompt, config, opts = {}) {
 // src/reviewers/grok.ts
 import fs8 from "fs";
 import os6 from "os";
-import path6 from "path";
+import path7 from "path";
 var GROK_PACKET_REVIEW_TIMEOUT_MS = 18e5;
 var GROK_WORKTREE_REVIEW_TIMEOUT_MS = 36e5;
 var GROK_INACTIVITY_TIMEOUT_MS = 9e5;
 var GROK_STREAM_TAIL_LIMIT = 1e5;
-var GROK_BIN_CANDIDATES = [path6.join(os6.homedir(), ".grok", "bin", "grok")];
+var GROK_BIN_CANDIDATES = [path7.join(os6.homedir(), ".grok", "bin", "grok")];
 function resolveGrokBin() {
   return resolveBin("grok", {
     candidates: GROK_BIN_CANDIDATES,
@@ -2284,12 +2286,12 @@ function replaceReviewSection(content) {
   const after = lines.slice(to).join("\n").replace(/^\n+/, "");
   return [before, REVIEW_PROFILE.trimEnd(), after].filter((s) => s.length > 0).join("\n\n") + "\n";
 }
-function ensureSandboxProfile(profile, file = path6.join(os6.homedir(), ".grok", "sandbox.toml")) {
+function ensureSandboxProfile(profile, file = path7.join(os6.homedir(), ".grok", "sandbox.toml")) {
   if (BUILTIN_SANDBOXES.has(profile) || profile !== REVIEW_PROFILE_NAME) return;
   try {
     const existing = fs8.existsSync(file) ? fs8.readFileSync(file, "utf8") : "";
     if (existing.includes(REVIEW_PROFILE_BLOCK)) return;
-    fs8.mkdirSync(path6.dirname(file), { recursive: true });
+    fs8.mkdirSync(path7.dirname(file), { recursive: true });
     const updated = existing.includes(REVIEW_PROFILE_HEADER) ? replaceReviewSection(existing) : null;
     const content = updated ?? (existing.trim() ? `${existing.trimEnd()}
 
@@ -2391,7 +2393,7 @@ async function runGrokReview(prompt, config, opts = {}) {
   let cwd;
   try {
     ensureSandboxProfile(sandbox);
-    cwd = worktreeCwd ?? fs8.mkdtempSync(path6.join(os6.tmpdir(), "grok-review-"));
+    cwd = worktreeCwd ?? fs8.mkdtempSync(path7.join(os6.tmpdir(), "grok-review-"));
     const { raw, stderrTail, timedOut, timedOutReason } = await runReviewerExec({
       args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
       bin: resolveGrokBin(),
@@ -2470,13 +2472,13 @@ function runClaudeVoice(prompt, config, opts = {}) {
 
 // src/modes/review/history-packet.ts
 import fs13 from "fs";
-import path12 from "path";
+import path13 from "path";
 
 // src/modes/review/ensemble-config.ts
 import fs9 from "fs";
 import os7 from "os";
-import path7 from "path";
-var ENSEMBLE_CONFIG_PATH = path7.join(os7.homedir(), ".ensemble-ai", "config.json");
+import path8 from "path";
+var ENSEMBLE_CONFIG_PATH = path8.join(os7.homedir(), ".ensemble-ai", "config.json");
 function asRecord2(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : null;
 }
@@ -2490,22 +2492,22 @@ function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
 
 // src/modes/review/gate-hunks.ts
 import fs11 from "fs";
-import path10 from "path";
+import path11 from "path";
 
 // src/modes/review/trail-io.ts
 import fs10 from "fs";
-import path8 from "path";
+import path9 from "path";
 
 // src/modes/review/diff.ts
 import { execFileSync as execFileSync4 } from "child_process";
 
 // src/modes/review/git-exec.ts
 import { execFileSync as execFileSync3 } from "child_process";
-import path9 from "path";
+import path10 from "path";
 function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
   const cmd = configured?.trim();
   if (!cmd) return "ssh -o BatchMode=yes";
-  const bin = path9.basename(cmd.split(/\s+/)[0]);
+  const bin = path10.basename(cmd.split(/\s+/)[0]);
   return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
 }
 var GIT_MAX_BUFFER = 64 * 1024 * 1024;
@@ -2591,9 +2593,9 @@ function hasGeneratedHeader(section2) {
   }
   return false;
 }
-function classifyFileKind(path17, isBinary, section2 = "") {
+function classifyFileKind(path18, isBinary, section2 = "") {
   if (isBinary) return "binary";
-  if (GENERATED_PATTERNS.some((re) => re.test(path17))) return "generated";
+  if (GENERATED_PATTERNS.some((re) => re.test(path18))) return "generated";
   return section2 && hasGeneratedHeader(section2) ? "generated" : "source";
 }
 var TEST_PATTERNS = [
@@ -2605,8 +2607,8 @@ var TEST_PATTERNS = [
   /Tests?\.(java|kt|swift|cs|scala)$/,
   /\.bats$/
 ];
-function isTestPath(path17) {
-  return TEST_PATTERNS.some((re) => re.test(path17));
+function isTestPath(path18) {
+  return TEST_PATTERNS.some((re) => re.test(path18));
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -2624,7 +2626,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path17 = pathOfSection(section2);
+    const path18 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -2635,8 +2637,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path17, isBinary, section2),
-      path: path17,
+      kind: classifyFileKind(path18, isBinary, section2),
+      path: path18,
       raw: section2,
       removed
     };
@@ -2808,7 +2810,7 @@ function persistGatePacket(baseDir, runId, input) {
 
 // src/modes/review/worktree.ts
 import fs12 from "fs";
-import path11 from "path";
+import path12 from "path";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
 }
@@ -2839,18 +2841,18 @@ function allowedRootsFromConfig(configPath) {
   const roots = readEnsembleConfig(configPath).allowedRepoRoots;
   if (!Array.isArray(roots) || roots.length === 0) return null;
   const strs = roots.filter((r) => typeof r === "string" && r.trim().length > 0);
-  return strs.length > 0 ? strs.map((r) => path11.resolve(r)) : null;
+  return strs.length > 0 ? strs.map((r) => path12.resolve(r)) : null;
 }
 function rootAllowed(repoRoot, allowed) {
   if (!allowed) return true;
-  const real = path11.resolve(repoRoot);
+  const real = path12.resolve(repoRoot);
   return allowed.some((root) => {
-    const rel = path11.relative(root, real);
-    return rel === "" || !rel.startsWith("..") && !path11.isAbsolute(rel);
+    const rel = path12.relative(root, real);
+    return rel === "" || !rel.startsWith("..") && !path12.isAbsolute(rel);
   });
 }
 function resolveRepoLocation(args, deps) {
-  const repoPath = path11.resolve(args.repoPath);
+  const repoPath = path12.resolve(args.repoPath);
   const top = deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
   if (!top.ok) {
     return {
@@ -2938,7 +2940,7 @@ function stripAgentInstructions(dir) {
   const removed = [];
   const remove = (rel) => {
     try {
-      fs12.rmSync(path11.join(dir, rel), { force: true, recursive: true });
+      fs12.rmSync(path12.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -2946,7 +2948,7 @@ function stripAgentInstructions(dir) {
   const walk = (rel) => {
     let entries;
     try {
-      entries = fs12.readdirSync(path11.join(dir, rel), { withFileTypes: true });
+      entries = fs12.readdirSync(path12.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -2956,7 +2958,7 @@ function stripAgentInstructions(dir) {
       if (isInstructionName(e.name)) {
         remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
-        if (fs12.existsSync(path11.join(dir, childRel, CURSOR_RULES))) {
+        if (fs12.existsSync(path12.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
         walk(childRel);
@@ -2972,7 +2974,7 @@ async function stripAgentInstructionsAsync(dir) {
   const removed = [];
   const remove = async (rel) => {
     try {
-      await fs12.promises.rm(path11.join(dir, rel), { force: true, recursive: true });
+      await fs12.promises.rm(path12.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -2980,7 +2982,7 @@ async function stripAgentInstructionsAsync(dir) {
   const walk = async (rel) => {
     let entries;
     try {
-      entries = await fs12.promises.readdir(path11.join(dir, rel), { withFileTypes: true });
+      entries = await fs12.promises.readdir(path12.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -2991,7 +2993,7 @@ async function stripAgentInstructionsAsync(dir) {
         await remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
         try {
-          await fs12.promises.access(path11.join(dir, childRel, CURSOR_RULES));
+          await fs12.promises.access(path12.join(dir, childRel, CURSOR_RULES));
           await remove(`${childRel}/${CURSOR_RULES}`);
         } catch {
         }
@@ -3008,14 +3010,14 @@ function isStrippedPath(p, stripped) {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
 var PARTIAL_CLONE_CONFIG_RE = "^(extensions\\.partialclone|remote\\..*\\.promisor)$";
-var ALTERNATES_REL = path11.join("objects", "info", "alternates");
+var ALTERNATES_REL = path12.join("objects", "info", "alternates");
 function completeSharedStore(repoRoot, git2) {
   const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
-  const commonDir = path11.resolve(repoRoot, common.text.trim());
-  if (!fs12.existsSync(path11.join(commonDir, "objects"))) return null;
-  if (fs12.existsSync(path11.join(commonDir, "shallow"))) return null;
-  if (fs12.existsSync(path11.join(commonDir, ALTERNATES_REL))) return null;
+  const commonDir = path12.resolve(repoRoot, common.text.trim());
+  if (!fs12.existsSync(path12.join(commonDir, "objects"))) return null;
+  if (fs12.existsSync(path12.join(commonDir, "shallow"))) return null;
+  if (fs12.existsSync(path12.join(commonDir, ALTERNATES_REL))) return null;
   if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
   return commonDir;
 }
@@ -3082,7 +3084,7 @@ function materializeWorktree(args, deps) {
   let parent = null;
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    const bare = path11.join(parent, "repo");
+    const bare = path12.join(parent, "repo");
     const created = deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
     if (!created.ok) {
       return { kind: "materialize-failed", message: privateRepoFailure(shared, created.error) };
@@ -3105,7 +3107,7 @@ function materializeWorktree(args, deps) {
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
-    const dir = path11.join(parent, "head");
+    const dir = path12.join(parent, "head");
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
       { cwd: bare, env: INERT_ENV }
@@ -3135,17 +3137,17 @@ function materializeWorktree(args, deps) {
 }
 var REAP_RM_OPTS = { force: true, maxRetries: 3, recursive: true, retryDelay: 50 };
 function reapParent(parent) {
-  if (!path11.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
+  if (!path12.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
     fs12.rmSync(parent, REAP_RM_OPTS);
   } catch {
   }
 }
 function reapWorktree(dir) {
-  reapParent(path11.dirname(dir));
+  reapParent(path12.dirname(dir));
 }
 async function resolveRepoLocationAsync(args, deps) {
-  const repoPath = path11.resolve(args.repoPath);
+  const repoPath = path12.resolve(args.repoPath);
   const top = await deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
   if (!top.ok) {
     return {
@@ -3184,7 +3186,7 @@ async function materializeWorktreeAsync(args, deps) {
   let parent = null;
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    const bare = path11.join(parent, "repo");
+    const bare = path12.join(parent, "repo");
     const created = await deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
     if (!created.ok) {
       return { kind: "materialize-failed", message: privateRepoFailure(shared, created.error) };
@@ -3207,7 +3209,7 @@ async function materializeWorktreeAsync(args, deps) {
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
-    const dir = path11.join(parent, "head");
+    const dir = path12.join(parent, "head");
     const added = await deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
       { cwd: bare, env: INERT_ENV }
@@ -3238,11 +3240,11 @@ async function materializeWorktreeAsync(args, deps) {
 async function completeSharedStoreAsync(repoRoot, git2) {
   const common = await git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
-  const commonDir = path11.resolve(repoRoot, common.text.trim());
+  const commonDir = path12.resolve(repoRoot, common.text.trim());
   const exists = (p) => fs12.promises.access(p).then(() => true, () => false);
-  if (!await exists(path11.join(commonDir, "objects"))) return null;
-  if (await exists(path11.join(commonDir, "shallow"))) return null;
-  if (await exists(path11.join(commonDir, ALTERNATES_REL))) return null;
+  if (!await exists(path12.join(commonDir, "objects"))) return null;
+  if (await exists(path12.join(commonDir, "shallow"))) return null;
+  if (await exists(path12.join(commonDir, ALTERNATES_REL))) return null;
   if ((await git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot })).ok) return null;
   return commonDir;
 }
@@ -3257,14 +3259,14 @@ async function fetchEnvAsync(repoRoot, bare, git2) {
   return { ...INERT_ENV, ...transportEnv(missing, ssh) };
 }
 async function reapParentAsync(parent) {
-  if (!path11.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
+  if (!path12.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
     await fs12.promises.rm(parent, REAP_RM_OPTS);
   } catch {
   }
 }
 async function reapWorktreeAsync(dir) {
-  await reapParentAsync(path11.dirname(dir));
+  await reapParentAsync(path12.dirname(dir));
 }
 
 // src/modes/review/history-packet.ts
@@ -3289,15 +3291,15 @@ function historyPacketHasData(packet) {
 var FIELD_SEP = "";
 var LOG_FORMAT = `--format=%h${FIELD_SEP}%at${FIELD_SEP}%an${FIELD_SEP}%s`;
 function containedPath(root, rel) {
-  const abs = path12.resolve(root, rel);
-  const back = path12.relative(path12.resolve(root), abs);
+  const abs = path13.resolve(root, rel);
+  const back = path13.relative(path13.resolve(root), abs);
   return back !== "" && !escapesRoot(back) ? abs : null;
 }
 function writeHistoryPacket(cwd, files) {
   for (const f of files) {
     const abs = containedPath(cwd, f.path);
     if (!abs) continue;
-    fs13.mkdirSync(path12.dirname(abs), { recursive: true });
+    fs13.mkdirSync(path13.dirname(abs), { recursive: true });
     fs13.writeFileSync(abs, f.contents, { mode: 256 });
   }
 }
@@ -3624,7 +3626,7 @@ function hasDepSurface(r) {
 // src/modes/review/receipt.ts
 import fs18 from "fs";
 import os10 from "os";
-import path15 from "path";
+import path16 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -3711,7 +3713,7 @@ function formatEvidenceShortfall(gaps) {
 
 // src/modes/review/holistic-gate.ts
 import fs17 from "fs";
-import path14 from "path";
+import path15 from "path";
 
 // src/modes/review/holistic.ts
 import fs16 from "fs";
@@ -3719,7 +3721,7 @@ import fs16 from "fs";
 // src/modes/brainstorm/voices.ts
 import fs15 from "fs";
 import os9 from "os";
-import path13 from "path";
+import path14 from "path";
 
 // src/modes/brainstorm/types.ts
 var VOICE_IDS = ["codex", "grok", "claude"];
@@ -3777,7 +3779,7 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), o),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), o)
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path13.join(os9.homedir(), ".ensemble-ai", "voices.json");
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path14.join(os9.homedir(), ".ensemble-ai", "voices.json");
 function str2(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
@@ -4020,18 +4022,18 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs17.realpathSync(path14.resolve(worktreeDir));
+    root = fs17.realpathSync(path15.resolve(worktreeDir));
   } catch {
     return () => null;
   }
   const inside = (p) => {
-    const rel = path14.relative(root, p);
+    const rel = path15.relative(root, p);
     return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
-      if (!file || file.includes("\0") || path14.isAbsolute(file)) return null;
-      const target = path14.resolve(root, file);
+      if (!file || file.includes("\0") || path15.isAbsolute(file)) return null;
+      const target = path15.resolve(root, file);
       if (!inside(target)) return null;
       const real = fs17.realpathSync(target);
       if (!inside(real)) return null;
@@ -4248,10 +4250,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path15.join(os10.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path16.join(os10.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path15.join(
+  return path16.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -4272,7 +4274,7 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs18.mkdirSync(path15.dirname(file), { recursive: true, mode: 448 });
+  fs18.mkdirSync(path16.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
   fs18.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
   fs18.chmodSync(tmp, 384);
@@ -5347,7 +5349,7 @@ function stageReview(payload, target, deps) {
 
 // src/modes/review/holistic-fixture.ts
 import fs19 from "fs";
-import path16 from "path";
+import path17 from "path";
 function anchor(v, where) {
   const e = v ?? {};
   if (typeof e.file !== "string" || typeof e.line !== "number" || typeof e.symbol !== "string")
@@ -5355,7 +5357,7 @@ function anchor(v, where) {
   return { file: e.file, line: e.line, symbol: e.symbol };
 }
 function loadHolisticFixture(dir) {
-  const raw = JSON.parse(fs19.readFileSync(path16.join(dir, "expectations.json"), "utf8"));
+  const raw = JSON.parse(fs19.readFileSync(path17.join(dir, "expectations.json"), "utf8"));
   const positives = Array.isArray(raw.plantedPositives) ? raw.plantedPositives : [];
   const misses = Array.isArray(raw.nearMisses) ? raw.nearMisses : [];
   if (positives.length === 0 || misses.length === 0)
@@ -5388,7 +5390,7 @@ function verifyFixtureAnchors(dir, fixture) {
   const check = (a, label2) => {
     let lines;
     try {
-      lines = fs19.readFileSync(path16.join(dir, a.file), "utf8").split(/\r?\n/);
+      lines = fs19.readFileSync(path17.join(dir, a.file), "utf8").split(/\r?\n/);
     } catch {
       broken.push(`${label2}: ${a.file} is unreadable`);
       return;
