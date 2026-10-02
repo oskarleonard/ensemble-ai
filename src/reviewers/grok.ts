@@ -215,23 +215,89 @@ export const GROK_CLI_SANDBOX = REVIEW_PROFILE_NAME;
 // outbound), which grok does NOT have. grok's `sandbox.toml` profile schema is `extends` /
 // `read_only` / `read_write` / `allow` / `deny` — FILES ONLY, no network keys — so no rule denies
 // this process direct outbound, and a grok that chose to ignore `HTTPS_PROXY` could reach any host.
-// What actually bounds it is the SEAT HAVING NO SHELL: `--disallowed-tools bash` means there is no
-// interpreter inside the untrusted tree for a prompt-injected file to drive (and `strict` is
-// documented as "no child network"). The id now names that: env-routed egress, no-shell containment.
-// A receipt reader must be able to tell this seat from the kernel-fenced one WITHOUT reading a PR.
+// What actually bounds it is the SEAT HAVING NO SHELL — the tool fence (GROK_REVIEW_TOOLS, verified
+// at spawn by grokToolFence): no interpreter inside the untrusted tree for a prompt-injected file to
+// drive. That containment is load-bearing, because `strict` does NOT deny a child process network
+// (verified live, incident 2026-10-01: a shell child's `curl https://example.com` → 200 with no proxy
+// env, and `curl --noproxy '*'` walks past the env-routed fence). The id names it: env-routed
+// egress, no-shell containment. A receipt reader must be able to tell this seat from the
+// kernel-fenced one WITHOUT reading a PR.
 //
-// Bump `version` whenever REVIEW_PROFILE_BLOCK, the egress allowlist, or this identity changes — a
-// receipt minted under a weaker profile must never verify as equivalent to one minted under a
-// tighter one. Versions advance across a rename and never reset (see CODEX_SANDBOX_PROFILE): this
-// seat's lineage is `ensemble-review` v1 → `…+proxy-env-noshell` v2 → this, so no (id, version) pair
-// is ever reused. v3 is the `auth.x.ai` allowlist entry (see egress-hosts.ts): a strictly WIDER
-// egress fence than v2's, hence a distinct version, so a v2 receipt can never read as equivalent.
+// Bump `version` whenever REVIEW_PROFILE_BLOCK, the egress allowlist, the tool fence, or this
+// identity changes — a receipt minted under a weaker profile must never verify as equivalent to one
+// minted under a tighter one. Versions advance across a rename and never reset (see
+// CODEX_SANDBOX_PROFILE): this seat's lineage is `ensemble-review` v1 → `…+proxy-env-noshell` v2 →
+// v3 (the `auth.x.ai` allowlist entry, see egress-hosts.ts) → v4, so no (id, version) pair is ever
+// reused. v4 is the FIRST version whose `noshell` holds: v2/v3 passed `--disallowed-tools bash`,
+// which matched no grok tool (the shell is `run_terminal_command`), so every v2/v3 seat held a
+// working shell (incident 2026-10-01). A v3 receipt must never read as equivalent to a v4 one.
 export const GROK_SANDBOX_PROFILE: SandboxProfileRef = {
   // Egress fenced by proxy ENV VARS ONLY (grok's sandbox schema has no network keys); what bounds a
-  // prompt-injected tree is that the seat has NO SHELL (`--disallowed-tools bash`) to exercise it.
+  // prompt-injected tree is that the seat has NO SHELL — the verified tool fence — to exercise it.
   id: 'ensemble-review-grok+proxy-env-noshell',
-  version: 3,
+  version: 4,
 };
+
+// THE TOOL FENCE (incident 2026-10-01). The ONLY tools a review seat may hold: read-only file
+// access. Nothing that executes (`run_terminal_command`, `spawn_subagent`, `workflow`, schedulers),
+// nothing that writes (`write`, `search_replace`), nothing that reaches out (images, feedback).
+// Every one of the 52 stored seats before this fence used only these three.
+export const GROK_REVIEW_TOOLS = ['read_file', 'list_dir', 'grep'] as const;
+// grok keeps its MCP meta-tools even under `--tools` ("MCP meta-tools remain available unless
+// denied") — removed explicitly. grok loads no MCP server (`grok mcp list` is empty), so they are
+// inert today; the fence below still refuses a seat that announces them.
+const GROK_DENIED_META_TOOLS = ['search_tool', 'use_tool'] as const;
+// A permission DENY rule on shell EXECUTION — the second layer, which holds even if a shell tool is
+// ever announced: grok refuses the call ("Denied by permission policy: deny rule on bash"). The
+// rule names the tool's internal type, `Bash`; `--deny run_terminal_command` does not match.
+const GROK_SHELL_DENY_RULE = 'Bash';
+
+// Why the fence is VERIFIED rather than trusted — each verified live on grok 1.0.44:
+//   · `--disallowed-tools bash` (v2/v3) never matched anything: the shell is `run_terminal_command`.
+//   · `--disallowed-tools run_terminal_command` cannot remove it either — grok keeps it listed and
+//     runs it, contrary to its own docs. A denylist is not a fence here.
+//   · `--tools <allowlist>` DOES remove it — but ONE name grok does not know makes it ignore the
+//     whole allowlist and hand back its full default set, shell included. A future tool rename
+//     would fail OPEN, silently.
+// So the allowlist is passed AND its result is checked: grok's stream opens with an init line that
+// announces the tools the session holds, before any model turn. Anything announced outside
+// GROK_REVIEW_TOOLS — or no announcement at all — kills the seat on the spot: fail closed, named.
+export type GrokToolFence = { ok: true } | { ok: false; why: string };
+
+const TOOL_FENCE_PREFIX = 'ensemble-ai: grok tool fence —';
+
+// PURE: the verdict on the stream's FIRST line.
+export function grokToolFence(firstLine: string): GrokToolFence {
+  let obj: unknown;
+  try {
+    obj = JSON.parse(firstLine);
+  } catch {
+    return {
+      ok: false,
+      why: `${TOOL_FENCE_PREFIX} grok's first output line is not its init announcement, so the tools it holds cannot be verified; refusing the seat`,
+    };
+  }
+  const o = (obj && typeof obj === 'object' ? obj : {}) as { subtype?: unknown; tools?: unknown; type?: unknown };
+  if (o.type !== 'system' || o.subtype !== 'init' || !Array.isArray(o.tools)) {
+    return {
+      ok: false,
+      why: `${TOOL_FENCE_PREFIX} grok's first output line did not announce its tools, so they cannot be verified; refusing the seat`,
+    };
+  }
+  const allowed = new Set<string>(GROK_REVIEW_TOOLS);
+  const extra = o.tools.map(String).filter((tool) => !allowed.has(tool));
+  if (extra.length > 0) {
+    return {
+      ok: false,
+      why: `${TOOL_FENCE_PREFIX} grok announced tools outside the review allowlist (${extra.join(', ')}); killed before its first turn rather than run it with them`,
+    };
+  }
+  return { ok: true };
+}
+
+// grok's init line also lists its skills and slash commands — a few KB. A first line this long with
+// no newline yet is not an init announcement; stop buffering and refuse.
+const TOOL_FENCE_FIRST_LINE_LIMIT = 256_000;
 
 // PURE: the exact grok CLI args for a review. Encodes every lived lesson as DATA
 // so a unit test pins it: `-p <prompt>` (single-turn, prints to stdout) ·
@@ -241,10 +307,12 @@ export const GROK_SANDBOX_PROFILE: SandboxProfileRef = {
 // load-bearing, `--include-partial-messages` is what makes the deltas flow
 // DURING work rather than only at each block's end)
 // · `-m <model>` + `--effort <effort>` (the CONFIGURED strong model) ·
-// `--sandbox <profile>` (THE boundary — an OS-enforced read-only sandbox, never
-// tool-denial) · `--cwd <neutral>` (the diff is IN the prompt, not the cwd —
-// stateless, like codex from tmpdir) · `--disable-web-search` +
-// `--disallowed-tools bash,search_replace` (defense in depth, NOT the boundary) ·
+// `--sandbox <profile>` (the READ boundary — an OS-enforced deny-by-default sandbox) ·
+// `--cwd <neutral>` (the diff is IN the prompt, not the cwd — stateless, like codex
+// from tmpdir) · `--disable-web-search` · THE TOOL FENCE: `--tools read_file,list_dir,grep`
+// (an allowlist — the shell is gone), `--disallowed-tools search_tool,use_tool` (the MCP
+// meta-tools an allowlist keeps), `--deny Bash` (shell execution refused even if a shell
+// is ever announced); runGrokReview VERIFIES the result (grokToolFence) ·
 // `--no-memory` (no cross-session state).
 export function buildGrokReviewArgs(
   config: ReviewerConfig,
@@ -266,8 +334,12 @@ export function buildGrokReviewArgs(
     '--cwd',
     cwd,
     '--disable-web-search',
+    '--tools',
+    GROK_REVIEW_TOOLS.join(','),
     '--disallowed-tools',
-    'bash,search_replace',
+    GROK_DENIED_META_TOOLS.join(','),
+    '--deny',
+    GROK_SHELL_DENY_RULE,
     '--no-memory',
   ];
 }
@@ -473,7 +545,7 @@ export async function runGrokReview(
   //     through a logging proxy) — `strict` denies CHILD-process network, not the main agent's
   //     outbound. The worktree egress proxy below DENIES that host; a packet seat has no proxy, so its
   //     telemetry is not network-fenced. ACCEPTED, not a cred-exfil hole: the packet diff is prompt
-  //     DATA (no untrusted tree to inject from), the seat has no shell (`--disallowed-tools bash`),
+  //     DATA (no untrusted tree to inject from), the seat has no shell (the verified tool fence),
   //     and grok holds no operator credentials — so that channel can carry only grok's first-party
   //     usage stats, a privacy nit, never a diff/secret leak. The packet path is left byte-identical.
   //
@@ -504,21 +576,60 @@ export async function runGrokReview(
     if (cancel.cancelled()) return cancelled();
     const seatTimeoutMs = deadlineAt - Date.now();
     if (seatTimeoutMs <= 0) return budgetSpent();
+    // THE TOOL FENCE, enforced at the stream's first line (grokToolFence): the init announcement is
+    // printed before any model turn, so a seat holding a tool outside the allowlist is killed before
+    // it can call one. The raw kill handle is kept apart from the caller's cancel, which marks the
+    // seat cancelled — a fence kill is a refusal, never a cancel.
+    let seatKill: (() => void) | undefined;
+    let fence: GrokToolFence | null = null;
+    let firstLine = '';
+    const onStdout = (chunk: string): void => {
+      if (fence) return;
+      firstLine += chunk;
+      const nl = firstLine.indexOf('\n');
+      if (nl === -1) {
+        if (firstLine.length <= TOOL_FENCE_FIRST_LINE_LIMIT) return;
+        fence = grokToolFence(firstLine.slice(0, 200));
+      } else {
+        fence = grokToolFence(firstLine.slice(0, nl));
+      }
+      firstLine = '';
+      if (!fence.ok) seatKill?.();
+    };
     const { raw, stderrTail, timedOut, timedOutReason } = await runReviewerExec({
       args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
       bin,
       capture: 'stdout',
+      onStdout,
       ...(proxy ? { env: proxyEnv(proxy.url) } : {}),
       // THE LIVENESS WATCHDOG. Under `capture: 'stdout'` the accumulated stdout IS what resets it
       // (spawn.ts), and grok's NDJSON now flows throughout the work — so this reclaims a WEDGED
       // seat in 15 min while `timeoutMs` above stands back as a pure runaway backstop.
       inactivityTimeoutMs: GROK_INACTIVITY_TIMEOUT_MS,
-      onSpawn: cancel.onSpawn,
+      onSpawn: (kill: () => void) => {
+        seatKill = kill;
+        cancel.onSpawn?.(kill);
+      },
       stderrLimit: GROK_SEAT_STDERR_LIMIT,
       // What is left of the ONE deadline at the moment the seat spawns — after the pre-flight AND the
       // egress proxy's start, so neither is ever added on top of the caller's budget.
       timeoutMs: seatTimeoutMs,
     });
+    // A stream that ended before its first newline (one line, or none) is judged on what it printed.
+    const verdict: GrokToolFence | null = fence ?? (raw ? grokToolFence(raw.split('\n')[0]) : null);
+    if (verdict && !verdict.ok) {
+      return {
+        ...(proxy ? { egressDenials: [...proxy.denials] } : {}),
+        ...preflight,
+        failWhy: verdict.why,
+        ok: false,
+        raw: null,
+        stderrTail: verdict.why,
+        ...(raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {}),
+        timedOut,
+        ...(timedOutReason ? { timedOutReason } : {}),
+      };
+    }
     const stream = raw ? parseGrokStream(raw) : null;
     // The reply is the stream's `result` line. The legacy envelope is tried ONLY when the stdout was
     // never the NDJSON stream (`events === 0`) — a CUT stream fails closed rather than handing

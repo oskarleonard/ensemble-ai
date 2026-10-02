@@ -110,6 +110,13 @@ export interface ReviewerExecOpts {
   env?: Record<string, string | undefined>;
   /** Receives the kill handle so a caller (e.g. a cancel) can abort the child. */
   onSpawn?: (kill: () => void) => void;
+  /**
+   * Sees every stdout chunk as it arrives (only while stdout is piped), BEFORE the run settles —
+   * so a caller can act on what the child announces at startup (grok's tool fence reads the
+   * stream's first line and kills the seat through `onSpawn`'s handle). Observation only: the
+   * reply, the watchdogs and the settle are untouched by it.
+   */
+  onStdout?: (chunk: string) => void;
   /** The -o tempfile the reply is read from, then unlinked. Required for 'outfile'. */
   outFile?: string;
   /**
@@ -250,12 +257,16 @@ export function runReviewerExec(
     if (capture === 'stdout') {
       child.stdout?.on('data', (chunk: Buffer) => {
         armIdle();
-        stdoutBuf += chunk.toString('utf8');
+        const text = chunk.toString('utf8');
+        stdoutBuf += text;
+        opts.onStdout?.(text);
       });
     } else if (streamStdout) {
       child.stdout?.on('data', (chunk: Buffer) => {
         armIdle();
-        streamTail += chunk.toString('utf8');
+        const text = chunk.toString('utf8');
+        opts.onStdout?.(text);
+        streamTail += text;
         // Trim at twice the cap, not on every chunk: an hour-long seat emits thousands of
         // events, and re-copying a 1 MB tail per event is avoidable churn. The bound the
         // caller sees is enforced once, at settle.

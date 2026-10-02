@@ -12,6 +12,8 @@ import {
   buildGrokReviewArgs,
   ensureSandboxProfile,
   extractGrokText,
+  GROK_REVIEW_TOOLS,
+  grokToolFence,
   GROK_INACTIVITY_TIMEOUT_MS,
   GROK_PACKET_REVIEW_TIMEOUT_MS,
   GROK_WORKTREE_REVIEW_TIMEOUT_MS,
@@ -128,11 +130,15 @@ describe('buildGrokReviewArgs', () => {
     expect(args[args.indexOf('--sandbox') + 1]).toBe('ensemble-review');
     // the diff is IN the prompt → grok runs from a neutral throwaway cwd.
     expect(args[args.indexOf('--cwd') + 1]).toBe('/tmp/cwd');
-    // defense in depth (NOT the boundary).
     expect(args).toContain('--disable-web-search');
-    expect(args[args.indexOf('--disallowed-tools') + 1]).toBe(
-      'bash,search_replace'
-    );
+    // THE TOOL FENCE (incident 2026-10-01): an ALLOWLIST of the three read tools — a denylist
+    // never removed grok's shell (`bash` matched nothing; `run_terminal_command` cannot be denied).
+    expect(args[args.indexOf('--tools') + 1]).toBe('read_file,list_dir,grep');
+    // the MCP meta-tools an allowlist keeps, removed explicitly.
+    expect(args[args.indexOf('--disallowed-tools') + 1]).toBe('search_tool,use_tool');
+    // shell EXECUTION refused even if a shell is ever announced (the rule names grok's `Bash` type).
+    expect(args[args.indexOf('--deny') + 1]).toBe('Bash');
+    expect(args.join(' ')).not.toContain('bash,search_replace');
     expect(args).toContain('--no-memory');
     // the unreliable structured-output path is NEVER used (freeform + parseFindings).
     expect(args.join(' ')).not.toContain('--json-schema');
@@ -363,10 +369,13 @@ describe('ensureSandboxProfile', () => {
   });
 });
 
+// grok's init announcement under the tool fence: exactly the allowlisted tools.
+const INIT_LINE = JSON.stringify({ session_id: 'S', subtype: 'init', tools: [...GROK_REVIEW_TOOLS], type: 'system' });
+
 // One NDJSON stream, as grok prints it: an init line, some work, then the terminal `result` line.
 const grokStream = (reply: string): string =>
   [
-    JSON.stringify({ session_id: 'S', subtype: 'init', type: 'system' }),
+    INIT_LINE,
     JSON.stringify({ event: { type: 'message_start' }, type: 'stream_event' }),
     JSON.stringify({
       event: { delta: { text: reply, type: 'text_delta' }, type: 'content_block_delta' },
@@ -457,9 +466,10 @@ describe('runGrokReview (stdout capture)', () => {
     expect(result.raw).toBeNull();
   });
 
-  // FORMAT DRIFT DEGRADES, it does not crash: a grok that ignored the streaming flag answers in the
-  // old envelope, which is not a stream at all — so the legacy extractor is allowed to take it.
-  it('still reads the OLD json envelope when grok emits no stream at all', async () => {
+  // FORMAT DRIFT FAILS CLOSED (incident 2026-10-01): a grok that ignored the streaming flag answers
+  // in the old envelope — no init announcement, so the tools it held cannot be verified. Its text
+  // is refused rather than attested under a `noshell` receipt that may not have held.
+  it('refuses the OLD json envelope: no init announcement, so the tool fence cannot be verified', async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
     await untilSpawned();
     child?.stdout.emit(
@@ -468,8 +478,9 @@ describe('runGrokReview (stdout capture)', () => {
     );
     child?.emit('close');
     const result = await p;
-    expect(result.ok).toBe(true);
-    expect(result.raw).toBe('LEGACY REVIEW');
+    expect(result.ok).toBe(false);
+    expect(result.raw).toBeNull();
+    expect(result.failWhy).toMatch(/tool fence — .*did not announce its tools/);
   });
 
   it('returns a bounded NDJSON tail so a seat leaves a record of what it was doing', async () => {
@@ -511,7 +522,7 @@ describe('runGrokReview (stdout capture)', () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
     await untilSpawned();
     // It spoke once, then went quiet — so the rolling bar is armed and reset, not never-started.
-    child?.stdout.emit('data', Buffer.from('{"type":"system","subtype":"init"}\n'));
+    child?.stdout.emit('data', Buffer.from(`${INIT_LINE}\n`));
     vi.advanceTimersByTime(GROK_INACTIVITY_TIMEOUT_MS + 1_000);
     expect(child?.kills[0]).toBe('SIGTERM');
     child?.emit('close');
@@ -531,6 +542,7 @@ describe('runGrokReview (stdout capture)', () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
     await untilSpawned();
     const almost = GROK_INACTIVITY_TIMEOUT_MS - 60_000; // 14 min of quiet, then a heartbeat
+    child?.stdout.emit('data', Buffer.from(`${INIT_LINE}\n`)); // the fence passes first
     for (let i = 0; i < 2; i++) {
       child?.stdout.emit('data', Buffer.from(`{"type":"stream_event","n":${i}}\n`));
       vi.advanceTimersByTime(almost);
@@ -940,3 +952,78 @@ function dial(port: number): Promise<void> {
     s.on('error', reject);
   });
 }
+
+describe('grokToolFence (incident 2026-10-01)', () => {
+  it('passes an init line that announces exactly the allowlisted tools', () => {
+    expect(grokToolFence(INIT_LINE)).toEqual({ ok: true });
+  });
+
+  it('refuses an init line that announces ANY tool outside the allowlist — the shell above all', () => {
+    const v = grokToolFence(
+      JSON.stringify({ subtype: 'init', tools: ['run_terminal_command', 'read_file', 'list_dir', 'grep', 'write'], type: 'system' })
+    );
+    expect(v.ok).toBe(false);
+    expect(!v.ok && v.why).toMatch(/outside the review allowlist \(run_terminal_command, write\)/);
+  });
+
+  // The fail-OPEN case that makes verification necessary: one unknown name in `--tools` and grok
+  // ignores the whole allowlist, handing back its full default set. The init line is where it shows.
+  it('refuses the full default set an unknown allowlist name makes grok fall back to', () => {
+    const fullSet = STREAM_LINES[0]; // the real captured init line (pre-fence): every default tool
+    const v = grokToolFence(fullSet);
+    expect(v.ok).toBe(false);
+    expect(!v.ok && v.why).toContain('run_terminal_command');
+  });
+
+  it('refuses a first line that is not an init announcement, or one without a tools list', () => {
+    expect(grokToolFence('{"type":"stream_event"}').ok).toBe(false);
+    expect(grokToolFence('{"type":"system","subtype":"init"}').ok).toBe(false);
+    expect(grokToolFence('{"type":"system","subtype":"init","tools":"read_file"}').ok).toBe(false);
+    expect(grokToolFence('not json').ok).toBe(false);
+  });
+});
+
+describe('runGrokReview — the tool fence is enforced at the first line', () => {
+  it('KILLS the seat the moment its init line announces a shell, before any turn, and names why', async () => {
+    const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
+    child?.stdout.emit(
+      'data',
+      Buffer.from(`${JSON.stringify({ subtype: 'init', tools: ['run_terminal_command', ...GROK_REVIEW_TOOLS], type: 'system' })}\n`)
+    );
+    expect(child?.kills[0]).toBe('SIGTERM'); // on the chunk — not at settle
+    child?.emit('close');
+    const result = await p;
+    expect(result.ok).toBe(false);
+    expect(result.raw).toBeNull();
+    expect(result.timedOut).toBe(false);
+    expect(result.failWhy).toMatch(/grok tool fence — .*\(run_terminal_command\)/);
+    expect(result.stderrTail).toBe(result.failWhy);
+    expect(result.stream).toContain('run_terminal_command'); // the evidence is kept
+  });
+
+  it('reads a first line split across chunks before judging it', async () => {
+    const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
+    const stream = grokStream('SPLIT INIT');
+    child?.stdout.emit('data', Buffer.from(stream.slice(0, 25)));
+    expect(child?.kills).toHaveLength(0); // no newline yet — no verdict yet
+    child?.stdout.emit('data', Buffer.from(stream.slice(25)));
+    child?.emit('close');
+    const result = await p;
+    expect(child?.kills).toHaveLength(0);
+    expect(result.ok).toBe(true);
+    expect(result.raw).toBe('SPLIT INIT');
+  });
+
+  it('kills a seat whose stream opens with anything but its tool announcement', async () => {
+    const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
+    child?.stdout.emit('data', Buffer.from('{"type":"stream_event","n":0}\n'));
+    expect(child?.kills[0]).toBe('SIGTERM');
+    child?.emit('close');
+    const result = await p;
+    expect(result.ok).toBe(false);
+    expect(result.failWhy).toMatch(/did not announce its tools/);
+  });
+});
