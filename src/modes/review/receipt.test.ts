@@ -143,6 +143,12 @@ describe('buildDiffReceipt', () => {
     expect(r.error).toMatch(/grok/);
   });
 
+  it('does NOT qualify a claude-only run — an empty core mints no content-tied receipt', () => {
+    const r = buildDiffReceipt({ ...BASE, coverage: coverage(), required: [], reviews: [] });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/claude-only/);
+  });
+
   it('does NOT qualify when a required reviewer failed', () => {
     const r = buildDiffReceipt({ ...BASE, coverage: coverage(), required: ['codex'], reviews: [review('codex', 'openai', 'failed-reviewer')] });
     expect(r.ok).toBe(false);

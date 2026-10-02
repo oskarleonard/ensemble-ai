@@ -146,8 +146,12 @@ describe('resolveReviewRoster — claude default-on, --no-claude opts out, --rev
     expect(resolveReviewRoster(['codex', 'grokk'], false)).toMatchObject({ error: expect.stringContaining('grokk') });
   });
 
-  it('requires ≥1 cross-vendor core (claude is additive, not standalone)', () => {
-    expect(resolveReviewRoster(['claude'], false)).toMatchObject({ error: expect.stringContaining('at least one') });
+  it('"claude" alone is the claude-only roster: no core seat, the Opus layer on (2026-10-02)', () => {
+    expect(resolveReviewRoster(['claude'], false)).toEqual({ claude: true, core: [] });
+  });
+
+  it('refuses a roster on which nothing would run (claude only + --no-claude)', () => {
+    expect(resolveReviewRoster(['claude'], true)).toMatchObject({ error: expect.stringContaining('nothing would run') });
   });
 });
 
@@ -603,9 +607,9 @@ describe('roster · claude in REVIEWER_IDS never leaks into the CLI core', () =>
     expect(r).toEqual({ claude: true, core: ['codex'] });
   });
 
-  it("a claude-only request still fails closed (no cross-vendor core)", () => {
+  it('a claude-only request runs claude ONCE (layer) with an EMPTY core — never claude as core', () => {
     const r = resolveReviewRoster(['claude'], false);
-    expect('error' in r && r.error).toMatch(/at least one cross-vendor/);
+    expect(r).toEqual({ claude: true, core: [] });
   });
 });
 

@@ -221,10 +221,11 @@ export async function runReviewMode(
   const log = opts.onProgress ?? (() => {});
   const ceilingBytes = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
   const profile: ReviewProfile = opts.profile ?? 'code';
-  const reviewers =
-    opts.reviewers && opts.reviewers.length > 0
-      ? opts.reviewers
-      : [...CORE_REVIEWER_IDS];
+  // undefined → the default core; an explicit list — INCLUDING an empty one — is the roster as
+  // given. `[]` is the claude-only run (resolveReviewRoster): no core seat spawns, the packet,
+  // coverage and evidence are built exactly as before for the Anthropic seats that follow, and
+  // no content-tied receipt qualifies (buildDiffReceipt refuses an empty core).
+  const reviewers = opts.reviewers ?? [...CORE_REVIEWER_IDS];
 
   const sourceLabel = opts.diffText !== undefined
     ? (opts.diffMode ?? 'raw')
@@ -357,7 +358,11 @@ export async function runReviewMode(
     /* trail write is best-effort — the gate fails closed if the packet is absent */
   }
 
-  log(`Running ${reviewers.length} reviewer(s): ${reviewers.join(', ')}…`);
+  log(
+    reviewers.length > 0
+      ? `Running ${reviewers.length} reviewer(s): ${reviewers.join(', ')}…`
+      : 'Running 0 core reviewer(s) — claude-only: the Opus reviewer, the lens (when requested) and the gate are the reviewers of record; no cross-vendor receipt will qualify'
+  );
   // Load the reviewers config ONCE per run (a file read + JSON parse), then index
   // it per reviewer — not once per reviewer inside the fan-out.
   const resolved = loadReviewers(opts.reviewersFile);

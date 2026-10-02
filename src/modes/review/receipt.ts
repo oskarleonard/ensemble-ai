@@ -421,6 +421,15 @@ export function buildDiffReceipt(args: {
       ok: false,
     };
   }
+  // The receipt is CONTENT-TIED by a cross-vendor core seat: a claude-only run (empty required
+  // set) has reviewed, but nothing here says a second vendor saw the bytes — so it earns none.
+  if (args.required.length === 0) {
+    return {
+      error:
+        'not qualified — no cross-vendor core seat on the roster (claude-only run); the content-tied receipt needs at least one of codex/grok',
+      ok: false,
+    };
+  }
   const vendors: string[] = [];
   for (const id of args.required) {
     const r = args.reviews.find((x) => x.reviewerId === id);

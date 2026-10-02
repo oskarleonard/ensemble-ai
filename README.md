@@ -56,6 +56,10 @@ ensemble-ai review --diff-file change.diff
 
 # pick reviewers + where the trail goes
 ensemble-ai review --reviewers codex,grok --out ./review-trail
+
+# claude-only: the Opus reviewer (+ --holistic lens) + the gate, no cross-vendor seat — e.g. while
+# every vendor seat is out of credit. Reviewed, but no content-tied receipt is minted.
+ensemble-ai review --reviewers claude
 ```
 
 Options: `--base <ref>` · `--reviewers <ids>` · `--optional-reviewers <ids>` · `--out <dir>` · `--sandbox <profile>` · `--allow-sensitive` · `--ceiling <bytes>` · `--cwd <dir>` · `--run-id <id>`.
@@ -381,7 +385,11 @@ Every seat is **config, not a hardcode** — two JSON files under `~/.ensemble-a
   **`config --json` carries `enabledReviewerIds`** (resolved at print time by that one owner) plus
   **`offSeats`** (`[{ id, until }]`, `until` null for an indefinite `enabled: false`) — so a consumer
   that fans out through the CLI reads the roster there and passes `--reviewers` with the seats that
-  are on, instead of re-deriving the rule from the file.
+  are on, instead of re-deriving the rule from the file. With every cross-vendor seat off, that is
+  `--reviewers claude` — the **claude-only** review (since 2026-10-02): the Opus reviewer, the
+  holistic lens and the gate run as usual, the run stands on them exactly as it already did when
+  every optional core seat died (incident 2026-09-28), and **no content-tied receipt is minted**
+  (`buildDiffReceipt` refuses an empty core — codex/grok are what tie a receipt to a second vendor).
 
 **`~/.ensemble-ai/voices.json`** — the Claude **voices** (`claude` = the brainstorm/consult voice **and** the cold-Opus review reviewer) plus the **`gate`** seat (the verified-gate synthesizer). The gate takes **`model`, `effort`, and `vendor` only** — the spawn is always one of the two FENCED runners, picked by `vendor` (anthropic = `claude -p` under plan-mode + write-tool deny, the default; codex = the sandboxed, egress-fenced codex runner), so a `cmd` key on the `gate` seat is **ignored + warned** (the read-only posture can't be configured away). This makes "reviewer = Opus @ high, **gate = Fable @ max**" expressible:
 

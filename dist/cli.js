@@ -7563,6 +7563,12 @@ function buildDiffReceipt(args) {
       ok: false
     };
   }
+  if (args.required.length === 0) {
+    return {
+      error: "not qualified \u2014 no cross-vendor core seat on the roster (claude-only run); the content-tied receipt needs at least one of codex/grok",
+      ok: false
+    };
+  }
   const vendors = [];
   for (const id of args.required) {
     const r = args.reviews.find((x) => x.reviewerId === id);
@@ -7882,7 +7888,7 @@ async function runReviewMode(opts) {
   });
   const ceilingBytes = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
   const profile = opts.profile ?? "code";
-  const reviewers = opts.reviewers && opts.reviewers.length > 0 ? opts.reviewers : [...CORE_REVIEWER_IDS];
+  const reviewers = opts.reviewers ?? [...CORE_REVIEWER_IDS];
   const sourceLabel = opts.diffText !== void 0 ? opts.diffMode ?? "raw" : opts.staged ? "staged" : opts.workingTree ? "working-tree" : "commit";
   log(`Acquiring diff (${sourceLabel} mode)\u2026`);
   const acquired = acquireDiff({
@@ -7971,7 +7977,9 @@ async function runReviewMode(opts) {
     });
   } catch {
   }
-  log(`Running ${reviewers.length} reviewer(s): ${reviewers.join(", ")}\u2026`);
+  log(
+    reviewers.length > 0 ? `Running ${reviewers.length} reviewer(s): ${reviewers.join(", ")}\u2026` : "Running 0 core reviewer(s) \u2014 claude-only: the Opus reviewer, the lens (when requested) and the gate are the reviewers of record; no cross-vendor receipt will qualify"
+  );
   const resolved = loadReviewers(opts.reviewersFile);
   const configs = Object.fromEntries(
     reviewers.map((id) => [
@@ -8392,12 +8400,13 @@ function resolveReviewRoster(requested, noClaude) {
     };
   }
   const core = ids.filter(isCoreReviewerId);
-  if (core.length === 0) {
+  const claude = ids.includes("claude") && !noClaude;
+  if (core.length === 0 && !claude) {
     return {
-      error: "select at least one cross-vendor reviewer (codex/grok) \u2014 claude is additive, not standalone"
+      error: noClaude ? "nothing would run \u2014 the roster names only claude and --no-claude turns it off" : "select at least one reviewer (codex, grok, or claude for a claude-only review)"
     };
   }
-  return { claude: ids.includes("claude") && !noClaude, core };
+  return { claude, core };
 }
 function storedToVoiceReview(r) {
   return {
@@ -10407,7 +10416,9 @@ Diff source (give at most ONE; default = current branch):
 Options:
   --base <ref>          base ref for the default (commit) mode
   --reviewers <ids>     comma-separated reviewer ids to subset the roster
-                        (default: codex,grok,claude \u2014 claude is a valid id)
+                        (default: codex,grok,claude \u2014 claude is a valid id; "claude" alone
+                        runs a CLAUDE-ONLY review: Opus reviewer + lens + gate, no
+                        cross-vendor receipt)
   --no-claude           drop the cold Opus reviewer + the synthesis pass (codex + grok
                         only) \u2014 e.g. from a terminal with no Claude CLI
   --holistic            add the HOLISTIC/architecture lens: one Anthropic seat that reads the
@@ -11021,7 +11032,8 @@ function reviewExitCode(opts) {
   if (result.blocked) return 2;
   const isOptional = (r) => r.reviewerId !== void 0 && optionalReviewers.includes(r.reviewerId);
   const dead = result.reviews.filter((r) => r.terminalState !== "reviewed");
-  if (result.reviews.length === 0 || dead.some((r) => !isOptional(r))) return 1;
+  if (dead.some((r) => !isOptional(r))) return 1;
+  if (result.reviews.length === 0 && !claudeLayerExpected) return 1;
   for (const r of dead) {
     console.error(
       `ensemble-ai ${cmd}: \u26A0 optional reviewer ${r.reviewerId} failed (${scrubControl(r.summary).slice(0, 200)}) \u2014 the run continues WITHOUT it; this is NOT a full ${result.reviews.length + (claudeLayerExpected ? 1 : 0)}-reviewer pass`
@@ -11192,6 +11204,11 @@ async function runReviewPipeline(input) {
   if ("error" in roster) {
     console.error(`ensemble-ai ${cmd}: --reviewers "${values.reviewers}" \u2014 ${roster.error}`);
     return 3;
+  }
+  if (roster.core.length === 0) {
+    console.error(
+      `ensemble-ai ${cmd}: claude-only roster \u2014 no cross-vendor seat runs; the Opus reviewer${values.holistic ? ", the holistic lens" : ""} and the gate are the second eyes, and no content-tied receipt will be minted`
+    );
   }
   const reviewers = requestedReviewers === void 0 ? void 0 : roster.core;
   const optionalReviewers = resolveOptionalReviewers(values["optional-reviewers"], roster.core, cmd);
