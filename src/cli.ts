@@ -231,7 +231,9 @@ Diff source (give at most ONE; default = current branch):
 Options:
   --base <ref>          base ref for the default (commit) mode
   --reviewers <ids>     comma-separated reviewer ids to subset the roster
-                        (default: codex,grok,claude — claude is a valid id)
+                        (default: codex,grok,claude — claude is a valid id; "claude" alone
+                        runs a CLAUDE-ONLY review: Opus reviewer + lens + gate, no
+                        cross-vendor receipt)
   --no-claude           drop the cold Opus reviewer + the synthesis pass (codex + grok
                         only) — e.g. from a terminal with no Claude CLI
   --holistic            add the HOLISTIC/architecture lens: one Anthropic seat that reads the
@@ -1121,7 +1123,11 @@ function reviewExitCode(opts: {
   const isOptional = (r: StoredReview): boolean =>
     r.reviewerId !== undefined && optionalReviewers.includes(r.reviewerId);
   const dead = result.reviews.filter((r) => r.terminalState !== 'reviewed');
-  if (result.reviews.length === 0 || dead.some((r) => !isOptional(r))) return 1;
+  if (dead.some((r) => !isOptional(r))) return 1;
+  // No core review at all is exit 1 ONLY when nothing else was expected to review: a claude-only
+  // roster (`--reviewers claude`) has zero core reviews by design and is judged below on the
+  // Opus reviewer like any other run.
+  if (result.reviews.length === 0 && !claudeLayerExpected) return 1;
   for (const r of dead) {
     console.error(
       `ensemble-ai ${cmd}: ⚠ optional reviewer ${r.reviewerId} failed (${clean(r.summary).slice(0, 200)}) — the run continues WITHOUT it; this is NOT a full ${result.reviews.length + (claudeLayerExpected ? 1 : 0)}-reviewer pass`
@@ -1406,6 +1412,12 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   if ('error' in roster) {
     console.error(`ensemble-ai ${cmd}: --reviewers "${values.reviewers}" — ${roster.error}`);
     return 3;
+  }
+  if (roster.core.length === 0) {
+    // Said once, up front, where the run's header lands: this review has no cross-vendor seat.
+    console.error(
+      `ensemble-ai ${cmd}: claude-only roster — no cross-vendor seat runs; the Opus reviewer${values.holistic ? ', the holistic lens' : ''} and the gate are the second eyes, and no content-tied receipt will be minted`
+    );
   }
   // Preserve the "no --reviewers → undefined → engine runs ALL configured core" contract;
   // an explicit list threads the resolved core subset.

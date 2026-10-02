@@ -349,8 +349,20 @@ describe('flag threading', () => {
 });
 
 describe('reviewer roster (codex+grok core; Opus/claude default-on, --no-claude opts out)', () => {
-  it('"claude" ALONE fails closed — needs ≥1 cross-vendor core (exit 3, no engine run)', async () => {
-    expect(await main(['review', '--working-tree', '--reviewers', 'claude'])).toBe(3);
+  it('"claude" ALONE is the claude-only roster (2026-10-02) — engine runs with an EMPTY core, said up front', async () => {
+    const errs: string[] = [];
+    vi.mocked(console.error).mockImplementation((...a: unknown[]) => {
+      errs.push(a.join(' '));
+    });
+    mockRun.mockResolvedValue(result({ reviews: [] }));
+    const code = await main(['review', '--working-tree', '--reviewers', 'claude']);
+    expect(code).not.toBe(3); // not a usage refusal any more
+    expect(mockRun).toHaveBeenCalledWith(expect.objectContaining({ reviewers: [] }));
+    expect(errs.join('\n')).toContain('claude-only roster');
+  });
+
+  it('"claude" + --no-claude is a roster on which nothing runs → exit 3, no engine run', async () => {
+    expect(await main(['review', '--working-tree', '--reviewers', 'claude', '--no-claude'])).toBe(3);
     expect(mockRun).not.toHaveBeenCalled();
   });
 

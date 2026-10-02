@@ -58,14 +58,20 @@ export type RosterResolution =
 
 // Resolve which reviewers run. The Opus (claude) reviewer + synthesis are DEFAULT-ON;
 // `--no-claude` forces them off. `--reviewers` subsets the roster — `claude` IS a valid id
-// (it is default-on now), and the cross-vendor CORE (codex/grok) mints the content-tied
-// receipt, so at least one core reviewer is required. Fails CLOSED on an unknown id (a typo
-// must never silently narrow the policy).
+// (it is default-on now). Fails CLOSED on an unknown id (a typo must never silently narrow
+// the policy).
 //
 // `claude` is now ALSO a registry ReviewerId (the dashboard-style consumers run it through
-// REVIEW_ADAPTERS), but in THIS pipeline it stays the additive layer: the core filter is
+// REVIEW_ADAPTERS), but in THIS pipeline it stays the layer: the core filter is
 // CORE_REVIEWER_IDS, never REVIEWER_IDS, so a `--reviewers codex,claude` request can never
 // run claude twice (once as core, once as the layer) or let it mint a same-vendor receipt.
+//
+// CLAUDE-ONLY (`--reviewers claude`, since 2026-10-02): an empty core is a valid roster. The
+// cross-vendor seats are second opinions; the Opus reviewer, the holistic lens and the gate are
+// a complete review on their own — exactly the run that already stands when every optional
+// core seat dies (incident 2026-09-28). What a claude-only run does NOT get is the content-tied
+// receipt: codex/grok mint it, so buildDiffReceipt refuses an empty core (receipt.ts). The only
+// refusal left is a roster on which NOTHING would run (`--reviewers claude --no-claude`).
 export function resolveReviewRoster(
   requested: string[] | undefined,
   noClaude: boolean
@@ -81,15 +87,15 @@ export function resolveReviewRoster(
     };
   }
   const core = ids.filter(isCoreReviewerId);
-  // codex/grok mint the content-tied receipt; claude is an ADDITIVE peer reviewer, never a
-  // standalone one. Require ≥1 cross-vendor core.
-  if (core.length === 0) {
+  const claude = ids.includes('claude') && !noClaude;
+  if (core.length === 0 && !claude) {
     return {
-      error:
-        'select at least one cross-vendor reviewer (codex/grok) — claude is additive, not standalone',
+      error: noClaude
+        ? 'nothing would run — the roster names only claude and --no-claude turns it off'
+        : 'select at least one reviewer (codex, grok, or claude for a claude-only review)',
     };
   }
-  return { claude: ids.includes('claude') && !noClaude, core };
+  return { claude, core };
 }
 
 // ── Voice-review adaptation + trail persistence ─────────────────────────────────────

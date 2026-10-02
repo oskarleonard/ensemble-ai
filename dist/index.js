@@ -4677,6 +4677,12 @@ function buildDiffReceipt(args) {
       ok: false
     };
   }
+  if (args.required.length === 0) {
+    return {
+      error: "not qualified \u2014 no cross-vendor core seat on the roster (claude-only run); the content-tied receipt needs at least one of codex/grok",
+      ok: false
+    };
+  }
   const vendors = [];
   for (const id of args.required) {
     const r = args.reviews.find((x) => x.reviewerId === id);
@@ -4983,7 +4989,7 @@ async function runReviewMode(opts) {
   });
   const ceilingBytes = opts.ceilingBytes ?? DEFAULT_COVERAGE_CEILING;
   const profile = opts.profile ?? "code";
-  const reviewers = opts.reviewers && opts.reviewers.length > 0 ? opts.reviewers : [...CORE_REVIEWER_IDS];
+  const reviewers = opts.reviewers ?? [...CORE_REVIEWER_IDS];
   const sourceLabel = opts.diffText !== void 0 ? opts.diffMode ?? "raw" : opts.staged ? "staged" : opts.workingTree ? "working-tree" : "commit";
   log(`Acquiring diff (${sourceLabel} mode)\u2026`);
   const acquired = acquireDiff({
@@ -5072,7 +5078,9 @@ async function runReviewMode(opts) {
     });
   } catch {
   }
-  log(`Running ${reviewers.length} reviewer(s): ${reviewers.join(", ")}\u2026`);
+  log(
+    reviewers.length > 0 ? `Running ${reviewers.length} reviewer(s): ${reviewers.join(", ")}\u2026` : "Running 0 core reviewer(s) \u2014 claude-only: the Opus reviewer, the lens (when requested) and the gate are the reviewers of record; no cross-vendor receipt will qualify"
+  );
   const resolved = loadReviewers(opts.reviewersFile);
   const configs = Object.fromEntries(
     reviewers.map((id) => [
