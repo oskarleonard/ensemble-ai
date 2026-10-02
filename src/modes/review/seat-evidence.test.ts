@@ -72,7 +72,7 @@ describe('seat qualification — a seat gets the worktree IFF its sandbox qualif
 // whole evidence machinery exists to close. codex and grok are fenced by DIFFERENT mechanisms:
 // codex's outbound is denied BY THE KERNEL except the one loopback proxy port; grok's is merely
 // ROUTED by proxy env vars (its sandbox.toml schema has no network keys), and what bounds a
-// prompt-injected tree there is that the seat has no shell (`--disallowed-tools bash`). The two ids
+// prompt-injected tree there is that the seat has no shell (the tool fence, verified at spawn). The two ids
 // once both ended `+egress-proxy`, so a receipt reader inferred codex's kernel guarantee for grok.
 // These assertions pin the distinction against a future copy-paste collapsing them back together.
 describe('the seat profile ids encode the MECHANISM, not merely the existence of a fence', () => {

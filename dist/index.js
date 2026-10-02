@@ -1637,12 +1637,16 @@ function runReviewerExec(opts) {
     if (capture === "stdout") {
       child.stdout?.on("data", (chunk) => {
         armIdle();
-        stdoutBuf += chunk.toString("utf8");
+        const text = chunk.toString("utf8");
+        stdoutBuf += text;
+        opts.onStdout?.(text);
       });
     } else if (streamStdout) {
       child.stdout?.on("data", (chunk) => {
         armIdle();
-        streamTail += chunk.toString("utf8");
+        const text = chunk.toString("utf8");
+        opts.onStdout?.(text);
+        streamTail += text;
         if (streamTail.length > streamLimit * 2) streamTail = streamTail.slice(-streamLimit);
       });
     }
@@ -2469,10 +2473,42 @@ ${REVIEW_PROFILE}` : REVIEW_PROFILE);
 var GROK_CLI_SANDBOX = REVIEW_PROFILE_NAME;
 var GROK_SANDBOX_PROFILE = {
   // Egress fenced by proxy ENV VARS ONLY (grok's sandbox schema has no network keys); what bounds a
-  // prompt-injected tree is that the seat has NO SHELL (`--disallowed-tools bash`) to exercise it.
+  // prompt-injected tree is that the seat has NO SHELL — the verified tool fence — to exercise it.
   id: "ensemble-review-grok+proxy-env-noshell",
-  version: 3
+  version: 4
 };
+var GROK_REVIEW_TOOLS = ["read_file", "list_dir", "grep"];
+var GROK_DENIED_META_TOOLS = ["search_tool", "use_tool"];
+var GROK_SHELL_DENY_RULE = "Bash";
+var TOOL_FENCE_PREFIX = "ensemble-ai: grok tool fence \u2014";
+function grokToolFence(firstLine2) {
+  let obj;
+  try {
+    obj = JSON.parse(firstLine2);
+  } catch {
+    return {
+      ok: false,
+      why: `${TOOL_FENCE_PREFIX} grok's first output line is not its init announcement, so the tools it holds cannot be verified; refusing the seat`
+    };
+  }
+  const o = obj && typeof obj === "object" ? obj : {};
+  if (o.type !== "system" || o.subtype !== "init" || !Array.isArray(o.tools)) {
+    return {
+      ok: false,
+      why: `${TOOL_FENCE_PREFIX} grok's first output line did not announce its tools, so they cannot be verified; refusing the seat`
+    };
+  }
+  const allowed = new Set(GROK_REVIEW_TOOLS);
+  const extra = o.tools.map(String).filter((tool) => !allowed.has(tool));
+  if (extra.length > 0) {
+    return {
+      ok: false,
+      why: `${TOOL_FENCE_PREFIX} grok announced tools outside the review allowlist (${extra.join(", ")}); killed before its first turn rather than run it with them`
+    };
+  }
+  return { ok: true };
+}
+var TOOL_FENCE_FIRST_LINE_LIMIT = 256e3;
 function buildGrokReviewArgs(config, prompt, cwd) {
   return [
     "-p",
@@ -2489,8 +2525,12 @@ function buildGrokReviewArgs(config, prompt, cwd) {
     "--cwd",
     cwd,
     "--disable-web-search",
+    "--tools",
+    GROK_REVIEW_TOOLS.join(","),
     "--disallowed-tools",
-    "bash,search_replace",
+    GROK_DENIED_META_TOOLS.join(","),
+    "--deny",
+    GROK_SHELL_DENY_RULE,
     "--no-memory"
   ];
 }
@@ -2586,21 +2626,55 @@ async function runGrokReview(prompt, config, opts = {}) {
     if (cancel.cancelled()) return cancelled();
     const seatTimeoutMs = deadlineAt - Date.now();
     if (seatTimeoutMs <= 0) return budgetSpent();
+    let seatKill;
+    let fence = null;
+    let firstLine2 = "";
+    const onStdout = (chunk) => {
+      if (fence) return;
+      firstLine2 += chunk;
+      const nl = firstLine2.indexOf("\n");
+      if (nl === -1) {
+        if (firstLine2.length <= TOOL_FENCE_FIRST_LINE_LIMIT) return;
+        fence = grokToolFence(firstLine2.slice(0, 200));
+      } else {
+        fence = grokToolFence(firstLine2.slice(0, nl));
+      }
+      firstLine2 = "";
+      if (!fence.ok) seatKill?.();
+    };
     const { raw, stderrTail, timedOut, timedOutReason } = await runReviewerExec({
       args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
       bin,
       capture: "stdout",
+      onStdout,
       ...proxy ? { env: proxyEnv(proxy.url) } : {},
       // THE LIVENESS WATCHDOG. Under `capture: 'stdout'` the accumulated stdout IS what resets it
       // (spawn.ts), and grok's NDJSON now flows throughout the work — so this reclaims a WEDGED
       // seat in 15 min while `timeoutMs` above stands back as a pure runaway backstop.
       inactivityTimeoutMs: GROK_INACTIVITY_TIMEOUT_MS,
-      onSpawn: cancel.onSpawn,
+      onSpawn: (kill) => {
+        seatKill = kill;
+        cancel.onSpawn?.(kill);
+      },
       stderrLimit: GROK_SEAT_STDERR_LIMIT,
       // What is left of the ONE deadline at the moment the seat spawns — after the pre-flight AND the
       // egress proxy's start, so neither is ever added on top of the caller's budget.
       timeoutMs: seatTimeoutMs
     });
+    const verdict = fence ?? (raw ? grokToolFence(raw.split("\n")[0]) : null);
+    if (verdict && !verdict.ok) {
+      return {
+        ...proxy ? { egressDenials: [...proxy.denials] } : {},
+        ...preflight,
+        failWhy: verdict.why,
+        ok: false,
+        raw: null,
+        stderrTail: verdict.why,
+        ...raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
+        timedOut,
+        ...timedOutReason ? { timedOutReason } : {}
+      };
+    }
     const stream = raw ? parseGrokStream(raw) : null;
     const text = !raw || !stream ? null : stream.events === 0 && !/^\s*\{\s*"type"\s*:/.test(raw) ? extractGrokText(raw) : stream.text;
     const stalled = timedOut && timedOutReason === "inactivity";
@@ -6467,6 +6541,7 @@ export {
   GROK_LOGIN_MARGIN_MS,
   GROK_PACKET_REVIEW_TIMEOUT_MS,
   GROK_PREFLIGHT_CANCELLED_WHY,
+  GROK_REVIEW_TOOLS,
   GROK_SANDBOX_PROFILE,
   GROK_STATUS_API_KEY,
   GROK_STATUS_AUTHENTICATED_VIA_PREFIX,
@@ -6574,6 +6649,7 @@ export {
   fsConventionReader,
   gatherConventions,
   grokLoginWarningLine,
+  grokToolFence,
   hasDepSurface,
   hasGeneratedHeader,
   holisticCapWasLifted,
