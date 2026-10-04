@@ -2200,8 +2200,12 @@ function resolveClaudeBin() {
 }
 function claudeAdvisorArgs(config) {
   const advisor = parseSeatAdvisor(config?.advisor, config?.id ?? "claude");
-  if (advisor === void 0) return [];
-  return ["--settings", JSON.stringify({ advisorModel: advisor === ADVISOR_OFF ? "" : advisor })];
+  if (advisor === void 0 || advisor === ADVISOR_OFF) return [];
+  return ["--settings", JSON.stringify({ advisorModel: advisor })];
+}
+function claudeAdvisorEnv(config) {
+  const advisor = parseSeatAdvisor(config?.advisor, config?.id ?? "claude");
+  return advisor === ADVISOR_OFF ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: "1" } : {};
 }
 var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
 function buildClaudeVoiceArgs(prompt, config) {
@@ -2217,6 +2221,7 @@ function runClaudeVoice(prompt, config, opts = {}) {
     args: buildClaudeVoiceArgs(prompt, config),
     bin: resolveClaudeBin(),
     capture: "stdout",
+    env: claudeAdvisorEnv(config),
     onSpawn: opts.onSpawn,
     stderrLimit: 2e3,
     timeoutMs
@@ -4244,6 +4249,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
     config,
     opts.worktree ? { readRoot: opts.worktree } : {}
   );
+  const env = claudeAdvisorEnv(config);
   const cwd = makeNeutralSeatCwd();
   try {
     if (opts.historyPacket?.length) {
@@ -4260,6 +4266,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
         bin: resolveClaudeBin(),
         capture: "stdout",
         cwd,
+        env,
         inactivityTimeoutMs,
         onSpawn: opts.onSpawn,
         stderrLimit: 2e3,
@@ -4374,6 +4381,7 @@ async function runClaudeExecVoice(prompt, config, opts, seams = {}) {
   const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
   const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const args = buildClaudeExecArgs(prompt, config);
+  const env = claudeAdvisorEnv(config);
   let retried = 0;
   for (; ; ) {
     const startedAt = Date.now();
@@ -4382,6 +4390,7 @@ async function runClaudeExecVoice(prompt, config, opts, seams = {}) {
       bin: resolveClaudeBin(),
       capture: "stdout",
       cwd: opts.worktree,
+      env,
       inactivityTimeoutMs,
       onSpawn: opts.onSpawn,
       stderrLimit: 2e3,

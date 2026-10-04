@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 
-import { claudeAdvisorArgs, resolveClaudeBin } from '../brainstorm/claude';
+import { claudeAdvisorArgs, claudeAdvisorEnv, resolveClaudeBin } from '../brainstorm/claude';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 import { isUnder, makeOwnerOnlyTempDir } from '../../core/artifacts';
@@ -126,10 +126,12 @@ export interface ClaudeSeatFence {
 // of this file. Honors the voice config's model/effort/advisor so a CONFIGURED Claude model runs.
 //
 // `--disallowedTools` is variadic, so it goes LAST — nothing may follow it. `--add-dir` is variadic
-// too, so it is always followed immediately by `--strict-mcp-config`. The advisor's `--settings`
-// sits between `--effort` and `--disallowedTools`, where it breaks neither. It is NOT a fence change
-// (no version bump): the settings object carries `advisorModel` alone, built in code — no config
-// value can add a permission, a tool, or an MCP server through it.
+// too, so it is always followed immediately by `--strict-mcp-config`. A pinned advisor's `--settings`
+// sits between `--effort` and `--disallowedTools`, where it breaks neither. "off" adds no argv: it is
+// CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1 in the spawn env (claudeAdvisorEnv), because no `--settings`
+// value disables the advisor on Claude Code 2.1.289 (measured 2026-10-04). Neither is a fence change
+// (no version bump): the settings object carries `advisorModel` alone and the env that one variable,
+// both built in code — no config value can add a permission, a tool, or an MCP server through them.
 //
 // THROWS when the read root lives inside the home directory: the home deny would then also deny the
 // worktree, and a seat that silently reviewed nothing is exactly the fail-open this fence exists to
@@ -293,6 +295,7 @@ export async function runClaudeReviewVoice(
     config,
     opts.worktree ? { readRoot: opts.worktree } : {}
   );
+  const env = claudeAdvisorEnv(config);
   // WORKTREE EVIDENCE (§2): the worktree is the seat's READ ROOT (`--add-dir`), never its cwd. The
   // seat never owns the worktree; the run reaps it. The neutral cwd is ours, and we reap it here.
   const cwd = makeNeutralSeatCwd();
@@ -319,6 +322,7 @@ export async function runClaudeReviewVoice(
         bin: resolveClaudeBin(),
         capture: 'stdout',
         cwd,
+        env,
         inactivityTimeoutMs,
         onSpawn: opts.onSpawn,
         stderrLimit: 2000,

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
+import { claudeAdvisorEnv } from '../brainstorm/claude';
+
 import { buildClaudeReviewArgs } from './claude';
 import {
   CLAUDE_REVIEWER_SEAT_DEFAULTS,
@@ -395,7 +397,9 @@ describe('the advisor on the gate + claude reviewer seats — own entry only, ne
     const off = resolve({ claude: { advisor: 'off' }, gate: { vendor: 'codex' } }, { vendor: 'anthropic' });
     expect(off.seat.vendor).toBe('anthropic');
     expect(off.seat.config.advisor).toBe('off');
-    expect(settingsOf(buildClaudeReviewArgs('P', off.seat.config))).toEqual({ advisorModel: '' });
+    // "off" is the env kill switch on the spawn, never a settings value.
+    expect(settingsOf(buildClaudeReviewArgs('P', off.seat.config))).toBeUndefined();
+    expect(claudeAdvisorEnv(off.seat.config)).toEqual({ CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' });
     // The entry's own advisor is ignored loudly; the claude entry's wins.
     const both = resolve(
       { claude: { advisor: 'claude-fable-5-1' }, gate: { advisor: 'off', vendor: 'codex' } },

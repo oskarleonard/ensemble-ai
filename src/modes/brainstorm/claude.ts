@@ -21,17 +21,26 @@ export function resolveClaudeBin(): string {
 // PURE: the advisor half of EVERY `claude` invocation this engine builds (review seat,
 // brainstorm/consult voice, execution seat) — one owner, so the three can never spell it
 // differently. Absent → no flag (the seat inherits the operator's settings). A model id →
-// `--settings {"advisorModel":"<id>"}`; "off" → `{"advisorModel":""}`, the value that
-// DISABLES the advisor even when the operator's settings enable one (null would NOT — it
-// falls back to the user setting, so it is never emitted). Built with JSON.stringify,
-// never concatenation. This is the SPAWN BACKSTOP: the CLI already refused an invalid value at
-// its up-front seat resolution, but a programmatic consumer (e.g. a dashboard setting
-// ReviewerConfig.advisor) hands a runner a config no resolver saw — so the value goes through
-// parseSeatAdvisor again, and an invalid one THROWS here rather than reaching the CLI.
+// `--settings {"advisorModel":"<id>"}`. "off" → no flag either: no `--settings` value disables
+// the advisor (measured 2026-10-04 — see core/types), so "off" is the env kill switch
+// claudeAdvisorEnv returns. Built with JSON.stringify, never concatenation. This is the SPAWN
+// BACKSTOP: the CLI already refused an invalid value at its up-front seat resolution, but a
+// programmatic consumer (e.g. a dashboard setting ReviewerConfig.advisor) hands a runner a config
+// no resolver saw — so the value goes through parseSeatAdvisor again, and an invalid one THROWS
+// here rather than reaching the CLI.
 export function claudeAdvisorArgs(config?: { advisor?: unknown; id: string }): string[] {
   const advisor = parseSeatAdvisor(config?.advisor, config?.id ?? 'claude');
-  if (advisor === undefined) return [];
-  return ['--settings', JSON.stringify({ advisorModel: advisor === ADVISOR_OFF ? '' : advisor })];
+  if (advisor === undefined || advisor === ADVISOR_OFF) return [];
+  return ['--settings', JSON.stringify({ advisorModel: advisor })];
+}
+
+// PURE: the env half of the advisor, merged over the parent env at every `claude` spawn. "off" →
+// CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1, the CLI's own kill switch and the one per-run off that holds
+// on any base model, whatever the operator's advisorModel (measured 2026-10-04). A model id or
+// absent → {}. Same parseSeatAdvisor backstop as claudeAdvisorArgs: an invalid value THROWS.
+export function claudeAdvisorEnv(config?: { advisor?: unknown; id: string }): Record<string, string> {
+  const advisor = parseSeatAdvisor(config?.advisor, config?.id ?? 'claude');
+  return advisor === ADVISOR_OFF ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' } : {};
 }
 
 // Claude's `--effort` accepts these levels; the 'default' sentinel (or anything
@@ -61,7 +70,8 @@ export function buildClaudeVoiceArgs(prompt: string, config?: VoiceConfig): stri
 // group-kill is mandatory), in STDOUT-capture mode (claude prints its reply to
 // stdout, no -o file — like grok). Returns the uniform {ok, raw, stderrTail,
 // timedOut} so the orchestrator treats every voice identically. Passes `config`
-// through so the roster's model/effort override is applied (see buildClaudeVoiceArgs).
+// through so the roster's model/effort override is applied (see buildClaudeVoiceArgs),
+// and its advisor "off" reaches the child's env (claudeAdvisorEnv).
 export function runClaudeVoice(
   prompt: string,
   config: VoiceConfig,
@@ -72,6 +82,7 @@ export function runClaudeVoice(
     args: buildClaudeVoiceArgs(prompt, config),
     bin: resolveClaudeBin(),
     capture: 'stdout',
+    env: claudeAdvisorEnv(config),
     onSpawn: opts.onSpawn,
     stderrLimit: 2000,
     timeoutMs,
