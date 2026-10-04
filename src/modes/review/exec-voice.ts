@@ -1,5 +1,5 @@
 import { runReviewerExec } from '../../core/spawn';
-import { claudeAdvisorArgs, resolveClaudeBin } from '../brainstorm/claude';
+import { claudeAdvisorArgs, claudeAdvisorEnv, resolveClaudeBin } from '../brainstorm/claude';
 import type { VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
@@ -36,7 +36,8 @@ import {
 // subscription burn) and the web tools (experiments are local; research is the reviewers' job)
 // off. Bash/Read/Write/Edit stay: they are the whole point. No home-read deny and no neutral cwd —
 // see the operator-decision block above. The seat's advisor rides `--settings` (claudeAdvisorArgs)
-// like every other claude seat. `--disallowedTools` is variadic, so it goes LAST.
+// and its "off" the spawn env (claudeAdvisorEnv), like every other claude seat.
+// `--disallowedTools` is variadic, so it goes LAST.
 export function buildClaudeExecArgs(prompt: string, config?: VoiceConfig): string[] {
   const args = [
     '-p',
@@ -81,6 +82,7 @@ export async function runClaudeExecVoice(
   const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
   const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const args = buildClaudeExecArgs(prompt, config);
+  const env = claudeAdvisorEnv(config);
   let retried = 0;
   for (;;) {
     const startedAt = Date.now();
@@ -89,6 +91,7 @@ export async function runClaudeExecVoice(
       bin: resolveClaudeBin(),
       capture: 'stdout',
       cwd: opts.worktree,
+      env,
       inactivityTimeoutMs,
       onSpawn: opts.onSpawn,
       stderrLimit: 2000,

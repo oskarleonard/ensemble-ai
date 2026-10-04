@@ -1,6 +1,19 @@
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { buildClaudeVoiceArgs, claudeAdvisorArgs } from './claude';
+import type { ReviewerExecOpts } from '../../core/spawn';
+
+// runClaudeVoice has no exec seam, so the spawn primitive is mocked: the test reads the exact
+// request the voice hands it, and nothing is ever spawned.
+const spawned = vi.hoisted(() => [] as ReviewerExecOpts[]);
+vi.mock('../../core/spawn', async (importActual) => ({
+  ...(await importActual<typeof import('../../core/spawn')>()),
+  runReviewerExec: vi.fn((req: ReviewerExecOpts) => {
+    spawned.push(req);
+    return Promise.resolve({ raw: 'IDEAS', stderrTail: '', timedOut: false });
+  }),
+}));
+
+import { buildClaudeVoiceArgs, claudeAdvisorArgs, claudeAdvisorEnv, runClaudeVoice } from './claude';
 import type { VoiceConfig } from './types';
 
 const cfg = (over: Partial<VoiceConfig> = {}): VoiceConfig => ({
@@ -56,10 +69,8 @@ describe('claudeAdvisorArgs — the advisor half of every claude invocation', ()
     expect(settingsOf(args)).toEqual({ advisorModel: 'claude-fable-5-1' });
   });
 
-  it('"off" → {"advisorModel":""} — the empty string DISABLES it; null is never emitted', () => {
-    const args = claudeAdvisorArgs(cfg({ advisor: 'off' }));
-    expect(settingsOf(args)).toEqual({ advisorModel: '' });
-    expect(args[1]).not.toContain('null');
+  it('"off" → no flag: no --settings value disables the advisor (measured 2026-10-04), so off rides the env', () => {
+    expect(claudeAdvisorArgs(cfg({ advisor: 'off' }))).toEqual([]);
   });
 
   it('a hand-built config with an invalid advisor throws, naming the seat — it never reaches the CLI', () => {
@@ -72,12 +83,60 @@ describe('buildClaudeVoiceArgs — the brainstorm/consult voice carries the advi
     expect(buildClaudeVoiceArgs('p', cfg())).not.toContain('--settings');
   });
 
-  it('a model id and "off" each ride --settings after --model/--effort', () => {
+  it('a model id rides --settings after --model/--effort; "off" adds no flag at all', () => {
     const withModel = buildClaudeVoiceArgs('p', cfg({ advisor: 'claude-opus-5-5', effort: 'high', model: 'opus' }));
     expect(settingsOf(withModel)).toEqual({ advisorModel: 'claude-opus-5-5' });
     expect(withModel.indexOf('--settings')).toBeGreaterThan(withModel.indexOf('--effort'));
-    expect(settingsOf(buildClaudeVoiceArgs('p', cfg({ advisor: 'off' })))).toEqual({ advisorModel: '' });
+    expect(buildClaudeVoiceArgs('p', cfg({ advisor: 'off' }))).toEqual(buildClaudeVoiceArgs('p', cfg()));
     // The tool-less posture is untouched.
     expect(withModel.slice(0, 6)).toEqual(['-p', 'p', '--output-format', 'text', '--tools', '']);
+  });
+});
+
+describe('claudeAdvisorEnv — the env half: "off" is the CLI kill switch', () => {
+  it('"off" → CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1, the one per-run off that holds on any base model', () => {
+    expect(claudeAdvisorEnv(cfg({ advisor: 'off' }))).toEqual({ CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' });
+  });
+
+  it('a pinned model → {} (the pin rides --settings, which still overrides the operator setting)', () => {
+    expect(claudeAdvisorEnv(cfg({ advisor: 'claude-fable-5-1' }))).toEqual({});
+  });
+
+  it('absent → {} (the seat inherits the operator settings)', () => {
+    expect(claudeAdvisorEnv(cfg())).toEqual({});
+    expect(claudeAdvisorEnv(undefined)).toEqual({});
+  });
+
+  it('an invalid advisor throws, naming the seat — the same spawn backstop as the argv', () => {
+    expect(() => claudeAdvisorEnv(cfg({ advisor: 'Not A Model' }))).toThrow(/claude seat: `advisor`/);
+    expect(() => claudeAdvisorEnv({ advisor: null, id: 'gate' })).toThrow(/gate seat: `advisor`/);
+  });
+});
+
+describe('runClaudeVoice — the advisor "off" reaches the spawned claude as its env', () => {
+  beforeAll(() => {
+    // Resolution short-circuits to an existing binary; the mocked spawn never runs it.
+    vi.stubEnv('CLAUDE_BIN', '/bin/echo');
+  });
+  afterAll(() => {
+    vi.unstubAllEnvs();
+  });
+  beforeEach(() => {
+    spawned.length = 0;
+  });
+
+  it('"off" → CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1 in the child env, and no --settings', async () => {
+    await runClaudeVoice('p', cfg({ advisor: 'off' }));
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0].env?.CLAUDE_CODE_DISABLE_ADVISOR_TOOL).toBe('1');
+    expect(spawned[0].args).not.toContain('--settings');
+  });
+
+  it('a pinned model or an absent advisor → the variable is never set', async () => {
+    await runClaudeVoice('p', cfg({ advisor: 'claude-opus-5-5' }));
+    await runClaudeVoice('p', cfg());
+    expect(spawned).toHaveLength(2);
+    for (const req of spawned) expect(req.env?.CLAUDE_CODE_DISABLE_ADVISOR_TOOL).toBeUndefined();
+    expect(settingsOf(spawned[0].args)).toEqual({ advisorModel: 'claude-opus-5-5' });
   });
 });

@@ -1,8 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { VoiceConfig } from '../brainstorm/types';
+import type { ReviewerExecOpts } from '../../core/spawn';
 
-import { buildClaudeExecArgs } from './exec-voice';
+import type { ReviewerExec } from './claude';
+import { buildClaudeExecArgs, runClaudeExecVoice } from './exec-voice';
 
 const CFG: VoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
 
@@ -36,14 +38,44 @@ describe('the exec-voice argv — unfenced where the review seats are fenced, an
 });
 
 describe('the exec-voice argv — the advisor rides --settings like every claude seat', () => {
-  it('absent → no --settings; a model id / "off" → advisorModel, before the variadic --disallowedTools', () => {
+  it('absent / "off" → no --settings; a model id → advisorModel, before the variadic --disallowedTools', () => {
     expect(buildClaudeExecArgs('PROMPT', CFG)).not.toContain('--settings');
-    for (const [advisor, advisorModel] of [['claude-fable-5-1', 'claude-fable-5-1'], ['off', '']]) {
-      const args = buildClaudeExecArgs('PROMPT', { ...CFG, advisor });
-      const at = args.indexOf('--settings');
-      expect(JSON.parse(args[at + 1])).toEqual({ advisorModel });
-      expect(at).toBeLessThan(args.indexOf('--disallowedTools'));
-      expect(args.slice(args.indexOf('--disallowedTools') + 1)).toEqual(['Agent', 'Task', 'WebFetch', 'WebSearch']);
-    }
+    // "off" is the env kill switch (claudeAdvisorEnv) — no settings value disables the advisor.
+    expect(buildClaudeExecArgs('PROMPT', { ...CFG, advisor: 'off' })).toEqual(buildClaudeExecArgs('PROMPT', CFG));
+    const args = buildClaudeExecArgs('PROMPT', { ...CFG, advisor: 'claude-fable-5-1' });
+    const at = args.indexOf('--settings');
+    expect(JSON.parse(args[at + 1])).toEqual({ advisorModel: 'claude-fable-5-1' });
+    expect(at).toBeLessThan(args.indexOf('--disallowedTools'));
+    expect(args.slice(args.indexOf('--disallowedTools') + 1)).toEqual(['Agent', 'Task', 'WebFetch', 'WebSearch']);
+  });
+});
+
+describe('runClaudeExecVoice — the advisor "off" reaches the spawned claude as its env', () => {
+  beforeAll(() => {
+    // Resolution short-circuits to an existing binary; the injected exec never spawns it.
+    vi.stubEnv('CLAUDE_BIN', '/bin/echo');
+  });
+  afterAll(() => {
+    vi.unstubAllEnvs();
+  });
+
+  const envOf = async (config: VoiceConfig) => {
+    const calls: ReviewerExecOpts[] = [];
+    const exec: ReviewerExec = (req) => {
+      calls.push(req);
+      return Promise.resolve({ raw: 'DONE', stderrTail: '', timedOut: false });
+    };
+    await runClaudeExecVoice('PROMPT', config, { timeoutMs: 1_000, worktree: '/tmp/worktree' }, { exec });
+    expect(calls).toHaveLength(1);
+    return calls[0].env;
+  };
+
+  it('"off" → CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1 in the child env', async () => {
+    expect((await envOf({ ...CFG, advisor: 'off' }))?.CLAUDE_CODE_DISABLE_ADVISOR_TOOL).toBe('1');
+  });
+
+  it('a pinned model or an absent advisor → the variable is never set', async () => {
+    expect((await envOf({ ...CFG, advisor: 'claude-fable-5-1' }))?.CLAUDE_CODE_DISABLE_ADVISOR_TOOL).toBeUndefined();
+    expect((await envOf(CFG))?.CLAUDE_CODE_DISABLE_ADVISOR_TOOL).toBeUndefined();
   });
 });

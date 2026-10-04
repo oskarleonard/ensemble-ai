@@ -115,10 +115,14 @@ export function parseSeatWindow(v: unknown): string | undefined {
 // A headless `claude -p` seat silently inherits `advisorModel` from the operator's
 // ~/.claude/settings.json. The `advisor` field makes it explicit config, in exactly
 // three states: a model id (that advisor), "off" (no advisor, even when the operator's
-// settings enable one), or ABSENT (inherit — the key omitted, never null). Probed on
-// Claude Code 2.1.286 (2026-10-01): a `--settings` advisorModel overrides the user
-// setting, the empty string disables it, and null falls back to the user setting —
-// so null is not a spelling of any state here, and is rejected.
+// settings enable one), or ABSENT (inherit — the key omitted, never null). Measured on
+// Claude Code 2.1.289 (2026-10-04, `--debug-file`): a `--settings` advisorModel id still
+// overrides the user setting, but NO settings value turns the advisor off — "" reads as
+// unset and enables a default advisor ranked above the base model, null is dropped by the
+// settings merge (the user setting wins), and an invalid name is merely skipped. The one
+// per-run off is CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1 in the spawned process's env (no
+// advisor tool at all, any base model), so "off" is that env kill switch
+// (claudeAdvisorEnv). null is not a spelling of any state here, and is rejected.
 export const ADVISOR_OFF = 'off';
 export const ADVISOR_MODEL_RE = /^[a-z0-9][a-z0-9.-]*$/;
 
