@@ -142,13 +142,15 @@ export function buildCodexReviewArgs(
   opts: { web?: boolean } = {}
 ): string[] {
   return [
+    // Vendor-side live web search (RunReviewOpts.web — voices only): the Responses `web_search`
+    // tool, executed by the vendor, so `-s read-only` and the egress posture are untouched. A
+    // GLOBAL codex flag: it must precede the `exec` subcommand (`codex exec --search` is rejected
+    // with "unexpected argument" — measured 2026-10-06; the voice then "produced no output").
+    ...(opts.web ? ['--search'] : []),
     'exec',
     '--skip-git-repo-check',
     '--ephemeral',
     '--json',
-    // Vendor-side live web search (RunReviewOpts.web — voices only): the Responses `web_search`
-    // tool, executed by the vendor, so `-s read-only` and the egress posture are untouched.
-    ...(opts.web ? ['--search'] : []),
     ...CODEX_SOURCE_FENCE_ARGS,
     '--color',
     'never',
