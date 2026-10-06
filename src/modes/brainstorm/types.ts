@@ -47,6 +47,12 @@ export interface VoiceConfig {
   model: string;
   sandbox?: string;
   vendor: string;
+  // WEB RESEARCH for the claude VOICE (brainstorm / consult only — the cold review reviewer never
+  // reads it): `true` opens WebSearch + WebFetch, pre-approved for the headless spawn, under a turn
+  // cap (buildClaudeVoiceArgs). Off by default: WebFetch is the local CLI fetching an arbitrary URL,
+  // so a prompt-injected topic or file can carry text out in a URL — a voice reads only the prompt
+  // and the shared file, which is why this is a per-voice choice and not a review-seat one.
+  web?: boolean;
 }
 
 // A seat config whose advisor has passed parseSeatAdvisor — what the seat resolvers (gate-seat,

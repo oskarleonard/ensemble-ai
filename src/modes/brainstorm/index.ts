@@ -55,7 +55,7 @@ async function runGenerate(
   log: (m: string) => void
 ): Promise<VoiceGenerateResult> {
   const config = configs[voiceId];
-  log(`  · ${voiceId} (${config.vendor} · ${config.model}) generating…`);
+  log(`  · ${voiceId} (${config.vendor} · ${config.model}${config.web ? ' · web' : ''}) generating…`);
   let res: VoiceRunResult;
   try {
     res = await adapters[voiceId](prompt, config, { timeoutMs });

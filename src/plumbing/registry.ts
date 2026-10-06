@@ -82,8 +82,10 @@ export function offSeatsOf(
 // structurally a ReviewerConfig — same fields). Only reviewer rows can carry an OFF note.
 function agentLine(c: ReviewerConfig | VoiceConfig, off?: OffSeat): string {
   const sandbox = c.sandbox ? ` · sandbox ${c.sandbox}` : '';
+  // Voices only (ReviewerConfig has no `web`): the claude voice's web research opt-in.
+  const web = 'web' in c && c.web === true ? ' · web' : '';
   const offNote = off ? (off.until ? ` · OFF until ${off.until}` : ' · OFF (enabled: false)') : '';
-  return `    ${c.id.padEnd(7)} ${c.vendor} · ${c.model} @ ${c.effort}${advisorNote(c.advisor)}${sandbox}${offNote}`;
+  return `    ${c.id.padEnd(7)} ${c.vendor} · ${c.model} @ ${c.effort}${advisorNote(c.advisor)}${web}${sandbox}${offNote}`;
 }
 
 // ` · advisor <model|off>` when a Claude seat states one; nothing when it inherits the operator's

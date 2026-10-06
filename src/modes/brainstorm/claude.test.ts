@@ -31,6 +31,18 @@ describe('buildClaudeVoiceArgs', () => {
     // `--tools ""` makes the voice provably read-only (ideation needs no tools).
     expect(args).toEqual(['-p', 'brainstorm prompt', '--output-format', 'text', '--tools', '']);
   });
+  it('`web: true` opens WebSearch + WebFetch, PRE-APPROVED for the headless spawn, under a turn cap (2026-10-06)', () => {
+    const args = buildClaudeVoiceArgs('p', cfg({ web: true }));
+    // `--allowedTools` is load-bearing: a `-p` spawn silently denies a permission-gated tool.
+    expect(args).toEqual([
+      '-p', 'p', '--output-format', 'text',
+      '--tools', 'WebSearch,WebFetch', '--allowedTools', 'WebSearch,WebFetch', '--max-turns', '25',
+    ]);
+  });
+  it('without `web` the voice stays tool-less (unchanged)', () => {
+    expect(buildClaudeVoiceArgs('p', cfg({ web: false }))).toContain('--tools');
+    expect(buildClaudeVoiceArgs('p', cfg({ web: false }))).not.toContain('WebFetch');
+  });
   it('passes the prompt verbatim (no shell interpolation)', () => {
     const tricky = 'a "quoted" $VAR & topic';
     expect(buildClaudeVoiceArgs(tricky)[1]).toBe(tricky);
