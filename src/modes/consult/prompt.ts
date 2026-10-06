@@ -142,7 +142,10 @@ Compare them and separate the signal:
 - DIVERGENCES: points they answered DIFFERENTLY — flag these as "look closer", and
   record who took which position.
 Then give ONE bottom-line recommendation, noting how much of it rests on agreement
-vs on a judgement call between diverging views.
+vs on a judgement call between diverging views. Write it for a human reader, not as
+one paragraph: the verdict in one or two sentences, then the actions or blockers as a
+numbered list (one per line, "1. …"), then a short paragraph on confidence. Separate
+those parts with blank lines (\\n\\n inside the JSON string).
 
 ## Question
 ${question.trim()}
@@ -160,7 +163,7 @@ ${JSON_RULE}
   "divergences": [
     { "point": "<the question they split on>", "positions": ["codex: X", "grok: Y"] }
   ],
-  "recommendation": "<the bottom-line answer, and how confident given agree vs diverge>"
+  "recommendation": "<verdict sentence(s)\\n\\n1. <action or blocker>\\n2. …\\n\\n<how confident, given agree vs diverge>"
 }
 Only list a REAL agreement (genuine concurrence, not a superficial overlap) and a
 REAL divergence (a substantive split, not wording). Empty arrays are fine.

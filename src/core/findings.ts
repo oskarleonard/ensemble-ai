@@ -123,6 +123,43 @@ export function stripTrailingCommas(s: string): string {
   return out;
 }
 
+// Escape RAW control characters (newline, CR, tab) INSIDE string literals. A model asked for a
+// multi-line field (the consult recommendation: verdict, numbered list, confidence) sometimes
+// writes a real line break where JSON wants `\n` — strict JSON.parse then fails on the whole
+// envelope and the synthesis is lost. Same string-state walk as stripTrailingCommas; outside a
+// string the text is untouched, so pretty-printed JSON stays exactly as it was. Third fallback
+// pass only, after strict and trailing-comma parses both failed.
+export function escapeRawNewlinesInStrings(s: string): string {
+  let out = '';
+  let inString = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (ch === '\\') {
+        out += ch;
+        if (i + 1 < s.length) out += s[++i];
+        continue;
+      }
+      if (ch === '"') inString = false;
+      else if (ch === '\n') {
+        out += '\\n';
+        continue;
+      } else if (ch === '\r') {
+        out += '\\r';
+        continue;
+      } else if (ch === '\t') {
+        out += '\\t';
+        continue;
+      }
+      out += ch;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    out += ch;
+  }
+  return out;
+}
+
 export function extractJsonBlock(raw: string): unknown {
   const fence = /```(?:json)?\s*([\s\S]*?)```/gi;
   let m: RegExpExecArray | null;
@@ -145,6 +182,15 @@ export function extractJsonBlock(raw: string): unknown {
   for (const c of candidates) {
     try {
       return JSON.parse(stripTrailingCommas(c));
+    } catch {
+      // try the next candidate
+    }
+  }
+  // THIRD pass: raw line breaks inside string literals (multi-line fields), with trailing
+  // commas stripped too — the two repairs are independent and a reply can need both.
+  for (const c of candidates) {
+    try {
+      return JSON.parse(stripTrailingCommas(escapeRawNewlinesInStrings(c)));
     } catch {
       // try the next candidate
     }
