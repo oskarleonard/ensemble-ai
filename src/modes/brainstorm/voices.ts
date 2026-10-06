@@ -109,6 +109,8 @@ export function parseVoices(raw: unknown): Record<VoiceId, VoiceConfig> {
     const sandbox = str(r.sandbox, VOICE_DEFAULTS[id].sandbox ?? '');
     out[id] = {
       ...(id === 'claude' && r.advisor !== undefined ? { advisor: r.advisor } : {}),
+      // Exactly `true` turns it on; anything else is the default (off) — never a string "yes".
+      ...(r.web === true ? { web: true } : {}),
       cmd: str(r.cmd, VOICE_DEFAULTS[id].cmd),
       effort: str(r.effort, VOICE_DEFAULTS[id].effort),
       id,

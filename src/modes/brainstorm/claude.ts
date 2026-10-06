@@ -57,8 +57,21 @@ const CLAUDE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 // Claude the same read-only guarantee codex (`-s read-only`) and grok (OS sandbox)
 // carry. Honors the voice config's model/effort/advisor so a CONFIGURED Claude model
 // actually runs (not merely printed in progress). Encoded as DATA so a unit test pins it.
+// The web research tool set and its turn cap (`web: true` on the voice). `--tools` makes the two
+// tools AVAILABLE and `--allowedTools` PRE-APPROVES them: a headless `-p` spawn silently denies a
+// permission-gated tool (measured 2026-10-06 — with `--tools` alone the voice reported "the
+// WebFetch permission was denied"). `--max-turns` bounds the research loop so a voice cannot
+// browse for an hour on a vendor window. WebSearch runs vendor-side; WebFetch is the local CLI
+// fetching an arbitrary URL — the exfiltration channel the review fence exists to close — which
+// is why this stays a per-voice opt-in and the review reviewer never gets it.
+export const CLAUDE_WEB_TOOLS = 'WebSearch,WebFetch';
+export const CLAUDE_WEB_MAX_TURNS = 25;
+
 export function buildClaudeVoiceArgs(prompt: string, config?: VoiceConfig): string[] {
-  const args = ['-p', prompt, '--output-format', 'text', '--tools', ''];
+  const args = ['-p', prompt, '--output-format', 'text'];
+  if (config?.web === true)
+    args.push('--tools', CLAUDE_WEB_TOOLS, '--allowedTools', CLAUDE_WEB_TOOLS, '--max-turns', String(CLAUDE_WEB_MAX_TURNS));
+  else args.push('--tools', '');
   if (config?.model && config.model !== 'default') args.push('--model', config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort)) args.push('--effort', config.effort);
   args.push(...claudeAdvisorArgs(config));

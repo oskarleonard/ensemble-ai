@@ -35,6 +35,12 @@ describe('parseVoices', () => {
     expect(out.grok.model).toBe(VOICE_DEFAULTS.grok.model); // junk ignored
     expect(out.grok.sandbox).toBe('ensemble-review'); // preserved
   });
+  it('carries `web: true` only when the file says exactly that (2026-10-06)', () => {
+    const out = parseVoices({ claude: { web: true }, codex: { web: 'yes' }, grok: { web: 1 } });
+    expect(out.claude.web).toBe(true);
+    expect(out.codex.web).toBeUndefined();
+    expect(out.grok.web).toBeUndefined();
+  });
   it('returns the baked defaults for a non-object', () => {
     expect(parseVoices(null)).toEqual(VOICE_DEFAULTS);
     expect(parseVoices('nope')).toEqual(VOICE_DEFAULTS);

@@ -2208,8 +2208,13 @@ function claudeAdvisorEnv(config) {
   return advisor === ADVISOR_OFF ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: "1" } : {};
 }
 var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
+var CLAUDE_WEB_TOOLS = "WebSearch,WebFetch";
+var CLAUDE_WEB_MAX_TURNS = 25;
 function buildClaudeVoiceArgs(prompt, config) {
-  const args = ["-p", prompt, "--output-format", "text", "--tools", ""];
+  const args = ["-p", prompt, "--output-format", "text"];
+  if (config?.web === true)
+    args.push("--tools", CLAUDE_WEB_TOOLS, "--allowedTools", CLAUDE_WEB_TOOLS, "--max-turns", String(CLAUDE_WEB_MAX_TURNS));
+  else args.push("--tools", "");
   if (config?.model && config.model !== "default") args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
   args.push(...claudeAdvisorArgs(config));
@@ -2288,6 +2293,8 @@ function parseVoices(raw) {
     const sandbox = str3(r.sandbox, VOICE_DEFAULTS[id].sandbox ?? "");
     out[id] = {
       ...id === "claude" && r.advisor !== void 0 ? { advisor: r.advisor } : {},
+      // Exactly `true` turns it on; anything else is the default (off) — never a string "yes".
+      ...r.web === true ? { web: true } : {},
       cmd: str3(r.cmd, VOICE_DEFAULTS[id].cmd),
       effort: str3(r.effort, VOICE_DEFAULTS[id].effort),
       id,
@@ -2317,7 +2324,7 @@ function listVoices(file = VOICES_FILE) {
 var DEFAULT_VOICE_TIMEOUT_MS = 3e5;
 async function runGenerate(voiceId, adapters, configs, prompt, timeoutMs, log) {
   const config = configs[voiceId];
-  log(`  \xB7 ${voiceId} (${config.vendor} \xB7 ${config.model}) generating\u2026`);
+  log(`  \xB7 ${voiceId} (${config.vendor} \xB7 ${config.model}${config.web ? " \xB7 web" : ""}) generating\u2026`);
   let res;
   try {
     res = await adapters[voiceId](prompt, config, { timeoutMs });
@@ -5152,7 +5159,7 @@ REAL divergence (a substantive split, not wording). Empty arrays are fine.
 var DEFAULT_VOICE_TIMEOUT_MS2 = 3e5;
 async function runAnswer(voiceId, adapters, configs, prompt, timeoutMs, log) {
   const config = configs[voiceId];
-  log(`  \xB7 ${voiceId} (${config.vendor} \xB7 ${config.model}) answering\u2026`);
+  log(`  \xB7 ${voiceId} (${config.vendor} \xB7 ${config.model}${config.web ? " \xB7 web" : ""}) answering\u2026`);
   let res;
   try {
     res = await adapters[voiceId](prompt, config, { timeoutMs });
@@ -10225,8 +10232,9 @@ function offSeatsOf(config, enabled) {
 }
 function agentLine(c, off) {
   const sandbox = c.sandbox ? ` \xB7 sandbox ${c.sandbox}` : "";
+  const web = "web" in c && c.web === true ? " \xB7 web" : "";
   const offNote = off ? off.until ? ` \xB7 OFF until ${off.until}` : " \xB7 OFF (enabled: false)" : "";
-  return `    ${c.id.padEnd(7)} ${c.vendor} \xB7 ${c.model} @ ${c.effort}${advisorNote(c.advisor)}${sandbox}${offNote}`;
+  return `    ${c.id.padEnd(7)} ${c.vendor} \xB7 ${c.model} @ ${c.effort}${advisorNote(c.advisor)}${web}${sandbox}${offNote}`;
 }
 function advisorNote(advisor) {
   if (advisor === void 0) return "";

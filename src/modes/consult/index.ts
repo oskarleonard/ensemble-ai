@@ -63,7 +63,7 @@ async function runAnswer(
   log: (m: string) => void
 ): Promise<VoiceAnswerResult> {
   const config = configs[voiceId];
-  log(`  · ${voiceId} (${config.vendor} · ${config.model}) answering…`);
+  log(`  · ${voiceId} (${config.vendor} · ${config.model}${config.web ? ' · web' : ''}) answering…`);
   let res: VoiceRunResult;
   try {
     res = await adapters[voiceId](prompt, config, { timeoutMs });
