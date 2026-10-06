@@ -78,8 +78,10 @@ export const VOICE_ADAPTERS: Record<
   ) => Promise<VoiceRunResult>
 > = {
   claude: (p, c, o) => runClaudeVoice(p, c, o),
-  codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), o),
-  grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), o),
+  // `web: true` on a cross-vendor voice = the vendor's own search tool (RunReviewOpts.web); it
+  // rides the per-call opts so a ReviewerConfig never carries it and the review seats never see it.
+  codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), { ...o, ...(c.web ? { web: true } : {}) }),
+  grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), { ...o, ...(c.web ? { web: true } : {}) }),
 };
 
 export const VOICES_FILE =
