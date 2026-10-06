@@ -10,6 +10,9 @@ import type { VoiceAnswerResult, VoiceConfig, VoiceId } from './types';
 type Reply = {
   answer?: string;
   critique?: string;
+  // A debate reply may depend on the round — a function gets the prompt.
+  debate?: string | ((prompt: string) => string);
+  judge?: string;
   synthesis?: string;
   fail?: 'throw' | 'null' | 'timeout';
 };
@@ -18,9 +21,11 @@ function ok(raw: string): VoiceRunResult {
   return { ok: true, raw, stderrTail: '', timedOut: false };
 }
 
-function roundOf(prompt: string): 'answer' | 'critique' | 'synthesis' {
+function roundOf(prompt: string): 'answer' | 'critique' | 'synthesis' | 'debate' | 'judge' {
   if (prompt.includes('SYNTHESIZER')) return 'synthesis';
   if (prompt.includes('candid participant')) return 'critique';
+  if (prompt.includes('You are the JUDGE')) return 'judge';
+  if (prompt.includes('evidence DEBATE')) return 'debate';
   return 'answer';
 }
 
@@ -35,7 +40,8 @@ function makeAdapters(
       if (r.fail === 'throw') throw new Error('boom');
       if (r.fail === 'null') return { ok: false, raw: null, stderrTail: '', timedOut: false };
       if (r.fail === 'timeout') return { ok: false, raw: 'partial', stderrTail: '', timedOut: true };
-      const raw = r[roundOf(prompt)];
+      const pick = r[roundOf(prompt)];
+      const raw = typeof pick === 'function' ? pick(prompt) : pick;
       if (raw === undefined) return { ok: false, raw: null, stderrTail: '', timedOut: false };
       return ok(raw);
     };
@@ -230,5 +236,107 @@ describe('fallbackSynthesis', () => {
     const s = fallbackSynthesis([]);
     expect(s.divergences).toEqual([]);
     expect(s.summary).toContain('No answers');
+  });
+});
+
+// ── --debate: argue the splits with evidence, then a judge rules ──────────────
+const SYNTH2 =
+  '{"summary":"headline","agreements":[{"point":"use X","voices":["codex","claude"]}],"divergences":[{"point":"how long","positions":["codex: 15","claude: 13"]},{"point":"key","positions":["codex: contract","claude: symbol"]}],"recommendation":"draft"}';
+const ev = (src: string) => `[{"source":"${src}","quote":"q","bearing":"b"}]`;
+const debateReply = (s1: string, s2: string) => `{"splits":[${s1},${s2}]}`;
+const JUDGE =
+  '{"summary":"after debate","rulings":[{"splitId":"split-1","outcome":"settled","direction":"claude: 13","why":"spec","evidenceCited":["claude: doc §1"]},{"splitId":"split-2","outcome":"converged","direction":"contract","why":"claude conceded","evidenceCited":["codex: doc §3"]}],"recommendation":"Final.\n\n1. do\n\nSure."}';
+
+describe('runConsultMode — --debate', () => {
+  it('runs rounds only while evidence is on the table, closes a conceded split, then the judge rules', async () => {
+    const calls: Array<{ prompt: string; voiceId: VoiceId }> = [];
+    const adapters = makeAdapters(
+      {
+        claude: {
+          answer: ANS('c'),
+          // round 1: holds split-1 with evidence, concedes split-2 (grounded)
+          debate: (p) =>
+            p.includes('Round 1 of')
+              ? debateReply(
+                  `{"id":"split-1","position":"13","stance":"hold","evidence":${ev('doc §1')},"rebuttal":"r"}`,
+                  `{"id":"split-2","position":"contract","stance":"concede","evidence":[],"rebuttal":"ok","movedBecause":"their §3 quote"}`
+                )
+              : debateReply(`{"id":"split-1","position":"13","stance":"hold","evidence":${ev('web https://x')},"rebuttal":"still"}`, '{"id":"split-2","position":"n/a","stance":"hold","evidence":[],"rebuttal":""}'),
+          judge: JUDGE,
+          synthesis: SYNTH2,
+        },
+        codex: {
+          answer: ANS('x'),
+          debate: (p) =>
+            p.includes('Round 1 of')
+              ? debateReply(`{"id":"split-1","position":"15","stance":"hold","evidence":[],"rebuttal":"r"}`, `{"id":"split-2","position":"contract","stance":"hold","evidence":${ev('doc §3')},"rebuttal":"r"}`)
+              : debateReply(`{"id":"split-1","position":"15","stance":"hold","evidence":[],"rebuttal":"r"}`, '{"id":"split-2","position":"n/a","stance":"hold","evidence":[],"rebuttal":""}'),
+        },
+      },
+      calls
+    );
+    const r = await runConsultMode({
+      adapters,
+      debate: { judge: 'claude', judgeConfig: { ...VOICE_DEFAULTS.claude, model: 'other-model' }, rounds: 3 },
+      question: 'Q?',
+      voiceConfigs: VOICE_DEFAULTS,
+      voices: ['codex', 'claude'],
+    });
+    expect(r.debate).toBeDefined();
+    const d = r.debate!;
+    expect(d.splits.map((s) => s.id)).toEqual(['split-1', 'split-2']);
+    // round 1 argued both; split-2 closed (conceded), split-1 stayed open (evidence, both hold);
+    // round 2 brought evidence again (claude's web source) with both holding → a third round
+    // for split-1 alone, the cap.
+    expect(d.rounds.map((x) => x.splitIds)).toEqual([['split-1', 'split-2'], ['split-1'], ['split-1']]);
+    // the judge ran once, through claude, on a different model → independent
+    const judgeCalls = calls.filter((c) => c.prompt.includes('You are the JUDGE'));
+    expect(judgeCalls.length).toBe(1);
+    expect(d.judge).toMatchObject({ independent: true, model: 'other-model', ok: true, voiceId: 'claude' });
+    expect(d.rulings.map((x) => [x.splitId, x.outcome])).toEqual([
+      ['split-1', 'settled'],
+      ['split-2', 'converged'],
+    ]);
+    expect(d.recommendation).toContain('1. do');
+    // the synthesizer's draft stays on the synthesis
+    expect(r.synthesis.recommendation).toBe('draft');
+    // the judge prompt carried every round for split-1
+    expect(judgeCalls[0].prompt).toContain('round 3, claude');
+  });
+
+  it('stops after one round when nobody brings evidence, and flags a judge that argued a side', async () => {
+    const calls: Array<{ prompt: string; voiceId: VoiceId }> = [];
+    const noEvidence = debateReply(
+      '{"id":"split-1","position":"a","stance":"hold","evidence":[],"rebuttal":"r"}',
+      '{"id":"split-2","position":"b","stance":"hold","evidence":[],"rebuttal":"r"}'
+    );
+    const adapters = makeAdapters(
+      {
+        claude: { answer: ANS('c'), debate: noEvidence, judge: JUDGE, synthesis: SYNTH2 },
+        codex: { answer: ANS('x'), debate: noEvidence },
+      },
+      calls
+    );
+    const r = await runConsultMode({ adapters, debate: { rounds: 2 }, question: 'Q?', voiceConfigs: VOICE_DEFAULTS, voices: ['codex', 'claude'] });
+    expect(r.debate!.rounds.length).toBe(1);
+    // default judge = the synthesizer (claude) on its own model → NOT independent, and said so
+    expect(r.debate!.judge).toMatchObject({ independent: false, voiceId: 'claude' });
+  });
+
+  it('skips the debate with no divergence, and survives a failed judge', async () => {
+    const calls: Array<{ prompt: string; voiceId: VoiceId }> = [];
+    const noSplit = '{"summary":"h","agreements":[{"point":"p","voices":["codex","claude"]}],"divergences":[],"recommendation":"r"}';
+    const a1 = makeAdapters({ claude: { answer: ANS('c'), synthesis: noSplit }, codex: { answer: ANS('x') } }, calls);
+    const r1 = await runConsultMode({ adapters: a1, debate: { rounds: 2 }, question: 'Q?', voiceConfigs: VOICE_DEFAULTS, voices: ['codex', 'claude'] });
+    expect(r1.debate).toBeUndefined();
+    expect(calls.some((c) => c.prompt.includes('evidence DEBATE'))).toBe(false);
+
+    const ev1 = debateReply(`{"id":"split-1","position":"a","stance":"hold","evidence":${ev('doc §1')},"rebuttal":"r"}`, '{"id":"split-2","position":"b","stance":"hold","evidence":[],"rebuttal":"r"}');
+    const a2 = makeAdapters({ claude: { answer: ANS('c'), debate: ev1, synthesis: SYNTH2 }, codex: { answer: ANS('x'), debate: ev1 } }, []);
+    const r2 = await runConsultMode({ adapters: a2, debate: { rounds: 1 }, question: 'Q?', voiceConfigs: VOICE_DEFAULTS, voices: ['codex', 'claude'] });
+    expect(r2.debate!.judge.ok).toBe(false);
+    expect(r2.debate!.rulings).toEqual([]);
+    expect(r2.debate!.recommendation).toBe('');
+    expect(r2.debate!.rounds.length).toBe(1);
   });
 });

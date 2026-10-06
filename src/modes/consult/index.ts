@@ -5,6 +5,15 @@ import {
   type VoiceRunResult,
 } from '../brainstorm/voices';
 
+import {
+  parseDebateReply,
+  parseJudgeReply,
+  renderDebatePrompt,
+  renderJudgePrompt,
+  rulingsTally,
+  splitsFromSynthesis,
+  splitsStillOpen,
+} from './debate';
 import { parseAnswer, parseConsultSynthesis, parseCritique } from './parse';
 import {
   renderAnswerPrompt,
@@ -14,6 +23,10 @@ import {
 import {
   type ConsultResult,
   type ConsultSynthesis,
+  type DebateResult,
+  type DebateRound,
+  type DebateSplit,
+  type DebateVoiceRound,
   type VoiceAnswerResult,
   type VoiceConfig,
   type VoiceCritiqueResult,
@@ -35,9 +48,26 @@ type Adapters = Record<
   ) => Promise<VoiceRunResult>
 >;
 
+// The debate after the synthesis: how many evidence rounds at most (a split stops early once a
+// voice moves or nobody brings new evidence), and who judges. The judge is a voice id plus an
+// optional model/effort override — the seat that rules should not be the one that argued, so
+// a caller normally pins a different model (voices.json `judge`, or --judge). Absent config =
+// that voice's own config, which the result then flags as NOT independent.
+export interface DebateOptions {
+  judge?: VoiceId;
+  judgeConfig?: VoiceConfig;
+  rounds: number;
+}
+
+export const DEFAULT_DEBATE_ROUNDS = 2;
+export const MAX_DEBATE_ROUNDS = 4;
+
 export interface ConsultOptions {
   // Injectable for tests — the real adapters spawn vendor CLIs.
   adapters?: Adapters;
+  // Argue the divergences with evidence after the synthesis, then have a judge rule (off by
+  // default; needs ≥2 healthy voices and ≥1 divergence to run at all).
+  debate?: DebateOptions;
   // Enable the optional round-2 cross-critique (default: false — consult is
   // answer→synthesize; the critique round is opt-in).
   critique?: boolean;
@@ -198,6 +228,153 @@ async function runSynthesis(
   };
 }
 
+// ── Rounds 4+: argue the splits with evidence, then an independent judge rules ─
+async function runDebateVoice(
+  voiceId: VoiceId,
+  adapters: Adapters,
+  configs: Record<VoiceId, VoiceConfig>,
+  prompt: string,
+  splitIds: readonly string[],
+  timeoutMs: number,
+  log: (m: string) => void
+): Promise<DebateVoiceRound> {
+  let res: VoiceRunResult;
+  try {
+    res = await adapters[voiceId](prompt, configs[voiceId], { timeoutMs });
+  } catch (e) {
+    log(`  · ${voiceId}: failed to run — ${(e as Error).message}`);
+    return { entries: [], error: (e as Error).message, ok: false, raw: null, voiceId };
+  }
+  if (!res.raw || res.timedOut) {
+    const error = res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output');
+    log(`  · ${voiceId}: ${error}`);
+    return { entries: [], error, ok: false, raw: res.raw, timedOut: res.timedOut, voiceId };
+  }
+  const parsed = parseDebateReply(res.raw, splitIds);
+  if (parsed.parseError) {
+    log(`  · ${voiceId}: ${parsed.parseError}`);
+    return { entries: [], error: parsed.parseError, ok: false, raw: res.raw, voiceId };
+  }
+  const moved = parsed.entries.filter((e) => e.stance !== 'hold').length;
+  const evidence = parsed.entries.reduce((n, e) => n + e.evidence.length, 0);
+  log(
+    `  · ${voiceId}: ${parsed.entries.length} position(s), ${evidence} evidence item(s), moved on ${moved}${
+      parsed.downgraded.length ? ` (${parsed.downgraded.length} ungrounded move(s) held)` : ''
+    }`
+  );
+  return { entries: parsed.entries, ok: true, raw: res.raw, voiceId };
+}
+
+// A judge is independent when its (voice, model) is not one that argued a side: a different
+// model of the same vendor counts — the identical model that argued does not.
+export function judgeIsIndependent(
+  judgeId: VoiceId,
+  judgeModel: string,
+  participants: readonly VoiceId[],
+  configs: Record<VoiceId, VoiceConfig>
+): boolean {
+  return !participants.some((id) => id === judgeId && configs[id].model === judgeModel);
+}
+
+async function runDebate(
+  opts: ConsultOptions,
+  debate: DebateOptions,
+  adapters: Adapters,
+  configs: Record<VoiceId, VoiceConfig>,
+  answers: VoiceAnswerResult[],
+  participants: VoiceId[],
+  synthesis: ConsultSynthesis,
+  timeoutMs: number,
+  log: (m: string) => void
+): Promise<DebateResult | undefined> {
+  const splits: DebateSplit[] = splitsFromSynthesis(synthesis);
+  if (synthesis.degraded) {
+    log('Debate · skipped — the synthesis is the deterministic fallback (no divergences were judged)');
+    return undefined;
+  }
+  if (splits.length === 0) {
+    log('Debate · skipped — no divergence to argue');
+    return undefined;
+  }
+  if (participants.length < 2) {
+    log(`Debate · skipped — need ≥2 voices with answers (have ${participants.length})`);
+    return undefined;
+  }
+  const maxRounds = Math.max(1, Math.min(MAX_DEBATE_ROUNDS, Math.floor(debate.rounds)));
+  const rounds: DebateRound[] = [];
+  let open = splits.map((s) => s.id);
+  for (let round = 1; round <= maxRounds && open.length > 0; round++) {
+    log(`Round ${3 + round} · debate ${round}/${maxRounds} — ${open.length} split(s), ${participants.length} voice(s)`);
+    const argued = splits.filter((s) => open.includes(s.id));
+    const voices = await Promise.all(
+      participants.map((id) =>
+        runDebateVoice(
+          id,
+          adapters,
+          configs,
+          renderDebatePrompt({
+            fileContext: opts.fileContext,
+            maxRounds,
+            own: answers.find((a) => a.voiceId === id),
+            prior: rounds,
+            question: opts.question,
+            round,
+            splits: argued,
+            voiceId: id,
+          }),
+          open,
+          timeoutMs,
+          log
+        )
+      )
+    );
+    const r: DebateRound = { round, splitIds: open, voices };
+    rounds.push(r);
+    if (voices.filter((v) => v.ok).length < 2) {
+      log('  · fewer than two voices argued — no further round');
+      break;
+    }
+    const next = splitsStillOpen(r, open);
+    log(`  · ${open.length - next.length} split(s) closed this round, ${next.length} still open`);
+    open = next;
+  }
+
+  const judgeId = debate.judge ?? pickSynthesizer(participants, undefined, answers) ?? participants[0];
+  const judgeCfg = debate.judgeConfig ?? configs[judgeId];
+  const independent = judgeIsIndependent(judgeId, judgeCfg.model, participants, configs);
+  const judgeBase = { effort: judgeCfg.effort, independent, model: judgeCfg.model, voiceId: judgeId };
+  log(
+    `Judge · ${judgeId} (${judgeCfg.vendor} · ${judgeCfg.model}@${judgeCfg.effort}${independent ? ' · independent' : ' · ALSO ARGUED A SIDE'}) ruling on ${splits.length} split(s)…`
+  );
+  const prompt = renderJudgePrompt({ draft: synthesis, fileContext: opts.fileContext, question: opts.question, rounds, splits });
+  let res: VoiceRunResult;
+  try {
+    res = await adapters[judgeId](prompt, judgeCfg, { timeoutMs });
+  } catch (e) {
+    log(`  · judge failed to run — ${(e as Error).message}`);
+    return { judge: { ...judgeBase, error: (e as Error).message, ok: false, raw: null }, recommendation: '', rounds, rulings: [], splits, summary: '' };
+  }
+  if (!res.raw || res.timedOut) {
+    const error = res.failWhy ?? (res.timedOut ? 'judge timed out' : 'judge produced no output');
+    log(`  · ${error}`);
+    return { judge: { ...judgeBase, error, ok: false, raw: res.raw }, recommendation: '', rounds, rulings: [], splits, summary: '' };
+  }
+  const parsed = parseJudgeReply(res.raw, splits.map((s) => s.id));
+  if (parsed.parseError) {
+    log(`  · judge output not parseable — ${parsed.parseError}`);
+    return { judge: { ...judgeBase, error: parsed.parseError, ok: false, raw: res.raw }, recommendation: '', rounds, rulings: [], splits, summary: '' };
+  }
+  log(`  · rulings: ${rulingsTally(parsed.rulings) || 'none'}${parsed.rulings.length < splits.length ? ` (${splits.length - parsed.rulings.length} split(s) left unruled)` : ''}`);
+  return {
+    judge: { ...judgeBase, ok: true, raw: res.raw },
+    recommendation: parsed.recommendation,
+    rounds,
+    rulings: parsed.rulings,
+    splits,
+    summary: parsed.summary,
+  };
+}
+
 // Pick the synthesizer: an explicit request that's in the roster wins; else prefer
 // Claude if it answered healthily (the natural synthesizer voice); else the first
 // healthy answerer; else null (→ deterministic fallback). Mirrors brainstorm.
@@ -226,6 +403,9 @@ export async function runConsultMode(opts: ConsultOptions): Promise<ConsultResul
   // The roster's advisors, checked before Round 1 spawns anything: an invalid one on a voice this
   // run uses refuses the whole run; a voice outside the roster is never read.
   assertRosterAdvisors(roster, configs, opts.voiceConfigs ? undefined : 'voices.json');
+  // The judge's seat is checked the same way, up front — it may spawn a claude the roster does not.
+  if (opts.debate?.judge && !roster.includes(opts.debate.judge))
+    assertRosterAdvisors([opts.debate.judge], opts.debate.judgeConfig ? { ...configs, [opts.debate.judge]: opts.debate.judgeConfig } : configs, opts.voiceConfigs ? undefined : 'voices.json');
   const timeoutMs = opts.timeoutMs ?? DEFAULT_VOICE_TIMEOUT_MS;
 
   // Round 1 — independent answers (parallel; one voice's failure is isolated).
@@ -263,5 +443,10 @@ export async function runConsultMode(opts: ConsultOptions): Promise<ConsultResul
     log
   );
 
-  return { answers, critique, question: opts.question, roster, synthesis };
+  // Rounds 4+ — optional: argue the divergences with evidence, then a judge rules.
+  const debate = opts.debate
+    ? await runDebate(opts, opts.debate, adapters, configs, answers, participants, synthesis, timeoutMs, log)
+    : undefined;
+
+  return { answers, critique, ...(debate ? { debate } : {}), question: opts.question, roster, synthesis };
 }

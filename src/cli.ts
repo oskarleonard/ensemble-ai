@@ -31,7 +31,7 @@ import {
   type StoredReview,
 } from './core/types';
 import { runBrainstormMode } from './modes/brainstorm';
-import { listVoices, VOICES_FILE } from './modes/brainstorm/voices';
+import { judgeConfig, listVoices, loadJudge, loadVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
   probeSeatLabel,
   probeSeatRecord,
@@ -50,7 +50,12 @@ import {
   type ResolvedVoiceConfig,
   type VoiceId,
 } from './modes/brainstorm/types';
-import { runConsultMode } from './modes/consult';
+import {
+  DEFAULT_DEBATE_ROUNDS,
+  type DebateOptions,
+  MAX_DEBATE_ROUNDS,
+  runConsultMode,
+} from './modes/consult';
 import type { ConsultResult } from './modes/consult/types';
 import { isImplemented, isMode, resolveMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
@@ -2346,6 +2351,16 @@ Options:
                         answers before synthesis (default: off — answer→synthesize)
   --voices <ids>        comma-separated voice ids (default: codex,grok,claude)
   --synthesizer <id>    which voice runs the synthesis (default: claude if present)
+  --debate              after the synthesis, the voices argue each DIVERGENCE with
+                        evidence (doc quotes, web sources) — a voice may move only by
+                        naming what moved it; a split stops once someone moves or no
+                        new evidence comes — then a JUDGE that took no part rules each
+                        split: settled / converged / judgement call / unverified, and
+                        writes the final recommendation (default: off)
+  --debate-rounds <n>   at most n evidence rounds (default 2, max 4)
+  --judge <id>          the voice the judge runs through (default: the synthesizer's);
+                        voices.json "judge": {voice, model, effort} pins its model so the
+                        seat that rules is not the model that argued
   --timeout <seconds>   per-voice timeout (default 300)
   --voices-file <path>  voices config json (default ~/.ensemble-ai/voices.json)
   --json                print the full result as JSON instead of formatted text
@@ -2414,8 +2429,41 @@ function printConsult(r: ConsultResult): void {
   }
   if (s.recommendation) {
     out.push('');
-    out.push('  → Recommendation');
+    out.push(r.debate?.recommendation ? '  → Draft recommendation (before the debate)' : '  → Recommendation');
     out.push(`     ${clean(s.recommendation).slice(0, 500)}`);
+  }
+  const d = r.debate;
+  if (d) {
+    out.push('');
+    const j = d.judge;
+    out.push(
+      `Debate — ${d.rounds.length} round(s) on ${d.splits.length} split(s) · judge ${j.voiceId} ${j.model}@${j.effort}${j.independent ? ' (independent)' : ' (ALSO ARGUED A SIDE)'}${j.ok ? '' : ` — ${clean(j.error ?? 'failed').slice(0, 120)}`}`
+    );
+    if (d.summary) out.push(`  ${clean(d.summary).slice(0, 400)}`);
+    for (const sp of d.splits) {
+      const ruling = d.rulings.find((x) => x.splitId === sp.id);
+      out.push('');
+      out.push(`  • ${clean(sp.point).slice(0, 300)}`);
+      for (const rd of d.rounds) {
+        for (const v of rd.voices) {
+          const e = v.entries.find((x) => x.splitId === sp.id);
+          if (e) out.push(`      r${rd.round} ${v.voiceId} [${e.stance}] ${clean(e.position).slice(0, 200)} · ${e.evidence.length} evidence`);
+        }
+      }
+      if (ruling) {
+        out.push(`      ⇒ ${ruling.outcome.toUpperCase()}: ${clean(ruling.direction).slice(0, 300)}`);
+        if (ruling.why) out.push(`        ${clean(ruling.why).slice(0, 300)}`);
+        if (ruling.whatWouldSettle) out.push(`        would settle it: ${clean(ruling.whatWouldSettle).slice(0, 200)}`);
+        if (ruling.defaultIfUndecided) out.push(`        default: ${clean(ruling.defaultIfUndecided).slice(0, 200)}`);
+      } else {
+        out.push('      ⇒ (no ruling)');
+      }
+    }
+    if (d.recommendation) {
+      out.push('');
+      out.push('  → Final recommendation (judge)');
+      out.push(`     ${clean(d.recommendation).slice(0, 800)}`);
+    }
   }
   out.push('');
   console.log(out.join('\n'));
@@ -2430,9 +2478,12 @@ async function consultCommand(args: string[]): Promise<number> {
       options: {
         critique: { type: 'boolean' },
         cwd: { type: 'string' },
+        debate: { type: 'boolean' },
+        'debate-rounds': { type: 'string' },
         file: { type: 'string' },
         help: { short: 'h', type: 'boolean' },
         json: { type: 'boolean' },
+        judge: { type: 'string' },
         synthesizer: { type: 'string' },
         timeout: { type: 'string' },
         voices: { type: 'string' },
@@ -2535,10 +2586,42 @@ async function consultCommand(args: string[]): Promise<number> {
     }
   }
 
+  // --debate: rounds in 1..MAX; --judge must be a known voice (it need not be in the roster —
+  // the point is a seat that did not argue). The judge's model/effort come from voices.json
+  // `judge` (voice/model/effort), with --judge overriding the voice id. Fail closed on bad values.
+  let debate: DebateOptions | undefined;
+  if (values.debate || typeof values['debate-rounds'] === 'string' || typeof values.judge === 'string') {
+    let rounds = DEFAULT_DEBATE_ROUNDS;
+    if (typeof values['debate-rounds'] === 'string') {
+      const n = Number(values['debate-rounds']);
+      if (!Number.isInteger(n) || n < 1 || n > MAX_DEBATE_ROUNDS) {
+        console.error(`ensemble-ai consult: --debate-rounds must be an integer from 1 to ${MAX_DEBATE_ROUNDS}`);
+        return 3;
+      }
+      rounds = n;
+    }
+    const voicesFile = typeof values['voices-file'] === 'string' ? values['voices-file'] : undefined;
+    const spec = loadJudge(voicesFile);
+    let judge: VoiceId | undefined = spec.voice;
+    if (typeof values.judge === 'string') {
+      if (!isVoiceId(values.judge)) {
+        console.error(`ensemble-ai consult: --judge "${values.judge}" is not a known voice (known: ${VOICE_IDS.join(', ')})`);
+        return 3;
+      }
+      judge = values.judge;
+    }
+    const configs = loadVoices(voicesFile);
+    debate = {
+      rounds,
+      ...(judge ? { judge, judgeConfig: judgeConfig(spec, judge, configs) } : {}),
+    };
+  }
+
   let result: ConsultResult;
   try {
     result = await runConsultMode({
       critique: Boolean(values.critique),
+      ...(debate ? { debate } : {}),
       fileContext,
       onProgress: (m) => console.error(`· ${m}`),
       question,

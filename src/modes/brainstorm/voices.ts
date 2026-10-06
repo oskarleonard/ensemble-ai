@@ -124,6 +124,46 @@ export function parseVoices(raw: unknown): Record<VoiceId, VoiceConfig> {
   return out;
 }
 
+// The JUDGE seat for `consult --debate` — voices.json `judge`: { "voice": "claude", "model":
+// "…", "effort": "…" }. A voice id to spawn through, with the model/effort the ruling runs at,
+// over that voice's own cmd/vendor/sandbox/advisor. The point of the override: the seat that
+// rules should not be the model that argued a side. Absent or malformed = the voice's own
+// config (the run then reports the judge as not independent). NEVER throws.
+export interface JudgeSpec {
+  effort?: string;
+  model?: string;
+  voice?: VoiceId;
+}
+
+export function parseJudge(raw: unknown): JudgeSpec {
+  if (!raw || typeof raw !== 'object') return {};
+  const j = (raw as Record<string, unknown>).judge;
+  if (!j || typeof j !== 'object') return {};
+  const r = j as Record<string, unknown>;
+  const voice = typeof r.voice === 'string' && (VOICE_IDS as readonly string[]).includes(r.voice) ? (r.voice as VoiceId) : undefined;
+  const model = typeof r.model === 'string' && r.model.trim() ? r.model.trim() : undefined;
+  const effort = typeof r.effort === 'string' && r.effort.trim() ? r.effort.trim() : undefined;
+  return { ...(voice ? { voice } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+}
+
+export function loadJudge(file: string = VOICES_FILE): JudgeSpec {
+  try {
+    return parseJudge(JSON.parse(fs.readFileSync(file, 'utf8')));
+  } catch {
+    return {};
+  }
+}
+
+// The judge's VoiceConfig: the chosen voice's config with the spec's model/effort over it.
+export function judgeConfig(
+  spec: JudgeSpec,
+  voiceId: VoiceId,
+  configs: Record<VoiceId, VoiceConfig>
+): VoiceConfig {
+  const base = configs[voiceId];
+  return { ...base, ...(spec.model ? { model: spec.model } : {}), ...(spec.effort ? { effort: spec.effort } : {}) };
+}
+
 export function loadVoices(
   file: string = VOICES_FILE
 ): Record<VoiceId, VoiceConfig> {

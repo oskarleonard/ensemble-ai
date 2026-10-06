@@ -4,14 +4,14 @@ import type { VoiceAnswerResult, VoiceCritiqueResult } from './types';
 // the voice may see and closes with a STRICT one-JSON-block output contract (the
 // reply is machine-read, not freeform prose). Same discipline as review/brainstorm.
 
-const JSON_RULE =
+export const JSON_RULE =
   'Respond with ONE fenced ```json block and NOTHING else, matching:';
 
 // Cap embedded file context so a huge file can't blow the prompt budget; the voice
 // sees the head, clearly marked as truncated.
 const FILE_CONTEXT_BUDGET = 24_000;
 
-function contextBlock(fileContext?: string): string {
+export function contextBlock(fileContext?: string): string {
   if (!fileContext || !fileContext.trim()) return '';
   const trimmed = fileContext.trimEnd();
   const body =
@@ -99,7 +99,7 @@ An empty "notes" array is fine if you have nothing to add.
 // CLI, so a verbose round could grow it past OS limits). Generous — a real answer is
 // a few hundred to low-thousands of chars.
 const SYNTHESIS_FIELD_BUDGET = 2500;
-function cap(s: string): string {
+export function cap(s: string): string {
   return s.length > SYNTHESIS_FIELD_BUDGET
     ? `${s.slice(0, SYNTHESIS_FIELD_BUDGET)}…[truncated]`
     : s;
