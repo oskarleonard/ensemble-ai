@@ -47,11 +47,12 @@ export interface VoiceConfig {
   model: string;
   sandbox?: string;
   vendor: string;
-  // WEB RESEARCH for the claude VOICE (brainstorm / consult only — the cold review reviewer never
-  // reads it): `true` opens WebSearch + WebFetch, pre-approved for the headless spawn, under a turn
-  // cap (buildClaudeVoiceArgs). Off by default: WebFetch is the local CLI fetching an arbitrary URL,
-  // so a prompt-injected topic or file can carry text out in a URL — a voice reads only the prompt
-  // and the shared file, which is why this is a per-voice choice and not a review-seat one.
+  // WEB for a VOICE (brainstorm / consult only — the review seats never read it). claude: WebSearch
+  // + WebFetch, pre-approved for the headless spawn, under a turn cap (buildClaudeVoiceArgs) — the
+  // fetch is the local CLI reaching an arbitrary URL, so a prompt-injected topic or file can carry
+  // text out in a URL; a voice reads only the prompt and the shared file, which is why this is a
+  // per-voice choice. codex / grok: the VENDOR's own search (`--search` / grok's `web_search`),
+  // executed behind the API host the fence already allows — no new local egress. Off by default.
   web?: boolean;
 }
 

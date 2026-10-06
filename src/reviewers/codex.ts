@@ -138,13 +138,17 @@ export interface CodexReviewResult {
 export function buildCodexReviewArgs(
   config: ReviewerConfig,
   outFile: string,
-  prompt: string
+  prompt: string,
+  opts: { web?: boolean } = {}
 ): string[] {
   return [
     'exec',
     '--skip-git-repo-check',
     '--ephemeral',
     '--json',
+    // Vendor-side live web search (RunReviewOpts.web — voices only): the Responses `web_search`
+    // tool, executed by the vendor, so `-s read-only` and the egress posture are untouched.
+    ...(opts.web ? ['--search'] : []),
     ...CODEX_SOURCE_FENCE_ARGS,
     '--color',
     'never',
@@ -177,6 +181,13 @@ export interface RunReviewOpts {
   // opts so seats extend through the one adapter contract (REVIEW_ADAPTERS), never a per-reviewer
   // intersection type. Only grok honors it today; codex needs its external wrapper first.
   worktree?: string;
+  // VENDOR-SIDE WEB SEARCH — set by the brainstorm / consult VOICES only (a `web: true` voice),
+  // never by the review pipeline. codex: `--search` (the native Responses `web_search` tool, run
+  // by the vendor behind api.openai.com — no new local egress). grok: `web_search` joins the tool
+  // allowlist and the fence expects it (`--disable-web-search` dropped); grok's search also runs
+  // through its chat proxy, and anything the CLI tried to fetch locally would still meet the
+  // egress fence. The review seats keep their fences exactly as before.
+  web?: boolean;
 }
 
 function reviewOutFile(): string {
@@ -353,7 +364,7 @@ export function runCodexReview(
   const outFile = reviewOutFile();
   return runReviewerExec({
     bin: resolveCodexBin(),
-    args: buildCodexReviewArgs(config, outFile, prompt),
+    args: buildCodexReviewArgs(config, outFile, prompt, { web: opts.web }),
     inactivityTimeoutMs: CODEX_INACTIVITY_TIMEOUT_MS,
     outFile,
     timeoutMs,

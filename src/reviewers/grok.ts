@@ -243,6 +243,13 @@ export const GROK_SANDBOX_PROFILE: SandboxProfileRef = {
 // nothing that writes (`write`, `search_replace`), nothing that reaches out (images, feedback).
 // Every one of the 52 stored seats before this fence used only these three.
 export const GROK_REVIEW_TOOLS = ['read_file', 'list_dir', 'grep'] as const;
+// The one tool grok announces with web search on (captured 2026-10-06 on grok 1.0.44: the init
+// line with `--disable-web-search` lists 25 tools, without it 26 — this one). A VOICE with
+// `web: true` (RunReviewOpts.web) adds it to the allowlist and the fence expects it; a review
+// seat never does.
+export const GROK_WEB_TOOL = 'web_search';
+export const grokAllowedTools = (web = false): readonly string[] =>
+  web ? [...GROK_REVIEW_TOOLS, GROK_WEB_TOOL] : [...GROK_REVIEW_TOOLS];
 // grok keeps its MCP meta-tools even under `--tools` ("MCP meta-tools remain available unless
 // denied") — removed explicitly. grok loads no MCP server (`grok mcp list` is empty), so they are
 // inert today; the fence below still refuses a seat that announces them.
@@ -267,7 +274,7 @@ export type GrokToolFence = { ok: true } | { ok: false; why: string };
 const TOOL_FENCE_PREFIX = 'ensemble-ai: grok tool fence —';
 
 // PURE: the verdict on the stream's FIRST line.
-export function grokToolFence(firstLine: string): GrokToolFence {
+export function grokToolFence(firstLine: string, opts: { web?: boolean } = {}): GrokToolFence {
   let obj: unknown;
   try {
     obj = JSON.parse(firstLine);
@@ -284,7 +291,7 @@ export function grokToolFence(firstLine: string): GrokToolFence {
       why: `${TOOL_FENCE_PREFIX} grok's first output line did not announce its tools, so they cannot be verified; refusing the seat`,
     };
   }
-  const allowed = new Set<string>(GROK_REVIEW_TOOLS);
+  const allowed = new Set<string>(grokAllowedTools(opts.web));
   const extra = o.tools.map(String).filter((tool) => !allowed.has(tool));
   if (extra.length > 0) {
     return {
@@ -317,7 +324,8 @@ const TOOL_FENCE_FIRST_LINE_LIMIT = 256_000;
 export function buildGrokReviewArgs(
   config: ReviewerConfig,
   prompt: string,
-  cwd: string
+  cwd: string,
+  opts: { web?: boolean } = {}
 ): string[] {
   return [
     '-p',
@@ -333,9 +341,11 @@ export function buildGrokReviewArgs(
     resolveReviewSandbox(config.sandbox),
     '--cwd',
     cwd,
-    '--disable-web-search',
+    // A voice with web search keeps grok's `web_search` (and the fence expects exactly that one
+    // extra name); every review seat still passes `--disable-web-search`.
+    ...(opts.web ? [] : ['--disable-web-search']),
     '--tools',
-    GROK_REVIEW_TOOLS.join(','),
+    grokAllowedTools(opts.web).join(','),
     '--disallowed-tools',
     GROK_DENIED_META_TOOLS.join(','),
     '--deny',
@@ -589,15 +599,15 @@ export async function runGrokReview(
       const nl = firstLine.indexOf('\n');
       if (nl === -1) {
         if (firstLine.length <= TOOL_FENCE_FIRST_LINE_LIMIT) return;
-        fence = grokToolFence(firstLine.slice(0, 200));
+        fence = grokToolFence(firstLine.slice(0, 200), { web: opts.web });
       } else {
-        fence = grokToolFence(firstLine.slice(0, nl));
+        fence = grokToolFence(firstLine.slice(0, nl), { web: opts.web });
       }
       firstLine = '';
       if (!fence.ok) seatKill?.();
     };
     const { raw, stderrTail, timedOut, timedOutReason } = await runReviewerExec({
-      args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
+      args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd, { web: opts.web }),
       bin,
       capture: 'stdout',
       onStdout,
@@ -616,7 +626,7 @@ export async function runGrokReview(
       timeoutMs: seatTimeoutMs,
     });
     // A stream that ended before its first newline (one line, or none) is judged on what it printed.
-    const verdict: GrokToolFence | null = fence ?? (raw ? grokToolFence(raw.split('\n')[0]) : null);
+    const verdict: GrokToolFence | null = fence ?? (raw ? grokToolFence(raw.split('\n')[0], { web: opts.web }) : null);
     if (verdict && !verdict.ok) {
       return {
         ...(proxy ? { egressDenials: [...proxy.denials] } : {}),

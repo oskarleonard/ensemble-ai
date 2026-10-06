@@ -2129,12 +2129,15 @@ function egressStartFailure(id, err) {
 var REVIEW_TIMEOUT_MS = 9e5;
 var CORE_WORKTREE_REVIEW_TIMEOUT_MS = 36e5;
 var CODEX_INACTIVITY_TIMEOUT_MS = 9e5;
-function buildCodexReviewArgs(config, outFile, prompt) {
+function buildCodexReviewArgs(config, outFile, prompt, opts = {}) {
   return [
     "exec",
     "--skip-git-repo-check",
     "--ephemeral",
     "--json",
+    // Vendor-side live web search (RunReviewOpts.web — voices only): the Responses `web_search`
+    // tool, executed by the vendor, so `-s read-only` and the egress posture are untouched.
+    ...opts.web ? ["--search"] : [],
     ...CODEX_SOURCE_FENCE_ARGS,
     "--color",
     "never",
@@ -2252,7 +2255,7 @@ function runCodexReview(prompt, config, opts = {}) {
   const outFile = reviewOutFile();
   return runReviewerExec({
     bin: resolveCodexBin(),
-    args: buildCodexReviewArgs(config, outFile, prompt),
+    args: buildCodexReviewArgs(config, outFile, prompt, { web: opts.web }),
     inactivityTimeoutMs: CODEX_INACTIVITY_TIMEOUT_MS,
     outFile,
     timeoutMs,
@@ -2478,10 +2481,12 @@ var GROK_SANDBOX_PROFILE = {
   version: 4
 };
 var GROK_REVIEW_TOOLS = ["read_file", "list_dir", "grep"];
+var GROK_WEB_TOOL = "web_search";
+var grokAllowedTools = (web = false) => web ? [...GROK_REVIEW_TOOLS, GROK_WEB_TOOL] : [...GROK_REVIEW_TOOLS];
 var GROK_DENIED_META_TOOLS = ["search_tool", "use_tool"];
 var GROK_SHELL_DENY_RULE = "Bash";
 var TOOL_FENCE_PREFIX = "ensemble-ai: grok tool fence \u2014";
-function grokToolFence(firstLine2) {
+function grokToolFence(firstLine2, opts = {}) {
   let obj;
   try {
     obj = JSON.parse(firstLine2);
@@ -2498,7 +2503,7 @@ function grokToolFence(firstLine2) {
       why: `${TOOL_FENCE_PREFIX} grok's first output line did not announce its tools, so they cannot be verified; refusing the seat`
     };
   }
-  const allowed = new Set(GROK_REVIEW_TOOLS);
+  const allowed = new Set(grokAllowedTools(opts.web));
   const extra = o.tools.map(String).filter((tool) => !allowed.has(tool));
   if (extra.length > 0) {
     return {
@@ -2509,7 +2514,7 @@ function grokToolFence(firstLine2) {
   return { ok: true };
 }
 var TOOL_FENCE_FIRST_LINE_LIMIT = 256e3;
-function buildGrokReviewArgs(config, prompt, cwd) {
+function buildGrokReviewArgs(config, prompt, cwd, opts = {}) {
   return [
     "-p",
     prompt,
@@ -2524,9 +2529,11 @@ function buildGrokReviewArgs(config, prompt, cwd) {
     resolveReviewSandbox(config.sandbox),
     "--cwd",
     cwd,
-    "--disable-web-search",
+    // A voice with web search keeps grok's `web_search` (and the fence expects exactly that one
+    // extra name); every review seat still passes `--disable-web-search`.
+    ...opts.web ? [] : ["--disable-web-search"],
     "--tools",
-    GROK_REVIEW_TOOLS.join(","),
+    grokAllowedTools(opts.web).join(","),
     "--disallowed-tools",
     GROK_DENIED_META_TOOLS.join(","),
     "--deny",
@@ -2635,15 +2642,15 @@ async function runGrokReview(prompt, config, opts = {}) {
       const nl = firstLine2.indexOf("\n");
       if (nl === -1) {
         if (firstLine2.length <= TOOL_FENCE_FIRST_LINE_LIMIT) return;
-        fence = grokToolFence(firstLine2.slice(0, 200));
+        fence = grokToolFence(firstLine2.slice(0, 200), { web: opts.web });
       } else {
-        fence = grokToolFence(firstLine2.slice(0, nl));
+        fence = grokToolFence(firstLine2.slice(0, nl), { web: opts.web });
       }
       firstLine2 = "";
       if (!fence.ok) seatKill?.();
     };
     const { raw, stderrTail, timedOut, timedOutReason } = await runReviewerExec({
-      args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd),
+      args: buildGrokReviewArgs({ ...config, sandbox }, prompt, cwd, { web: opts.web }),
       bin,
       capture: "stdout",
       onStdout,
@@ -2661,7 +2668,7 @@ async function runGrokReview(prompt, config, opts = {}) {
       // egress proxy's start, so neither is ever added on top of the caller's budget.
       timeoutMs: seatTimeoutMs
     });
-    const verdict = fence ?? (raw ? grokToolFence(raw.split("\n")[0]) : null);
+    const verdict = fence ?? (raw ? grokToolFence(raw.split("\n")[0], { web: opts.web }) : null);
     if (verdict && !verdict.ok) {
       return {
         ...proxy ? { egressDenials: [...proxy.denials] } : {},
@@ -4064,8 +4071,10 @@ function toReviewerConfig(c) {
 }
 var VOICE_ADAPTERS = {
   claude: (p, c, o) => runClaudeVoice(p, c, o),
-  codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), o),
-  grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), o)
+  // `web: true` on a cross-vendor voice = the vendor's own search tool (RunReviewOpts.web); it
+  // rides the per-call opts so a ReviewerConfig never carries it and the review seats never see it.
+  codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), { ...o, ...c.web ? { web: true } : {} }),
+  grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), { ...o, ...c.web ? { web: true } : {} })
 };
 var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path15.join(os10.homedir(), ".ensemble-ai", "voices.json");
 function str2(v, fallback) {
@@ -6571,6 +6580,7 @@ export {
   GROK_STATUS_AUTHENTICATED_VIA_PREFIX,
   GROK_STATUS_LOGGED_IN_PREFIX,
   GROK_STATUS_NOT_AUTHENTICATED,
+  GROK_WEB_TOOL,
   GROK_WORKTREE_REVIEW_TIMEOUT_MS,
   GrokLoginExpiryError,
   GrokPreflightCancelledError,
@@ -6673,6 +6683,7 @@ export {
   formatEvidenceShortfall,
   fsConventionReader,
   gatherConventions,
+  grokAllowedTools,
   grokLoginWarningLine,
   grokToolFence,
   hasDepSurface,

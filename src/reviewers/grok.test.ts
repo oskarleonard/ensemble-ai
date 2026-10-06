@@ -112,6 +112,16 @@ afterEach(() => {
 });
 
 describe('buildGrokReviewArgs', () => {
+  it('`web: true` (a voice) keeps grok\'s `web_search` — in the allowlist, `--disable-web-search` dropped; a review seat never', () => {
+    const web = buildGrokReviewArgs(CONFIG, 'PROMPT', '/tmp/cwd', { web: true });
+    expect(web[web.indexOf('--tools') + 1]).toBe('read_file,list_dir,grep,web_search');
+    expect(web).not.toContain('--disable-web-search');
+    // the shell deny and the sandbox hold exactly as before.
+    expect(web[web.indexOf('--deny') + 1]).toBe('Bash');
+    expect(web[web.indexOf('--sandbox') + 1]).toBe('ensemble-review');
+    const seat = buildGrokReviewArgs(CONFIG, 'PROMPT', '/tmp/cwd');
+    expect(seat[seat.indexOf('--tools') + 1]).toBe('read_file,list_dir,grep');
+  });
   it('pins single-turn STREAMING output, the configured model+effort, the deny-by-default sandbox, and the neutral cwd', () => {
     const args = buildGrokReviewArgs(CONFIG, 'PROMPT', '/tmp/cwd');
     // single-turn: the prompt is the value of -p (reply prints to stdout).
@@ -956,6 +966,17 @@ function dial(port: number): Promise<void> {
 describe('grokToolFence (incident 2026-10-01)', () => {
   it('passes an init line that announces exactly the allowlisted tools', () => {
     expect(grokToolFence(INIT_LINE)).toEqual({ ok: true });
+  });
+
+  it('with `web` the fence expects `web_search` too — and still refuses it on a review seat', () => {
+    const withWeb = JSON.stringify({ subtype: 'init', tools: [...GROK_REVIEW_TOOLS, 'web_search'], type: 'system' });
+    expect(grokToolFence(withWeb, { web: true })).toEqual({ ok: true });
+    const seat = grokToolFence(withWeb);
+    expect(seat.ok).toBe(false);
+    expect(!seat.ok && seat.why).toMatch(/outside the review allowlist \(web_search\)/);
+    // a web voice is no licence for anything else
+    const shell = JSON.stringify({ subtype: 'init', tools: [...GROK_REVIEW_TOOLS, 'web_search', 'run_terminal_command'], type: 'system' });
+    expect(grokToolFence(shell, { web: true }).ok).toBe(false);
   });
 
   it('refuses an init line that announces ANY tool outside the allowlist — the shell above all', () => {

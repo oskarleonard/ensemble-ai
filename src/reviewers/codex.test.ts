@@ -71,6 +71,12 @@ beforeEach(() => {
 });
 
 describe('buildCodexReviewArgs', () => {
+  it('`web: true` (a voice) adds the vendor-side `--search`; the default (a review seat) never does', () => {
+    expect(buildCodexReviewArgs(CONFIG, '/tmp/out.md', 'PROMPT', { web: true })).toContain('--search');
+    expect(buildCodexReviewArgs(CONFIG, '/tmp/out.md', 'PROMPT')).not.toContain('--search');
+    // read-only stays regardless — the search runs on the vendor's side.
+    expect(buildCodexReviewArgs(CONFIG, '/tmp/out.md', 'PROMPT', { web: true }).join(' ')).toContain('-s read-only');
+  });
   it('pins read-only, the configured model+effort, skip-git, and the -o file', () => {
     const args = buildCodexReviewArgs(CONFIG, '/tmp/out.md', 'PROMPT');
     expect(args[0]).toBe('exec');
