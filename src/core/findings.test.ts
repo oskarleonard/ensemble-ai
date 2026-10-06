@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { extractJsonBlock, parseFindings, stripTrailingCommas } from './findings';
+import { escapeRawNewlinesInStrings, extractJsonBlock, parseFindings, stripTrailingCommas } from './findings';
 
 const ok = {
   findings: [
@@ -44,6 +44,16 @@ describe('extractJsonBlock', () => {
     const tricky = { note: 'a literal ,} and ,] stay: "quoted,}" end', ok: true };
     const raw = '```json\n' + JSON.stringify(tricky).replace('"ok":true}', '"ok":true,}') + '\n```';
     expect(extractJsonBlock(raw)).toEqual(tricky);
+  });
+
+  it('repairs a RAW line break inside a string literal (multi-line recommendation)', () => {
+    const raw = '{"recommendation":"Verdict.\n\n1. first\n2. second\n\nConfident.","n":1}';
+    expect(() => JSON.parse(raw)).toThrow();
+    expect(extractJsonBlock(raw)).toEqual({ recommendation: 'Verdict.\n\n1. first\n2. second\n\nConfident.', n: 1 });
+    // pretty-printed JSON (newlines OUTSIDE strings) is untouched, an already-escaped \\n stays one
+    const pretty = '{\n  "a": "x\\ny",\n  "b": "q\\"z"\n}';
+    expect(escapeRawNewlinesInStrings(pretty)).toBe(pretty);
+    expect(extractJsonBlock(pretty + ',')).toEqual({ a: 'x\ny', b: 'q"z' });
   });
 
   it('stripTrailingCommas handles escape sequences without flipping string state', () => {
