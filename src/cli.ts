@@ -31,6 +31,7 @@ import {
   type StoredReview,
 } from './core/types';
 import { runBrainstormMode } from './modes/brainstorm';
+import { composeEvidenceContext, type EvidenceRootInfo, openEvidenceRoot } from './modes/evidence';
 import { judgeConfig, listVoices, loadJudge, loadVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
   probeSeatLabel,
@@ -2122,6 +2123,8 @@ Options:
   --voices-file <path>  voices config json (default ~/.ensemble-ai/voices.json)
   --json                print the full result as JSON instead of formatted text
   --cwd <dir>           working dir for --file resolution (default: cwd)
+  --evidence-root <dir> a sealed evidence directory (outside $HOME) every voice reads on every
+                        call behind the review fences; the file rides in full with its INDEX
   -h, --help            this help
 
 Exit codes: 0 = produced ideas (synthesis printed) · 1 = no usable output (every
@@ -2201,6 +2204,7 @@ async function brainstormCommand(args: string[]): Promise<number> {
       options: {
         cwd: { type: 'string' },
         file: { type: 'string' },
+        'evidence-root': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
         json: { type: 'boolean' },
         synthesizer: { type: 'string' },
@@ -2247,6 +2251,20 @@ async function brainstormCommand(args: string[]): Promise<number> {
       );
       return 3;
     }
+  }
+
+  // --evidence-root (hugin spec doc-review-evidence §3): a sealed directory of raw evidence every
+  // voice reads on every call behind the review seats' fences; the prompt carries the file in
+  // full plus the root's INDEX and the citation contract. Fails closed on a bad root.
+  let evidenceInfo: EvidenceRootInfo | undefined;
+  if (typeof values['evidence-root'] === 'string') {
+    try {
+      evidenceInfo = openEvidenceRoot(path.resolve(cwd, values['evidence-root']));
+    } catch (e) {
+      console.error(`ensemble-ai: ${(e as Error).message}`);
+      return 3;
+    }
+    fileContext = composeEvidenceContext(fileContext, evidenceInfo);
   }
 
   // --voices: fail CLOSED on an unknown id (a typo must error, never silently run a
@@ -2309,6 +2327,7 @@ async function brainstormCommand(args: string[]): Promise<number> {
   let result: BrainstormResult;
   try {
     result = await runBrainstormMode({
+      ...(evidenceInfo ? { evidenceRoot: evidenceInfo.root } : {}),
       fileContext,
       onProgress: (m) => console.error(`· ${m}`),
       synthesizer,
@@ -2365,6 +2384,8 @@ Options:
   --voices-file <path>  voices config json (default ~/.ensemble-ai/voices.json)
   --json                print the full result as JSON instead of formatted text
   --cwd <dir>           working dir for --file resolution (default: cwd)
+  --evidence-root <dir> a sealed evidence directory (outside $HOME) every voice reads on every
+                        call behind the review fences; the file rides in full with its INDEX
   -h, --help            this help
 
 Exit codes: 0 = produced answers (synthesis printed) · 1 = no usable output (every
@@ -2481,6 +2502,7 @@ async function consultCommand(args: string[]): Promise<number> {
         debate: { type: 'boolean' },
         'debate-rounds': { type: 'string' },
         file: { type: 'string' },
+        'evidence-root': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
         json: { type: 'boolean' },
         judge: { type: 'string' },
@@ -2528,6 +2550,20 @@ async function consultCommand(args: string[]): Promise<number> {
       );
       return 3;
     }
+  }
+
+  // --evidence-root (hugin spec doc-review-evidence §3): a sealed directory of raw evidence every
+  // voice reads on every call behind the review seats' fences; the prompt carries the file in
+  // full plus the root's INDEX and the citation contract. Fails closed on a bad root.
+  let evidenceInfo: EvidenceRootInfo | undefined;
+  if (typeof values['evidence-root'] === 'string') {
+    try {
+      evidenceInfo = openEvidenceRoot(path.resolve(cwd, values['evidence-root']));
+    } catch (e) {
+      console.error(`ensemble-ai: ${(e as Error).message}`);
+      return 3;
+    }
+    fileContext = composeEvidenceContext(fileContext, evidenceInfo);
   }
 
   // --voices: fail CLOSED on an unknown id (a typo must error, never silently run a
@@ -2622,6 +2658,7 @@ async function consultCommand(args: string[]): Promise<number> {
     result = await runConsultMode({
       critique: Boolean(values.critique),
       ...(debate ? { debate } : {}),
+      ...(evidenceInfo ? { evidenceRoot: evidenceInfo.root } : {}),
       fileContext,
       onProgress: (m) => console.error(`· ${m}`),
       question,

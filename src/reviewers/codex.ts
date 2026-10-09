@@ -182,6 +182,11 @@ export interface RunReviewOpts {
   // seat must never reap it. Absent ⇒ the packet path (a throwaway cwd). It lives on the SHARED
   // opts so seats extend through the one adapter contract (REVIEW_ADAPTERS), never a per-reviewer
   // intersection type. Only grok honors it today; codex needs its external wrapper first.
+  // An EVIDENCE ROOT (brainstorm/consult `--evidence-root`, 2026-10-09): a sealed directory of raw
+  // evidence the voice reads on every call, granted through the SAME fence as a worktree — codex's
+  // kernel sandbox with the root as the read root, grok's tool fence + egress proxy, claude's
+  // capability fence — but never confused with one: it roots Slack/Notion text, not a repo.
+  evidenceRoot?: string;
   worktree?: string;
   // VENDOR-SIDE WEB SEARCH — set by the brainstorm / consult VOICES only (a `web: true` voice),
   // never by the review pipeline. codex: `--search` (the native Responses `web_search` tool, run
@@ -312,7 +317,7 @@ async function runCodexWorktreeReview(
   const wrapped = wrapWithSandbox(
     profile.file,
     bin,
-    buildCodexWorktreeArgs(config, reply.file, prompt)
+    buildCodexWorktreeArgs(config, reply.file, prompt, { web: opts.web })
   );
   // Both temp dirs (the profile sandbox-exec reads, and the reply the SEAT writes) and the proxy
   // socket are ours to reap. `finally` on the promise (not the caller) because the dir names are
@@ -361,7 +366,8 @@ export function runCodexReview(
   config: ReviewerConfig,
   opts: RunReviewOpts = {}
 ): Promise<CodexReviewResult> {
-  if (opts.worktree) return runCodexWorktreeReview(prompt, config, opts.worktree, opts);
+  const readRoot = opts.worktree ?? opts.evidenceRoot;
+  if (readRoot) return runCodexWorktreeReview(prompt, config, readRoot, opts);
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const outFile = reviewOutFile();
   return runReviewerExec({

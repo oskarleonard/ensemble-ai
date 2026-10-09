@@ -10,7 +10,12 @@ import {
   TRANSIENT_RETRY_DELAYS_MS,
   USAGE_LIMIT_FAIL_PREFIX,
 } from '../../core/claude-stream';
+import fs from 'node:fs';
+import os from 'node:os';
+
+import { isUnder, makeOwnerOnlyTempDir } from '../../core/artifacts';
 import { resolveBin } from '../../core/bin';
+import { CLAUDE_REVIEW_DENIED_TOOLS, homeReadDenyRules } from '../../core/claude-fence';
 import { runReviewerExec } from '../../core/spawn';
 import { ADVISOR_OFF, parseSeatAdvisor } from '../../core/types';
 import {
@@ -54,6 +59,45 @@ export function claudeAdvisorEnv(config?: { advisor?: unknown; id: string }): Re
 
 export const CLAUDE_WEB_TOOLS = 'WebSearch,WebFetch';
 export const CLAUDE_WEB_MAX_TURNS = 25;
+// Behind an evidence root the voice READS (Read/Grep/Glob are turns), so the cap is wider.
+export const CLAUDE_EVIDENCE_MAX_TURNS = 60;
+
+export interface ClaudeVoiceFence {
+  // Injectable for tests. Defaults to the real home directory.
+  homeDir?: string;
+  // The one directory the voice may read: the evidence root, granted via `--add-dir`.
+  evidenceRoot?: string;
+}
+
+// PURE: the claude CLI args for a voice that reads an EVIDENCE ROOT (hugin spec doc-review-evidence
+// §3) — the review seat's capability fence (modes/review/claude.ts, every clause a probe result)
+// with ONE difference: `WebSearch` stays when the voice has `web` (vendor-side search is a named
+// residual channel; `WebFetch` — a local fetch of an arbitrary URL, the exfiltration channel — is
+// denied like every other write/exec/egress tool). Neutral cwd + `--add-dir <root>` so a planted
+// CLAUDE.md in the root is never loaded as instructions; `--strict-mcp-config` loads zero MCP
+// servers (the work profile's connectors stay out); the home-read deny keeps vendor auth and every
+// other repo out of the voice's reach. THROWS when the root lives inside the home directory.
+// `--disallowedTools` is variadic, so it goes LAST; `--add-dir` is variadic too, so it is followed
+// immediately by `--strict-mcp-config`.
+export function buildClaudeEvidenceArgs(prompt: string, config: VoiceConfig | undefined, fence: ClaudeVoiceFence): string[] {
+  const root = fence.evidenceRoot;
+  if (!root) throw new Error('buildClaudeEvidenceArgs: an evidence root is required');
+  const home = fence.homeDir ?? os.homedir();
+  if (root === home || isUnder(root, home))
+    throw new Error(
+      `refusing to fence a claude voice whose evidence root (${root}) is inside the home directory — the home-read deny would also deny the root. Seal the evidence outside $HOME.`
+    );
+  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--permission-mode', 'plan'];
+  if (config?.web === true) args.push('--allowedTools', 'WebSearch');
+  args.push('--max-turns', String(CLAUDE_EVIDENCE_MAX_TURNS));
+  if (config?.model && config.model !== 'default') args.push('--model', config.model);
+  if (config && CLAUDE_EFFORTS.has(config.effort)) args.push('--effort', config.effort);
+  args.push(...claudeAdvisorArgs(config));
+  args.push('--add-dir', root, '--strict-mcp-config');
+  const denied = CLAUDE_REVIEW_DENIED_TOOLS.filter((t) => !(config?.web === true && t === 'WebSearch'));
+  args.push('--disallowedTools', ...denied, ...homeReadDenyRules(home));
+  return args;
+}
 
 // PURE: the claude CLI args for the voice. `-p <prompt>` (headless, single-shot) +
 // `--output-format stream-json --verbose` (the liveness signal — see the header). With `web`
@@ -94,15 +138,21 @@ export async function runClaudeVoice(
   const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
   const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  const args = buildClaudeVoiceArgs(prompt, config);
+  // Behind an evidence root: the fenced argv (built BEFORE the neutral cwd exists, so an
+  // unfenceable root throws without leaking a dir) and a neutral, owner-only, EMPTY cwd the voice
+  // never owns — reaped here. Without one: the tool-less / web-only voice in a throwaway cwd.
+  const args = opts.evidenceRoot ? buildClaudeEvidenceArgs(prompt, config, { evidenceRoot: opts.evidenceRoot }) : buildClaudeVoiceArgs(prompt, config);
+  const neutralCwd = opts.evidenceRoot ? makeOwnerOnlyTempDir('ensemble-voice-cwd-') : undefined;
   const env = claudeAdvisorEnv(config);
   let retried = 0;
+  try {
   for (;;) {
     const startedAt = Date.now();
     const { raw, stderrTail, timedOut, timedOutReason } = await exec({
       args,
       bin: seams.bin ?? resolveClaudeBin(),
       capture: 'stdout',
+      ...(neutralCwd ? { cwd: neutralCwd } : {}),
       env,
       inactivityTimeoutMs,
       onSpawn: opts.onSpawn,
@@ -184,5 +234,8 @@ export async function runClaudeVoice(
       ...(reply === null && activity ? { stream: activity } : {}),
       timedOut: false,
     };
+  }
+  } finally {
+    if (neutralCwd) fs.rmSync(neutralCwd, { force: true, recursive: true });
   }
 }

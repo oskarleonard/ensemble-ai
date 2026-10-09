@@ -9,15 +9,21 @@ const JSON_RULE =
   'Respond with ONE fenced ```json block and NOTHING else, matching:';
 
 // Cap embedded file context so a huge file can't blow the prompt budget; the voice
-// sees the head, clearly marked as truncated.
-const FILE_CONTEXT_BUDGET = 24_000;
+// sees the head, clearly marked as truncated. Behind an EVIDENCE ROOT (--evidence-root) the
+// budget is raised (setContextBudget): the document under review must never be cut, and the
+// index of the evidence rides in the same block.
+export const FILE_CONTEXT_BUDGET = 24_000;
+let contextBudget = FILE_CONTEXT_BUDGET;
+export function setContextBudget(chars: number): void {
+  contextBudget = Math.max(1000, Math.floor(chars));
+}
 
 function contextBlock(fileContext?: string): string {
   if (!fileContext || !fileContext.trim()) return '';
   const trimmed = fileContext.trimEnd();
   const body =
-    trimmed.length > FILE_CONTEXT_BUDGET
-      ? `${trimmed.slice(0, FILE_CONTEXT_BUDGET)}\n…[context truncated]`
+    trimmed.length > contextBudget
+      ? `${trimmed.slice(0, contextBudget)}\n…[context truncated]`
       : trimmed;
   return `\n## Shared context\n${body}\n`;
 }

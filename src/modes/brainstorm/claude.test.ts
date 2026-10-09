@@ -152,3 +152,32 @@ describe('runClaudeVoice — the advisor "off" reaches the spawned claude as its
     expect(settingsOf(spawned[0].args)).toEqual({ advisorModel: 'claude-opus-5-5' });
   });
 });
+
+describe('buildClaudeEvidenceArgs — the voice behind the capability fence over an evidence root (2026-10-09)', async () => {
+  const { buildClaudeEvidenceArgs, CLAUDE_EVIDENCE_MAX_TURNS } = await import('./claude');
+  const home = '/Users/nobody';
+  const root = '/private/tmp/hugin-evidence/runs/abc';
+  it('neutral-cwd fence: plan mode, --add-dir then --strict-mcp-config, every exec/write/egress tool denied, home reads denied', () => {
+    const args = buildClaudeEvidenceArgs('p', cfg({ model: 'opus', effort: 'max' }), { evidenceRoot: root, homeDir: home });
+    expect(args.slice(0, 7)).toEqual(['-p', 'p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'plan']);
+    expect(args[args.indexOf('--add-dir') + 1]).toBe(root);
+    expect(args[args.indexOf('--add-dir') + 2]).toBe('--strict-mcp-config');
+    const denied = args.slice(args.indexOf('--disallowedTools') + 1);
+    for (const t of ['Bash', 'Agent', 'Task', 'WebFetch', 'WebSearch', 'Write', 'Edit', 'NotebookEdit']) expect(denied).toContain(t);
+    expect(denied).toContain(`Read(/${home}/**)`);
+    expect(denied).toContain(`Grep(/${home}/**)`);
+    expect(args.indexOf('--disallowedTools')).toBeLessThan(args.indexOf('Bash'));
+    expect(args[args.indexOf('--max-turns') + 1]).toBe(String(CLAUDE_EVIDENCE_MAX_TURNS));
+    expect(args).not.toContain('--allowedTools');
+  });
+  it('a `web` voice keeps WebSearch (pre-approved, vendor-side) and still loses WebFetch', () => {
+    const args = buildClaudeEvidenceArgs('p', cfg({ web: true }), { evidenceRoot: root, homeDir: home });
+    expect(args[args.indexOf('--allowedTools') + 1]).toBe('WebSearch');
+    const denied = args.slice(args.indexOf('--disallowedTools') + 1);
+    expect(denied).not.toContain('WebSearch');
+    expect(denied).toContain('WebFetch');
+  });
+  it('refuses a root inside the home directory (the deny would deny the root)', () => {
+    expect(() => buildClaudeEvidenceArgs('p', cfg(), { evidenceRoot: `${home}/evidence`, homeDir: home })).toThrow(/inside the home directory/);
+  });
+});

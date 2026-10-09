@@ -26,11 +26,14 @@ type Adapters = Record<
   (
     prompt: string,
     config: VoiceConfig,
-    opts?: { onSpawn?: (kill: () => void) => void; timeoutMs?: number }
+    opts?: { evidenceRoot?: string; onSpawn?: (kill: () => void) => void; timeoutMs?: number }
   ) => Promise<VoiceRunResult>
 >;
 
 export interface BrainstormOptions {
+  // The evidence root EVERY call reads (modes/evidence.ts, `--evidence-root`): passed to each
+  // adapter beside the timeout, so answer, critique, synthesis, debate and judge all see it.
+  evidenceRoot?: string;
   // Injectable for tests — the real adapters spawn vendor CLIs.
   adapters?: Adapters;
   fileContext?: string;
@@ -233,7 +236,14 @@ export async function runBrainstormMode(
   const log = opts.onProgress ?? (() => {});
   const roster =
     opts.voices && opts.voices.length > 0 ? opts.voices : [...VOICE_IDS];
-  const adapters = opts.adapters ?? VOICE_ADAPTERS;
+  const baseAdapters = opts.adapters ?? VOICE_ADAPTERS;
+  const evidenceRoot = opts.evidenceRoot;
+  // Every call carries the evidence root (never a per-round choice — hugin spec §3 principle 1).
+  const adapters: Adapters = evidenceRoot
+    ? (Object.fromEntries(
+        Object.entries(baseAdapters).map(([id, fn]) => [id, (p: string, c: VoiceConfig, o?: Parameters<typeof fn>[2]) => fn(p, c, { ...o, evidenceRoot })])
+      ) as Adapters)
+    : baseAdapters;
   const configs = opts.voiceConfigs ?? loadVoices(opts.voicesFile);
   // The roster's advisors, checked before Round 1 spawns anything: an invalid one on a voice this
   // run uses refuses the whole run; a voice outside the roster is never read.

@@ -2101,8 +2101,11 @@ function writeCodexSandboxProfile(paths) {
 function wrapWithSandbox(profileFile, bin, args) {
   return { args: ["-f", profileFile, bin, ...args], bin: "/usr/bin/sandbox-exec" };
 }
-function buildCodexWorktreeArgs(config, outFile, prompt) {
+function buildCodexWorktreeArgs(config, outFile, prompt, opts = {}) {
   return [
+    // Vendor-side live web search (a `web: true` brainstorm/consult voice behind an evidence root)
+    // — a GLOBAL flag, so it goes before `exec` (#101). Never set by the review pipeline.
+    ...opts.web ? ["--search"] : [],
     "exec",
     "--skip-git-repo-check",
     "--ephemeral",
@@ -2256,7 +2259,7 @@ async function runCodexWorktreeReview(prompt, config, worktree, opts) {
   const wrapped = wrapWithSandbox(
     profile.file,
     bin,
-    buildCodexWorktreeArgs(config, reply.file, prompt)
+    buildCodexWorktreeArgs(config, reply.file, prompt, { web: opts.web })
   );
   const cleanup = () => {
     profile.cleanup();
@@ -2288,7 +2291,8 @@ async function runCodexWorktreeReview(prompt, config, worktree, opts) {
   }
 }
 function runCodexReview(prompt, config, opts = {}) {
-  if (opts.worktree) return runCodexWorktreeReview(prompt, config, opts.worktree, opts);
+  const readRoot = opts.worktree ?? opts.evidenceRoot;
+  if (readRoot) return runCodexWorktreeReview(prompt, config, readRoot, opts);
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const outFile = reviewOutFile();
   return runReviewerExec({
@@ -2620,9 +2624,9 @@ function extractGrokText(stdout) {
   return trimmed || null;
 }
 async function runGrokReview(prompt, config, opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? (opts.worktree ? GROK_WORKTREE_REVIEW_TIMEOUT_MS : GROK_PACKET_REVIEW_TIMEOUT_MS);
+  const timeoutMs = opts.timeoutMs ?? (opts.worktree ?? opts.evidenceRoot ? GROK_WORKTREE_REVIEW_TIMEOUT_MS : GROK_PACKET_REVIEW_TIMEOUT_MS);
   const sandbox = resolveReviewSandbox(config.sandbox);
-  const worktreeCwd = opts.worktree;
+  const worktreeCwd = opts.worktree ?? opts.evidenceRoot;
   if (worktreeCwd && sandbox !== GROK_CLI_SANDBOX) {
     return {
       ok: false,
@@ -2753,8 +2757,8 @@ async function runGrokReview(prompt, config, opts = {}) {
 }
 
 // src/modes/review/claude.ts
-import fs15 from "fs";
-import os9 from "os";
+import fs16 from "fs";
+import os10 from "os";
 
 // src/core/claude-stream.ts
 var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
@@ -2825,6 +2829,35 @@ function streamActivityTail(stdout, limit = 600) {
 }
 
 // src/modes/brainstorm/claude.ts
+import fs10 from "fs";
+import os8 from "os";
+
+// src/core/claude-fence.ts
+var CLAUDE_REVIEW_DENIED_TOOLS = [
+  "Bash",
+  // The fan-out channel: a subagent is a fresh full-context conversation at the seat's own
+  // model/effort — at opus@max a skill- or model-initiated fan-out multiplies the operator's
+  // subscription burn ~15x (lived: run 2026-08-07-17-16-13 ate ~77% of a Max 5x window). The
+  // seat is a cold SINGLE-PASS peer; both tool names are denied ('Task' is the older name —
+  // a fence names the tool before it comes back). Fence version bumped: 1 → 2.
+  "Agent",
+  "Task",
+  "WebFetch",
+  "WebSearch",
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit"
+];
+var CLAUDE_READ_TOOLS = ["Read", "Grep", "Glob"];
+function denyUnder(tool, absDir) {
+  return `${tool}(/${absDir.replace(/\/+$/, "")}/**)`;
+}
+function homeReadDenyRules(homeDir) {
+  return CLAUDE_READ_TOOLS.map((t) => denyUnder(t, homeDir));
+}
+
+// src/modes/brainstorm/claude.ts
 function resolveClaudeBin() {
   return resolveBin("claude", { envVar: "CLAUDE_BIN" });
 }
@@ -2839,6 +2872,26 @@ function claudeAdvisorEnv(config) {
 }
 var CLAUDE_WEB_TOOLS = "WebSearch,WebFetch";
 var CLAUDE_WEB_MAX_TURNS = 25;
+var CLAUDE_EVIDENCE_MAX_TURNS = 60;
+function buildClaudeEvidenceArgs(prompt, config, fence) {
+  const root = fence.evidenceRoot;
+  if (!root) throw new Error("buildClaudeEvidenceArgs: an evidence root is required");
+  const home = fence.homeDir ?? os8.homedir();
+  if (root === home || isUnder(root, home))
+    throw new Error(
+      `refusing to fence a claude voice whose evidence root (${root}) is inside the home directory \u2014 the home-read deny would also deny the root. Seal the evidence outside $HOME.`
+    );
+  const args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "plan"];
+  if (config?.web === true) args.push("--allowedTools", "WebSearch");
+  args.push("--max-turns", String(CLAUDE_EVIDENCE_MAX_TURNS));
+  if (config?.model && config.model !== "default") args.push("--model", config.model);
+  if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
+  args.push(...claudeAdvisorArgs(config));
+  args.push("--add-dir", root, "--strict-mcp-config");
+  const denied = CLAUDE_REVIEW_DENIED_TOOLS.filter((t) => !(config?.web === true && t === "WebSearch"));
+  args.push("--disallowedTools", ...denied, ...homeReadDenyRules(home));
+  return args;
+}
 function buildClaudeVoiceArgs(prompt, config) {
   const args = ["-p", prompt, "--output-format", "stream-json", "--verbose"];
   if (config?.web === true)
@@ -2856,113 +2909,119 @@ async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
   const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
   const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  const args = buildClaudeVoiceArgs(prompt, config);
+  const args = opts.evidenceRoot ? buildClaudeEvidenceArgs(prompt, config, { evidenceRoot: opts.evidenceRoot }) : buildClaudeVoiceArgs(prompt, config);
+  const neutralCwd = opts.evidenceRoot ? makeOwnerOnlyTempDir("ensemble-voice-cwd-") : void 0;
   const env = claudeAdvisorEnv(config);
   let retried = 0;
-  for (; ; ) {
-    const startedAt = Date.now();
-    const { raw, stderrTail, timedOut, timedOutReason } = await exec({
-      args,
-      bin: seams.bin ?? resolveClaudeBin(),
-      capture: "stdout",
-      env,
-      inactivityTimeoutMs,
-      onSpawn: opts.onSpawn,
-      stderrLimit: 2e3,
-      timeoutMs
-    });
-    const elapsedMs = Date.now() - startedAt;
-    const stream = typeof raw === "string" ? extractStreamResult(raw) : null;
-    const text = stream?.found ? stream.text : raw;
-    const activity = streamActivityTail(raw);
-    const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
-    if (transient && retried < retryDelaysMs.length) {
-      await sleep(retryDelaysMs[retried]);
-      retried += 1;
-      continue;
-    }
-    if (transient) {
-      const errorLine = (stream?.found ? stream.text ?? "" : raw ?? "").trim();
+  try {
+    for (; ; ) {
+      const startedAt = Date.now();
+      const { raw, stderrTail, timedOut, timedOutReason } = await exec({
+        args,
+        bin: seams.bin ?? resolveClaudeBin(),
+        capture: "stdout",
+        ...neutralCwd ? { cwd: neutralCwd } : {},
+        env,
+        inactivityTimeoutMs,
+        onSpawn: opts.onSpawn,
+        stderrLimit: 2e3,
+        timeoutMs
+      });
+      const elapsedMs = Date.now() - startedAt;
+      const stream = typeof raw === "string" ? extractStreamResult(raw) : null;
+      const text = stream?.found ? stream.text : raw;
+      const activity = streamActivityTail(raw);
+      const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
+      if (transient && retried < retryDelaysMs.length) {
+        await sleep(retryDelaysMs[retried]);
+        retried += 1;
+        continue;
+      }
+      if (transient) {
+        const errorLine = (stream?.found ? stream.text ?? "" : raw ?? "").trim();
+        return {
+          failWhy: `persistent transient API error after ${retried + 1} attempts`,
+          ok: false,
+          raw: null,
+          stderrTail: errorLine.slice(0, 300),
+          timedOut: false
+        };
+      }
+      const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
+      if (!timedOut && limitText) {
+        return {
+          failWhy: `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${limitText.slice(0, 160)}`,
+          ok: false,
+          raw: null,
+          stderrTail: limitText.slice(0, 300),
+          timedOut: false
+        };
+      }
+      if (!timedOut && stream?.found && stream.isError) {
+        const status = stream.apiErrorStatus;
+        return {
+          failWhy: `the voice returned an error result${status ? ` (API status ${status})` : ""}`,
+          ok: false,
+          raw: null,
+          stderrTail: (stream.text ?? "").trim().slice(0, 300) || stderrTail,
+          timedOut: false
+        };
+      }
+      if (timedOut) {
+        const bar = timedOutReason === "inactivity" ? inactivityTimeoutMs : timeoutMs;
+        const span = bar >= 6e4 ? `${Math.round(bar / 6e4)} min` : `${Math.round(bar / 1e3)} s`;
+        const failWhy = timedOutReason === "inactivity" ? `stalled: no stream output for ${span} (wedged seat reclaimed)` : `still working when the ${span} backstop cut it \u2014 give it budget`;
+        return {
+          failWhy,
+          ok: false,
+          raw: null,
+          stderrTail,
+          ...activity ? { stream: activity } : {},
+          timedOut: true,
+          ...timedOutReason ? { timedOutReason } : {}
+        };
+      }
+      const retryNote = retried > 0 ? `[retried ${retried}x on transient API error] ` : "";
+      const reply = text && text.trim() ? text : null;
       return {
-        failWhy: `persistent transient API error after ${retried + 1} attempts`,
-        ok: false,
-        raw: null,
-        stderrTail: errorLine.slice(0, 300),
+        ok: reply !== null,
+        raw: reply,
+        stderrTail: retryNote ? `${retryNote}${stderrTail ?? ""}` : stderrTail,
+        ...reply === null && activity ? { stream: activity } : {},
         timedOut: false
       };
     }
-    const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
-    if (!timedOut && limitText) {
-      return {
-        failWhy: `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${limitText.slice(0, 160)}`,
-        ok: false,
-        raw: null,
-        stderrTail: limitText.slice(0, 300),
-        timedOut: false
-      };
-    }
-    if (!timedOut && stream?.found && stream.isError) {
-      const status = stream.apiErrorStatus;
-      return {
-        failWhy: `the voice returned an error result${status ? ` (API status ${status})` : ""}`,
-        ok: false,
-        raw: null,
-        stderrTail: (stream.text ?? "").trim().slice(0, 300) || stderrTail,
-        timedOut: false
-      };
-    }
-    if (timedOut) {
-      const bar = timedOutReason === "inactivity" ? inactivityTimeoutMs : timeoutMs;
-      const span = bar >= 6e4 ? `${Math.round(bar / 6e4)} min` : `${Math.round(bar / 1e3)} s`;
-      const failWhy = timedOutReason === "inactivity" ? `stalled: no stream output for ${span} (wedged seat reclaimed)` : `still working when the ${span} backstop cut it \u2014 give it budget`;
-      return {
-        failWhy,
-        ok: false,
-        raw: null,
-        stderrTail,
-        ...activity ? { stream: activity } : {},
-        timedOut: true,
-        ...timedOutReason ? { timedOutReason } : {}
-      };
-    }
-    const retryNote = retried > 0 ? `[retried ${retried}x on transient API error] ` : "";
-    const reply = text && text.trim() ? text : null;
-    return {
-      ok: reply !== null,
-      raw: reply,
-      stderrTail: retryNote ? `${retryNote}${stderrTail ?? ""}` : stderrTail,
-      ...reply === null && activity ? { stream: activity } : {},
-      timedOut: false
-    };
+  } finally {
+    if (neutralCwd) fs10.rmSync(neutralCwd, { force: true, recursive: true });
   }
 }
 
 // src/modes/review/history-packet.ts
-import fs14 from "fs";
+import fs15 from "fs";
 import path14 from "path";
 
 // src/modes/review/ensemble-config.ts
-import fs10 from "fs";
-import os8 from "os";
+import fs11 from "fs";
+import os9 from "os";
 import path9 from "path";
-var ENSEMBLE_CONFIG_PATH = path9.join(os8.homedir(), ".ensemble-ai", "config.json");
+var ENSEMBLE_CONFIG_PATH = path9.join(os9.homedir(), ".ensemble-ai", "config.json");
 function asRecord2(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : null;
 }
 function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
   try {
-    return asRecord2(JSON.parse(fs10.readFileSync(configPath, "utf8"))) ?? {};
+    return asRecord2(JSON.parse(fs11.readFileSync(configPath, "utf8"))) ?? {};
   } catch {
     return {};
   }
 }
 
 // src/modes/review/gate-hunks.ts
-import fs12 from "fs";
+import fs13 from "fs";
 import path12 from "path";
 
 // src/modes/review/trail-io.ts
-import fs11 from "fs";
+import fs12 from "fs";
 import path10 from "path";
 
 // src/modes/review/diff.ts
@@ -3276,7 +3335,7 @@ function persistGatePacket(baseDir, runId, input) {
 }
 
 // src/modes/review/worktree.ts
-import fs13 from "fs";
+import fs14 from "fs";
 import path13 from "path";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
@@ -3407,7 +3466,7 @@ function stripAgentInstructions(dir) {
   const removed = [];
   const remove = (rel) => {
     try {
-      fs13.rmSync(path13.join(dir, rel), { force: true, recursive: true });
+      fs14.rmSync(path13.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -3415,7 +3474,7 @@ function stripAgentInstructions(dir) {
   const walk = (rel) => {
     let entries;
     try {
-      entries = fs13.readdirSync(path13.join(dir, rel), { withFileTypes: true });
+      entries = fs14.readdirSync(path13.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -3425,7 +3484,7 @@ function stripAgentInstructions(dir) {
       if (isInstructionName(e.name)) {
         remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
-        if (fs13.existsSync(path13.join(dir, childRel, CURSOR_RULES))) {
+        if (fs14.existsSync(path13.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
         walk(childRel);
@@ -3441,7 +3500,7 @@ async function stripAgentInstructionsAsync(dir) {
   const removed = [];
   const remove = async (rel) => {
     try {
-      await fs13.promises.rm(path13.join(dir, rel), { force: true, recursive: true });
+      await fs14.promises.rm(path13.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -3449,7 +3508,7 @@ async function stripAgentInstructionsAsync(dir) {
   const walk = async (rel) => {
     let entries;
     try {
-      entries = await fs13.promises.readdir(path13.join(dir, rel), { withFileTypes: true });
+      entries = await fs14.promises.readdir(path13.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -3460,7 +3519,7 @@ async function stripAgentInstructionsAsync(dir) {
         await remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
         try {
-          await fs13.promises.access(path13.join(dir, childRel, CURSOR_RULES));
+          await fs14.promises.access(path13.join(dir, childRel, CURSOR_RULES));
           await remove(`${childRel}/${CURSOR_RULES}`);
         } catch {
         }
@@ -3482,9 +3541,9 @@ function completeSharedStore(repoRoot, git2) {
   const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
   const commonDir = path13.resolve(repoRoot, common.text.trim());
-  if (!fs13.existsSync(path13.join(commonDir, "objects"))) return null;
-  if (fs13.existsSync(path13.join(commonDir, "shallow"))) return null;
-  if (fs13.existsSync(path13.join(commonDir, ALTERNATES_REL))) return null;
+  if (!fs14.existsSync(path13.join(commonDir, "objects"))) return null;
+  if (fs14.existsSync(path13.join(commonDir, "shallow"))) return null;
+  if (fs14.existsSync(path13.join(commonDir, ALTERNATES_REL))) return null;
   if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
   return commonDir;
 }
@@ -3606,7 +3665,7 @@ var REAP_RM_OPTS = { force: true, maxRetries: 3, recursive: true, retryDelay: 50
 function reapParent(parent) {
   if (!path13.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    fs13.rmSync(parent, REAP_RM_OPTS);
+    fs14.rmSync(parent, REAP_RM_OPTS);
   } catch {
   }
 }
@@ -3708,7 +3767,7 @@ async function completeSharedStoreAsync(repoRoot, git2) {
   const common = await git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
   const commonDir = path13.resolve(repoRoot, common.text.trim());
-  const exists = (p) => fs13.promises.access(p).then(() => true, () => false);
+  const exists = (p) => fs14.promises.access(p).then(() => true, () => false);
   if (!await exists(path13.join(commonDir, "objects"))) return null;
   if (await exists(path13.join(commonDir, "shallow"))) return null;
   if (await exists(path13.join(commonDir, ALTERNATES_REL))) return null;
@@ -3728,7 +3787,7 @@ async function fetchEnvAsync(repoRoot, bare, git2) {
 async function reapParentAsync(parent) {
   if (!path13.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    await fs13.promises.rm(parent, REAP_RM_OPTS);
+    await fs14.promises.rm(parent, REAP_RM_OPTS);
   } catch {
   }
 }
@@ -3766,8 +3825,8 @@ function writeHistoryPacket(cwd, files) {
   for (const f of files) {
     const abs = containedPath(cwd, f.path);
     if (!abs) continue;
-    fs14.mkdirSync(path14.dirname(abs), { recursive: true });
-    fs14.writeFileSync(abs, f.contents, { mode: 256 });
+    fs15.mkdirSync(path14.dirname(abs), { recursive: true });
+    fs15.writeFileSync(abs, f.contents, { mode: 256 });
   }
 }
 
@@ -3776,31 +3835,8 @@ var CLAUDE_CAPABILITY_FENCE = {
   id: "claude-capability-fence",
   version: 2
 };
-var CLAUDE_REVIEW_DENIED_TOOLS = [
-  "Bash",
-  // The fan-out channel: a subagent is a fresh full-context conversation at the seat's own
-  // model/effort — at opus@max a skill- or model-initiated fan-out multiplies the operator's
-  // subscription burn ~15x (lived: run 2026-08-07-17-16-13 ate ~77% of a Max 5x window). The
-  // seat is a cold SINGLE-PASS peer; both tool names are denied ('Task' is the older name —
-  // a fence names the tool before it comes back). Fence version bumped: 1 → 2.
-  "Agent",
-  "Task",
-  "WebFetch",
-  "WebSearch",
-  "Write",
-  "Edit",
-  "MultiEdit",
-  "NotebookEdit"
-];
-var CLAUDE_READ_TOOLS = ["Read", "Grep", "Glob"];
-function denyUnder(tool, absDir) {
-  return `${tool}(/${absDir.replace(/\/+$/, "")}/**)`;
-}
-function homeReadDenyRules(homeDir) {
-  return CLAUDE_READ_TOOLS.map((t) => denyUnder(t, homeDir));
-}
 function buildClaudeReviewArgs(prompt, config, fence = {}) {
-  const homeDir = fence.homeDir ?? os9.homedir();
+  const homeDir = fence.homeDir ?? os10.homedir();
   if (fence.readRoot && isUnder(fence.readRoot, homeDir)) {
     throw new Error(
       `ensemble-ai: refusing to fence a Claude seat whose read root (${fence.readRoot}) is inside the home directory (${homeDir}) \u2014 the home-read deny would also deny the worktree. Point TMPDIR outside $HOME.`
@@ -3914,7 +3950,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
     }
   } finally {
     try {
-      fs15.rmSync(cwd, { force: true, recursive: true });
+      fs16.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
   }
@@ -4050,8 +4086,8 @@ function hasDepSurface(r) {
 }
 
 // src/modes/review/receipt.ts
-import fs19 from "fs";
-import os11 from "os";
+import fs20 from "fs";
+import os12 from "os";
 import path17 from "path";
 
 // src/modes/review/evidence.ts
@@ -4138,15 +4174,15 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/holistic-gate.ts
-import fs18 from "fs";
+import fs19 from "fs";
 import path16 from "path";
 
 // src/modes/review/holistic.ts
-import fs17 from "fs";
+import fs18 from "fs";
 
 // src/modes/brainstorm/voices.ts
-import fs16 from "fs";
-import os10 from "os";
+import fs17 from "fs";
+import os11 from "os";
 import path15 from "path";
 
 // src/modes/brainstorm/types.ts
@@ -4215,7 +4251,7 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), { ...o, ...c.web ? { web: true } : {} }),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), { ...o, ...c.web ? { web: true } : {} })
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path15.join(os10.homedir(), ".ensemble-ai", "voices.json");
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path15.join(os11.homedir(), ".ensemble-ai", "voices.json");
 function str2(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
@@ -4254,7 +4290,7 @@ function parseJudge(raw) {
 }
 function loadJudge(file = VOICES_FILE) {
   try {
-    return parseJudge(JSON.parse(fs16.readFileSync(file, "utf8")));
+    return parseJudge(JSON.parse(fs17.readFileSync(file, "utf8")));
   } catch {
     return {};
   }
@@ -4265,7 +4301,7 @@ function judgeConfig(spec, voiceId, configs) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs16.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs17.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
@@ -4321,7 +4357,7 @@ function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
 }, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
-    raw = JSON.parse(fs17.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs18.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -4486,7 +4522,7 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs18.realpathSync(path16.resolve(worktreeDir));
+    root = fs19.realpathSync(path16.resolve(worktreeDir));
   } catch {
     return () => null;
   }
@@ -4499,11 +4535,11 @@ function worktreeReader(worktreeDir) {
       if (!file || file.includes("\0") || path16.isAbsolute(file)) return null;
       const target = path16.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs18.realpathSync(target);
+      const real = fs19.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs18.statSync(real);
+      const st = fs19.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs18.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs19.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
@@ -4714,7 +4750,7 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path17.join(os11.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path17.join(os12.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
   return path17.join(
@@ -4738,11 +4774,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs19.mkdirSync(path17.dirname(file), { recursive: true, mode: 448 });
+  fs20.mkdirSync(path17.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs19.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs19.chmodSync(tmp, 384);
-  fs19.renameSync(tmp, file);
+  fs20.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs20.chmodSync(tmp, 384);
+  fs20.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -4824,7 +4860,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs19.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs20.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -5821,7 +5857,7 @@ function stageReview(payload, target, deps) {
 }
 
 // src/modes/review/holistic-fixture.ts
-import fs20 from "fs";
+import fs21 from "fs";
 import path18 from "path";
 function anchor(v, where) {
   const e = v ?? {};
@@ -5830,7 +5866,7 @@ function anchor(v, where) {
   return { file: e.file, line: e.line, symbol: e.symbol };
 }
 function loadHolisticFixture(dir) {
-  const raw = JSON.parse(fs20.readFileSync(path18.join(dir, "expectations.json"), "utf8"));
+  const raw = JSON.parse(fs21.readFileSync(path18.join(dir, "expectations.json"), "utf8"));
   const positives = Array.isArray(raw.plantedPositives) ? raw.plantedPositives : [];
   const misses = Array.isArray(raw.nearMisses) ? raw.nearMisses : [];
   if (positives.length === 0 || misses.length === 0)
@@ -5863,7 +5899,7 @@ function verifyFixtureAnchors(dir, fixture) {
   const check = (a, label2) => {
     let lines;
     try {
-      lines = fs20.readFileSync(path18.join(dir, a.file), "utf8").split(/\r?\n/);
+      lines = fs21.readFileSync(path18.join(dir, a.file), "utf8").split(/\r?\n/);
     } catch {
       broken.push(`${label2}: ${a.file} is unreadable`);
       return;
@@ -6004,10 +6040,14 @@ function parseSynthesis(raw) {
 // src/modes/brainstorm/prompt.ts
 var JSON_RULE = "Respond with ONE fenced ```json block and NOTHING else, matching:";
 var FILE_CONTEXT_BUDGET = 24e3;
+var contextBudget = FILE_CONTEXT_BUDGET;
+function setContextBudget(chars) {
+  contextBudget = Math.max(1e3, Math.floor(chars));
+}
 function contextBlock(fileContext) {
   if (!fileContext || !fileContext.trim()) return "";
   const trimmed = fileContext.trimEnd();
-  const body = trimmed.length > FILE_CONTEXT_BUDGET ? `${trimmed.slice(0, FILE_CONTEXT_BUDGET)}
+  const body = trimmed.length > contextBudget ? `${trimmed.slice(0, contextBudget)}
 \u2026[context truncated]` : trimmed;
   return `
 ## Shared context
@@ -6254,7 +6294,11 @@ async function runBrainstormMode(opts) {
   const log = opts.onProgress ?? (() => {
   });
   const roster = opts.voices && opts.voices.length > 0 ? opts.voices : [...VOICE_IDS];
-  const adapters = opts.adapters ?? VOICE_ADAPTERS;
+  const baseAdapters = opts.adapters ?? VOICE_ADAPTERS;
+  const evidenceRoot = opts.evidenceRoot;
+  const adapters = evidenceRoot ? Object.fromEntries(
+    Object.entries(baseAdapters).map(([id, fn]) => [id, (p, c, o) => fn(p, c, { ...o, evidenceRoot })])
+  ) : baseAdapters;
   const configs = opts.voiceConfigs ?? loadVoices(opts.voicesFile);
   assertRosterAdvisors(roster, configs, opts.voiceConfigs ? void 0 : "voices.json");
   const timeoutMs = opts.timeoutMs ?? DEFAULT_VOICE_TIMEOUT_MS;
@@ -6305,10 +6349,11 @@ __export(consult_exports, {
 // src/modes/consult/prompt.ts
 var JSON_RULE2 = "Respond with ONE fenced ```json block and NOTHING else, matching:";
 var FILE_CONTEXT_BUDGET2 = 24e3;
+var contextBudget2 = FILE_CONTEXT_BUDGET2;
 function contextBlock2(fileContext) {
   if (!fileContext || !fileContext.trim()) return "";
   const trimmed = fileContext.trimEnd();
-  const body = trimmed.length > FILE_CONTEXT_BUDGET2 ? `${trimmed.slice(0, FILE_CONTEXT_BUDGET2)}
+  const body = trimmed.length > contextBudget2 ? `${trimmed.slice(0, contextBudget2)}
 \u2026[context truncated]` : trimmed;
   return `
 ## Context
@@ -7058,7 +7103,11 @@ async function runConsultMode(opts) {
   const log = opts.onProgress ?? (() => {
   });
   const roster = opts.voices && opts.voices.length > 0 ? opts.voices : [...VOICE_IDS];
-  const adapters = opts.adapters ?? VOICE_ADAPTERS;
+  const baseAdapters = opts.adapters ?? VOICE_ADAPTERS;
+  const evidenceRoot = opts.evidenceRoot;
+  const adapters = evidenceRoot ? Object.fromEntries(
+    Object.entries(baseAdapters).map(([id, fn]) => [id, (p, c, o) => fn(p, c, { ...o, evidenceRoot })])
+  ) : baseAdapters;
   const configs = opts.voiceConfigs ?? loadVoices(opts.voicesFile);
   assertRosterAdvisors(roster, configs, opts.voiceConfigs ? void 0 : "voices.json");
   if (opts.debate?.judge && !roster.includes(opts.debate.judge))
@@ -7125,6 +7174,7 @@ export {
   CI_OUTPUT_PATTERNS,
   CLAUDE_CAPABILITY_FENCE,
   CLAUDE_EFFORTS,
+  CLAUDE_EVIDENCE_MAX_TURNS,
   CLAUDE_INACTIVITY_TIMEOUT_MS,
   CLAUDE_READ_TOOLS,
   CLAUDE_REVIEW_DENIED_TOOLS,
@@ -7148,6 +7198,7 @@ export {
   EVIDENCE_MANIFEST_FILE,
   EVIDENCE_MANIFEST_SCHEMA_VERSION,
   EVIDENCE_SEATS,
+  FILE_CONTEXT_BUDGET,
   FINDINGS_INSTRUCTIONS,
   GROK_CLI_SANDBOX,
   GROK_INACTIVITY_TIMEOUT_MS,
@@ -7213,6 +7264,7 @@ export {
   assembleCodePacket,
   assertRosterAdvisors,
   boundedStreamTail,
+  buildClaudeEvidenceArgs,
   buildClaudeReviewArgs,
   buildClaudeVoiceArgs,
   buildCodexReviewArgs,
@@ -7407,6 +7459,7 @@ export {
   section,
   securityClassLabel,
   segmentsWithoutTruncationSplices,
+  setContextBudget,
   severityAtLeast,
   sha256Hex,
   stageReview,
