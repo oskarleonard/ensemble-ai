@@ -6,7 +6,8 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { composeEvidenceContext, EVIDENCE_CONTRACT, openEvidenceRoot } from './evidence';
 
-const outside = fs.mkdtempSync(path.join('/private/tmp', 'evidence-root-'));
+// os.tmpdir(): /var/folders/… on macOS, /tmp on Linux CI — never under the FAKE home the tests pass.
+const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'evidence-root-'));
 afterAll(() => fs.rmSync(outside, { force: true, recursive: true }));
 
 describe('openEvidenceRoot', () => {
