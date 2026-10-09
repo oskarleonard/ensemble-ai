@@ -32,6 +32,7 @@ import {
 } from './core/types';
 import { runBrainstormMode } from './modes/brainstorm';
 import { composeEvidenceContext, type EvidenceRootInfo, openEvidenceRoot } from './modes/evidence';
+import { type Companion, getCompanionNames, installCompanions, parseCompanionFlags } from './modes/review/companions';
 import { judgeConfig, listVoices, loadJudge, loadVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
   probeSeatLabel,
@@ -1241,6 +1242,7 @@ async function reviewCommand(
         pr: { type: 'string' },
         premise: { type: 'boolean' },
         repo: { type: 'string' },
+        companion: { type: 'string' },
         reviewers: { type: 'string' },
         'run-id': { type: 'string' },
         sandbox: { type: 'string' },
@@ -1336,6 +1338,17 @@ async function reviewCommand(
   // owner-only temp parent (worktree + its private repo); nothing is registered in the user's shared
   // checkout, so there is no `git worktree prune` to run and a crash/SIGTERM leaks at most one temp
   // parent (spec §9, grok-f1). Every failure is a NAMED cause, never a generic "git failed".
+  let companions: Companion[] = [];
+  try {
+    companions = parseCompanionFlags(typeof values.companion === 'string' ? values.companion.split(',').map((x) => x.trim()).filter(Boolean) : undefined);
+  } catch (e) {
+    console.error(`ensemble-ai ${cmd}: ${(e as Error).message}`);
+    return 3;
+  }
+  if (companions.length > 0 && !repoFlag) {
+    console.error(`ensemble-ai ${cmd}: --companion needs --repo (companions are placed inside the worktree)`);
+    return 3;
+  }
   let worktree: WorktreeSession | null = null;
   if (repoFlag && source.postTarget && source.headShaOverride && source.prBaseSha) {
     console.error(`· materializing the PR head as a read-only worktree of ${repoFlag}…`);
@@ -1351,6 +1364,13 @@ async function reviewCommand(
       return 3;
     }
     worktree = opened;
+    // Companion repos (hugin spec doc-review-evidence §8): placed INSIDE the worktree before any
+    // seat spawns, so every fenced seat reaches them through the one read root it already has.
+    if (companions.length > 0) {
+      const installed = installCompanions(worktree.dir, companions);
+      for (const c of installed)
+        console.error(`· companion ${c.name}: ${c.files} file(s) under .companions/${c.name}/${c.strippedInstructionFiles.length ? ` (${c.strippedInstructionFiles.length} instruction file(s) stripped)` : ''}`);
+    }
   }
 
   try {
@@ -1912,6 +1932,9 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       const receipt: DiffReviewReceipt = {
         ...result.receiptCandidate,
         ...(peerReviewers.length > 0 ? { peerReviewers } : {}),
+        // Companion repos installed inside the worktree (`--companion`), by name — data the
+        // verifier shows; a run with companions is not evidence-equivalent to one without.
+        ...(getCompanionNames().length > 0 ? { companions: getCompanionNames() } : {}),
         // Stamp the Anthropic seats' realized classes in beside the core's (a v2 receipt only —
         // a packet run's candidate carries no evidence maps at all, and must stay byte-identical
         // to a legacy one). Never hashed, so the receipt key is unchanged.
@@ -2807,6 +2830,8 @@ Options:
   --staged              use the staged diff (\`git diff --cached\`) as the current state
   --working-tree        use uncommitted tracked changes (\`git diff HEAD\`)
   --repo <dir>          the repo to verify, AND a request for WORKTREE evidence: verify then asks
+  --companion <n>=<dir>[,<n2>=<dir2>] sibling repos' exports (pinned commit, no .git) placed read-only
+                        inside the worktree under .companions/<n>/ as context (needs --repo)
                         the stronger question "was this reviewed with whole-project evidence?" and
                         FAILS (evidence-degraded) on a receipt whose realized per-seat evidence is
                         weaker, naming the seat. Every receipt minted so far is packet-evidenced.

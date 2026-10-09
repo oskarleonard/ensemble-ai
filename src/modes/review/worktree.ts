@@ -264,7 +264,7 @@ const CURSOR_RULES = 'rules';
 
 // The strip set as prose, DERIVED from the constants above so a seat prompt can never name a
 // different list than `stripAgentInstructions` actually removes.
-const STRIPPED_INSTRUCTION_PATHS = [...AGENT_INSTRUCTION_NAMES, `${CURSOR_DIR}/${CURSOR_RULES}`];
+export const STRIPPED_INSTRUCTION_PATHS = [...AGENT_INSTRUCTION_NAMES, `${CURSOR_DIR}/${CURSOR_RULES}`];
 
 // CASE-INSENSITIVE name matching for the strip (r3 review, claude-f1 — agree-grounded):
 // macOS and Windows filesystems are case-insensitive by default, so a PR author's

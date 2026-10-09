@@ -1,5 +1,6 @@
 import { CI_EVIDENCE_SECTION_TITLE } from '../../core/packet';
 
+import { companionsClause } from './companions';
 import { resolveCiEvidence } from './ci-evidence';
 import { HISTORY_PACKET_CLAUSE } from './history-packet';
 import {
@@ -187,7 +188,7 @@ cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from)
 
 ${materializedDiffClause(args)}${ci}
 
-${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 
 ${OPERATOR_REVIEW_METHOD}
 

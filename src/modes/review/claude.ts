@@ -22,6 +22,7 @@ import { type RunReviewOpts, REVIEW_TIMEOUT_MS } from '../../reviewers/codex';
 
 import type { SandboxProfileRef } from './evidence';
 import { HISTORY_PACKET_CLAUSE, writeHistoryPacket } from './history-packet';
+import { companionsClause } from './companions';
 import { UNTRUSTED_INSTRUCTIONS_CLAUSE } from './worktree';
 
 // The COLD headless `claude -p` used as a review VOICE (a peer reviewer) and as the
@@ -347,5 +348,5 @@ Read any file in that directory for whole-project context: a finding may cite an
 reinvented utility, a convention the diff drifts from). Anchor every finding at file:line as it
 exists at ${args.headSha}.
 
-${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}`;
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}`;
 }
