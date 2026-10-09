@@ -470,7 +470,7 @@ export async function runGrokReview(
 ): Promise<CodexReviewResult> {
   const timeoutMs =
     opts.timeoutMs ??
-    (opts.worktree ? GROK_WORKTREE_REVIEW_TIMEOUT_MS : GROK_PACKET_REVIEW_TIMEOUT_MS);
+    ((opts.worktree ?? opts.evidenceRoot) ? GROK_WORKTREE_REVIEW_TIMEOUT_MS : GROK_PACKET_REVIEW_TIMEOUT_MS);
   // Pin the boundary to a proven read-only profile (provisioning the resolved one,
   // which is exactly what buildGrokReviewArgs will pass to --sandbox).
   const sandbox = resolveReviewSandbox(config.sandbox);
@@ -484,7 +484,9 @@ export async function runGrokReview(
   // while the receipt named a profile it never ran under. Compared against the CLI sandbox NAME,
   // not the receipt's profile id: since codex-f3 the id also names the egress fence, which grok's
   // sandbox schema knows nothing about. Fail closed rather than attest a fence that did not apply.
-  const worktreeCwd = opts.worktree;
+  // An evidence root (brainstorm/consult `--evidence-root`) rides the worktree path: the same
+  // qualified sandbox, tool fence and egress proxy, with the root as the seat's cwd.
+  const worktreeCwd = opts.worktree ?? opts.evidenceRoot;
   if (worktreeCwd && sandbox !== GROK_CLI_SANDBOX) {
     return {
       ok: false,

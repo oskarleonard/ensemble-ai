@@ -3,9 +3,9 @@
 // src/cli.ts
 import { execFileSync as execFileSync5 } from "child_process";
 import crypto2 from "crypto";
-import fs24 from "fs";
-import os12 from "os";
-import path20 from "path";
+import fs26 from "fs";
+import os14 from "os";
+import path21 from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 import { parseArgs } from "util";
 
@@ -999,10 +999,14 @@ function parseSynthesis(raw) {
 // src/modes/brainstorm/prompt.ts
 var JSON_RULE = "Respond with ONE fenced ```json block and NOTHING else, matching:";
 var FILE_CONTEXT_BUDGET = 24e3;
+var contextBudget = FILE_CONTEXT_BUDGET;
+function setContextBudget(chars) {
+  contextBudget = Math.max(1e3, Math.floor(chars));
+}
 function contextBlock(fileContext) {
   if (!fileContext || !fileContext.trim()) return "";
   const trimmed = fileContext.trimEnd();
-  const body = trimmed.length > FILE_CONTEXT_BUDGET ? `${trimmed.slice(0, FILE_CONTEXT_BUDGET)}
+  const body = trimmed.length > contextBudget ? `${trimmed.slice(0, contextBudget)}
 \u2026[context truncated]` : trimmed;
   return `
 ## Shared context
@@ -1117,8 +1121,8 @@ a tight ranked list of the genuinely strong ideas over a long one.
 }
 
 // src/modes/brainstorm/voices.ts
-import fs11 from "fs";
-import os8 from "os";
+import fs12 from "fs";
+import os9 from "os";
 import path9 from "path";
 
 // src/reviewers/codex.ts
@@ -1591,8 +1595,11 @@ function writeCodexSandboxProfile(paths) {
 function wrapWithSandbox(profileFile, bin, args) {
   return { args: ["-f", profileFile, bin, ...args], bin: "/usr/bin/sandbox-exec" };
 }
-function buildCodexWorktreeArgs(config, outFile, prompt) {
+function buildCodexWorktreeArgs(config, outFile, prompt, opts = {}) {
   return [
+    // Vendor-side live web search (a `web: true` brainstorm/consult voice behind an evidence root)
+    // — a GLOBAL flag, so it goes before `exec` (#101). Never set by the review pipeline.
+    ...opts.web ? ["--search"] : [],
     "exec",
     "--skip-git-repo-check",
     "--ephemeral",
@@ -1746,7 +1753,7 @@ async function runCodexWorktreeReview(prompt, config, worktree, opts) {
   const wrapped = wrapWithSandbox(
     profile.file,
     bin,
-    buildCodexWorktreeArgs(config, reply.file, prompt)
+    buildCodexWorktreeArgs(config, reply.file, prompt, { web: opts.web })
   );
   const cleanup = () => {
     profile.cleanup();
@@ -1778,7 +1785,8 @@ async function runCodexWorktreeReview(prompt, config, worktree, opts) {
   }
 }
 function runCodexReview(prompt, config, opts = {}) {
-  if (opts.worktree) return runCodexWorktreeReview(prompt, config, opts.worktree, opts);
+  const readRoot = opts.worktree ?? opts.evidenceRoot;
+  if (readRoot) return runCodexWorktreeReview(prompt, config, readRoot, opts);
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   const outFile = reviewOutFile();
   return runReviewerExec({
@@ -2107,9 +2115,9 @@ function extractGrokText(stdout) {
   return trimmed || null;
 }
 async function runGrokReview(prompt, config, opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? (opts.worktree ? GROK_WORKTREE_REVIEW_TIMEOUT_MS : GROK_PACKET_REVIEW_TIMEOUT_MS);
+  const timeoutMs = opts.timeoutMs ?? (opts.worktree ?? opts.evidenceRoot ? GROK_WORKTREE_REVIEW_TIMEOUT_MS : GROK_PACKET_REVIEW_TIMEOUT_MS);
   const sandbox = resolveReviewSandbox(config.sandbox);
-  const worktreeCwd = opts.worktree;
+  const worktreeCwd = opts.worktree ?? opts.evidenceRoot;
   if (worktreeCwd && sandbox !== GROK_CLI_SANDBOX) {
     return {
       ok: false,
@@ -2308,6 +2316,35 @@ function streamActivityTail(stdout, limit = 600) {
 }
 
 // src/modes/brainstorm/claude.ts
+import fs11 from "fs";
+import os8 from "os";
+
+// src/core/claude-fence.ts
+var CLAUDE_REVIEW_DENIED_TOOLS = [
+  "Bash",
+  // The fan-out channel: a subagent is a fresh full-context conversation at the seat's own
+  // model/effort — at opus@max a skill- or model-initiated fan-out multiplies the operator's
+  // subscription burn ~15x (lived: run 2026-08-07-17-16-13 ate ~77% of a Max 5x window). The
+  // seat is a cold SINGLE-PASS peer; both tool names are denied ('Task' is the older name —
+  // a fence names the tool before it comes back). Fence version bumped: 1 → 2.
+  "Agent",
+  "Task",
+  "WebFetch",
+  "WebSearch",
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit"
+];
+var CLAUDE_READ_TOOLS = ["Read", "Grep", "Glob"];
+function denyUnder(tool, absDir) {
+  return `${tool}(/${absDir.replace(/\/+$/, "")}/**)`;
+}
+function homeReadDenyRules(homeDir) {
+  return CLAUDE_READ_TOOLS.map((t) => denyUnder(t, homeDir));
+}
+
+// src/modes/brainstorm/claude.ts
 function resolveClaudeBin() {
   return resolveBin("claude", { envVar: "CLAUDE_BIN" });
 }
@@ -2322,6 +2359,26 @@ function claudeAdvisorEnv(config) {
 }
 var CLAUDE_WEB_TOOLS = "WebSearch,WebFetch";
 var CLAUDE_WEB_MAX_TURNS = 25;
+var CLAUDE_EVIDENCE_MAX_TURNS = 60;
+function buildClaudeEvidenceArgs(prompt, config, fence) {
+  const root = fence.evidenceRoot;
+  if (!root) throw new Error("buildClaudeEvidenceArgs: an evidence root is required");
+  const home = fence.homeDir ?? os8.homedir();
+  if (root === home || isUnder(root, home))
+    throw new Error(
+      `refusing to fence a claude voice whose evidence root (${root}) is inside the home directory \u2014 the home-read deny would also deny the root. Seal the evidence outside $HOME.`
+    );
+  const args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "plan"];
+  if (config?.web === true) args.push("--allowedTools", "WebSearch");
+  args.push("--max-turns", String(CLAUDE_EVIDENCE_MAX_TURNS));
+  if (config?.model && config.model !== "default") args.push("--model", config.model);
+  if (config && CLAUDE_EFFORTS.has(config.effort)) args.push("--effort", config.effort);
+  args.push(...claudeAdvisorArgs(config));
+  args.push("--add-dir", root, "--strict-mcp-config");
+  const denied = CLAUDE_REVIEW_DENIED_TOOLS.filter((t) => !(config?.web === true && t === "WebSearch"));
+  args.push("--disallowedTools", ...denied, ...homeReadDenyRules(home));
+  return args;
+}
 function buildClaudeVoiceArgs(prompt, config) {
   const args = ["-p", prompt, "--output-format", "stream-json", "--verbose"];
   if (config?.web === true)
@@ -2339,84 +2396,90 @@ async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
   const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
   const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  const args = buildClaudeVoiceArgs(prompt, config);
+  const args = opts.evidenceRoot ? buildClaudeEvidenceArgs(prompt, config, { evidenceRoot: opts.evidenceRoot }) : buildClaudeVoiceArgs(prompt, config);
+  const neutralCwd = opts.evidenceRoot ? makeOwnerOnlyTempDir("ensemble-voice-cwd-") : void 0;
   const env = claudeAdvisorEnv(config);
   let retried = 0;
-  for (; ; ) {
-    const startedAt = Date.now();
-    const { raw, stderrTail, timedOut, timedOutReason } = await exec({
-      args,
-      bin: seams.bin ?? resolveClaudeBin(),
-      capture: "stdout",
-      env,
-      inactivityTimeoutMs,
-      onSpawn: opts.onSpawn,
-      stderrLimit: 2e3,
-      timeoutMs
-    });
-    const elapsedMs = Date.now() - startedAt;
-    const stream = typeof raw === "string" ? extractStreamResult(raw) : null;
-    const text = stream?.found ? stream.text : raw;
-    const activity = streamActivityTail(raw);
-    const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
-    if (transient && retried < retryDelaysMs.length) {
-      await sleep(retryDelaysMs[retried]);
-      retried += 1;
-      continue;
-    }
-    if (transient) {
-      const errorLine = (stream?.found ? stream.text ?? "" : raw ?? "").trim();
+  try {
+    for (; ; ) {
+      const startedAt = Date.now();
+      const { raw, stderrTail, timedOut, timedOutReason } = await exec({
+        args,
+        bin: seams.bin ?? resolveClaudeBin(),
+        capture: "stdout",
+        ...neutralCwd ? { cwd: neutralCwd } : {},
+        env,
+        inactivityTimeoutMs,
+        onSpawn: opts.onSpawn,
+        stderrLimit: 2e3,
+        timeoutMs
+      });
+      const elapsedMs = Date.now() - startedAt;
+      const stream = typeof raw === "string" ? extractStreamResult(raw) : null;
+      const text = stream?.found ? stream.text : raw;
+      const activity = streamActivityTail(raw);
+      const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
+      if (transient && retried < retryDelaysMs.length) {
+        await sleep(retryDelaysMs[retried]);
+        retried += 1;
+        continue;
+      }
+      if (transient) {
+        const errorLine = (stream?.found ? stream.text ?? "" : raw ?? "").trim();
+        return {
+          failWhy: `persistent transient API error after ${retried + 1} attempts`,
+          ok: false,
+          raw: null,
+          stderrTail: errorLine.slice(0, 300),
+          timedOut: false
+        };
+      }
+      const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
+      if (!timedOut && limitText) {
+        return {
+          failWhy: `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${limitText.slice(0, 160)}`,
+          ok: false,
+          raw: null,
+          stderrTail: limitText.slice(0, 300),
+          timedOut: false
+        };
+      }
+      if (!timedOut && stream?.found && stream.isError) {
+        const status = stream.apiErrorStatus;
+        return {
+          failWhy: `the voice returned an error result${status ? ` (API status ${status})` : ""}`,
+          ok: false,
+          raw: null,
+          stderrTail: (stream.text ?? "").trim().slice(0, 300) || stderrTail,
+          timedOut: false
+        };
+      }
+      if (timedOut) {
+        const bar = timedOutReason === "inactivity" ? inactivityTimeoutMs : timeoutMs;
+        const span = bar >= 6e4 ? `${Math.round(bar / 6e4)} min` : `${Math.round(bar / 1e3)} s`;
+        const failWhy = timedOutReason === "inactivity" ? `stalled: no stream output for ${span} (wedged seat reclaimed)` : `still working when the ${span} backstop cut it \u2014 give it budget`;
+        return {
+          failWhy,
+          ok: false,
+          raw: null,
+          stderrTail,
+          ...activity ? { stream: activity } : {},
+          timedOut: true,
+          ...timedOutReason ? { timedOutReason } : {}
+        };
+      }
+      const retryNote = retried > 0 ? `[retried ${retried}x on transient API error] ` : "";
+      const reply = text && text.trim() ? text : null;
       return {
-        failWhy: `persistent transient API error after ${retried + 1} attempts`,
-        ok: false,
-        raw: null,
-        stderrTail: errorLine.slice(0, 300),
+        ok: reply !== null,
+        raw: reply,
+        stderrTail: retryNote ? `${retryNote}${stderrTail ?? ""}` : stderrTail,
+        ...reply === null && activity ? { stream: activity } : {},
         timedOut: false
       };
     }
-    const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
-    if (!timedOut && limitText) {
-      return {
-        failWhy: `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${limitText.slice(0, 160)}`,
-        ok: false,
-        raw: null,
-        stderrTail: limitText.slice(0, 300),
-        timedOut: false
-      };
-    }
-    if (!timedOut && stream?.found && stream.isError) {
-      const status = stream.apiErrorStatus;
-      return {
-        failWhy: `the voice returned an error result${status ? ` (API status ${status})` : ""}`,
-        ok: false,
-        raw: null,
-        stderrTail: (stream.text ?? "").trim().slice(0, 300) || stderrTail,
-        timedOut: false
-      };
-    }
-    if (timedOut) {
-      const bar = timedOutReason === "inactivity" ? inactivityTimeoutMs : timeoutMs;
-      const span = bar >= 6e4 ? `${Math.round(bar / 6e4)} min` : `${Math.round(bar / 1e3)} s`;
-      const failWhy = timedOutReason === "inactivity" ? `stalled: no stream output for ${span} (wedged seat reclaimed)` : `still working when the ${span} backstop cut it \u2014 give it budget`;
-      return {
-        failWhy,
-        ok: false,
-        raw: null,
-        stderrTail,
-        ...activity ? { stream: activity } : {},
-        timedOut: true,
-        ...timedOutReason ? { timedOutReason } : {}
-      };
-    }
-    const retryNote = retried > 0 ? `[retried ${retried}x on transient API error] ` : "";
-    const reply = text && text.trim() ? text : null;
-    return {
-      ok: reply !== null,
-      raw: reply,
-      stderrTail: retryNote ? `${retryNote}${stderrTail ?? ""}` : stderrTail,
-      ...reply === null && activity ? { stream: activity } : {},
-      timedOut: false
-    };
+  } finally {
+    if (neutralCwd) fs11.rmSync(neutralCwd, { force: true, recursive: true });
   }
 }
 
@@ -2470,7 +2533,7 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), { ...o, ...c.web ? { web: true } : {} }),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), { ...o, ...c.web ? { web: true } : {} })
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path9.join(os8.homedir(), ".ensemble-ai", "voices.json");
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path9.join(os9.homedir(), ".ensemble-ai", "voices.json");
 function str3(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
@@ -2509,7 +2572,7 @@ function parseJudge(raw) {
 }
 function loadJudge(file = VOICES_FILE) {
   try {
-    return parseJudge(JSON.parse(fs11.readFileSync(file, "utf8")));
+    return parseJudge(JSON.parse(fs12.readFileSync(file, "utf8")));
   } catch {
     return {};
   }
@@ -2520,7 +2583,7 @@ function judgeConfig(spec, voiceId, configs) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs11.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs12.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
@@ -2666,7 +2729,11 @@ async function runBrainstormMode(opts) {
   const log = opts.onProgress ?? (() => {
   });
   const roster = opts.voices && opts.voices.length > 0 ? opts.voices : [...VOICE_IDS];
-  const adapters = opts.adapters ?? VOICE_ADAPTERS;
+  const baseAdapters = opts.adapters ?? VOICE_ADAPTERS;
+  const evidenceRoot = opts.evidenceRoot;
+  const adapters = evidenceRoot ? Object.fromEntries(
+    Object.entries(baseAdapters).map(([id, fn]) => [id, (p, c, o) => fn(p, c, { ...o, evidenceRoot })])
+  ) : baseAdapters;
   const configs = opts.voiceConfigs ?? loadVoices(opts.voicesFile);
   assertRosterAdvisors(roster, configs, opts.voiceConfigs ? void 0 : "voices.json");
   const timeoutMs = opts.timeoutMs ?? DEFAULT_VOICE_TIMEOUT_MS;
@@ -2702,33 +2769,215 @@ async function runBrainstormMode(opts) {
   return { critique, generate, roster, synthesis, topic: opts.topic };
 }
 
-// src/modes/review/claude.ts
-import fs17 from "fs";
+// src/modes/evidence.ts
+import fs13 from "fs";
 import os10 from "os";
+import path10 from "path";
+
+// src/modes/consult/prompt.ts
+var JSON_RULE2 = "Respond with ONE fenced ```json block and NOTHING else, matching:";
+var FILE_CONTEXT_BUDGET2 = 24e3;
+var contextBudget2 = FILE_CONTEXT_BUDGET2;
+function setContextBudget2(chars) {
+  contextBudget2 = Math.max(1e3, Math.floor(chars));
+}
+function contextBlock2(fileContext) {
+  if (!fileContext || !fileContext.trim()) return "";
+  const trimmed = fileContext.trimEnd();
+  const body = trimmed.length > contextBudget2 ? `${trimmed.slice(0, contextBudget2)}
+\u2026[context truncated]` : trimmed;
+  return `
+## Context
+${body}
+`;
+}
+function renderAnswerPrompt(question, fileContext) {
+  return `You are an independent expert answering a question inside a multi-model
+consultation. Work ENTIRELY ON YOUR OWN: you have no knowledge of anyone else's
+answer \u2014 do not hedge toward, anticipate, or defer to a consensus. Give YOUR honest,
+reasoned answer. Where you are uncertain, say so plainly.
+
+## Question
+${question.trim()}
+${contextBlock2(fileContext)}
+## Output format \u2014 STRICT
+${JSON_RULE2}
+{
+  "summary": "<your bottom-line answer in one sentence>",
+  "answer": "<your full reasoned answer: the recommendation and the WHY>",
+  "keyPoints": ["<a discrete claim or consideration behind your answer>"]
+}
+Give 2-5 keyPoints \u2014 the load-bearing claims of your answer, each a standalone
+sentence (these are what the ensemble compares across voices). Be decisive; do not
+pad.
+`;
+}
+function peerAnswersBlock(peers) {
+  return peers.map(
+    (p) => `[${p.voiceId}] ${p.summary}
+${p.answer}${p.keyPoints.length ? `
+- ${p.keyPoints.join("\n- ")}` : ""}`
+  ).join("\n\n");
+}
+function renderCritiquePrompt2(question, peers, fileContext) {
+  return `You are a sharp, candid participant in a multi-model consultation. Below are
+answers from the OTHER voices (you did not write these) to the question. For the
+strongest points, say where you AGREE, where you have a CONCERN or disagree, and where
+an answer should be REFINED. Be specific \u2014 this sharpens the final synthesis.
+
+## Question
+${question.trim()}
+${contextBlock2(fileContext)}
+## Answers from the other voices
+${peerAnswersBlock(peers)}
+
+## Output format \u2014 STRICT
+${JSON_RULE2}
+{
+  "summary": "<your overall read of where the voices land>",
+  "notes": [
+    {
+      "target": "<the [voice] or claim you are addressing>",
+      "stance": "support" | "concern" | "extend",
+      "assessment": "<concrete: what you agree with, what you doubt, how to refine>"
+    }
+  ]
+}
+An empty "notes" array is fine if you have nothing to add.
+`;
+}
+var SYNTHESIS_FIELD_BUDGET2 = 2500;
+function cap2(s) {
+  return s.length > SYNTHESIS_FIELD_BUDGET2 ? `${s.slice(0, SYNTHESIS_FIELD_BUDGET2)}\u2026[truncated]` : s;
+}
+function answersBlock(answers) {
+  return answers.filter((a) => a.ok).map(
+    (a) => `[${a.voiceId}] ${cap2(a.summary)}
+${cap2(a.answer)}${a.keyPoints.length ? `
+key points:
+- ${a.keyPoints.map(cap2).join("\n- ")}` : ""}`
+  ).join("\n\n");
+}
+function critiqueBlock(critique) {
+  const lines = [];
+  for (const c of critique) {
+    if (!c.ok) continue;
+    for (const n of c.notes) {
+      lines.push(`(${c.voiceId}) ${n.stance} on ${cap2(n.target)}: ${cap2(n.assessment)}`);
+    }
+  }
+  return lines.length ? `
+
+## Cross-critique notes
+${lines.join("\n")}` : "";
+}
+function renderSynthesisPrompt2(question, answers, critique) {
+  return `You are the SYNTHESIZER for a multi-model consultation. Several models each
+answered the SAME question INDEPENDENTLY (they did not see each other's answers).
+Compare them and separate the signal:
+- AGREEMENTS: substantive points the voices CONCUR on \u2014 these are the confident core.
+- DIVERGENCES: points they answered DIFFERENTLY \u2014 flag these as "look closer", and
+  record who took which position.
+Then give ONE bottom-line recommendation, noting how much of it rests on agreement
+vs on a judgement call between diverging views. Write it for a human reader, not as
+one paragraph: the verdict in one or two sentences, then the actions or blockers as a
+numbered list (one per line, "1. \u2026"), then a short paragraph on confidence. Separate
+those parts with blank lines (\\n\\n inside the JSON string).
+
+## Question
+${question.trim()}
+
+## Independent answers
+${answersBlock(answers)}${critiqueBlock(critique)}
+
+## Output format \u2014 STRICT
+${JSON_RULE2}
+{
+  "summary": "<the headline answer in 2-3 sentences>",
+  "agreements": [
+    { "point": "<a substantive point the voices agree on>", "voices": ["codex", "grok"] }
+  ],
+  "divergences": [
+    { "point": "<the question they split on>", "positions": ["codex: X", "grok: Y"] }
+  ],
+  "recommendation": "<verdict sentence(s)\\n\\n1. <action or blocker>\\n2. \u2026\\n\\n<how confident, given agree vs diverge>"
+}
+Only list a REAL agreement (genuine concurrence, not a superficial overlap) and a
+REAL divergence (a substantive split, not wording). Empty arrays are fine.
+`;
+}
+
+// src/modes/evidence.ts
+var EVIDENCE_CONTEXT_BUDGET = 12e4;
+var EVIDENCE_INDEX_BUDGET = 8e3;
+var EVIDENCE_CONTRACT = `The directory granted to you is the EVIDENCE for this review \u2014 read what you need from it
+(its INDEX is below). START every point with the section (\xA7n) it concerns AND cite the evidence
+path(s) you checked (\`notion/\u2026\`, \`linear/\u2026\`, \`reviews/\u2026\`, \`code/\u2026\`, \`doc.md\`). If a thread, a
+page or a prior ruling already settles the point, write \`settled: <path>\` and raise it only if
+you disagree \u2014 then say what the evidence missed. A claim about code must name the file you read.`;
+function openEvidenceRoot(dir, home = os10.homedir()) {
+  if (!path10.isAbsolute(dir)) throw new Error(`--evidence-root must be an absolute path (got ${dir})`);
+  let root;
+  try {
+    root = fs13.realpathSync(dir);
+  } catch {
+    throw new Error(`--evidence-root ${dir} does not exist`);
+  }
+  if (!fs13.statSync(root).isDirectory()) throw new Error(`--evidence-root ${dir} is not a directory`);
+  if (root === home || isUnder(root, home))
+    throw new Error(
+      `--evidence-root ${root} is inside the home directory \u2014 the claude seat's home-read deny would deny it; seal the evidence outside $HOME`
+    );
+  let index = null;
+  try {
+    index = fs13.readFileSync(path10.join(root, "INDEX.md"), "utf8").slice(0, EVIDENCE_INDEX_BUDGET);
+  } catch {
+    index = null;
+  }
+  return { root, index };
+}
+function composeEvidenceContext(fileContext, info) {
+  setContextBudget(EVIDENCE_CONTEXT_BUDGET);
+  setContextBudget2(EVIDENCE_CONTEXT_BUDGET);
+  const doc = fileContext?.trimEnd() ?? "";
+  const index = info.index ? `
+### Evidence index (${path10.basename(info.root)}/INDEX.md)
+${info.index.trimEnd()}
+` : "\n(the evidence root has no INDEX.md \u2014 list the directory)\n";
+  return `${doc}
+
+## Evidence root
+${EVIDENCE_CONTRACT}
+${index}`;
+}
+
+// src/modes/review/claude.ts
+import fs19 from "fs";
+import os12 from "os";
 
 // src/modes/review/history-packet.ts
-import fs16 from "fs";
-import path15 from "path";
+import fs18 from "fs";
+import path16 from "path";
 
 // src/modes/review/ensemble-config.ts
-import fs12 from "fs";
-import os9 from "os";
-import path10 from "path";
-var ENSEMBLE_CONFIG_PATH = path10.join(os9.homedir(), ".ensemble-ai", "config.json");
+import fs14 from "fs";
+import os11 from "os";
+import path11 from "path";
+var ENSEMBLE_CONFIG_PATH = path11.join(os11.homedir(), ".ensemble-ai", "config.json");
 function asRecord(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : null;
 }
 function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
   try {
-    return asRecord(JSON.parse(fs12.readFileSync(configPath, "utf8"))) ?? {};
+    return asRecord(JSON.parse(fs14.readFileSync(configPath, "utf8"))) ?? {};
   } catch {
     return {};
   }
 }
 
 // src/modes/review/gate-hunks.ts
-import fs14 from "fs";
-import path13 from "path";
+import fs16 from "fs";
+import path14 from "path";
 
 // src/modes/review/secret-scan.ts
 var SENSITIVE_PATH_PATTERNS = [
@@ -3235,12 +3484,12 @@ function assembleCodePacket(input) {
 }
 
 // src/modes/review/trail-io.ts
-import fs13 from "fs";
-import path11 from "path";
+import fs15 from "fs";
+import path12 from "path";
 function readTrailJson(baseDir, runId, name2) {
   try {
     return JSON.parse(
-      fs13.readFileSync(path11.join(reviewDir(baseDir, runId), name2), "utf8")
+      fs15.readFileSync(path12.join(reviewDir(baseDir, runId), name2), "utf8")
     );
   } catch {
     return null;
@@ -3276,11 +3525,11 @@ function sha256Hex(input) {
 
 // src/modes/review/git-exec.ts
 import { execFileSync as execFileSync3 } from "child_process";
-import path12 from "path";
+import path13 from "path";
 function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
   const cmd = configured?.trim();
   if (!cmd) return "ssh -o BatchMode=yes";
-  const bin = path12.basename(cmd.split(/\s+/)[0]);
+  const bin = path13.basename(cmd.split(/\s+/)[0]);
   return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
 }
 function effectiveSshCommand(cwd, cache) {
@@ -3425,9 +3674,9 @@ function hasGeneratedHeader(section2) {
   }
   return false;
 }
-function classifyFileKind(path21, isBinary, section2 = "") {
+function classifyFileKind(path22, isBinary, section2 = "") {
   if (isBinary) return "binary";
-  if (GENERATED_PATTERNS.some((re) => re.test(path21))) return "generated";
+  if (GENERATED_PATTERNS.some((re) => re.test(path22))) return "generated";
   return section2 && hasGeneratedHeader(section2) ? "generated" : "source";
 }
 var TEST_PATTERNS = [
@@ -3439,8 +3688,8 @@ var TEST_PATTERNS = [
   /Tests?\.(java|kt|swift|cs|scala)$/,
   /\.bats$/
 ];
-function isTestPath(path21) {
-  return TEST_PATTERNS.some((re) => re.test(path21));
+function isTestPath(path22) {
+  return TEST_PATTERNS.some((re) => re.test(path22));
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -3458,7 +3707,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path21 = pathOfSection(section2);
+    const path22 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -3469,8 +3718,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path21, isBinary, section2),
-      path: path21,
+      kind: classifyFileKind(path22, isBinary, section2),
+      path: path22,
       raw: section2,
       removed
     };
@@ -3644,8 +3893,8 @@ function readGatePacketHeadSha(baseDir, runId) {
   return raw && typeof raw.headSha === "string" && raw.headSha.trim() && raw.schemaVersion === GATE_PACKET_SCHEMA_VERSION ? raw.headSha : null;
 }
 function readGatePacket(baseDir, runId, expectedHeadSha) {
-  const file = path13.join(reviewDir(baseDir, runId), "packet.gate.json");
-  if (!fs14.existsSync(file)) return { ok: false, reason: "missing" };
+  const file = path14.join(reviewDir(baseDir, runId), "packet.gate.json");
+  if (!fs16.existsSync(file)) return { ok: false, reason: "missing" };
   const raw = readTrailJson(baseDir, runId, "packet.gate.json");
   if (raw === null || typeof raw.diff !== "string" || typeof raw.headSha !== "string" || raw.schemaVersion !== GATE_PACKET_SCHEMA_VERSION) {
     return { ok: false, reason: "corrupt" };
@@ -3741,8 +3990,8 @@ function hunkCodeLines(hunk) {
 }
 
 // src/modes/review/worktree.ts
-import fs15 from "fs";
-import path14 from "path";
+import fs17 from "fs";
+import path15 from "path";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
 }
@@ -3773,18 +4022,18 @@ function allowedRootsFromConfig(configPath) {
   const roots = readEnsembleConfig(configPath).allowedRepoRoots;
   if (!Array.isArray(roots) || roots.length === 0) return null;
   const strs = roots.filter((r) => typeof r === "string" && r.trim().length > 0);
-  return strs.length > 0 ? strs.map((r) => path14.resolve(r)) : null;
+  return strs.length > 0 ? strs.map((r) => path15.resolve(r)) : null;
 }
 function rootAllowed(repoRoot, allowed) {
   if (!allowed) return true;
-  const real = path14.resolve(repoRoot);
+  const real = path15.resolve(repoRoot);
   return allowed.some((root) => {
-    const rel = path14.relative(root, real);
-    return rel === "" || !rel.startsWith("..") && !path14.isAbsolute(rel);
+    const rel = path15.relative(root, real);
+    return rel === "" || !rel.startsWith("..") && !path15.isAbsolute(rel);
   });
 }
 function resolveRepoLocation(args, deps) {
-  const repoPath = path14.resolve(args.repoPath);
+  const repoPath = path15.resolve(args.repoPath);
   const top = deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
   if (!top.ok) {
     return {
@@ -3872,7 +4121,7 @@ function stripAgentInstructions(dir) {
   const removed = [];
   const remove = (rel) => {
     try {
-      fs15.rmSync(path14.join(dir, rel), { force: true, recursive: true });
+      fs17.rmSync(path15.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -3880,7 +4129,7 @@ function stripAgentInstructions(dir) {
   const walk = (rel) => {
     let entries;
     try {
-      entries = fs15.readdirSync(path14.join(dir, rel), { withFileTypes: true });
+      entries = fs17.readdirSync(path15.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -3890,7 +4139,7 @@ function stripAgentInstructions(dir) {
       if (isInstructionName(e.name)) {
         remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
-        if (fs15.existsSync(path14.join(dir, childRel, CURSOR_RULES))) {
+        if (fs17.existsSync(path15.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
         walk(childRel);
@@ -3906,14 +4155,14 @@ function isStrippedPath(p, stripped) {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
 var PARTIAL_CLONE_CONFIG_RE = "^(extensions\\.partialclone|remote\\..*\\.promisor)$";
-var ALTERNATES_REL = path14.join("objects", "info", "alternates");
+var ALTERNATES_REL = path15.join("objects", "info", "alternates");
 function completeSharedStore(repoRoot, git2) {
   const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
-  const commonDir = path14.resolve(repoRoot, common.text.trim());
-  if (!fs15.existsSync(path14.join(commonDir, "objects"))) return null;
-  if (fs15.existsSync(path14.join(commonDir, "shallow"))) return null;
-  if (fs15.existsSync(path14.join(commonDir, ALTERNATES_REL))) return null;
+  const commonDir = path15.resolve(repoRoot, common.text.trim());
+  if (!fs17.existsSync(path15.join(commonDir, "objects"))) return null;
+  if (fs17.existsSync(path15.join(commonDir, "shallow"))) return null;
+  if (fs17.existsSync(path15.join(commonDir, ALTERNATES_REL))) return null;
   if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
   return commonDir;
 }
@@ -3980,7 +4229,7 @@ function materializeWorktree(args, deps) {
   let parent = null;
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    const bare = path14.join(parent, "repo");
+    const bare = path15.join(parent, "repo");
     const created = deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
     if (!created.ok) {
       return { kind: "materialize-failed", message: privateRepoFailure(shared, created.error) };
@@ -4003,7 +4252,7 @@ function materializeWorktree(args, deps) {
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
-    const dir = path14.join(parent, "head");
+    const dir = path15.join(parent, "head");
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
       { cwd: bare, env: INERT_ENV }
@@ -4033,14 +4282,14 @@ function materializeWorktree(args, deps) {
 }
 var REAP_RM_OPTS = { force: true, maxRetries: 3, recursive: true, retryDelay: 50 };
 function reapParent(parent) {
-  if (!path14.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
+  if (!path15.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    fs15.rmSync(parent, REAP_RM_OPTS);
+    fs17.rmSync(parent, REAP_RM_OPTS);
   } catch {
   }
 }
 function reapWorktree(dir) {
-  reapParent(path14.dirname(dir));
+  reapParent(path15.dirname(dir));
 }
 
 // src/modes/review/history-packet.ts
@@ -4352,16 +4601,16 @@ function buildHistoryPacket(args) {
   return { bytes, files, shallow: false, truncated };
 }
 function containedPath(root, rel) {
-  const abs = path15.resolve(root, rel);
-  const back = path15.relative(path15.resolve(root), abs);
+  const abs = path16.resolve(root, rel);
+  const back = path16.relative(path16.resolve(root), abs);
   return back !== "" && !escapesRoot(back) ? abs : null;
 }
 function writeHistoryPacket(cwd, files) {
   for (const f of files) {
     const abs = containedPath(cwd, f.path);
     if (!abs) continue;
-    fs16.mkdirSync(path15.dirname(abs), { recursive: true });
-    fs16.writeFileSync(abs, f.contents, { mode: 256 });
+    fs18.mkdirSync(path16.dirname(abs), { recursive: true });
+    fs18.writeFileSync(abs, f.contents, { mode: 256 });
   }
 }
 
@@ -4370,31 +4619,8 @@ var CLAUDE_CAPABILITY_FENCE = {
   id: "claude-capability-fence",
   version: 2
 };
-var CLAUDE_REVIEW_DENIED_TOOLS = [
-  "Bash",
-  // The fan-out channel: a subagent is a fresh full-context conversation at the seat's own
-  // model/effort — at opus@max a skill- or model-initiated fan-out multiplies the operator's
-  // subscription burn ~15x (lived: run 2026-08-07-17-16-13 ate ~77% of a Max 5x window). The
-  // seat is a cold SINGLE-PASS peer; both tool names are denied ('Task' is the older name —
-  // a fence names the tool before it comes back). Fence version bumped: 1 → 2.
-  "Agent",
-  "Task",
-  "WebFetch",
-  "WebSearch",
-  "Write",
-  "Edit",
-  "MultiEdit",
-  "NotebookEdit"
-];
-var CLAUDE_READ_TOOLS = ["Read", "Grep", "Glob"];
-function denyUnder(tool, absDir) {
-  return `${tool}(/${absDir.replace(/\/+$/, "")}/**)`;
-}
-function homeReadDenyRules(homeDir) {
-  return CLAUDE_READ_TOOLS.map((t) => denyUnder(t, homeDir));
-}
 function buildClaudeReviewArgs(prompt, config, fence = {}) {
-  const homeDir = fence.homeDir ?? os10.homedir();
+  const homeDir = fence.homeDir ?? os12.homedir();
   if (fence.readRoot && isUnder(fence.readRoot, homeDir)) {
     throw new Error(
       `ensemble-ai: refusing to fence a Claude seat whose read root (${fence.readRoot}) is inside the home directory (${homeDir}) \u2014 the home-read deny would also deny the worktree. Point TMPDIR outside $HOME.`
@@ -4508,7 +4734,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
     }
   } finally {
     try {
-      fs17.rmSync(cwd, { force: true, recursive: true });
+      fs19.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
   }
@@ -5099,135 +5325,6 @@ async function runProbeGate(opts) {
   } catch {
   }
   return { ran: true, report, spawned };
-}
-
-// src/modes/consult/prompt.ts
-var JSON_RULE2 = "Respond with ONE fenced ```json block and NOTHING else, matching:";
-var FILE_CONTEXT_BUDGET2 = 24e3;
-function contextBlock2(fileContext) {
-  if (!fileContext || !fileContext.trim()) return "";
-  const trimmed = fileContext.trimEnd();
-  const body = trimmed.length > FILE_CONTEXT_BUDGET2 ? `${trimmed.slice(0, FILE_CONTEXT_BUDGET2)}
-\u2026[context truncated]` : trimmed;
-  return `
-## Context
-${body}
-`;
-}
-function renderAnswerPrompt(question, fileContext) {
-  return `You are an independent expert answering a question inside a multi-model
-consultation. Work ENTIRELY ON YOUR OWN: you have no knowledge of anyone else's
-answer \u2014 do not hedge toward, anticipate, or defer to a consensus. Give YOUR honest,
-reasoned answer. Where you are uncertain, say so plainly.
-
-## Question
-${question.trim()}
-${contextBlock2(fileContext)}
-## Output format \u2014 STRICT
-${JSON_RULE2}
-{
-  "summary": "<your bottom-line answer in one sentence>",
-  "answer": "<your full reasoned answer: the recommendation and the WHY>",
-  "keyPoints": ["<a discrete claim or consideration behind your answer>"]
-}
-Give 2-5 keyPoints \u2014 the load-bearing claims of your answer, each a standalone
-sentence (these are what the ensemble compares across voices). Be decisive; do not
-pad.
-`;
-}
-function peerAnswersBlock(peers) {
-  return peers.map(
-    (p) => `[${p.voiceId}] ${p.summary}
-${p.answer}${p.keyPoints.length ? `
-- ${p.keyPoints.join("\n- ")}` : ""}`
-  ).join("\n\n");
-}
-function renderCritiquePrompt2(question, peers, fileContext) {
-  return `You are a sharp, candid participant in a multi-model consultation. Below are
-answers from the OTHER voices (you did not write these) to the question. For the
-strongest points, say where you AGREE, where you have a CONCERN or disagree, and where
-an answer should be REFINED. Be specific \u2014 this sharpens the final synthesis.
-
-## Question
-${question.trim()}
-${contextBlock2(fileContext)}
-## Answers from the other voices
-${peerAnswersBlock(peers)}
-
-## Output format \u2014 STRICT
-${JSON_RULE2}
-{
-  "summary": "<your overall read of where the voices land>",
-  "notes": [
-    {
-      "target": "<the [voice] or claim you are addressing>",
-      "stance": "support" | "concern" | "extend",
-      "assessment": "<concrete: what you agree with, what you doubt, how to refine>"
-    }
-  ]
-}
-An empty "notes" array is fine if you have nothing to add.
-`;
-}
-var SYNTHESIS_FIELD_BUDGET2 = 2500;
-function cap2(s) {
-  return s.length > SYNTHESIS_FIELD_BUDGET2 ? `${s.slice(0, SYNTHESIS_FIELD_BUDGET2)}\u2026[truncated]` : s;
-}
-function answersBlock(answers) {
-  return answers.filter((a) => a.ok).map(
-    (a) => `[${a.voiceId}] ${cap2(a.summary)}
-${cap2(a.answer)}${a.keyPoints.length ? `
-key points:
-- ${a.keyPoints.map(cap2).join("\n- ")}` : ""}`
-  ).join("\n\n");
-}
-function critiqueBlock(critique) {
-  const lines = [];
-  for (const c of critique) {
-    if (!c.ok) continue;
-    for (const n of c.notes) {
-      lines.push(`(${c.voiceId}) ${n.stance} on ${cap2(n.target)}: ${cap2(n.assessment)}`);
-    }
-  }
-  return lines.length ? `
-
-## Cross-critique notes
-${lines.join("\n")}` : "";
-}
-function renderSynthesisPrompt2(question, answers, critique) {
-  return `You are the SYNTHESIZER for a multi-model consultation. Several models each
-answered the SAME question INDEPENDENTLY (they did not see each other's answers).
-Compare them and separate the signal:
-- AGREEMENTS: substantive points the voices CONCUR on \u2014 these are the confident core.
-- DIVERGENCES: points they answered DIFFERENTLY \u2014 flag these as "look closer", and
-  record who took which position.
-Then give ONE bottom-line recommendation, noting how much of it rests on agreement
-vs on a judgement call between diverging views. Write it for a human reader, not as
-one paragraph: the verdict in one or two sentences, then the actions or blockers as a
-numbered list (one per line, "1. \u2026"), then a short paragraph on confidence. Separate
-those parts with blank lines (\\n\\n inside the JSON string).
-
-## Question
-${question.trim()}
-
-## Independent answers
-${answersBlock(answers)}${critiqueBlock(critique)}
-
-## Output format \u2014 STRICT
-${JSON_RULE2}
-{
-  "summary": "<the headline answer in 2-3 sentences>",
-  "agreements": [
-    { "point": "<a substantive point the voices agree on>", "voices": ["codex", "grok"] }
-  ],
-  "divergences": [
-    { "point": "<the question they split on>", "positions": ["codex: X", "grok: Y"] }
-  ],
-  "recommendation": "<verdict sentence(s)\\n\\n1. <action or blocker>\\n2. \u2026\\n\\n<how confident, given agree vs diverge>"
-}
-Only list a REAL agreement (genuine concurrence, not a superficial overlap) and a
-REAL divergence (a substantive split, not wording). Empty arrays are fine.
-`;
 }
 
 // src/modes/consult/types.ts
@@ -5857,7 +5954,11 @@ async function runConsultMode(opts) {
   const log = opts.onProgress ?? (() => {
   });
   const roster = opts.voices && opts.voices.length > 0 ? opts.voices : [...VOICE_IDS];
-  const adapters = opts.adapters ?? VOICE_ADAPTERS;
+  const baseAdapters = opts.adapters ?? VOICE_ADAPTERS;
+  const evidenceRoot = opts.evidenceRoot;
+  const adapters = evidenceRoot ? Object.fromEntries(
+    Object.entries(baseAdapters).map(([id, fn]) => [id, (p, c, o) => fn(p, c, { ...o, evidenceRoot })])
+  ) : baseAdapters;
   const configs = opts.voiceConfigs ?? loadVoices(opts.voicesFile);
   assertRosterAdvisors(roster, configs, opts.voiceConfigs ? void 0 : "voices.json");
   if (opts.debate?.judge && !roster.includes(opts.debate.judge))
@@ -6177,9 +6278,9 @@ function scanDependencySurface(files) {
 }
 
 // src/modes/review/receipt.ts
-import fs20 from "fs";
-import os11 from "os";
-import path17 from "path";
+import fs22 from "fs";
+import os13 from "os";
+import path18 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -6262,11 +6363,11 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/holistic-gate.ts
-import fs19 from "fs";
-import path16 from "path";
+import fs21 from "fs";
+import path17 from "path";
 
 // src/modes/review/holistic.ts
-import fs18 from "fs";
+import fs20 from "fs";
 var HOLISTIC_SEAT_ID = "holistic";
 var HOLISTIC_SEVERITY_CAP = "medium";
 var HOLISTIC_DEFAULTS = { effort: "high", model: "opus" };
@@ -6309,7 +6410,7 @@ function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
 }, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
-    raw = JSON.parse(fs18.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs20.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -6474,24 +6575,24 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs19.realpathSync(path16.resolve(worktreeDir));
+    root = fs21.realpathSync(path17.resolve(worktreeDir));
   } catch {
     return () => null;
   }
   const inside = (p) => {
-    const rel = path16.relative(root, p);
+    const rel = path17.relative(root, p);
     return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
-      if (!file || file.includes("\0") || path16.isAbsolute(file)) return null;
-      const target = path16.resolve(root, file);
+      if (!file || file.includes("\0") || path17.isAbsolute(file)) return null;
+      const target = path17.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs19.realpathSync(target);
+      const real = fs21.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs19.statSync(real);
+      const st = fs21.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs19.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs21.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
@@ -8020,10 +8121,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path17.join(os11.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path18.join(os13.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path17.join(
+  return path18.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -8044,11 +8145,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs20.mkdirSync(path17.dirname(file), { recursive: true, mode: 448 });
+  fs22.mkdirSync(path18.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs20.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs20.chmodSync(tmp, 384);
-  fs20.renameSync(tmp, file);
+  fs22.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs22.chmodSync(tmp, 384);
+  fs22.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -8130,7 +8231,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs20.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs22.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -9359,7 +9460,7 @@ function renderClaudeLayer(result) {
 }
 
 // src/modes/review/gate-seat.ts
-import fs21 from "fs";
+import fs23 from "fs";
 var GATE_VENDORS = /* @__PURE__ */ new Set(["anthropic", "codex"]);
 var CODEX_GATE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
 var CODEX_GATE_DEFAULTS = { effort: "xhigh", model: "gpt-5.6-sol" };
@@ -9505,7 +9606,7 @@ function resolveGateSeat(raw, flags, warn, parseAdvisor = parseSeatAdvisor) {
 }
 function readVoicesRaw(file, warn, seatLabel, fallbackNote) {
   try {
-    return JSON.parse(fs21.readFileSync(file, "utf8"));
+    return JSON.parse(fs23.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(
@@ -9587,12 +9688,12 @@ function shadowChampionConfig(claudeSeat, effort, warn) {
 }
 
 // src/modes/review/regate.ts
-import fs22 from "fs";
-import path18 from "path";
+import fs24 from "fs";
+import path19 from "path";
 function readConventionPathsFromTrail(baseDir, runId) {
   try {
     const raw = JSON.parse(
-      fs22.readFileSync(path18.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
+      fs24.readFileSync(path19.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
     );
     const paths = (raw.files ?? []).filter((f) => f.included === true && typeof f.path === "string").map((f) => f.path);
     return paths.length > 0 ? paths : void 0;
@@ -9641,8 +9742,8 @@ async function runRegate(opts) {
     ...opts.worktree ? { worktree: opts.worktree } : {}
   });
   try {
-    const p = path18.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
-    const existing = fs22.existsSync(p) ? JSON.parse(fs22.readFileSync(p, "utf8")) : {};
+    const p = path19.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
+    const existing = fs24.existsSync(p) ? JSON.parse(fs24.readFileSync(p, "utf8")) : {};
     writeTrailFile(
       opts.baseDir,
       opts.runId,
@@ -9673,8 +9774,8 @@ async function runRegate(opts) {
 }
 
 // src/modes/review/reseat.ts
-import fs23 from "fs";
-import path19 from "path";
+import fs25 from "fs";
+import path20 from "path";
 
 // src/modes/review/evidence-manifest.ts
 var EVIDENCE_MANIFEST_SCHEMA_VERSION = 1;
@@ -9767,7 +9868,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   if (!stored) return { error: `run ${runId} has no review.${seat}.json under ${baseDir}` };
   let parsed;
   try {
-    parsed = JSON.parse(fs23.readFileSync(path19.join(dir, `packet.${seat}.json`), "utf8"));
+    parsed = JSON.parse(fs25.readFileSync(path20.join(dir, `packet.${seat}.json`), "utf8"));
   } catch {
     return { error: `run ${runId} has no readable packet.${seat}.json` };
   }
@@ -9777,7 +9878,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   const packet = parsed;
   let prompt;
   try {
-    prompt = fs23.readFileSync(path19.join(dir, `prompt.${seat}.md`), "utf8");
+    prompt = fs25.readFileSync(path20.join(dir, `prompt.${seat}.md`), "utf8");
   } catch {
     return { error: `run ${runId} has no readable prompt.${seat}.md` };
   }
@@ -9836,25 +9937,25 @@ function readReseatLock(p) {
   let startedMs;
   let since;
   try {
-    const st = fs23.statSync(p);
+    const st = fs25.statSync(p);
     startedMs = st.mtimeMs;
     since = new Date(st.mtimeMs).toISOString();
   } catch {
     return null;
   }
   try {
-    const held = JSON.parse(fs23.readFileSync(p, "utf8"));
+    const held = JSON.parse(fs25.readFileSync(p, "utf8"));
     if (typeof held.at === "string") since = held.at;
   } catch {
   }
   return { since, startedMs };
 }
 function acquireReseatLock(baseDir, runId) {
-  const p = path19.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
+  const p = path20.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
   const held = () => `another reseat is already running on run ${runId} (lock ${RESEAT_LOCK_FILE}, since ${readReseatLock(p)?.since ?? "unknown"})`;
   const claim = () => {
     try {
-      return fs23.openSync(p, "wx");
+      return fs25.openSync(p, "wx");
     } catch {
       return null;
     }
@@ -9864,28 +9965,28 @@ function acquireReseatLock(baseDir, runId) {
     const prior = readReseatLock(p);
     if (prior && Date.now() - prior.startedMs <= RESEAT_LOCK_STALE_MS) throw new ReseatLockedError(held());
     try {
-      fs23.rmSync(p, { force: true });
+      fs25.rmSync(p, { force: true });
     } catch {
     }
     fd = claim();
     if (fd === null) throw new ReseatLockedError(held());
   }
   try {
-    fs23.writeFileSync(fd, JSON.stringify({ at: (/* @__PURE__ */ new Date()).toISOString(), pid: process.pid }));
+    fs25.writeFileSync(fd, JSON.stringify({ at: (/* @__PURE__ */ new Date()).toISOString(), pid: process.pid }));
   } finally {
-    fs23.closeSync(fd);
+    fs25.closeSync(fd);
   }
   return () => {
     try {
-      fs23.rmSync(p, { force: true });
+      fs25.rmSync(p, { force: true });
     } catch {
     }
   };
 }
 function foldSynthesis(baseDir, runId, patch, log) {
   try {
-    const p = path19.join(reviewDir(baseDir, runId), "claude-synthesis.json");
-    const existing = fs23.existsSync(p) ? JSON.parse(fs23.readFileSync(p, "utf8")) : {};
+    const p = path20.join(reviewDir(baseDir, runId), "claude-synthesis.json");
+    const existing = fs25.existsSync(p) ? JSON.parse(fs25.readFileSync(p, "utf8")) : {};
     writeTrailFile(baseDir, runId, "claude-synthesis.json", JSON.stringify(patch(existing), null, 2));
     return true;
   } catch (e) {
@@ -9897,8 +9998,8 @@ function appendEgressDenials(baseDir, runId, denials, log) {
   if (denials.length === 0) return;
   try {
     log(`reseat: \u26A0 egress fence: ${formatEgressDenialCounts(denials)}`);
-    const p = path19.join(reviewDir(baseDir, runId), "egress-denials.json");
-    const prior = fs23.existsSync(p) ? JSON.parse(fs23.readFileSync(p, "utf8")) : [];
+    const p = path20.join(reviewDir(baseDir, runId), "egress-denials.json");
+    const prior = fs25.existsSync(p) ? JSON.parse(fs25.readFileSync(p, "utf8")) : [];
     if (!Array.isArray(prior)) {
       log(
         "reseat: egress-denials.json is not an array \u2014 leaving it untouched; this retry's denials are in the result only"
@@ -10020,9 +10121,9 @@ async function reseatUnderLock(opts, pre) {
     log
   );
   try {
-    const mp = path19.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
-    if (fs23.existsSync(mp)) {
-      const manifest = JSON.parse(fs23.readFileSync(mp, "utf8"));
+    const mp = path20.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
+    if (fs25.existsSync(mp)) {
+      const manifest = JSON.parse(fs25.readFileSync(mp, "utf8"));
       manifest.realizedEvidence = {
         ...manifest.realizedEvidence ?? {},
         [seat]: seatRun.realized
@@ -11170,28 +11271,28 @@ function genRunId() {
 }
 function clearReusedRunTrail(baseDir, trailDir) {
   try {
-    if (fs24.lstatSync(trailDir).isSymbolicLink()) return;
+    if (fs26.lstatSync(trailDir).isSymbolicLink()) return;
   } catch {
     return;
   }
   let realBase;
   let realTarget;
   try {
-    realBase = fs24.realpathSync(baseDir);
-    realTarget = fs24.realpathSync(trailDir);
+    realBase = fs26.realpathSync(baseDir);
+    realTarget = fs26.realpathSync(trailDir);
   } catch {
     return;
   }
-  const rel = path20.relative(realBase, realTarget);
+  const rel = path21.relative(realBase, realTarget);
   if (!rel || escapesRoot(rel)) {
     return;
   }
-  fs24.rmSync(realTarget, { force: true, recursive: true });
+  fs26.rmSync(realTarget, { force: true, recursive: true });
 }
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
   try {
-    const s = fs24.readFileSync(0, "utf8");
+    const s = fs26.readFileSync(0, "utf8");
     return s.trim() ? s : void 0;
   } catch {
     return void 0;
@@ -11237,9 +11338,9 @@ function gitToplevel(cwd) {
 }
 function resolveTrailBase(gitRoot, localRepoTrail) {
   if (gitRoot && localRepoTrail) {
-    return path20.join(gitRoot, ".ensemble-ai", "reviews");
+    return path21.join(gitRoot, ".ensemble-ai", "reviews");
   }
-  return path20.join(os12.tmpdir(), "ensemble-ai", "reviews");
+  return path21.join(os14.tmpdir(), "ensemble-ai", "reviews");
 }
 function ghConventionReader(repoSlug, ref, cwd) {
   const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
@@ -11366,7 +11467,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "diff-file": {
       let text;
       try {
-        text = fs24.readFileSync(String(selection.diffFile), "utf8");
+        text = fs26.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
@@ -11738,7 +11839,7 @@ async function reviewCommand(args, profile = "code") {
     console.log(usage);
     return 0;
   }
-  const cwd = values.cwd ? path20.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path21.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
   const postComment = Boolean(values["post-comment"]);
@@ -11818,7 +11919,7 @@ async function runReviewPipeline(input) {
   const optionalReviewers = resolveOptionalReviewers(values["optional-reviewers"], roster.core, cmd);
   if ("code" in optionalReviewers) return optionalReviewers.code;
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-  const out = typeof values.out === "string" ? path20.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+  const out = typeof values.out === "string" ? path21.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
   const ceiling = positiveCeiling(
     typeof values.ceiling === "string" ? values.ceiling : void 0,
@@ -12149,7 +12250,7 @@ async function runReviewPipeline(input) {
     const first = result.reviews[0];
     const pinnedReviewerId = first.reviewerId ?? first.reviewer.vendor;
     console.log(
-      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path20.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
+      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path21.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
   }
   if (claudeLayer) {
@@ -12286,6 +12387,8 @@ Options:
   --voices-file <path>  voices config json (default ~/.ensemble-ai/voices.json)
   --json                print the full result as JSON instead of formatted text
   --cwd <dir>           working dir for --file resolution (default: cwd)
+  --evidence-root <dir> a sealed evidence directory (outside $HOME) every voice reads on every
+                        call behind the review fences; the file rides in full with its INDEX
   -h, --help            this help
 
 Exit codes: 0 = produced ideas (synthesis printed) \xB7 1 = no usable output (every
@@ -12356,6 +12459,7 @@ async function brainstormCommand(args) {
       options: {
         cwd: { type: "string" },
         file: { type: "string" },
+        "evidence-root": { type: "string" },
         help: { short: "h", type: "boolean" },
         json: { type: "boolean" },
         synthesizer: { type: "string" },
@@ -12382,25 +12486,35 @@ async function brainstormCommand(args) {
     console.error(BRAINSTORM_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path20.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path21.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path20.resolve(cwd, values.file);
+    const filePath = path21.resolve(cwd, values.file);
     try {
-      const bytes = fs24.statSync(filePath).size;
+      const bytes = fs26.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs24.readFileSync(filePath, "utf8");
+      fileContext = fs26.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${e.message}`
       );
       return 3;
     }
+  }
+  let evidenceInfo;
+  if (typeof values["evidence-root"] === "string") {
+    try {
+      evidenceInfo = openEvidenceRoot(path21.resolve(cwd, values["evidence-root"]));
+    } catch (e) {
+      console.error(`ensemble-ai: ${e.message}`);
+      return 3;
+    }
+    fileContext = composeEvidenceContext(fileContext, evidenceInfo);
   }
   let voices;
   if (typeof values.voices === "string") {
@@ -12447,6 +12561,7 @@ async function brainstormCommand(args) {
   let result;
   try {
     result = await runBrainstormMode({
+      ...evidenceInfo ? { evidenceRoot: evidenceInfo.root } : {},
       fileContext,
       onProgress: (m) => console.error(`\xB7 ${m}`),
       synthesizer,
@@ -12495,6 +12610,8 @@ Options:
   --voices-file <path>  voices config json (default ~/.ensemble-ai/voices.json)
   --json                print the full result as JSON instead of formatted text
   --cwd <dir>           working dir for --file resolution (default: cwd)
+  --evidence-root <dir> a sealed evidence directory (outside $HOME) every voice reads on every
+                        call behind the review fences; the file rides in full with its INDEX
   -h, --help            this help
 
 Exit codes: 0 = produced answers (synthesis printed) \xB7 1 = no usable output (every
@@ -12606,6 +12723,7 @@ async function consultCommand(args) {
         debate: { type: "boolean" },
         "debate-rounds": { type: "string" },
         file: { type: "string" },
+        "evidence-root": { type: "string" },
         help: { short: "h", type: "boolean" },
         json: { type: "boolean" },
         judge: { type: "string" },
@@ -12633,25 +12751,35 @@ async function consultCommand(args) {
     console.error(CONSULT_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path20.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path21.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path20.resolve(cwd, values.file);
+    const filePath = path21.resolve(cwd, values.file);
     try {
-      const bytes = fs24.statSync(filePath).size;
+      const bytes = fs26.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs24.readFileSync(filePath, "utf8");
+      fileContext = fs26.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai consult: cannot read --file ${values.file}: ${e.message}`
       );
       return 3;
     }
+  }
+  let evidenceInfo;
+  if (typeof values["evidence-root"] === "string") {
+    try {
+      evidenceInfo = openEvidenceRoot(path21.resolve(cwd, values["evidence-root"]));
+    } catch (e) {
+      console.error(`ensemble-ai: ${e.message}`);
+      return 3;
+    }
+    fileContext = composeEvidenceContext(fileContext, evidenceInfo);
   }
   let voices;
   if (typeof values.voices === "string") {
@@ -12727,6 +12855,7 @@ async function consultCommand(args) {
     result = await runConsultMode({
       critique: Boolean(values.critique),
       ...debate ? { debate } : {},
+      ...evidenceInfo ? { evidenceRoot: evidenceInfo.root } : {},
       fileContext,
       onProgress: (m) => console.error(`\xB7 ${m}`),
       question,
@@ -12876,11 +13005,11 @@ async function receiptCommand(args) {
     console.log(RECEIPT_USAGE);
     return 0;
   }
-  const receiptPathArg = typeof positionals[0] === "string" ? path20.resolve(positionals[0]) : void 0;
+  const receiptPathArg = typeof positionals[0] === "string" ? path21.resolve(positionals[0]) : void 0;
   const readReceiptFile = (p) => {
     let raw;
     try {
-      raw = fs24.readFileSync(p, "utf8");
+      raw = fs26.readFileSync(p, "utf8");
     } catch (e) {
       return { error: `cannot read receipt ${p}: ${e.message}` };
     }
@@ -12921,8 +13050,8 @@ async function receiptCommand(args) {
     console.error(`ensemble-ai receipt ${sub}: choose at most one of --repo / --cwd (both name the repo to verify)`);
     return 3;
   }
-  const repoLocation = typeof values.repo === "string" ? path20.resolve(values.repo) : void 0;
-  const cwd = repoLocation ?? (values.cwd ? path20.resolve(String(values.cwd)) : process.cwd());
+  const repoLocation = typeof values.repo === "string" ? path21.resolve(values.repo) : void 0;
+  const cwd = repoLocation ?? (values.cwd ? path21.resolve(String(values.cwd)) : process.cwd());
   const intendedEvidence = repoLocation ? Object.fromEntries(required.map((id) => [id, "worktree"])) : void 0;
   const acceptDegraded = Boolean(values["accept-degraded"]);
   if (acceptDegraded && !intendedEvidence) {
@@ -12961,7 +13090,7 @@ async function receiptCommand(args) {
     }),
     repo: acquired.repoId
   };
-  const store = values.store ? path20.resolve(String(values.store)) : defaultReceiptStore();
+  const store = values.store ? path21.resolve(String(values.store)) : defaultReceiptStore();
   if (sub === "show") {
     const receipt = readReceipt(store, key);
     if (!receipt) {
@@ -12997,7 +13126,7 @@ async function receiptCommand(args) {
     // with isDiffReviewed so a digest-only drift still reports `stale`.
     readReceipt: receiptPathArg ? (k) => explicit && receiptIdentityMatches(explicit, k) ? explicit : null : (k) => readReceipt(store, k),
     strict: Boolean(values.strict || values["require-artifacts"]),
-    trailDir: typeof values.trail === "string" ? path20.resolve(values.trail) : void 0
+    trailDir: typeof values.trail === "string" ? path21.resolve(values.trail) : void 0
   };
   const state = verifyReceipt({ coverage: acquired.coverage, key, required }, verifyDeps);
   console.log(formatVerify(state, key));
@@ -13045,8 +13174,8 @@ async function reviewersCommand(args) {
     console.log(REVIEWERS_USAGE);
     return 0;
   }
-  const reviewersFile = typeof values["reviewers-file"] === "string" ? path20.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
-  const voicesFile = typeof values["voices-file"] === "string" ? path20.resolve(values["voices-file"]) : VOICES_FILE;
+  const reviewersFile = typeof values["reviewers-file"] === "string" ? path21.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
+  const voicesFile = typeof values["voices-file"] === "string" ? path21.resolve(values["voices-file"]) : VOICES_FILE;
   const warn = (m) => console.error(`\xB7 ${m}`);
   let gateAdvisor;
   const gateSeat = loadGateSeat(voicesFile, {}, warn, (v) => {
@@ -13079,10 +13208,10 @@ async function reviewersCommand(args) {
     offSeats: offSeatsOf(reviewersConfig, enabledIds),
     reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,
-    reviewersFileExists: fs24.existsSync(reviewersFile),
+    reviewersFileExists: fs26.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
     voicesFile,
-    voicesFileExists: fs24.existsSync(voicesFile)
+    voicesFileExists: fs26.existsSync(voicesFile)
   };
   if (values.json) console.log(JSON.stringify(view, null, 2));
   else console.log(renderRegistry(view));
@@ -13184,7 +13313,7 @@ async function diffCommand(args) {
     "--convention-cap"
   );
   if (typeof conventionCap === "object") return conventionCap.code;
-  const cwd = values.cwd ? path20.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path21.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
   let acquired;
@@ -13288,7 +13417,7 @@ async function pushFenceCommand(args) {
     );
     return 3;
   }
-  const cwd = values.cwd ? path20.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path21.resolve(String(values.cwd)) : process.cwd();
   const gh = ghRunner(cwd);
   const scope = selection.owner && selection.repo ? ["-R", `${selection.owner}/${selection.repo}`] : [];
   const view = gh([
@@ -13346,7 +13475,7 @@ Exit: 0 = current (or ahead of main); 3 = STALE or DIVERGED; 1 = error. A consum
 gates on the exit code, or parses --json for a softer "N behind" surface.`;
 function resolveSelfRepo(git2) {
   const r = git2(["rev-parse", "--show-toplevel"], {
-    cwd: path20.dirname(fileURLToPath2(import.meta.url))
+    cwd: path21.dirname(fileURLToPath2(import.meta.url))
   });
   return r.ok ? r.text.trim() : null;
 }
@@ -13813,7 +13942,7 @@ async function probeCommand(rest) {
   let brief = null;
   if (briefPath) {
     try {
-      brief = fs24.readFileSync(path20.resolve(cwd, briefPath), "utf8");
+      brief = fs26.readFileSync(path21.resolve(cwd, briefPath), "utf8");
       console.error(`\xB7 operator brief: ${briefPath} (${brief.length} chars)`);
     } catch (e) {
       if (briefFlag) {
@@ -13893,7 +14022,7 @@ async function probeCommand(rest) {
     }
     const directive = "directive" in directiveRes ? directiveRes.directive : null;
     const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-    const out = typeof values.out === "string" ? path20.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+    const out = typeof values.out === "string" ? path21.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
     const trailDir = reviewDir(out, runId);
     const prompt = renderProbePrompt({
       baseSha: source.prBaseSha,

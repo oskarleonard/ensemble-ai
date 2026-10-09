@@ -406,9 +406,13 @@ export function wrapWithSandbox(
 export function buildCodexWorktreeArgs(
   config: { effort: string; model: string },
   outFile: string,
-  prompt: string
+  prompt: string,
+  opts: { web?: boolean } = {}
 ): string[] {
   return [
+    // Vendor-side live web search (a `web: true` brainstorm/consult voice behind an evidence root)
+    // — a GLOBAL flag, so it goes before `exec` (#101). Never set by the review pipeline.
+    ...(opts.web ? ['--search'] : []),
     'exec',
     '--skip-git-repo-check',
     '--ephemeral',
