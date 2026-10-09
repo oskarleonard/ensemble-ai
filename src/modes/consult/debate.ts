@@ -172,11 +172,39 @@ export function anonymizeVoiceText(text: string, alias: VoiceAlias): string {
   return out;
 }
 
-/** The inverse: labels back to ids, so rulings name the voices for the reader. */
+/**
+ * The inverse: labels back to ids, so rulings name the voices for the reader. The full label
+ * ("Voice A", any case/spacing) always maps back. Judges also shorten to a bare letter — "A/C's
+ * distinction stands, and B concedes" (hugin run b27c794b, 2026-10-09, 21 leaks) — and a bare
+ * capital letter is only mapped back where the surrounding words make it a voice and not the
+ * article or an initial: a possessive, a slash chain (A/B/C), a conjunction chain with another
+ * label (A, B and C), a preposition before it (by C, toward B), a colon/paren label, or one of
+ * the debate verbs after it (A moved, C demonstrates). "A separate guard …" stays as written.
+ */
 export function deanonymizeJudgeText(text: string, alias: VoiceAlias): string {
   let out = text;
-  for (const [id, label] of Object.entries(alias)) out = out.replace(new RegExp(label.replace(/\s/g, '\\s*'), 'gi'), id);
-  return out;
+  const letterOf: Record<string, string> = {};
+  for (const [id, label] of Object.entries(alias)) {
+    out = out.replace(new RegExp(label.replace(/\s/g, '\\s*'), 'gi'), id);
+    const letter = label.replace(/^Voice\s*/i, '');
+    if (letter.length === 1) letterOf[letter.toUpperCase()] = id;
+  }
+  const letters = Object.keys(letterOf);
+  if (letters.length === 0) return out;
+  const L = `[${letters.join('')}]`;
+  const re = new RegExp(`(?<![A-Za-z0-9§#_])(${L})(?![a-z0-9_])`, 'g');
+  const verbs =
+    'moved|moves|move|concedes|conceded|concede|demonstrates|demonstrated|agrees|agreed|holds|held|stands|stood|argues|argued|cites|cited|shows|showed|claims|claimed|answered|answers|proposed|proposes|notes|noted|asserts|asserted|maintains|maintained|accepts|accepted|disputes|disputed|rejects|rejected|misreads|misread|overstates|overstated|conflates|conflated|relies|relied|points|pointed|treats|treated|reads|read|identifies|identified|offers|offered|presents|presented|prevails|prevailed|yields|yielded|initially|rightly|correctly|wrongly';
+  const preps = 'by|with|to|toward|towards|from|than|against|between|unlike|like|versus|vs\\.?|of|for|both|neither|either|nor|per';
+  const afterOk = new RegExp(`^(?:['’]s\\b|\\s*/\\s*${L}\\b|\\s*,\\s*${L}\\b|\\s+(?:and|or)\\s+${L}\\b|\\s*:|\\)|\\s+(?:${verbs})\\b)`);
+  const beforeOk = new RegExp(`(?:${L}\\s*/\\s*|${L}\\s*,\\s*|${L}\\s+(?:and|or)\\s+|\\b(?:${preps})\\s+|\\()$`, 'i');
+  return out.replace(re, (m, letter: string, at: number, whole: string) => {
+    const id = letterOf[letter];
+    if (!id) return m;
+    const after = whole.slice(at + 1, at + 40);
+    const before = whole.slice(Math.max(0, at - 40), at);
+    return afterOk.test(after) || beforeOk.test(before) ? id : m;
+  });
 }
 
 export function renderJudgePrompt(args: {
@@ -195,7 +223,7 @@ models answered a question independently; a synthesizer separated what they agre
 where they diverge; the diverging voices then argued each split with evidence over
 ${rounds.length} round(s). Rule on EVERY split BY THE EVIDENCE — never by which argument is
 longer, which model wrote it, or your own prior — then write the final recommendation in
-light of your rulings.${alias ? ' The voices are labelled Voice A, Voice B, … — you are not told which model is which, on purpose.' : ''}
+light of your rulings.${alias ? ' The voices are labelled Voice A, Voice B, … — you are not told which model is which, on purpose. Always write the full label ("Voice A"), never a bare letter.' : ''}
 
 Outcomes:
 - "settled": the evidence decides it. Say which position stands and why, citing the evidence.

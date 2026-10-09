@@ -351,7 +351,7 @@ async function runDebate(
   const independent = judgeIsIndependent(judgeId, judgeCfg.model, participants, configs);
   const judgeBase = { effort: judgeCfg.effort, independent, model: judgeCfg.model, voiceId: judgeId };
   log(
-    `Judge · ${judgeId} (${judgeCfg.vendor} · ${judgeCfg.model}@${judgeCfg.effort}${independent ? ' · independent' : ' · ALSO ARGUED A SIDE'}) ruling on ${splits.length} split(s)…`
+    `Judge · ${judgeId} (${judgeCfg.vendor} · ${judgeCfg.model}@${judgeCfg.effort}${independent ? ' · independent' : ' · blind · same model argued a side'}) ruling on ${splits.length} split(s)…`
   );
   // The blind judge: labels in, names out (debate.ts).
   const alias = voiceAliases(participants);
