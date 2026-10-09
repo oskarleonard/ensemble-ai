@@ -301,7 +301,7 @@ describe('runConsultMode — --debate', () => {
     // the synthesizer's draft stays on the synthesis
     expect(r.synthesis.recommendation).toBe('draft');
     // the judge prompt carried every round for split-1
-    expect(judgeCalls[0].prompt).toContain('round 3, claude');
+    expect(judgeCalls[0].prompt).toMatch(/round 3, Voice [A-C]/);
   });
 
   it('stops after one round when nobody brings evidence, and flags a judge that argued a side', async () => {

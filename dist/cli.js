@@ -5537,14 +5537,30 @@ agreements (not in dispute):
 draft recommendation:
 ${cap2(draft.recommendation)}`;
 }
+function voiceAliases(voiceIds) {
+  const out = {};
+  voiceIds.forEach((id, i) => out[id] = `Voice ${String.fromCharCode(65 + i % 26)}`);
+  return out;
+}
+function anonymizeVoiceText(text, alias) {
+  let out = text;
+  for (const [id, label2] of Object.entries(alias)) out = out.replace(new RegExp(`\\b${id}\\b`, "gi"), label2);
+  return out;
+}
+function deanonymizeJudgeText(text, alias) {
+  let out = text;
+  for (const [id, label2] of Object.entries(alias)) out = out.replace(new RegExp(label2.replace(/\s/g, "\\s*"), "gi"), id);
+  return out;
+}
 function renderJudgePrompt(args) {
-  const { draft, fileContext, question, rounds, splits } = args;
+  const { draft, fileContext, question, rounds, splits, alias } = args;
+  const hide = (t) => alias ? anonymizeVoiceText(t, alias) : t;
   return `You are the JUDGE of a multi-model consultation. You took NO part in it. Several
 models answered a question independently; a synthesizer separated what they agree on from
 where they diverge; the diverging voices then argued each split with evidence over
 ${rounds.length} round(s). Rule on EVERY split BY THE EVIDENCE \u2014 never by which argument is
 longer, which model wrote it, or your own prior \u2014 then write the final recommendation in
-light of your rulings.
+light of your rulings.${alias ? " The voices are labelled Voice A, Voice B, \u2026 \u2014 you are not told which model is which, on purpose." : ""}
 
 Outcomes:
 - "settled": the evidence decides it. Say which position stands and why, citing the evidence.
@@ -5559,10 +5575,10 @@ the outcome is "judgement".
 ${question.trim()}
 ${contextBlock2(fileContext)}
 ## The splits, with every round
-${roundsBlock(rounds, splits)}
+${hide(roundsBlock(rounds, splits))}
 
 ## The synthesizer's draft (before the debate)
-${draftBlock(draft)}
+${hide(draftBlock(draft))}
 
 ## Output format \u2014 STRICT
 ${JSON_RULE2}
@@ -6004,7 +6020,8 @@ async function runDebate(opts, debate, adapters, configs, answers, participants,
   log(
     `Judge \xB7 ${judgeId} (${judgeCfg.vendor} \xB7 ${judgeCfg.model}@${judgeCfg.effort}${independent ? " \xB7 independent" : " \xB7 ALSO ARGUED A SIDE"}) ruling on ${splits.length} split(s)\u2026`
   );
-  const prompt = renderJudgePrompt({ draft: synthesis, fileContext: opts.fileContext, question: opts.question, rounds, splits });
+  const alias = voiceAliases(participants);
+  const prompt = renderJudgePrompt({ alias, draft: synthesis, fileContext: opts.fileContext, question: opts.question, rounds, splits });
   let res;
   try {
     res = await adapters[judgeId](prompt, judgeCfg, { timeoutMs });
@@ -6017,7 +6034,7 @@ async function runDebate(opts, debate, adapters, configs, answers, participants,
     log(`  \xB7 ${error}`);
     return { judge: { ...judgeBase, error, ok: false, raw: res.raw, ...seatFailureMeta(res) }, recommendation: "", rounds, rulings: [], splits, summary: "" };
   }
-  const parsed = parseJudgeReply(res.raw, splits.map((s) => s.id));
+  const parsed = parseJudgeReply(deanonymizeJudgeText(res.raw, alias), splits.map((s) => s.id));
   if (parsed.parseError) {
     log(`  \xB7 judge output not parseable \u2014 ${parsed.parseError}`);
     return { judge: { ...judgeBase, error: parsed.parseError, ok: false, raw: res.raw }, recommendation: "", rounds, rulings: [], splits, summary: "" };
