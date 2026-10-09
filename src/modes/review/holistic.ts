@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 
+import { companionsClause } from './companions';
 import { parseFindings } from '../../core/findings';
 import { parseSeatAdvisor, type Severity } from '../../core/types';
 import type { RunReviewOpts } from '../../reviewers/codex';
@@ -212,7 +213,7 @@ ${readOnlyWorktreeClause({ headSha: args.headSha, reach: 'search and read it', w
 
 ${materializedDiffClause(args)}
 
-${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 
 The other reviewers already read the diff closely and will report its bugs. Do NOT repeat them.
 Your job is the thing they structurally CANNOT see: how this change sits in the WHOLE project.

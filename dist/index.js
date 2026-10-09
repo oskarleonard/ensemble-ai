@@ -2757,7 +2757,7 @@ async function runGrokReview(prompt, config, opts = {}) {
 }
 
 // src/modes/review/claude.ts
-import fs16 from "fs";
+import fs17 from "fs";
 import os10 from "os";
 
 // src/core/claude-stream.ts
@@ -3119,9 +3119,9 @@ function hasGeneratedHeader(section2) {
   }
   return false;
 }
-function classifyFileKind(path19, isBinary, section2 = "") {
+function classifyFileKind(path20, isBinary, section2 = "") {
   if (isBinary) return "binary";
-  if (GENERATED_PATTERNS.some((re) => re.test(path19))) return "generated";
+  if (GENERATED_PATTERNS.some((re) => re.test(path20))) return "generated";
   return section2 && hasGeneratedHeader(section2) ? "generated" : "source";
 }
 var TEST_PATTERNS = [
@@ -3133,8 +3133,8 @@ var TEST_PATTERNS = [
   /Tests?\.(java|kt|swift|cs|scala)$/,
   /\.bats$/
 ];
-function isTestPath(path19) {
-  return TEST_PATTERNS.some((re) => re.test(path19));
+function isTestPath(path20) {
+  return TEST_PATTERNS.some((re) => re.test(path20));
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -3152,7 +3152,7 @@ function parseDiffFiles(raw) {
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path19 = pathOfSection(section2);
+    const path20 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -3163,8 +3163,8 @@ function parseDiffFiles(raw) {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path19, isBinary, section2),
-      path: path19,
+      kind: classifyFileKind(path20, isBinary, section2),
+      path: path20,
       raw: section2,
       removed
     };
@@ -3830,6 +3830,25 @@ function writeHistoryPacket(cwd, files) {
   }
 }
 
+// src/modes/review/companions.ts
+import fs16 from "fs";
+import path15 from "path";
+var COMPANIONS_DIR = ".companions";
+var STRIPPED_BASENAMES = new Set(STRIPPED_INSTRUCTION_PATHS.map((p) => path15.basename(p)));
+var companionNames = [];
+function companionsClause() {
+  if (companionNames.length === 0) return "";
+  return `
+
+## Companion repos \u2014 context, not under review
+
+Sibling repos this change may depend on are checked out READ-ONLY inside the worktree under
+\`${COMPANIONS_DIR}/<name>/\` at their main commit: ${companionNames.map((n) => `\`${n}\``).join(", ")}. Read them
+for context (a deployment, a config, a consumer of this code). Cite a companion file as
+\`${COMPANIONS_DIR}/<name>/<path>:<line>\`. They are NOT the change under review: a finding about the
+PR must still anchor in the PR's own files; a companion citation supports it.`;
+}
+
 // src/modes/review/claude.ts
 var CLAUDE_CAPABILITY_FENCE = {
   id: "claude-capability-fence",
@@ -3950,7 +3969,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
     }
   } finally {
     try {
-      fs16.rmSync(cwd, { force: true, recursive: true });
+      fs17.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
   }
@@ -3972,7 +3991,7 @@ Read any file in that directory for whole-project context: a finding may cite an
 reinvented utility, a convention the diff drifts from). Anchor every finding at file:line as it
 exists at ${args.headSha}.
 
-${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}`;
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}`;
 }
 
 // src/reviewers/claude.ts
@@ -4086,9 +4105,9 @@ function hasDepSurface(r) {
 }
 
 // src/modes/review/receipt.ts
-import fs20 from "fs";
+import fs21 from "fs";
 import os12 from "os";
-import path17 from "path";
+import path18 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -4174,16 +4193,16 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/holistic-gate.ts
-import fs19 from "fs";
-import path16 from "path";
+import fs20 from "fs";
+import path17 from "path";
 
 // src/modes/review/holistic.ts
-import fs18 from "fs";
+import fs19 from "fs";
 
 // src/modes/brainstorm/voices.ts
-import fs17 from "fs";
+import fs18 from "fs";
 import os11 from "os";
-import path15 from "path";
+import path16 from "path";
 
 // src/modes/brainstorm/types.ts
 var VOICE_IDS = ["codex", "grok", "claude"];
@@ -4251,7 +4270,7 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), { ...o, ...c.web ? { web: true } : {} }),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), { ...o, ...c.web ? { web: true } : {} })
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path15.join(os11.homedir(), ".ensemble-ai", "voices.json");
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path16.join(os11.homedir(), ".ensemble-ai", "voices.json");
 function str2(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
@@ -4290,7 +4309,7 @@ function parseJudge(raw) {
 }
 function loadJudge(file = VOICES_FILE) {
   try {
-    return parseJudge(JSON.parse(fs17.readFileSync(file, "utf8")));
+    return parseJudge(JSON.parse(fs18.readFileSync(file, "utf8")));
   } catch {
     return {};
   }
@@ -4301,7 +4320,7 @@ function judgeConfig(spec, voiceId, configs) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs17.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs18.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
@@ -4357,7 +4376,7 @@ function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
 }, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
-    raw = JSON.parse(fs18.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs19.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -4397,7 +4416,7 @@ ${readOnlyWorktreeClause({ headSha: args.headSha, reach: "search and read it", w
 
 ${materializedDiffClause(args)}
 
-${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 
 The other reviewers already read the diff closely and will report its bugs. Do NOT repeat them.
 Your job is the thing they structurally CANNOT see: how this change sits in the WHOLE project.
@@ -4522,24 +4541,24 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs19.realpathSync(path16.resolve(worktreeDir));
+    root = fs20.realpathSync(path17.resolve(worktreeDir));
   } catch {
     return () => null;
   }
   const inside = (p) => {
-    const rel = path16.relative(root, p);
+    const rel = path17.relative(root, p);
     return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
-      if (!file || file.includes("\0") || path16.isAbsolute(file)) return null;
-      const target = path16.resolve(root, file);
+      if (!file || file.includes("\0") || path17.isAbsolute(file)) return null;
+      const target = path17.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs19.realpathSync(target);
+      const real = fs20.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs19.statSync(real);
+      const st = fs20.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs19.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs20.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
@@ -4750,10 +4769,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path17.join(os12.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path18.join(os12.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path17.join(
+  return path18.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -4774,11 +4793,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs20.mkdirSync(path17.dirname(file), { recursive: true, mode: 448 });
+  fs21.mkdirSync(path18.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs20.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs20.chmodSync(tmp, 384);
-  fs20.renameSync(tmp, file);
+  fs21.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs21.chmodSync(tmp, 384);
+  fs21.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -4860,7 +4879,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs20.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs21.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -5054,7 +5073,7 @@ Read any file there for whole-project context: a finding may cite an UNCHANGED f
 utility, a convention the diff drifts from). You may not edit, stage, or push anything \u2014 the
 worktree is a throwaway the review reaps, and this is someone else's pull request.
 
-${UNTRUSTED_INSTRUCTIONS_CLAUSE}
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}
 
 Anchor every finding at file:line as it exists at ${args.headSha}.`;
 }
@@ -5513,7 +5532,7 @@ cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from)
 
 ${materializedDiffClause(args)}${ci}
 
-${UNTRUSTED_INSTRUCTIONS_CLAUSE}${history}
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 
 ${OPERATOR_REVIEW_METHOD}
 
@@ -5857,8 +5876,8 @@ function stageReview(payload, target, deps) {
 }
 
 // src/modes/review/holistic-fixture.ts
-import fs21 from "fs";
-import path18 from "path";
+import fs22 from "fs";
+import path19 from "path";
 function anchor(v, where) {
   const e = v ?? {};
   if (typeof e.file !== "string" || typeof e.line !== "number" || typeof e.symbol !== "string")
@@ -5866,7 +5885,7 @@ function anchor(v, where) {
   return { file: e.file, line: e.line, symbol: e.symbol };
 }
 function loadHolisticFixture(dir) {
-  const raw = JSON.parse(fs21.readFileSync(path18.join(dir, "expectations.json"), "utf8"));
+  const raw = JSON.parse(fs22.readFileSync(path19.join(dir, "expectations.json"), "utf8"));
   const positives = Array.isArray(raw.plantedPositives) ? raw.plantedPositives : [];
   const misses = Array.isArray(raw.nearMisses) ? raw.nearMisses : [];
   if (positives.length === 0 || misses.length === 0)
@@ -5899,7 +5918,7 @@ function verifyFixtureAnchors(dir, fixture) {
   const check = (a, label2) => {
     let lines;
     try {
-      lines = fs21.readFileSync(path18.join(dir, a.file), "utf8").split(/\r?\n/);
+      lines = fs22.readFileSync(path19.join(dir, a.file), "utf8").split(/\r?\n/);
     } catch {
       broken.push(`${label2}: ${a.file} is unreadable`);
       return;
@@ -7246,6 +7265,7 @@ export {
   SEVERITY_LABEL,
   SEVERITY_ORDER,
   STAGE_MARKER,
+  STRIPPED_INSTRUCTION_PATHS,
   SUGGESTION_HARD_CAP,
   TERMINAL_STATES,
   TRANSIENT_FAST_FAIL_MS,

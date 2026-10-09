@@ -100,6 +100,8 @@ export interface DiffReviewReceipt {
   // which `receipt verify` reads as `unknown` = weaker (gate-r3 pin 2).
   realizedEvidence?: EvidenceMap;
   repo: string | null;
+  // Companion repos installed inside the worktree as context (`--companion`), by name.
+  companions?: string[];
   reviewerPolicy: ReviewerId[];
   runId: string;
   // The sandbox profile id + version each worktree seat ran under (hashed into a v2 policyHash).
