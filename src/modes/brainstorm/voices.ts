@@ -18,6 +18,27 @@ import { type ResolvedVoiceConfig, VOICE_IDS, type VoiceConfig, type VoiceId } f
 // brainstorm parsers. Aliased so the brainstorm code never reads "review" types.
 export type VoiceRunResult = CodexReviewResult;
 
+// Which watchdog reclaimed a seat: `absolute` (still working when the runaway backstop cut it —
+// give it budget) or `inactivity` (it went silent — it wedged). Carried into every mode's result
+// JSON (2026-10-09) so a board can say WHY a voice died, not just that it did.
+export type SeatTimeoutReason = 'absolute' | 'inactivity';
+
+// PURE: the failure facts a mode's result carries beside `error` — whether and why the seat timed
+// out, and what it was doing last (the stream tail when the seat streamed, else its stderr tail),
+// bounded. Absent fields stay absent so a healthy result's JSON does not grow.
+export function seatFailureMeta(res: VoiceRunResult): {
+  tail?: string;
+  timedOut?: boolean;
+  timedOutReason?: SeatTimeoutReason;
+} {
+  const tail = (res.stream ?? res.stderrTail ?? '').trim().slice(-600);
+  return {
+    ...(res.timedOut ? { timedOut: true } : {}),
+    ...(res.timedOutReason ? { timedOutReason: res.timedOutReason } : {}),
+    ...(tail ? { tail } : {}),
+  };
+}
+
 // The brainstorm roster default — Codex + Grok + Claude. CONFIG, not a hardcode:
 // one JSON file (env-overridable) swaps any model without a code edit. codex/grok
 // reuse the proven review adapters at a LIGHTER effort (ideation, not an xhigh

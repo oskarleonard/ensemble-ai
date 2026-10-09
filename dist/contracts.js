@@ -122,6 +122,36 @@ function stripTrailingCommas(s) {
   }
   return out;
 }
+function escapeRawNewlinesInStrings(s) {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (ch === "\\") {
+        out += ch;
+        if (i + 1 < s.length) out += s[++i];
+        continue;
+      }
+      if (ch === '"') inString = false;
+      else if (ch === "\n") {
+        out += "\\n";
+        continue;
+      } else if (ch === "\r") {
+        out += "\\r";
+        continue;
+      } else if (ch === "	") {
+        out += "\\t";
+        continue;
+      }
+      out += ch;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    out += ch;
+  }
+  return out;
+}
 function extractJsonBlock(raw) {
   const fence = /```(?:json)?\s*([\s\S]*?)```/gi;
   let m;
@@ -141,6 +171,12 @@ function extractJsonBlock(raw) {
   for (const c of candidates) {
     try {
       return JSON.parse(stripTrailingCommas(c));
+    } catch {
+    }
+  }
+  for (const c of candidates) {
+    try {
+      return JSON.parse(stripTrailingCommas(escapeRawNewlinesInStrings(c)));
     } catch {
     }
   }
@@ -515,6 +551,7 @@ export {
   TRUNCATION_MARKER_RE,
   assembleCodePacket,
   enabledReviewerIds,
+  escapeRawNewlinesInStrings,
   evidenceRef,
   extractJsonBlock,
   isCoreReviewerId,

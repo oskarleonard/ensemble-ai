@@ -1,3 +1,15 @@
+import {
+  CLAUDE_EFFORTS,
+  CLAUDE_INACTIVITY_TIMEOUT_MS,
+  extractStreamResult,
+  isRetryableApiStatus,
+  isTransientApiErrorReply,
+  isUsageLimitReply,
+  streamActivityTail,
+  TRANSIENT_FAST_FAIL_MS,
+  TRANSIENT_RETRY_DELAYS_MS,
+  USAGE_LIMIT_FAIL_PREFIX,
+} from '../../core/claude-stream';
 import { resolveBin } from '../../core/bin';
 import { runReviewerExec } from '../../core/spawn';
 import { ADVISOR_OFF, parseSeatAdvisor } from '../../core/types';
@@ -9,66 +21,47 @@ import {
 
 import type { VoiceConfig } from './types';
 
-// The Claude (Anthropic) brainstorm voice — the third vendor beside Codex + Grok.
-// Claude is a brainstorm-ONLY voice: in review it arbitrates the cross-vendor
-// findings and must stay independent, but in brainstorm every voice just
-// contributes ideas, so there is no independence concern.
+// The Claude VOICE for brainstorm / consult — a headless `claude -p` over the round's prompt.
+// Not a review seat: it reads no worktree, so it needs no capability fence; the only tools it
+// may hold are the web pair (`web: true`), pre-approved for the headless spawn.
+//
+// LIVENESS (2026-10-09). The voice used to run `--output-format text`, which prints nothing
+// until the reply is complete — so the spawn layer had no signal that the seat was alive, and
+// a single ABSOLUTE timeout was the only thing that could end it. Run 2026-10-08-19-32-31
+// (hugin) lost both opus@max seats that way: 14 and 13 minutes into honest web research,
+// killed by a 900 s cap, with "timed out" as the whole explanation. The voice now runs the
+// SAME stream contract as every other headless Anthropic seat (core/claude-stream.ts):
+// `--output-format stream-json --verbose` emits one event per line while the seat works, the
+// INACTIVITY watchdog reclaims a seat only after CLAUDE_INACTIVITY_TIMEOUT_MS of total silence,
+// and the absolute `timeoutMs` is a runaway backstop the caller sizes in hours — a seat that is
+// working is never the thing the cap kills. Every failure is NAMED (failWhy) and carries which
+// watchdog fired (timedOutReason) plus what the seat was doing last (stream tail).
 
 export function resolveClaudeBin(): string {
   return resolveBin('claude', { envVar: 'CLAUDE_BIN' });
 }
 
-// PURE: the advisor half of EVERY `claude` invocation this engine builds (review seat,
-// brainstorm/consult voice, execution seat) — one owner, so the three can never spell it
-// differently. Absent → no flag (the seat inherits the operator's settings). A model id →
-// `--settings {"advisorModel":"<id>"}`. "off" → no flag either: no `--settings` value disables
-// the advisor (measured 2026-10-04 — see core/types), so "off" is the env kill switch
-// claudeAdvisorEnv returns. Built with JSON.stringify, never concatenation. This is the SPAWN
-// BACKSTOP: the CLI already refused an invalid value at its up-front seat resolution, but a
-// programmatic consumer (e.g. a dashboard setting ReviewerConfig.advisor) hands a runner a config
-// no resolver saw — so the value goes through parseSeatAdvisor again, and an invalid one THROWS
-// here rather than reaching the CLI.
 export function claudeAdvisorArgs(config?: { advisor?: unknown; id: string }): string[] {
   const advisor = parseSeatAdvisor(config?.advisor, config?.id ?? 'claude');
   if (advisor === undefined || advisor === ADVISOR_OFF) return [];
   return ['--settings', JSON.stringify({ advisorModel: advisor })];
 }
 
-// PURE: the env half of the advisor, merged over the parent env at every `claude` spawn. "off" →
-// CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1, the CLI's own kill switch and the one per-run off that holds
-// on any base model, whatever the operator's advisorModel (measured 2026-10-04). A model id or
-// absent → {}. Same parseSeatAdvisor backstop as claudeAdvisorArgs: an invalid value THROWS.
 export function claudeAdvisorEnv(config?: { advisor?: unknown; id: string }): Record<string, string> {
   const advisor = parseSeatAdvisor(config?.advisor, config?.id ?? 'claude');
   return advisor === ADVISOR_OFF ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' } : {};
 }
 
-// Claude's `--effort` accepts these levels; the 'default' sentinel (or anything
-// else) means "leave it to the CLI default", so the flag is omitted rather than
-// passed as an invalid value.
-const CLAUDE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
-
-// PURE: the claude CLI args for a brainstorm voice. `-p <prompt>` (headless,
-// single-shot, prints the reply to STDOUT) + `--output-format text` (a plain reply;
-// we parse the embedded ```json block out of it ourselves, exactly like the codex /
-// grok voices — symmetry IS robustness). `--tools ""` DISABLES every tool: ideation
-// needs none, and a tool-less voice is provably READ-ONLY — it cannot read, write, or
-// execute anything even if the topic or file context tries to prompt-inject it, giving
-// Claude the same read-only guarantee codex (`-s read-only`) and grok (OS sandbox)
-// carry. Honors the voice config's model/effort/advisor so a CONFIGURED Claude model
-// actually runs (not merely printed in progress). Encoded as DATA so a unit test pins it.
-// The web research tool set and its turn cap (`web: true` on the voice). `--tools` makes the two
-// tools AVAILABLE and `--allowedTools` PRE-APPROVES them: a headless `-p` spawn silently denies a
-// permission-gated tool (measured 2026-10-06 — with `--tools` alone the voice reported "the
-// WebFetch permission was denied"). `--max-turns` bounds the research loop so a voice cannot
-// browse for an hour on a vendor window. WebSearch runs vendor-side; WebFetch is the local CLI
-// fetching an arbitrary URL — the exfiltration channel the review fence exists to close — which
-// is why this stays a per-voice opt-in and the review reviewer never gets it.
 export const CLAUDE_WEB_TOOLS = 'WebSearch,WebFetch';
 export const CLAUDE_WEB_MAX_TURNS = 25;
 
+// PURE: the claude CLI args for the voice. `-p <prompt>` (headless, single-shot) +
+// `--output-format stream-json --verbose` (the liveness signal — see the header). With `web`
+// the two web tools are the ONLY tools and are pre-approved (`--allowedTools` is load-bearing: a
+// `-p` spawn silently denies a permission-gated tool) under a turn cap; without it `--tools ''`
+// keeps the voice provably tool-less. Honors the config's model / effort / advisor.
 export function buildClaudeVoiceArgs(prompt: string, config?: VoiceConfig): string[] {
-  const args = ['-p', prompt, '--output-format', 'text'];
+  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose'];
   if (config?.web === true)
     args.push('--tools', CLAUDE_WEB_TOOLS, '--allowedTools', CLAUDE_WEB_TOOLS, '--max-turns', String(CLAUDE_WEB_MAX_TURNS));
   else args.push('--tools', '');
@@ -78,31 +71,118 @@ export function buildClaudeVoiceArgs(prompt: string, config?: VoiceConfig): stri
   return args;
 }
 
-// Invoke Claude headless with the brainstorm prompt over the SAME group-aware
-// watchdog spawn primitive the reviewers use (claude can fork subprocesses, so the
-// group-kill is mandatory), in STDOUT-capture mode (claude prints its reply to
-// stdout, no -o file — like grok). Returns the uniform {ok, raw, stderrTail,
-// timedOut} so the orchestrator treats every voice identically. Passes `config`
-// through so the roster's model/effort override is applied (see buildClaudeVoiceArgs),
-// and its advisor "off" reaches the child's env (claudeAdvisorEnv).
-export function runClaudeVoice(
+// Test seams: the exec primitive, the binary, the waits and the liveness bar. Production
+// callers pass nothing.
+export interface BrainstormClaudeSeams {
+  bin?: string;
+  exec?: typeof runReviewerExec;
+  fastFailMs?: number;
+  inactivityTimeoutMs?: number;
+  retryDelaysMs?: readonly number[];
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+export async function runClaudeVoice(
   prompt: string,
   config: VoiceConfig,
-  opts: RunReviewOpts = {}
+  opts: RunReviewOpts = {},
+  seams: BrainstormClaudeSeams = {}
 ): Promise<CodexReviewResult> {
+  const exec = seams.exec ?? runReviewerExec;
+  const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
+  const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
+  const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  return runReviewerExec({
-    args: buildClaudeVoiceArgs(prompt, config),
-    bin: resolveClaudeBin(),
-    capture: 'stdout',
-    env: claudeAdvisorEnv(config),
-    onSpawn: opts.onSpawn,
-    stderrLimit: 2000,
-    timeoutMs,
-  }).then(({ raw, stderrTail, timedOut }) => ({
-    ok: raw !== null && !timedOut,
-    raw,
-    stderrTail,
-    timedOut,
-  }));
+  const args = buildClaudeVoiceArgs(prompt, config);
+  const env = claudeAdvisorEnv(config);
+  let retried = 0;
+  for (;;) {
+    const startedAt = Date.now();
+    const { raw, stderrTail, timedOut, timedOutReason } = await exec({
+      args,
+      bin: seams.bin ?? resolveClaudeBin(),
+      capture: 'stdout',
+      env,
+      inactivityTimeoutMs,
+      onSpawn: opts.onSpawn,
+      stderrLimit: 2000,
+      timeoutMs,
+    });
+    const elapsedMs = Date.now() - startedAt;
+    const stream = typeof raw === 'string' ? extractStreamResult(raw) : null;
+    // The reply is the result event's text; a stream that never completed (killed) or a reply
+    // that was not stream-json at all falls back to the raw stdout, as before.
+    const text = stream?.found ? stream.text : raw;
+    const activity = streamActivityTail(raw);
+    const transient =
+      !timedOut &&
+      typeof raw === 'string' &&
+      elapsedMs < fastFailMs &&
+      (stream?.found
+        ? stream.isError &&
+          (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? ''))
+        : isTransientApiErrorReply(raw));
+    if (transient && retried < retryDelaysMs.length) {
+      await sleep(retryDelaysMs[retried]);
+      retried += 1;
+      continue;
+    }
+    if (transient) {
+      const errorLine = (stream?.found ? (stream.text ?? '') : (raw ?? '')).trim();
+      return {
+        failWhy: `persistent transient API error after ${retried + 1} attempts`,
+        ok: false,
+        raw: null,
+        stderrTail: errorLine.slice(0, 300),
+        timedOut: false,
+      };
+    }
+    const limitText = typeof text === 'string' && isUsageLimitReply(text) ? text.trim() : null;
+    if (!timedOut && limitText) {
+      return {
+        failWhy: `${USAGE_LIMIT_FAIL_PREFIX} — ${limitText.slice(0, 160)}`,
+        ok: false,
+        raw: null,
+        stderrTail: limitText.slice(0, 300),
+        timedOut: false,
+      };
+    }
+    if (!timedOut && stream?.found && stream.isError) {
+      const status = stream.apiErrorStatus;
+      return {
+        failWhy: `the voice returned an error result${status ? ` (API status ${status})` : ''}`,
+        ok: false,
+        raw: null,
+        stderrTail: (stream.text ?? '').trim().slice(0, 300) || stderrTail,
+        timedOut: false,
+      };
+    }
+    if (timedOut) {
+      const bar = timedOutReason === 'inactivity' ? inactivityTimeoutMs : timeoutMs;
+      const span = bar >= 60_000 ? `${Math.round(bar / 60_000)} min` : `${Math.round(bar / 1000)} s`;
+      const failWhy =
+        timedOutReason === 'inactivity'
+          ? `stalled: no stream output for ${span} (wedged seat reclaimed)`
+          : `still working when the ${span} backstop cut it — give it budget`;
+      return {
+        failWhy,
+        ok: false,
+        raw: null,
+        stderrTail,
+        ...(activity ? { stream: activity } : {}),
+        timedOut: true,
+        ...(timedOutReason ? { timedOutReason } : {}),
+      };
+    }
+    const retryNote = retried > 0 ? `[retried ${retried}x on transient API error] ` : '';
+    const reply = text && text.trim() ? text : null;
+    return {
+      ok: reply !== null,
+      raw: reply,
+      stderrTail: retryNote ? `${retryNote}${stderrTail ?? ''}` : stderrTail,
+      ...(reply === null && activity ? { stream: activity } : {}),
+      timedOut: false,
+    };
+  }
 }

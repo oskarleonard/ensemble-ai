@@ -26,16 +26,16 @@ const cfg = (over: Partial<VoiceConfig> = {}): VoiceConfig => ({
 });
 
 describe('buildClaudeVoiceArgs', () => {
-  it('runs headless single-shot, printing plain text to stdout, with ALL tools disabled', () => {
+  it('runs headless single-shot, STREAMING events to stdout (the liveness signal, 2026-10-09), with ALL tools disabled', () => {
     const args = buildClaudeVoiceArgs('brainstorm prompt');
     // `--tools ""` makes the voice provably read-only (ideation needs no tools).
-    expect(args).toEqual(['-p', 'brainstorm prompt', '--output-format', 'text', '--tools', '']);
+    expect(args).toEqual(['-p', 'brainstorm prompt', '--output-format', 'stream-json', '--verbose', '--tools', '']);
   });
   it('`web: true` opens WebSearch + WebFetch, PRE-APPROVED for the headless spawn, under a turn cap (2026-10-06)', () => {
     const args = buildClaudeVoiceArgs('p', cfg({ web: true }));
     // `--allowedTools` is load-bearing: a `-p` spawn silently denies a permission-gated tool.
     expect(args).toEqual([
-      '-p', 'p', '--output-format', 'text',
+      '-p', 'p', '--output-format', 'stream-json', '--verbose',
       '--tools', 'WebSearch,WebFetch', '--allowedTools', 'WebSearch,WebFetch', '--max-turns', '25',
     ]);
   });
@@ -101,7 +101,7 @@ describe('buildClaudeVoiceArgs — the brainstorm/consult voice carries the advi
     expect(withModel.indexOf('--settings')).toBeGreaterThan(withModel.indexOf('--effort'));
     expect(buildClaudeVoiceArgs('p', cfg({ advisor: 'off' }))).toEqual(buildClaudeVoiceArgs('p', cfg()));
     // The tool-less posture is untouched.
-    expect(withModel.slice(0, 6)).toEqual(['-p', 'p', '--output-format', 'text', '--tools', '']);
+    expect(withModel.slice(0, 7)).toEqual(['-p', 'p', '--output-format', 'stream-json', '--verbose', '--tools', '']);
   });
 });
 

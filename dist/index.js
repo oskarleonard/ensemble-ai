@@ -128,6 +128,36 @@ function stripTrailingCommas(s) {
   }
   return out;
 }
+function escapeRawNewlinesInStrings(s) {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (ch === "\\") {
+        out += ch;
+        if (i + 1 < s.length) out += s[++i];
+        continue;
+      }
+      if (ch === '"') inString = false;
+      else if (ch === "\n") {
+        out += "\\n";
+        continue;
+      } else if (ch === "\r") {
+        out += "\\r";
+        continue;
+      } else if (ch === "	") {
+        out += "\\t";
+        continue;
+      }
+      out += ch;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    out += ch;
+  }
+  return out;
+}
 function extractJsonBlock(raw) {
   const fence = /```(?:json)?\s*([\s\S]*?)```/gi;
   let m;
@@ -147,6 +177,12 @@ function extractJsonBlock(raw) {
   for (const c of candidates) {
     try {
       return JSON.parse(stripTrailingCommas(c));
+    } catch {
+    }
+  }
+  for (const c of candidates) {
+    try {
+      return JSON.parse(stripTrailingCommas(escapeRawNewlinesInStrings(c)));
     } catch {
     }
   }
@@ -2720,6 +2756,74 @@ async function runGrokReview(prompt, config, opts = {}) {
 import fs15 from "fs";
 import os9 from "os";
 
+// src/core/claude-stream.ts
+var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
+function isTransientApiErrorReply(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 1500) return false;
+  return /\bAPI Error:\s*(?:429|5\d\d)\b/i.test(trimmed) || /\boverloaded\b/i.test(trimmed);
+}
+function isUsageLimitReply(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 300) return false;
+  return /\b(session|usage|weekly) limit\b/i.test(trimmed) && /\b(reset|hit|reached)\b/i.test(trimmed);
+}
+function isRetryableApiStatus(status) {
+  return status === 429 || typeof status === "number" && status >= 500 && status <= 599;
+}
+var USAGE_LIMIT_FAIL_PREFIX = "operator usage limit reached";
+function isUsageLimitFailure(failWhy) {
+  return failWhy?.startsWith(USAGE_LIMIT_FAIL_PREFIX) ?? false;
+}
+var TRANSIENT_RETRY_DELAYS_MS = [15e3, 45e3];
+var TRANSIENT_FAST_FAIL_MS = 12e4;
+var CLAUDE_INACTIVITY_TIMEOUT_MS = 6e5;
+function extractStreamResult(stdout) {
+  let found = { apiErrorStatus: null, found: false, isError: false, text: null };
+  for (const line of stdout.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("{")) continue;
+    let obj;
+    try {
+      obj = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    if (!obj || typeof obj !== "object") continue;
+    const o = obj;
+    if (o.type !== "result") continue;
+    found = {
+      apiErrorStatus: typeof o.api_error_status === "number" ? o.api_error_status : null,
+      found: true,
+      isError: o.is_error === true,
+      text: typeof o.result === "string" ? o.result : null
+    };
+  }
+  return found;
+}
+function streamActivityTail(stdout, limit = 600) {
+  if (!stdout) return "";
+  const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+  const summarized = [];
+  for (const line of lines.slice(-12)) {
+    if (!line.startsWith("{")) {
+      summarized.push(line);
+      continue;
+    }
+    try {
+      const o = JSON.parse(line);
+      const type = typeof o.type === "string" ? o.type : "event";
+      const msg = o.message;
+      const content = Array.isArray(msg?.content) ? msg.content : [];
+      const tools = content.filter((c) => c?.type === "tool_use").map((c) => String(c.name ?? "tool"));
+      summarized.push(tools.length ? `${type}: ${tools.join(",")}` : type);
+    } catch {
+      summarized.push(line.slice(0, 80));
+    }
+  }
+  return summarized.join(" \xB7 ").slice(-limit);
+}
+
 // src/modes/brainstorm/claude.ts
 function resolveClaudeBin() {
   return resolveBin("claude", { envVar: "CLAUDE_BIN" });
@@ -2733,11 +2837,10 @@ function claudeAdvisorEnv(config) {
   const advisor = parseSeatAdvisor(config?.advisor, config?.id ?? "claude");
   return advisor === ADVISOR_OFF ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: "1" } : {};
 }
-var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
 var CLAUDE_WEB_TOOLS = "WebSearch,WebFetch";
 var CLAUDE_WEB_MAX_TURNS = 25;
 function buildClaudeVoiceArgs(prompt, config) {
-  const args = ["-p", prompt, "--output-format", "text"];
+  const args = ["-p", prompt, "--output-format", "stream-json", "--verbose"];
   if (config?.web === true)
     args.push("--tools", CLAUDE_WEB_TOOLS, "--allowedTools", CLAUDE_WEB_TOOLS, "--max-turns", String(CLAUDE_WEB_MAX_TURNS));
   else args.push("--tools", "");
@@ -2746,22 +2849,92 @@ function buildClaudeVoiceArgs(prompt, config) {
   args.push(...claudeAdvisorArgs(config));
   return args;
 }
-function runClaudeVoice(prompt, config, opts = {}) {
+var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
+  const exec = seams.exec ?? runReviewerExec;
+  const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
+  const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
+  const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  return runReviewerExec({
-    args: buildClaudeVoiceArgs(prompt, config),
-    bin: resolveClaudeBin(),
-    capture: "stdout",
-    env: claudeAdvisorEnv(config),
-    onSpawn: opts.onSpawn,
-    stderrLimit: 2e3,
-    timeoutMs
-  }).then(({ raw, stderrTail, timedOut }) => ({
-    ok: raw !== null && !timedOut,
-    raw,
-    stderrTail,
-    timedOut
-  }));
+  const args = buildClaudeVoiceArgs(prompt, config);
+  const env = claudeAdvisorEnv(config);
+  let retried = 0;
+  for (; ; ) {
+    const startedAt = Date.now();
+    const { raw, stderrTail, timedOut, timedOutReason } = await exec({
+      args,
+      bin: seams.bin ?? resolveClaudeBin(),
+      capture: "stdout",
+      env,
+      inactivityTimeoutMs,
+      onSpawn: opts.onSpawn,
+      stderrLimit: 2e3,
+      timeoutMs
+    });
+    const elapsedMs = Date.now() - startedAt;
+    const stream = typeof raw === "string" ? extractStreamResult(raw) : null;
+    const text = stream?.found ? stream.text : raw;
+    const activity = streamActivityTail(raw);
+    const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
+    if (transient && retried < retryDelaysMs.length) {
+      await sleep(retryDelaysMs[retried]);
+      retried += 1;
+      continue;
+    }
+    if (transient) {
+      const errorLine = (stream?.found ? stream.text ?? "" : raw ?? "").trim();
+      return {
+        failWhy: `persistent transient API error after ${retried + 1} attempts`,
+        ok: false,
+        raw: null,
+        stderrTail: errorLine.slice(0, 300),
+        timedOut: false
+      };
+    }
+    const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
+    if (!timedOut && limitText) {
+      return {
+        failWhy: `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${limitText.slice(0, 160)}`,
+        ok: false,
+        raw: null,
+        stderrTail: limitText.slice(0, 300),
+        timedOut: false
+      };
+    }
+    if (!timedOut && stream?.found && stream.isError) {
+      const status = stream.apiErrorStatus;
+      return {
+        failWhy: `the voice returned an error result${status ? ` (API status ${status})` : ""}`,
+        ok: false,
+        raw: null,
+        stderrTail: (stream.text ?? "").trim().slice(0, 300) || stderrTail,
+        timedOut: false
+      };
+    }
+    if (timedOut) {
+      const bar = timedOutReason === "inactivity" ? inactivityTimeoutMs : timeoutMs;
+      const span = bar >= 6e4 ? `${Math.round(bar / 6e4)} min` : `${Math.round(bar / 1e3)} s`;
+      const failWhy = timedOutReason === "inactivity" ? `stalled: no stream output for ${span} (wedged seat reclaimed)` : `still working when the ${span} backstop cut it \u2014 give it budget`;
+      return {
+        failWhy,
+        ok: false,
+        raw: null,
+        stderrTail,
+        ...activity ? { stream: activity } : {},
+        timedOut: true,
+        ...timedOutReason ? { timedOutReason } : {}
+      };
+    }
+    const retryNote = retried > 0 ? `[retried ${retried}x on transient API error] ` : "";
+    const reply = text && text.trim() ? text : null;
+    return {
+      ok: reply !== null,
+      raw: reply,
+      stderrTail: retryNote ? `${retryNote}${stderrTail ?? ""}` : stderrTail,
+      ...reply === null && activity ? { stream: activity } : {},
+      timedOut: false
+    };
+  }
 }
 
 // src/modes/review/history-packet.ts
@@ -3603,7 +3776,6 @@ var CLAUDE_CAPABILITY_FENCE = {
   id: "claude-capability-fence",
   version: 2
 };
-var CLAUDE_EFFORTS2 = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
 var CLAUDE_REVIEW_DENIED_TOOLS = [
   "Bash",
   // The fan-out channel: a subagent is a fresh full-context conversation at the seat's own
@@ -3639,7 +3811,7 @@ function buildClaudeReviewArgs(prompt, config, fence = {}) {
   args.push("--strict-mcp-config");
   if (config?.model && config.model !== "default")
     args.push("--model", config.model);
-  if (config && CLAUDE_EFFORTS2.has(config.effort))
+  if (config && CLAUDE_EFFORTS.has(config.effort))
     args.push("--effort", config.effort);
   args.push(...claudeAdvisorArgs(config));
   args.push("--disallowedTools", ...CLAUDE_REVIEW_DENIED_TOOLS, ...homeReadDenyRules(homeDir));
@@ -3648,50 +3820,7 @@ function buildClaudeReviewArgs(prompt, config, fence = {}) {
 function makeNeutralSeatCwd() {
   return makeOwnerOnlyTempDir("ensemble-seat-cwd-");
 }
-function isTransientApiErrorReply(raw) {
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 1500) return false;
-  return /\bAPI Error:\s*(?:429|5\d\d)\b/i.test(trimmed) || /\boverloaded\b/i.test(trimmed);
-}
-function isUsageLimitReply(raw) {
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 300) return false;
-  return /\b(session|usage|weekly) limit\b/i.test(trimmed) && /\b(reset|hit|reached)\b/i.test(trimmed);
-}
-function isRetryableApiStatus(status) {
-  return status === 429 || typeof status === "number" && status >= 500 && status <= 599;
-}
-var USAGE_LIMIT_FAIL_PREFIX = "operator usage limit reached";
-function isUsageLimitFailure(failWhy) {
-  return failWhy?.startsWith(USAGE_LIMIT_FAIL_PREFIX) ?? false;
-}
-var TRANSIENT_RETRY_DELAYS_MS = [15e3, 45e3];
-var TRANSIENT_FAST_FAIL_MS = 12e4;
-var CLAUDE_INACTIVITY_TIMEOUT_MS = 6e5;
-function extractStreamResult(stdout) {
-  let found = { apiErrorStatus: null, found: false, isError: false, text: null };
-  for (const line of stdout.split("\n")) {
-    const t = line.trim();
-    if (!t.startsWith("{")) continue;
-    let obj;
-    try {
-      obj = JSON.parse(t);
-    } catch {
-      continue;
-    }
-    if (!obj || typeof obj !== "object") continue;
-    const o = obj;
-    if (o.type !== "result") continue;
-    found = {
-      apiErrorStatus: typeof o.api_error_status === "number" ? o.api_error_status : null,
-      found: true,
-      isError: o.is_error === true,
-      text: typeof o.result === "string" ? o.result : null
-    };
-  }
-  return found;
-}
-var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
   const exec = seams.exec ?? runReviewerExec;
   const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
@@ -3731,7 +3860,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       const text = stream?.found ? stream.text : raw;
       const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
       if (transient && retried < retryDelaysMs.length) {
-        await sleep(retryDelaysMs[retried]);
+        await sleep2(retryDelaysMs[retried]);
         retried += 1;
         continue;
       }
@@ -4037,6 +4166,14 @@ function parseVoiceIds(raw) {
 var CRITIQUE_STANCES = ["support", "concern", "extend"];
 
 // src/modes/brainstorm/voices.ts
+function seatFailureMeta(res) {
+  const tail = (res.stream ?? res.stderrTail ?? "").trim().slice(-600);
+  return {
+    ...res.timedOut ? { timedOut: true } : {},
+    ...res.timedOutReason ? { timedOutReason: res.timedOutReason } : {},
+    ...tail ? { tail } : {}
+  };
+}
 var VOICE_DEFAULTS = {
   claude: {
     cmd: "claude",
@@ -4105,6 +4242,27 @@ function parseVoices(raw) {
   }
   return out;
 }
+function parseJudge(raw) {
+  if (!raw || typeof raw !== "object") return {};
+  const j = raw.judge;
+  if (!j || typeof j !== "object") return {};
+  const r = j;
+  const voice = typeof r.voice === "string" && VOICE_IDS.includes(r.voice) ? r.voice : void 0;
+  const model = typeof r.model === "string" && r.model.trim() ? r.model.trim() : void 0;
+  const effort = typeof r.effort === "string" && r.effort.trim() ? r.effort.trim() : void 0;
+  return { ...voice ? { voice } : {}, ...model ? { model } : {}, ...effort ? { effort } : {} };
+}
+function loadJudge(file = VOICES_FILE) {
+  try {
+    return parseJudge(JSON.parse(fs16.readFileSync(file, "utf8")));
+  } catch {
+    return {};
+  }
+}
+function judgeConfig(spec, voiceId, configs) {
+  const base = configs[voiceId];
+  return { ...base, ...spec.model ? { model: spec.model } : {}, ...spec.effort ? { effort: spec.effort } : {} };
+}
 function loadVoices(file = VOICES_FILE) {
   try {
     return parseVoices(JSON.parse(fs16.readFileSync(file, "utf8")));
@@ -4140,20 +4298,20 @@ function resolveHolisticSeat(raw, flags = {}, warn = () => {
   const model = nonEmptyStr(flags.model) || entry && nonEmptyStr(entry.model) || HOLISTIC_DEFAULTS.model;
   const advisor = entry ? parseAdvisor(entry.advisor, "voices.json holistic") : void 0;
   const flagEffort = nonEmptyStr(flags.effort);
-  if (flagEffort && !CLAUDE_EFFORTS2.has(flagEffort))
+  if (flagEffort && !CLAUDE_EFFORTS.has(flagEffort))
     warn(
-      `holistic seat: --holistic-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 ignored`
+      `holistic seat: --holistic-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join("|")}) \u2014 ignored`
     );
   let effort = HOLISTIC_DEFAULTS.effort;
-  if (flagEffort && CLAUDE_EFFORTS2.has(flagEffort)) {
+  if (flagEffort && CLAUDE_EFFORTS.has(flagEffort)) {
     effort = flagEffort;
   } else {
     const rawEffort = entry ? nonEmptyStr(entry.effort) : null;
     if (rawEffort && rawEffort !== "default") {
-      if (CLAUDE_EFFORTS2.has(rawEffort)) effort = rawEffort;
+      if (CLAUDE_EFFORTS.has(rawEffort)) effort = rawEffort;
       else
         warn(
-          `holistic seat: \`effort\` "${rawEffort}" is not a known effort (${[...CLAUDE_EFFORTS2].join("|")}) \u2014 using the built-in default "${HOLISTIC_DEFAULTS.effort}"`
+          `holistic seat: \`effort\` "${rawEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join("|")}) \u2014 using the built-in default "${HOLISTIC_DEFAULTS.effort}"`
         );
     }
   }
@@ -5978,7 +6136,7 @@ async function runGenerate(voiceId, adapters, configs, prompt, timeoutMs, log) {
   if (!res.raw || res.timedOut) {
     const error = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
     log(`  \xB7 ${voiceId}: ${error}`);
-    return { error, ideas: [], ok: false, raw: res.raw, summary: "", timedOut: res.timedOut, voiceId };
+    return { error, ideas: [], ok: false, raw: res.raw, summary: "", ...seatFailureMeta(res), voiceId };
   }
   const parsed = parseIdeas(res.raw);
   if (parsed.parseError || parsed.ideas.length === 0) {
@@ -6008,7 +6166,7 @@ async function runCritique(voiceId, adapters, configs, topic, allIdeas, fileCont
   }
   if (!res.raw || res.timedOut) {
     const error = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
-    return { critiques: [], error, extensions: [], ok: false, raw: res.raw, summary: "", timedOut: res.timedOut, voiceId };
+    return { critiques: [], error, extensions: [], ok: false, raw: res.raw, summary: "", ...seatFailureMeta(res), voiceId };
   }
   const parsed = parseCritique(res.raw);
   if (parsed.parseError) {
@@ -6070,7 +6228,8 @@ async function runSynthesis(synthId, adapters, configs, topic, allIdeas, critiqu
     log(`  \xB7 synthesis produced no usable output \u2014 using the deterministic fallback`);
     return {
       ...fallbackSynthesis(allIdeas),
-      error: res.timedOut ? "synthesis timed out" : "synthesis produced no output"
+      error: res.failWhy ? `synthesis: ${res.failWhy}` : res.timedOut ? "synthesis timed out" : "synthesis produced no output",
+      ...seatFailureMeta(res)
     };
   }
   const parsed = parseSynthesis(res.raw);
@@ -6134,109 +6293,14 @@ async function runBrainstormMode(opts) {
 // src/modes/consult/index.ts
 var consult_exports = {};
 __export(consult_exports, {
+  DEFAULT_DEBATE_ROUNDS: () => DEFAULT_DEBATE_ROUNDS,
   DEFAULT_VOICE_TIMEOUT_MS: () => DEFAULT_VOICE_TIMEOUT_MS2,
+  MAX_DEBATE_ROUNDS: () => MAX_DEBATE_ROUNDS,
   fallbackSynthesis: () => fallbackSynthesis2,
+  judgeIsIndependent: () => judgeIsIndependent,
   pickSynthesizer: () => pickSynthesizer2,
   runConsultMode: () => runConsultMode
 });
-
-// src/modes/consult/parse.ts
-function str4(v) {
-  return typeof v === "string" ? v.trim() : "";
-}
-function asStance2(v) {
-  return oneOf(CRITIQUE_STANCES, v, "concern");
-}
-function strList(v) {
-  if (!Array.isArray(v)) return [];
-  return [...new Set(v.map(str4).filter(Boolean))];
-}
-function parseAnswer(raw) {
-  const obj = extractJsonBlock(raw);
-  if (!obj || typeof obj !== "object") {
-    return { answer: "", keyPoints: [], parseError: "no parseable JSON block in the output", summary: "" };
-  }
-  const o = obj;
-  const summary = str4(o.summary);
-  const answer = str4(o.answer);
-  const keyPoints = strList(o.keyPoints);
-  if (!summary && !answer) {
-    return { answer: "", keyPoints, parseError: 'output has no "answer" or "summary"', summary: "" };
-  }
-  return { answer, keyPoints, summary };
-}
-function parseCritique2(raw) {
-  const obj = extractJsonBlock(raw);
-  if (!obj || typeof obj !== "object") {
-    return { notes: [], parseError: "no parseable JSON block in the output", summary: "" };
-  }
-  const o = obj;
-  const summary = str4(o.summary);
-  if (!Array.isArray(o.notes)) {
-    return { notes: [], parseError: 'output has no "notes" array', summary };
-  }
-  const notes = [];
-  for (const rn of o.notes) {
-    if (!rn || typeof rn !== "object") continue;
-    const n = rn;
-    const target = str4(n.target);
-    const assessment = str4(n.assessment);
-    if (!target && !assessment) continue;
-    notes.push({ assessment, stance: asStance2(n.stance), target: target || "(unspecified)" });
-  }
-  return { notes, summary };
-}
-function parseAgreements2(v) {
-  if (!Array.isArray(v)) return [];
-  const out = [];
-  for (const ra of v) {
-    if (!ra || typeof ra !== "object") continue;
-    const a = ra;
-    const point = str4(a.point);
-    if (!point) continue;
-    out.push({ point, voices: strList(a.voices) });
-  }
-  return out;
-}
-function parseDivergences(v) {
-  if (!Array.isArray(v)) return [];
-  const out = [];
-  for (const rd of v) {
-    if (!rd || typeof rd !== "object") continue;
-    const d = rd;
-    const point = str4(d.point);
-    if (!point) continue;
-    out.push({ point, positions: strList(d.positions) });
-  }
-  return out;
-}
-function parseConsultSynthesis(raw) {
-  const obj = extractJsonBlock(raw);
-  if (!obj || typeof obj !== "object") {
-    return {
-      agreements: [],
-      divergences: [],
-      parseError: "no parseable JSON block in the output",
-      recommendation: "",
-      summary: ""
-    };
-  }
-  const o = obj;
-  const summary = str4(o.summary);
-  const recommendation = str4(o.recommendation);
-  const agreements = parseAgreements2(o.agreements);
-  const divergences = parseDivergences(o.divergences);
-  if (!recommendation && !summary) {
-    return {
-      agreements,
-      divergences,
-      parseError: 'output has no "recommendation" or "summary"',
-      recommendation: "",
-      summary: ""
-    };
-  }
-  return { agreements, divergences, recommendation, summary };
-}
 
 // src/modes/consult/prompt.ts
 var JSON_RULE2 = "Respond with ONE fenced ```json block and NOTHING else, matching:";
@@ -6339,7 +6403,10 @@ Compare them and separate the signal:
 - DIVERGENCES: points they answered DIFFERENTLY \u2014 flag these as "look closer", and
   record who took which position.
 Then give ONE bottom-line recommendation, noting how much of it rests on agreement
-vs on a judgement call between diverging views.
+vs on a judgement call between diverging views. Write it for a human reader, not as
+one paragraph: the verdict in one or two sentences, then the actions or blockers as a
+numbered list (one per line, "1. \u2026"), then a short paragraph on confidence. Separate
+those parts with blank lines (\\n\\n inside the JSON string).
 
 ## Question
 ${question.trim()}
@@ -6357,15 +6424,408 @@ ${JSON_RULE2}
   "divergences": [
     { "point": "<the question they split on>", "positions": ["codex: X", "grok: Y"] }
   ],
-  "recommendation": "<the bottom-line answer, and how confident given agree vs diverge>"
+  "recommendation": "<verdict sentence(s)\\n\\n1. <action or blocker>\\n2. \u2026\\n\\n<how confident, given agree vs diverge>"
 }
 Only list a REAL agreement (genuine concurrence, not a superficial overlap) and a
 REAL divergence (a substantive split, not wording). Empty arrays are fine.
 `;
 }
 
+// src/modes/consult/types.ts
+var DEBATE_STANCES = ["hold", "move", "concede"];
+var RULING_OUTCOMES = ["settled", "converged", "judgement", "unverified"];
+
+// src/modes/consult/debate.ts
+function splitsBlock(splits) {
+  return splits.map((s) => `[${s.id}] ${cap2(s.point)}
+${s.positions.map((p) => `  - ${cap2(p)}`).join("\n")}`).join("\n\n");
+}
+function evidenceLines(ev) {
+  if (ev.length === 0) return "    evidence: none brought";
+  return ev.map((e) => `    evidence (${cap2(e.source)}): "${cap2(e.quote)}" \u2014 ${cap2(e.bearing)}`).join("\n");
+}
+function entryBlock(e) {
+  const lines = [`    position: ${cap2(e.position)}`, `    stance: ${e.stance}`, evidenceLines(e.evidence)];
+  if (e.rebuttal) lines.push(`    rebuttal: ${cap2(e.rebuttal)}`);
+  if (e.movedBecause) lines.push(`    moved because: ${cap2(e.movedBecause)}`);
+  if (e.wouldChangeMind) lines.push(`    would change mind: ${cap2(e.wouldChangeMind)}`);
+  return lines.join("\n");
+}
+function priorRoundBlock(voiceId, last, splitIds) {
+  if (!last) return "";
+  const out = [];
+  for (const id of splitIds) {
+    const theirs = last.voices.filter((v) => v.ok && v.voiceId !== voiceId);
+    const mine = last.voices.find((v) => v.ok && v.voiceId === voiceId)?.entries.find((e) => e.splitId === id);
+    const lines = [`[${id}]`];
+    for (const v of theirs) {
+      const e = v.entries.find((x) => x.splitId === id);
+      if (e) lines.push(`  ${v.voiceId}, last round:
+${entryBlock(e)}`);
+    }
+    if (mine) lines.push(`  you, last round: ${cap2(mine.position)} (${mine.stance})`);
+    if (lines.length > 1) out.push(lines.join("\n"));
+  }
+  return out.length ? `
+## Last round (round ${last.round}) on the splits still open
+${out.join("\n\n")}
+` : "";
+}
+function ownAnswerBlock(own) {
+  if (!own || !own.ok) return "";
+  const kp = own.keyPoints.length ? `
+- ${own.keyPoints.map(cap2).join("\n- ")}` : "";
+  return `
+## Your original answer
+${cap2(own.summary)}${kp}
+`;
+}
+function renderDebatePrompt(args) {
+  const { fileContext, maxRounds, own, prior, question, round, splits, voiceId } = args;
+  const last = prior[prior.length - 1];
+  return `You are [${voiceId}], one side in an evidence DEBATE inside a multi-model consultation.
+The voices answered a question independently; a synthesizer found the points below where
+you and the other side DIVERGED. Argue YOUR side of each split \u2014 with PROOF \u2014 and answer
+the other side. Round ${round} of ${maxRounds}.
+
+Rules:
+- Evidence first. For every split bring the strongest CHECKABLE evidence you can: a quote
+  from the document (source "doc \xA7<section>"), a web source (source "web <url>", and what
+  it states), or a mechanism argument (source "reasoning"). Use your tools \u2014 search, fetch \u2014
+  wherever a fact can be checked; a claim nobody checked is worth little to the judge.
+- You may MOVE or CONCEDE only by naming the evidence that moved you (movedBecause).
+  Agreeing to be agreeable is a failure. Holding without evidence is also a failure \u2014 if
+  no evidence exists either way, say so in wouldChangeMind.
+- In rebuttal, answer the other side's actual evidence, not its wording.
+- One or two sentences per field; quotes may be longer.
+
+## Question
+${question.trim()}
+${contextBlock2(fileContext)}${ownAnswerBlock(own)}
+## The splits
+${splitsBlock(splits)}
+${priorRoundBlock(voiceId, last, splits.map((s) => s.id))}
+## Output format \u2014 STRICT
+${JSON_RULE2}
+{
+  "splits": [
+    {
+      "id": "<split id, exactly as listed>",
+      "position": "<your position after this round>",
+      "stance": "hold" | "move" | "concede",
+      "evidence": [
+        { "source": "doc \xA73.2 | web <url> | reasoning", "quote": "<what it says>", "bearing": "<what it shows for this split>" }
+      ],
+      "rebuttal": "<your answer to the other side's position and evidence>",
+      "movedBecause": "<required when stance is move or concede: the evidence that moved you>",
+      "wouldChangeMind": "<what would change your mind, or what you could not verify>"
+    }
+  ]
+}
+Cover every split id listed. "concede" = you now agree with the other side; "move" = you
+changed part of your position; "hold" = you stand, with evidence.
+`;
+}
+function roundsBlock(rounds, splits) {
+  return splits.map((s) => {
+    const lines = [`[${s.id}] ${cap2(s.point)}`, ...s.positions.map((p) => `  opening: ${cap2(p)}`)];
+    for (const r of rounds) {
+      if (!r.splitIds.includes(s.id)) continue;
+      for (const v of r.voices) {
+        if (!v.ok) {
+          lines.push(`  round ${r.round}, ${v.voiceId}: (no entry \u2014 ${cap2(v.error ?? "failed")})`);
+          continue;
+        }
+        const e = v.entries.find((x) => x.splitId === s.id);
+        if (e) lines.push(`  round ${r.round}, ${v.voiceId}:
+${entryBlock(e)}`);
+      }
+    }
+    return lines.join("\n");
+  }).join("\n\n");
+}
+function draftBlock(draft) {
+  const agree = draft.agreements.length ? `
+agreements (not in dispute):
+- ${draft.agreements.map((a) => cap2(a.point)).join("\n- ")}` : "";
+  return `${cap2(draft.summary)}${agree}
+
+draft recommendation:
+${cap2(draft.recommendation)}`;
+}
+function renderJudgePrompt(args) {
+  const { draft, fileContext, question, rounds, splits } = args;
+  return `You are the JUDGE of a multi-model consultation. You took NO part in it. Several
+models answered a question independently; a synthesizer separated what they agree on from
+where they diverge; the diverging voices then argued each split with evidence over
+${rounds.length} round(s). Rule on EVERY split BY THE EVIDENCE \u2014 never by which argument is
+longer, which model wrote it, or your own prior \u2014 then write the final recommendation in
+light of your rulings.
+
+Outcomes:
+- "settled": the evidence decides it. Say which position stands and why, citing the evidence.
+- "converged": a voice moved or conceded for a stated reason. Record where they landed.
+- "judgement": both positions are reasonable and the evidence does not decide. Do NOT pick a
+  winner: state the trade-off in one line and a default.
+- "unverified": it turns on a fact nobody checked. Say what would settle it and a default.
+A ruling that cites no evidence is not a ruling \u2014 if you find yourself choosing on taste,
+the outcome is "judgement".
+
+## Question
+${question.trim()}
+${contextBlock2(fileContext)}
+## The splits, with every round
+${roundsBlock(rounds, splits)}
+
+## The synthesizer's draft (before the debate)
+${draftBlock(draft)}
+
+## Output format \u2014 STRICT
+${JSON_RULE2}
+{
+  "summary": "<how the debate changed the picture, 2-3 sentences>",
+  "rulings": [
+    {
+      "splitId": "<split id, exactly as listed>",
+      "outcome": "settled" | "converged" | "judgement" | "unverified",
+      "direction": "<settled/converged: the position that stands, and whose \xB7 judgement: the trade-off \xB7 unverified: the unchecked fact>",
+      "why": "<the ruling's reason, resting on the evidence>",
+      "evidenceCited": ["<voice>: <source>"],
+      "whatWouldSettle": "<unverified only: the data, test or author's answer that would settle it>",
+      "defaultIfUndecided": "<judgement/unverified: the default to take if the human does not decide>"
+    }
+  ],
+  "recommendation": "<verdict sentence(s)\\n\\n1. <action or blocker>\\n2. \u2026\\n\\n<how confident, given what is settled vs still a judgement call>"
+}
+Cover every split id. Keep the agreements as they are \u2014 they were not in dispute.
+`;
+}
+function str4(v) {
+  return typeof v === "string" ? v.trim() : "";
+}
+function strList(v) {
+  if (!Array.isArray(v)) return [];
+  return [...new Set(v.map(str4).filter(Boolean))];
+}
+function parseEvidence(v) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const re of v) {
+    if (!re || typeof re !== "object") continue;
+    const e = re;
+    const source = str4(e.source);
+    const quote = str4(e.quote);
+    const bearing = str4(e.bearing);
+    if (!source && !quote) continue;
+    out.push({ bearing, quote, source: source || "unstated" });
+  }
+  return out;
+}
+function parseDebateReply(raw, splitIds) {
+  const obj = extractJsonBlock(raw);
+  if (!obj || typeof obj !== "object") {
+    return { downgraded: [], entries: [], parseError: "no parseable JSON block in the output" };
+  }
+  const o = obj;
+  if (!Array.isArray(o.splits)) return { downgraded: [], entries: [], parseError: 'output has no "splits" array' };
+  const known = new Set(splitIds);
+  const seen = /* @__PURE__ */ new Set();
+  const entries = [];
+  const downgraded = [];
+  for (const rs of o.splits) {
+    if (!rs || typeof rs !== "object") continue;
+    const s = rs;
+    const id = str4(s.id);
+    if (!known.has(id) || seen.has(id)) continue;
+    seen.add(id);
+    const position = str4(s.position);
+    const rebuttal = str4(s.rebuttal);
+    if (!position && !rebuttal) continue;
+    let stance = oneOf(DEBATE_STANCES, s.stance, "hold");
+    const movedBecause = str4(s.movedBecause);
+    if (stance !== "hold" && !movedBecause) {
+      stance = "hold";
+      downgraded.push(id);
+    }
+    const wouldChangeMind = str4(s.wouldChangeMind);
+    entries.push({
+      evidence: parseEvidence(s.evidence),
+      ...stance !== "hold" ? { movedBecause } : {},
+      position,
+      rebuttal,
+      splitId: id,
+      stance,
+      ...wouldChangeMind ? { wouldChangeMind } : {}
+    });
+  }
+  if (entries.length === 0) return { downgraded, entries, parseError: "output covers none of the splits" };
+  return { downgraded, entries };
+}
+function parseJudgeReply(raw, splitIds) {
+  const obj = extractJsonBlock(raw);
+  if (!obj || typeof obj !== "object") {
+    return { parseError: "no parseable JSON block in the output", recommendation: "", rulings: [], summary: "" };
+  }
+  const o = obj;
+  const summary = str4(o.summary);
+  const recommendation = str4(o.recommendation);
+  const known = new Set(splitIds);
+  const seen = /* @__PURE__ */ new Set();
+  const rulings = [];
+  if (Array.isArray(o.rulings)) {
+    for (const rr of o.rulings) {
+      if (!rr || typeof rr !== "object") continue;
+      const r = rr;
+      const splitId = str4(r.splitId);
+      if (!known.has(splitId) || seen.has(splitId)) continue;
+      const direction = str4(r.direction);
+      const why = str4(r.why);
+      if (!direction && !why) continue;
+      seen.add(splitId);
+      const outcome = oneOf(RULING_OUTCOMES, r.outcome, "judgement");
+      const evidenceCited = strList(r.evidenceCited);
+      const whatWouldSettle = str4(r.whatWouldSettle);
+      const defaultIfUndecided = str4(r.defaultIfUndecided);
+      rulings.push({
+        ...defaultIfUndecided ? { defaultIfUndecided } : {},
+        direction,
+        evidenceCited,
+        // A "settled" ruling that cites nothing is the taste call the prompt forbids — it is a
+        // judgement call for the reader, and the UI says so.
+        outcome: outcome === "settled" && evidenceCited.length === 0 ? "judgement" : outcome,
+        splitId,
+        ...whatWouldSettle ? { whatWouldSettle } : {},
+        why
+      });
+    }
+  }
+  if (rulings.length === 0 && !recommendation && !summary) {
+    return { parseError: 'output has no "rulings", "recommendation" or "summary"', recommendation: "", rulings: [], summary: "" };
+  }
+  return { recommendation, rulings, summary };
+}
+function splitsStillOpen(round, openIds) {
+  const out = [];
+  for (const id of openIds) {
+    const entries = round.voices.filter((v) => v.ok).flatMap((v) => v.entries.filter((e) => e.splitId === id));
+    if (entries.length === 0) continue;
+    const moved = entries.some((e) => e.stance !== "hold");
+    const evidence = entries.some((e) => e.evidence.length > 0);
+    if (!moved && evidence) out.push(id);
+  }
+  return out;
+}
+function splitsFromSynthesis(synthesis) {
+  return synthesis.divergences.map((d, i) => ({ id: `split-${i + 1}`, point: d.point, positions: d.positions }));
+}
+function rulingsTally(rulings) {
+  const counts = /* @__PURE__ */ new Map();
+  for (const r of rulings) counts.set(r.outcome, (counts.get(r.outcome) ?? 0) + 1);
+  return RULING_OUTCOMES.filter((o) => counts.has(o)).map((o) => `${counts.get(o)} ${o}`).join(", ");
+}
+
+// src/modes/consult/parse.ts
+function str5(v) {
+  return typeof v === "string" ? v.trim() : "";
+}
+function asStance2(v) {
+  return oneOf(CRITIQUE_STANCES, v, "concern");
+}
+function strList2(v) {
+  if (!Array.isArray(v)) return [];
+  return [...new Set(v.map(str5).filter(Boolean))];
+}
+function parseAnswer(raw) {
+  const obj = extractJsonBlock(raw);
+  if (!obj || typeof obj !== "object") {
+    return { answer: "", keyPoints: [], parseError: "no parseable JSON block in the output", summary: "" };
+  }
+  const o = obj;
+  const summary = str5(o.summary);
+  const answer = str5(o.answer);
+  const keyPoints = strList2(o.keyPoints);
+  if (!summary && !answer) {
+    return { answer: "", keyPoints, parseError: 'output has no "answer" or "summary"', summary: "" };
+  }
+  return { answer, keyPoints, summary };
+}
+function parseCritique2(raw) {
+  const obj = extractJsonBlock(raw);
+  if (!obj || typeof obj !== "object") {
+    return { notes: [], parseError: "no parseable JSON block in the output", summary: "" };
+  }
+  const o = obj;
+  const summary = str5(o.summary);
+  if (!Array.isArray(o.notes)) {
+    return { notes: [], parseError: 'output has no "notes" array', summary };
+  }
+  const notes = [];
+  for (const rn of o.notes) {
+    if (!rn || typeof rn !== "object") continue;
+    const n = rn;
+    const target = str5(n.target);
+    const assessment = str5(n.assessment);
+    if (!target && !assessment) continue;
+    notes.push({ assessment, stance: asStance2(n.stance), target: target || "(unspecified)" });
+  }
+  return { notes, summary };
+}
+function parseAgreements2(v) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const ra of v) {
+    if (!ra || typeof ra !== "object") continue;
+    const a = ra;
+    const point = str5(a.point);
+    if (!point) continue;
+    out.push({ point, voices: strList2(a.voices) });
+  }
+  return out;
+}
+function parseDivergences(v) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const rd of v) {
+    if (!rd || typeof rd !== "object") continue;
+    const d = rd;
+    const point = str5(d.point);
+    if (!point) continue;
+    out.push({ point, positions: strList2(d.positions) });
+  }
+  return out;
+}
+function parseConsultSynthesis(raw) {
+  const obj = extractJsonBlock(raw);
+  if (!obj || typeof obj !== "object") {
+    return {
+      agreements: [],
+      divergences: [],
+      parseError: "no parseable JSON block in the output",
+      recommendation: "",
+      summary: ""
+    };
+  }
+  const o = obj;
+  const summary = str5(o.summary);
+  const recommendation = str5(o.recommendation);
+  const agreements = parseAgreements2(o.agreements);
+  const divergences = parseDivergences(o.divergences);
+  if (!recommendation && !summary) {
+    return {
+      agreements,
+      divergences,
+      parseError: 'output has no "recommendation" or "summary"',
+      recommendation: "",
+      summary: ""
+    };
+  }
+  return { agreements, divergences, recommendation, summary };
+}
+
 // src/modes/consult/index.ts
 var DEFAULT_VOICE_TIMEOUT_MS2 = 3e5;
+var DEFAULT_DEBATE_ROUNDS = 2;
+var MAX_DEBATE_ROUNDS = 4;
 async function runAnswer(voiceId, adapters, configs, prompt, timeoutMs, log) {
   const config = configs[voiceId];
   log(`  \xB7 ${voiceId} (${config.vendor} \xB7 ${config.model}${config.web ? " \xB7 web" : ""}) answering\u2026`);
@@ -6379,7 +6839,7 @@ async function runAnswer(voiceId, adapters, configs, prompt, timeoutMs, log) {
   if (!res.raw || res.timedOut) {
     const error = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
     log(`  \xB7 ${voiceId}: ${error}`);
-    return { answer: "", error, keyPoints: [], ok: false, raw: res.raw, summary: "", timedOut: res.timedOut, voiceId };
+    return { answer: "", error, keyPoints: [], ok: false, raw: res.raw, summary: "", ...seatFailureMeta(res), voiceId };
   }
   const parsed = parseAnswer(res.raw);
   if (parsed.parseError) {
@@ -6409,7 +6869,7 @@ async function runCritique2(voiceId, adapters, configs, question, answers, fileC
   }
   if (!res.raw || res.timedOut) {
     const error = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
-    return { error, notes: [], ok: false, raw: res.raw, summary: "", timedOut: res.timedOut, voiceId };
+    return { error, notes: [], ok: false, raw: res.raw, summary: "", ...seatFailureMeta(res), voiceId };
   }
   const parsed = parseCritique2(res.raw);
   if (parsed.parseError) {
@@ -6450,7 +6910,8 @@ async function runSynthesis2(synthId, adapters, configs, question, answers, crit
     log(`  \xB7 synthesis produced no usable output \u2014 using the deterministic fallback`);
     return {
       ...fallbackSynthesis2(answers),
-      error: res.timedOut ? "synthesis timed out" : "synthesis produced no output"
+      error: res.failWhy ? `synthesis: ${res.failWhy}` : res.timedOut ? "synthesis timed out" : "synthesis produced no output",
+      ...seatFailureMeta(res)
     };
   }
   const parsed = parseConsultSynthesis(res.raw);
@@ -6472,6 +6933,121 @@ async function runSynthesis2(synthId, adapters, configs, question, answers, crit
     summary: parsed.summary
   };
 }
+async function runDebateVoice(voiceId, adapters, configs, prompt, splitIds, timeoutMs, log) {
+  let res;
+  try {
+    res = await adapters[voiceId](prompt, configs[voiceId], { timeoutMs });
+  } catch (e) {
+    log(`  \xB7 ${voiceId}: failed to run \u2014 ${e.message}`);
+    return { entries: [], error: e.message, ok: false, raw: null, voiceId };
+  }
+  if (!res.raw || res.timedOut) {
+    const error = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
+    log(`  \xB7 ${voiceId}: ${error}`);
+    return { entries: [], error, ok: false, raw: res.raw, ...seatFailureMeta(res), voiceId };
+  }
+  const parsed = parseDebateReply(res.raw, splitIds);
+  if (parsed.parseError) {
+    log(`  \xB7 ${voiceId}: ${parsed.parseError}`);
+    return { entries: [], error: parsed.parseError, ok: false, raw: res.raw, voiceId };
+  }
+  const moved = parsed.entries.filter((e) => e.stance !== "hold").length;
+  const evidence = parsed.entries.reduce((n, e) => n + e.evidence.length, 0);
+  log(
+    `  \xB7 ${voiceId}: ${parsed.entries.length} position(s), ${evidence} evidence item(s), moved on ${moved}${parsed.downgraded.length ? ` (${parsed.downgraded.length} ungrounded move(s) held)` : ""}`
+  );
+  return { entries: parsed.entries, ok: true, raw: res.raw, voiceId };
+}
+function judgeIsIndependent(judgeId, judgeModel, participants, configs) {
+  return !participants.some((id) => id === judgeId && configs[id].model === judgeModel);
+}
+async function runDebate(opts, debate, adapters, configs, answers, participants, synthesis, timeoutMs, log) {
+  const splits = splitsFromSynthesis(synthesis);
+  if (synthesis.degraded) {
+    log("Debate \xB7 skipped \u2014 the synthesis is the deterministic fallback (no divergences were judged)");
+    return void 0;
+  }
+  if (splits.length === 0) {
+    log("Debate \xB7 skipped \u2014 no divergence to argue");
+    return void 0;
+  }
+  if (participants.length < 2) {
+    log(`Debate \xB7 skipped \u2014 need \u22652 voices with answers (have ${participants.length})`);
+    return void 0;
+  }
+  const maxRounds = Math.max(1, Math.min(MAX_DEBATE_ROUNDS, Math.floor(debate.rounds)));
+  const rounds = [];
+  let open = splits.map((s) => s.id);
+  for (let round = 1; round <= maxRounds && open.length > 0; round++) {
+    log(`Round ${3 + round} \xB7 debate ${round}/${maxRounds} \u2014 ${open.length} split(s), ${participants.length} voice(s)`);
+    const argued = splits.filter((s) => open.includes(s.id));
+    const voices = await Promise.all(
+      participants.map(
+        (id) => runDebateVoice(
+          id,
+          adapters,
+          configs,
+          renderDebatePrompt({
+            fileContext: opts.fileContext,
+            maxRounds,
+            own: answers.find((a) => a.voiceId === id),
+            prior: rounds,
+            question: opts.question,
+            round,
+            splits: argued,
+            voiceId: id
+          }),
+          open,
+          timeoutMs,
+          log
+        )
+      )
+    );
+    const r = { round, splitIds: open, voices };
+    rounds.push(r);
+    if (voices.filter((v) => v.ok).length < 2) {
+      log("  \xB7 fewer than two voices argued \u2014 no further round");
+      break;
+    }
+    const next = splitsStillOpen(r, open);
+    log(`  \xB7 ${open.length - next.length} split(s) closed this round, ${next.length} still open`);
+    open = next;
+  }
+  const judgeId = debate.judge ?? pickSynthesizer2(participants, void 0, answers) ?? participants[0];
+  const judgeCfg = debate.judgeConfig ?? configs[judgeId];
+  const independent = judgeIsIndependent(judgeId, judgeCfg.model, participants, configs);
+  const judgeBase = { effort: judgeCfg.effort, independent, model: judgeCfg.model, voiceId: judgeId };
+  log(
+    `Judge \xB7 ${judgeId} (${judgeCfg.vendor} \xB7 ${judgeCfg.model}@${judgeCfg.effort}${independent ? " \xB7 independent" : " \xB7 ALSO ARGUED A SIDE"}) ruling on ${splits.length} split(s)\u2026`
+  );
+  const prompt = renderJudgePrompt({ draft: synthesis, fileContext: opts.fileContext, question: opts.question, rounds, splits });
+  let res;
+  try {
+    res = await adapters[judgeId](prompt, judgeCfg, { timeoutMs });
+  } catch (e) {
+    log(`  \xB7 judge failed to run \u2014 ${e.message}`);
+    return { judge: { ...judgeBase, error: e.message, ok: false, raw: null }, recommendation: "", rounds, rulings: [], splits, summary: "" };
+  }
+  if (!res.raw || res.timedOut) {
+    const error = res.failWhy ?? (res.timedOut ? "judge timed out" : "judge produced no output");
+    log(`  \xB7 ${error}`);
+    return { judge: { ...judgeBase, error, ok: false, raw: res.raw, ...seatFailureMeta(res) }, recommendation: "", rounds, rulings: [], splits, summary: "" };
+  }
+  const parsed = parseJudgeReply(res.raw, splits.map((s) => s.id));
+  if (parsed.parseError) {
+    log(`  \xB7 judge output not parseable \u2014 ${parsed.parseError}`);
+    return { judge: { ...judgeBase, error: parsed.parseError, ok: false, raw: res.raw }, recommendation: "", rounds, rulings: [], splits, summary: "" };
+  }
+  log(`  \xB7 rulings: ${rulingsTally(parsed.rulings) || "none"}${parsed.rulings.length < splits.length ? ` (${splits.length - parsed.rulings.length} split(s) left unruled)` : ""}`);
+  return {
+    judge: { ...judgeBase, ok: true, raw: res.raw },
+    recommendation: parsed.recommendation,
+    rounds,
+    rulings: parsed.rulings,
+    splits,
+    summary: parsed.summary
+  };
+}
 function pickSynthesizer2(roster, requested, answers) {
   if (requested && roster.includes(requested)) return requested;
   const healthy = answers.filter((a) => a.ok).map((a) => a.voiceId);
@@ -6485,6 +7061,8 @@ async function runConsultMode(opts) {
   const adapters = opts.adapters ?? VOICE_ADAPTERS;
   const configs = opts.voiceConfigs ?? loadVoices(opts.voicesFile);
   assertRosterAdvisors(roster, configs, opts.voiceConfigs ? void 0 : "voices.json");
+  if (opts.debate?.judge && !roster.includes(opts.debate.judge))
+    assertRosterAdvisors([opts.debate.judge], opts.debate.judgeConfig ? { ...configs, [opts.debate.judge]: opts.debate.judgeConfig } : configs, opts.voiceConfigs ? void 0 : "voices.json");
   const timeoutMs = opts.timeoutMs ?? DEFAULT_VOICE_TIMEOUT_MS2;
   log(`Round 1 \xB7 independent answers \u2014 ${roster.length} voice(s): ${roster.join(", ")}`);
   const answerPrompt = renderAnswerPrompt(opts.question, opts.fileContext);
@@ -6514,7 +7092,8 @@ async function runConsultMode(opts) {
     timeoutMs,
     log
   );
-  return { answers, critique, question: opts.question, roster, synthesis };
+  const debate = opts.debate ? await runDebate(opts, opts.debate, adapters, configs, answers, participants, synthesis, timeoutMs, log) : void 0;
+  return { answers, critique, ...debate ? { debate } : {}, question: opts.question, roster, synthesis };
 }
 
 // src/modes/index.ts
@@ -6545,7 +7124,7 @@ export {
   CI_EVIDENCE_TRAIL_FILE,
   CI_OUTPUT_PATTERNS,
   CLAUDE_CAPABILITY_FENCE,
-  CLAUDE_EFFORTS2 as CLAUDE_EFFORTS,
+  CLAUDE_EFFORTS,
   CLAUDE_INACTIVITY_TIMEOUT_MS,
   CLAUDE_READ_TOOLS,
   CLAUDE_REVIEW_DENIED_TOOLS,
@@ -6667,6 +7246,7 @@ export {
   enabledReviewerIds,
   ensureGrokLogin,
   ensureSandboxProfile,
+  escapeRawNewlinesInStrings,
   escapesRoot,
   evaluatePushFence,
   evidenceRef,
@@ -6717,12 +7297,14 @@ export {
   isUsageLimitFailure,
   isUsageLimitReply,
   isVoiceId,
+  judgeConfig,
   keyOf,
   killTree,
   listReviewers,
   listVoices,
   loadHolisticFixture,
   loadHolisticSeat,
+  loadJudge,
   loadPostingPosture,
   loadReviewers,
   loadVoices,
@@ -6744,6 +7326,7 @@ export {
   parseGrokStream,
   parseHolisticSites,
   parseIdeas,
+  parseJudge,
   parseLsTree,
   parsePushContext,
   parseReviewSummaries,
@@ -6820,6 +7403,7 @@ export {
   scanTextForSecrets,
   scoreHolisticFixture,
   scrubRepoEnv,
+  seatFailureMeta,
   section,
   securityClassLabel,
   segmentsWithoutTruncationSplices,

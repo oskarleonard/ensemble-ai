@@ -15,7 +15,7 @@ import {
   VOICE_IDS,
   type VoiceId,
 } from './types';
-import { assertRosterAdvisors, loadVoices, VOICE_ADAPTERS, type VoiceRunResult } from './voices';
+import { assertRosterAdvisors, loadVoices, seatFailureMeta, VOICE_ADAPTERS, type VoiceRunResult } from './voices';
 
 // Default per-voice timeout for a brainstorm round (ideation is lighter than an
 // xhigh code audit; the CLI can override). The shared spawn watchdog enforces it.
@@ -66,7 +66,7 @@ async function runGenerate(
   if (!res.raw || res.timedOut) {
     const error = (res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output'));
     log(`  · ${voiceId}: ${error}`);
-    return { error, ideas: [], ok: false, raw: res.raw, summary: '', timedOut: res.timedOut, voiceId };
+    return { error, ideas: [], ok: false, raw: res.raw, summary: '', ...seatFailureMeta(res), voiceId };
   }
   const parsed = parseIdeas(res.raw);
   if (parsed.parseError || parsed.ideas.length === 0) {
@@ -108,7 +108,7 @@ async function runCritique(
   }
   if (!res.raw || res.timedOut) {
     const error = (res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output'));
-    return { critiques: [], error, extensions: [], ok: false, raw: res.raw, summary: '', timedOut: res.timedOut, voiceId };
+    return { critiques: [], error, extensions: [], ok: false, raw: res.raw, summary: '', ...seatFailureMeta(res), voiceId };
   }
   const parsed = parseCritique(res.raw);
   if (parsed.parseError) {
@@ -191,7 +191,8 @@ async function runSynthesis(
     log(`  · synthesis produced no usable output — using the deterministic fallback`);
     return {
       ...fallbackSynthesis(allIdeas),
-      error: res.timedOut ? 'synthesis timed out' : 'synthesis produced no output',
+      error: res.failWhy ? `synthesis: ${res.failWhy}` : res.timedOut ? 'synthesis timed out' : 'synthesis produced no output',
+      ...seatFailureMeta(res),
     };
   }
   const parsed = parseSynthesis(res.raw);

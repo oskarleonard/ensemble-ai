@@ -109,7 +109,10 @@ export interface VoiceGenerateResult {
   ok: boolean;
   raw: string | null;
   summary: string;
+  // Why it timed out (which watchdog) and what it was doing last — see voices.ts seatFailureMeta.
+  tail?: string;
   timedOut?: boolean;
+  timedOutReason?: 'absolute' | 'inactivity';
   voiceId: VoiceId;
 }
 
@@ -121,7 +124,10 @@ export interface VoiceCritiqueResult {
   ok: boolean;
   raw: string | null;
   summary: string;
+  // Why it timed out (which watchdog) and what it was doing last — see voices.ts seatFailureMeta.
+  tail?: string;
   timedOut?: boolean;
+  timedOutReason?: 'absolute' | 'inactivity';
   voiceId: VoiceId;
 }
 
@@ -132,6 +138,10 @@ export interface SynthesisResult {
   by: VoiceId | null;
   degraded: boolean;
   error?: string;
+  // Why it timed out (which watchdog) and what it was doing last — see voices.ts seatFailureMeta.
+  tail?: string;
+  timedOut?: boolean;
+  timedOutReason?: 'absolute' | 'inactivity';
   ok: boolean;
   ranked: RankedIdea[];
   raw: string | null;
