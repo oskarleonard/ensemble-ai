@@ -32,7 +32,10 @@ export interface VoiceAnswerResult {
   ok: boolean;
   raw: string | null;
   summary: string;
+  // Why it timed out (which watchdog) and what it was doing last — see voices.ts seatFailureMeta.
+  tail?: string;
   timedOut?: boolean;
+  timedOutReason?: 'absolute' | 'inactivity';
   voiceId: VoiceId;
 }
 
@@ -51,7 +54,10 @@ export interface VoiceCritiqueResult {
   ok: boolean;
   raw: string | null;
   summary: string;
+  // Why it timed out (which watchdog) and what it was doing last — see voices.ts seatFailureMeta.
+  tail?: string;
   timedOut?: boolean;
+  timedOutReason?: 'absolute' | 'inactivity';
   voiceId: VoiceId;
 }
 
@@ -127,7 +133,10 @@ export interface DebateVoiceRound {
   error?: string;
   ok: boolean;
   raw: string | null;
+  // Why it timed out (which watchdog) and what it was doing last — see voices.ts seatFailureMeta.
+  tail?: string;
   timedOut?: boolean;
+  timedOutReason?: 'absolute' | 'inactivity';
   voiceId: VoiceId;
 }
 
@@ -165,6 +174,10 @@ export interface DebateSplit {
 export interface DebateJudge {
   effort: string;
   error?: string;
+  // Why it timed out (which watchdog) and what it was doing last — see voices.ts seatFailureMeta.
+  tail?: string;
+  timedOut?: boolean;
+  timedOutReason?: 'absolute' | 'inactivity';
   // true = the judge's (voice, model) is not one of the debating voices' — a different model
   // of the same vendor counts; the identical model that argued a side does not.
   independent: boolean;

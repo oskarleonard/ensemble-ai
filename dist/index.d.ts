@@ -1,9 +1,9 @@
 import { a as ReviewerConfig, R as ReviewerId, T as TerminalState, S as StoredReview, b as ReviewFinding, c as Severity, p as parseSeatAdvisor, d as SeatDiagnostics, e as ReviewPacket } from './types-DgfmIzB8.js';
 export { A as ADVISOR_MODEL_RE, f as ADVISOR_OFF, C as CONFIDENCES, g as CORE_REVIEWER_IDS, h as Confidence, i as CoreReviewerId, E as Evidence, M as ManifestEntry, P as PacketSection, j as REVIEWER_IDS, k as SEVERITIES, l as TERMINAL_STATES, m as enabledReviewerIds, n as isCoreReviewerId, o as isReviewerId, q as isSeatAdvisor, r as parseReviewerIds, s as parseSeatWindow, t as severityAtLeast, u as titleCase } from './types-DgfmIzB8.js';
-import { R as ReviewProfile } from './contracts-CZyGkP7Q.js';
-export { C as CI_EVIDENCE_SECTION_TITLE, D as DIFF_SECTION_TITLE, a as DIFF_USEFUL_FLOOR, F as FINDINGS_INSTRUCTIONS, P as PACKET_BUDGETS, b as PacketInput, c as ParsedReview, d as REVIEW_PROFILES, S as SECURITY_CLASSES, e as SECURITY_OBJECTIVE, f as SEVERITY_LABEL, g as SEVERITY_ORDER, h as SecurityClass, T as TRUNCATION_MARKER_RE, i as assembleCodePacket, j as classifySecurityFinding, k as evidenceRef, l as extractJsonBlock, m as isReviewProfile, o as oneOf, p as parseFindings, r as renderReviewPrompt, n as reviewerVisibleDiff, s as section, q as securityClassLabel, t as segmentsWithoutTruncationSplices, u as stripSecurityTag, v as stripTrailingCommas } from './contracts-CZyGkP7Q.js';
-import { V as VoiceId, a as VoiceConfig, R as ResolvedVoiceConfig, I as Idea, S as SynthesisResult, b as VoiceGenerateResult, B as BrainstormResult, c as VoiceCritiqueResult$1, C as Critique, d as RawIdea, e as RankedIdea, f as CritiqueStance } from './types-hvdZhdkR.js';
-export { g as CRITIQUE_STANCES, h as VOICE_IDS, i as isVoiceId, p as parseVoiceIds } from './types-hvdZhdkR.js';
+import { R as ReviewProfile } from './contracts-JEs8tgml.js';
+export { C as CI_EVIDENCE_SECTION_TITLE, D as DIFF_SECTION_TITLE, a as DIFF_USEFUL_FLOOR, F as FINDINGS_INSTRUCTIONS, P as PACKET_BUDGETS, b as PacketInput, c as ParsedReview, d as REVIEW_PROFILES, S as SECURITY_CLASSES, e as SECURITY_OBJECTIVE, f as SEVERITY_LABEL, g as SEVERITY_ORDER, h as SecurityClass, T as TRUNCATION_MARKER_RE, i as assembleCodePacket, j as classifySecurityFinding, k as escapeRawNewlinesInStrings, l as evidenceRef, m as extractJsonBlock, n as isReviewProfile, o as oneOf, p as parseFindings, r as renderReviewPrompt, q as reviewerVisibleDiff, s as section, t as securityClassLabel, u as segmentsWithoutTruncationSplices, v as stripSecurityTag, w as stripTrailingCommas } from './contracts-JEs8tgml.js';
+import { V as VoiceId, a as VoiceConfig, R as ResolvedVoiceConfig, I as Idea, S as SynthesisResult, b as VoiceGenerateResult, B as BrainstormResult, c as VoiceCritiqueResult$1, C as Critique, d as RawIdea, e as RankedIdea, f as CritiqueStance } from './types-DpTj1RQa.js';
+export { g as CRITIQUE_STANCES, h as VOICE_IDS, i as isVoiceId, p as parseVoiceIds } from './types-DpTj1RQa.js';
 
 type GitRun = (args: string[], opts?: {
     cwd?: string;
@@ -158,10 +158,24 @@ interface RunReviewOpts {
 declare function runCodexReview(prompt: string, config: ReviewerConfig, opts?: RunReviewOpts): Promise<CodexReviewResult>;
 
 type VoiceRunResult = CodexReviewResult;
+type SeatTimeoutReason = 'absolute' | 'inactivity';
+declare function seatFailureMeta(res: VoiceRunResult): {
+    tail?: string;
+    timedOut?: boolean;
+    timedOutReason?: SeatTimeoutReason;
+};
 declare const VOICE_DEFAULTS: Record<VoiceId, ResolvedVoiceConfig>;
 declare const VOICE_ADAPTERS: Record<VoiceId, (prompt: string, config: VoiceConfig, opts?: RunReviewOpts) => Promise<VoiceRunResult>>;
 declare const VOICES_FILE: string;
 declare function parseVoices(raw: unknown): Record<VoiceId, VoiceConfig>;
+interface JudgeSpec {
+    effort?: string;
+    model?: string;
+    voice?: VoiceId;
+}
+declare function parseJudge(raw: unknown): JudgeSpec;
+declare function loadJudge(file?: string): JudgeSpec;
+declare function judgeConfig(spec: JudgeSpec, voiceId: VoiceId, configs: Record<VoiceId, VoiceConfig>): VoiceConfig;
 declare function loadVoices(file?: string): Record<VoiceId, VoiceConfig>;
 declare function assertRosterAdvisors(roster: readonly VoiceId[], configs: Record<VoiceId, VoiceConfig>, source?: string): void;
 declare function listVoices(file?: string): VoiceConfig[];
@@ -1183,17 +1197,7 @@ interface CodeReviewSeatPromptArgs {
 }
 declare function renderCodeReviewSeatPrompt(args: CodeReviewSeatPromptArgs): string;
 
-declare const CLAUDE_CAPABILITY_FENCE: SandboxProfileRef;
 declare const CLAUDE_EFFORTS: Set<string>;
-declare const CLAUDE_REVIEW_DENIED_TOOLS: readonly ["Bash", "Agent", "Task", "WebFetch", "WebSearch", "Write", "Edit", "MultiEdit", "NotebookEdit"];
-declare const CLAUDE_READ_TOOLS: readonly ["Read", "Grep", "Glob"];
-declare function homeReadDenyRules(homeDir: string): string[];
-interface ClaudeSeatFence {
-    homeDir?: string;
-    readRoot?: string;
-}
-declare function buildClaudeReviewArgs(prompt: string, config?: VoiceConfig, fence?: ClaudeSeatFence): string[];
-declare function makeNeutralSeatCwd(): string;
 declare function isTransientApiErrorReply(raw: string): boolean;
 declare function isUsageLimitReply(raw: string): boolean;
 declare function isRetryableApiStatus(status: number | null): boolean;
@@ -1209,6 +1213,18 @@ interface StreamResultEvent {
     text: string | null;
 }
 declare function extractStreamResult(stdout: string): StreamResultEvent;
+
+declare const CLAUDE_CAPABILITY_FENCE: SandboxProfileRef;
+
+declare const CLAUDE_REVIEW_DENIED_TOOLS: readonly ["Bash", "Agent", "Task", "WebFetch", "WebSearch", "Write", "Edit", "MultiEdit", "NotebookEdit"];
+declare const CLAUDE_READ_TOOLS: readonly ["Read", "Grep", "Glob"];
+declare function homeReadDenyRules(homeDir: string): string[];
+interface ClaudeSeatFence {
+    homeDir?: string;
+    readRoot?: string;
+}
+declare function buildClaudeReviewArgs(prompt: string, config?: VoiceConfig, fence?: ClaudeSeatFence): string[];
+declare function makeNeutralSeatCwd(): string;
 type ReviewerExec = typeof runReviewerExec;
 interface ClaudeVoiceSeams {
     exec?: ReviewerExec;
@@ -1312,7 +1328,14 @@ declare function claudeAdvisorEnv(config?: {
 declare const CLAUDE_WEB_TOOLS = "WebSearch,WebFetch";
 declare const CLAUDE_WEB_MAX_TURNS = 25;
 declare function buildClaudeVoiceArgs(prompt: string, config?: VoiceConfig): string[];
-declare function runClaudeVoice(prompt: string, config: VoiceConfig, opts?: RunReviewOpts): Promise<CodexReviewResult>;
+interface BrainstormClaudeSeams {
+    bin?: string;
+    exec?: typeof runReviewerExec;
+    fastFailMs?: number;
+    inactivityTimeoutMs?: number;
+    retryDelaysMs?: readonly number[];
+}
+declare function runClaudeVoice(prompt: string, config: VoiceConfig, opts?: RunReviewOpts, seams?: BrainstormClaudeSeams): Promise<CodexReviewResult>;
 
 declare function renderGeneratePrompt(topic: string, fileContext?: string): string;
 declare function renderCritiquePrompt(topic: string, peerIdeas: Idea[], fileContext?: string): string;
@@ -1345,7 +1368,9 @@ interface VoiceAnswerResult {
     ok: boolean;
     raw: string | null;
     summary: string;
+    tail?: string;
     timedOut?: boolean;
+    timedOutReason?: 'absolute' | 'inactivity';
     voiceId: VoiceId;
 }
 interface AnswerNote {
@@ -1359,7 +1384,9 @@ interface VoiceCritiqueResult {
     ok: boolean;
     raw: string | null;
     summary: string;
+    tail?: string;
     timedOut?: boolean;
+    timedOutReason?: 'absolute' | 'inactivity';
     voiceId: VoiceId;
 }
 interface AgreementPoint {
@@ -1381,9 +1408,77 @@ interface ConsultSynthesis {
     recommendation: string;
     summary: string;
 }
+declare const DEBATE_STANCES: readonly ["hold", "move", "concede"];
+type DebateStance = (typeof DEBATE_STANCES)[number];
+interface DebateEvidence {
+    bearing: string;
+    quote: string;
+    source: string;
+}
+interface DebateEntry {
+    evidence: DebateEvidence[];
+    movedBecause?: string;
+    position: string;
+    rebuttal: string;
+    splitId: string;
+    stance: DebateStance;
+    wouldChangeMind?: string;
+}
+interface DebateVoiceRound {
+    entries: DebateEntry[];
+    error?: string;
+    ok: boolean;
+    raw: string | null;
+    tail?: string;
+    timedOut?: boolean;
+    timedOutReason?: 'absolute' | 'inactivity';
+    voiceId: VoiceId;
+}
+interface DebateRound {
+    round: number;
+    splitIds: string[];
+    voices: DebateVoiceRound[];
+}
+declare const RULING_OUTCOMES: readonly ["settled", "converged", "judgement", "unverified"];
+type RulingOutcome = (typeof RULING_OUTCOMES)[number];
+interface SplitRuling {
+    defaultIfUndecided?: string;
+    direction: string;
+    evidenceCited: string[];
+    outcome: RulingOutcome;
+    splitId: string;
+    whatWouldSettle?: string;
+    why: string;
+}
+interface DebateSplit {
+    id: string;
+    point: string;
+    positions: string[];
+}
+interface DebateJudge {
+    effort: string;
+    error?: string;
+    tail?: string;
+    timedOut?: boolean;
+    timedOutReason?: 'absolute' | 'inactivity';
+    independent: boolean;
+    model: string;
+    ok: boolean;
+    raw: string | null;
+    voiceId: VoiceId;
+}
+interface DebateResult {
+    judge: DebateJudge;
+    recommendation: string;
+    rounds: DebateRound[];
+    rulings: SplitRuling[];
+    splits: DebateSplit[];
+    summary: string;
+}
 interface ConsultResult {
     answers: VoiceAnswerResult[];
     critique: VoiceCritiqueResult[];
+    debate?: DebateResult;
     question: string;
     roster: VoiceId[];
     synthesis: ConsultSynthesis;
@@ -1394,8 +1489,16 @@ type Adapters = Record<VoiceId, (prompt: string, config: VoiceConfig, opts?: {
     onSpawn?: (kill: () => void) => void;
     timeoutMs?: number;
 }) => Promise<VoiceRunResult>>;
+interface DebateOptions {
+    judge?: VoiceId;
+    judgeConfig?: VoiceConfig;
+    rounds: number;
+}
+declare const DEFAULT_DEBATE_ROUNDS = 2;
+declare const MAX_DEBATE_ROUNDS = 4;
 interface ConsultOptions {
     adapters?: Adapters;
+    debate?: DebateOptions;
     critique?: boolean;
     fileContext?: string;
     onProgress?: (msg: string) => void;
@@ -1407,16 +1510,21 @@ interface ConsultOptions {
     voicesFile?: string;
 }
 declare function fallbackSynthesis(answers: VoiceAnswerResult[]): ConsultSynthesis;
+declare function judgeIsIndependent(judgeId: VoiceId, judgeModel: string, participants: readonly VoiceId[], configs: Record<VoiceId, VoiceConfig>): boolean;
 declare function pickSynthesizer(roster: VoiceId[], requested: VoiceId | undefined, answers: VoiceAnswerResult[]): VoiceId | null;
 declare function runConsultMode(opts: ConsultOptions): Promise<ConsultResult>;
 
 type index_ConsultOptions = ConsultOptions;
+declare const index_DEFAULT_DEBATE_ROUNDS: typeof DEFAULT_DEBATE_ROUNDS;
 declare const index_DEFAULT_VOICE_TIMEOUT_MS: typeof DEFAULT_VOICE_TIMEOUT_MS;
+type index_DebateOptions = DebateOptions;
+declare const index_MAX_DEBATE_ROUNDS: typeof MAX_DEBATE_ROUNDS;
 declare const index_fallbackSynthesis: typeof fallbackSynthesis;
+declare const index_judgeIsIndependent: typeof judgeIsIndependent;
 declare const index_pickSynthesizer: typeof pickSynthesizer;
 declare const index_runConsultMode: typeof runConsultMode;
 declare namespace index {
-  export { type index_ConsultOptions as ConsultOptions, index_DEFAULT_VOICE_TIMEOUT_MS as DEFAULT_VOICE_TIMEOUT_MS, index_fallbackSynthesis as fallbackSynthesis, index_pickSynthesizer as pickSynthesizer, index_runConsultMode as runConsultMode };
+  export { type index_ConsultOptions as ConsultOptions, index_DEFAULT_DEBATE_ROUNDS as DEFAULT_DEBATE_ROUNDS, index_DEFAULT_VOICE_TIMEOUT_MS as DEFAULT_VOICE_TIMEOUT_MS, type index_DebateOptions as DebateOptions, index_MAX_DEBATE_ROUNDS as MAX_DEBATE_ROUNDS, index_fallbackSynthesis as fallbackSynthesis, index_judgeIsIndependent as judgeIsIndependent, index_pickSynthesizer as pickSynthesizer, index_runConsultMode as runConsultMode };
 }
 
 declare const MODES: readonly ["review", "brainstorm", "security", "consult"];
@@ -1427,4 +1535,4 @@ declare function resolveMode(v: string): string;
 declare function isMode(v: string): v is ModeName;
 declare function isImplemented(mode: ModeName): boolean;
 
-export { AGENT_INSTRUCTION_NAMES, type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormOptions, BrainstormResult, type BuildReceiptResult, CI_EVIDENCE_BOTH_REASON, CI_EVIDENCE_LIMITS, CI_EVIDENCE_TRAIL_FILE, CI_OUTPUT_PATTERNS, CLAUDE_CAPABILITY_FENCE, CLAUDE_EFFORTS, CLAUDE_INACTIVITY_TIMEOUT_MS, CLAUDE_READ_TOOLS, CLAUDE_REVIEW_DENIED_TOOLS, CLAUDE_WEB_MAX_TURNS, CLAUDE_WEB_TOOLS, CODEX_INACTIVITY_TIMEOUT_MS, CODEX_SANDBOX_PROFILE, COLD_PEER_ROLE, CORE_WORKTREE_REVIEW_TIMEOUT_MS, type CiEvidenceInput, type CiEvidenceLimits, type CiEvidenceResolution, type CiEvidenceResult, type ClaudeSeatFence, type ClaudeVoiceSeams, type CodeReviewSeatPromptArgs, type CodexReviewResult, type CodexSandboxPaths, type ConsultResult, type ConsultSynthesis, type ConventionCitation, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type ConventionTier, type Coverage, type CoverageFileEntry, type CoveragePolicy, Critique, CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_POSTURE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, ENSEMBLE_CONFIG_PATH, EVIDENCE_CLASSES, EVIDENCE_MANIFEST_FILE, EVIDENCE_MANIFEST_SCHEMA_VERSION, EVIDENCE_SEATS, type EgressDenial, type EgressProxy, type EnsureGrokLoginOpts, type EvidenceClass, type EvidenceGap, type EvidenceManifest, type EvidenceMap, type EvidenceSeat, type FileDiff, type FileKind, type FixtureAnchor, type FixtureScore, GROK_CLI_SANDBOX, GROK_INACTIVITY_TIMEOUT_MS, GROK_LOGIN_EXPIRY_FAIL_PREFIX, GROK_LOGIN_MARGIN_MS, GROK_PACKET_REVIEW_TIMEOUT_MS, GROK_PREFLIGHT_CANCELLED_WHY, GROK_REVIEW_TOOLS, GROK_SANDBOX_PROFILE, GROK_STATUS_API_KEY, GROK_STATUS_AUTHENTICATED_VIA_PREFIX, GROK_STATUS_LOGGED_IN_PREFIX, GROK_STATUS_NOT_AUTHENTICATED, GROK_WEB_TOOL, GROK_WORKTREE_REVIEW_TIMEOUT_MS, type GatherConfig, type GatheredConventions, type GhResult, type GhRunner, type GitRun, type GitRunAsync, GrokLoginExpiryError, type GrokModelsResult, type GrokModelsRun, type GrokModelsRunner, GrokPreflightCancelledError, type GrokStreamSummary, type GrokToolFence, HARNESS_SEATS, HOLISTIC_DEFAULTS, HOLISTIC_MIN_ANCHOR_NONWS, HOLISTIC_SEAT_ID, HOLISTIC_SEVERITY_CAP, type HarnessSeat, type HolisticEntry, type HolisticFixture, type HolisticPlan, type HolisticPolicyDeps, type HolisticPromptArgs, type HolisticProvenance, type HolisticRunner, type HolisticSeatFlags, type HolisticSite, type HolisticSiteRole, IMPLEMENTED_MODES, Idea, type InlineSecretHit, MDNS_RESPONDER_SOCKET, MODES, MODE_ALIASES, type ManifestBlob, type ModeName, type NearMiss, OPERATOR_REVIEW_METHOD, type OmitReason, POLICY_VERSIONS, POLICY_VERSION_EVIDENCE, POLICY_VERSION_LEGACY, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PendingState, type PersistReviewInput, type PlacedFinding, type PlantedPositive, type PolicyHashInputs, type PostingPosture, type PrPushContext, type PreflightError, type PreflightErrorKind, type PushFenceVerdict, QUALIFY_PROBE_PORT, QUALITY_LENS, REPO_LOCATION_ENV, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, RankedIdea, RawIdea, type ReceiptCoverage, type ReceiptKey, type RepoLocation, ResolvedVoiceConfig, type ReviewEvidence, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, type ReviewSummary, ReviewerConfig, type ReviewerExec, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunHolisticLensOptions, type RunReviewOpts, SANDBOX_WRITABLE_TMP, STAGE_MARKER, SUGGESTION_HARD_CAP, type SandboxProfileMap, type SandboxProfileRef, type ScoredFinding, type SeatCancel, SeatDiagnostics, type SecretScanResult, type SensitivePathHit, Severity, type SiteCheck, type SiteReader, type StageCounts, type StageFailure, type StagePlan, type StageResult, type StageSuccess, type StageTarget, type StagedComment, type StagedReviewPayload, type StartEgressProxyOpts, StoredReview, type StreamResultEvent, type SummaryBodyInput, SynthesisResult, TRANSIENT_FAST_FAIL_MS, TRANSIENT_RETRY_DELAYS_MS, TerminalState, type TextSecretHit, UNTRUSTED_INSTRUCTIONS_CLAUSE, USAGE_LIMIT_FAIL_PREFIX, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, type VerifySandboxPaths, type VoiceAnswerResult, VoiceConfig, VoiceCritiqueResult$1 as VoiceCritiqueResult, VoiceGenerateResult, VoiceId, type VoiceRunResult, type Worktree, type WorktreeEvidence, acquireDiff, allowedRootsFromConfig, applyHolisticPolicy, asRecord, assertRosterAdvisors, boundedStreamTail, buildClaudeReviewArgs, buildClaudeVoiceArgs, buildCodexReviewArgs, buildCodexWorktreeArgs, buildDiffReceipt, buildEvidenceManifest, buildGrokReviewArgs, buildStagedReviewPayload, canonicalizeDiff, capHolisticSeverity, checkFreshness, classifyFileKind, classifyGitError, classifyPending, claudeAdvisorArgs, claudeAdvisorEnv, claudeWorktreePromptSuffix, codexSandboxSupported, computeCoverage, computePolicyHash, computePolicyHashAt, index as consult, coverageCounts, coverageShortfall, defaultCodexSandboxPaths, defaultReceiptStore, defuseUntrusted, diffDigest, effectiveSshFrom, ensureGrokLogin, ensureSandboxProfile, escapesRoot, evaluatePushFence, evidenceShortfall, extractDirRefs, extractGrokText, extractIncludes, extractRefs, extractStreamResult, fallbackSynthesis$1 as fallbackSynthesis, fetchCiEvidence, findQuoteSpan, findQuoteSpans, findingTrailer, formatEvidenceShortfall, fsConventionReader, gatherConventions, grokAllowedTools, grokLoginWarningLine, grokToolFence, hasDepSurface, hasGeneratedHeader, holisticCapWasLifted, homeReadDenyRules, isCommitSha, isConventionsDoc, isDiffReviewed, isEnsembleStagedReview, isEvidenceClass, isEvidenceSeat, isGrokLoginExpiryFailure, isHolisticRecord, isImplemented, isMode, isPolicyVersion, isPreflightError, isRetryableApiStatus, isStrippedPath, isTestPath, isTransientApiErrorReply, isUnder, isUnsafeReadRoot, isUsageLimitFailure, isUsageLimitReply, keyOf, killTree, listReviewers, listVoices, loadHolisticFixture, loadHolisticSeat, loadPostingPosture, loadReviewers, loadVoices, makeEscalatingKill, makeNeutralSeatCwd, makeOwnerOnlyTempDir, materializeWorktree, materializeWorktreeAsync, materializedDiffClause, meetsInlineFloor, memoryConventionReader, missingConfig, omittedLine, parseConventionCitation, parseCritique, parseDiffFiles, parseGrokStream, parseHolisticSites, parseIdeas, parseLsTree, parsePushContext, parseReviewSummaries, parseReviewers, parseSeatAdvisor, parseSynthesis, parseTrailerIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, planPlacement, proxyEnv, readEnsembleConfig, readOnlyWorktreeClause, readReadableSurface, readReceipt, readReview, readReviewsForRun, reapWorktree, reapWorktreeAsync, receiptIdentityMatches, receiptKeyHash, receiptPath, receiptPolicyVersion, redactUrlCredentials, remoteSlug, renderCodeReviewSeatPrompt, renderCodexSandboxProfile, renderCritiquePrompt, renderGeneratePrompt, renderHolisticPrompt, renderInlineComment, renderSummaryBody, renderSynthesisPrompt, renderVerifySandboxProfile, repoIdFromSlug, resolveBase, resolveBin, resolveCiEvidence, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveHolisticPlan, resolveHolisticSeat, resolveInRepo, resolveMode, resolvePolicyVersion, resolvePosture, resolveReceipt, resolveRepoId, resolveRepoLocation, resolveRepoLocationAsync, resolveReviewSandbox, resolveReviewer, reviewDir, rootAllowed, runBrainstormMode, runClaudeReview, runClaudeReviewVoice, runClaudeVoice, runCodexReview, runGrokReview, runHolisticLens, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, scanTextForSecrets, scoreHolisticFixture, scrubRepoEnv, sha256Hex, stageReview, startEgressProxy, stripAgentInstructions, stripAgentInstructionsAsync, summarizeCoverage, trackSeatCancel, transportEnv, validateReceiptShape, verifyFixtureAnchors, verifySiteAtHead, worktreeReader, wrapWithSandbox, writeCodexSandboxProfile, writeEvidenceManifest, writeReceipt, writeTrailFile };
+export { AGENT_INSTRUCTION_NAMES, type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormClaudeSeams, type BrainstormOptions, BrainstormResult, type BuildReceiptResult, CI_EVIDENCE_BOTH_REASON, CI_EVIDENCE_LIMITS, CI_EVIDENCE_TRAIL_FILE, CI_OUTPUT_PATTERNS, CLAUDE_CAPABILITY_FENCE, CLAUDE_EFFORTS, CLAUDE_INACTIVITY_TIMEOUT_MS, CLAUDE_READ_TOOLS, CLAUDE_REVIEW_DENIED_TOOLS, CLAUDE_WEB_MAX_TURNS, CLAUDE_WEB_TOOLS, CODEX_INACTIVITY_TIMEOUT_MS, CODEX_SANDBOX_PROFILE, COLD_PEER_ROLE, CORE_WORKTREE_REVIEW_TIMEOUT_MS, type CiEvidenceInput, type CiEvidenceLimits, type CiEvidenceResolution, type CiEvidenceResult, type ClaudeSeatFence, type ClaudeVoiceSeams, type CodeReviewSeatPromptArgs, type CodexReviewResult, type CodexSandboxPaths, type ConsultResult, type ConsultSynthesis, type ConventionCitation, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type ConventionTier, type Coverage, type CoverageFileEntry, type CoveragePolicy, Critique, CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_POSTURE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, ENSEMBLE_CONFIG_PATH, EVIDENCE_CLASSES, EVIDENCE_MANIFEST_FILE, EVIDENCE_MANIFEST_SCHEMA_VERSION, EVIDENCE_SEATS, type EgressDenial, type EgressProxy, type EnsureGrokLoginOpts, type EvidenceClass, type EvidenceGap, type EvidenceManifest, type EvidenceMap, type EvidenceSeat, type FileDiff, type FileKind, type FixtureAnchor, type FixtureScore, GROK_CLI_SANDBOX, GROK_INACTIVITY_TIMEOUT_MS, GROK_LOGIN_EXPIRY_FAIL_PREFIX, GROK_LOGIN_MARGIN_MS, GROK_PACKET_REVIEW_TIMEOUT_MS, GROK_PREFLIGHT_CANCELLED_WHY, GROK_REVIEW_TOOLS, GROK_SANDBOX_PROFILE, GROK_STATUS_API_KEY, GROK_STATUS_AUTHENTICATED_VIA_PREFIX, GROK_STATUS_LOGGED_IN_PREFIX, GROK_STATUS_NOT_AUTHENTICATED, GROK_WEB_TOOL, GROK_WORKTREE_REVIEW_TIMEOUT_MS, type GatherConfig, type GatheredConventions, type GhResult, type GhRunner, type GitRun, type GitRunAsync, GrokLoginExpiryError, type GrokModelsResult, type GrokModelsRun, type GrokModelsRunner, GrokPreflightCancelledError, type GrokStreamSummary, type GrokToolFence, HARNESS_SEATS, HOLISTIC_DEFAULTS, HOLISTIC_MIN_ANCHOR_NONWS, HOLISTIC_SEAT_ID, HOLISTIC_SEVERITY_CAP, type HarnessSeat, type HolisticEntry, type HolisticFixture, type HolisticPlan, type HolisticPolicyDeps, type HolisticPromptArgs, type HolisticProvenance, type HolisticRunner, type HolisticSeatFlags, type HolisticSite, type HolisticSiteRole, IMPLEMENTED_MODES, Idea, type InlineSecretHit, type JudgeSpec, MDNS_RESPONDER_SOCKET, MODES, MODE_ALIASES, type ManifestBlob, type ModeName, type NearMiss, OPERATOR_REVIEW_METHOD, type OmitReason, POLICY_VERSIONS, POLICY_VERSION_EVIDENCE, POLICY_VERSION_LEGACY, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PendingState, type PersistReviewInput, type PlacedFinding, type PlantedPositive, type PolicyHashInputs, type PostingPosture, type PrPushContext, type PreflightError, type PreflightErrorKind, type PushFenceVerdict, QUALIFY_PROBE_PORT, QUALITY_LENS, REPO_LOCATION_ENV, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, RankedIdea, RawIdea, type ReceiptCoverage, type ReceiptKey, type RepoLocation, ResolvedVoiceConfig, type ReviewEvidence, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, ReviewProfile, type ReviewSummary, ReviewerConfig, type ReviewerExec, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunHolisticLensOptions, type RunReviewOpts, SANDBOX_WRITABLE_TMP, STAGE_MARKER, SUGGESTION_HARD_CAP, type SandboxProfileMap, type SandboxProfileRef, type ScoredFinding, type SeatCancel, SeatDiagnostics, type SeatTimeoutReason, type SecretScanResult, type SensitivePathHit, Severity, type SiteCheck, type SiteReader, type StageCounts, type StageFailure, type StagePlan, type StageResult, type StageSuccess, type StageTarget, type StagedComment, type StagedReviewPayload, type StartEgressProxyOpts, StoredReview, type StreamResultEvent, type SummaryBodyInput, SynthesisResult, TRANSIENT_FAST_FAIL_MS, TRANSIENT_RETRY_DELAYS_MS, TerminalState, type TextSecretHit, UNTRUSTED_INSTRUCTIONS_CLAUSE, USAGE_LIMIT_FAIL_PREFIX, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, type VerifySandboxPaths, type VoiceAnswerResult, VoiceConfig, VoiceCritiqueResult$1 as VoiceCritiqueResult, VoiceGenerateResult, VoiceId, type VoiceRunResult, type Worktree, type WorktreeEvidence, acquireDiff, allowedRootsFromConfig, applyHolisticPolicy, asRecord, assertRosterAdvisors, boundedStreamTail, buildClaudeReviewArgs, buildClaudeVoiceArgs, buildCodexReviewArgs, buildCodexWorktreeArgs, buildDiffReceipt, buildEvidenceManifest, buildGrokReviewArgs, buildStagedReviewPayload, canonicalizeDiff, capHolisticSeverity, checkFreshness, classifyFileKind, classifyGitError, classifyPending, claudeAdvisorArgs, claudeAdvisorEnv, claudeWorktreePromptSuffix, codexSandboxSupported, computeCoverage, computePolicyHash, computePolicyHashAt, index as consult, coverageCounts, coverageShortfall, defaultCodexSandboxPaths, defaultReceiptStore, defuseUntrusted, diffDigest, effectiveSshFrom, ensureGrokLogin, ensureSandboxProfile, escapesRoot, evaluatePushFence, evidenceShortfall, extractDirRefs, extractGrokText, extractIncludes, extractRefs, extractStreamResult, fallbackSynthesis$1 as fallbackSynthesis, fetchCiEvidence, findQuoteSpan, findQuoteSpans, findingTrailer, formatEvidenceShortfall, fsConventionReader, gatherConventions, grokAllowedTools, grokLoginWarningLine, grokToolFence, hasDepSurface, hasGeneratedHeader, holisticCapWasLifted, homeReadDenyRules, isCommitSha, isConventionsDoc, isDiffReviewed, isEnsembleStagedReview, isEvidenceClass, isEvidenceSeat, isGrokLoginExpiryFailure, isHolisticRecord, isImplemented, isMode, isPolicyVersion, isPreflightError, isRetryableApiStatus, isStrippedPath, isTestPath, isTransientApiErrorReply, isUnder, isUnsafeReadRoot, isUsageLimitFailure, isUsageLimitReply, judgeConfig, keyOf, killTree, listReviewers, listVoices, loadHolisticFixture, loadHolisticSeat, loadJudge, loadPostingPosture, loadReviewers, loadVoices, makeEscalatingKill, makeNeutralSeatCwd, makeOwnerOnlyTempDir, materializeWorktree, materializeWorktreeAsync, materializedDiffClause, meetsInlineFloor, memoryConventionReader, missingConfig, omittedLine, parseConventionCitation, parseCritique, parseDiffFiles, parseGrokStream, parseHolisticSites, parseIdeas, parseJudge, parseLsTree, parsePushContext, parseReviewSummaries, parseReviewers, parseSeatAdvisor, parseSynthesis, parseTrailerIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, planPlacement, proxyEnv, readEnsembleConfig, readOnlyWorktreeClause, readReadableSurface, readReceipt, readReview, readReviewsForRun, reapWorktree, reapWorktreeAsync, receiptIdentityMatches, receiptKeyHash, receiptPath, receiptPolicyVersion, redactUrlCredentials, remoteSlug, renderCodeReviewSeatPrompt, renderCodexSandboxProfile, renderCritiquePrompt, renderGeneratePrompt, renderHolisticPrompt, renderInlineComment, renderSummaryBody, renderSynthesisPrompt, renderVerifySandboxProfile, repoIdFromSlug, resolveBase, resolveBin, resolveCiEvidence, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveHolisticPlan, resolveHolisticSeat, resolveInRepo, resolveMode, resolvePolicyVersion, resolvePosture, resolveReceipt, resolveRepoId, resolveRepoLocation, resolveRepoLocationAsync, resolveReviewSandbox, resolveReviewer, reviewDir, rootAllowed, runBrainstormMode, runClaudeReview, runClaudeReviewVoice, runClaudeVoice, runCodexReview, runGrokReview, runHolisticLens, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, scanTextForSecrets, scoreHolisticFixture, scrubRepoEnv, seatFailureMeta, sha256Hex, stageReview, startEgressProxy, stripAgentInstructions, stripAgentInstructionsAsync, summarizeCoverage, trackSeatCancel, transportEnv, validateReceiptShape, verifyFixtureAnchors, verifySiteAtHead, worktreeReader, wrapWithSandbox, writeCodexSandboxProfile, writeEvidenceManifest, writeReceipt, writeTrailFile };

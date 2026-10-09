@@ -1,6 +1,7 @@
 import {
   assertRosterAdvisors,
   loadVoices,
+  seatFailureMeta,
   VOICE_ADAPTERS,
   type VoiceRunResult,
 } from '../brainstorm/voices';
@@ -104,7 +105,7 @@ async function runAnswer(
   if (!res.raw || res.timedOut) {
     const error = (res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output'));
     log(`  · ${voiceId}: ${error}`);
-    return { answer: '', error, keyPoints: [], ok: false, raw: res.raw, summary: '', timedOut: res.timedOut, voiceId };
+    return { answer: '', error, keyPoints: [], ok: false, raw: res.raw, summary: '', ...seatFailureMeta(res), voiceId };
   }
   const parsed = parseAnswer(res.raw);
   if (parsed.parseError) {
@@ -145,7 +146,7 @@ async function runCritique(
   }
   if (!res.raw || res.timedOut) {
     const error = (res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output'));
-    return { error, notes: [], ok: false, raw: res.raw, summary: '', timedOut: res.timedOut, voiceId };
+    return { error, notes: [], ok: false, raw: res.raw, summary: '', ...seatFailureMeta(res), voiceId };
   }
   const parsed = parseCritique(res.raw);
   if (parsed.parseError) {
@@ -205,7 +206,8 @@ async function runSynthesis(
     log(`  · synthesis produced no usable output — using the deterministic fallback`);
     return {
       ...fallbackSynthesis(answers),
-      error: res.timedOut ? 'synthesis timed out' : 'synthesis produced no output',
+      error: res.failWhy ? `synthesis: ${res.failWhy}` : res.timedOut ? 'synthesis timed out' : 'synthesis produced no output',
+      ...seatFailureMeta(res),
     };
   }
   const parsed = parseConsultSynthesis(res.raw);
@@ -248,7 +250,7 @@ async function runDebateVoice(
   if (!res.raw || res.timedOut) {
     const error = res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output');
     log(`  · ${voiceId}: ${error}`);
-    return { entries: [], error, ok: false, raw: res.raw, timedOut: res.timedOut, voiceId };
+    return { entries: [], error, ok: false, raw: res.raw, ...seatFailureMeta(res), voiceId };
   }
   const parsed = parseDebateReply(res.raw, splitIds);
   if (parsed.parseError) {
@@ -357,7 +359,7 @@ async function runDebate(
   if (!res.raw || res.timedOut) {
     const error = res.failWhy ?? (res.timedOut ? 'judge timed out' : 'judge produced no output');
     log(`  · ${error}`);
-    return { judge: { ...judgeBase, error, ok: false, raw: res.raw }, recommendation: '', rounds, rulings: [], splits, summary: '' };
+    return { judge: { ...judgeBase, error, ok: false, raw: res.raw, ...seatFailureMeta(res) }, recommendation: '', rounds, rulings: [], splits, summary: '' };
   }
   const parsed = parseJudgeReply(res.raw, splits.map((s) => s.id));
   if (parsed.parseError) {
