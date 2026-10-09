@@ -7,6 +7,7 @@ import {
 } from '../brainstorm/voices';
 
 import {
+  deanonymizeJudgeText,
   parseDebateReply,
   parseJudgeReply,
   renderDebatePrompt,
@@ -14,6 +15,7 @@ import {
   rulingsTally,
   splitsFromSynthesis,
   splitsStillOpen,
+  voiceAliases,
 } from './debate';
 import { parseAnswer, parseConsultSynthesis, parseCritique } from './parse';
 import {
@@ -351,7 +353,9 @@ async function runDebate(
   log(
     `Judge · ${judgeId} (${judgeCfg.vendor} · ${judgeCfg.model}@${judgeCfg.effort}${independent ? ' · independent' : ' · ALSO ARGUED A SIDE'}) ruling on ${splits.length} split(s)…`
   );
-  const prompt = renderJudgePrompt({ draft: synthesis, fileContext: opts.fileContext, question: opts.question, rounds, splits });
+  // The blind judge: labels in, names out (debate.ts).
+  const alias = voiceAliases(participants);
+  const prompt = renderJudgePrompt({ alias, draft: synthesis, fileContext: opts.fileContext, question: opts.question, rounds, splits });
   let res: VoiceRunResult;
   try {
     res = await adapters[judgeId](prompt, judgeCfg, { timeoutMs });
@@ -364,7 +368,7 @@ async function runDebate(
     log(`  · ${error}`);
     return { judge: { ...judgeBase, error, ok: false, raw: res.raw, ...seatFailureMeta(res) }, recommendation: '', rounds, rulings: [], splits, summary: '' };
   }
-  const parsed = parseJudgeReply(res.raw, splits.map((s) => s.id));
+  const parsed = parseJudgeReply(deanonymizeJudgeText(res.raw, alias), splits.map((s) => s.id));
   if (parsed.parseError) {
     log(`  · judge output not parseable — ${parsed.parseError}`);
     return { judge: { ...judgeBase, error: parsed.parseError, ok: false, raw: res.raw }, recommendation: '', rounds, rulings: [], splits, summary: '' };

@@ -150,20 +150,52 @@ function draftBlock(draft: ConsultSynthesis): string {
   return `${cap(draft.summary)}${agree}\n\ndraft recommendation:\n${cap(draft.recommendation)}`;
 }
 
+// THE BLIND JUDGE (2026-10-09, hugin spec doc-review-evidence "judge impartiality"): the judge
+// never sees which model argued which side. Every voice id in the splits, the rounds and the
+// draft is replaced by a neutral label ("Voice A", "Voice B", …) before the prompt is built, and
+// the rulings are mapped back to the ids afterwards (deanonymizeJudgeText). A judge that is a
+// different model of the same vendor still leans toward its own house's review when it can
+// recognise it; with the labels, it rules on the evidence or on nothing.
+export type VoiceAlias = Record<string, string>;
+
+/** Deterministic labels in roster order — letters carry no vendor. */
+export function voiceAliases(voiceIds: readonly string[]): VoiceAlias {
+  const out: VoiceAlias = {};
+  voiceIds.forEach((id, i) => (out[id] = `Voice ${String.fromCharCode(65 + (i % 26))}`));
+  return out;
+}
+
+/** Replace every voice id (whole word, any case) in a text with its label. */
+export function anonymizeVoiceText(text: string, alias: VoiceAlias): string {
+  let out = text;
+  for (const [id, label] of Object.entries(alias)) out = out.replace(new RegExp(`\\b${id}\\b`, 'gi'), label);
+  return out;
+}
+
+/** The inverse: labels back to ids, so rulings name the voices for the reader. */
+export function deanonymizeJudgeText(text: string, alias: VoiceAlias): string {
+  let out = text;
+  for (const [id, label] of Object.entries(alias)) out = out.replace(new RegExp(label.replace(/\s/g, '\\s*'), 'gi'), id);
+  return out;
+}
+
 export function renderJudgePrompt(args: {
   draft: ConsultSynthesis;
   fileContext?: string;
   question: string;
   rounds: DebateRound[];
   splits: DebateSplit[];
+  /** When given, every voice id in the splits/rounds/draft is replaced by its label. */
+  alias?: VoiceAlias;
 }): string {
-  const { draft, fileContext, question, rounds, splits } = args;
+  const { draft, fileContext, question, rounds, splits, alias } = args;
+  const hide = (t: string) => (alias ? anonymizeVoiceText(t, alias) : t);
   return `You are the JUDGE of a multi-model consultation. You took NO part in it. Several
 models answered a question independently; a synthesizer separated what they agree on from
 where they diverge; the diverging voices then argued each split with evidence over
 ${rounds.length} round(s). Rule on EVERY split BY THE EVIDENCE — never by which argument is
 longer, which model wrote it, or your own prior — then write the final recommendation in
-light of your rulings.
+light of your rulings.${alias ? ' The voices are labelled Voice A, Voice B, … — you are not told which model is which, on purpose.' : ''}
 
 Outcomes:
 - "settled": the evidence decides it. Say which position stands and why, citing the evidence.
@@ -178,10 +210,10 @@ the outcome is "judgement".
 ${question.trim()}
 ${contextBlock(fileContext)}
 ## The splits, with every round
-${roundsBlock(rounds, splits)}
+${hide(roundsBlock(rounds, splits))}
 
 ## The synthesizer's draft (before the debate)
-${draftBlock(draft)}
+${hide(draftBlock(draft))}
 
 ## Output format — STRICT
 ${JSON_RULE}
