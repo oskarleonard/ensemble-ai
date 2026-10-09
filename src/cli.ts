@@ -2481,7 +2481,7 @@ function printConsult(r: ConsultResult): void {
     out.push('');
     const j = d.judge;
     out.push(
-      `Debate — ${d.rounds.length} round(s) on ${d.splits.length} split(s) · judge ${j.voiceId} ${j.model}@${j.effort}${j.independent ? ' (independent)' : ' (ALSO ARGUED A SIDE)'}${j.ok ? '' : ` — ${clean(j.error ?? 'failed').slice(0, 120)}`}`
+      `Debate — ${d.rounds.length} round(s) on ${d.splits.length} split(s) · judge ${j.voiceId} ${j.model}@${j.effort}${j.independent ? ' (independent)' : ' (blind · same model argued a side)'}${j.ok ? '' : ` — ${clean(j.error ?? 'failed').slice(0, 120)}`}`
     );
     if (d.summary) out.push(`  ${clean(d.summary).slice(0, 400)}`);
     for (const sp of d.splits) {

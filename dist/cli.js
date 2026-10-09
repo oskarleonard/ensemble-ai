@@ -5549,8 +5549,27 @@ function anonymizeVoiceText(text, alias) {
 }
 function deanonymizeJudgeText(text, alias) {
   let out = text;
-  for (const [id, label2] of Object.entries(alias)) out = out.replace(new RegExp(label2.replace(/\s/g, "\\s*"), "gi"), id);
-  return out;
+  const letterOf = {};
+  for (const [id, label2] of Object.entries(alias)) {
+    out = out.replace(new RegExp(label2.replace(/\s/g, "\\s*"), "gi"), id);
+    const letter = label2.replace(/^Voice\s*/i, "");
+    if (letter.length === 1) letterOf[letter.toUpperCase()] = id;
+  }
+  const letters = Object.keys(letterOf);
+  if (letters.length === 0) return out;
+  const L = `[${letters.join("")}]`;
+  const re = new RegExp(`(?<![A-Za-z0-9\xA7#_])(${L})(?![a-z0-9_])`, "g");
+  const verbs = "moved|moves|move|concedes|conceded|concede|demonstrates|demonstrated|agrees|agreed|holds|held|stands|stood|argues|argued|cites|cited|shows|showed|claims|claimed|answered|answers|proposed|proposes|notes|noted|asserts|asserted|maintains|maintained|accepts|accepted|disputes|disputed|rejects|rejected|misreads|misread|overstates|overstated|conflates|conflated|relies|relied|points|pointed|treats|treated|reads|read|identifies|identified|offers|offered|presents|presented|prevails|prevailed|yields|yielded|initially|rightly|correctly|wrongly";
+  const preps = "by|with|to|toward|towards|from|than|against|between|unlike|like|versus|vs\\.?|of|for|both|neither|either|nor|per";
+  const afterOk = new RegExp(`^(?:['\u2019]s\\b|\\s*/\\s*${L}\\b|\\s*,\\s*${L}\\b|\\s+(?:and|or)\\s+${L}\\b|\\s*:|\\)|\\s+(?:${verbs})\\b)`);
+  const beforeOk = new RegExp(`(?:${L}\\s*/\\s*|${L}\\s*,\\s*|${L}\\s+(?:and|or)\\s+|\\b(?:${preps})\\s+|\\()$`, "i");
+  return out.replace(re, (m, letter, at, whole) => {
+    const id = letterOf[letter];
+    if (!id) return m;
+    const after = whole.slice(at + 1, at + 40);
+    const before = whole.slice(Math.max(0, at - 40), at);
+    return afterOk.test(after) || beforeOk.test(before) ? id : m;
+  });
 }
 function renderJudgePrompt(args) {
   const { draft, fileContext, question, rounds, splits, alias } = args;
@@ -5560,7 +5579,7 @@ models answered a question independently; a synthesizer separated what they agre
 where they diverge; the diverging voices then argued each split with evidence over
 ${rounds.length} round(s). Rule on EVERY split BY THE EVIDENCE \u2014 never by which argument is
 longer, which model wrote it, or your own prior \u2014 then write the final recommendation in
-light of your rulings.${alias ? " The voices are labelled Voice A, Voice B, \u2026 \u2014 you are not told which model is which, on purpose." : ""}
+light of your rulings.${alias ? ' The voices are labelled Voice A, Voice B, \u2026 \u2014 you are not told which model is which, on purpose. Always write the full label ("Voice A"), never a bare letter.' : ""}
 
 Outcomes:
 - "settled": the evidence decides it. Say which position stands and why, citing the evidence.
@@ -6018,7 +6037,7 @@ async function runDebate(opts, debate, adapters, configs, answers, participants,
   const independent = judgeIsIndependent(judgeId, judgeCfg.model, participants, configs);
   const judgeBase = { effort: judgeCfg.effort, independent, model: judgeCfg.model, voiceId: judgeId };
   log(
-    `Judge \xB7 ${judgeId} (${judgeCfg.vendor} \xB7 ${judgeCfg.model}@${judgeCfg.effort}${independent ? " \xB7 independent" : " \xB7 ALSO ARGUED A SIDE"}) ruling on ${splits.length} split(s)\u2026`
+    `Judge \xB7 ${judgeId} (${judgeCfg.vendor} \xB7 ${judgeCfg.model}@${judgeCfg.effort}${independent ? " \xB7 independent" : " \xB7 blind \xB7 same model argued a side"}) ruling on ${splits.length} split(s)\u2026`
   );
   const alias = voiceAliases(participants);
   const prompt = renderJudgePrompt({ alias, draft: synthesis, fileContext: opts.fileContext, question: opts.question, rounds, splits });
@@ -12805,7 +12824,7 @@ function printConsult(r) {
     out.push("");
     const j = d.judge;
     out.push(
-      `Debate \u2014 ${d.rounds.length} round(s) on ${d.splits.length} split(s) \xB7 judge ${j.voiceId} ${j.model}@${j.effort}${j.independent ? " (independent)" : " (ALSO ARGUED A SIDE)"}${j.ok ? "" : ` \u2014 ${scrubControl(j.error ?? "failed").slice(0, 120)}`}`
+      `Debate \u2014 ${d.rounds.length} round(s) on ${d.splits.length} split(s) \xB7 judge ${j.voiceId} ${j.model}@${j.effort}${j.independent ? " (independent)" : " (blind \xB7 same model argued a side)"}${j.ok ? "" : ` \u2014 ${scrubControl(j.error ?? "failed").slice(0, 120)}`}`
     );
     if (d.summary) out.push(`  ${scrubControl(d.summary).slice(0, 400)}`);
     for (const sp of d.splits) {
