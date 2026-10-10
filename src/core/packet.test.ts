@@ -237,3 +237,34 @@ describe('assembleCodePacket — CI evidence section', () => {
     }
   });
 });
+
+describe('the diff section follows the coverage ceiling', () => {
+  // The regression: a caller raised --ceiling to 500 KB, coverage admitted 150 files (~500 K chars),
+  // and the packet — budgeted at the 200 K floor — spliced 300 K of them out in path order while the
+  // coverage listing still said "150 reviewed" (run 2026-10-10-14-16-53-f5983e4d, lisk-app#409).
+  const file = (name: string, n: number): string => `diff --git a/${name} b/${name}\n+${'x'.repeat(n)}\n`;
+  const overFloor = file('src/a.ts', PACKET_BUDGETS.diff) + file('src/z.ts', 50_000);
+  const base = { objective: 'o', pr: 1, repo: 'r' };
+
+  it('without a ceiling the floor still applies (the pre-existing behavior)', () => {
+    const p = assembleCodePacket({ ...base, diff: overFloor });
+    const v = reviewerVisibleDiff(p);
+    expect(v.truncated).toBe(true);
+    expect(v.text).toMatch(TRUNCATION_MARKER_RE);
+  });
+
+  it('with the ceiling the admitted diff ships WHOLE — what coverage says the seats saw is what they see', () => {
+    const p = assembleCodePacket({ ...base, diff: overFloor, diffBudget: 500_000 });
+    const v = reviewerVisibleDiff(p);
+    expect(v.truncated).toBe(false);
+    expect(v.text).toBe(overFloor);
+    expect(v.text).toContain('diff --git a/src/z.ts');
+    expect(p.sections.find((s) => s.title === DIFF_SECTION_TITLE)?.note).not.toMatch(/truncated/);
+  });
+
+  it('a ceiling below the floor never LOWERS the budget', () => {
+    const under = file('src/a.ts', 100_000);
+    const p = assembleCodePacket({ ...base, diff: under, diffBudget: 1_000 });
+    expect(reviewerVisibleDiff(p).truncated).toBe(false);
+  });
+});

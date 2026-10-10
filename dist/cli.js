@@ -3922,7 +3922,7 @@ function assembleCodePacket(input) {
     DIFF_SECTION_TITLE,
     "the change itself \u2014 review THIS, not the whole repo",
     input.diff,
-    PACKET_BUDGETS.diff
+    Math.max(PACKET_BUDGETS.diff, input.diffBudget ?? 0)
   );
   sections.push(
     diff,
@@ -4132,14 +4132,15 @@ function omittedLine(o) {
 function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
   const source = files.filter((f) => f.kind === "source");
   const admitted = /* @__PURE__ */ new Set();
+  const includedSections = [];
   let includedBytes = 0;
   for (const f of [...source.filter((f2) => !isTestPath(f2.path)), ...source.filter((f2) => isTestPath(f2.path))]) {
     if (includedBytes + f.bytes > ceilingBytes && includedBytes > 0) continue;
     admitted.add(f);
+    includedSections.push(f.raw);
     includedBytes += f.bytes;
   }
   const entries = [];
-  const includedSections = [];
   for (const f of files) {
     const base = {
       added: f.added,
@@ -4161,7 +4162,6 @@ function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
       continue;
     }
     entries.push({ ...base, included: true });
-    includedSections.push(f.raw);
   }
   const coverage = {
     files: entries,
@@ -4280,6 +4280,7 @@ function acquireDiff(opts) {
 var GATE_PACKET_SCHEMA_VERSION = 2;
 function persistGatePacket(baseDir, runId, input) {
   const packet = {
+    ...input.changedFiles ? { changedFiles: [...input.changedFiles] } : {},
     diff: input.diff,
     headSha: input.headSha,
     schemaVersion: GATE_PACKET_SCHEMA_VERSION
@@ -4298,7 +4299,8 @@ function readGatePacket(baseDir, runId, expectedHeadSha) {
     return { ok: false, reason: "corrupt" };
   }
   if (raw.headSha !== expectedHeadSha) return { ok: false, reason: "sha-mismatch" };
-  return { diff: raw.diff, ok: true };
+  const changedFiles = Array.isArray(raw.changedFiles) && raw.changedFiles.every((p) => typeof p === "string") ? raw.changedFiles : void 0;
+  return { ...changedFiles ? { changedFiles } : {}, diff: raw.diff, ok: true };
 }
 var HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 function parseFileHunks(fileSection) {
@@ -8018,9 +8020,18 @@ async function runGate(opts) {
   const { findings, injections } = prepareGateFindings(healthy, packetHunks);
   const reconcileOpts = {
     gateEvidence: opts.gateEvidence,
-    // The pinned packet's file set IS "what this PR changes" — the same bytes the reviewers saw.
-    // A holistic `agree` must cite its reinvention inside it.
-    ...opts.holistic ? { holistic: { ...opts.holistic, diffFiles: new Set(packetHunks.keys()) } } : {}
+    // "What this PR changes" is the pinned packet's `changedFiles` — EVERY path the change
+    // touches, including files coverage omitted over the ceiling — not merely the hunks that fit
+    // the packet: the lens reads the whole tree, and its two sites are verified verbatim at
+    // headSha regardless. A packet written before the field falls back to the hunk keys.
+    ...opts.holistic ? {
+      holistic: {
+        ...opts.holistic,
+        diffFiles: new Set(
+          packet.ok && packet.changedFiles ? packet.changedFiles : packetHunks.keys()
+        )
+      }
+    } : {}
   };
   const settleShadow = async (shadowAttempt2, primary, primaryUsable) => {
     if (!opts.shadow) return;
@@ -8958,6 +8969,9 @@ async function runReviewMode(opts) {
     ciEvidence,
     ciEvidenceUnavailable,
     diff: acquired.diff,
+    // The covered diff was admitted under THIS ceiling; the packet's diff section follows it so
+    // the coverage listing and the bytes the seats see cannot disagree.
+    diffBudget: ceilingBytes,
     directive: opts.directive,
     objective: opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE),
     pr: 0,
@@ -8976,6 +8990,7 @@ async function runReviewMode(opts) {
   const pinnedDiff = reviewerVisibleDiff(packet).text;
   try {
     persistGatePacket(opts.out, opts.runId, {
+      changedFiles: acquired.coverage.files.map((f) => f.path).filter((p) => p && p !== "unknown"),
       diff: pinnedDiff,
       headSha: acquired.headSha
     });
@@ -11141,11 +11156,12 @@ function stageReview(payload, target, deps) {
 }
 
 // src/plumbing/diff-preview.ts
-function buildPacketPreview(acquired, profile, agentsMd, agentsBudget) {
+function buildPacketPreview(acquired, profile, agentsMd, agentsBudget, diffBudget) {
   const packet = assembleCodePacket({
     agentsBudget,
     agentsMd,
     diff: acquired.diff,
+    diffBudget,
     objective: profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE,
     pr: 0,
     repo: acquired.repoId ?? ""
@@ -13673,7 +13689,7 @@ async function diffCommand(args) {
       conventions = gathered.manifest;
     }
   }
-  const preview = buildPacketPreview(acquired, profile, agentsMd, conventions?.capBytes);
+  const preview = buildPacketPreview(acquired, profile, agentsMd, conventions?.capBytes, ceiling);
   if (values.json) {
     console.log(
       JSON.stringify(

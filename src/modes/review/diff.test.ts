@@ -209,11 +209,17 @@ describe('computeCoverage', () => {
     expect(includedDiff).not.toContain('src/a.test.ts');
   });
 
-  it('tests fill whatever budget the source leaves, in diff order', () => {
+  it('tests fill whatever budget the source leaves; the SHIPPED diff is source-first, entries stay in diff order', () => {
+    // The test file comes FIRST in diff order. Coverage entries (listings, receipts) keep that order;
+    // the concatenated diff the packet carries puts the change before its test, so a downstream cut
+    // — should one ever land — eats the test, never the change (run 2026-10-10-14-16-53-f5983e4d).
     const files = parseDiffFiles(TEST_FILE + SOURCE_FILE);
     const { coverage, includedDiff } = computeCoverage(files, 10_000);
     expect(coverage.includedFiles).toBe(2);
-    expect(includedDiff.indexOf('src/a.test.ts')).toBeLessThan(includedDiff.indexOf('src/b.ts'));
+    expect(coverage.files.map((f) => f.path)).toEqual(['src/a.test.ts', 'src/b.ts']);
+    expect(includedDiff.indexOf('src/b.ts')).toBeLessThan(includedDiff.indexOf('src/a.test.ts'));
+    // Nothing is lost or duplicated by the reordering: the shipped diff is exactly both sections.
+    expect(includedDiff).toBe(SOURCE_FILE + TEST_FILE);
   });
 });
 

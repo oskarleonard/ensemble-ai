@@ -27,12 +27,16 @@ export function buildPacketPreview(
   acquired: AcquiredDiff,
   profile: ReviewProfile,
   agentsMd?: string,
-  agentsBudget?: number
+  agentsBudget?: number,
+  // The coverage ceiling `acquired.diff` was admitted under — the preview must budget the diff
+  // section exactly as runReviewMode does, or it previews a splice the review never makes.
+  diffBudget?: number
 ): PacketPreview {
   const packet = assembleCodePacket({
     agentsBudget,
     agentsMd,
     diff: acquired.diff,
+    diffBudget,
     objective: profile === 'security' ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE,
     pr: 0,
     repo: acquired.repoId ?? '',

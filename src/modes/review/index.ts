@@ -351,6 +351,9 @@ export async function runReviewMode(
     ciEvidence,
     ciEvidenceUnavailable,
     diff: acquired.diff,
+    // The covered diff was admitted under THIS ceiling; the packet's diff section follows it so
+    // the coverage listing and the bytes the seats see cannot disagree.
+    diffBudget: ceilingBytes,
     directive: opts.directive,
     objective:
       opts.objective ??
@@ -373,8 +376,10 @@ export async function runReviewMode(
   }
 
   // Materialize the PINNED gate packet ONCE per run: the exact REVIEWER-VISIBLE diff (the
-  // packet's diff-section body — head+tail-truncated over PACKET_BUDGETS.diff, exactly what every
-  // reviewer saw in the prompt) + the head SHA it was resolved at. Pinning the reviewer-visible
+  // packet's diff-section body — head+tail-truncated over the diff budget, exactly what every
+  // reviewer saw in the prompt) + the head SHA it was resolved at + EVERY path the change
+  // touches (included or omitted), so the holistic gate can ask "is this a file the PR
+  // changes?" without conflating it with "did the packet carry its hunks?". Pinning the reviewer-visible
   // bytes (NOT the full pre-truncation acquired.diff) is the binding fix (grok-f1/codex-f3): a
   // citation into bytes the reviewers did NOT see can never validate a dismissal. The verified
   // gate's hunk-resolver + citation-validator read ONLY this artifact (never the working tree),
@@ -384,6 +389,7 @@ export async function runReviewMode(
   const pinnedDiff = reviewerVisibleDiff(packet).text;
   try {
     persistGatePacket(opts.out, opts.runId, {
+      changedFiles: acquired.coverage.files.map((f) => f.path).filter((p) => p && p !== 'unknown'),
       diff: pinnedDiff,
       headSha: acquired.headSha,
     });

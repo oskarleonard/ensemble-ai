@@ -3318,7 +3318,7 @@ async function diffCommand(args: string[]): Promise<number> {
     }
   }
 
-  const preview = buildPacketPreview(acquired, profile, agentsMd, conventions?.capBytes);
+  const preview = buildPacketPreview(acquired, profile, agentsMd, conventions?.capBytes, ceiling);
   if (values.json) {
     console.log(
       JSON.stringify(

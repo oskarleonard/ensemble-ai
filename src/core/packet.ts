@@ -4,11 +4,18 @@ import type { PacketSection, ReviewPacket } from './types';
 // Per-section character budgets — bound the prompt BY CONSTRUCTION (the
 // "prompt-too-big" risk). Windows are large now, so these are generous, but the
 // diff is the signal: it gets the lion's share and surrounding context is capped
-// so it can't drown it. The diff budget is kept >= the coverage ceiling
-// (DEFAULT_COVERAGE_CEILING, 200k) so a diff coverage marked fully-included is
+// so it can't drown it. `diff` is the FLOOR of the diff section's budget: the
+// section is lifted to the coverage ceiling the diff was admitted under
+// (PacketInput.diffBudget, from --ceiling), so a diff coverage marked included is
 // shipped WHOLE, not silently truncated to head+tail — else the receipt would
-// certify code the reviewer never saw. (A diff still over this budget is truncated
-// and the receipt is then disqualified — see buildDiffReceipt's diffTruncated.)
+// certify code the reviewer never saw. The floor alone used to BE the budget, and
+// a caller raising --ceiling above it got coverage that said "150 files reviewed"
+// while the packet spliced out 300 KB of them in path order: run
+// 2026-10-10-14-16-53-f5983e4d (lisk-app#409, 204 files, ceiling 500 KB) shipped
+// hunks for 65 of 150 covered files and every file of the module under review
+// fell in the cut. (A diff still over its budget — the first admitted file alone
+// over the ceiling — is truncated and the receipt is then disqualified — see
+// buildDiffReceipt's diffTruncated.)
 export const PACKET_BUDGETS = {
   // The FLOOR for the conventions section. When the conventions were GATHERED under a byte
   // cap (core/conventions.ts), the section budget is that cap instead (PacketInput.agentsBudget):
@@ -46,6 +53,11 @@ export interface PacketInput {
   ciEvidenceUnavailable?: string;
   constraints?: string; // known constraints the change must respect
   diff: string; // git diff under review (REQUIRED — the change itself)
+  // The coverage ceiling (bytes) `diff` was admitted under (computeCoverage). Lifts the diff
+  // section's budget to it (never below PACKET_BUDGETS.diff), so what coverage says the reviewers
+  // saw is what they see. A UTF-8 byte ceiling is always ≥ the char count, so an admitted diff
+  // never truncates; only the first-file-alone-over-the-ceiling case still can.
+  diffBudget?: number;
   directive?: string; // the original directive / PR description
   objective: string; // why this review was fired
   pr: number;
@@ -121,7 +133,8 @@ export function section(
 }
 
 // The title of the diff section in the assembled packet — the reviewer-visible diff bytes live
-// in its body (head+tail-truncated over PACKET_BUDGETS.diff). The verified gate pins THIS (not the
+// in its body (head+tail-truncated over the diff budget — PACKET_BUDGETS.diff lifted to the
+// coverage ceiling). The verified gate pins THIS (not the
 // full pre-truncation diff) so a citation can only ever validate against bytes a reviewer saw.
 export const DIFF_SECTION_TITLE = 'The diff under review';
 
@@ -188,7 +201,7 @@ export function assembleCodePacket(input: PacketInput): ReviewPacket {
     DIFF_SECTION_TITLE,
     'the change itself — review THIS, not the whole repo',
     input.diff,
-    PACKET_BUDGETS.diff
+    Math.max(PACKET_BUDGETS.diff, input.diffBudget ?? 0)
   );
   sections.push(
     diff,
