@@ -290,3 +290,46 @@ describe('a dead seat names the retry — and the hint keeps the run\'s evidence
     );
   });
 });
+
+// CONVENTIONS ONCE: when every core seat reads the tree, the gathered conventions are written into
+// the worktree once and the packet carries a pointer, instead of ~350 KB inlined in every part.
+describe('review --repo: large conventions are handed over as a file in the worktree', () => {
+  it('writes the file, points the packet at it, and reports the path', async () => {
+    const { adapters, spawns } = stubAdapters();
+    const big = `# RULES\n${'- a rule the reviewer must follow\n'.repeat(2000)}`; // > 32 KB
+    const result = await runReviewMode(
+      runOpts({
+        adapters,
+        agentsMd: big,
+        reviewers: ['grok'],
+        worktree: { baseSha: BASE, dir: worktreeDir, headSha: HEAD },
+      })
+    );
+    const file = path.join(worktreeDir, '.ensemble-conventions', 'CONVENTIONS.md');
+    expect(fs.existsSync(file)).toBe(true);
+    expect(fs.readFileSync(file, 'utf8')).toBe(big);
+    expect(result.conventionsPath).toBe(file);
+    expect(spawns[0].prompt).toContain(file);
+    expect(spawns[0].prompt).toContain('are NOT inlined here');
+    expect(spawns[0].prompt.split('a rule the reviewer must follow').length).toBeLessThan(5); // not the 2000 copies
+    // the chunk trail records the seat's pin beside its outcome
+    const trail = JSON.parse(fs.readFileSync(path.join(out, 'wt-run', 'chunks.json'), 'utf8')) as { chunks: { seats: Record<string, { effort?: string; model?: string }> }[] };
+    expect(trail.chunks[0].seats.grok.model).toBeDefined();
+    expect(trail.chunks[0].seats.grok.effort).toBeDefined();
+  });
+
+  it('small conventions stay inline, and so do large ones when no worktree exists', async () => {
+    const small = '# RULES\n- one rule\n';
+    const a = stubAdapters();
+    const r1 = await runReviewMode(runOpts({ adapters: a.adapters, agentsMd: small, reviewers: ['grok'], worktree: { baseSha: BASE, dir: worktreeDir, headSha: HEAD } }));
+    expect(r1.conventionsPath).toBeUndefined();
+    expect(a.spawns[0].prompt).toContain('- one rule');
+    const big = `# RULES\n${'- a rule the reviewer must follow\n'.repeat(2000)}`;
+    const b = stubAdapters();
+    const r2 = await runReviewMode(runOpts({ adapters: b.adapters, agentsMd: big, reviewers: ['grok'], runId: 'wt-run-2' }));
+    expect(r2.conventionsPath).toBeUndefined();
+    // inline (bounded by the packet's conventions budget, as before) — never a pointer
+    expect(b.spawns[0].prompt.split('a rule the reviewer must follow').length).toBeGreaterThan(300);
+    expect(b.spawns[0].prompt).not.toContain('are NOT inlined here');
+  });
+});

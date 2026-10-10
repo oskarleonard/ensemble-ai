@@ -263,9 +263,16 @@ export const CHUNKS_TRAIL_FILE = 'chunks.json';
 export const CHUNKS_TRAIL_SCHEMA_VERSION = 1;
 
 export interface ChunkSeatRecord {
+  // How deep the read was, off the seat's own stream (seat-usage.ts readDepthOf): `thin` is a
+  // seat that returned far too little work for the bytes it was handed; `unmeasured` a stream
+  // that carried no usage. Absent on records written before the telemetry existed.
+  depth?: 'ok' | 'thin' | 'unmeasured';
+  effort?: string;
   elapsedMs?: number;
   findings: number;
+  model?: string;
   state: 'reviewed' | 'failed-reviewer' | 'skipped';
+  usage?: { cachedInputTokens?: number; inputTokens?: number; outputTokens?: number; toolCalls?: number; turns?: number };
   // Why the seat ended short of `reviewed`, when it did (the seat's own summary head).
   why?: string;
 }
@@ -303,6 +310,9 @@ export function renderCoverageOverview(
     .filter((c) => Object.values(c.seats).some((s) => s.state === 'reviewed'))
     .reduce((n, c) => n + c.files.length, 0);
   const unreadParts = trail.chunks.filter((c) => !Object.values(c.seats).some((s) => s.state === 'reviewed'));
+  const thinReads = trail.chunks.flatMap((c) =>
+    Object.entries(c.seats).filter(([, s]) => s.depth === 'thin').map(([id]) => `${id} on part ${c.index}`)
+  );
   const overflow = trail.omitted.filter((o) => o.reason === 'over-limit');
   const junk = trail.omitted.filter((o) => o.reason !== 'over-limit');
   out.push(`# Coverage overview — ${extra.headSha.slice(0, 12)}`);
@@ -310,6 +320,10 @@ export function renderCoverageOverview(
   out.push(
     `${extra.totalFiles} changed file(s) · ${trail.chunks.length} part(s) planned under a ${trail.ceilingBytes.toLocaleString('en-US')}-byte ceiling (max ${trail.maxChunks}) · ${reviewedParts} part(s) reviewed by at least one seat · ${reviewedFiles} file(s) read by a seat · ${junk.length} generated/binary file(s) skipped by kind · ${overflow.length} file(s) past the part limit (NOT reviewed).`
   );
+  if (thinReads.length > 0) {
+    out.push('');
+    out.push(`⚠ THIN READS: ${thinReads.join(', ')} — the seat returned far too little work for the bytes it was handed (seat-usage.ts floor). Treat those parts as NOT reviewed by that seat.`);
+  }
   if (extra.gateCounts) {
     const g = Object.entries(extra.gateCounts)
       .filter(([, n]) => n > 0)
@@ -322,7 +336,14 @@ export function renderCoverageOverview(
   out.push('## Parts');
   for (const c of trail.chunks) {
     const seats = Object.entries(c.seats)
-      .map(([id, s]) => `${id} ${s.state === 'reviewed' ? `✓ ${s.findings} finding(s)` : `✗ ${s.state}${s.why ? ` — ${s.why}` : ''}`}`)
+      .map(([id, s]) => {
+        const pin = s.model ? ` (${s.model}${s.effort ? ` @ ${s.effort}` : ''})` : '';
+        const depth = s.depth === 'thin' ? ' — THIN READ' : s.depth === 'unmeasured' ? ' — depth unmeasured' : '';
+        const mins = s.elapsedMs !== undefined ? ` ${Math.round(s.elapsedMs / 60000)} min` : '';
+        const out = s.usage?.outputTokens !== undefined ? `, ${s.usage.outputTokens.toLocaleString('en-US')} out tokens` : '';
+        const tools = s.usage?.toolCalls !== undefined ? `, ${s.usage.toolCalls} tool calls` : '';
+        return `${id}${pin} ${s.state === 'reviewed' ? `✓ ${s.findings} finding(s)${mins}${out}${tools}${depth}` : `✗ ${s.state}${s.why ? ` — ${s.why}` : ''}`}`;
+      })
       .join(' · ');
     const tests = c.files.filter((f) => f.test).length;
     out.push('');

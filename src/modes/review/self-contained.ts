@@ -207,6 +207,8 @@ type ClaudeRunner = (
 export const CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 10_800_000; // 180 min runaway backstop
 export const HOLISTIC_WORKTREE_TIMEOUT_MS = 1_800_000; // 30 min runaway backstop
 export const GATE_WORKTREE_TIMEOUT_MS = 7_200_000; // 120 min runaway backstop
+// How many parts the Claude producer reads at once on a review in parts (see runClaudeProducer).
+export const PRODUCER_PART_CONCURRENCY = 3;
 
 async function runClaudeReviewer(
   reviewPrompt: string,
@@ -331,6 +333,9 @@ export interface ClaudeLayerOptions {
   // history here. The files are still seeded (an honest note beats an absent one), but the prompt
   // clause is NOT rendered: a prompt must never point a seat at evidence it cannot open.
   historyPacket?: HistoryPacket;
+  // The conventions file in the worktree (modes/review CONVENTIONS_IN_TREE_*), when the run handed
+  // the gathered rules over by path — the producer and the lens prompts point at it.
+  conventionsPath?: string;
   // The pinned reviewer-visible diff. Under the capability fence the Anthropic seats have no shell,
   // so the engine hands them the change instead of letting them run `git diff` (see ./claude).
   // Absent ⇒ the seats fall back to the packet prompt, which already embeds the diff. On a review
@@ -448,6 +453,7 @@ export type ClaudeProducerOptions = Pick<
   | 'ciEvidence'
   | 'ciEvidenceUnavailable'
   | 'claudeConfig'
+  | 'conventionsPath'
   | 'expectedHeadSha'
   | 'historyPacket'
   | 'includeClaudeReviewer'
@@ -508,6 +514,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
             ...(ciForProducer.kind === 'unavailable'
               ? { ciEvidenceUnavailable: ciForProducer.reason }
               : {}),
+            ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
             diff: part.diff,
             headSha: opts.expectedHeadSha,
             history: hasHistory,
@@ -565,27 +572,38 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
     // in part order with their `chunk`, nothing laundered. Each part's reply is kept on disk under
     // its suffix so the merged `claude-review.raw.md` is a record, not the only copy.
     const n = parts.length;
-    log(`  · claude (anthropic/${modelLabel}) reviewing the change in ${n} parts at the PR head…`);
-    const partReviews: { part: ProducerPart; raw: string | null; review: VoiceReview; spawned: boolean }[] = [];
-    for (const part of parts) {
-      log(`  · claude: part ${part.index}/${n} — ${part.label}…`);
-      const res = await runClaudeReviewer(
-        producerPromptFor(part),
-        opts.claudeConfig,
-        run,
-        producerTimeout,
-        log,
-        opts.worktree,
-        opts.historyPacket
-      );
-      partReviews.push({ part, ...res });
-      try {
-        writeTrailFile(opts.baseDir, opts.runId, `findings.claude.c${part.index}.json`, JSON.stringify(res.review.findings, null, 2));
-        if (res.raw !== null) writeTrailFile(opts.baseDir, opts.runId, `claude-review.c${part.index}.raw.md`, res.raw);
-      } catch (e) {
-        log(`  · claude: part ${part.index} trail write failed (${(e as Error).message}) — continuing`);
+    log(`  · claude (anthropic/${modelLabel}) reviewing the change in ${n} parts at the PR head (${PRODUCER_PART_CONCURRENCY} at a time)…`);
+    // The parts are cold, independent single-pass reads with no shared state, so they run a few
+    // at a time (the producer was the long pole of a review in parts: ~17 min per part, one after
+    // another). Bounded, not all at once: each is a headless claude spawn with its own context.
+    // Results are kept in PART ORDER whatever order they finish in.
+    const partReviews: { part: ProducerPart; raw: string | null; review: VoiceReview; spawned: boolean }[] = new Array(n);
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < n) {
+        const i = next++;
+        const part = parts[i];
+        log(`  · claude: part ${part.index}/${n} — ${part.label}…`);
+        const res = await runClaudeReviewer(
+          producerPromptFor(part),
+          opts.claudeConfig,
+          run,
+          producerTimeout,
+          log,
+          opts.worktree,
+          opts.historyPacket
+        );
+        partReviews[i] = { part, ...res };
+        log(`  · claude: part ${part.index}/${n} ${res.review.ok ? 'reviewed' : 'FAILED'} — ${res.review.findings.length} finding(s)`);
+        try {
+          writeTrailFile(opts.baseDir, opts.runId, `findings.claude.c${part.index}.json`, JSON.stringify(res.review.findings, null, 2));
+          if (res.raw !== null) writeTrailFile(opts.baseDir, opts.runId, `claude-review.c${part.index}.raw.md`, res.raw);
+        } catch (e) {
+          log(`  · claude: part ${part.index} trail write failed (${(e as Error).message}) — continuing`);
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(PRODUCER_PART_CONCURRENCY, n) }, () => worker()));
     claudeSpawned = partReviews.some((p) => p.spawned);
     claudeParts = partReviews.map((p) => ({ findings: p.review.findings.length, index: p.part.index, ok: p.review.ok, summary: p.review.summary }));
     const failed = partReviews.filter((p) => !p.review.ok);
@@ -641,7 +659,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
 
 export type HolisticStageOptions = Pick<
   ClaudeLayerOptions,
-  'baseDir' | 'expectedHeadSha' | 'historyPacket' | 'holistic' | 'lensHandoff' | 'log' | 'pinnedDiff' | 'run' | 'runId' | 'timeoutMs' | 'worktree'
+  'baseDir' | 'conventionsPath' | 'expectedHeadSha' | 'historyPacket' | 'holistic' | 'lensHandoff' | 'log' | 'pinnedDiff' | 'run' | 'runId' | 'timeoutMs' | 'worktree'
 >;
 
 export interface HolisticStageOutcome {
@@ -680,6 +698,7 @@ export async function runHolisticStage(opts: HolisticStageOptions): Promise<Holi
       config: lensConfig,
       diff: plan.diff,
       headSha: opts.expectedHeadSha,
+      ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
       ...(opts.historyPacket ? { historyPacket: opts.historyPacket } : {}),
       log,
       run,

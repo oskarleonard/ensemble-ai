@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { writeTrailFile } from '../../core/artifacts';
 import {
   type ConventionManifest,
@@ -71,6 +74,7 @@ import {
   RETRIES_ON_PACKET,
   runCoreSeat,
 } from './seat-run';
+import { describeUsage, readDepthOf } from './seat-usage';
 import { resolveGitleaksExemptions } from './gitleaks-allowlist';
 import { scanDiffForSecrets, type SecretScanResult } from './secret-scan';
 
@@ -175,6 +179,9 @@ export interface ReviewModeOptions {
 }
 
 export interface PacketsReady {
+  // The conventions file written into the worktree (CONVENTIONS_IN_TREE) when the gathered text
+  // was handed to the seats by path instead of inline — the fenced Anthropic prompts point at it.
+  conventionsPath?: string;
   headSha: string;
   lensHandoff?: { diff: string; scope: string };
   parts: ReviewPart[];
@@ -195,6 +202,9 @@ export interface ReviewModeResult {
   // The run's per-seat evidence identity for the CORE seats (intent, fact, and the sandbox profiles
   // that fenced them). Present on every non-blocked run; all-`packet` in packet mode.
   evidence?: ReviewEvidence;
+  // The conventions file in the worktree, when the gathered conventions were handed to the seats
+  // by path (see CONVENTIONS_IN_TREE in runReviewMode). Absent ⇒ they rode inline in the packet.
+  conventionsPath?: string;
   // The LENS handoff for a review in parts: as much of the union diff as one packet holds (part 1
   // onward, whole parts only) plus the scope listing naming every other changed file. Absent on a
   // single-part review — the lens then gets `pinnedDiff`, which IS the whole change.
@@ -238,6 +248,22 @@ export interface ReviewPart {
   prompt: string;
   // Absent when the change fit one packet and nothing was omitted (no scope section was rendered).
   scope?: string;
+}
+
+// Where the gathered conventions land inside the worktree when they are handed over by path
+// (see runReviewMode): a dotted, engine-owned dir beside `.companions/`, never a path the PR
+// could have committed, and never one of the stripped agent-instruction names.
+export const CONVENTIONS_IN_TREE_DIR = '.ensemble-conventions';
+export const CONVENTIONS_IN_TREE_FILE = 'CONVENTIONS.md';
+// Below this many chars the conventions ride inline regardless — a pointer costs a read.
+export const CONVENTIONS_INLINE_MAX = 32_000;
+
+export function conventionsPointer(file: string, chars: number, files?: number): string {
+  return `The repository's conventions (${files !== undefined ? `${files} file(s), ` : ''}${chars.toLocaleString('en-US')} chars, gathered at the PR BASE — the rules this change is judged against, not the PR's own edits to them) are NOT inlined here. They are at:
+
+  ${file}
+
+Read that file BEFORE reviewing (it is the AGENTS.md / rules / docs web the repo asks a reviewer to read; the manifest of what it contains is conventions.json in the trail). Cite a rule by its heading when a finding rests on it.`;
 }
 
 // The default `code`-profile review objective. Exported so the `diff` plumbing
@@ -402,6 +428,44 @@ export async function runReviewMode(
     );
   }
 
+  // Load the reviewers config ONCE per run (a file read + JSON parse), then index it per
+  // reviewer — before the packet, because whether every seat will READ THE TREE decides how the
+  // conventions are handed over (inline, or as a file in the worktree).
+  const resolved = loadReviewers(opts.reviewersFile);
+  const configs = Object.fromEntries(
+    reviewers.map((id) => [
+      id,
+      { ...resolved[id], ...(opts.sandbox ? { sandbox: opts.sandbox } : {}) },
+    ])
+  ) as Record<ReviewerId, ReviewerConfig>;
+  const wt = opts.worktree;
+  const quals = wt ? qualifyCoreSeats(reviewers, wt.dir, configs) : {};
+  const everySeatReadsTree = Boolean(wt) && reviewers.every((id) => quals[id]?.qualified);
+
+  // CONVENTIONS ONCE (2026-10-10 architecture review, item 3): a full review gathered ~350 KB of
+  // conventions and inlined them in EVERY part's packet — ~40% of each prompt, repeated per part
+  // per seat, while every seat already had the tree on disk. When every core seat reads the
+  // worktree, the gathered text is written there ONCE (engine-written, at the PR base, so it is
+  // the same data the inline section carried) and the packet carries a short pointer; the
+  // fenced Anthropic prompts point at the same file. Any seat on the packet alone ⇒ inline, as
+  // before, so a packet seat is never asked to read a file it cannot reach.
+  let conventionsPath: string | undefined;
+  if (wt && everySeatReadsTree && agentsMd && agentsMd.length > CONVENTIONS_INLINE_MAX) {
+    try {
+      const dir = path.join(wt.dir, CONVENTIONS_IN_TREE_DIR);
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, CONVENTIONS_IN_TREE_FILE);
+      fs.writeFileSync(file, agentsMd, { mode: 0o600 });
+      conventionsPath = file;
+      const files = conventionManifest ? conventionManifest.files.filter((f) => f.included).length : undefined;
+      agentsMd = conventionsPointer(file, agentsMd.length, files);
+      log(`Conventions: handed to the seats as a file in the worktree (${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}) instead of inline — every seat reads the tree, and the packet no longer repeats them per part`);
+    } catch (e) {
+      log(`Conventions: could not be written into the worktree (${(e as Error).message}) — inlined in the packet instead`);
+      conventionsPath = undefined;
+    }
+  }
+
   // ONE both-fields rule, owned by ci-evidence.ts and applied at every seam (this engine, the
   // packet, the worktree producer). The drop is announced, not silent.
   const ci = resolveCiEvidence(opts.ciEvidence, opts.ciEvidenceUnavailable);
@@ -517,7 +581,7 @@ export async function runReviewMode(
   // take the paid review down with it: reported, then the fan-out proceeds.
   if (opts.onPacketsReady) {
     try {
-      opts.onPacketsReady({ headSha: acquired.headSha, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt });
+      opts.onPacketsReady({ ...(conventionsPath ? { conventionsPath } : {}), headSha: acquired.headSha, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt });
     } catch (e) {
       log(`onPacketsReady hook failed (${(e as Error).message}) — the Anthropic stages will run after the core instead`);
     }
@@ -528,21 +592,9 @@ export async function runReviewMode(
       ? `Running ${reviewers.length} reviewer(s): ${reviewers.join(', ')}…`
       : 'Running 0 core reviewer(s) — claude-only: the Opus reviewer, the lens (when requested) and the gate are the reviewers of record; no cross-vendor receipt will qualify'
   );
-  // Load the reviewers config ONCE per run (a file read + JSON parse), then index
-  // it per reviewer — not once per reviewer inside the fan-out.
-  const resolved = loadReviewers(opts.reviewersFile);
-  const configs = Object.fromEntries(
-    reviewers.map((id) => [
-      id,
-      { ...resolved[id], ...(opts.sandbox ? { sandbox: opts.sandbox } : {}) },
-    ])
-  ) as Record<ReviewerId, ReviewerConfig>;
-
   // WORKTREE EVIDENCE MODE (spec §1–§2). The worktree's presence is the request; qualification
   // decides, per seat, whether the request is granted. The worktree prompt is the pinned packet
   // prompt PLUS the whole-project preamble — a packet seat never sees it.
-  const wt = opts.worktree;
-  const quals = wt ? qualifyCoreSeats(reviewers, wt.dir, configs) : {};
   const worktreePrompts = wt
     ? prompts.map((p) => p + worktreePromptSuffix({ baseSha: wt.baseSha, headSha: wt.headSha, worktree: wt.dir }))
     : undefined;
@@ -556,7 +608,7 @@ export async function runReviewMode(
   const seatRuns = await Promise.all(
     reviewers.map(async (id) => {
       const reviewer = configs[id];
-      log(`  · ${id} (${reviewer.vendor} · ${reviewer.model})…`);
+      log(`  · ${id} (${reviewer.vendor} · ${reviewer.model} @ ${reviewer.effort})…`);
       const runPart = (k: number, suffix?: string) =>
         runCoreSeat({
           adapter: adapters[id],
@@ -573,12 +625,27 @@ export async function runReviewMode(
           ...(wt && worktreePrompts ? { worktree: wt.dir, worktreePrompt: worktreePrompts[k] } : {}),
         });
       const record = (k: number, s: Awaited<ReturnType<typeof runCoreSeat>>): void => {
-        const idx = acquired.plan.chunks[k]?.index ?? 1;
+        const chunk = acquired.plan.chunks[k];
+        const idx = chunk?.index ?? 1;
         const seats = partSeats.get(idx) ?? {};
+        const usage = s.review.diagnostics?.usage;
+        const depth =
+          s.review.terminalState === 'reviewed'
+            ? readDepthOf(usage ?? {}, chunk?.bytes ?? 0, s.realized === 'worktree')
+            : undefined;
+        if (depth === 'thin') {
+          log(
+            `  · ⚠ ${id}: THIN READ on part ${idx} — ${describeUsage(usage ?? {})} for ${(chunk?.bytes ?? 0).toLocaleString('en-US')} bytes of diff; the seat returned far too little work for what it was handed`
+          );
+        }
         seats[id] = {
+          ...(depth ? { depth } : {}),
+          effort: reviewer.effort,
           ...(s.review.diagnostics ? { elapsedMs: s.review.diagnostics.elapsedMs } : {}),
           findings: s.review.findings.length,
+          model: reviewer.model,
           state: s.review.terminalState === 'reviewed' ? 'reviewed' : 'failed-reviewer',
+          ...(usage ? { usage } : {}),
           ...(s.review.terminalState === 'reviewed' ? {} : { why: scrubControl(s.review.summary).slice(0, 160) }),
         };
         partSeats.set(idx, seats);
@@ -749,8 +816,8 @@ export async function runReviewMode(
     // caller writes receiptCandidate once the roster is verified complete.
     const store = opts.receiptStore ?? defaultReceiptStore();
     log('Receipt qualified by the core — deferred to the full-roster gate.');
-    return { acquired, blocked: false, conventionManifest, depSurface, evidence, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, ...(conventionsPath ? { conventionsPath } : {}), depSurface, evidence, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
   }
   log(`No receipt — ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, evidence, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, ...(conventionsPath ? { conventionsPath } : {}), depSurface, evidence, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan };
 }

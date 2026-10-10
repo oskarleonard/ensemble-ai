@@ -219,3 +219,33 @@ describe('planChunks — first-fit over open parts, distinct labels', () => {
     expect(plan.chunks.map((c) => c.label)).toEqual(['svc/ramp', 'svc/ramp (2)', 'svc/ramp (3)']);
   });
 });
+
+describe('renderCoverageOverview — thin reads are named', () => {
+  it('lists every thin seat-part and shows each seat’s pin and usage', () => {
+    const md = renderCoverageOverview(
+      {
+        ceilingBytes: 500_000,
+        chunks: [
+          {
+            bytes: 499_000,
+            files: [{ added: 1, path: 'a.go', removed: 0, test: false }],
+            index: 1,
+            label: 'backend',
+            promptChars: 1,
+            seats: {
+              codex: { depth: 'thin', effort: 'medium', elapsedMs: 93_000, findings: 1, model: 'gpt-6-astra', state: 'reviewed', usage: { outputTokens: 1179, toolCalls: 3 } },
+              grok: { depth: 'ok', effort: 'low', elapsedMs: 1_150_000, findings: 7, model: 'grok-4.7', state: 'reviewed', usage: { outputTokens: 40_000, toolCalls: 90 } },
+            },
+          },
+        ],
+        maxChunks: 8,
+        omitted: [],
+        schemaVersion: 1,
+      },
+      { headSha: 'abc', totalFiles: 1 }
+    );
+    expect(md).toContain('⚠ THIN READS: codex on part 1');
+    expect(md).toContain('codex (gpt-6-astra @ medium) ✓ 1 finding(s) 2 min, 1,179 out tokens, 3 tool calls — THIN READ');
+    expect(md).toContain('grok (grok-4.7 @ low) ✓ 7 finding(s) 19 min, 40,000 out tokens, 90 tool calls');
+  });
+});

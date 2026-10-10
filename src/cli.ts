@@ -1674,7 +1674,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   let historyPacket: HistoryPacket | undefined;
   let producerStage: Promise<ClaudeProducerOutcome> | undefined;
   let lensStage: Promise<HolisticStageOutcome> | undefined;
-  const startAnthropicStages = (ready: { headSha: string; lensHandoff?: { diff: string; scope: string }; parts: { diff: string; index: number; label: string; prompt: string; scope?: string }[]; pinnedDiff: string; prompt: string }): void => {
+  const startAnthropicStages = (ready: { conventionsPath?: string; headSha: string; lensHandoff?: { diff: string; scope: string }; parts: { diff: string; index: number; label: string; prompt: string; scope?: string }[]; pinnedDiff: string; prompt: string }): void => {
     if (!roster.claude || !anthropicSeats) return;
     if (worktree && ready.pinnedDiff) {
       const { capBytes, logCommits } = historyPacketConfig(readEnsembleConfig());
@@ -1711,6 +1711,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       ...(ciText ? { ciEvidence: ciText } : {}),
       ...(ciEvidenceUnavailable ? { ciEvidenceUnavailable } : {}),
       claudeConfig: anthropicSeats.claude.config,
+      ...(ready.conventionsPath ? { conventionsPath: ready.conventionsPath } : {}),
       expectedHeadSha: ready.headSha,
       ...(historyPacket ? { historyPacket } : {}),
       includeClaudeReviewer: true,
@@ -1728,6 +1729,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
     if (values.holistic) {
       lensStage = runHolisticStage({
         baseDir: out,
+        ...(ready.conventionsPath ? { conventionsPath: ready.conventionsPath } : {}),
         expectedHeadSha: ready.headSha,
         ...(historyPacket ? { historyPacket } : {}),
         holistic: {

@@ -13,6 +13,7 @@ import type { CodexReviewResult, RunReviewOpts } from '../../reviewers/codex';
 
 import type { EvidenceClass } from './evidence';
 import type { SeatQualification } from './seat-evidence';
+import { parseSeatUsage } from './seat-usage';
 
 // ONE CORE SEAT (codex / grok), run with the evidence its policy qualified it for, and its trail
 // artifact persisted. This is where INTENT becomes FACT: the returned `realized` class is what the
@@ -111,8 +112,10 @@ function timedOutSummary(result: CodexReviewResult, timing: SeatTiming): string 
 // timeout it is the only text the seat left behind. Pre-flight warnings ride their own field, so
 // the summaries below (which quote the head of stderrTail) never show a warning in the seat's place.
 function seatDiagnostics(result: CodexReviewResult, timing: SeatTiming): SeatDiagnostics {
+  const usage = parseSeatUsage(result.stream);
   return {
     elapsedMs: timing.endedAt - timing.startedAt,
+    ...(Object.keys(usage).length > 0 ? { usage } : {}),
     endedAt: new Date(timing.endedAt).toISOString(),
     ...(result.failWhy ? { failWhy: result.failWhy } : {}),
     ...(result.preflightWarnings?.length ? { preflightWarnings: [...result.preflightWarnings] } : {}),
