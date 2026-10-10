@@ -184,7 +184,7 @@ describe('assembleCodePacket — CI evidence section', () => {
     const p = assembleCodePacket({ ...base, ciEvidence: 'Head commit: abc\n## Check runs\n- failure · lint' });
     const titles = p.sections.map((s) => s.title);
     const ci = titles.indexOf(CI_EVIDENCE_SECTION_TITLE);
-    expect(ci).toBeGreaterThan(titles.indexOf('Changed files (full content)'));
+    expect(titles).not.toContain('Changed files (full content)'); // rendered only when supplied
     expect(ci).toBeLessThan(titles.indexOf('Repo conventions (AGENTS.md)'));
     const s = p.sections[ci];
     expect(s.included).toBe(true);

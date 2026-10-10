@@ -299,6 +299,9 @@ export interface SeatDiagnostics {
   elapsedMs: number;
   endedAt: string;
   failWhy?: string;
+  // Read-depth telemetry off the seat's own progress stream (modes/review/seat-usage.ts):
+  // tokens, tool calls, turns. Absent when the stream carried none.
+  usage?: { cachedInputTokens?: number; inputTokens?: number; outputTokens?: number; toolCalls?: number; turns?: number };
   // The seat's pre-flight warnings (today: grok's login pre-flight), kept apart from `stderrTail`.
   preflightWarnings?: string[];
   startedAt: string;

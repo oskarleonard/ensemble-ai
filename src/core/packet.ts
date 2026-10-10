@@ -229,15 +229,19 @@ export function assembleCodePacket(input: PacketInput): ReviewPacket {
     input.diff,
     Math.max(PACKET_BUDGETS.diff, input.diffBudget ?? 0)
   );
-  sections.push(
-    diff,
-    section(
-      'Changed files (full content)',
-      'surrounding context for the diff hunks',
-      input.surroundingFiles ?? '',
-      PACKET_BUDGETS.files
-    )
-  );
+  sections.push(diff);
+  // Surrounding file content is rendered only when a caller supplies it. No caller does today,
+  // and an always-present UNAVAILABLE section was one more line in every prompt saying nothing.
+  if (input.surroundingFiles) {
+    sections.push(
+      section(
+        'Changed files (full content)',
+        'surrounding context for the diff hunks',
+        input.surroundingFiles,
+        PACKET_BUDGETS.files
+      )
+    );
+  }
   // CI evidence — the machine's OWN execution result for this head, as DATA (incident 2026-08-10:
   // a green job's warning annotation carried the error every reader missed). Rendered whenever a
   // fetch was attempted, so an unavailable section is loud, never indistinguishable from "no checks".

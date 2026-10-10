@@ -7,6 +7,7 @@ import {
   materializedDiffClause,
   readOnlyWorktreeClause,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
+  conventionsFileClause,
 } from './worktree';
 
 // THE ONE CLAUDE PRODUCER (spec §3) — the worktree-mode Claude seat, running the built-in
@@ -149,6 +150,10 @@ export interface CodeReviewSeatPromptArgs {
   // `git log`/`git blame` the fence took away. Omitted ⇒ no clause, because a prompt must never
   // name evidence that is not there (a shallow clone builds no packet).
   history?: boolean;
+  // The conventions file in the worktree (modes/review CONVENTIONS_IN_TREE_*), when the run handed
+  // the gathered rules over by path. This seat never read the packet's conventions section, so
+  // without this it reviewed with no conventions at all. Omitted ⇒ no clause.
+  conventionsPath?: string;
   // The change-scope note when the change is reviewed in PARTS (./chunks renderChangeScope):
   // `diff` is then one part, and the seat is told which other changed files exist. Omitted ⇒
   // `diff` is the whole change, as before.
@@ -192,7 +197,7 @@ cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from)
 
 ${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...(args.scope ? { scope: args.scope } : {}) })}${ci}
 
-${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${args.conventionsPath ? conventionsFileClause(args.conventionsPath) : ''}${history}
 
 ${OPERATOR_REVIEW_METHOD}
 

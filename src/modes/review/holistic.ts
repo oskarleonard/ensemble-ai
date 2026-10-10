@@ -15,6 +15,7 @@ import {
   materializedDiffClause,
   readOnlyWorktreeClause,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
+  conventionsFileClause,
 } from './worktree';
 
 // THE HOLISTIC / ARCHITECTURE LENS (spec §4) — a SEAT in the registry, not a parallel pipeline
@@ -192,6 +193,10 @@ export interface HolisticPromptArgs {
   // is its heaviest consumer: "is this a reinvention, or the deliberate replacement of the util
   // three commits ago?" is a question only history answers. Omitted ⇒ no clause.
   history?: boolean;
+  // The conventions file in the worktree (modes/review CONVENTIONS_IN_TREE_*), when the run handed
+  // the gathered rules over by path — CONVENTION DRIFT is one of the three classes this lens
+  // reports, and until now it had no conventions text at all. Omitted ⇒ no clause.
+  conventionsPath?: string;
   // The change-scope note when the change was reviewed in PARTS (./chunks renderLensScope): the
   // lens is handed as much of the diff as one packet holds and told, file by file, what else the
   // PR changes. Omitted ⇒ the diff IS the whole change, as before.
@@ -217,7 +222,7 @@ ${readOnlyWorktreeClause({ headSha: args.headSha, reach: 'search and read it', w
 
 ${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...(args.scope ? { scope: args.scope } : {}) })}
 
-${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${args.conventionsPath ? conventionsFileClause(args.conventionsPath) : ''}${history}
 
 The other reviewers already read the diff closely and will report its bugs. Do NOT repeat them.
 Your job is the thing they structurally CANNOT see: how this change sits in the WHOLE project.
@@ -278,6 +283,8 @@ export interface RunHolisticLensOptions {
   historyPacket?: HistoryPacket;
   log?: (m: string) => void;
   run: HolisticRunner;
+  // The conventions file in the worktree (HolisticPromptArgs.conventionsPath).
+  conventionsPath?: string;
   // The change-scope note for a review in parts (HolisticPromptArgs.scope).
   scope?: string;
   timeoutMs?: number;
@@ -298,6 +305,7 @@ export async function runHolisticLens(
     diff: opts.diff,
     headSha: opts.headSha,
     history: hasHistory,
+    ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
     ...(opts.scope ? { scope: opts.scope } : {}),
     worktree: opts.worktree,
   });

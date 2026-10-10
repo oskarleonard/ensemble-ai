@@ -1003,3 +1003,28 @@ describe('runClaudeReviewLayer — pre-started producer and lens are awaited, ne
     fs.rmSync(base, { force: true, recursive: true });
   });
 });
+
+describe('runClaudeProducer — parts run a few at a time and merge in part order', () => {
+  it('overlaps parts and keeps part order whatever order they finish in', async () => {
+    const base = tmpTrail();
+    const runId = 'parts-parallel';
+    seedCoreTrail(base, runId, [stored('codex')]);
+    const parts = [1, 2, 3].map((i) => ({ diff: `diff --git a/p${i} b/p${i}\n@@ -1,1 +1,1 @@\n+x\n`, index: i, label: `p${i}`, prompt: `PROMPT ${i}` }));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const run = async (prompt: string): Promise<VoiceRunResult> => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // part 1 finishes LAST
+      const i = Number(prompt.match(/PROMPT (\d)/)?.[1]);
+      await new Promise((r) => setTimeout(r, i === 1 ? 60 : 10));
+      inFlight--;
+      return okRun(JSON.stringify({ findings: [{ body: 'b', confidence: 'high', evidence: { file: `p${i}`, line: 1 }, severity: 'low', title: `in p${i}` }], summary: `read p${i}` }));
+    };
+    const res = await runClaudeProducer({ baseDir: base, claudeConfig: CFG, expectedHeadSha: HEAD, includeClaudeReviewer: true, parts, reviewPrompt: 'PROMPT 1', run, runId });
+    expect(maxInFlight).toBeGreaterThan(1);
+    expect(res.claudeReview?.findings.map((f) => [f.chunk, f.evidence.file])).toEqual([[1, 'p1'], [2, 'p2'], [3, 'p3']]);
+    expect(res.claudeParts?.map((p) => p.index)).toEqual([1, 2, 3]);
+    fs.rmSync(base, { force: true, recursive: true });
+  });
+});

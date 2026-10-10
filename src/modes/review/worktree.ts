@@ -339,6 +339,19 @@ ${args.diff}
 \`\`\``;
 }
 
+// The conventions handoff by PATH (modes/review CONVENTIONS_IN_TREE_*): the gathered rules sit in
+// the worktree as a file the fenced seat can Read, so the prompt names it instead of carrying
+// 350 KB of it ahead of every part's diff.
+export function conventionsFileClause(file: string): string {
+  return `
+
+## Repo conventions — read the file
+
+The repository's conventions (AGENTS.md, rules, docs the repo asks a reviewer to read, gathered at
+the PR BASE so the PR's own edits to them are not the rules it is judged by) are in ONE file:
+\`${file}\`. Read it before reviewing. Cite a rule by its heading when a finding rests on it.`;
+}
+
 // Remove every agent-instruction file from a materialized worktree, recursively (a monorepo package
 // may carry its own). Returns the sorted repo-relative paths removed. Symlinks are unlinked, never
 // followed. Never throws: a file we cannot remove is reported by its ABSENCE from the returned list,
