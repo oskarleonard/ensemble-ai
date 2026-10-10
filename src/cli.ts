@@ -2019,16 +2019,23 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       if (trail && Array.isArray(trail.chunks)) {
         const claudeReview = claudeLayer?.claudeReview ?? null;
         for (const c of trail.chunks) {
-          if (claudeLayerExpected) {
-            const partFindings = claudeReview?.findings.filter((f) => (f.chunk ?? 1) === c.index).length ?? 0;
-            c.seats.claude = claudeReview
+          if (!claudeLayerExpected) continue;
+          // Per PART when the producer ran in parts — the trail must say which part failed, not
+          // paint the whole-review state onto every row.
+          const part = claudeLayer?.claudeParts?.find((p) => p.index === c.index);
+          c.seats.claude = part
+            ? {
+                findings: part.findings,
+                state: part.ok ? 'reviewed' : 'failed-reviewer',
+                ...(part.ok ? {} : { why: clean(part.summary).slice(0, 160) }),
+              }
+            : claudeReview
               ? {
-                  findings: partFindings,
+                  findings: claudeReview.findings.filter((f) => (f.chunk ?? 1) === c.index).length,
                   state: claudeReview.ok ? 'reviewed' : 'failed-reviewer',
                   ...(claudeReview.ok ? {} : { why: clean(claudeReview.summary).slice(0, 160) }),
                 }
               : { findings: 0, state: 'skipped', why: 'the claude layer did not run' };
-          }
         }
         writeTrailFile(out, runId, CHUNKS_TRAIL_FILE, JSON.stringify(trail, null, 2));
         writeTrailFile(

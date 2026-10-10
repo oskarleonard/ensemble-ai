@@ -119,14 +119,23 @@ export function planChunks(files: FileDiff[], ceilingBytes: number, maxChunks: n
   const cap = Math.max(1, Math.floor(maxChunks));
   const total = files.reduce((n, f) => n + f.bytes, 0);
   const finish = (parts: FileDiff[][]): ChunkPlan => {
-    const chunks: DiffChunk[] = parts.slice(0, cap).map((part, i) => ({
-      bytes: part.reduce((n, f) => n + f.bytes, 0),
-      diff: part.map((f) => f.raw).join(''),
-      files: part,
-      index: i + 1,
-      label: chunkLabel(part.map((f) => f.path)),
-      paths: part.map((f) => f.path),
-    }));
+    const labels: string[] = [];
+    const chunks: DiffChunk[] = parts.slice(0, cap).map((part, i) => {
+      // A spilled area yields consecutive parts with the same directories; number them so the
+      // trail, the prompts and the overview never show two parts with one name.
+      let label = chunkLabel(part.map((f) => f.path));
+      const dup = labels.filter((l) => l === label || l.startsWith(`${label} (`)).length;
+      if (dup > 0) label = `${label} (${dup + 1})`;
+      labels.push(label);
+      return {
+        bytes: part.reduce((n, f) => n + f.bytes, 0),
+        diff: part.map((f) => f.raw).join(''),
+        files: part,
+        index: i + 1,
+        label,
+        paths: part.map((f) => f.path),
+      };
+    });
     const overflow = parts.slice(cap).flat();
     return { ceilingBytes, chunks, overflow };
   };
@@ -134,27 +143,34 @@ export function planChunks(files: FileDiff[], ceilingBytes: number, maxChunks: n
   if (total <= ceilingBytes) return finish([sourceFirst(files)]);
 
   const areas = groupByArea(files, ceilingBytes, 1).map(sourceFirst);
-  const parts: FileDiff[][] = [];
-  let cur: FileDiff[] = [];
-  let curBytes = 0;
-  const close = (): void => {
-    if (cur.length > 0) parts.push(cur);
-    cur = [];
-    curBytes = 0;
-  };
+  // Classic first-fit over OPEN parts: an area that fits goes into the first part with room for
+  // the whole of it (keeping areas whole and parts fewer), else opens a new part; an area larger
+  // than a part spills file by file into the last part and onward. Parts keep their creation
+  // order, so part 1 still begins with the first area of the diff.
+  const parts: { bytes: number; files: FileDiff[] }[] = [];
   for (const area of areas) {
     const areaBytes = area.reduce((n, f) => n + f.bytes, 0);
-    // An area that fits a fresh part but not the current one starts a new part, so areas stay
-    // whole wherever the budget allows.
-    if (cur.length > 0 && curBytes + areaBytes > ceilingBytes && areaBytes <= ceilingBytes) close();
+    if (areaBytes <= ceilingBytes) {
+      const home = parts.find((p) => p.bytes + areaBytes <= ceilingBytes);
+      if (home) {
+        home.files.push(...area);
+        home.bytes += areaBytes;
+      } else {
+        parts.push({ bytes: areaBytes, files: [...area] });
+      }
+      continue;
+    }
     for (const f of area) {
-      if (cur.length > 0 && curBytes + f.bytes > ceilingBytes) close();
-      cur.push(f);
-      curBytes += f.bytes;
+      const last = parts[parts.length - 1];
+      if (last && last.bytes + f.bytes <= ceilingBytes) {
+        last.files.push(f);
+        last.bytes += f.bytes;
+      } else {
+        parts.push({ bytes: f.bytes, files: [f] });
+      }
     }
   }
-  close();
-  return finish(parts);
+  return finish(parts.map((p) => p.files));
 }
 
 // ── The scope note ────────────────────────────────────────────────────────────────────

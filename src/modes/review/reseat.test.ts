@@ -891,3 +891,88 @@ describe('splitWorktreePrompt — a preamble whose header this version cannot fi
     expect(splitWorktreePrompt(real)).toEqual({ baseSha: null, hadWorktree: false, packetPrompt: real, preambleHeadSha: null, unverifiedTail: false });
   });
 });
+
+// A seat that reviewed the change in PARTS (chunks.ts) is retried PART BY PART and re-merged.
+// Retrying only `packet.grok.json` (part 1's) would rewrite the merged review of record with one
+// part's findings and silently drop the rest — the exact hole this test pins shut.
+describe('runReseat — a seat whose run was in parts is retried part by part and re-merged', () => {
+  const PART_PACKET = (p: string): ReviewPacket => ({
+    complete: true,
+    objective: 'o',
+    pr: 0,
+    repo: 'acme/webapp',
+    sections: [{ body: `diff --git a/${p} b/${p}\n@@ -1,1 +1,1 @@\n+x`, included: true, note: 'n', title: 'The diff under review', truncated: false }],
+  });
+  function seedPartsRun(): { base: string; runId: string } {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-reseat-parts-'));
+    const runId = 'parts-run';
+    persistReview(base, {
+      findings: [], packet: PACKET, prompt: PINNED, raw: '{}', reviewer: CODEX, runId, summary: 'codex summary', terminalState: 'reviewed',
+    });
+    // The merged grok review of record: INCOMPLETE because part 2 died.
+    persistReview(base, {
+      findings: [], packet: PART_PACKET('backend/a.go'), prompt: 'PART 1 PROMPT\n', raw: null, reviewer: GROK, runId,
+      summary: 'Reviewed in 2 part(s); 1 part(s) did not complete', terminalState: 'failed-reviewer',
+    });
+    persistReview(base, {
+      artifactSuffix: 'c1', findings: [], packet: PART_PACKET('backend/a.go'), prompt: 'PART 1 PROMPT\n', raw: '{}', reviewer: GROK, runId,
+      summary: 'part 1 ok', terminalState: 'reviewed',
+    });
+    persistReview(base, {
+      artifactSuffix: 'c2', findings: [], packet: PART_PACKET('web/c.ts'), prompt: 'PART 2 PROMPT\n', raw: null, reviewer: GROK, runId,
+      summary: 'timed out', terminalState: 'failed-reviewer',
+    });
+    persistGatePacket(base, runId, { diff: GATE_DIFF, headSha: RUN_HEAD });
+    fs.writeFileSync(
+      path.join(reviewDir(base, runId), 'chunks.json'),
+      JSON.stringify({ ceilingBytes: 300, chunks: [{ bytes: 1, files: [], index: 1, label: 'backend', promptChars: 1, seats: {} }, { bytes: 1, files: [], index: 2, label: 'web', promptChars: 1, seats: {} }], maxChunks: 8, omitted: [], schemaVersion: 1 })
+    );
+    fs.writeFileSync(path.join(reviewDir(base, runId), 'claude-synthesis.json'), JSON.stringify({ claudeReview: { ok: true, voiceId: 'claude' }, synthesis: { degraded: false } }));
+    return { base, runId };
+  }
+
+  it('loads every part\'s artifacts and refuses when one is missing', () => {
+    const { base, runId } = seedPartsRun();
+    const art = readSeatArtifacts(base, runId, 'grok');
+    expect('error' in art).toBe(false);
+    if ('error' in art) return;
+    expect(art.parts?.map((p) => [p.index, p.label, p.prompt])).toEqual([[1, 'backend', 'PART 1 PROMPT\n'], [2, 'web', 'PART 2 PROMPT\n']]);
+    fs.rmSync(path.join(reviewDir(base, runId), 'prompt.grok.c2.md'));
+    expect(readSeatArtifacts(base, runId, 'grok')).toEqual({ error: expect.stringContaining('prompt.grok.c2.md') });
+  });
+
+  it('re-runs ONLY the failed part, reuses the surviving one, merges, records the heal, and regates the union', async () => {
+    const { base, runId } = seedPartsRun();
+    const prompts: string[] = [];
+    const adapter: ReviewAdapter = async (prompt) => {
+      prompts.push(prompt);
+      const file = prompt.includes('PART 1') ? 'backend/a.go' : 'web/c.ts';
+      return {
+        ok: true,
+        raw: '```json\n' + JSON.stringify({ findings: [{ body: 'b', confidence: 'high', evidence: { file, line: 1 }, severity: 'low', title: `in ${file}` }], summary: `read ${file}` }) + '\n```',
+        stderrTail: '',
+        timedOut: false,
+      };
+    };
+    const res = await runReseat({
+      adapter, baseDir: base, gateConfig: GATE_CFG, regate: async () => REGATE_OK, reviewer: GROK, runId, seat: 'grok',
+    });
+    // part 1 completed in the dead attempt → reused from disk, never re-billed
+    expect(prompts).toEqual(['PART 2 PROMPT\n']);
+    expect(res.ok).toBe(true);
+    expect(res.review.terminalState).toBe('reviewed');
+    expect(res.review.findings.map((f) => [f.id, f.chunk, f.evidence.file])).toEqual([['f1', 2, 'web/c.ts']]);
+    expect(res.review.summary).toContain('Part 1/2 (backend): part 1 ok');
+    const dir = reviewDir(base, runId);
+    const merged = JSON.parse(fs.readFileSync(path.join(dir, 'review.grok.json'), 'utf8')) as { findings: unknown[]; terminalState: string };
+    expect(merged.terminalState).toBe('reviewed');
+    expect(merged.findings).toHaveLength(1);
+    const part2 = JSON.parse(fs.readFileSync(path.join(dir, 'review.grok.c2.json'), 'utf8')) as { terminalState: string };
+    expect(part2.terminalState).toBe('reviewed');
+    // the chunk trail now says what happened to each part, and the overview was re-rendered
+    const trail = JSON.parse(fs.readFileSync(path.join(dir, 'chunks.json'), 'utf8')) as { chunks: { index: number; seats: Record<string, { state: string; findings: number }> }[] };
+    expect(trail.chunks[0].seats.grok).toMatchObject({ findings: 0, state: 'reviewed' });
+    expect(trail.chunks[1].seats.grok).toMatchObject({ findings: 1, state: 'reviewed' });
+    expect(fs.existsSync(path.join(dir, 'coverage-overview.md'))).toBe(true);
+  });
+});

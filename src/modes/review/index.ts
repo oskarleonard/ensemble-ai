@@ -7,7 +7,9 @@ import {
 import type { EgressDenial } from '../../core/egress-proxy';
 import {
   assembleCodePacket,
+  PACKET_BUDGETS,
   reviewerVisibleDiff,
+  section,
 } from '../../core/packet';
 import { renderReviewPrompt } from '../../core/prompt';
 import { loadReviewers } from '../../core/reviewers';
@@ -406,6 +408,10 @@ export async function runReviewMode(
     opts.objective ?? (profile === 'security' ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE);
   const scoped = partCount > 1 || acquired.plan.overflow.length > 0;
   const scopeInput = { coverage: acquired.coverage, plan: acquired.plan };
+  // The scope note the FENCED prompts embed raw (the `/code-review` producer, the lens) is bounded
+  // exactly as the packet section is, so a thousand-file change cannot put an unbounded listing in
+  // front of every part's diff.
+  const boundedScope = (text: string): string => section('scope', 'scope', text, PACKET_BUDGETS.scope).body;
   const packets = (partCount > 0 ? acquired.plan.chunks : [null]).map((chunk) =>
     assembleCodePacket({
       agentsBudget: conventionManifest?.capBytes,
@@ -446,7 +452,7 @@ export async function runReviewMode(
       index: chunk?.index ?? 1,
       label: chunk?.label ?? '(the change)',
       prompt: prompts[i],
-      ...(chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index) } : {}),
+      ...(chunk && scoped ? { scope: boundedScope(renderChangeScope(scopeInput, chunk.index)) } : {}),
     };
   });
 
@@ -476,17 +482,20 @@ export async function runReviewMode(
   // names every other changed file as changed — never the sentence "this is exactly the diff"
   // over a slice (run 2026-10-10-18-51-44-9acc127a's lens was told that, and believed it).
   let lensHandoff: { diff: string; scope: string } | undefined;
-  if (partCount > 1) {
+  // Also on a ONE-part review that left files past the part limit: the lens must not be told
+  // the diff is exactly the change when named files were never shipped.
+  if (scoped && partCount > 0) {
     const shown: number[] = [];
     let bytes = 0;
     for (const p of parts) {
-      if (shown.length > 0 && bytes + p.diff.length > ceilingBytes) break;
+      const partBytes = Buffer.byteLength(p.diff, 'utf8');
+      if (shown.length > 0 && bytes + partBytes > ceilingBytes) break;
       shown.push(p.index);
-      bytes += p.diff.length;
+      bytes += partBytes;
     }
     lensHandoff = {
       diff: parts.filter((p) => shown.includes(p.index)).map((p) => p.diff).join(''),
-      scope: renderLensScope(scopeInput, shown),
+      scope: boundedScope(renderLensScope(scopeInput, shown)),
     };
   }
 

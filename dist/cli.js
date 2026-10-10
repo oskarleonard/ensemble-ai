@@ -4121,14 +4121,21 @@ function planChunks(files, ceilingBytes, maxChunks) {
   const cap4 = Math.max(1, Math.floor(maxChunks));
   const total = files.reduce((n, f) => n + f.bytes, 0);
   const finish = (parts2) => {
-    const chunks = parts2.slice(0, cap4).map((part, i) => ({
-      bytes: part.reduce((n, f) => n + f.bytes, 0),
-      diff: part.map((f) => f.raw).join(""),
-      files: part,
-      index: i + 1,
-      label: chunkLabel(part.map((f) => f.path)),
-      paths: part.map((f) => f.path)
-    }));
+    const labels = [];
+    const chunks = parts2.slice(0, cap4).map((part, i) => {
+      let label2 = chunkLabel(part.map((f) => f.path));
+      const dup = labels.filter((l) => l === label2 || l.startsWith(`${label2} (`)).length;
+      if (dup > 0) label2 = `${label2} (${dup + 1})`;
+      labels.push(label2);
+      return {
+        bytes: part.reduce((n, f) => n + f.bytes, 0),
+        diff: part.map((f) => f.raw).join(""),
+        files: part,
+        index: i + 1,
+        label: label2,
+        paths: part.map((f) => f.path)
+      };
+    });
     const overflow = parts2.slice(cap4).flat();
     return { ceilingBytes, chunks, overflow };
   };
@@ -4136,24 +4143,29 @@ function planChunks(files, ceilingBytes, maxChunks) {
   if (total <= ceilingBytes) return finish([sourceFirst(files)]);
   const areas = groupByArea(files, ceilingBytes, 1).map(sourceFirst);
   const parts = [];
-  let cur = [];
-  let curBytes = 0;
-  const close = () => {
-    if (cur.length > 0) parts.push(cur);
-    cur = [];
-    curBytes = 0;
-  };
   for (const area of areas) {
     const areaBytes = area.reduce((n, f) => n + f.bytes, 0);
-    if (cur.length > 0 && curBytes + areaBytes > ceilingBytes && areaBytes <= ceilingBytes) close();
+    if (areaBytes <= ceilingBytes) {
+      const home = parts.find((p) => p.bytes + areaBytes <= ceilingBytes);
+      if (home) {
+        home.files.push(...area);
+        home.bytes += areaBytes;
+      } else {
+        parts.push({ bytes: areaBytes, files: [...area] });
+      }
+      continue;
+    }
     for (const f of area) {
-      if (cur.length > 0 && curBytes + f.bytes > ceilingBytes) close();
-      cur.push(f);
-      curBytes += f.bytes;
+      const last = parts[parts.length - 1];
+      if (last && last.bytes + f.bytes <= ceilingBytes) {
+        last.files.push(f);
+        last.bytes += f.bytes;
+      } else {
+        parts.push({ bytes: f.bytes, files: [f] });
+      }
     }
   }
-  close();
-  return finish(parts);
+  return finish(parts.map((p) => p.files));
 }
 function fileLine(f) {
   return `${f.path} (+${f.added}/-${f.removed})`;
@@ -4330,12 +4342,21 @@ function classifyFileKind(path24, isBinary, section2 = "", firstLine4) {
 }
 function worktreeFirstLineReader(dir) {
   const root = nodePath.resolve(dir);
+  let realRoot;
+  try {
+    realRoot = fs18.realpathSync(root);
+  } catch {
+    return () => null;
+  }
   return (p) => {
     const full = nodePath.resolve(root, p);
     if (full !== root && !full.startsWith(root + nodePath.sep)) return null;
     let fd = null;
     try {
-      fd = fs18.openSync(full, "r");
+      const real = fs18.realpathSync(full);
+      if (real !== realRoot && !real.startsWith(realRoot + nodePath.sep)) return null;
+      fd = fs18.openSync(full, fs18.constants.O_RDONLY | fs18.constants.O_NOFOLLOW);
+      if (!fs18.fstatSync(fd).isFile()) return null;
       const buf = Buffer.alloc(512);
       const n = fs18.readSync(fd, buf, 0, 512, 0);
       const text = buf.subarray(0, n).toString("utf8");
@@ -4374,9 +4395,11 @@ function pathOfSection(section2) {
 function parseDiffFiles(raw, opts = {}) {
   if (!raw.trim()) return [];
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
-  return parts.map((section2) => {
+  return parts.map((part) => {
+    let section2 = part;
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
     const path24 = pathOfSection(section2);
+    if (!section2.endsWith("\n")) section2 += "\n";
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -7892,7 +7915,12 @@ function flattenFindings(reviews) {
   });
   return out;
 }
-function prepareGateFindings(reviews, packetHunks) {
+var GATE_HUNK_BUDGET_MAX_PARTS = 8;
+function gateHunkBudgetFor(parts) {
+  const n = Math.max(1, Math.min(GATE_HUNK_BUDGET_MAX_PARTS, Math.floor(parts)));
+  return GATE_HUNK_BYTE_BUDGET * n;
+}
+function prepareGateFindings(reviews, packetHunks, hunkBudget = GATE_HUNK_BYTE_BUDGET) {
   const raw = flattenFindings(reviews);
   const resolved = /* @__PURE__ */ new Map();
   for (const rf of raw) {
@@ -7929,7 +7957,7 @@ function prepareGateFindings(reviews, packetHunks) {
     }
     const win = windowHunk(res.hunk, res.bodyIndex);
     const bytes = Buffer.byteLength(win.text, "utf8");
-    const admitted = injections.length === 0 || usedBytes + bytes <= GATE_HUNK_BYTE_BUDGET;
+    const admitted = injections.length === 0 || usedBytes + bytes <= hunkBudget;
     const label2 = admitted ? `H${injections.length + 1}` : "";
     const injection = { label: label2, rangeKey: key, text: win.text, truncated: win.truncated };
     byKey.set(key, { ...injection, admitted, winEnd: win.end, winStart: win.start });
@@ -8364,7 +8392,10 @@ async function runGate(opts) {
     log(`  \xB7 gate: pinned packet unusable (${packet.reason}) \u2014 verdicts cannot be grounded`);
   }
   const packetHunks = packet.ok ? parsePacketHunks(packet.diff) : /* @__PURE__ */ new Map();
-  const { findings, injections } = prepareGateFindings(healthy, packetHunks);
+  const chunkTrail = readTrailJson(opts.baseDir, opts.runId, CHUNKS_TRAIL_FILE);
+  const partCount = Array.isArray(chunkTrail?.chunks) ? Math.max(1, chunkTrail.chunks.length) : 1;
+  const { findings, injections } = prepareGateFindings(healthy, packetHunks, gateHunkBudgetFor(partCount));
+  if (partCount > 1) log(`  \xB7 gate: ${partCount} parts \u2014 hunk budget ${gateHunkBudgetFor(partCount)} bytes`);
   const reconcileOpts = {
     gateEvidence: opts.gateEvidence,
     // "What this PR changes" is the pinned packet's `changedFiles` — EVERY path the change
@@ -9329,6 +9360,7 @@ async function runReviewMode(opts) {
   const objective = opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE);
   const scoped = partCount > 1 || acquired.plan.overflow.length > 0;
   const scopeInput = { coverage: acquired.coverage, plan: acquired.plan };
+  const boundedScope = (text) => section("scope", "scope", text, PACKET_BUDGETS.scope).body;
   const packets = (partCount > 0 ? acquired.plan.chunks : [null]).map(
     (chunk) => assembleCodePacket({
       agentsBudget: conventionManifest?.capBytes,
@@ -9366,7 +9398,7 @@ async function runReviewMode(opts) {
       index: chunk?.index ?? 1,
       label: chunk?.label ?? "(the change)",
       prompt: prompts[i],
-      ...chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index) } : {}
+      ...chunk && scoped ? { scope: boundedScope(renderChangeScope(scopeInput, chunk.index)) } : {}
     };
   });
   const pinnedDiff = parts.map((p) => p.diff).join("");
@@ -9379,17 +9411,18 @@ async function runReviewMode(opts) {
   } catch {
   }
   let lensHandoff;
-  if (partCount > 1) {
+  if (scoped && partCount > 0) {
     const shown = [];
     let bytes = 0;
     for (const p of parts) {
-      if (shown.length > 0 && bytes + p.diff.length > ceilingBytes) break;
+      const partBytes = Buffer.byteLength(p.diff, "utf8");
+      if (shown.length > 0 && bytes + partBytes > ceilingBytes) break;
       shown.push(p.index);
-      bytes += p.diff.length;
+      bytes += partBytes;
     }
     lensHandoff = {
       diff: parts.filter((p) => shown.includes(p.index)).map((p) => p.diff).join(""),
-      scope: renderLensScope(scopeInput, shown)
+      scope: boundedScope(renderLensScope(scopeInput, shown))
     };
   }
   log(
@@ -9991,6 +10024,7 @@ async function runClaudeReviewLayer(opts) {
   const producerTimeout = opts.timeoutMs ?? (opts.worktree ? CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS : void 0);
   let claudeReview = null;
   let claudeSpawned = false;
+  let claudeParts;
   if (opts.includeClaudeReviewer && parts.length === 1) {
     log(
       opts.worktree ? `  \xB7 claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (cold single-pass peer)\u2026` : `  \xB7 claude (anthropic/${modelLabel}) reviewing the diff (cold)\u2026`
@@ -10042,6 +10076,7 @@ async function runClaudeReviewLayer(opts) {
       }
     }
     claudeSpawned = partReviews.some((p) => p.spawned);
+    claudeParts = partReviews.map((p) => ({ findings: p.review.findings.length, index: p.part.index, ok: p.review.ok, summary: p.review.summary }));
     const failed = partReviews.filter((p) => !p.review.ok);
     const findings = [];
     for (const p of partReviews) {
@@ -10197,6 +10232,7 @@ ${p.raw}`);
     }
   }
   return {
+    ...claudeParts ? { claudeParts } : {},
     claudeReview,
     claudeSpawned,
     gateSpawned: gate.gateSpawned,
@@ -10710,6 +10746,29 @@ function readSeatArtifacts(baseDir, runId, seat) {
   } catch {
     return { error: `run ${runId} has no readable prompt.${seat}.md` };
   }
+  const trail = readTrailJson(baseDir, runId, CHUNKS_TRAIL_FILE);
+  if (trail && Array.isArray(trail.chunks) && trail.chunks.length > 1) {
+    const parts = [];
+    for (const c of trail.chunks) {
+      let partPacket;
+      try {
+        partPacket = JSON.parse(fs28.readFileSync(path22.join(dir, `packet.${seat}.c${c.index}.json`), "utf8"));
+      } catch {
+        return { error: `run ${runId} reviewed in ${trail.chunks.length} parts but has no readable packet.${seat}.c${c.index}.json` };
+      }
+      if (!isReviewPacketShape(partPacket)) {
+        return { error: `run ${runId} has an unreadable packet.${seat}.c${c.index}.json (unexpected shape)` };
+      }
+      let partPrompt;
+      try {
+        partPrompt = fs28.readFileSync(path22.join(dir, `prompt.${seat}.c${c.index}.md`), "utf8");
+      } catch {
+        return { error: `run ${runId} reviewed in ${trail.chunks.length} parts but has no readable prompt.${seat}.c${c.index}.md` };
+      }
+      parts.push({ index: c.index, label: c.label, packet: partPacket, prompt: partPrompt });
+    }
+    return { packet, parts, prompt, stored };
+  }
   return { packet, prompt, stored };
 }
 function checkReseat(baseDir, runId, seat, worktreeHeadSha) {
@@ -10747,7 +10806,30 @@ function checkReseat(baseDir, runId, seat, worktreeHeadSha) {
       refusal: `seat ${seat} completed in run ${runId} \u2014 nothing to retry (re-running a healthy seat is a new review)`
     };
   }
-  return { art, headSha, split };
+  let partSplits;
+  if (art.parts) {
+    partSplits = [];
+    for (const part of art.parts) {
+      const ps = splitWorktreePrompt(part.prompt);
+      if (ps.unverifiedTail && !ps.recoveredHeader) {
+        return {
+          refusal: `seat ${seat}'s persisted prompt for part ${part.index} carries a worktree preamble whose header this engine cannot read \u2014 refusing to guess where the packet ends; re-run the review instead`
+        };
+      }
+      if (ps.preambleHeadSha && ps.preambleHeadSha !== headSha) {
+        return {
+          refusal: `seat ${seat}'s persisted prompt for part ${part.index} was pinned at ${ps.preambleHeadSha.slice(0, 12)} but the run's gate packet is at ${headSha.slice(0, 12)} \u2014 refusing to retry across heads`
+        };
+      }
+      if (!part.packet.complete) {
+        return {
+          refusal: `run ${runId}'s pinned packet for part ${part.index} was incomplete (no usable diff) \u2014 nothing a retry could review; re-run the review`
+        };
+      }
+      partSplits.push(ps);
+    }
+  }
+  return { art, headSha, ...partSplits ? { partSplits } : {}, split };
 }
 function reseatRefusal(baseDir, runId, seat, worktreeHeadSha) {
   const pre = checkReseat(baseDir, runId, seat, worktreeHeadSha);
@@ -10873,13 +10955,14 @@ async function reseatUnderLock(opts, pre) {
       )
     );
   }
-  const seatRun = await runCoreSeat({
+  const runOnePart = (packet, packetPrompt, partWorktreePrompt, artifactSuffix) => runCoreSeat({
     adapter: opts.adapter,
+    ...artifactSuffix ? { artifactSuffix } : {},
     log,
     out: baseDir,
-    packet: art.packet,
-    packetComplete: art.packet.complete,
-    packetPrompt: split.packetPrompt,
+    packet,
+    packetComplete: packet.complete,
+    packetPrompt,
     qualification: opts.qualification,
     retryOnPacket: RETRIES_ON_PACKET[seat],
     reviewer: opts.reviewer,
@@ -10889,8 +10972,55 @@ async function reseatUnderLock(opts, pre) {
     // full run records. Without `worktreePrompt` it stays a packet run — the seat is never told
     // about a tree it did not get.
     ...wt ? { worktree: wt.dir } : {},
-    ...worktreePrompt ? { worktreePrompt } : {}
+    ...partWorktreePrompt ? { worktreePrompt: partWorktreePrompt } : {}
   });
+  let seatRun;
+  const partsRerun = /* @__PURE__ */ new Set();
+  if (art.parts && pre.partSplits) {
+    const n = art.parts.length;
+    const runs = [];
+    const manifestRealized = (() => {
+      try {
+        const m = JSON.parse(fs28.readFileSync(path22.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE), "utf8"));
+        return m.realizedEvidence?.[seat] === "worktree" ? "worktree" : "packet";
+      } catch {
+        return "packet";
+      }
+    })();
+    for (let i = 0; i < n; i++) {
+      const part = art.parts[i];
+      const ps = pre.partSplits[i];
+      const surviving = readPartReview(baseDir, runId, seat, part.index);
+      if (surviving && surviving.terminalState === "reviewed") {
+        log(`reseat: ${seat} part ${part.index}/${n} \u2014 ${part.label}: completed in the dead attempt, reused (${surviving.findings.length} finding(s))`);
+        runs.push({
+          index: part.index,
+          label: part.label,
+          seat: { egressDenials: [], fallbackReason: null, realized: manifestRealized, review: surviving }
+        });
+        continue;
+      }
+      partsRerun.add(part.index);
+      log(`reseat: ${seat} part ${part.index}/${n} \u2014 ${part.label}\u2026`);
+      const partWorktreePrompt = wt && qualified ? ps.packetPrompt + worktreePromptSuffix({ baseSha: wt.baseSha ?? ps.baseSha, headSha: wt.headSha, worktree: wt.dir }) : void 0;
+      const r = await runOnePart(part.packet, ps.packetPrompt, partWorktreePrompt, `c${part.index}`);
+      log(
+        `reseat: ${seat} part ${part.index}/${n} ${r.review.terminalState} \u2014 ${r.review.findings.length} finding(s)${r.review.terminalState === "reviewed" ? "" : ` \u2014 ${scrubControl(r.review.summary).slice(0, 160)}`}`
+      );
+      runs.push({ index: part.index, label: part.label, seat: r });
+    }
+    seatRun = mergeChunkSeatRuns({
+      out: baseDir,
+      packet: art.packet,
+      prompt: split.packetPrompt,
+      reviewer: opts.reviewer,
+      runId,
+      runs
+    });
+    recordHealedParts(baseDir, runId, seat, runs, log);
+  } else {
+    seatRun = await runOnePart(art.packet, split.packetPrompt, worktreePrompt);
+  }
   const review = seatRun.review;
   const fallbackReason = seatRun.fallbackReason ?? (wt && !qualified ? `${seat}: no sandbox qualification for the re-materialized worktree${opts.qualification?.reason ? ` (${opts.qualification.reason})` : ""} \u2014 re-ran on the PACKET` : opts.worktreeUnavailable ?? null);
   if (fallbackReason && !seatRun.fallbackReason) log(`reseat: \u26A0 ${scrubControl(fallbackReason)}`);
@@ -10997,6 +11127,7 @@ async function reseatUnderLock(opts, pre) {
     runId,
     ...wt ? { worktree: wt.dir } : {}
   });
+  if (art.parts) rerenderOverview(baseDir, runId, headSha, gate.ok ? verdictCounts(gate.verdicts) : void 0, log);
   return {
     egressDenials: seatRun.egressDenials,
     evidenceDowngraded,
@@ -11007,6 +11138,47 @@ async function reseatUnderLock(opts, pre) {
     review,
     stampWritten
   };
+}
+function readPartReview(baseDir, runId, seat, index) {
+  try {
+    const raw = JSON.parse(fs28.readFileSync(path22.join(reviewDir(baseDir, runId), `review.${seat}.c${index}.json`), "utf8"));
+    if (typeof raw !== "object" || raw === null) return null;
+    const r = raw;
+    if (!Array.isArray(r.findings) || typeof r.terminalState !== "string" || typeof r.summary !== "string") return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+function recordHealedParts(baseDir, runId, seat, runs, log) {
+  try {
+    const trail = readTrailJson(baseDir, runId, CHUNKS_TRAIL_FILE);
+    if (!trail || !Array.isArray(trail.chunks)) return;
+    for (const r of runs) {
+      const c = trail.chunks.find((x) => x.index === r.index);
+      if (!c) continue;
+      const rv = r.seat.review;
+      c.seats[seat] = {
+        ...rv.diagnostics ? { elapsedMs: rv.diagnostics.elapsedMs } : {},
+        findings: rv.findings.length,
+        state: rv.terminalState === "reviewed" ? "reviewed" : "failed-reviewer",
+        ...rv.terminalState === "reviewed" ? {} : { why: scrubControl(rv.summary).slice(0, 160) }
+      };
+    }
+    writeTrailFile(baseDir, runId, CHUNKS_TRAIL_FILE, JSON.stringify(trail, null, 2));
+  } catch (e) {
+    log(`reseat: ${CHUNKS_TRAIL_FILE} could not be updated (${e.message})`);
+  }
+}
+function rerenderOverview(baseDir, runId, headSha, gateCounts, log) {
+  try {
+    const trail = readTrailJson(baseDir, runId, CHUNKS_TRAIL_FILE);
+    if (!trail || !Array.isArray(trail.chunks)) return;
+    const totalFiles = trail.chunks.reduce((n, c) => n + c.files.length, 0) + trail.omitted.length;
+    writeTrailFile(baseDir, runId, "coverage-overview.md", renderCoverageOverview(trail, { ...gateCounts ? { gateCounts } : {}, headSha, totalFiles }));
+  } catch (e) {
+    log(`reseat: coverage-overview.md could not be re-rendered (${e.message})`);
+  }
 }
 
 // src/plumbing/pin-check.ts
@@ -13169,14 +13341,17 @@ async function runReviewPipeline(input) {
       if (trail && Array.isArray(trail.chunks)) {
         const claudeReview = claudeLayer?.claudeReview ?? null;
         for (const c of trail.chunks) {
-          if (claudeLayerExpected) {
-            const partFindings = claudeReview?.findings.filter((f) => (f.chunk ?? 1) === c.index).length ?? 0;
-            c.seats.claude = claudeReview ? {
-              findings: partFindings,
-              state: claudeReview.ok ? "reviewed" : "failed-reviewer",
-              ...claudeReview.ok ? {} : { why: scrubControl(claudeReview.summary).slice(0, 160) }
-            } : { findings: 0, state: "skipped", why: "the claude layer did not run" };
-          }
+          if (!claudeLayerExpected) continue;
+          const part = claudeLayer?.claudeParts?.find((p) => p.index === c.index);
+          c.seats.claude = part ? {
+            findings: part.findings,
+            state: part.ok ? "reviewed" : "failed-reviewer",
+            ...part.ok ? {} : { why: scrubControl(part.summary).slice(0, 160) }
+          } : claudeReview ? {
+            findings: claudeReview.findings.filter((f) => (f.chunk ?? 1) === c.index).length,
+            state: claudeReview.ok ? "reviewed" : "failed-reviewer",
+            ...claudeReview.ok ? {} : { why: scrubControl(claudeReview.summary).slice(0, 160) }
+          } : { findings: 0, state: "skipped", why: "the claude layer did not run" };
         }
         writeTrailFile(out, runId, CHUNKS_TRAIL_FILE, JSON.stringify(trail, null, 2));
         writeTrailFile(
