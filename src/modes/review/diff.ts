@@ -112,12 +112,25 @@ export function classifyFileKind(
 // Reads at most the first 512 bytes; a missing file (deleted in the PR) is null.
 export function worktreeFirstLineReader(dir: string): (path: string) => string | null {
   const root = nodePath.resolve(dir);
+  let realRoot: string;
+  try {
+    realRoot = fs.realpathSync(root);
+  } catch {
+    return () => null;
+  }
   return (p: string): string | null => {
     const full = nodePath.resolve(root, p);
     if (full !== root && !full.startsWith(root + nodePath.sep)) return null;
     let fd: number | null = null;
     try {
-      fd = fs.openSync(full, 'r');
+      // Confined for real, not lexically: a PR can commit a symlink (`link.go -> /etc/hosts`, or a
+      // symlinked directory), so the REAL path must sit under the real root, the final component
+      // is opened O_NOFOLLOW, and only a regular file is read — a FIFO or device would block the
+      // whole acquire before any seat spawned.
+      const real = fs.realpathSync(full);
+      if (real !== realRoot && !real.startsWith(realRoot + nodePath.sep)) return null;
+      fd = fs.openSync(full, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      if (!fs.fstatSync(fd).isFile()) return null;
       const buf = Buffer.alloc(512);
       const n = fs.readSync(fd, buf, 0, 512, 0);
       const text = buf.subarray(0, n).toString('utf8');
@@ -188,11 +201,16 @@ export function parseDiffFiles(raw: string, opts: ParseDiffOptions = {}): FileDi
   // Anchor splits to a `diff --git` at column 0 (a hunk body line that merely
   // starts with "diff --git" can't, since hunk content is prefixed by +/-/space).
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
-  return parts.map((section) => {
+  return parts.map((part) => {
+    let section = part;
     const isBinary =
       /^Binary files .* differ$/m.test(section) ||
       /^GIT binary patch$/m.test(section);
     const path = pathOfSection(section);
+    // Every section ends with a newline. A diff whose LAST section lacks one (a hand-made
+    // `--diff-file`, a capture cut short) would otherwise glue onto the next header once sections
+    // are reordered (source-first, area parts), and the gate's hunk parser would drop that file.
+    if (!section.endsWith('\n')) section += '\n';
     let added = 0;
     let removed = 0;
     for (const line of section.split('\n')) {

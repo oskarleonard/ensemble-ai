@@ -200,3 +200,22 @@ describe('renderCoverageOverview — the one page a human reads first', () => {
     expect(md).toContain('- gen/ent/x.go (generated)');
   });
 });
+
+describe('planChunks — first-fit over open parts, distinct labels', () => {
+  it('places an area into the first open part with room, so fewer parts are opened', () => {
+    // in-order packing would open 4 parts (130|130|60+60|130+60); first-fit over open parts gives 3
+    const fs = files(['a/x', 130], ['b/x', 130], ['c/x', 60], ['d/x', 60], ['e/x', 130], ['f/x', 60]);
+    const plan = planChunks(fs, 200, 8);
+    expect(plan.chunks.map((c) => c.paths)).toEqual([
+      ['a/x', 'c/x'],
+      ['b/x', 'd/x'],
+      ['e/x', 'f/x'],
+    ]);
+  });
+
+  it('numbers consecutive parts that spill out of one area', () => {
+    const fs = files(['svc/ramp/a.go', 300], ['svc/ramp/b.go', 300], ['svc/ramp/c.go', 300]);
+    const plan = planChunks(fs, 350, 8);
+    expect(plan.chunks.map((c) => c.label)).toEqual(['svc/ramp', 'svc/ramp (2)', 'svc/ramp (3)']);
+  });
+});

@@ -19,6 +19,8 @@ import {
   resolveFindingHunk,
   windowHunk,
 } from './gate-hunks';
+import { CHUNKS_TRAIL_FILE } from './chunks';
+import { readTrailJson } from './trail-io';
 import {
   type FixStatus,
   type PostableClass,
@@ -274,9 +276,21 @@ function flattenFindings(reviews: VoiceReview[]): RawFinding[] {
 // injected once (charged once); each hunk is windowed to ±25 lines; the first hunk always
 // fits, thereafter a hunk that would exceed the byte budget is NAMED-truncated (its finding
 // dismissal-ineligible). Reads ONLY the passed packet hunks — never the working tree.
+// The hunk budget for ONE gate prompt. A review in PARTS (chunks.ts) brings every part's findings
+// to one gate, so the budget scales with the parts (capped) — else the parts that fit under the
+// 40 KB line get hunks and the rest arrive dismissal-ineligible for a reason that has nothing to
+// do with the finding. Each part's hunks were already bounded by the ceiling, and a gate seat holds
+// a multi-part prompt as easily as it holds one.
+export const GATE_HUNK_BUDGET_MAX_PARTS = 8;
+export function gateHunkBudgetFor(parts: number): number {
+  const n = Math.max(1, Math.min(GATE_HUNK_BUDGET_MAX_PARTS, Math.floor(parts)));
+  return GATE_HUNK_BYTE_BUDGET * n;
+}
+
 export function prepareGateFindings(
   reviews: VoiceReview[],
-  packetHunks: Map<string, Hunk[]>
+  packetHunks: Map<string, Hunk[]>,
+  hunkBudget: number = GATE_HUNK_BYTE_BUDGET
 ): { findings: GateFinding[]; injections: GateInjection[] } {
   const raw = flattenFindings(reviews);
   const resolved = new Map<string, ResolvedHunk | null>();
@@ -328,7 +342,7 @@ export function prepareGateFindings(
     const bytes = Buffer.byteLength(win.text, 'utf8');
     // The first admitted hunk always goes in (mirrors coverage's includedBytes>0 rule) so a
     // lone over-budget hunk is still shown; subsequent over-budget hunks are truncated out.
-    const admitted = injections.length === 0 || usedBytes + bytes <= GATE_HUNK_BYTE_BUDGET;
+    const admitted = injections.length === 0 || usedBytes + bytes <= hunkBudget;
     const label = admitted ? `H${injections.length + 1}` : '';
     const injection: GateInjection = { label, rangeKey: key, text: win.text, truncated: win.truncated };
     byKey.set(key, { ...injection, admitted, winEnd: win.end, winStart: win.start });
@@ -1264,7 +1278,12 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // untrusted — they are excluded from the exit gate (cli.ts `hasHighFinding` requires
   // terminalState === 'reviewed') and were never synthesized, so the gate must not launder
   // them into the verdict set either.
-  const { findings, injections } = prepareGateFindings(healthy, packetHunks);
+  // A review in PARTS brings every part's findings here — the hunk budget follows the part count
+  // recorded in the chunk trail (one part ⇒ the budget this gate always had).
+  const chunkTrail = readTrailJson<{ chunks?: unknown[] }>(opts.baseDir, opts.runId, CHUNKS_TRAIL_FILE);
+  const partCount = Array.isArray(chunkTrail?.chunks) ? Math.max(1, chunkTrail.chunks.length) : 1;
+  const { findings, injections } = prepareGateFindings(healthy, packetHunks, gateHunkBudgetFor(partCount));
+  if (partCount > 1) log(`  · gate: ${partCount} parts — hunk budget ${gateHunkBudgetFor(partCount)} bytes`);
 
   // ONE reconcile config for the primary AND the shadow — property 3 of the shadow gate: a
   // verdict difference must be judge vs judge, never a reconcile-input drift.

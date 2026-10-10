@@ -3112,14 +3112,21 @@ function planChunks(files, ceilingBytes, maxChunks) {
   const cap3 = Math.max(1, Math.floor(maxChunks));
   const total = files.reduce((n, f) => n + f.bytes, 0);
   const finish = (parts2) => {
-    const chunks = parts2.slice(0, cap3).map((part, i) => ({
-      bytes: part.reduce((n, f) => n + f.bytes, 0),
-      diff: part.map((f) => f.raw).join(""),
-      files: part,
-      index: i + 1,
-      label: chunkLabel(part.map((f) => f.path)),
-      paths: part.map((f) => f.path)
-    }));
+    const labels = [];
+    const chunks = parts2.slice(0, cap3).map((part, i) => {
+      let label2 = chunkLabel(part.map((f) => f.path));
+      const dup = labels.filter((l) => l === label2 || l.startsWith(`${label2} (`)).length;
+      if (dup > 0) label2 = `${label2} (${dup + 1})`;
+      labels.push(label2);
+      return {
+        bytes: part.reduce((n, f) => n + f.bytes, 0),
+        diff: part.map((f) => f.raw).join(""),
+        files: part,
+        index: i + 1,
+        label: label2,
+        paths: part.map((f) => f.path)
+      };
+    });
     const overflow = parts2.slice(cap3).flat();
     return { ceilingBytes, chunks, overflow };
   };
@@ -3127,24 +3134,29 @@ function planChunks(files, ceilingBytes, maxChunks) {
   if (total <= ceilingBytes) return finish([sourceFirst(files)]);
   const areas = groupByArea(files, ceilingBytes, 1).map(sourceFirst);
   const parts = [];
-  let cur = [];
-  let curBytes = 0;
-  const close = () => {
-    if (cur.length > 0) parts.push(cur);
-    cur = [];
-    curBytes = 0;
-  };
   for (const area of areas) {
     const areaBytes = area.reduce((n, f) => n + f.bytes, 0);
-    if (cur.length > 0 && curBytes + areaBytes > ceilingBytes && areaBytes <= ceilingBytes) close();
+    if (areaBytes <= ceilingBytes) {
+      const home = parts.find((p) => p.bytes + areaBytes <= ceilingBytes);
+      if (home) {
+        home.files.push(...area);
+        home.bytes += areaBytes;
+      } else {
+        parts.push({ bytes: areaBytes, files: [...area] });
+      }
+      continue;
+    }
     for (const f of area) {
-      if (cur.length > 0 && curBytes + f.bytes > ceilingBytes) close();
-      cur.push(f);
-      curBytes += f.bytes;
+      const last = parts[parts.length - 1];
+      if (last && last.bytes + f.bytes <= ceilingBytes) {
+        last.files.push(f);
+        last.bytes += f.bytes;
+      } else {
+        parts.push({ bytes: f.bytes, files: [f] });
+      }
     }
   }
-  close();
-  return finish(parts);
+  return finish(parts.map((p) => p.files));
 }
 function fileLine(f) {
   return `${f.path} (+${f.added}/-${f.removed})`;
@@ -3321,12 +3333,21 @@ function classifyFileKind(path21, isBinary, section2 = "", firstLine2) {
 }
 function worktreeFirstLineReader(dir) {
   const root = nodePath.resolve(dir);
+  let realRoot;
+  try {
+    realRoot = fs13.realpathSync(root);
+  } catch {
+    return () => null;
+  }
   return (p) => {
     const full = nodePath.resolve(root, p);
     if (full !== root && !full.startsWith(root + nodePath.sep)) return null;
     let fd = null;
     try {
-      fd = fs13.openSync(full, "r");
+      const real = fs13.realpathSync(full);
+      if (real !== realRoot && !real.startsWith(realRoot + nodePath.sep)) return null;
+      fd = fs13.openSync(full, fs13.constants.O_RDONLY | fs13.constants.O_NOFOLLOW);
+      if (!fs13.fstatSync(fd).isFile()) return null;
       const buf = Buffer.alloc(512);
       const n = fs13.readSync(fd, buf, 0, 512, 0);
       const text = buf.subarray(0, n).toString("utf8");
@@ -3365,9 +3386,11 @@ function pathOfSection(section2) {
 function parseDiffFiles(raw, opts = {}) {
   if (!raw.trim()) return [];
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
-  return parts.map((section2) => {
+  return parts.map((part) => {
+    let section2 = part;
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
     const path21 = pathOfSection(section2);
+    if (!section2.endsWith("\n")) section2 += "\n";
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
@@ -5780,6 +5803,7 @@ async function runReviewMode(opts) {
   const objective = opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE);
   const scoped = partCount > 1 || acquired.plan.overflow.length > 0;
   const scopeInput = { coverage: acquired.coverage, plan: acquired.plan };
+  const boundedScope = (text) => section("scope", "scope", text, PACKET_BUDGETS.scope).body;
   const packets = (partCount > 0 ? acquired.plan.chunks : [null]).map(
     (chunk) => assembleCodePacket({
       agentsBudget: conventionManifest?.capBytes,
@@ -5817,7 +5841,7 @@ async function runReviewMode(opts) {
       index: chunk?.index ?? 1,
       label: chunk?.label ?? "(the change)",
       prompt: prompts[i],
-      ...chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index) } : {}
+      ...chunk && scoped ? { scope: boundedScope(renderChangeScope(scopeInput, chunk.index)) } : {}
     };
   });
   const pinnedDiff = parts.map((p) => p.diff).join("");
@@ -5830,17 +5854,18 @@ async function runReviewMode(opts) {
   } catch {
   }
   let lensHandoff;
-  if (partCount > 1) {
+  if (scoped && partCount > 0) {
     const shown = [];
     let bytes = 0;
     for (const p of parts) {
-      if (shown.length > 0 && bytes + p.diff.length > ceilingBytes) break;
+      const partBytes = Buffer.byteLength(p.diff, "utf8");
+      if (shown.length > 0 && bytes + partBytes > ceilingBytes) break;
       shown.push(p.index);
-      bytes += p.diff.length;
+      bytes += partBytes;
     }
     lensHandoff = {
       diff: parts.filter((p) => shown.includes(p.index)).map((p) => p.diff).join(""),
-      scope: renderLensScope(scopeInput, shown)
+      scope: boundedScope(renderLensScope(scopeInput, shown))
     };
   }
   log(

@@ -9,7 +9,11 @@ import type { ResolvedVoiceConfig } from '../brainstorm/types';
 
 import type { EvidenceClass } from './evidence';
 import { EVIDENCE_MANIFEST_FILE } from './evidence-manifest';
+import { type ChunkSeatRun, mergeChunkSeatRuns } from './chunk-merge';
+import { CHUNKS_TRAIL_FILE, type ChunksTrail, renderCoverageOverview } from './chunks';
+import { verdictCounts } from './gate';
 import { readGatePacketHeadSha } from './gate-hunks';
+import { readTrailJson } from './trail-io';
 import {
   readConventionPathsFromTrail,
   type RegateOptions,
@@ -157,8 +161,20 @@ export function splitWorktreePrompt(prompt: string): SplitPrompt {
 
 export interface SeatArtifacts {
   packet: ReviewPacket;
+  // The seat's PART artifacts when the run reviewed the change in parts (chunks.ts): each part's
+  // own pinned packet + prompt, under `.c<k>`. A multi-part seat is retried PART BY PART and
+  // re-merged — retrying only `packet.<seat>.json` (part 1's) would rewrite the merged review of
+  // record with one part's review and silently drop the rest.
+  parts?: SeatPartArtifacts[];
   prompt: string;
   stored: StoredReview;
+}
+
+export interface SeatPartArtifacts {
+  index: number;
+  label: string;
+  packet: ReviewPacket;
+  prompt: string;
 }
 
 // Is this parsed JSON actually a packet? `JSON.parse` succeeding proves only that the bytes were
@@ -202,6 +218,31 @@ export function readSeatArtifacts(
   } catch {
     return { error: `run ${runId} has no readable prompt.${seat}.md` };
   }
+  // A run in PARTS recorded them in chunks.json; every part's packet + prompt must be on disk, or
+  // the retry cannot re-send what the dead attempt saw.
+  const trail = readTrailJson<ChunksTrail>(baseDir, runId, CHUNKS_TRAIL_FILE);
+  if (trail && Array.isArray(trail.chunks) && trail.chunks.length > 1) {
+    const parts: SeatPartArtifacts[] = [];
+    for (const c of trail.chunks) {
+      let partPacket: unknown;
+      try {
+        partPacket = JSON.parse(fs.readFileSync(path.join(dir, `packet.${seat}.c${c.index}.json`), 'utf8'));
+      } catch {
+        return { error: `run ${runId} reviewed in ${trail.chunks.length} parts but has no readable packet.${seat}.c${c.index}.json` };
+      }
+      if (!isReviewPacketShape(partPacket)) {
+        return { error: `run ${runId} has an unreadable packet.${seat}.c${c.index}.json (unexpected shape)` };
+      }
+      let partPrompt: string;
+      try {
+        partPrompt = fs.readFileSync(path.join(dir, `prompt.${seat}.c${c.index}.md`), 'utf8');
+      } catch {
+        return { error: `run ${runId} reviewed in ${trail.chunks.length} parts but has no readable prompt.${seat}.c${c.index}.md` };
+      }
+      parts.push({ index: c.index, label: c.label, packet: partPacket, prompt: partPrompt });
+    }
+    return { packet, parts, prompt, stored };
+  }
   return { packet, prompt, stored };
 }
 
@@ -211,6 +252,8 @@ export function readSeatArtifacts(
 export interface ReseatReady {
   art: SeatArtifacts;
   headSha: string;
+  // Each part's prompt split, in part order, when the seat's artifacts are in parts.
+  partSplits?: SplitPrompt[];
   split: SplitPrompt;
 }
 
@@ -286,7 +329,32 @@ export function checkReseat(
       refusal: `seat ${seat} completed in run ${runId} — nothing to retry (re-running a healthy seat is a new review)`,
     };
   }
-  return { art, headSha, split };
+  // The same two prompt checks for every PART's prompt: a part whose packet boundary cannot be
+  // found, or that was pinned at another head, refuses the whole retry before anything is billed.
+  let partSplits: SplitPrompt[] | undefined;
+  if (art.parts) {
+    partSplits = [];
+    for (const part of art.parts) {
+      const ps = splitWorktreePrompt(part.prompt);
+      if (ps.unverifiedTail && !ps.recoveredHeader) {
+        return {
+          refusal: `seat ${seat}'s persisted prompt for part ${part.index} carries a worktree preamble whose header this engine cannot read — refusing to guess where the packet ends; re-run the review instead`,
+        };
+      }
+      if (ps.preambleHeadSha && ps.preambleHeadSha !== headSha) {
+        return {
+          refusal: `seat ${seat}'s persisted prompt for part ${part.index} was pinned at ${ps.preambleHeadSha.slice(0, 12)} but the run's gate packet is at ${headSha.slice(0, 12)} — refusing to retry across heads`,
+        };
+      }
+      if (!part.packet.complete) {
+        return {
+          refusal: `run ${runId}'s pinned packet for part ${part.index} was incomplete (no usable diff) — nothing a retry could review; re-run the review`,
+        };
+      }
+      partSplits.push(ps);
+    }
+  }
+  return { art, headSha, ...(partSplits ? { partSplits } : {}), split };
 }
 
 // Why this run may NOT be reseated, in the exact words the caller should print — or null when it may.
@@ -549,24 +617,96 @@ async function reseatUnderLock(opts: ReseatOptions, pre: ReseatReady): Promise<R
     );
   }
 
-  const seatRun = await runCoreSeat({
-    adapter: opts.adapter,
-    log,
-    out: baseDir,
-    packet: art.packet,
-    packetComplete: art.packet.complete,
-    packetPrompt: split.packetPrompt,
-    qualification: opts.qualification,
-    retryOnPacket: RETRIES_ON_PACKET[seat],
-    reviewer: opts.reviewer,
-    runId,
-    // The worktree rides through even when the seat does NOT qualify: runCoreSeat's packet branch
-    // is what turns "asked for a worktree, could not have one" into the loud `fallbackReason` a
-    // full run records. Without `worktreePrompt` it stays a packet run — the seat is never told
-    // about a tree it did not get.
-    ...(wt ? { worktree: wt.dir } : {}),
-    ...(worktreePrompt ? { worktreePrompt } : {}),
-  });
+  // ONE part (the common case), or EVERY part of a seat that reviewed the change in parts: the
+  // parts run one after another exactly as the fan-out ran them, each against its own pinned
+  // packet, and merge into the review of record under chunk-merge's rules. Re-running only part 1
+  // would rewrite the merged review with a fraction of the change and call it healed.
+  const runOnePart = (
+    packet: ReviewPacket,
+    packetPrompt: string,
+    partWorktreePrompt: string | undefined,
+    artifactSuffix?: string
+  ) =>
+    runCoreSeat({
+      adapter: opts.adapter,
+      ...(artifactSuffix ? { artifactSuffix } : {}),
+      log,
+      out: baseDir,
+      packet,
+      packetComplete: packet.complete,
+      packetPrompt,
+      qualification: opts.qualification,
+      retryOnPacket: RETRIES_ON_PACKET[seat],
+      reviewer: opts.reviewer,
+      runId,
+      // The worktree rides through even when the seat does NOT qualify: runCoreSeat's packet branch
+      // is what turns "asked for a worktree, could not have one" into the loud `fallbackReason` a
+      // full run records. Without `worktreePrompt` it stays a packet run — the seat is never told
+      // about a tree it did not get.
+      ...(wt ? { worktree: wt.dir } : {}),
+      ...(partWorktreePrompt ? { worktreePrompt: partWorktreePrompt } : {}),
+    });
+  let seatRun: Awaited<ReturnType<typeof runCoreSeat>>;
+  // The parts the retry actually ran (the rest were reused from disk) — for the trail record.
+  const partsRerun = new Set<number>();
+  if (art.parts && pre.partSplits) {
+    const n = art.parts.length;
+    const runs: ChunkSeatRun[] = [];
+    // A part that completed in the dead attempt is REUSED, not re-billed: its own review is on
+    // disk under `.c<k>`, and its evidence class is the one the run's manifest recorded for this
+    // seat (the parts of one seat ran under one qualification).
+    const manifestRealized = ((): EvidenceClass => {
+      try {
+        const m = JSON.parse(fs.readFileSync(path.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE), 'utf8')) as {
+          realizedEvidence?: Record<string, string>;
+        };
+        return m.realizedEvidence?.[seat] === 'worktree' ? 'worktree' : 'packet';
+      } catch {
+        return 'packet';
+      }
+    })();
+    for (let i = 0; i < n; i++) {
+      const part = art.parts[i];
+      const ps = pre.partSplits[i];
+      const surviving = readPartReview(baseDir, runId, seat, part.index);
+      if (surviving && surviving.terminalState === 'reviewed') {
+        log(`reseat: ${seat} part ${part.index}/${n} — ${part.label}: completed in the dead attempt, reused (${surviving.findings.length} finding(s))`);
+        runs.push({
+          index: part.index,
+          label: part.label,
+          seat: { egressDenials: [], fallbackReason: null, realized: manifestRealized, review: surviving },
+        });
+        continue;
+      }
+      partsRerun.add(part.index);
+      log(`reseat: ${seat} part ${part.index}/${n} — ${part.label}…`);
+      const partWorktreePrompt =
+        wt && qualified
+          ? ps.packetPrompt +
+            worktreePromptSuffix({ baseSha: wt.baseSha ?? ps.baseSha, headSha: wt.headSha, worktree: wt.dir })
+          : undefined;
+      const r = await runOnePart(part.packet, ps.packetPrompt, partWorktreePrompt, `c${part.index}`);
+      log(
+        `reseat: ${seat} part ${part.index}/${n} ${r.review.terminalState} — ${r.review.findings.length} finding(s)${
+          r.review.terminalState === 'reviewed' ? '' : ` — ${scrubControl(r.review.summary).slice(0, 160)}`
+        }`
+      );
+      runs.push({ index: part.index, label: part.label, seat: r });
+    }
+    seatRun = mergeChunkSeatRuns({
+      out: baseDir,
+      packet: art.packet,
+      prompt: split.packetPrompt,
+      reviewer: opts.reviewer,
+      runId,
+      runs,
+    });
+    // The chunk trail records THIS seat's per-part outcome as it now stands — reused parts and
+    // re-run parts alike — so chunks.json and the overview never keep saying a healed part failed.
+    recordHealedParts(baseDir, runId, seat, runs, log);
+  } else {
+    seatRun = await runOnePart(art.packet, split.packetPrompt, worktreePrompt);
+  }
   const review = seatRun.review;
   // A worktree the caller supplied with NO qualification never reaches seat-run's own fallback
   // wording (it has no reason to report), so the run would otherwise look exactly like one that was
@@ -712,6 +852,7 @@ async function reseatUnderLock(opts: ReseatOptions, pre: ReseatReady): Promise<R
     runId,
     ...(wt ? { worktree: wt.dir } : {}),
   });
+  if (art.parts) rerenderOverview(baseDir, runId, headSha, gate.ok ? verdictCounts(gate.verdicts) : undefined, log);
   return {
     egressDenials: seatRun.egressDenials,
     evidenceDowngraded,
@@ -722,4 +863,51 @@ async function reseatUnderLock(opts: ReseatOptions, pre: ReseatReady): Promise<R
     review,
     stampWritten,
   };
+}
+
+// One part's own review of record (`review.<seat>.c<k>.json`), shape-guarded like readReview.
+function readPartReview(baseDir: string, runId: string, seat: CoreReviewerId, index: number): StoredReview | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(reviewDir(baseDir, runId), `review.${seat}.c${index}.json`), 'utf8')) as unknown;
+    if (typeof raw !== 'object' || raw === null) return null;
+    const r = raw as Record<string, unknown>;
+    if (!Array.isArray(r.findings) || typeof r.terminalState !== 'string' || typeof r.summary !== 'string') return null;
+    return raw as StoredReview;
+  } catch {
+    return null;
+  }
+}
+
+// Fold this seat's per-part outcome into chunks.json. Best-effort like every trail write.
+function recordHealedParts(baseDir: string, runId: string, seat: CoreReviewerId, runs: readonly ChunkSeatRun[], log: (m: string) => void): void {
+  try {
+    const trail = readTrailJson<ChunksTrail>(baseDir, runId, CHUNKS_TRAIL_FILE);
+    if (!trail || !Array.isArray(trail.chunks)) return;
+    for (const r of runs) {
+      const c = trail.chunks.find((x) => x.index === r.index);
+      if (!c) continue;
+      const rv = r.seat.review;
+      c.seats[seat] = {
+        ...(rv.diagnostics ? { elapsedMs: rv.diagnostics.elapsedMs } : {}),
+        findings: rv.findings.length,
+        state: rv.terminalState === 'reviewed' ? 'reviewed' : 'failed-reviewer',
+        ...(rv.terminalState === 'reviewed' ? {} : { why: scrubControl(rv.summary).slice(0, 160) }),
+      };
+    }
+    writeTrailFile(baseDir, runId, CHUNKS_TRAIL_FILE, JSON.stringify(trail, null, 2));
+  } catch (e) {
+    log(`reseat: ${CHUNKS_TRAIL_FILE} could not be updated (${(e as Error).message})`);
+  }
+}
+
+// Re-render coverage-overview.md from the (now updated) chunk trail with the regate's counts.
+function rerenderOverview(baseDir: string, runId: string, headSha: string, gateCounts: Record<string, number> | undefined, log: (m: string) => void): void {
+  try {
+    const trail = readTrailJson<ChunksTrail>(baseDir, runId, CHUNKS_TRAIL_FILE);
+    if (!trail || !Array.isArray(trail.chunks)) return;
+    const totalFiles = trail.chunks.reduce((n, c) => n + c.files.length, 0) + trail.omitted.length;
+    writeTrailFile(baseDir, runId, 'coverage-overview.md', renderCoverageOverview(trail, { ...(gateCounts ? { gateCounts } : {}), headSha, totalFiles }));
+  } catch (e) {
+    log(`reseat: coverage-overview.md could not be re-rendered (${(e as Error).message})`);
+  }
 }

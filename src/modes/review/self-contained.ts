@@ -380,6 +380,9 @@ export interface ClaudeLayerOptions {
 export interface ClaudeLayerResult {
   // The cold Opus review (null when claude is not in the roster).
   claudeReview: VoiceReview | null;
+  // The producer's outcome PER PART on a review in parts (chunks.ts) — what the chunk trail and
+  // the coverage overview record for the claude seat on each part. Absent on a single-part review.
+  claudeParts?: { findings: number; index: number; ok: boolean; summary: string }[];
   // Whether the claude PRODUCER seat actually spawned (see GateRunResult.gateSpawned, which this
   // mirrors). Its REALIZED evidence is derived from this: a producer whose spawn threw — claude is
   // not installed, or the capability fence refused an unfenceable read root — read NOTHING, and must
@@ -491,6 +494,7 @@ export async function runClaudeReviewLayer(
 
   let claudeReview: VoiceReview | null = null;
   let claudeSpawned = false;
+  let claudeParts: ClaudeLayerResult['claudeParts'];
   if (opts.includeClaudeReviewer && parts.length === 1) {
     log(
       opts.worktree
@@ -549,6 +553,7 @@ export async function runClaudeReviewLayer(
       }
     }
     claudeSpawned = partReviews.some((p) => p.spawned);
+    claudeParts = partReviews.map((p) => ({ findings: p.review.findings.length, index: p.part.index, ok: p.review.ok, summary: p.review.summary }));
     const failed = partReviews.filter((p) => !p.review.ok);
     const findings: ReviewFinding[] = [];
     for (const p of partReviews) {
@@ -752,6 +757,7 @@ export async function runClaudeReviewLayer(
   }
 
   return {
+    ...(claudeParts ? { claudeParts } : {}),
     claudeReview,
     claudeSpawned,
     gateSpawned: gate.gateSpawned,
