@@ -256,11 +256,14 @@ export async function runReviewMode(
   const depSurface =
     profile === 'security' ? scanDependencySurface(acquired.files) : undefined;
 
-  // Secret-scan the FULL canonical diff (the change identity), not just the
-  // covered subset — the payload + the manifest must reflect the whole change.
+  // Secret-scan the FULL canonical diff (the change identity) so the manifest
+  // reflects the whole change — but only a hit in a COVERED file can block: an
+  // omitted file's bytes never reach a vendor (the packet carries acquired.diff,
+  // the covered subset; the raw diff feeds the digest only).
   // (acquireDiff already parsed these files for coverage — reuse, don't re-parse.)
   const secretScan = scanDiffForSecrets(acquired.files, {
     allowSensitive: opts.allowSensitive,
+    coveredPaths: new Set(acquired.coverage.files.filter((f) => f.included).map((f) => f.path)),
   });
   if (secretScan.blocked) {
     const paths = [
@@ -277,6 +280,9 @@ export async function runReviewMode(
       reviews: [],
       secretScan,
     };
+  }
+  for (const s of secretScan.inlineSecretsOmitted) {
+    log(`secret-scan: ${s.path} (${s.label}) — in an OMITTED file, not transmitted; not blocking`);
   }
 
   // Gather the repo's convention web (root + touched packages + the linked/swept md)

@@ -129,6 +129,42 @@ index 111..222 100644
   });
 });
 
+describe('scanDiffForSecrets — the coverage cut bounds the inline block', () => {
+  // Run 2026-10-10-14-18-10-a3163f6e: a gitleaks self-test with a planted AKIA… was
+  // omitted (over-limit) and still vetoed the whole review.
+  const selftest = 'backend/scripts/gitleaks-selftest.sh';
+  const twoFiles =
+    diffFor('src/a.ts', ['const a = 1;']) +
+    diffFor(selftest, ['aws_access_key=AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE']);
+
+  it('an inline hit in an OMITTED file is named, not blocking', () => {
+    const r = scanDiffForSecrets(parseDiffFiles(twoFiles), { coveredPaths: new Set(['src/a.ts']) });
+    expect(r.blocked).toBe(false);
+    expect(r.inlineSecrets).toHaveLength(0);
+    expect(r.inlineSecretsOmitted).toEqual([{ label: 'aws-access-key', path: selftest }]);
+  });
+
+  it('the same hit in a COVERED file still blocks', () => {
+    const r = scanDiffForSecrets(parseDiffFiles(twoFiles), { coveredPaths: new Set(['src/a.ts', selftest]) });
+    expect(r.blocked).toBe(true);
+    expect(r.inlineSecrets).toEqual([{ label: 'aws-access-key', path: selftest }]);
+    expect(r.inlineSecretsOmitted).toHaveLength(0);
+  });
+
+  it('without a cut, every file counts as transmitted (unchanged default)', () => {
+    const r = scanDiffForSecrets(parseDiffFiles(twoFiles));
+    expect(r.blocked).toBe(true);
+    expect(r.inlineSecretsOmitted).toHaveLength(0);
+  });
+
+  it('the PATH rule ignores the cut — an omitted .env still blocks', () => {
+    const files = parseDiffFiles(diffFor('.env', ['API_KEY=abc']) + CLEAN);
+    const r = scanDiffForSecrets(files, { coveredPaths: new Set(['src/a.ts']) });
+    expect(r.blocked).toBe(true);
+    expect(r.sensitivePaths.map((p) => p.label)).toContain('dotenv');
+  });
+});
+
 describe('scanDiffForSecrets — clean diff', () => {
   it('does not block ordinary code', () => {
     const r = scanDiffForSecrets(parseDiffFiles(CLEAN));

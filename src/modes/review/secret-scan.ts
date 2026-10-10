@@ -95,9 +95,13 @@ export interface InlineSecretHit {
 
 export interface SecretScanResult {
   // Whether the review should be blocked. true when any sensitive path or inline
-  // secret is present AND the caller did not pass allowSensitive.
+  // secret is present in a TRANSMITTED file AND the caller did not pass allowSensitive.
   blocked: boolean;
   inlineSecrets: InlineSecretHit[];
+  // Inline hits in files the coverage cut already OMITTED from the payload (binary,
+  // generated, over-limit). Nothing of them reaches a vendor, so they never block —
+  // but they are still NAMED here so the manifest reflects the whole change.
+  inlineSecretsOmitted: InlineSecretHit[];
   // The caller's explicit acknowledgement (recorded for the manifest).
   overridden: boolean;
   sensitivePaths: SensitivePathHit[];
@@ -120,21 +124,34 @@ function payloadLines(section: string): string[] {
 }
 
 // Scan the parsed file diffs for sensitive paths + inline secrets. PURE.
+//
+// The PATH rule runs over EVERY file: a `.env` / `.pem` staged in the change is a
+// signal about the change itself, whether or not its bytes ship. The INLINE scan
+// is a leak check on the PAYLOAD, so with `coveredPaths` given it blocks only on
+// files the coverage cut actually transmits; a hit in an omitted file is recorded
+// under `inlineSecretsOmitted` instead. Born of run 2026-10-10-14-18-10-a3163f6e:
+// a 411-file PR touched the repo's gitleaks SELF-TEST (planted fake `AKIA…`), the
+// cut had already omitted that file as over-limit, and the review still died on
+// it — a veto over bytes no vendor was ever going to see. Without `coveredPaths`
+// (no cut known) every file counts as transmitted, as before.
 export function scanDiffForSecrets(
   files: FileDiff[],
-  opts: { allowSensitive?: boolean } = {}
+  opts: { allowSensitive?: boolean; coveredPaths?: ReadonlySet<string> } = {}
 ): SecretScanResult {
   const sensitivePaths: SensitivePathHit[] = [];
   const inlineSecrets: InlineSecretHit[] = [];
+  const inlineSecretsOmitted: InlineSecretHit[] = [];
   for (const f of files) {
     for (const { label, re } of SENSITIVE_PATH_PATTERNS) {
       if (label === 'dotenv' && DOTENV_TEMPLATE_RE.test(f.path)) continue;
       if (re.test(f.path)) sensitivePaths.push({ label, path: f.path });
     }
     if (f.isBinary) continue;
+    const transmitted = opts.coveredPaths ? opts.coveredPaths.has(f.path) : true;
     const lines = payloadLines(f.raw);
     for (const { label, re } of INLINE_SECRET_PATTERNS) {
-      if (lines.some((line) => re.test(line))) inlineSecrets.push({ label, path: f.path });
+      if (!lines.some((line) => re.test(line))) continue;
+      (transmitted ? inlineSecrets : inlineSecretsOmitted).push({ label, path: f.path });
     }
   }
   const hasRisk = sensitivePaths.length > 0 || inlineSecrets.length > 0;
@@ -142,6 +159,7 @@ export function scanDiffForSecrets(
   return {
     blocked: hasRisk && !overridden,
     inlineSecrets,
+    inlineSecretsOmitted,
     overridden,
     sensitivePaths,
   };

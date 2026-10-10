@@ -864,10 +864,14 @@ function printSummary(result: ReviewModeResult, profile: ReviewProfile): void {
     out.push(...renderConventionManifest(result.conventionManifest));
   }
   const ss = result.secretScan;
-  if (ss.sensitivePaths.length || ss.inlineSecrets.length) {
+  if (ss.sensitivePaths.length || ss.inlineSecrets.length || ss.inlineSecretsOmitted.length) {
+    const omitted = ss.inlineSecretsOmitted.length
+      ? ` · ${ss.inlineSecretsOmitted.length} inline in omitted file(s), not transmitted`
+      : '';
     out.push(
-      `  secrets: ${ss.sensitivePaths.length} sensitive path(s), ${ss.inlineSecrets.length} inline${ss.overridden ? ' (overridden)' : ''}`
+      `  secrets: ${ss.sensitivePaths.length} sensitive path(s), ${ss.inlineSecrets.length} inline${ss.overridden ? ' (overridden)' : ''}${omitted}`
     );
+    for (const s of ss.inlineSecretsOmitted) out.push(`             omitted-file hit: ${s.path} (${s.label})`);
   }
   if (result.depSurface) out.push(...depSurfaceBlock(result.depSurface));
   if (result.blocked) {

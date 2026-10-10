@@ -267,15 +267,18 @@ function payloadLines(section2) {
 function scanDiffForSecrets(files, opts = {}) {
   const sensitivePaths = [];
   const inlineSecrets = [];
+  const inlineSecretsOmitted = [];
   for (const f of files) {
     for (const { label: label2, re } of SENSITIVE_PATH_PATTERNS) {
       if (label2 === "dotenv" && DOTENV_TEMPLATE_RE.test(f.path)) continue;
       if (re.test(f.path)) sensitivePaths.push({ label: label2, path: f.path });
     }
     if (f.isBinary) continue;
+    const transmitted = opts.coveredPaths ? opts.coveredPaths.has(f.path) : true;
     const lines = payloadLines(f.raw);
     for (const { label: label2, re } of INLINE_SECRET_PATTERNS) {
-      if (lines.some((line) => re.test(line))) inlineSecrets.push({ label: label2, path: f.path });
+      if (!lines.some((line) => re.test(line))) continue;
+      (transmitted ? inlineSecrets : inlineSecretsOmitted).push({ label: label2, path: f.path });
     }
   }
   const hasRisk = sensitivePaths.length > 0 || inlineSecrets.length > 0;
@@ -283,6 +286,7 @@ function scanDiffForSecrets(files, opts = {}) {
   return {
     blocked: hasRisk && !overridden,
     inlineSecrets,
+    inlineSecretsOmitted,
     overridden,
     sensitivePaths
   };
@@ -5246,7 +5250,8 @@ async function runReviewMode(opts) {
   );
   const depSurface = profile === "security" ? scanDependencySurface(acquired.files) : void 0;
   const secretScan = scanDiffForSecrets(acquired.files, {
-    allowSensitive: opts.allowSensitive
+    allowSensitive: opts.allowSensitive,
+    coveredPaths: new Set(acquired.coverage.files.filter((f) => f.included).map((f) => f.path))
   });
   if (secretScan.blocked) {
     const paths = [
@@ -5263,6 +5268,9 @@ async function runReviewMode(opts) {
       reviews: [],
       secretScan
     };
+  }
+  for (const s of secretScan.inlineSecretsOmitted) {
+    log(`secret-scan: ${s.path} (${s.label}) \u2014 in an OMITTED file, not transmitted; not blocking`);
   }
   let agentsMd = opts.agentsMd;
   let conventionManifest;

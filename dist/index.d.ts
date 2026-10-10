@@ -931,11 +931,13 @@ interface InlineSecretHit {
 interface SecretScanResult {
     blocked: boolean;
     inlineSecrets: InlineSecretHit[];
+    inlineSecretsOmitted: InlineSecretHit[];
     overridden: boolean;
     sensitivePaths: SensitivePathHit[];
 }
 declare function scanDiffForSecrets(files: FileDiff[], opts?: {
     allowSensitive?: boolean;
+    coveredPaths?: ReadonlySet<string>;
 }): SecretScanResult;
 
 interface WorktreeEvidence {

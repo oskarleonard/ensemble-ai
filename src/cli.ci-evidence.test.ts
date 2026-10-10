@@ -63,6 +63,7 @@ const engineResult = (): ReviewModeResult =>
     secretScan: {
       blocked: false,
       inlineSecrets: [],
+      inlineSecretsOmitted: [],
       overridden: false,
       sensitivePaths: [],
     },
