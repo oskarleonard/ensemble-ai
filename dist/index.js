@@ -3207,7 +3207,7 @@ function planChunks(files, ceilingBytes, maxChunks) {
 function fileLine(f) {
   return `${f.path} (+${f.added}/-${f.removed})`;
 }
-function renderChangeScope(input, chunkIndex) {
+function renderChangeScope(input, chunkIndex, seams) {
   const { coverage, plan } = input;
   const byPath = new Map(coverage.files.map((f) => [f.path, f]));
   const part = plan.chunks.find((c) => c.index === chunkIndex);
@@ -3244,6 +3244,10 @@ function renderChangeScope(input, chunkIndex) {
     for (const f of omitted) {
       lines.push(`  ${fileLine(f)} \u2014 ${f.omitReason ?? "omitted"}/${f.kind}`);
     }
+  }
+  if (seams) {
+    lines.push("");
+    lines.push(seams);
   }
   return lines.join("\n");
 }
@@ -4800,7 +4804,13 @@ network: there is no Bash tool, so do not try to run \`git\` or any command.
 
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: "search and read it", worktree: args.worktree })}
 
-${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...args.scope ? { scope: args.scope } : {} })}
+${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...args.scope ? { scope: args.scope } : {} })}${args.skeleton ? `
+
+## The whole change as a skeleton
+
+Every changed file with the declarations its hunks add (+) and remove (\u2212), at the PR head \u2014 including the parts whose hunks are not materialized above. Open a file for anything below signature level.
+
+${args.skeleton}` : ""}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${args.conventionsPath ? conventionsFileClause(args.conventionsPath) : ""}${history}
 
@@ -4854,6 +4864,7 @@ async function runHolisticLens(opts) {
     history: hasHistory,
     ...opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {},
     ...opts.scope ? { scope: opts.scope } : {},
+    ...opts.skeleton ? { skeleton: opts.skeleton } : {},
     worktree: opts.worktree
   });
   const fail = (summary) => ({
@@ -5706,6 +5717,197 @@ var RETRIES_ON_PACKET = {
   grok: false
 };
 
+// src/modes/review/skeleton.ts
+var DECL_PATTERNS = [
+  /^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*[([]/,
+  // go: func Name( / func (r *T) Name( / generic
+  /^\s*type\s+([A-Z][A-Za-z0-9_]*)\s+(?:struct|interface|func|=|[A-Za-z\[])/,
+  // go: type Name struct|interface|…
+  /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*[(<]/,
+  // ts/js
+  /^\s*export\s+(?:const|let|var|class|interface|type|enum|abstract\s+class)\s+([A-Za-z_$][A-Za-z0-9_$]*)/,
+  // ts/js exports
+  /^\s*(?:abstract\s+)?class\s+([A-Z][A-Za-z0-9_$]*)/,
+  // class Name (ts/js/py/kt/swift/java)
+  /^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/,
+  // python
+  /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)/,
+  // rust
+  /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait)\s+([A-Z][A-Za-z0-9_]*)/,
+  // rust types
+  /^\s*(?:(?:public|private|internal|protected|open|override|suspend|static|final)\s+)*fun\s+(?:<[^>]*>\s*)?(?:[A-Za-z_][A-Za-z0-9_.]*\.)?([A-Za-z_][A-Za-z0-9_]*)\s*\(/,
+  // kotlin
+  /^\s*(?:(?:public|private|internal|fileprivate|open|static|final|override)\s+)*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]/,
+  // swift
+  /^\s*(?:(?:public|private|protected|static|final|abstract|synchronized)\s+)+[A-Za-z_<>[\],.? ]+\s+([a-z][A-Za-z0-9_]*)\s*\(/
+  // java/kt methods with modifiers
+];
+var NOISE_NAMES = /* @__PURE__ */ new Set(["main", "init", "new", "New", "String", "Error", "Close", "Run", "run", "get", "set", "default", "index", "test", "Test"]);
+function declName(line) {
+  for (const re of DECL_PATTERNS) {
+    const m = re.exec(line);
+    if (m?.[1] && m[1].length >= 2 && !NOISE_NAMES.has(m[1])) return m[1];
+  }
+  return null;
+}
+var HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
+function walkSection(section2, on) {
+  const headers = [];
+  let newNo = null;
+  let oldNo = null;
+  let inHunk = false;
+  for (const raw of section2.split("\n")) {
+    const h = HUNK_RE.exec(raw);
+    if (h) {
+      headers.push(`@@ -${h[1]}${h[2] ? `,${h[2]}` : ""} +${h[3]}${h[4] ? `,${h[4]}` : ""} @@${h[5] ?? ""}`.trimEnd());
+      oldNo = Number(h[1]);
+      newNo = Number(h[3]);
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    if (raw.startsWith("+++") || raw.startsWith("---")) continue;
+    if (raw.startsWith("+")) {
+      on({ kind: "+", line: raw.slice(1), newNo, oldNo: null });
+      if (newNo !== null) newNo++;
+    } else if (raw.startsWith("-")) {
+      on({ kind: "-", line: raw.slice(1), newNo: null, oldNo });
+      if (oldNo !== null) oldNo++;
+    } else if (raw.startsWith(" ") || raw === "") {
+      on({ kind: " ", line: raw.slice(1), newNo, oldNo });
+      if (newNo !== null) newNo++;
+      if (oldNo !== null) oldNo++;
+    } else if (raw.startsWith("\\")) {
+    } else {
+      inHunk = false;
+    }
+  }
+  return headers;
+}
+function skeletonOf(f) {
+  const added = [];
+  const removed = [];
+  const hunks = walkSection(f.raw, ({ kind, line, newNo, oldNo }) => {
+    if (kind === " ") return;
+    const name2 = declName(line);
+    if (!name2) return;
+    const entry = { line: line.trim().slice(0, 160), lineNo: kind === "+" ? newNo : oldNo, name: name2 };
+    (kind === "+" ? added : removed).push(entry);
+  });
+  return { added, addedLines: f.added, hunks, path: f.path, removed, removedLines: f.removed };
+}
+var SKELETON_BUDGET_CHARS = 2e5;
+function renderSkeleton(files, coverage, plan) {
+  const partOf = /* @__PURE__ */ new Map();
+  for (const c of plan.chunks) for (const p of c.paths) partOf.set(p, c.index);
+  const entryOf = new Map(coverage.files.map((e) => [e.path, e]));
+  const out = [];
+  out.push(
+    `Whole-change skeleton: ${files.length} file(s), ${plan.chunks.length} part(s). Per file: part, hunk headers, declarations the hunks ADD (+) and REMOVE (\u2212) with their line numbers at the PR head. Read a file in the worktree for anything below signature level.`
+  );
+  let used = out[0].length;
+  let cut = 0;
+  for (const f of files) {
+    const sk = skeletonOf(f);
+    const e = entryOf.get(f.path);
+    const where = e && !e.included ? `omitted: ${e.omitReason ?? "omitted"}/${e.kind}` : `part ${partOf.get(f.path) ?? "?"}`;
+    const lines = [`### ${f.path} (+${f.added}/-${f.removed}) \u2014 ${where}`];
+    if (sk.hunks.length > 0) lines.push(`hunks: ${sk.hunks.slice(0, 12).join(" \xB7 ")}${sk.hunks.length > 12 ? ` \xB7 +${sk.hunks.length - 12} more` : ""}`);
+    for (const d of sk.added.slice(0, 24)) lines.push(`+ ${d.lineNo ?? "?"}: ${d.line}`);
+    if (sk.added.length > 24) lines.push(`+ \u2026 ${sk.added.length - 24} more added declarations`);
+    for (const d of sk.removed.slice(0, 12)) lines.push(`\u2212 ${d.lineNo ?? "?"}: ${d.line}`);
+    if (sk.removed.length > 12) lines.push(`\u2212 \u2026 ${sk.removed.length - 12} more removed declarations`);
+    const block = lines.join("\n");
+    if (used + block.length + 2 > SKELETON_BUDGET_CHARS) {
+      cut++;
+      continue;
+    }
+    out.push(block);
+    used += block.length + 2;
+  }
+  if (cut > 0) out.push(`\u2026 ${cut} file(s) not shown \u2014 the skeleton reached its ${SKELETON_BUDGET_CHARS.toLocaleString("en-US")}-char budget; their paths are in the change listing.`);
+  return out.join("\n\n");
+}
+var SEAMS_PER_PART_CHARS = 24e3;
+var HITS_PER_SYMBOL_FILE = 3;
+function referencesIn(f, symbol) {
+  const re = new RegExp(`(^|[^A-Za-z0-9_$])${symbol.replace(/[$]/g, "\\$")}(?![A-Za-z0-9_$])`);
+  const hits = [];
+  walkSection(f.raw, ({ kind, line, newNo }) => {
+    if (kind === "-") return;
+    if (hits.length >= HITS_PER_SYMBOL_FILE) return;
+    if (!re.test(line)) return;
+    if (declName(line) === symbol) return;
+    hits.push({ line: line.trim().slice(0, 140), lineNo: newNo, path: f.path });
+  });
+  return hits;
+}
+function computeSeams(plan) {
+  const declsByPart = /* @__PURE__ */ new Map();
+  for (const c of plan.chunks) {
+    const decls = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const f of c.files) {
+      for (const d of skeletonOf(f).added) {
+        if (seen.has(d.name)) continue;
+        seen.add(d.name);
+        decls.push({ name: d.name, path: f.path });
+      }
+    }
+    declsByPart.set(c.index, decls);
+  }
+  const notes = /* @__PURE__ */ new Map();
+  for (const c of plan.chunks) {
+    const lines = [];
+    let used = 0;
+    const push = (s) => {
+      if (used + s.length + 1 > SEAMS_PER_PART_CHARS) return false;
+      lines.push(s);
+      used += s.length + 1;
+      return true;
+    };
+    const mine = declsByPart.get(c.index) ?? [];
+    const outward = [];
+    for (const d of mine) {
+      for (const other of plan.chunks) {
+        if (other.index === c.index) continue;
+        for (const f of other.files) {
+          for (const h of referencesIn(f, d.name)) {
+            outward.push(`  ${d.name} (declared in ${d.path}) \u2190 part ${other.index} ${h.path}:${h.lineNo ?? "?"}  ${h.line}`);
+          }
+        }
+      }
+    }
+    const inward = [];
+    for (const other of plan.chunks) {
+      if (other.index === c.index) continue;
+      for (const d of declsByPart.get(other.index) ?? []) {
+        for (const f of c.files) {
+          for (const h of referencesIn(f, d.name)) {
+            inward.push(`  ${h.path}:${h.lineNo ?? "?"}  ${h.line}  \u2192 ${d.name} declared in part ${other.index} ${d.path}`);
+          }
+        }
+      }
+    }
+    if (outward.length === 0 && inward.length === 0) {
+      notes.set(c.index, "");
+      continue;
+    }
+    push(`Seams \u2014 where this part meets the other parts (from the hunks; read both sides at the PR head before judging either):`);
+    if (outward.length > 0) {
+      push(`Other parts use what THIS part declares:`);
+      for (const l of outward) if (!push(l)) break;
+    }
+    if (inward.length > 0) {
+      push(`THIS part uses what other parts declare:`);
+      for (const l of inward) if (!push(l)) break;
+    }
+    if (used >= SEAMS_PER_PART_CHARS - 200) push(`  \u2026 seam note truncated at ${SEAMS_PER_PART_CHARS.toLocaleString("en-US")} chars`);
+    notes.set(c.index, lines.join("\n"));
+  }
+  return notes;
+}
+
 // src/modes/review/gitleaks-allowlist.ts
 var CONFIG_MAX_BYTES = 256 * 1024;
 var PATTERN_MAX_CHARS = 512;
@@ -5852,6 +6054,7 @@ async function resolveGitleaksExemptions(reader, paths) {
 }
 
 // src/modes/review/index.ts
+var SKELETON_TRAIL_FILE = "skeleton.md";
 var CONVENTIONS_IN_TREE_DIR = ".ensemble-conventions";
 var CONVENTIONS_IN_TREE_FILE = "CONVENTIONS.md";
 var CONVENTIONS_INLINE_MAX = 32e3;
@@ -6002,6 +6205,16 @@ async function runReviewMode(opts) {
   const objective = opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE);
   const scoped = partCount > 1 || acquired.plan.overflow.length > 0;
   const scopeInput = { coverage: acquired.coverage, plan: acquired.plan };
+  const seams = partCount > 1 ? computeSeams(acquired.plan) : /* @__PURE__ */ new Map();
+  const skeleton = partCount > 1 ? renderSkeleton(acquired.files, acquired.coverage, acquired.plan) : void 0;
+  if (skeleton) {
+    try {
+      writeTrailFile(opts.out, opts.runId, SKELETON_TRAIL_FILE, skeleton);
+    } catch {
+    }
+    const seamParts = [...seams.values()].filter(Boolean).length;
+    log(`Skeleton: ${skeleton.length.toLocaleString("en-US")} chars for the whole change \xB7 seams noted for ${seamParts} of ${partCount} parts`);
+  }
   const boundedScope = (text) => section("scope", "scope", text, PACKET_BUDGETS.scope).body;
   const packets = (partCount > 0 ? acquired.plan.chunks : [null]).map(
     (chunk) => assembleCodePacket({
@@ -6018,7 +6231,7 @@ async function runReviewMode(opts) {
       objective,
       pr: 0,
       repo: acquired.repoId ?? "",
-      ...chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index) } : {}
+      ...chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index, seams.get(chunk.index) || void 0) } : {}
     })
   );
   const packet = packets[0];
@@ -6040,7 +6253,7 @@ async function runReviewMode(opts) {
       index: chunk?.index ?? 1,
       label: chunk?.label ?? "(the change)",
       prompt: prompts[i],
-      ...chunk && scoped ? { scope: boundedScope(renderChangeScope(scopeInput, chunk.index)) } : {}
+      ...chunk && scoped ? { scope: boundedScope(renderChangeScope(scopeInput, chunk.index, seams.get(chunk.index) || void 0)) } : {}
     };
   });
   const pinnedDiff = parts.map((p) => p.diff).join("");
@@ -6069,7 +6282,7 @@ async function runReviewMode(opts) {
   }
   if (opts.onPacketsReady) {
     try {
-      opts.onPacketsReady({ ...conventionsPath ? { conventionsPath } : {}, headSha: acquired.headSha, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt });
+      opts.onPacketsReady({ ...conventionsPath ? { conventionsPath } : {}, headSha: acquired.headSha, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, ...skeleton ? { skeleton } : {} });
     } catch (e) {
       log(`onPacketsReady hook failed (${e.message}) \u2014 the Anthropic stages will run after the core instead`);
     }
@@ -6231,10 +6444,10 @@ async function runReviewMode(opts) {
   if (built.ok && built.receipt) {
     const store = opts.receiptStore ?? defaultReceiptStore();
     log("Receipt qualified by the core \u2014 deferred to the full-roster gate.");
-    return { acquired, blocked: false, conventionManifest, ...conventionsPath ? { conventionsPath } : {}, depSurface, evidence, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, ...conventionsPath ? { conventionsPath } : {}, depSurface, evidence, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan, ...skeleton ? { skeleton } : {} };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, ...conventionsPath ? { conventionsPath } : {}, depSurface, evidence, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, ...conventionsPath ? { conventionsPath } : {}, depSurface, evidence, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan, ...skeleton ? { skeleton } : {} };
 }
 
 // src/modes/review/evidence-manifest.ts
@@ -8122,6 +8335,7 @@ export {
   SEVERITIES,
   SEVERITY_LABEL,
   SEVERITY_ORDER,
+  SKELETON_TRAIL_FILE,
   STAGE_MARKER,
   STRIPPED_INSTRUCTION_PATHS,
   SUGGESTION_HARD_CAP,

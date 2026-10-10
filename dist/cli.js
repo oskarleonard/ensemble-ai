@@ -4225,7 +4225,7 @@ function planChunks(files, ceilingBytes, maxChunks) {
 function fileLine(f) {
   return `${f.path} (+${f.added}/-${f.removed})`;
 }
-function renderChangeScope(input, chunkIndex) {
+function renderChangeScope(input, chunkIndex, seams) {
   const { coverage, plan } = input;
   const byPath2 = new Map(coverage.files.map((f) => [f.path, f]));
   const part = plan.chunks.find((c) => c.index === chunkIndex);
@@ -4262,6 +4262,10 @@ function renderChangeScope(input, chunkIndex) {
     for (const f of omitted) {
       lines.push(`  ${fileLine(f)} \u2014 ${f.omitReason ?? "omitted"}/${f.kind}`);
     }
+  }
+  if (seams) {
+    lines.push("");
+    lines.push(seams);
   }
   return lines.join("\n");
 }
@@ -7023,7 +7027,13 @@ network: there is no Bash tool, so do not try to run \`git\` or any command.
 
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: "search and read it", worktree: args.worktree })}
 
-${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...args.scope ? { scope: args.scope } : {} })}
+${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...args.scope ? { scope: args.scope } : {} })}${args.skeleton ? `
+
+## The whole change as a skeleton
+
+Every changed file with the declarations its hunks add (+) and remove (\u2212), at the PR head \u2014 including the parts whose hunks are not materialized above. Open a file for anything below signature level.
+
+${args.skeleton}` : ""}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${args.conventionsPath ? conventionsFileClause(args.conventionsPath) : ""}${history}
 
@@ -7077,6 +7087,7 @@ async function runHolisticLens(opts) {
     history: hasHistory,
     ...opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {},
     ...opts.scope ? { scope: opts.scope } : {},
+    ...opts.skeleton ? { skeleton: opts.skeleton } : {},
     worktree: opts.worktree
   });
   const fail = (summary) => ({
@@ -9277,6 +9288,197 @@ var RETRIES_ON_PACKET = {
   grok: false
 };
 
+// src/modes/review/skeleton.ts
+var DECL_PATTERNS = [
+  /^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*[([]/,
+  // go: func Name( / func (r *T) Name( / generic
+  /^\s*type\s+([A-Z][A-Za-z0-9_]*)\s+(?:struct|interface|func|=|[A-Za-z\[])/,
+  // go: type Name struct|interface|…
+  /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*[(<]/,
+  // ts/js
+  /^\s*export\s+(?:const|let|var|class|interface|type|enum|abstract\s+class)\s+([A-Za-z_$][A-Za-z0-9_$]*)/,
+  // ts/js exports
+  /^\s*(?:abstract\s+)?class\s+([A-Z][A-Za-z0-9_$]*)/,
+  // class Name (ts/js/py/kt/swift/java)
+  /^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/,
+  // python
+  /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)/,
+  // rust
+  /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait)\s+([A-Z][A-Za-z0-9_]*)/,
+  // rust types
+  /^\s*(?:(?:public|private|internal|protected|open|override|suspend|static|final)\s+)*fun\s+(?:<[^>]*>\s*)?(?:[A-Za-z_][A-Za-z0-9_.]*\.)?([A-Za-z_][A-Za-z0-9_]*)\s*\(/,
+  // kotlin
+  /^\s*(?:(?:public|private|internal|fileprivate|open|static|final|override)\s+)*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*[(<]/,
+  // swift
+  /^\s*(?:(?:public|private|protected|static|final|abstract|synchronized)\s+)+[A-Za-z_<>[\],.? ]+\s+([a-z][A-Za-z0-9_]*)\s*\(/
+  // java/kt methods with modifiers
+];
+var NOISE_NAMES = /* @__PURE__ */ new Set(["main", "init", "new", "New", "String", "Error", "Close", "Run", "run", "get", "set", "default", "index", "test", "Test"]);
+function declName(line) {
+  for (const re of DECL_PATTERNS) {
+    const m = re.exec(line);
+    if (m?.[1] && m[1].length >= 2 && !NOISE_NAMES.has(m[1])) return m[1];
+  }
+  return null;
+}
+var HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
+function walkSection(section2, on) {
+  const headers = [];
+  let newNo = null;
+  let oldNo = null;
+  let inHunk = false;
+  for (const raw of section2.split("\n")) {
+    const h = HUNK_RE.exec(raw);
+    if (h) {
+      headers.push(`@@ -${h[1]}${h[2] ? `,${h[2]}` : ""} +${h[3]}${h[4] ? `,${h[4]}` : ""} @@${h[5] ?? ""}`.trimEnd());
+      oldNo = Number(h[1]);
+      newNo = Number(h[3]);
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    if (raw.startsWith("+++") || raw.startsWith("---")) continue;
+    if (raw.startsWith("+")) {
+      on({ kind: "+", line: raw.slice(1), newNo, oldNo: null });
+      if (newNo !== null) newNo++;
+    } else if (raw.startsWith("-")) {
+      on({ kind: "-", line: raw.slice(1), newNo: null, oldNo });
+      if (oldNo !== null) oldNo++;
+    } else if (raw.startsWith(" ") || raw === "") {
+      on({ kind: " ", line: raw.slice(1), newNo, oldNo });
+      if (newNo !== null) newNo++;
+      if (oldNo !== null) oldNo++;
+    } else if (raw.startsWith("\\")) {
+    } else {
+      inHunk = false;
+    }
+  }
+  return headers;
+}
+function skeletonOf(f) {
+  const added = [];
+  const removed = [];
+  const hunks = walkSection(f.raw, ({ kind, line, newNo, oldNo }) => {
+    if (kind === " ") return;
+    const name2 = declName(line);
+    if (!name2) return;
+    const entry = { line: line.trim().slice(0, 160), lineNo: kind === "+" ? newNo : oldNo, name: name2 };
+    (kind === "+" ? added : removed).push(entry);
+  });
+  return { added, addedLines: f.added, hunks, path: f.path, removed, removedLines: f.removed };
+}
+var SKELETON_BUDGET_CHARS = 2e5;
+function renderSkeleton(files, coverage, plan) {
+  const partOf = /* @__PURE__ */ new Map();
+  for (const c of plan.chunks) for (const p of c.paths) partOf.set(p, c.index);
+  const entryOf = new Map(coverage.files.map((e) => [e.path, e]));
+  const out = [];
+  out.push(
+    `Whole-change skeleton: ${files.length} file(s), ${plan.chunks.length} part(s). Per file: part, hunk headers, declarations the hunks ADD (+) and REMOVE (\u2212) with their line numbers at the PR head. Read a file in the worktree for anything below signature level.`
+  );
+  let used = out[0].length;
+  let cut = 0;
+  for (const f of files) {
+    const sk = skeletonOf(f);
+    const e = entryOf.get(f.path);
+    const where = e && !e.included ? `omitted: ${e.omitReason ?? "omitted"}/${e.kind}` : `part ${partOf.get(f.path) ?? "?"}`;
+    const lines = [`### ${f.path} (+${f.added}/-${f.removed}) \u2014 ${where}`];
+    if (sk.hunks.length > 0) lines.push(`hunks: ${sk.hunks.slice(0, 12).join(" \xB7 ")}${sk.hunks.length > 12 ? ` \xB7 +${sk.hunks.length - 12} more` : ""}`);
+    for (const d of sk.added.slice(0, 24)) lines.push(`+ ${d.lineNo ?? "?"}: ${d.line}`);
+    if (sk.added.length > 24) lines.push(`+ \u2026 ${sk.added.length - 24} more added declarations`);
+    for (const d of sk.removed.slice(0, 12)) lines.push(`\u2212 ${d.lineNo ?? "?"}: ${d.line}`);
+    if (sk.removed.length > 12) lines.push(`\u2212 \u2026 ${sk.removed.length - 12} more removed declarations`);
+    const block = lines.join("\n");
+    if (used + block.length + 2 > SKELETON_BUDGET_CHARS) {
+      cut++;
+      continue;
+    }
+    out.push(block);
+    used += block.length + 2;
+  }
+  if (cut > 0) out.push(`\u2026 ${cut} file(s) not shown \u2014 the skeleton reached its ${SKELETON_BUDGET_CHARS.toLocaleString("en-US")}-char budget; their paths are in the change listing.`);
+  return out.join("\n\n");
+}
+var SEAMS_PER_PART_CHARS = 24e3;
+var HITS_PER_SYMBOL_FILE = 3;
+function referencesIn(f, symbol) {
+  const re = new RegExp(`(^|[^A-Za-z0-9_$])${symbol.replace(/[$]/g, "\\$")}(?![A-Za-z0-9_$])`);
+  const hits = [];
+  walkSection(f.raw, ({ kind, line, newNo }) => {
+    if (kind === "-") return;
+    if (hits.length >= HITS_PER_SYMBOL_FILE) return;
+    if (!re.test(line)) return;
+    if (declName(line) === symbol) return;
+    hits.push({ line: line.trim().slice(0, 140), lineNo: newNo, path: f.path });
+  });
+  return hits;
+}
+function computeSeams(plan) {
+  const declsByPart = /* @__PURE__ */ new Map();
+  for (const c of plan.chunks) {
+    const decls = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const f of c.files) {
+      for (const d of skeletonOf(f).added) {
+        if (seen.has(d.name)) continue;
+        seen.add(d.name);
+        decls.push({ name: d.name, path: f.path });
+      }
+    }
+    declsByPart.set(c.index, decls);
+  }
+  const notes = /* @__PURE__ */ new Map();
+  for (const c of plan.chunks) {
+    const lines = [];
+    let used = 0;
+    const push = (s) => {
+      if (used + s.length + 1 > SEAMS_PER_PART_CHARS) return false;
+      lines.push(s);
+      used += s.length + 1;
+      return true;
+    };
+    const mine = declsByPart.get(c.index) ?? [];
+    const outward = [];
+    for (const d of mine) {
+      for (const other of plan.chunks) {
+        if (other.index === c.index) continue;
+        for (const f of other.files) {
+          for (const h of referencesIn(f, d.name)) {
+            outward.push(`  ${d.name} (declared in ${d.path}) \u2190 part ${other.index} ${h.path}:${h.lineNo ?? "?"}  ${h.line}`);
+          }
+        }
+      }
+    }
+    const inward = [];
+    for (const other of plan.chunks) {
+      if (other.index === c.index) continue;
+      for (const d of declsByPart.get(other.index) ?? []) {
+        for (const f of c.files) {
+          for (const h of referencesIn(f, d.name)) {
+            inward.push(`  ${h.path}:${h.lineNo ?? "?"}  ${h.line}  \u2192 ${d.name} declared in part ${other.index} ${d.path}`);
+          }
+        }
+      }
+    }
+    if (outward.length === 0 && inward.length === 0) {
+      notes.set(c.index, "");
+      continue;
+    }
+    push(`Seams \u2014 where this part meets the other parts (from the hunks; read both sides at the PR head before judging either):`);
+    if (outward.length > 0) {
+      push(`Other parts use what THIS part declares:`);
+      for (const l of outward) if (!push(l)) break;
+    }
+    if (inward.length > 0) {
+      push(`THIS part uses what other parts declare:`);
+      for (const l of inward) if (!push(l)) break;
+    }
+    if (used >= SEAMS_PER_PART_CHARS - 200) push(`  \u2026 seam note truncated at ${SEAMS_PER_PART_CHARS.toLocaleString("en-US")} chars`);
+    notes.set(c.index, lines.join("\n"));
+  }
+  return notes;
+}
+
 // src/modes/review/gitleaks-allowlist.ts
 var CONFIG_MAX_BYTES = 256 * 1024;
 var PATTERN_MAX_CHARS = 512;
@@ -9423,6 +9625,7 @@ async function resolveGitleaksExemptions(reader, paths) {
 }
 
 // src/modes/review/index.ts
+var SKELETON_TRAIL_FILE = "skeleton.md";
 var CONVENTIONS_IN_TREE_DIR = ".ensemble-conventions";
 var CONVENTIONS_IN_TREE_FILE = "CONVENTIONS.md";
 var CONVENTIONS_INLINE_MAX = 32e3;
@@ -9573,6 +9776,16 @@ async function runReviewMode(opts) {
   const objective = opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE);
   const scoped = partCount > 1 || acquired.plan.overflow.length > 0;
   const scopeInput = { coverage: acquired.coverage, plan: acquired.plan };
+  const seams = partCount > 1 ? computeSeams(acquired.plan) : /* @__PURE__ */ new Map();
+  const skeleton = partCount > 1 ? renderSkeleton(acquired.files, acquired.coverage, acquired.plan) : void 0;
+  if (skeleton) {
+    try {
+      writeTrailFile(opts.out, opts.runId, SKELETON_TRAIL_FILE, skeleton);
+    } catch {
+    }
+    const seamParts = [...seams.values()].filter(Boolean).length;
+    log(`Skeleton: ${skeleton.length.toLocaleString("en-US")} chars for the whole change \xB7 seams noted for ${seamParts} of ${partCount} parts`);
+  }
   const boundedScope = (text) => section("scope", "scope", text, PACKET_BUDGETS.scope).body;
   const packets = (partCount > 0 ? acquired.plan.chunks : [null]).map(
     (chunk) => assembleCodePacket({
@@ -9589,7 +9802,7 @@ async function runReviewMode(opts) {
       objective,
       pr: 0,
       repo: acquired.repoId ?? "",
-      ...chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index) } : {}
+      ...chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index, seams.get(chunk.index) || void 0) } : {}
     })
   );
   const packet = packets[0];
@@ -9611,7 +9824,7 @@ async function runReviewMode(opts) {
       index: chunk?.index ?? 1,
       label: chunk?.label ?? "(the change)",
       prompt: prompts[i],
-      ...chunk && scoped ? { scope: boundedScope(renderChangeScope(scopeInput, chunk.index)) } : {}
+      ...chunk && scoped ? { scope: boundedScope(renderChangeScope(scopeInput, chunk.index, seams.get(chunk.index) || void 0)) } : {}
     };
   });
   const pinnedDiff = parts.map((p) => p.diff).join("");
@@ -9640,7 +9853,7 @@ async function runReviewMode(opts) {
   }
   if (opts.onPacketsReady) {
     try {
-      opts.onPacketsReady({ ...conventionsPath ? { conventionsPath } : {}, headSha: acquired.headSha, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt });
+      opts.onPacketsReady({ ...conventionsPath ? { conventionsPath } : {}, headSha: acquired.headSha, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, ...skeleton ? { skeleton } : {} });
     } catch (e) {
       log(`onPacketsReady hook failed (${e.message}) \u2014 the Anthropic stages will run after the core instead`);
     }
@@ -9802,10 +10015,10 @@ async function runReviewMode(opts) {
   if (built.ok && built.receipt) {
     const store = opts.receiptStore ?? defaultReceiptStore();
     log("Receipt qualified by the core \u2014 deferred to the full-roster gate.");
-    return { acquired, blocked: false, conventionManifest, ...conventionsPath ? { conventionsPath } : {}, depSurface, evidence, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, ...conventionsPath ? { conventionsPath } : {}, depSurface, evidence, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan, ...skeleton ? { skeleton } : {} };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, ...conventionsPath ? { conventionsPath } : {}, depSurface, evidence, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, ...conventionsPath ? { conventionsPath } : {}, depSurface, evidence, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan, ...skeleton ? { skeleton } : {} };
 }
 
 // src/modes/review/code-review-seat.ts
@@ -10115,6 +10328,61 @@ function renderSettlements(settlements, scrub) {
   return out;
 }
 
+// src/modes/review/integration.ts
+var INTEGRATION_SEAT_ID = "integration";
+var SCHEMA_BLOCK3 = `{"summary":"<one sentence: what you checked across the parts and what you found>","findings":[{"title":"<short>","body":"<the two sides of the seam as path:line at the PR head, what disagrees, and what breaks>","severity":"high|medium|low","confidence":"high|medium|low","evidence":{"file":"<a file this PR changes>","line":<number>}}]}`;
+function renderIntegrationPrompt(args) {
+  const history = args.history ? `
+
+${HISTORY_PACKET_CLAUSE}` : "";
+  return `You are the INTEGRATION seat of a multi-model code review, reviewing someone else's pull
+request. Read-only: you may not edit, stage, or push anything. You have NO shell and NO network:
+there is no Bash tool, so do not try to run \`git\` or any command.
+
+${readOnlyWorktreeClause({ headSha: args.headSha, reach: "read every file you need", worktree: args.worktree })}
+
+The change is \`git diff ${args.baseSha}...${args.headSha}\`. It was too large for one reviewer prompt, so
+the other reviewers each read ONE PART of it. You read the WHOLE change at signature resolution \u2014
+the skeleton below \u2014 plus the listing of every part, and you open the files at the PR head for
+anything below that level. Your job is what no part-reader could see: whether the parts fit EACH
+OTHER and what the change breaks elsewhere.
+
+## The change, part by part
+
+${args.scope}
+
+## The whole change as a skeleton
+
+${args.skeleton}
+
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${args.conventionsPath ? conventionsFileClause(args.conventionsPath) : ""}${history}
+
+## What to look for \u2014 ONLY these classes
+
+1. CONTRACT DRIFT across parts: a request/response shape, schema, migration, enum, route, event or
+   config changed in one place and a producer/consumer of it in another place (changed or NOT
+   changed in this PR) that no longer agrees. Open both sides. Name both path:line.
+2. HALF-DONE CHANGES: a rename, a new required field, a new variant, a new error code \u2014 applied in
+   some sites and missing in others (switch/case sites, serializers, fixtures, docs the code cites,
+   generated clients that were not regenerated).
+3. GUARDS AND INVARIANTS applied unevenly: a check added in one handler/service/path and absent in
+   a sibling that handles the same input.
+4. BEHAVIOR CHANGED WITH NO TEST: a changed function whose tests were not touched, a fixture that
+   never sets a newly added field, a test that pins the OLD behavior and still passes only because
+   it no longer exercises the changed path.
+5. REGRESSION RISK OUTSIDE THE DIFF: an unchanged caller/consumer in the tree that the change
+   breaks (open it; cite its path:line at the head).
+
+Never report style, naming, formatting, or a bug visible inside one part's hunks alone \u2014 the part
+reviewers own those. Every finding MUST name at least two sites as \`path:line\` as they exist at
+${args.headSha}, with the \`evidence\` object pointing at a file THIS PR changes. If the sites agree once you
+read them, do not file it. Finding nothing is a legitimate outcome: say what seams you checked.
+
+Your FINAL output must end with exactly one fenced \`\`\`json block, and no other json block, in this
+schema:
+${SCHEMA_BLOCK3}`;
+}
+
 // src/modes/review/self-contained.ts
 function resolveReviewRoster(requested, noClaude) {
   if (requested === void 0) {
@@ -10174,6 +10442,8 @@ function loadVoiceReviewsFromTrail(baseDir, runId) {
   const out = readReviewsForRun(baseDir, runId).map(storedToVoiceReview);
   const claude = reviewJsonFromTrail(baseDir, runId, "review.claude.json");
   if (claude) out.push(claude);
+  const integration = reviewJsonFromTrail(baseDir, runId, `review.${INTEGRATION_SEAT_ID}.json`);
+  if (integration) out.push(integration);
   const holistic = reviewJsonFromTrail(baseDir, runId, `review.${HOLISTIC_SEAT_ID}.json`);
   if (holistic) out.push(holistic);
   return out;
@@ -10372,6 +10642,7 @@ async function runHolisticStage(opts) {
       log,
       run,
       ...lensScope ? { scope: lensScope } : {},
+      ...opts.skeleton ? { skeleton: opts.skeleton } : {},
       // The lens only runs WITH worktree evidence (resolveHolisticPlan), so the
       // worktree-sized default applies whenever the caller didn't set one.
       timeoutMs: opts.timeoutMs ?? HOLISTIC_WORKTREE_TIMEOUT_MS,
@@ -10392,6 +10663,79 @@ async function runHolisticStage(opts) {
     }
   }
   return { holisticReview, holisticSkipped: plan.run ? null : plan.skipReason };
+}
+var INTEGRATION_WORKTREE_TIMEOUT_MS = 36e5;
+async function runIntegrationStage(opts) {
+  const log = opts.log ?? (() => {
+  });
+  const run = opts.run ?? runClaudeReviewVoice;
+  if (!opts.worktree) {
+    const why = "integration seat: this run has NO worktree evidence \u2014 the seat opens both sides of every seam or it does not run. No seat spawned, no findings added.";
+    log(`  \xB7 ${why}`);
+    return { integrationReview: null, integrationSkipped: why };
+  }
+  if (!opts.baseSha) {
+    const why = "integration seat: this run resolved no base SHA \u2014 the seat cannot name the range. No seat spawned, no findings added.";
+    log(`  \xB7 ${why}`);
+    return { integrationReview: null, integrationSkipped: why };
+  }
+  log(`  \xB7 integration seat (anthropic/${opts.config.model} @ ${opts.config.effort}) reading the whole change across its parts\u2026`);
+  const prompt = renderIntegrationPrompt({
+    baseSha: opts.baseSha,
+    ...opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {},
+    headSha: opts.expectedHeadSha,
+    history: historyPacketHasData(opts.historyPacket),
+    scope: opts.scope,
+    skeleton: opts.skeleton,
+    worktree: opts.worktree
+  });
+  const fail = (summary, raw) => {
+    const review2 = { findings: [], ok: false, summary, voiceId: INTEGRATION_SEAT_ID };
+    try {
+      persistSeatReview(opts.baseDir, opts.runId, INTEGRATION_SEAT_ID, review2, raw);
+    } catch {
+    }
+    return { integrationReview: review2, integrationSkipped: null };
+  };
+  let res;
+  try {
+    res = await run(prompt, opts.config, {
+      ...opts.historyPacket ? { historyPacket: opts.historyPacket.files } : {},
+      timeoutMs: opts.timeoutMs ?? INTEGRATION_WORKTREE_TIMEOUT_MS,
+      worktree: opts.worktree
+    });
+  } catch (e) {
+    log(`  \xB7 integration: failed to run \u2014 ${e.message}`);
+    return fail(`the integration seat did not run: ${e.message}`, null);
+  }
+  if (!res.raw || res.timedOut) {
+    const why = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
+    log(`  \xB7 integration: ${why}`);
+    return fail(`the integration seat ${why}`, res.raw ?? null);
+  }
+  const parsed = parseFindings(res.raw);
+  if (parsed.parseError) {
+    log(`  \xB7 integration: ${parsed.parseError}`);
+    return fail(`output not parseable (${parsed.parseError})`, res.raw);
+  }
+  let review = withSeatAdvisor(
+    { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: INTEGRATION_SEAT_ID },
+    opts.config
+  );
+  try {
+    persistSeatReview(opts.baseDir, opts.runId, INTEGRATION_SEAT_ID, review, res.raw);
+  } catch (e) {
+    const why = e.message;
+    log(`  \xB7 integration: trail persist FAILED (${why}) \u2014 the seat's findings are dropped from this run`);
+    review = { ...review, findings: [], ok: false, summary: `the integration seat ran but FAILED to persist to the trail (${why})` };
+  }
+  try {
+    writeTrailFile(opts.baseDir, opts.runId, `review.${INTEGRATION_SEAT_ID}.md`, renderReviewMarkdown(review));
+  } catch (e) {
+    log(`  \xB7 trail write review.${INTEGRATION_SEAT_ID}.md failed (${e.message}) \u2014 continuing`);
+  }
+  log(`  \xB7 integration: reviewed the seams \u2014 ${review.findings.length} finding(s)`);
+  return { integrationReview: review, integrationSkipped: null };
 }
 async function runClaudeReviewLayer(opts) {
   const log = opts.log ?? (() => {
@@ -10419,6 +10763,8 @@ async function runClaudeReviewLayer(opts) {
   }
   const lensOutcome = opts.lens ? await opts.lens : await runHolisticStage(opts);
   const holisticReview = lensOutcome.holisticReview;
+  const integrationOutcome = opts.integration ? await opts.integration : null;
+  const integrationReview = integrationOutcome?.integrationReview ?? null;
   const voiceReviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
   const gate = await runGate({
     baseDir: opts.baseDir,
@@ -10488,6 +10834,8 @@ async function runClaudeReviewLayer(opts) {
     claudeReview,
     claudeSpawned,
     gateSpawned: gate.gateSpawned,
+    ...integrationReview !== null ? { integrationReview } : {},
+    ...integrationOutcome?.integrationSkipped ? { integrationSkipped: integrationOutcome.integrationSkipped } : {},
     gateTrailWritten: gate.gateTrailWritten,
     gateVerdicts,
     holisticReview,
@@ -10523,6 +10871,17 @@ function renderClaudeLayer(result) {
         out.push(`     [${f.severity}] ${scrubControl(where)}  ${scrubControl(f.title)}`);
       }
     }
+  }
+  const ir = result.integrationReview;
+  if (ir) {
+    out.push("");
+    out.push(`  \u2500\u2500 integration seat \u2014 ${ir.ok ? "read the seams across the parts" : "failed"} (ONE seat \xB7 cross-part contract, guards, half-done changes, untested behavior, regressions outside the diff) \u2500\u2500`);
+    if (!ir.ok) out.push(`     ${scrubControl(ir.summary)}`);
+    else if (ir.findings.length === 0) out.push("     no findings \u2014 the seams it checked are in its summary; a clean pass is not a certification");
+    for (const f of ir.findings) out.push(`     \u2212 [${f.severity}] ${scrubControl(evidenceRef(f.evidence.file, f.evidence.line))}  ${scrubControl(f.title)}`);
+  } else if (result.integrationSkipped) {
+    out.push("");
+    out.push(`  \u2500\u2500 integration seat \u2014 skipped: ${scrubControl(result.integrationSkipped)} \u2500\u2500`);
   }
   const hr = result.holisticReview;
   if (hr) {
@@ -13122,6 +13481,7 @@ async function reviewCommand(args, profile = "code") {
         "no-claude": { type: "boolean" },
         "no-conventions": { type: "boolean" },
         "no-fail-on-high": { type: "boolean" },
+        "no-integration": { type: "boolean" },
         "no-settle": { type: "boolean" },
         "optional-reviewers": { type: "string" },
         "verify-confirmed": { type: "boolean" },
@@ -13341,6 +13701,7 @@ async function runReviewPipeline(input) {
   let historyPacket;
   let producerStage;
   let lensStage;
+  let integrationStage;
   const startAnthropicStages = (ready) => {
     if (!roster.claude || !anthropicSeats) return;
     if (worktree && ready.pinnedDiff) {
@@ -13368,7 +13729,7 @@ async function runReviewPipeline(input) {
     const stageBaseSha = source.prBaseSha ?? null;
     const log = (m) => console.error(`\xB7 ${m}`);
     console.error(
-      `\xB7 anthropic stages started alongside the core: producer (${ready.parts.length} part(s))${values.holistic ? " + holistic lens" : ""}`
+      `\xB7 anthropic stages started alongside the core: producer (${ready.parts.length} part(s))${values.holistic ? " + holistic lens" : ""}${ready.skeleton && worktree && !values["no-integration"] ? " + integration seat" : ""}`
     );
     producerStage = runClaudeProducer({
       baseDir: out,
@@ -13404,9 +13765,27 @@ async function runReviewPipeline(input) {
         log,
         pinnedDiff: ready.pinnedDiff,
         runId,
+        ...ready.skeleton ? { skeleton: ready.skeleton } : {},
         ...worktree ? { worktree: worktree.dir } : {}
       });
       lensStage.catch(() => {
+      });
+    }
+    if (ready.skeleton && ready.lensHandoff && worktree && !values["no-integration"]) {
+      integrationStage = runIntegrationStage({
+        baseDir: out,
+        baseSha: stageBaseSha,
+        config: anthropicSeats.claude.config,
+        ...ready.conventionsPath ? { conventionsPath: ready.conventionsPath } : {},
+        expectedHeadSha: ready.headSha,
+        ...historyPacket ? { historyPacket } : {},
+        log,
+        runId,
+        scope: ready.lensHandoff.scope,
+        skeleton: ready.skeleton,
+        worktree: worktree.dir
+      });
+      integrationStage.catch(() => {
       });
     }
   };
@@ -13546,6 +13925,8 @@ async function runReviewPipeline(input) {
         // The stages that started with the packet (startAnthropicStages) — awaited, not re-run.
         ...producerStage ? { producer: producerStage } : {},
         ...lensStage ? { lens: lensStage } : {},
+        ...integrationStage ? { integration: integrationStage } : {},
+        ...result.skeleton ? { skeleton: result.skeleton } : {},
         ...result.lensHandoff ? { lensHandoff: result.lensHandoff } : {},
         // `security --repo` must NOT have its security-auditor prompt replaced by the
         // `/code-review` skill's structural-quality lens (codex-f3).
