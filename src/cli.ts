@@ -82,6 +82,8 @@ import {
   runClaudeReviewLayer,
   runHolisticStage,
   type HolisticStageOutcome,
+  runIntegrationStage,
+  type IntegrationStageOutcome,
 } from './modes/review/self-contained';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
 import {
@@ -1277,6 +1279,7 @@ async function reviewCommand(
         'no-claude': { type: 'boolean' },
         'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
+        'no-integration': { type: 'boolean' },
         'no-settle': { type: 'boolean' },
         'optional-reviewers': { type: 'string' },
         'verify-confirmed': { type: 'boolean' },
@@ -1674,7 +1677,8 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   let historyPacket: HistoryPacket | undefined;
   let producerStage: Promise<ClaudeProducerOutcome> | undefined;
   let lensStage: Promise<HolisticStageOutcome> | undefined;
-  const startAnthropicStages = (ready: { conventionsPath?: string; headSha: string; lensHandoff?: { diff: string; scope: string }; parts: { diff: string; index: number; label: string; prompt: string; scope?: string }[]; pinnedDiff: string; prompt: string }): void => {
+  let integrationStage: Promise<IntegrationStageOutcome> | undefined;
+  const startAnthropicStages = (ready: { conventionsPath?: string; headSha: string; lensHandoff?: { diff: string; scope: string }; parts: { diff: string; index: number; label: string; prompt: string; scope?: string }[]; pinnedDiff: string; prompt: string; skeleton?: string }): void => {
     if (!roster.claude || !anthropicSeats) return;
     if (worktree && ready.pinnedDiff) {
       const { capBytes, logCommits } = historyPacketConfig(readEnsembleConfig());
@@ -1703,7 +1707,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
     const stageBaseSha = source.prBaseSha ?? null;
     const log = (m: string) => console.error(`· ${m}`);
     console.error(
-      `· anthropic stages started alongside the core: producer (${ready.parts.length} part(s))${values.holistic ? ' + holistic lens' : ''}`
+      `· anthropic stages started alongside the core: producer (${ready.parts.length} part(s))${values.holistic ? ' + holistic lens' : ''}${ready.skeleton && worktree && !values['no-integration'] ? ' + integration seat' : ''}`
     );
     producerStage = runClaudeProducer({
       baseDir: out,
@@ -1740,9 +1744,31 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         log,
         pinnedDiff: ready.pinnedDiff,
         runId,
+        ...(ready.skeleton ? { skeleton: ready.skeleton } : {}),
         ...(worktree ? { worktree: worktree.dir } : {}),
       });
       lensStage.catch(() => {});
+      // (the lens reads the skeleton too — threaded below via the layer's `skeleton`)
+    }
+    // THE INTEGRATION SEAT (modes/review/integration.ts): on a review in parts with a worktree,
+    // one Anthropic seat over the whole-change skeleton + the listing + the tree, for the seams
+    // the part-readers cannot see. `--no-integration` opts out. The seat is the claude producer's
+    // config (same house bar), not a separate pin.
+    if (ready.skeleton && ready.lensHandoff && worktree && !values['no-integration']) {
+      integrationStage = runIntegrationStage({
+        baseDir: out,
+        baseSha: stageBaseSha,
+        config: anthropicSeats.claude.config,
+        ...(ready.conventionsPath ? { conventionsPath: ready.conventionsPath } : {}),
+        expectedHeadSha: ready.headSha,
+        ...(historyPacket ? { historyPacket } : {}),
+        log,
+        runId,
+        scope: ready.lensHandoff.scope,
+        skeleton: ready.skeleton,
+        worktree: worktree.dir,
+      });
+      integrationStage.catch(() => {});
     }
   };
 
@@ -1930,6 +1956,8 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         // The stages that started with the packet (startAnthropicStages) — awaited, not re-run.
         ...(producerStage ? { producer: producerStage } : {}),
         ...(lensStage ? { lens: lensStage } : {}),
+        ...(integrationStage ? { integration: integrationStage } : {}),
+        ...(result.skeleton ? { skeleton: result.skeleton } : {}),
         ...(result.lensHandoff ? { lensHandoff: result.lensHandoff } : {}),
         // `security --repo` must NOT have its security-auditor prompt replaced by the
         // `/code-review` skill's structural-quality lens (codex-f3).

@@ -201,6 +201,10 @@ export interface HolisticPromptArgs {
   // lens is handed as much of the diff as one packet holds and told, file by file, what else the
   // PR changes. Omitted ⇒ the diff IS the whole change, as before.
   scope?: string;
+  // The whole change at signature resolution (./skeleton renderSkeleton) on a review in parts —
+  // the lens's job is whole-project, and the parts' hunks it was not handed are in here as
+  // declarations with line numbers to open at the head. Omitted ⇒ no clause.
+  skeleton?: string;
   worktree: string;
 }
 
@@ -220,7 +224,7 @@ network: there is no Bash tool, so do not try to run \`git\` or any command.
 
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: 'search and read it', worktree: args.worktree })}
 
-${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...(args.scope ? { scope: args.scope } : {}) })}
+${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...(args.scope ? { scope: args.scope } : {}) })}${args.skeleton ? `\n\n## The whole change as a skeleton\n\nEvery changed file with the declarations its hunks add (+) and remove (−), at the PR head — including the parts whose hunks are not materialized above. Open a file for anything below signature level.\n\n${args.skeleton}` : ''}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${args.conventionsPath ? conventionsFileClause(args.conventionsPath) : ''}${history}
 
@@ -287,6 +291,8 @@ export interface RunHolisticLensOptions {
   conventionsPath?: string;
   // The change-scope note for a review in parts (HolisticPromptArgs.scope).
   scope?: string;
+  // The whole-change skeleton for a review in parts (HolisticPromptArgs.skeleton).
+  skeleton?: string;
   timeoutMs?: number;
   worktree: string;
 }
@@ -307,6 +313,7 @@ export async function runHolisticLens(
     history: hasHistory,
     ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
     ...(opts.scope ? { scope: opts.scope } : {}),
+    ...(opts.skeleton ? { skeleton: opts.skeleton } : {}),
     worktree: opts.worktree,
   });
   const fail = (summary: string): { raw: string | null; review: VoiceReview } => ({

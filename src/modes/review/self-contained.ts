@@ -45,6 +45,7 @@ import {
   runHolisticLens,
 } from './holistic';
 import { worktreeReader } from './holistic-gate';
+import { INTEGRATION_SEAT_ID, renderIntegrationPrompt } from './integration';
 import { type HistoryPacket, historyPacketHasData } from './history-packet';
 import type { ReviewProfile } from './profile';
 import { type ReviewSynthesis, type VoiceReview } from './synthesis';
@@ -166,6 +167,9 @@ export function loadVoiceReviewsFromTrail(
   const out = readReviewsForRun(baseDir, runId).map(storedToVoiceReview);
   const claude = reviewJsonFromTrail(baseDir, runId, 'review.claude.json');
   if (claude) out.push(claude);
+  // The integration seat (a review in parts) sits after the reviewers and before the lens.
+  const integration = reviewJsonFromTrail(baseDir, runId, `review.${INTEGRATION_SEAT_ID}.json`);
+  if (integration) out.push(integration);
   // The lens is LAST so its findingIds sort after the reviewers' in the gate prompt. Absent
   // whenever the lens did not run (the default) — no file, no voice, no findings.
   const holistic = reviewJsonFromTrail(baseDir, runId, `review.${HOLISTIC_SEAT_ID}.json`);
@@ -355,6 +359,12 @@ export interface ClaudeLayerOptions {
   producer?: Promise<ClaudeProducerOutcome>;
   // The lens stage, likewise pre-started (runHolisticStage). Absent ⇒ run here, as before.
   lens?: Promise<HolisticStageOutcome>;
+  // The INTEGRATION seat (./integration), pre-started by the caller on a review in parts. The
+  // layer only awaits it (it never starts it: the seat needs the skeleton, which is the caller's)
+  // so its review is on disk before the gate reads the voices.
+  integration?: Promise<IntegrationStageOutcome>;
+  // The whole-change skeleton (skeleton.ts) for the lens on a review in parts.
+  skeleton?: string;
   // The head SHA the reviewers saw — the gate reads the pinned packet keyed by it, and a
   // mismatch fails the packet closed (all verdicts unverified).
   expectedHeadSha: string;
@@ -415,6 +425,10 @@ export interface ClaudeLayerResult {
   // The holistic lens's review — null when the lens was off (the default) or skipped. OPTIONAL:
   // this interface is a consumer contract (the dashboard renders it), and the lens is additive.
   holisticReview?: VoiceReview | null;
+  // The integration seat's review on a review in parts (./integration). Absent when it did not run.
+  integrationReview?: VoiceReview | null;
+  // Why the integration seat did not run when it was asked for.
+  integrationSkipped?: string | null;
   // Why the lens did NOT run, when it was requested. Null/absent ⇒ it ran, or was never requested.
   holisticSkipped?: string | null;
   // The model that ACTUALLY ran the claude voice (e.g. `opus`, `sonnet`) — rendered in the
@@ -659,7 +673,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
 
 export type HolisticStageOptions = Pick<
   ClaudeLayerOptions,
-  'baseDir' | 'conventionsPath' | 'expectedHeadSha' | 'historyPacket' | 'holistic' | 'lensHandoff' | 'log' | 'pinnedDiff' | 'run' | 'runId' | 'timeoutMs' | 'worktree'
+  'baseDir' | 'conventionsPath' | 'expectedHeadSha' | 'historyPacket' | 'holistic' | 'lensHandoff' | 'log' | 'pinnedDiff' | 'run' | 'runId' | 'skeleton' | 'timeoutMs' | 'worktree'
 >;
 
 export interface HolisticStageOutcome {
@@ -703,6 +717,7 @@ export async function runHolisticStage(opts: HolisticStageOptions): Promise<Holi
       log,
       run,
       ...(lensScope ? { scope: lensScope } : {}),
+      ...(opts.skeleton ? { skeleton: opts.skeleton } : {}),
       // The lens only runs WITH worktree evidence (resolveHolisticPlan), so the
       // worktree-sized default applies whenever the caller didn't set one.
       timeoutMs: opts.timeoutMs ?? HOLISTIC_WORKTREE_TIMEOUT_MS,
@@ -728,6 +743,110 @@ export async function runHolisticStage(opts: HolisticStageOptions): Promise<Holi
   }
 
   return { holisticReview, holisticSkipped: plan.run ? null : plan.skipReason };
+}
+
+// ── The integration stage (a review in parts) ───────────────────────────────────────
+//
+// One Anthropic seat over the whole-change skeleton + the change listing + the tree, reporting
+// cross-part contract drift, half-done changes, uneven guards, untested behavior changes and
+// regressions outside the diff (./integration). Started by the caller with the packet (it needs
+// nothing from the core seats), persisted like every voice so the gate reads it off disk.
+
+export interface IntegrationStageOptions {
+  baseDir: string;
+  baseSha: string | null;
+  config: ResolvedVoiceConfig;
+  conventionsPath?: string;
+  expectedHeadSha: string;
+  historyPacket?: HistoryPacket;
+  log?: (m: string) => void;
+  run?: ClaudeRunner;
+  runId: string;
+  // The change listing (chunks.ts renderLensScope) and the skeleton (skeleton.ts).
+  scope: string;
+  skeleton: string;
+  timeoutMs?: number;
+  worktree?: string;
+}
+
+export interface IntegrationStageOutcome {
+  integrationReview: VoiceReview | null;
+  integrationSkipped: string | null;
+}
+
+export const INTEGRATION_WORKTREE_TIMEOUT_MS = 3_600_000; // 60 min runaway backstop
+
+export async function runIntegrationStage(opts: IntegrationStageOptions): Promise<IntegrationStageOutcome> {
+  const log = opts.log ?? (() => {});
+  const run: ClaudeRunner = opts.run ?? runClaudeReviewVoice;
+  if (!opts.worktree) {
+    const why = 'integration seat: this run has NO worktree evidence — the seat opens both sides of every seam or it does not run. No seat spawned, no findings added.';
+    log(`  · ${why}`);
+    return { integrationReview: null, integrationSkipped: why };
+  }
+  if (!opts.baseSha) {
+    const why = 'integration seat: this run resolved no base SHA — the seat cannot name the range. No seat spawned, no findings added.';
+    log(`  · ${why}`);
+    return { integrationReview: null, integrationSkipped: why };
+  }
+  log(`  · integration seat (anthropic/${opts.config.model} @ ${opts.config.effort}) reading the whole change across its parts…`);
+  const prompt = renderIntegrationPrompt({
+    baseSha: opts.baseSha,
+    ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
+    headSha: opts.expectedHeadSha,
+    history: historyPacketHasData(opts.historyPacket),
+    scope: opts.scope,
+    skeleton: opts.skeleton,
+    worktree: opts.worktree,
+  });
+  const fail = (summary: string, raw: string | null): IntegrationStageOutcome => {
+    const review: VoiceReview = { findings: [], ok: false, summary, voiceId: INTEGRATION_SEAT_ID };
+    try {
+      persistSeatReview(opts.baseDir, opts.runId, INTEGRATION_SEAT_ID, review, raw);
+    } catch {
+      /* a failed seat with no trail entry reads as absent — the gate simply has no voice */
+    }
+    return { integrationReview: review, integrationSkipped: null };
+  };
+  let res: VoiceRunResult;
+  try {
+    res = await run(prompt, opts.config, {
+      ...(opts.historyPacket ? { historyPacket: opts.historyPacket.files } : {}),
+      timeoutMs: opts.timeoutMs ?? INTEGRATION_WORKTREE_TIMEOUT_MS,
+      worktree: opts.worktree,
+    });
+  } catch (e) {
+    log(`  · integration: failed to run — ${(e as Error).message}`);
+    return fail(`the integration seat did not run: ${(e as Error).message}`, null);
+  }
+  if (!res.raw || res.timedOut) {
+    const why = res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output');
+    log(`  · integration: ${why}`);
+    return fail(`the integration seat ${why}`, res.raw ?? null);
+  }
+  const parsed = parseFindings(res.raw);
+  if (parsed.parseError) {
+    log(`  · integration: ${parsed.parseError}`);
+    return fail(`output not parseable (${parsed.parseError})`, res.raw);
+  }
+  let review: VoiceReview = withSeatAdvisor(
+    { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: INTEGRATION_SEAT_ID },
+    opts.config
+  );
+  try {
+    persistSeatReview(opts.baseDir, opts.runId, INTEGRATION_SEAT_ID, review, res.raw);
+  } catch (e) {
+    const why = (e as Error).message;
+    log(`  · integration: trail persist FAILED (${why}) — the seat's findings are dropped from this run`);
+    review = { ...review, findings: [], ok: false, summary: `the integration seat ran but FAILED to persist to the trail (${why})` };
+  }
+  try {
+    writeTrailFile(opts.baseDir, opts.runId, `review.${INTEGRATION_SEAT_ID}.md`, renderReviewMarkdown(review));
+  } catch (e) {
+    log(`  · trail write review.${INTEGRATION_SEAT_ID}.md failed (${(e as Error).message}) — continuing`);
+  }
+  log(`  · integration: reviewed the seams — ${review.findings.length} finding(s)`);
+  return { integrationReview: review, integrationSkipped: null };
 }
 
 // Run the cold Opus reviewer (when in the roster) over the SAME prompt + persist it, write
@@ -767,6 +886,9 @@ export async function runClaudeReviewLayer(
 
   const lensOutcome = opts.lens ? await opts.lens : await runHolisticStage(opts);
   const holisticReview = lensOutcome.holisticReview;
+  // The integration seat's review must be on disk before the gate loads the voices.
+  const integrationOutcome = opts.integration ? await opts.integration : null;
+  const integrationReview = integrationOutcome?.integrationReview ?? null;
 
   // Run the GATE over the reviews READ BACK from the trail files (the literal "reads the
   // three review files") — grounding each finding against the pinned packet hunks, tagging
@@ -858,6 +980,8 @@ export async function runClaudeReviewLayer(
     claudeReview,
     claudeSpawned,
     gateSpawned: gate.gateSpawned,
+    ...(integrationReview !== null ? { integrationReview } : {}),
+    ...(integrationOutcome?.integrationSkipped ? { integrationSkipped: integrationOutcome.integrationSkipped } : {}),
     gateTrailWritten: gate.gateTrailWritten,
     gateVerdicts,
     holisticReview,
@@ -913,6 +1037,17 @@ export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
 
   // The lens gets its OWN block, named as one seat. It is never folded into the reviewers' list,
   // because a reader must never mistake a single whole-tree opinion for cross-vendor corroboration.
+  const ir = result.integrationReview;
+  if (ir) {
+    out.push('');
+    out.push(`  ── integration seat — ${ir.ok ? 'read the seams across the parts' : 'failed'} (ONE seat · cross-part contract, guards, half-done changes, untested behavior, regressions outside the diff) ──`);
+    if (!ir.ok) out.push(`     ${scrub(ir.summary)}`);
+    else if (ir.findings.length === 0) out.push('     no findings — the seams it checked are in its summary; a clean pass is not a certification');
+    for (const f of ir.findings) out.push(`     − [${f.severity}] ${scrub(evidenceRef(f.evidence.file, f.evidence.line))}  ${scrub(f.title)}`);
+  } else if (result.integrationSkipped) {
+    out.push('');
+    out.push(`  ── integration seat — skipped: ${scrub(result.integrationSkipped)} ──`);
+  }
   const hr = result.holisticReview;
   if (hr) {
     out.push('');

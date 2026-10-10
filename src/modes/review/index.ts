@@ -75,6 +75,7 @@ import {
   runCoreSeat,
 } from './seat-run';
 import { describeUsage, readDepthOf } from './seat-usage';
+import { computeSeams, renderSkeleton } from './skeleton';
 import { resolveGitleaksExemptions } from './gitleaks-allowlist';
 import { scanDiffForSecrets, type SecretScanResult } from './secret-scan';
 
@@ -183,6 +184,9 @@ export interface PacketsReady {
   // was handed to the seats by path instead of inline — the fenced Anthropic prompts point at it.
   conventionsPath?: string;
   headSha: string;
+  // The whole-change skeleton (skeleton.ts) on a review in parts — for the lens and the
+  // integration seat. Absent on a single-part review.
+  skeleton?: string;
   lensHandoff?: { diff: string; scope: string };
   parts: ReviewPart[];
   pinnedDiff: string;
@@ -205,6 +209,9 @@ export interface ReviewModeResult {
   // The conventions file in the worktree, when the gathered conventions were handed to the seats
   // by path (see CONVENTIONS_IN_TREE in runReviewMode). Absent ⇒ they rode inline in the packet.
   conventionsPath?: string;
+  // The whole-change skeleton (skeleton.ts) on a review in parts; also written to the trail as
+  // SKELETON_TRAIL_FILE. Absent on a single-part review.
+  skeleton?: string;
   // The LENS handoff for a review in parts: as much of the union diff as one packet holds (part 1
   // onward, whole parts only) plus the scope listing naming every other changed file. Absent on a
   // single-part review — the lens then gets `pinnedDiff`, which IS the whole change.
@@ -253,6 +260,7 @@ export interface ReviewPart {
 // Where the gathered conventions land inside the worktree when they are handed over by path
 // (see runReviewMode): a dotted, engine-owned dir beside `.companions/`, never a path the PR
 // could have committed, and never one of the stripped agent-instruction names.
+export const SKELETON_TRAIL_FILE = 'skeleton.md';
 export const CONVENTIONS_IN_TREE_DIR = '.ensemble-conventions';
 export const CONVENTIONS_IN_TREE_FILE = 'CONVENTIONS.md';
 // Below this many chars the conventions ride inline regardless — a pointer costs a read.
@@ -485,6 +493,20 @@ export async function runReviewMode(
     opts.objective ?? (profile === 'security' ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE);
   const scoped = partCount > 1 || acquired.plan.overflow.length > 0;
   const scopeInput = { coverage: acquired.coverage, plan: acquired.plan };
+  // THE SEAMS + THE SKELETON (skeleton.ts) on a review in parts: each part's scope note carries
+  // the lines in the other parts that name what it declares (and the reverse); the whole change
+  // at signature resolution goes to the trail, the lens and the integration seat.
+  const seams = partCount > 1 ? computeSeams(acquired.plan) : new Map<number, string>();
+  const skeleton = partCount > 1 ? renderSkeleton(acquired.files, acquired.coverage, acquired.plan) : undefined;
+  if (skeleton) {
+    try {
+      writeTrailFile(opts.out, opts.runId, SKELETON_TRAIL_FILE, skeleton);
+    } catch {
+      /* trail write is best-effort */
+    }
+    const seamParts = [...seams.values()].filter(Boolean).length;
+    log(`Skeleton: ${skeleton.length.toLocaleString('en-US')} chars for the whole change · seams noted for ${seamParts} of ${partCount} parts`);
+  }
   // The scope note the FENCED prompts embed raw (the `/code-review` producer, the lens) is bounded
   // exactly as the packet section is, so a thousand-file change cannot put an unbounded listing in
   // front of every part's diff.
@@ -504,7 +526,7 @@ export async function runReviewMode(
       objective,
       pr: 0,
       repo: acquired.repoId ?? '',
-      ...(chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index) } : {}),
+      ...(chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index, seams.get(chunk.index) || undefined) } : {}),
     })
   );
   const packet = packets[0];
@@ -529,7 +551,7 @@ export async function runReviewMode(
       index: chunk?.index ?? 1,
       label: chunk?.label ?? '(the change)',
       prompt: prompts[i],
-      ...(chunk && scoped ? { scope: boundedScope(renderChangeScope(scopeInput, chunk.index)) } : {}),
+      ...(chunk && scoped ? { scope: boundedScope(renderChangeScope(scopeInput, chunk.index, seams.get(chunk.index) || undefined)) } : {}),
     };
   });
 
@@ -581,7 +603,7 @@ export async function runReviewMode(
   // take the paid review down with it: reported, then the fan-out proceeds.
   if (opts.onPacketsReady) {
     try {
-      opts.onPacketsReady({ ...(conventionsPath ? { conventionsPath } : {}), headSha: acquired.headSha, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt });
+      opts.onPacketsReady({ ...(conventionsPath ? { conventionsPath } : {}), headSha: acquired.headSha, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt, ...(skeleton ? { skeleton } : {}) });
     } catch (e) {
       log(`onPacketsReady hook failed (${(e as Error).message}) — the Anthropic stages will run after the core instead`);
     }
@@ -816,8 +838,8 @@ export async function runReviewMode(
     // caller writes receiptCandidate once the roster is verified complete.
     const store = opts.receiptStore ?? defaultReceiptStore();
     log('Receipt qualified by the core — deferred to the full-roster gate.');
-    return { acquired, blocked: false, conventionManifest, ...(conventionsPath ? { conventionsPath } : {}), depSurface, evidence, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, ...(conventionsPath ? { conventionsPath } : {}), depSurface, evidence, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan, ...(skeleton ? { skeleton } : {}) };
   }
   log(`No receipt — ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, ...(conventionsPath ? { conventionsPath } : {}), depSurface, evidence, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, ...(conventionsPath ? { conventionsPath } : {}), depSurface, evidence, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan, ...(skeleton ? { skeleton } : {}) };
 }

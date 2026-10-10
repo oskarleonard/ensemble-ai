@@ -189,7 +189,7 @@ export interface ScopeInput {
 // those files should read it in the worktree), and what no reviewer ever sees (omitted, with the
 // reason). A seat that reads only its own hunks and is told nothing else would file "X is never
 // called" against a caller sitting in part 3 — this note is what stops that.
-export function renderChangeScope(input: ScopeInput, chunkIndex: number): string {
+export function renderChangeScope(input: ScopeInput, chunkIndex: number, seams?: string): string {
   const { coverage, plan } = input;
   const byPath = new Map(coverage.files.map((f) => [f.path, f]));
   const part = plan.chunks.find((c) => c.index === chunkIndex);
@@ -226,6 +226,13 @@ export function renderChangeScope(input: ScopeInput, chunkIndex: number): string
     for (const f of omitted) {
       lines.push(`  ${fileLine(f)} — ${f.omitReason ?? 'omitted'}/${f.kind}`);
     }
+  }
+  // The seam note (skeleton.ts computeSeams): the lines in the other parts that name what this
+  // part declares, and the other parts' declarations this part's hunks name — "go look" turned
+  // into "here is what to look at".
+  if (seams) {
+    lines.push('');
+    lines.push(seams);
   }
   return lines.join('\n');
 }

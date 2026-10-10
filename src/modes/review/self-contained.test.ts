@@ -24,6 +24,7 @@ import {
   storedToVoiceReview,
   runClaudeProducer,
   runHolisticStage,
+  runIntegrationStage,
 } from './self-contained';
 
 const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
@@ -1025,6 +1026,51 @@ describe('runClaudeProducer — parts run a few at a time and merge in part orde
     expect(maxInFlight).toBeGreaterThan(1);
     expect(res.claudeReview?.findings.map((f) => [f.chunk, f.evidence.file])).toEqual([[1, 'p1'], [2, 'p2'], [3, 'p3']]);
     expect(res.claudeParts?.map((p) => p.index)).toEqual([1, 2, 3]);
+    fs.rmSync(base, { force: true, recursive: true });
+  });
+});
+
+describe('runIntegrationStage — one seat over the skeleton, its review reaches the gate', () => {
+  it('persists review.integration.json and the layer loads it as a voice', async () => {
+    const base = tmpTrail();
+    const runId = 'integration';
+    seedCoreTrail(base, runId, [stored('codex')]);
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-sc-wt-'));
+    const prompts: string[] = [];
+    const run = async (prompt: string): Promise<VoiceRunResult> => {
+      if (prompt.includes('VERIFIED GATE')) return okRun(GATE);
+      prompts.push(prompt);
+      return okRun(JSON.stringify({ findings: [{ body: 'contract drift between a.go:3 and b.ts:9', confidence: 'high', evidence: { file: 'src/x.ts', line: 3 }, severity: 'high', title: 'client sends network, handler ignores it' }], summary: 'checked the recipient seam' }));
+    };
+    const integration = runIntegrationStage({
+      baseDir: base, baseSha: 'b'.repeat(40), config: CFG, expectedHeadSha: HEAD, run, runId,
+      scope: 'part 1 — backend\npart 2 — web', skeleton: '### a.go — part 1', worktree: wt,
+    });
+    const res = await runClaudeReviewLayer({
+      baseDir: base, claudeConfig: CFG, coreReviews: [stored('codex')], expectedHeadSha: HEAD, includeClaudeReviewer: false,
+      integration, reviewPrompt: 'P', run, runId, worktree: wt,
+    });
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('INTEGRATION seat');
+    expect(res.integrationReview?.ok).toBe(true);
+    expect(res.integrationReview?.findings[0].title).toBe('client sends network, handler ignores it');
+    expect(fs.existsSync(path.join(reviewDir(base, runId), 'review.integration.json'))).toBe(true);
+    // the gate saw the integration voice (its finding id is minted from the voice id)
+    expect(res.gateVerdicts.map((v) => v.findingId)).toContain('integration#1');
+    fs.rmSync(base, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  it('refuses without a worktree, loudly, with no spawn', async () => {
+    const base = tmpTrail();
+    let spawned = 0;
+    const res = await runIntegrationStage({
+      baseDir: base, baseSha: 'b'.repeat(40), config: CFG, expectedHeadSha: HEAD,
+      run: async () => { spawned++; return okRun('{}'); }, runId: 'no-wt', scope: 's', skeleton: 'k',
+    });
+    expect(spawned).toBe(0);
+    expect(res.integrationReview).toBeNull();
+    expect(res.integrationSkipped).toContain('NO worktree evidence');
     fs.rmSync(base, { force: true, recursive: true });
   });
 });

@@ -399,3 +399,42 @@ describe('runReviewMode — onPacketsReady fires before any core seat spawns', (
     expect(progress.some((m) => m.includes('onPacketsReady hook failed (caller bug)'))).toBe(true);
   });
 });
+
+describe('runReviewMode — a review in parts carries seams in each part and writes the skeleton', () => {
+  it('each part’s scope note names the other parts’ lines that touch its declarations; skeleton.md lands in the trail', async () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-seams-'));
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-seams-cwd-'));
+    const go = `diff --git a/backend/h.go b/backend/h.go\n--- a/backend/h.go\n+++ b/backend/h.go\n@@ -1,2 +1,5 @@\n package h\n+type CreateRecipientRequest struct {\n+\tNetwork string\n+}\n ${'x'.repeat(200)}\n`;
+    const ts = `diff --git a/web/c.ts b/web/c.ts\n--- a/web/c.ts\n+++ b/web/c.ts\n@@ -1,2 +1,4 @@\n import { http } from './http';\n+export async function createRecipient(req: CreateRecipientRequest): Promise<void> {\n+  await http.post('/recipients', req);\n+}\n ${'y'.repeat(200)}\n`;
+    const prompts: string[] = [];
+    const adapter: ReviewAdapter = async (prompt) => {
+      prompts.push(prompt);
+      return { ok: true, raw: REVIEW, stderrTail: '', timedOut: false };
+    };
+    let ready: { skeleton?: string } | undefined;
+    const res = await runReviewMode({
+      adapters: { claude: adapter, codex: adapter, grok: adapter },
+      ceilingBytes: 320,
+      conventionReader: null,
+      cwd,
+      diffMode: 'pr',
+      diffText: go + ts,
+      headShaOverride: 'a'.repeat(40),
+      noConventions: true,
+      onPacketsReady: (r) => { ready = r; },
+      out,
+      receiptStore: path.join(out, 'receipts'),
+      reviewers: ['grok'],
+      reviewersFile: NO_REVIEWERS_FILE,
+      runId: 'seams-run',
+    });
+    expect(res.acquired.plan.chunks).toHaveLength(2);
+    expect(prompts[0]).toContain('Other parts use what THIS part declares:');
+    expect(prompts[0]).toContain('CreateRecipientRequest (declared in backend/h.go) ← part 2 web/c.ts:2');
+    expect(prompts[1]).toContain('THIS part uses what other parts declare:');
+    expect(res.skeleton).toContain('### backend/h.go');
+    expect(ready?.skeleton).toBe(res.skeleton);
+    expect(fs.existsSync(path.join(reviewDir(out, 'seams-run'), 'skeleton.md'))).toBe(true);
+    for (const d of [out, cwd]) fs.rmSync(d, { force: true, recursive: true });
+  });
+});
