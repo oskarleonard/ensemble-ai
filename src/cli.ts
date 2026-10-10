@@ -13,6 +13,8 @@ import {
   type ConventionReader,
   fsConventionReader,
   gatherConventions,
+  gitConventionReader,
+  gitHasCommit,
 } from './core/conventions';
 import { isEntrypoint } from './core/entrypoint';
 import { evidenceRef, SEVERITY_LABEL, SEVERITY_ORDER } from './core/findings';
@@ -75,7 +77,11 @@ import {
   renderClaudeLayer,
   renderPremiseSimplify,
   resolveReviewRoster,
+  runClaudeProducer,
+  type ClaudeProducerOutcome,
   runClaudeReviewLayer,
+  runHolisticStage,
+  type HolisticStageOutcome,
 } from './modes/review/self-contained';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
 import {
@@ -1454,10 +1460,26 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       "· conventions: skipped — a URL PR's head SHA was unresolvable, so its conventions can't be fetched and the local repo's belong to a DIFFERENT repo"
     );
   }
+  // With a worktree, the conventions come out of the LOCAL clone at the PR's BASE ref
+  // (gitConventionReader) — the same ref and the same tracked-files view the gh reader gives a URL
+  // PR, without one API round-trip per candidate file (~25 min on a 411-file change). The clone
+  // must actually hold the base commit; otherwise the gh reader stays, and says so.
+  const gitConventions =
+    !noConventions && !source.noLocalConventions && worktree && source.prBaseSha
+      ? gitHasCommit(worktree.dir, source.prBaseSha)
+        ? gitConventionReader(worktree.dir, source.prBaseSha)
+        : null
+      : null;
+  if (!noConventions && !source.noLocalConventions && worktree && source.prBaseSha && !gitConventions) {
+    console.error(
+      `· conventions: the local clone does not hold the PR base ${source.prBaseSha.slice(0, 12)} — gathering through the GitHub API instead (slower)`
+    );
+  }
+  if (gitConventions) console.error(`· conventions: reading from the local clone at the PR base ${source.prBaseSha?.slice(0, 12)}`);
   const conventionReader =
     noConventions || source.noLocalConventions
       ? null
-      : buildConventionReader(cwd, source.conventionsCtx);
+      : (gitConventions ?? buildConventionReader(cwd, source.conventionsCtx));
 
   // Resolve the roster: the cross-vendor CORE (codex/grok — subset with `--reviewers`,
   // fail-closed on a typo) + whether the cold Opus (claude) reviewer + synthesis run
@@ -1644,6 +1666,84 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // (a base ref that cannot be resolved, a secret-scan block) come after the clear.
   clearReusedRunTrail(out, trailDir);
 
+  // THE ANTHROPIC STAGES START WITH THE PACKET, NOT AFTER THE CORE. The producer and the lens depend
+  // on the pinned packet (parts, diff, scope) and the tree — never on codex/grok's replies — so
+  // they are started from the engine's onPacketsReady hook and overlap the cross-vendor fan-out.
+  // On a change in parts this takes a whole seat-phase off the critical path. The layer below
+  // awaits these promises instead of spawning the stages itself.
+  let historyPacket: HistoryPacket | undefined;
+  let producerStage: Promise<ClaudeProducerOutcome> | undefined;
+  let lensStage: Promise<HolisticStageOutcome> | undefined;
+  const startAnthropicStages = (ready: { headSha: string; lensHandoff?: { diff: string; scope: string }; parts: { diff: string; index: number; label: string; prompt: string; scope?: string }[]; pinnedDiff: string; prompt: string }): void => {
+    if (!roster.claude || !anthropicSeats) return;
+    if (worktree && ready.pinnedDiff) {
+      const { capBytes, logCommits } = historyPacketConfig(readEnsembleConfig());
+      try {
+        historyPacket = buildHistoryPacket({
+          baseSha: worktree.baseSha,
+          capBytes,
+          diff: ready.pinnedDiff,
+          git: execGit(),
+          headSha: worktree.headSha,
+          logCommits,
+          strippedInstructionFiles: worktree.strippedInstructionFiles,
+          worktree: worktree.dir,
+        });
+        console.error(
+          historyPacket.shallow
+            ? '· history packet: SKIPPED — this checkout is a shallow clone, so its `git log`/`git blame` would be a misleading fragment; the seats are told nothing about a history they do not have'
+            : `· history packet: ${historyPacket.files.length - 1} file(s), ${historyPacket.bytes} bytes${historyPacket.truncated ? ' (truncated to the cap)' : ''}`
+        );
+      } catch (e) {
+        console.error(
+          `· history packet: could not be built (${(e as Error).message}) — the Anthropic seats review without it`
+        );
+      }
+    }
+    const stageBaseSha = source.prBaseSha ?? null;
+    const log = (m: string) => console.error(`· ${m}`);
+    console.error(
+      `· anthropic stages started alongside the core: producer (${ready.parts.length} part(s))${values.holistic ? ' + holistic lens' : ''}`
+    );
+    producerStage = runClaudeProducer({
+      baseDir: out,
+      baseSha: stageBaseSha,
+      ...(ciText ? { ciEvidence: ciText } : {}),
+      ...(ciEvidenceUnavailable ? { ciEvidenceUnavailable } : {}),
+      claudeConfig: anthropicSeats.claude.config,
+      expectedHeadSha: ready.headSha,
+      ...(historyPacket ? { historyPacket } : {}),
+      includeClaudeReviewer: true,
+      log,
+      ...(ready.parts.length > 1 ? { parts: ready.parts } : {}),
+      pinnedDiff: ready.pinnedDiff,
+      profile,
+      reviewPrompt: ready.prompt,
+      runId,
+      ...(worktree ? { worktree: worktree.dir } : {}),
+    });
+    // A rejection is caught by the layer's await (and its crash backstop); this only keeps an
+    // early failure from surfacing as an unhandled rejection while the core is still running.
+    producerStage.catch(() => {});
+    if (values.holistic) {
+      lensStage = runHolisticStage({
+        baseDir: out,
+        expectedHeadSha: ready.headSha,
+        ...(historyPacket ? { historyPacket } : {}),
+        holistic: {
+          baseSha: stageBaseSha,
+          ...(anthropicSeats.holistic ? { config: anthropicSeats.holistic } : {}),
+        },
+        ...(ready.lensHandoff ? { lensHandoff: ready.lensHandoff } : {}),
+        log,
+        pinnedDiff: ready.pinnedDiff,
+        runId,
+        ...(worktree ? { worktree: worktree.dir } : {}),
+      });
+      lensStage.catch(() => {});
+    }
+  };
+
   let result: ReviewModeResult;
   try {
     result = await runReviewMode({
@@ -1662,6 +1762,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       headShaOverride: source.headShaOverride,
       ...(maxChunks !== undefined ? { maxChunks } : {}),
       noConventions,
+      onPacketsReady: startAnthropicStages,
       onProgress: (m) => console.error(`· ${m}`),
       out,
       peerSeats,
@@ -1737,39 +1838,6 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       console.error(
         `· gate seat: CODEX (${gateSeat.config.model} @ ${gateSeat.config.effort}) — the fenced codex runner judges; the anthropic gate is off this run${values['shadow-gate'] ? ' (shadowing as the audit-only champion)' : ''}`
       );
-    // THE HISTORY PACKET (modes/review/history-packet.ts). The capability fence removed Bash from
-    // the Anthropic seats, which took away the `git log`/`git blame` a reviewer genuinely uses. The
-    // ENGINE runs those commands instead and seeds each fenced seat's own cwd with the answers as
-    // read-only data — restoring the acceptance principle (per seat, engine context >= the manual
-    // in-project baseline; the only permitted difference is the sandbox). Worktree runs only: a
-    // packet-mode seat has no repo to read a history out of. Best-effort — a git failure costs a
-    // file and a line in the packet's README, never the review.
-    let historyPacket: HistoryPacket | undefined;
-    if (worktree && result.pinnedDiff) {
-      const { capBytes, logCommits } = historyPacketConfig(readEnsembleConfig());
-      try {
-        historyPacket = buildHistoryPacket({
-          baseSha: worktree.baseSha,
-          capBytes,
-          diff: result.pinnedDiff,
-          git: execGit(),
-          headSha: worktree.headSha,
-          logCommits,
-          strippedInstructionFiles: worktree.strippedInstructionFiles,
-          worktree: worktree.dir,
-        });
-        console.error(
-          historyPacket.shallow
-            ? '· history packet: SKIPPED — this checkout is a shallow clone, so its `git log`/`git blame` would be a misleading fragment; the seats are told nothing about a history they do not have'
-            : `· history packet: ${historyPacket.files.length - 1} file(s), ${historyPacket.bytes} bytes${historyPacket.truncated ? ' (truncated to the cap)' : ''}`
-        );
-      } catch (e) {
-        console.error(
-          `· history packet: could not be built (${(e as Error).message}) — the Anthropic seats review without it`
-        );
-      }
-    }
-
     // The PR's base SHA when the compare API bound it (a URL PR), else the local diff's. It is
     // the range the worktree seats + the lens are told the change spans — never a receipt field.
     const layerBaseSha = source.prBaseSha ?? result.acquired.baseSha;
@@ -1857,6 +1925,9 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         // A review in PARTS (chunks.ts): the producer reviews each part the core saw, and the
         // lens is handed what one packet holds plus the listing of every other changed file.
         ...(result.parts && result.parts.length > 1 ? { parts: result.parts } : {}),
+        // The stages that started with the packet (startAnthropicStages) — awaited, not re-run.
+        ...(producerStage ? { producer: producerStage } : {}),
+        ...(lensStage ? { lens: lensStage } : {}),
         ...(result.lensHandoff ? { lensHandoff: result.lensHandoff } : {}),
         // `security --repo` must NOT have its security-auditor prompt replaced by the
         // `/code-review` skill's structural-quality lens (codex-f3).

@@ -164,9 +164,22 @@ export interface ReviewModeOptions {
   // part of the run's evidence INTENT — and therefore of `policyHash` — but this mode never spawns
   // them, so it records their intent and the caller records what they realized.
   peerSeats?: readonly EvidenceSeat[];
+  // Called ONCE, the moment the packet is pinned and BEFORE any core seat spawns, with everything
+  // the Anthropic producer and the lens need (they depend on the packet, never on the core seats'
+  // replies). A caller uses it to START those stages so they overlap the cross-vendor fan-out
+  // instead of following it. Not called on a secret-scan block (no packet is built).
+  onPacketsReady?: (ready: PacketsReady) => void;
   // The materialized worktree (spec §1). Absent ⇒ every seat reviews the packet, the receipt hashes
   // under the legacy (v1) schema, and nothing about the packet path changes.
   worktree?: WorktreeEvidence;
+}
+
+export interface PacketsReady {
+  headSha: string;
+  lensHandoff?: { diff: string; scope: string };
+  parts: ReviewPart[];
+  pinnedDiff: string;
+  prompt: string;
 }
 
 export interface ReviewModeResult {
@@ -497,6 +510,17 @@ export async function runReviewMode(
       diff: parts.filter((p) => shown.includes(p.index)).map((p) => p.diff).join(''),
       scope: boundedScope(renderLensScope(scopeInput, shown)),
     };
+  }
+
+  // Everything the Anthropic stages need is pinned now — hand it over before the fan-out so a
+  // caller can run them alongside the core seats. A throwing hook is the caller's bug and must not
+  // take the paid review down with it: reported, then the fan-out proceeds.
+  if (opts.onPacketsReady) {
+    try {
+      opts.onPacketsReady({ headSha: acquired.headSha, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt });
+    } catch (e) {
+      log(`onPacketsReady hook failed (${(e as Error).message}) — the Anthropic stages will run after the core instead`);
+    }
   }
 
   log(

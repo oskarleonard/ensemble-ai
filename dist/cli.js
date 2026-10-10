@@ -617,6 +617,50 @@ function fsConventionReader(repoRoot) {
     }
   };
 }
+function gitHasCommit(repoDir, sha) {
+  try {
+    execFileSync("git", ["-C", repoDir, "cat-file", "-e", `${sha}^{commit}`], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function gitConventionReader(repoDir, ref) {
+  const dir = path2.resolve(repoDir);
+  const clean = (rel) => {
+    const n = rel.replace(/^\.\//, "").replace(/\/+$/, "");
+    if (!n || path2.isAbsolute(n) || n.split("/").some((seg) => seg === ".." || seg === "")) return null;
+    return n;
+  };
+  const MAX_BLOB = 16 * 1024 * 1024;
+  return {
+    async read(rel, maxBytes) {
+      const p = clean(rel);
+      if (!p) return null;
+      try {
+        const type = execFileSync("git", ["-C", dir, "cat-file", "-t", `${ref}:${p}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+        if (type !== "blob") return null;
+        const size = Number(execFileSync("git", ["-C", dir, "cat-file", "-s", `${ref}:${p}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim());
+        if (!Number.isFinite(size) || size > MAX_BLOB) return null;
+        const buf = execFileSync("git", ["-C", dir, "cat-file", "blob", `${ref}:${p}`], { maxBuffer: MAX_BLOB + 1024, stdio: ["ignore", "pipe", "ignore"] });
+        const want = maxBytes === void 0 ? buf : buf.subarray(0, Math.min(maxBytes, buf.length));
+        return want.toString("utf8").replace(/�$/, "");
+      } catch {
+        return null;
+      }
+    },
+    async list(dirRel) {
+      const p = clean(dirRel);
+      if (!p) return [];
+      try {
+        const out = execFileSync("git", ["-C", dir, "ls-tree", "--name-only", `${ref}:${p}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+        return out.split("\n").map((n) => n.trim()).filter((n) => n.endsWith(".md")).map((n) => joinDir(p, n));
+      } catch {
+        return [];
+      }
+    }
+  };
+}
 
 // src/core/entrypoint.ts
 import fs3 from "fs";
@@ -9425,6 +9469,13 @@ async function runReviewMode(opts) {
       scope: boundedScope(renderLensScope(scopeInput, shown))
     };
   }
+  if (opts.onPacketsReady) {
+    try {
+      opts.onPacketsReady({ headSha: acquired.headSha, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt });
+    } catch (e) {
+      log(`onPacketsReady hook failed (${e.message}) \u2014 the Anthropic stages will run after the core instead`);
+    }
+  }
   log(
     reviewers.length > 0 ? `Running ${reviewers.length} reviewer(s): ${reviewers.join(", ")}\u2026` : "Running 0 core reviewer(s) \u2014 claude-only: the Opus reviewer, the lens (when requested) and the gate are the reviewers of record; no cross-vendor receipt will qualify"
   );
@@ -9995,7 +10046,7 @@ async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log, work
 function claudeModelLabel(config) {
   return config.model && config.model !== "default" ? config.model : "opus";
 }
-async function runClaudeReviewLayer(opts) {
+async function runClaudeProducer(opts) {
   const log = opts.log ?? (() => {
   });
   const run = opts.run ?? runClaudeReviewVoice;
@@ -10108,21 +10159,12 @@ ${p.raw}`);
       };
     }
   }
-  const coreVoices = opts.coreReviews.map(storedToVoiceReview);
-  for (const v of coreVoices) {
-    try {
-      writeTrailFile(opts.baseDir, opts.runId, `review.${v.voiceId}.md`, renderReviewMarkdown(v));
-    } catch (e) {
-      log(`  \xB7 trail write review.${v.voiceId}.md failed (${e.message}) \u2014 continuing`);
-    }
-  }
-  if (claudeReview) {
-    try {
-      writeTrailFile(opts.baseDir, opts.runId, "review.claude.md", renderReviewMarkdown(claudeReview));
-    } catch (e) {
-      log(`  \xB7 trail write review.claude.md failed (${e.message}) \u2014 continuing`);
-    }
-  }
+  return { ...claudeParts ? { claudeParts } : {}, claudeReview, claudeSpawned };
+}
+async function runHolisticStage(opts) {
+  const log = opts.log ?? (() => {
+  });
+  const run = opts.run ?? runClaudeReviewVoice;
   const holistic = opts.holistic;
   const lensDiff = opts.lensHandoff?.diff ?? opts.pinnedDiff;
   const lensScope = opts.lensHandoff?.scope;
@@ -10167,6 +10209,34 @@ ${p.raw}`);
       log(`  \xB7 trail write review.${HOLISTIC_SEAT_ID}.md failed (${e.message}) \u2014 continuing`);
     }
   }
+  return { holisticReview, holisticSkipped: plan.run ? null : plan.skipReason };
+}
+async function runClaudeReviewLayer(opts) {
+  const log = opts.log ?? (() => {
+  });
+  const run = opts.run ?? runClaudeReviewVoice;
+  const modelLabel = claudeModelLabel(opts.claudeConfig);
+  const produced = opts.producer ? await opts.producer : await runClaudeProducer(opts);
+  const claudeReview = produced.claudeReview;
+  const claudeSpawned = produced.claudeSpawned;
+  const claudeParts = produced.claudeParts;
+  const coreVoices = opts.coreReviews.map(storedToVoiceReview);
+  for (const v of coreVoices) {
+    try {
+      writeTrailFile(opts.baseDir, opts.runId, `review.${v.voiceId}.md`, renderReviewMarkdown(v));
+    } catch (e) {
+      log(`  \xB7 trail write review.${v.voiceId}.md failed (${e.message}) \u2014 continuing`);
+    }
+  }
+  if (claudeReview) {
+    try {
+      writeTrailFile(opts.baseDir, opts.runId, "review.claude.md", renderReviewMarkdown(claudeReview));
+    } catch (e) {
+      log(`  \xB7 trail write review.claude.md failed (${e.message}) \u2014 continuing`);
+    }
+  }
+  const lensOutcome = opts.lens ? await opts.lens : await runHolisticStage(opts);
+  const holisticReview = lensOutcome.holisticReview;
   const voiceReviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
   const gate = await runGate({
     baseDir: opts.baseDir,
@@ -10239,7 +10309,7 @@ ${p.raw}`);
     gateTrailWritten: gate.gateTrailWritten,
     gateVerdicts,
     holisticReview,
-    holisticSkipped: plan.run ? null : plan.skipReason,
+    holisticSkipped: lensOutcome.holisticSkipped,
     modelLabel,
     settlements,
     settlerSkipped,
@@ -12978,7 +13048,14 @@ async function runReviewPipeline(input) {
       "\xB7 conventions: skipped \u2014 a URL PR's head SHA was unresolvable, so its conventions can't be fetched and the local repo's belong to a DIFFERENT repo"
     );
   }
-  const conventionReader = noConventions || source.noLocalConventions ? null : buildConventionReader(cwd, source.conventionsCtx);
+  const gitConventions = !noConventions && !source.noLocalConventions && worktree && source.prBaseSha ? gitHasCommit(worktree.dir, source.prBaseSha) ? gitConventionReader(worktree.dir, source.prBaseSha) : null : null;
+  if (!noConventions && !source.noLocalConventions && worktree && source.prBaseSha && !gitConventions) {
+    console.error(
+      `\xB7 conventions: the local clone does not hold the PR base ${source.prBaseSha.slice(0, 12)} \u2014 gathering through the GitHub API instead (slower)`
+    );
+  }
+  if (gitConventions) console.error(`\xB7 conventions: reading from the local clone at the PR base ${source.prBaseSha?.slice(0, 12)}`);
+  const conventionReader = noConventions || source.noLocalConventions ? null : gitConventions ?? buildConventionReader(cwd, source.conventionsCtx);
   const noClaude = Boolean(values["no-claude"]);
   const requestedReviewers = typeof values.reviewers === "string" ? values.reviewers.split(",") : void 0;
   const roster = resolveReviewRoster(requestedReviewers, noClaude);
@@ -13079,6 +13156,76 @@ async function runReviewPipeline(input) {
     if (!anthropicSeats) return 3;
   }
   clearReusedRunTrail(out, trailDir);
+  let historyPacket;
+  let producerStage;
+  let lensStage;
+  const startAnthropicStages = (ready) => {
+    if (!roster.claude || !anthropicSeats) return;
+    if (worktree && ready.pinnedDiff) {
+      const { capBytes, logCommits } = historyPacketConfig(readEnsembleConfig());
+      try {
+        historyPacket = buildHistoryPacket({
+          baseSha: worktree.baseSha,
+          capBytes,
+          diff: ready.pinnedDiff,
+          git: execGit(),
+          headSha: worktree.headSha,
+          logCommits,
+          strippedInstructionFiles: worktree.strippedInstructionFiles,
+          worktree: worktree.dir
+        });
+        console.error(
+          historyPacket.shallow ? "\xB7 history packet: SKIPPED \u2014 this checkout is a shallow clone, so its `git log`/`git blame` would be a misleading fragment; the seats are told nothing about a history they do not have" : `\xB7 history packet: ${historyPacket.files.length - 1} file(s), ${historyPacket.bytes} bytes${historyPacket.truncated ? " (truncated to the cap)" : ""}`
+        );
+      } catch (e) {
+        console.error(
+          `\xB7 history packet: could not be built (${e.message}) \u2014 the Anthropic seats review without it`
+        );
+      }
+    }
+    const stageBaseSha = source.prBaseSha ?? null;
+    const log = (m) => console.error(`\xB7 ${m}`);
+    console.error(
+      `\xB7 anthropic stages started alongside the core: producer (${ready.parts.length} part(s))${values.holistic ? " + holistic lens" : ""}`
+    );
+    producerStage = runClaudeProducer({
+      baseDir: out,
+      baseSha: stageBaseSha,
+      ...ciText ? { ciEvidence: ciText } : {},
+      ...ciEvidenceUnavailable ? { ciEvidenceUnavailable } : {},
+      claudeConfig: anthropicSeats.claude.config,
+      expectedHeadSha: ready.headSha,
+      ...historyPacket ? { historyPacket } : {},
+      includeClaudeReviewer: true,
+      log,
+      ...ready.parts.length > 1 ? { parts: ready.parts } : {},
+      pinnedDiff: ready.pinnedDiff,
+      profile,
+      reviewPrompt: ready.prompt,
+      runId,
+      ...worktree ? { worktree: worktree.dir } : {}
+    });
+    producerStage.catch(() => {
+    });
+    if (values.holistic) {
+      lensStage = runHolisticStage({
+        baseDir: out,
+        expectedHeadSha: ready.headSha,
+        ...historyPacket ? { historyPacket } : {},
+        holistic: {
+          baseSha: stageBaseSha,
+          ...anthropicSeats.holistic ? { config: anthropicSeats.holistic } : {}
+        },
+        ...ready.lensHandoff ? { lensHandoff: ready.lensHandoff } : {},
+        log,
+        pinnedDiff: ready.pinnedDiff,
+        runId,
+        ...worktree ? { worktree: worktree.dir } : {}
+      });
+      lensStage.catch(() => {
+      });
+    }
+  };
   let result;
   try {
     result = await runReviewMode({
@@ -13097,6 +13244,7 @@ async function runReviewPipeline(input) {
       headShaOverride: source.headShaOverride,
       ...maxChunks !== void 0 ? { maxChunks } : {},
       noConventions,
+      onPacketsReady: startAnthropicStages,
       onProgress: (m) => console.error(`\xB7 ${m}`),
       out,
       peerSeats,
@@ -13140,29 +13288,6 @@ async function runReviewPipeline(input) {
       console.error(
         `\xB7 gate seat: CODEX (${gateSeat.config.model} @ ${gateSeat.config.effort}) \u2014 the fenced codex runner judges; the anthropic gate is off this run${values["shadow-gate"] ? " (shadowing as the audit-only champion)" : ""}`
       );
-    let historyPacket;
-    if (worktree && result.pinnedDiff) {
-      const { capBytes, logCommits } = historyPacketConfig(readEnsembleConfig());
-      try {
-        historyPacket = buildHistoryPacket({
-          baseSha: worktree.baseSha,
-          capBytes,
-          diff: result.pinnedDiff,
-          git: execGit(),
-          headSha: worktree.headSha,
-          logCommits,
-          strippedInstructionFiles: worktree.strippedInstructionFiles,
-          worktree: worktree.dir
-        });
-        console.error(
-          historyPacket.shallow ? "\xB7 history packet: SKIPPED \u2014 this checkout is a shallow clone, so its `git log`/`git blame` would be a misleading fragment; the seats are told nothing about a history they do not have" : `\xB7 history packet: ${historyPacket.files.length - 1} file(s), ${historyPacket.bytes} bytes${historyPacket.truncated ? " (truncated to the cap)" : ""}`
-        );
-      } catch (e) {
-        console.error(
-          `\xB7 history packet: could not be built (${e.message}) \u2014 the Anthropic seats review without it`
-        );
-      }
-    }
     const layerBaseSha = source.prBaseSha ?? result.acquired.baseSha;
     try {
       claudeLayer = await runClaudeReviewLayer({
@@ -13234,6 +13359,9 @@ async function runReviewPipeline(input) {
         // A review in PARTS (chunks.ts): the producer reviews each part the core saw, and the
         // lens is handed what one packet holds plus the listing of every other changed file.
         ...result.parts && result.parts.length > 1 ? { parts: result.parts } : {},
+        // The stages that started with the packet (startAnthropicStages) — awaited, not re-run.
+        ...producerStage ? { producer: producerStage } : {},
+        ...lensStage ? { lens: lensStage } : {},
         ...result.lensHandoff ? { lensHandoff: result.lensHandoff } : {},
         // `security --repo` must NOT have its security-auditor prompt replaced by the
         // `/code-review` skill's structural-quality lens (codex-f3).

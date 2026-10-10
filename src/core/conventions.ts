@@ -674,3 +674,65 @@ export function memoryConventionReader(
     },
   };
 }
+
+// A git-object-backed reader: the repo's conventions AT A REF, read out of a local clone with
+// `git cat-file` / `git ls-tree`. The equivalent of the gh-backed reader a URL-PR review uses
+// (same ref, same tracked-files-only view, same silent misses) without one API round-trip per
+// candidate file: on a 411-file change the gh reader took ~25 min of a 67-min run
+// (2026-10-10-18-51-44-9acc127a) while the clone it could have read sat on disk. The ref is the
+// PR's BASE, never its head — the conventions a PR is judged against must not be the PR's own
+// edits to them (the same rule the gh reader keeps). Only tracked blobs are reachable, so an
+// ignored local file can never leak in. A ref the clone does not have ⇒ the caller must not build
+// this reader (gitHasCommit) — it falls back to gh, loudly.
+export function gitHasCommit(repoDir: string, sha: string): boolean {
+  try {
+    execFileSync('git', ['-C', repoDir, 'cat-file', '-e', `${sha}^{commit}`], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function gitConventionReader(repoDir: string, ref: string): ConventionReader {
+  const dir = path.resolve(repoDir);
+  // A repo-relative path only: no absolute paths, no `..` — git would otherwise resolve
+  // `ref:../x` relative to the tree root anyway, but the rule is explicit, not inherited.
+  const clean = (rel: string): string | null => {
+    const n = rel.replace(/^\.\//, '').replace(/\/+$/, '');
+    if (!n || path.isAbsolute(n) || n.split('/').some((seg) => seg === '..' || seg === '')) return null;
+    return n;
+  };
+  // Blob sizes beyond this are not conventions docs; refusing them keeps the read bounded.
+  const MAX_BLOB = 16 * 1024 * 1024;
+  return {
+    async read(rel, maxBytes) {
+      const p = clean(rel);
+      if (!p) return null;
+      try {
+        const type = execFileSync('git', ['-C', dir, 'cat-file', '-t', `${ref}:${p}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        if (type !== 'blob') return null;
+        const size = Number(execFileSync('git', ['-C', dir, 'cat-file', '-s', `${ref}:${p}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim());
+        if (!Number.isFinite(size) || size > MAX_BLOB) return null;
+        const buf = execFileSync('git', ['-C', dir, 'cat-file', 'blob', `${ref}:${p}`], { maxBuffer: MAX_BLOB + 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+        const want = maxBytes === undefined ? buf : buf.subarray(0, Math.min(maxBytes, buf.length));
+        return want.toString('utf8').replace(/�$/, '');
+      } catch {
+        return null; // missing at this ref, a directory, or unreadable — silent, like the gh reader's 404
+      }
+    },
+    async list(dirRel) {
+      const p = clean(dirRel);
+      if (!p) return [];
+      try {
+        const out = execFileSync('git', ['-C', dir, 'ls-tree', '--name-only', `${ref}:${p}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+        return out
+          .split('\n')
+          .map((n) => n.trim())
+          .filter((n) => n.endsWith('.md'))
+          .map((n) => joinDir(p, n));
+      } catch {
+        return [];
+      }
+    },
+  };
+}

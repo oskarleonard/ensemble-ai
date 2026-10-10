@@ -22,6 +22,8 @@ import {
   resolveReviewRoster,
   runClaudeReviewLayer,
   storedToVoiceReview,
+  runClaudeProducer,
+  runHolisticStage,
 } from './self-contained';
 
 const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
@@ -967,5 +969,37 @@ describe('runClaudeReviewLayer — the producer reviews a change in parts', () =
     expect(lensPrompts[0]).not.toContain('diff --git a/web/c.ts');
     fs.rmSync(base, { force: true, recursive: true });
     fs.rmSync(wt, { force: true, recursive: true });
+  });
+});
+
+// A caller that started the producer and the lens alongside the core hands the layer the
+// promises; the layer awaits them and spawns neither a second time.
+describe('runClaudeReviewLayer — pre-started producer and lens are awaited, never re-run', () => {
+  it('uses the handed-in outcomes and still runs the gate over the union', async () => {
+    const base = tmpTrail();
+    const runId = 'prestarted';
+    seedCoreTrail(base, runId, [stored('codex')]);
+    let producerSpawns = 0;
+    const producerRun = async (): Promise<VoiceRunResult> => {
+      producerSpawns++;
+      return okRun(CLAUDE_REVIEW);
+    };
+    const producer = runClaudeProducer({
+      baseDir: base, claudeConfig: CFG, expectedHeadSha: HEAD, includeClaudeReviewer: true, reviewPrompt: 'PROMPT', run: producerRun, runId,
+    });
+    const lens = runHolisticStage({ baseDir: base, expectedHeadSha: HEAD, run: producerRun, runId });
+    const { calls, run } = makeRunner();
+    const res = await runClaudeReviewLayer({
+      baseDir: base, claudeConfig: CFG, coreReviews: [stored('codex')], expectedHeadSha: HEAD, includeClaudeReviewer: true,
+      lens, producer, reviewPrompt: 'PROMPT', run, runId,
+    });
+    expect(producerSpawns).toBe(1); // the producer ran once, in the pre-started stage
+    expect(calls.map((c) => c.round)).toEqual(['gate']); // the layer's own runner only gated
+    expect(res.claudeReview?.ok).toBe(true);
+    expect(res.claudeReview?.findings[0].title).toBe('claude bug');
+    expect(res.holisticReview).toBeNull();
+    expect(res.holisticSkipped).toBeNull(); // not requested
+    expect(res.gateVerdicts.map((v) => v.findingId).sort()).toEqual(['claude#1', 'codex#1']);
+    fs.rmSync(base, { force: true, recursive: true });
   });
 });
