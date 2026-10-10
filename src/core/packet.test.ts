@@ -7,6 +7,7 @@ import {
   PACKET_BUDGETS,
   type PacketInput,
   reviewerVisibleDiff,
+  SCOPE_SECTION_TITLE,
   segmentsWithoutTruncationSplices,
   TRUNCATION_MARKER_RE,
 } from './packet';
@@ -241,7 +242,7 @@ describe('assembleCodePacket — CI evidence section', () => {
 describe('the diff section follows the coverage ceiling', () => {
   // The regression: a caller raised --ceiling to 500 KB, coverage admitted 150 files (~500 K chars),
   // and the packet — budgeted at the 200 K floor — spliced 300 K of them out in path order while the
-  // coverage listing still said "150 reviewed" (run 2026-10-10-14-16-53-f5983e4d, lisk-app#409).
+  // coverage listing still said "150 reviewed" (run 2026-10-10-14-16-53-f5983e4d).
   const file = (name: string, n: number): string => `diff --git a/${name} b/${name}\n+${'x'.repeat(n)}\n`;
   const overFloor = file('src/a.ts', PACKET_BUDGETS.diff) + file('src/z.ts', 50_000);
   const base = { objective: 'o', pr: 1, repo: 'r' };
@@ -266,5 +267,26 @@ describe('the diff section follows the coverage ceiling', () => {
     const under = file('src/a.ts', 100_000);
     const p = assembleCodePacket({ ...base, diff: under, diffBudget: 1_000 });
     expect(reviewerVisibleDiff(p).truncated).toBe(false);
+  });
+});
+
+describe('the change-scope section (a review in parts)', () => {
+  const base: PacketInput = { diff: 'diff --git a/x b/x\n+'.padEnd(400, 'x'), objective: 'o', pr: 0, repo: 'r' };
+
+  it('is absent when no scope is given — the packet is byte-identical to before parts existed', () => {
+    const p = assembleCodePacket(base);
+    expect(p.sections.map((s) => s.title)).not.toContain(SCOPE_SECTION_TITLE);
+  });
+
+  it('precedes the diff section and carries the note whole', () => {
+    const scope = 'PART 2 of 3: web\nFiles in THIS part:\n  web/c.ts (+1/-1)';
+    const p = assembleCodePacket({ ...base, scope });
+    const titles = p.sections.map((s) => s.title);
+    expect(titles.indexOf(SCOPE_SECTION_TITLE)).toBeLessThan(titles.indexOf(DIFF_SECTION_TITLE));
+    const s = p.sections.find((x) => x.title === SCOPE_SECTION_TITLE);
+    expect(s?.included).toBe(true);
+    expect(s?.truncated).toBe(false);
+    expect(s?.body).toBe(scope);
+    expect(PACKET_BUDGETS.scope).toBeGreaterThanOrEqual(64_000);
   });
 });

@@ -81,6 +81,7 @@ function result(over: Partial<ReviewModeResult>): ReviewModeResult {
       files: [],
       headSha: 'h',
       mode: 'working-tree',
+      plan: { ceilingBytes: 200_000, chunks: [], overflow: [] },
       rawDiff: '',
       repoId: null,
     },

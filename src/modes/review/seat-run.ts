@@ -38,6 +38,10 @@ export interface SeatRunResult {
 
 export interface RunCoreSeatArgs {
   adapter: ReviewAdapter;
+  // The review PART's artifact suffix (`c2`), when this seat run is one part of several — its
+  // files land beside the reviewer's merged set (core/artifacts PersistReviewInput). Absent ⇒
+  // the canonical files, as before.
+  artifactSuffix?: string;
   log: (m: string) => void;
   out: string;
   packet: ReturnType<typeof assembleCodePacket>;
@@ -139,6 +143,7 @@ function persistAttempt(
       result.failWhy ||
       `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || 'no output'}`;
   return persistReview(args.out, {
+    ...(args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {}),
     diagnostics: seatDiagnostics(result, timing),
     findings: parsed?.findings ?? [],
     packet: args.packet,
@@ -165,6 +170,7 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
       fallbackReason: null,
       realized: 'packet',
       review: persistReview(args.out, {
+        ...(args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {}),
         findings: [],
         packet: args.packet,
         prompt: args.packetPrompt,

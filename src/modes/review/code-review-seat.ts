@@ -149,6 +149,10 @@ export interface CodeReviewSeatPromptArgs {
   // `git log`/`git blame` the fence took away. Omitted ⇒ no clause, because a prompt must never
   // name evidence that is not there (a shallow clone builds no packet).
   history?: boolean;
+  // The change-scope note when the change is reviewed in PARTS (./chunks renderChangeScope):
+  // `diff` is then one part, and the seat is told which other changed files exist. Omitted ⇒
+  // `diff` is the whole change, as before.
+  scope?: string;
   // The detached, read-only worktree of the PR head — the whole project, as Oskar sees it when
   // he opens a CLI in-project. Reached by ABSOLUTE path: it is a read root, not the seat's cwd.
   worktree: string;
@@ -186,7 +190,7 @@ You have NO shell and NO network: there is no Bash tool, so do not try to run \`
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: 'reach every file', worktree: args.worktree })} Read any file there for whole-project context: a finding may
 cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from).
 
-${materializedDiffClause(args)}${ci}
+${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...(args.scope ? { scope: args.scope } : {}) })}${ci}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 

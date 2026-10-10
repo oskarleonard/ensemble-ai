@@ -1,6 +1,9 @@
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import nodePath from 'node:path';
 
 import { sha256Hex } from '../../core/hash';
+import { type ChunkPlan, DEFAULT_MAX_CHUNKS, planChunks } from './chunks';
 import { scrubRepoEnv } from './git-exec';
 
 // Diff acquisition + the canonical-diff content digest + per-file COVERAGE.
@@ -51,7 +54,9 @@ const GENERATED_PATTERNS: RegExp[] = [
   /(^|\/)(generated|__generated__)\//,
   /\.gen\.[a-z]+$/,
   /\.pb\.go$/,
-  /[._]generated\.[a-z]+$/,
+  // `-generated.json` joins `.generated.*` / `_generated.*`: an emitted API spec named that way
+  // (an `api-specs/<service>-generated.json`, 66 KB on run 2026-10-10-18-51-44-9acc127a) is generator output too.
+  /[._-]generated\.[a-z]+$/,
 ];
 
 // A generator's own fingerprint on the file's FIRST line: Go's canonical
@@ -63,7 +68,9 @@ const GENERATED_FIRST_LINE = /Code generated .*DO NOT EDIT|@generated\b|DO NOT E
 // top-of-file edit): a mid-file hunk of a generated file shows no header and stays `source`,
 // which fails CLOSED (it costs budget, it never un-reviews a hand-written file); and a
 // hand-written file that merely mentions the marker further down (a generator's template) is
-// not caught.
+// not caught. When the run HAS the tree (a worktree), the first line is read from the FILE
+// instead — see `classifyFileKind`'s `firstLine` — so a mid-file hunk of an ORM client is
+// classed by what the file says about itself, not by what the hunk happens to show.
 export function hasGeneratedHeader(section: string): boolean {
   const lines = section.split('\n');
   const at = lines.findIndex((l) => /^@@ -\d+(?:,\d+)? \+1(?:,\d+)? @@/.test(l));
@@ -76,10 +83,52 @@ export function hasGeneratedHeader(section: string): boolean {
   return false;
 }
 
-export function classifyFileKind(path: string, isBinary: boolean, section = ''): FileKind {
+// The first-line test on a line read from the file itself (worktree evidence). The same
+// fingerprint `hasGeneratedHeader` applies to a hunk — one rule, two sources.
+export function hasGeneratedFirstLine(line: string | null | undefined): boolean {
+  return typeof line === 'string' && GENERATED_FIRST_LINE.test(line);
+}
+
+// `firstLine` is the file's own first line at the PR head when the run has a worktree (null for
+// a deleted file or an unreadable one). Run 2026-10-10-18-51-44-9acc127a: 50 ent
+// ORM files under `gen/ent/` changed mid-file, so no hunk showed their `Code generated` header,
+// they were classed `source`, and their 348 KB took the ceiling budget ahead of hand-written
+// code. The path patterns above cannot name `gen/` (see the note there); the file's first line
+// can, and it is the generator's own statement.
+export function classifyFileKind(
+  path: string,
+  isBinary: boolean,
+  section = '',
+  firstLine?: string | null
+): FileKind {
   if (isBinary) return 'binary';
   if (GENERATED_PATTERNS.some((re) => re.test(path))) return 'generated';
-  return section && hasGeneratedHeader(section) ? 'generated' : 'source';
+  if (section && hasGeneratedHeader(section)) return 'generated';
+  return hasGeneratedFirstLine(firstLine) ? 'generated' : 'source';
+}
+
+// A first-line reader over a checked-out tree: `path` is repo-relative (as the diff names it) and
+// is confined to `dir` — a diff path that escapes the tree (`../`, an absolute path) reads nothing.
+// Reads at most the first 512 bytes; a missing file (deleted in the PR) is null.
+export function worktreeFirstLineReader(dir: string): (path: string) => string | null {
+  const root = nodePath.resolve(dir);
+  return (p: string): string | null => {
+    const full = nodePath.resolve(root, p);
+    if (full !== root && !full.startsWith(root + nodePath.sep)) return null;
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(full, 'r');
+      const buf = Buffer.alloc(512);
+      const n = fs.readSync(fd, buf, 0, 512, 0);
+      const text = buf.subarray(0, n).toString('utf8');
+      const nl = text.indexOf('\n');
+      return nl < 0 ? text : text.slice(0, nl);
+    } catch {
+      return null;
+    } finally {
+      if (fd !== null) fs.closeSync(fd);
+    }
+  };
 }
 
 // Test files, for the admission ORDER in computeCoverage (never for omission: a test is source,
@@ -125,9 +174,16 @@ function pathOfSection(section: string): string {
   return 'unknown';
 }
 
+export interface ParseDiffOptions {
+  // The file's own first line at the PR head (worktree evidence), consulted only for a file no
+  // path pattern and no hunk header already classed — see classifyFileKind. Absent ⇒ hunk-only
+  // classification, byte-identical to the packet-mode behavior.
+  readFirstLine?: (path: string) => string | null;
+}
+
 // Split a unified diff into per-file sections (each starts at a `diff --git`
 // line) and classify each. PURE — feed it a diff string, get structured files.
-export function parseDiffFiles(raw: string): FileDiff[] {
+export function parseDiffFiles(raw: string, opts: ParseDiffOptions = {}): FileDiff[] {
   if (!raw.trim()) return [];
   // Anchor splits to a `diff --git` at column 0 (a hunk body line that merely
   // starts with "diff --git" can't, since hunk content is prefixed by +/-/space).
@@ -143,11 +199,17 @@ export function parseDiffFiles(raw: string): FileDiff[] {
       if (line.startsWith('+') && !line.startsWith('+++')) added++;
       else if (line.startsWith('-') && !line.startsWith('---')) removed++;
     }
+    // The tree is consulted LAST and only when it can change the answer: a path pattern or a
+    // hunk header already settles most files, and a reader call per file is a disk read.
+    let kind = classifyFileKind(path, isBinary, section);
+    if (kind === 'source' && opts.readFirstLine && path !== 'unknown') {
+      kind = classifyFileKind(path, isBinary, section, opts.readFirstLine(path));
+    }
     return {
       added,
       bytes: Buffer.byteLength(section, 'utf8'),
       isBinary,
-      kind: classifyFileKind(path, isBinary, section),
+      kind,
       path,
       raw: section,
       removed,
@@ -158,6 +220,9 @@ export function parseDiffFiles(raw: string): FileDiff[] {
 export interface CoverageFileEntry {
   added: number;
   bytes: number;
+  // The 1-based review PART this file's hunks shipped in (chunks.ts). Present on every included
+  // file; `1` for the whole of a change that fit one packet.
+  chunk?: number;
   included: boolean;
   kind: FileKind;
   omitReason?: OmitReason;
@@ -166,6 +231,10 @@ export interface CoverageFileEntry {
 }
 
 export interface Coverage {
+  // How many review PARTS the included files were planned into (1 = one packet, as before).
+  // Optional on the type because a Coverage is also rebuilt from older trails and receipts
+  // that never recorded it; computeCoverage always sets it.
+  chunks?: number;
   files: CoverageFileEntry[];
   includedBytes: number;
   includedFiles: number;
@@ -213,26 +282,27 @@ export function omittedLine(o: {
 // concatenated into the diff the packet carries in ADMISSION order — non-test source
 // first, then tests — so the reviewer reads the change before its tests, and if a
 // downstream budget ever cuts the shipped diff, the cut eats tests before the change:
-// run 2026-10-10-14-16-53-f5983e4d (lisk-app#409) shipped in path order under a
+// run 2026-10-10-14-16-53-f5983e4d shipped in path order under a
 // packet budget below the ceiling, and the head+tail splice landed on the one module
 // the PR was about while 65 KB of spec files survived ahead of it.
+//
+// CHUNKED (chunks.ts): a change over the ceiling is no longer cut at the ceiling. The source
+// files are planned into PARTS, each within the ceiling, each a whole packet for every seat;
+// `over-limit` survives only for files past `maxChunks` parts (NAMED, as before). A change that
+// fits one part is planned exactly as the single-packet rule above — same files, same order,
+// same bytes. `includedDiff` is the UNION of every part's diff (what the gate pins); the parts
+// themselves ride on `plan`.
 export function computeCoverage(
   files: FileDiff[],
-  ceilingBytes: number = DEFAULT_COVERAGE_CEILING
-): { coverage: Coverage; includedDiff: string } {
+  ceilingBytes: number = DEFAULT_COVERAGE_CEILING,
+  opts: { maxChunks?: number } = {}
+): { coverage: Coverage; includedDiff: string; plan: ChunkPlan } {
   const source = files.filter((f) => f.kind === 'source');
-  const admitted = new Set<FileDiff>();
-  const includedSections: string[] = [];
-  let includedBytes = 0;
-  for (const f of [...source.filter((f) => !isTestPath(f.path)), ...source.filter((f) => isTestPath(f.path))]) {
-    // The first admitted file always fits, even alone over the ceiling — a review of
-    // nothing is worse than a review of one large file.
-    if (includedBytes + f.bytes > ceilingBytes && includedBytes > 0) continue;
-    admitted.add(f);
-    includedSections.push(f.raw);
-    includedBytes += f.bytes;
-  }
+  const plan = planChunks(source, ceilingBytes, opts.maxChunks ?? DEFAULT_MAX_CHUNKS);
+  const chunkOf = new Map<FileDiff, number>();
+  for (const c of plan.chunks) for (const f of c.files) chunkOf.set(f, c.index);
   const entries: CoverageFileEntry[] = [];
+  let includedBytes = 0;
   for (const f of files) {
     const base = {
       added: f.added,
@@ -249,13 +319,16 @@ export function computeCoverage(
       entries.push({ ...base, included: false, omitReason: 'generated' });
       continue;
     }
-    if (!admitted.has(f)) {
+    const chunk = chunkOf.get(f);
+    if (chunk === undefined) {
       entries.push({ ...base, included: false, omitReason: 'over-limit' });
       continue;
     }
-    entries.push({ ...base, included: true });
+    includedBytes += f.bytes;
+    entries.push({ ...base, chunk, included: true });
   }
   const coverage: Coverage = {
+    chunks: plan.chunks.length,
     files: entries,
     includedBytes,
     includedFiles: entries.filter((e) => e.included).length,
@@ -263,7 +336,7 @@ export function computeCoverage(
     totalBytes: files.reduce((n, f) => n + f.bytes, 0),
     totalFiles: files.length,
   };
-  return { coverage, includedDiff: includedSections.join('') };
+  return { coverage, includedDiff: plan.chunks.map((c) => c.diff).join(''), plan };
 }
 
 // Normalize a diff for a STABLE content digest: LF line endings + a single
@@ -357,6 +430,9 @@ export interface AcquiredDiff {
   files: FileDiff[];
   headSha: string;
   mode: DiffMode;
+  // The review PARTS the covered diff was planned into (chunks.ts) — one for a change that fits
+  // the ceiling, several for one that does not. `diff` above is their union.
+  plan: ChunkPlan;
   // The full base...HEAD diff before coverage filtering (the digest is over this).
   rawDiff: string;
   repoId: string | null;
@@ -366,6 +442,11 @@ export interface AcquireDiffOpts {
   base?: string;
   ceilingBytes?: number;
   cwd: string;
+  // Cap on review parts (chunks.ts DEFAULT_MAX_CHUNKS). Files past it are `over-limit`, named.
+  maxChunks?: number;
+  // A first-line reader over the PR head's tree (worktreeFirstLineReader), when the run has a
+  // worktree: lets a mid-file hunk of a generated file be classed by the file's own header.
+  readFirstLine?: (path: string) => string | null;
   // The mode LABEL for a pre-supplied diffText (default 'raw'). A `gh pr diff`
   // capture passes 'pr' so the manifest/receipt name the source honestly; the text
   // is still treated as raw (no git resolution, no local commit identity).
@@ -435,8 +516,10 @@ export function acquireDiff(opts: AcquireDiffOpts): AcquiredDiff {
     rawDiff = git(opts.cwd, ['diff', `${base}...HEAD`]);
   }
 
-  const files = parseDiffFiles(rawDiff);
-  const { coverage, includedDiff } = computeCoverage(files, ceiling);
+  const files = parseDiffFiles(rawDiff, opts.readFirstLine ? { readFirstLine: opts.readFirstLine } : {});
+  const { coverage, includedDiff, plan } = computeCoverage(files, ceiling, {
+    ...(opts.maxChunks !== undefined ? { maxChunks: opts.maxChunks } : {}),
+  });
   return {
     baseRef,
     baseSha,
@@ -450,6 +533,7 @@ export function acquireDiff(opts: AcquireDiffOpts): AcquiredDiff {
     files,
     headSha,
     mode,
+    plan,
     rawDiff,
     repoId,
   };

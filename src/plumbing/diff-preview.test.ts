@@ -46,6 +46,11 @@ function acquired(over: Partial<AcquiredDiff> = {}): AcquiredDiff {
     files: [],
     headSha: 'bbb',
     mode: 'commit',
+    plan: {
+      ceilingBytes: 200_000,
+      chunks: [{ bytes: DIFF.length, diff: DIFF, files: [], index: 1, label: 'src', paths: ['src/a.ts'] }],
+      overflow: [],
+    },
     rawDiff: DIFF,
     repoId: 'https://example/repo',
     ...over,
@@ -104,5 +109,46 @@ describe('renderPacketPreview', () => {
     });
     expect(out).toContain('rendered prompt');
     expect(out).toContain('const b = 2;');
+  });
+});
+
+describe('buildPacketPreview — a change in parts previews every part', () => {
+  const PART = (p: string): string => `diff --git a/${p} b/${p}\n--- a/${p}\n+++ b/${p}\n@@ -1,1 +1,1 @@\n+${'y'.repeat(250)}\n`;
+  it('renders one prompt per part with the scope note, and sums the cost', () => {
+    const d1 = PART('backend/a.go');
+    const d2 = PART('web/c.ts');
+    const acq = acquired({
+      coverage: {
+        chunks: 2,
+        files: [
+          { added: 1, bytes: d1.length, chunk: 1, included: true, kind: 'source', path: 'backend/a.go', removed: 0 },
+          { added: 1, bytes: d2.length, chunk: 2, included: true, kind: 'source', path: 'web/c.ts', removed: 0 },
+        ],
+        includedBytes: d1.length + d2.length,
+        includedFiles: 2,
+        omittedFiles: 0,
+        totalBytes: d1.length + d2.length,
+        totalFiles: 2,
+      },
+      diff: d1 + d2,
+      plan: {
+        ceilingBytes: 300,
+        chunks: [
+          { bytes: d1.length, diff: d1, files: [], index: 1, label: 'backend', paths: ['backend/a.go'] },
+          { bytes: d2.length, diff: d2, files: [], index: 2, label: 'web', paths: ['web/c.ts'] },
+        ],
+        overflow: [],
+      },
+    });
+    const preview = buildPacketPreview(acq, 'code', undefined, undefined, 300);
+    expect(preview.parts).toHaveLength(2);
+    expect(preview.parts?.[0].prompt).toContain('PART 1 of 2');
+    expect(preview.parts?.[0].prompt).toContain('diff --git a/backend/a.go');
+    expect(preview.parts?.[0].prompt).not.toContain('diff --git a/web/c.ts');
+    expect(preview.parts?.[1].prompt).toContain('diff --git a/web/c.ts');
+    const text = renderPacketPreview(acq, preview, { full: false, profile: 'code', reviewers: ['codex', 'grok'] });
+    expect(text).toContain('parts:   2 (ceiling 300 bytes per part)');
+    expect(text).toContain('part 1: backend — 1 file(s)');
+    expect(text).toContain('across 2 parts × 2 reviewer(s)');
   });
 });

@@ -62,6 +62,13 @@ import type { ConsultResult } from './modes/consult/types';
 import { isImplemented, isMode, resolveMode } from './modes';
 import { runReviewMode, type ReviewModeResult } from './modes/review';
 import {
+  CHUNKS_TRAIL_FILE,
+  type ChunksTrail,
+  DEFAULT_MAX_CHUNKS,
+  renderCoverageOverview,
+} from './modes/review/chunks';
+import { readTrailJson } from './modes/review/trail-io';
+import {
   claudeLayerHasHigh,
   type ClaudeLayerResult,
   claudeModelLabel,
@@ -81,6 +88,7 @@ import {
   renderHighGate,
   resolveHighGate,
   type ShadowGateSeat,
+  verdictCounts,
 } from './modes/review/gate';
 import { runClaudeReviewVoice } from './modes/review/claude';
 import { runCodexReview } from './reviewers/codex';
@@ -333,7 +341,10 @@ Options:
                         repo's own diff, else an OS temp dir — the path is printed)
   --sandbox <profile>   reviewer sandbox profile override (deny-by-default only)
   --allow-sensitive     review even if the diff carries secrets/sensitive paths
-  --ceiling <bytes>     coverage byte ceiling (default 200000)
+  --ceiling <bytes>     coverage byte ceiling (default 200000) — the size of ONE packet; a
+                        larger change is reviewed in PARTS of this size, each whole
+  --max-chunks <n>      cap on review parts (default ${DEFAULT_MAX_CHUNKS}); files past it are
+                        NAMED as over-limit, never silently dropped
   --convention-cap <bytes>  conventions byte cap (default 150000; a full review wants more)
   --cwd <dir>           repo working dir (default: cwd)
   --run-id <id>         trail/receipt run id (default: generated)
@@ -860,6 +871,23 @@ function printSummary(result: ReviewModeResult, profile: ReviewProfile): void {
   for (const f of a.coverage.files.filter((x) => !x.included)) {
     out.push(`             ${omittedLine({ kind: f.kind, path: f.path, reason: f.omitReason })}`);
   }
+  // A review in PARTS (chunks.ts): say so where the files line is, with each part's label and
+  // size, so a reader of the summary knows the seats read N packets, not one.
+  // (`plan` is read defensively: a consumer that rebuilds a ReviewModeResult from an older trail
+  // has no plan, and the summary must still print.)
+  const plan = a.plan as AcquiredDiff['plan'] | undefined;
+  if (plan && plan.chunks.length > 1) {
+    out.push(
+      `  parts:   ${plan.chunks.length} (ceiling ${plan.ceilingBytes.toLocaleString('en-US')} bytes per part) — every seat reviewed each part; one gate judged them together`
+    );
+    for (const c of plan.chunks) {
+      out.push(`             part ${c.index}: ${c.label} — ${c.paths.length} file(s), ${c.bytes.toLocaleString('en-US')} bytes`);
+    }
+    if (plan.overflow.length > 0) {
+      out.push(`             ⚠ ${plan.overflow.length} file(s) past the part limit were NOT reviewed (listed above as over-limit; raise --max-chunks)`);
+    }
+    out.push('             overview: coverage-overview.md + chunks.json in the trail dir');
+  }
   if (result.conventionManifest && result.conventionManifest.files.length > 0) {
     out.push(...renderConventionManifest(result.conventionManifest));
   }
@@ -1231,6 +1259,7 @@ async function reviewCommand(
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
         'gate-dismissals': { type: 'boolean' },
+        'max-chunks': { type: 'string' },
         'gate-effort': { type: 'string' },
         'gate-model': { type: 'string' },
         'gate-vendor': { type: 'string' },
@@ -1487,6 +1516,12 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
     '--convention-cap'
   );
   if (typeof conventionCap === 'object') return conventionCap.code;
+  const maxChunks = positiveCount(
+    typeof values['max-chunks'] === 'string' ? values['max-chunks'] : undefined,
+    cmd,
+    '--max-chunks'
+  );
+  if (typeof maxChunks === 'object') return maxChunks.code;
 
   // The Anthropic seats this command runs AFTER the core: the `claude` producer (default-on) and
   // the `gate`. They are part of the run's evidence INTENT — the gate is an evidence-bearing actor
@@ -1625,6 +1660,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       diffText: source.diffText,
       directive,
       headShaOverride: source.headShaOverride,
+      ...(maxChunks !== undefined ? { maxChunks } : {}),
       noConventions,
       onProgress: (m) => console.error(`· ${m}`),
       out,
@@ -1818,6 +1854,10 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         // The pinned reviewer-visible diff. Under the capability fence the Anthropic seats have no
         // Bash, so `/code-review` and the lens are HANDED the change instead of deriving it.
         pinnedDiff: result.pinnedDiff,
+        // A review in PARTS (chunks.ts): the producer reviews each part the core saw, and the
+        // lens is handed what one packet holds plus the listing of every other changed file.
+        ...(result.parts && result.parts.length > 1 ? { parts: result.parts } : {}),
+        ...(result.lensHandoff ? { lensHandoff: result.lensHandoff } : {}),
         // `security --repo` must NOT have its security-auditor prompt replaced by the
         // `/code-review` skill's structural-quality lens (codex-f3).
         profile,
@@ -1966,6 +2006,44 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
     } else {
       result.receiptError =
         'review INCOMPLETE — the default-on Opus (claude) reviewer was expected but did not complete, so no fully-reviewed receipt was minted';
+    }
+  }
+
+  // THE COVERAGE OVERVIEW (chunks.ts, step 5 of the chunked review): fold the Anthropic seats'
+  // per-part outcomes into chunks.json beside the core's, then render ONE human page —
+  // coverage-overview.md — that says which parts existed, what every seat did with each, how
+  // the gate came out across them, and what nobody read. Best-effort, like every trail write.
+  if (!result.blocked) {
+    try {
+      const trail = readTrailJson<ChunksTrail>(out, runId, CHUNKS_TRAIL_FILE);
+      if (trail && Array.isArray(trail.chunks)) {
+        const claudeReview = claudeLayer?.claudeReview ?? null;
+        for (const c of trail.chunks) {
+          if (claudeLayerExpected) {
+            const partFindings = claudeReview?.findings.filter((f) => (f.chunk ?? 1) === c.index).length ?? 0;
+            c.seats.claude = claudeReview
+              ? {
+                  findings: partFindings,
+                  state: claudeReview.ok ? 'reviewed' : 'failed-reviewer',
+                  ...(claudeReview.ok ? {} : { why: clean(claudeReview.summary).slice(0, 160) }),
+                }
+              : { findings: 0, state: 'skipped', why: 'the claude layer did not run' };
+          }
+        }
+        writeTrailFile(out, runId, CHUNKS_TRAIL_FILE, JSON.stringify(trail, null, 2));
+        writeTrailFile(
+          out,
+          runId,
+          'coverage-overview.md',
+          renderCoverageOverview(trail, {
+            ...(claudeLayer ? { gateCounts: verdictCounts(gateRecords) } : {}),
+            headSha: result.acquired.headSha,
+            totalFiles: result.acquired.coverage.totalFiles,
+          })
+        );
+      }
+    } catch {
+      /* trail write is best-effort */
     }
   }
 
@@ -2800,6 +2878,23 @@ function parseConventionPaths(
 // a fractional cap degrades to 1-byte reads and a cap past the allocator's limit made
 // every file read fail silently ("0/0 files gathered").
 const MAX_BYTES_FLAG = 64 * 1024 * 1024;
+// A small positive integer flag (`--max-chunks`): 1..MAX_CHUNKS_FLAG. Absent ⇒ undefined (the
+// engine default applies); anything else is a usage error, never a silent clamp.
+const MAX_CHUNKS_FLAG = 64;
+function positiveCount(
+  raw: string | undefined,
+  cmd: string,
+  flag: string
+): number | undefined | { code: number } {
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0 || n > MAX_CHUNKS_FLAG) {
+    console.error(`ensemble-ai ${cmd}: ${flag} must be a positive integer (at most ${MAX_CHUNKS_FLAG})`);
+    return { code: 3 };
+  }
+  return n;
+}
+
 function positiveCeiling(
   raw: string | undefined,
   cmd: string,
@@ -3201,7 +3296,9 @@ Options:
   --reviewers <ids>     reviewers to size the cost preview against (default: all)
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
-  --ceiling <bytes>     coverage byte ceiling (default 200000)
+  --ceiling <bytes>     coverage byte ceiling (default 200000) — one packet; a larger change
+                        previews as PARTS of this size
+  --max-chunks <n>      cap on review parts (default ${DEFAULT_MAX_CHUNKS})
   --convention-cap <bytes>  conventions byte cap (default 150000)
   --full                print the ENTIRE rendered prompt (the literal payload)
   --json                print { packet, prompt } as JSON
@@ -3223,6 +3320,7 @@ async function diffCommand(args: string[]): Promise<number> {
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
         full: { type: 'boolean' },
+        'max-chunks': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
         json: { type: 'boolean' },
         'no-conventions': { type: 'boolean' },
@@ -3270,6 +3368,12 @@ async function diffCommand(args: string[]): Promise<number> {
     '--convention-cap'
   );
   if (typeof conventionCap === 'object') return conventionCap.code;
+  const maxChunks = positiveCount(
+    typeof values['max-chunks'] === 'string' ? values['max-chunks'] : undefined,
+    'diff',
+    '--max-chunks'
+  );
+  if (typeof maxChunks === 'object') return maxChunks.code;
   const cwd = values.cwd ? path.resolve(String(values.cwd)) : process.cwd();
 
   const source = resolveDiffSourceForCommand(values, positionals, 'diff', cwd);
@@ -3284,6 +3388,7 @@ async function diffCommand(args: string[]): Promise<number> {
       diffMode: source.diffMode,
       diffText: source.diffText,
       headShaOverride: source.headShaOverride,
+      ...(maxChunks !== undefined ? { maxChunks } : {}),
       repoIdOverride: source.postTarget?.repoSlug
         ? repoIdFromSlug(source.postTarget.repoSlug)
         : undefined,

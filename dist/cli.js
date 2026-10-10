@@ -3,9 +3,9 @@
 // src/cli.ts
 import { execFileSync as execFileSync5 } from "child_process";
 import crypto2 from "crypto";
-import fs27 from "fs";
+import fs29 from "fs";
 import os14 from "os";
-import path22 from "path";
+import path23 from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 import { parseArgs } from "util";
 
@@ -164,22 +164,29 @@ function manifestOf(packet) {
     truncated: s.truncated
   }));
 }
-function reviewJson(reviewerId) {
-  return `review.${reviewerId}.json`;
+function reviewJson(reviewerId, suffix) {
+  return `review.${reviewerId}${suffix ? `.${suffix}` : ""}.json`;
+}
+function safeSuffix(suffix) {
+  if (suffix === void 0) return void 0;
+  if (!/^[a-z0-9]{1,16}$/i.test(suffix)) throw new Error(`invalid artifact suffix: ${suffix}`);
+  return suffix;
 }
 function persistReview(baseDir, input) {
   const dir = reviewDir(baseDir, input.runId);
   const id = input.reviewer.id;
-  writeAtomic(baseDir, dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
-  writeAtomic(baseDir, dir, `prompt.${id}.md`, input.prompt);
-  if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review.raw.md`, input.raw);
-  else removeStale(baseDir, dir, `${id}-review.raw.md`);
-  if (input.stream) writeAtomic(baseDir, dir, `${id}-stream.jsonl`, input.stream);
-  else removeStale(baseDir, dir, `${id}-stream.jsonl`);
+  const suffix = safeSuffix(input.artifactSuffix);
+  const tag = suffix ? `.${suffix}` : "";
+  writeAtomic(baseDir, dir, `packet.${id}${tag}.json`, JSON.stringify(input.packet, null, 2));
+  writeAtomic(baseDir, dir, `prompt.${id}${tag}.md`, input.prompt);
+  if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review${tag}.raw.md`, input.raw);
+  else removeStale(baseDir, dir, `${id}-review${tag}.raw.md`);
+  if (input.stream) writeAtomic(baseDir, dir, `${id}-stream${tag}.jsonl`, input.stream);
+  else removeStale(baseDir, dir, `${id}-stream${tag}.jsonl`);
   writeAtomic(
     baseDir,
     dir,
-    `findings.${id}.json`,
+    `findings.${id}${tag}.json`,
     JSON.stringify(input.findings, null, 2)
   );
   const stored = {
@@ -200,7 +207,7 @@ function persistReview(baseDir, input) {
     summary: input.summary,
     terminalState: input.terminalState
   };
-  writeAtomic(baseDir, dir, reviewJson(id), JSON.stringify(stored, null, 2));
+  writeAtomic(baseDir, dir, reviewJson(id, suffix), JSON.stringify(stored, null, 2));
   return stored;
 }
 function isStoredReviewShape(v) {
@@ -3203,6 +3210,19 @@ ${args.headSha}). It is NOT your working directory \u2014 ${args.reach} by ABSOL
 directory, with Read, Grep, and Glob.`;
 }
 function materializedDiffClause(args) {
+  if (args.scope) {
+    return `The change under review is \`git diff ${args.baseSha}...${args.headSha}\`. It is larger than one
+packet, so it is handed over in PARTS: the scope note says which changed files' hunks are
+materialized below and which are not. Every file the note lists is changed by this PR \u2014 read the
+ones whose hunks are not below in the checkout at ${args.headSha} rather than assuming they are
+unchanged.
+
+${args.scope}
+
+\`\`\`diff
+${args.diff}
+\`\`\``;
+  }
   return `The change under review is exactly \`git diff ${args.baseSha}...${args.headSha}\`, already
 materialized for you:
 
@@ -3468,15 +3488,15 @@ PR must still anchor in the PR's own files; a companion citation supports it.`;
 }
 
 // src/modes/review/claude.ts
-import fs20 from "fs";
+import fs21 from "fs";
 import os12 from "os";
 
 // src/modes/review/history-packet.ts
-import fs19 from "fs";
+import fs20 from "fs";
 import path17 from "path";
 
 // src/modes/review/gate-hunks.ts
-import fs18 from "fs";
+import fs19 from "fs";
 import path16 from "path";
 
 // src/modes/review/secret-scan.ts
@@ -3848,6 +3868,9 @@ var PACKET_BUDGETS = {
   files: 4e4,
   history: 4e3,
   objective: 2e3,
+  // The change-scope listing for a review in parts (PacketInput.scope): one line per changed
+  // file, so ~60 chars × files. 64 K holds a thousand-file change whole.
+  scope: 64e3,
   summary: 4e3,
   tests: 8e3
 };
@@ -3884,6 +3907,7 @@ function section(title, why, body, budget) {
   };
 }
 var DIFF_SECTION_TITLE = "The diff under review";
+var SCOPE_SECTION_TITLE = "Change scope (this review runs in parts)";
 var CI_EVIDENCE_SECTION_TITLE = "CI evidence (checks + annotations at the PR head)";
 function reviewerVisibleDiff(packet) {
   const s = packet.sections.find((sec) => sec.title === DIFF_SECTION_TITLE);
@@ -3915,6 +3939,16 @@ function assembleCodePacket(input) {
         "what the author says the change does + why \u2014 weigh, don\u2019t trust",
         input.authorSummary,
         PACKET_BUDGETS.summary
+      )
+    );
+  }
+  if (input.scope) {
+    sections.push(
+      section(
+        SCOPE_SECTION_TITLE,
+        "this change is reviewed in parts \u2014 what this packet carries, what the other parts carry, what no reviewer sees",
+        input.scope,
+        PACKET_BUDGETS.scope
       )
     );
   }
@@ -4023,11 +4057,222 @@ function isFinding(v) {
 
 // src/modes/review/diff.ts
 import { execFileSync as execFileSync4 } from "child_process";
+import fs18 from "fs";
+import nodePath from "path";
 
 // src/core/hash.ts
 import crypto from "crypto";
 function sha256Hex(input) {
   return crypto.createHash("sha256").update(input, "utf8").digest("hex");
+}
+
+// src/modes/review/chunks.ts
+var DEFAULT_MAX_CHUNKS = 8;
+function areaAt(path24, depth) {
+  const parts = path24.split("/");
+  const dirs = parts.slice(0, -1);
+  if (dirs.length === 0) return ".";
+  return dirs.slice(0, depth).join("/");
+}
+function groupByArea(files, ceilingBytes, depth) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const f of files) {
+    const key = areaAt(f.path, depth);
+    const g = groups.get(key);
+    if (g) g.push(f);
+    else groups.set(key, [f]);
+  }
+  const out = [];
+  for (const g of groups.values()) {
+    const bytes = g.reduce((n, f) => n + f.bytes, 0);
+    const splittable = g.some((f) => f.path.split("/").length - 1 > depth);
+    if (bytes > ceilingBytes && splittable && g.length > 1) {
+      out.push(...groupByArea(g, ceilingBytes, depth + 1));
+    } else {
+      out.push(g);
+    }
+  }
+  return out;
+}
+function sourceFirst(files) {
+  return [...files.filter((f) => !isTestPath(f.path)), ...files.filter((f) => isTestPath(f.path))];
+}
+function chunkLabel(paths) {
+  if (paths.length === 0) return "(empty)";
+  const dirLists = paths.map((p) => p.split("/").slice(0, -1));
+  let common = [...dirLists[0]];
+  for (const d of dirLists.slice(1)) {
+    let i = 0;
+    while (i < common.length && i < d.length && common[i] === d[i]) i++;
+    common = common.slice(0, i);
+  }
+  const prefix = common.join("/");
+  const next = /* @__PURE__ */ new Set();
+  for (const d of dirLists) {
+    const seg = d[common.length];
+    next.add(seg === void 0 ? "(files)" : seg);
+  }
+  const names = [...next];
+  if (names.length === 1 && names[0] === "(files)") return prefix || ".";
+  const shown = names.slice(0, 4).join(", ") + (names.length > 4 ? `, +${names.length - 4} more` : "");
+  return prefix ? `${prefix}/{${shown}}` : `{${shown}}`;
+}
+function planChunks(files, ceilingBytes, maxChunks) {
+  const cap4 = Math.max(1, Math.floor(maxChunks));
+  const total = files.reduce((n, f) => n + f.bytes, 0);
+  const finish = (parts2) => {
+    const chunks = parts2.slice(0, cap4).map((part, i) => ({
+      bytes: part.reduce((n, f) => n + f.bytes, 0),
+      diff: part.map((f) => f.raw).join(""),
+      files: part,
+      index: i + 1,
+      label: chunkLabel(part.map((f) => f.path)),
+      paths: part.map((f) => f.path)
+    }));
+    const overflow = parts2.slice(cap4).flat();
+    return { ceilingBytes, chunks, overflow };
+  };
+  if (files.length === 0) return { ceilingBytes, chunks: [], overflow: [] };
+  if (total <= ceilingBytes) return finish([sourceFirst(files)]);
+  const areas = groupByArea(files, ceilingBytes, 1).map(sourceFirst);
+  const parts = [];
+  let cur = [];
+  let curBytes = 0;
+  const close = () => {
+    if (cur.length > 0) parts.push(cur);
+    cur = [];
+    curBytes = 0;
+  };
+  for (const area of areas) {
+    const areaBytes = area.reduce((n, f) => n + f.bytes, 0);
+    if (cur.length > 0 && curBytes + areaBytes > ceilingBytes && areaBytes <= ceilingBytes) close();
+    for (const f of area) {
+      if (cur.length > 0 && curBytes + f.bytes > ceilingBytes) close();
+      cur.push(f);
+      curBytes += f.bytes;
+    }
+  }
+  close();
+  return finish(parts);
+}
+function fileLine(f) {
+  return `${f.path} (+${f.added}/-${f.removed})`;
+}
+function renderChangeScope(input, chunkIndex) {
+  const { coverage, plan } = input;
+  const byPath2 = new Map(coverage.files.map((f) => [f.path, f]));
+  const part = plan.chunks.find((c) => c.index === chunkIndex);
+  if (!part) return "";
+  const lines = [];
+  const n = plan.chunks.length;
+  lines.push(
+    `This change is larger than one review packet (ceiling ${plan.ceilingBytes.toLocaleString("en-US")} bytes), so it is reviewed in ${n} part(s) by the same reviewers. You are reading PART ${chunkIndex} of ${n}: ${part.label} \u2014 ${part.paths.length} file(s), ${part.bytes.toLocaleString("en-US")} bytes. Review the hunks in THIS part. Every part's findings are judged together by one verification gate.`
+  );
+  lines.push("");
+  lines.push(`Files in THIS part (their hunks are below):`);
+  for (const p of part.paths) {
+    const f = byPath2.get(p);
+    lines.push(`  ${f ? fileLine(f) : p}`);
+  }
+  const others = plan.chunks.filter((c) => c.index !== chunkIndex);
+  if (others.length > 0) {
+    lines.push("");
+    lines.push(
+      `Files in the OTHER parts \u2014 also changed by this PR, reviewed separately. Their hunks are NOT below; if a finding depends on one of them, read the file as it exists at the PR head rather than assuming it is unchanged:`
+    );
+    for (const c of others) {
+      lines.push(`  part ${c.index} \u2014 ${c.label}:`);
+      for (const p of c.paths) {
+        const f = byPath2.get(p);
+        lines.push(`    ${f ? fileLine(f) : p}`);
+      }
+    }
+  }
+  const omitted = coverage.files.filter((f) => !f.included);
+  if (omitted.length > 0) {
+    lines.push("");
+    lines.push(`Changed but NOT shipped to any reviewer (named so nothing is silently missing):`);
+    for (const f of omitted) {
+      lines.push(`  ${fileLine(f)} \u2014 ${f.omitReason ?? "omitted"}/${f.kind}`);
+    }
+  }
+  return lines.join("\n");
+}
+function renderLensScope(input, materializedChunks) {
+  const { coverage, plan } = input;
+  const lines = [];
+  const n = plan.chunks.length;
+  const shown = new Set(materializedChunks);
+  lines.push(
+    `This change touches ${coverage.totalFiles} file(s) and was reviewed in ${n} part(s). The diff materialized below carries part(s) ${[...shown].join(", ")}; every other changed file is listed here with its +/- line counts and is readable at the PR head in the worktree \u2014 it IS part of this change even though its hunks are not below.`
+  );
+  for (const c of plan.chunks) {
+    lines.push("");
+    lines.push(`part ${c.index} \u2014 ${c.label}${shown.has(c.index) ? " (hunks below)" : " (hunks NOT below \u2014 read at head)"}:`);
+    for (const p of c.paths) {
+      const f = coverage.files.find((x) => x.path === p);
+      lines.push(`  ${f ? fileLine(f) : p}`);
+    }
+  }
+  const omitted = coverage.files.filter((f) => !f.included);
+  if (omitted.length > 0) {
+    lines.push("");
+    lines.push(`Changed but not reviewed by any seat:`);
+    for (const f of omitted) lines.push(`  ${fileLine(f)} \u2014 ${f.omitReason ?? "omitted"}/${f.kind}`);
+  }
+  return lines.join("\n");
+}
+var CHUNKS_TRAIL_FILE = "chunks.json";
+var CHUNKS_TRAIL_SCHEMA_VERSION = 1;
+function renderCoverageOverview(trail, extra) {
+  const out = [];
+  const reviewedParts = trail.chunks.filter(
+    (c) => Object.values(c.seats).some((s) => s.state === "reviewed")
+  ).length;
+  const reviewedFiles = trail.chunks.filter((c) => Object.values(c.seats).some((s) => s.state === "reviewed")).reduce((n, c) => n + c.files.length, 0);
+  const unreadParts = trail.chunks.filter((c) => !Object.values(c.seats).some((s) => s.state === "reviewed"));
+  const overflow = trail.omitted.filter((o) => o.reason === "over-limit");
+  const junk = trail.omitted.filter((o) => o.reason !== "over-limit");
+  out.push(`# Coverage overview \u2014 ${extra.headSha.slice(0, 12)}`);
+  out.push("");
+  out.push(
+    `${extra.totalFiles} changed file(s) \xB7 ${trail.chunks.length} part(s) planned under a ${trail.ceilingBytes.toLocaleString("en-US")}-byte ceiling (max ${trail.maxChunks}) \xB7 ${reviewedParts} part(s) reviewed by at least one seat \xB7 ${reviewedFiles} file(s) read by a seat \xB7 ${junk.length} generated/binary file(s) skipped by kind \xB7 ${overflow.length} file(s) past the part limit (NOT reviewed).`
+  );
+  if (extra.gateCounts) {
+    const g = Object.entries(extra.gateCounts).filter(([, n]) => n > 0).map(([k, n]) => `${n} ${k}`).join(" \xB7 ");
+    out.push("");
+    out.push(`Gate across all parts: ${g || "no findings"}.`);
+  }
+  out.push("");
+  out.push("## Parts");
+  for (const c of trail.chunks) {
+    const seats = Object.entries(c.seats).map(([id, s]) => `${id} ${s.state === "reviewed" ? `\u2713 ${s.findings} finding(s)` : `\u2717 ${s.state}${s.why ? ` \u2014 ${s.why}` : ""}`}`).join(" \xB7 ");
+    const tests = c.files.filter((f) => f.test).length;
+    out.push("");
+    out.push(`### Part ${c.index} \u2014 ${c.label}`);
+    out.push(`${c.files.length} file(s) (${tests} test) \xB7 ${c.bytes.toLocaleString("en-US")} bytes \xB7 prompt ${c.promptChars.toLocaleString("en-US")} chars`);
+    out.push(`Seats: ${seats || "none ran"}`);
+    out.push("");
+    for (const f of c.files) out.push(`- ${f.path} (+${f.added}/-${f.removed})${f.test ? " [test]" : ""}`);
+  }
+  if (unreadParts.length > 0) {
+    out.push("");
+    out.push("## Parts NO seat completed");
+    for (const c of unreadParts) out.push(`- part ${c.index} \u2014 ${c.label} (${c.files.length} file(s))`);
+  }
+  if (overflow.length > 0) {
+    out.push("");
+    out.push(`## Not reviewed \u2014 past the ${trail.maxChunks}-part limit`);
+    out.push("Raise `--max-chunks` to review these; they are part of the change.");
+    for (const o of overflow) out.push(`- ${o.path} (${o.kind})`);
+  }
+  if (junk.length > 0) {
+    out.push("");
+    out.push("## Skipped by kind (generated / binary)");
+    for (const o of junk) out.push(`- ${o.path} (${o.reason})`);
+  }
+  out.push("");
+  return out.join("\n");
 }
 
 // src/modes/review/diff.ts
@@ -4058,7 +4303,9 @@ var GENERATED_PATTERNS = [
   /(^|\/)(generated|__generated__)\//,
   /\.gen\.[a-z]+$/,
   /\.pb\.go$/,
-  /[._]generated\.[a-z]+$/
+  // `-generated.json` joins `.generated.*` / `_generated.*`: an emitted API spec named that way
+  // (an `api-specs/<service>-generated.json`, 66 KB on run 2026-10-10-18-51-44-9acc127a) is generator output too.
+  /[._-]generated\.[a-z]+$/
 ];
 var GENERATED_FIRST_LINE = /Code generated .*DO NOT EDIT|@generated\b|DO NOT EDIT/;
 function hasGeneratedHeader(section2) {
@@ -4072,10 +4319,34 @@ function hasGeneratedHeader(section2) {
   }
   return false;
 }
-function classifyFileKind(path23, isBinary, section2 = "") {
+function hasGeneratedFirstLine(line) {
+  return typeof line === "string" && GENERATED_FIRST_LINE.test(line);
+}
+function classifyFileKind(path24, isBinary, section2 = "", firstLine4) {
   if (isBinary) return "binary";
-  if (GENERATED_PATTERNS.some((re) => re.test(path23))) return "generated";
-  return section2 && hasGeneratedHeader(section2) ? "generated" : "source";
+  if (GENERATED_PATTERNS.some((re) => re.test(path24))) return "generated";
+  if (section2 && hasGeneratedHeader(section2)) return "generated";
+  return hasGeneratedFirstLine(firstLine4) ? "generated" : "source";
+}
+function worktreeFirstLineReader(dir) {
+  const root = nodePath.resolve(dir);
+  return (p) => {
+    const full = nodePath.resolve(root, p);
+    if (full !== root && !full.startsWith(root + nodePath.sep)) return null;
+    let fd = null;
+    try {
+      fd = fs18.openSync(full, "r");
+      const buf = Buffer.alloc(512);
+      const n = fs18.readSync(fd, buf, 0, 512, 0);
+      const text = buf.subarray(0, n).toString("utf8");
+      const nl = text.indexOf("\n");
+      return nl < 0 ? text : text.slice(0, nl);
+    } catch {
+      return null;
+    } finally {
+      if (fd !== null) fs18.closeSync(fd);
+    }
+  };
 }
 var TEST_PATTERNS = [
   /(^|\/)(test|tests|__tests__|spec|specs|testdata|__snapshots__)\//,
@@ -4086,8 +4357,8 @@ var TEST_PATTERNS = [
   /Tests?\.(java|kt|swift|cs|scala)$/,
   /\.bats$/
 ];
-function isTestPath(path23) {
-  return TEST_PATTERNS.some((re) => re.test(path23));
+function isTestPath(path24) {
+  return TEST_PATTERNS.some((re) => re.test(path24));
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -4100,24 +4371,28 @@ function pathOfSection(section2) {
   if (header) return header[2].trim();
   return "unknown";
 }
-function parseDiffFiles(raw) {
+function parseDiffFiles(raw, opts = {}) {
   if (!raw.trim()) return [];
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path23 = pathOfSection(section2);
+    const path24 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
       if (line.startsWith("+") && !line.startsWith("+++")) added++;
       else if (line.startsWith("-") && !line.startsWith("---")) removed++;
     }
+    let kind = classifyFileKind(path24, isBinary, section2);
+    if (kind === "source" && opts.readFirstLine && path24 !== "unknown") {
+      kind = classifyFileKind(path24, isBinary, section2, opts.readFirstLine(path24));
+    }
     return {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path23, isBinary, section2),
-      path: path23,
+      kind,
+      path: path24,
       raw: section2,
       removed
     };
@@ -4129,18 +4404,13 @@ function coverageCounts(c) {
 function omittedLine(o) {
   return `omitted: ${o.path} (${o.reason ?? "omitted"}/${o.kind})`;
 }
-function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
+function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING, opts = {}) {
   const source = files.filter((f) => f.kind === "source");
-  const admitted = /* @__PURE__ */ new Set();
-  const includedSections = [];
-  let includedBytes = 0;
-  for (const f of [...source.filter((f2) => !isTestPath(f2.path)), ...source.filter((f2) => isTestPath(f2.path))]) {
-    if (includedBytes + f.bytes > ceilingBytes && includedBytes > 0) continue;
-    admitted.add(f);
-    includedSections.push(f.raw);
-    includedBytes += f.bytes;
-  }
+  const plan = planChunks(source, ceilingBytes, opts.maxChunks ?? DEFAULT_MAX_CHUNKS);
+  const chunkOf = /* @__PURE__ */ new Map();
+  for (const c of plan.chunks) for (const f of c.files) chunkOf.set(f, c.index);
   const entries = [];
+  let includedBytes = 0;
   for (const f of files) {
     const base = {
       added: f.added,
@@ -4157,13 +4427,16 @@ function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
       entries.push({ ...base, included: false, omitReason: "generated" });
       continue;
     }
-    if (!admitted.has(f)) {
+    const chunk = chunkOf.get(f);
+    if (chunk === void 0) {
       entries.push({ ...base, included: false, omitReason: "over-limit" });
       continue;
     }
-    entries.push({ ...base, included: true });
+    includedBytes += f.bytes;
+    entries.push({ ...base, chunk, included: true });
   }
   const coverage = {
+    chunks: plan.chunks.length,
     files: entries,
     includedBytes,
     includedFiles: entries.filter((e) => e.included).length,
@@ -4171,7 +4444,7 @@ function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
     totalBytes: files.reduce((n, f) => n + f.bytes, 0),
     totalFiles: files.length
   };
-  return { coverage, includedDiff: includedSections.join("") };
+  return { coverage, includedDiff: plan.chunks.map((c) => c.diff).join(""), plan };
 }
 function canonicalizeDiff(raw) {
   return raw.replace(/\r\n?/g, "\n").replace(/\n*$/, "\n");
@@ -4256,8 +4529,10 @@ function acquireDiff(opts) {
     headSha = gitOrNull(opts.cwd, ["rev-parse", "HEAD"]) ?? "working-tree (no commit identity)";
     rawDiff = git(opts.cwd, ["diff", `${base}...HEAD`]);
   }
-  const files = parseDiffFiles(rawDiff);
-  const { coverage, includedDiff } = computeCoverage(files, ceiling);
+  const files = parseDiffFiles(rawDiff, opts.readFirstLine ? { readFirstLine: opts.readFirstLine } : {});
+  const { coverage, includedDiff, plan } = computeCoverage(files, ceiling, {
+    ...opts.maxChunks !== void 0 ? { maxChunks: opts.maxChunks } : {}
+  });
   return {
     baseRef,
     baseSha,
@@ -4271,6 +4546,7 @@ function acquireDiff(opts) {
     files,
     headSha,
     mode,
+    plan,
     rawDiff,
     repoId
   };
@@ -4293,7 +4569,7 @@ function readGatePacketHeadSha(baseDir, runId) {
 }
 function readGatePacket(baseDir, runId, expectedHeadSha) {
   const file = path16.join(reviewDir(baseDir, runId), "packet.gate.json");
-  if (!fs18.existsSync(file)) return { ok: false, reason: "missing" };
+  if (!fs19.existsSync(file)) return { ok: false, reason: "missing" };
   const raw = readTrailJson(baseDir, runId, "packet.gate.json");
   if (raw === null || typeof raw.diff !== "string" || typeof raw.headSha !== "string" || raw.schemaVersion !== GATE_PACKET_SCHEMA_VERSION) {
     return { ok: false, reason: "corrupt" };
@@ -4706,8 +4982,8 @@ function writeHistoryPacket(cwd, files) {
   for (const f of files) {
     const abs = containedPath(cwd, f.path);
     if (!abs) continue;
-    fs19.mkdirSync(path17.dirname(abs), { recursive: true });
-    fs19.writeFileSync(abs, f.contents, { mode: 256 });
+    fs20.mkdirSync(path17.dirname(abs), { recursive: true });
+    fs20.writeFileSync(abs, f.contents, { mode: 256 });
   }
 }
 
@@ -4831,7 +5107,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
     }
   } finally {
     try {
-      fs20.rmSync(cwd, { force: true, recursive: true });
+      fs21.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
   }
@@ -6320,6 +6596,76 @@ var REVIEW_ADAPTERS = {
   grok: runGrokReview
 };
 
+// src/modes/review/chunk-merge.ts
+import fs22 from "fs";
+import path18 from "path";
+function mergedDiagnostics(runs) {
+  const ds = runs.map((r) => r.seat.review.diagnostics).filter((d) => Boolean(d));
+  if (ds.length === 0) return void 0;
+  const failed = runs.find((r) => r.seat.review.terminalState !== "reviewed")?.seat.review.diagnostics;
+  const timedOut = ds.find((d) => d.timedOutReason);
+  const failWhy = ds.map((d) => d.failWhy).filter(Boolean);
+  const warnings = ds.flatMap((d) => d.preflightWarnings ?? []);
+  return {
+    elapsedMs: ds.reduce((n, d) => n + d.elapsedMs, 0),
+    endedAt: ds.map((d) => d.endedAt).sort().at(-1),
+    ...failWhy.length > 0 ? { failWhy: failWhy.join(" \xB7 ") } : {},
+    ...warnings.length > 0 ? { preflightWarnings: [...new Set(warnings)] } : {},
+    startedAt: ds.map((d) => d.startedAt).sort()[0],
+    // The stderr that matters is the failing part's; a clean merge keeps the last part's tail.
+    stderrTail: (failed ?? ds[ds.length - 1]).stderrTail,
+    ...timedOut?.timedOutReason ? { timedOutReason: timedOut.timedOutReason } : {}
+  };
+}
+function mergeChunkSeatRuns(args) {
+  const runs = [...args.runs].sort((a, b) => a.index - b.index);
+  const n = runs.length;
+  const findings = [];
+  for (const r of runs) {
+    for (const f of r.seat.review.findings) {
+      findings.push({ ...f, chunk: r.index, id: `f${findings.length + 1}` });
+    }
+  }
+  const failed = runs.filter((r) => r.seat.review.terminalState !== "reviewed");
+  const terminalState = failed.length === 0 ? "reviewed" : "failed-reviewer";
+  const summary = failed.length === 0 ? runs.map((r) => `Part ${r.index}/${n} (${r.label}): ${r.seat.review.summary}`).join("\n") : [
+    `Reviewed in ${n} part(s); ${failed.length} part(s) did not complete, so this reviewer is INCOMPLETE for the change.`,
+    ...failed.map((r) => `Part ${r.index}/${n} (${r.label}) FAILED: ${r.seat.review.summary}`),
+    ...runs.filter((r) => r.seat.review.terminalState === "reviewed").map((r) => `Part ${r.index}/${n} (${r.label}): ${r.seat.review.summary}`)
+  ].join("\n");
+  const dir = reviewDir(args.out, args.runId);
+  const raws = runs.map((r) => {
+    try {
+      const raw = fs22.readFileSync(path18.join(dir, `${args.reviewer.id}-review.c${r.index}.raw.md`), "utf8");
+      return `## Part ${r.index} of ${n} \u2014 ${r.label}
+
+${raw}`;
+    } catch {
+      return null;
+    }
+  }).filter((x) => x !== null);
+  const review = persistReview(args.out, {
+    diagnostics: mergedDiagnostics(runs),
+    findings,
+    packet: args.packet,
+    prompt: args.prompt,
+    raw: raws.length > 0 ? raws.join("\n\n") : null,
+    reviewer: args.reviewer,
+    runId: args.runId,
+    summary,
+    terminalState
+  });
+  const realized = runs.every((r) => r.seat.realized === "worktree") ? "worktree" : "packet";
+  const fallbacks = runs.map((r) => r.seat.fallbackReason ? `part ${r.index}/${n}: ${r.seat.fallbackReason}` : null).filter((x) => x !== null);
+  const egressDenials = runs.flatMap((r) => [...r.seat.egressDenials]);
+  return {
+    egressDenials,
+    fallbackReason: fallbacks.length > 0 ? fallbacks.join("; ") : null,
+    realized,
+    review
+  };
+}
+
 // src/modes/review/dep-surface.ts
 var MANIFEST_PATTERNS = [
   { label: "npm", re: /(^|\/)package\.json$/ },
@@ -6411,9 +6757,9 @@ function scanDependencySurface(files) {
 }
 
 // src/modes/review/receipt.ts
-import fs23 from "fs";
+import fs25 from "fs";
 import os13 from "os";
-import path19 from "path";
+import path20 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -6496,11 +6842,11 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/holistic-gate.ts
-import fs22 from "fs";
-import path18 from "path";
+import fs24 from "fs";
+import path19 from "path";
 
 // src/modes/review/holistic.ts
-import fs21 from "fs";
+import fs23 from "fs";
 var HOLISTIC_SEAT_ID = "holistic";
 var HOLISTIC_SEVERITY_CAP = "medium";
 var HOLISTIC_DEFAULTS = { effort: "high", model: "opus" };
@@ -6543,7 +6889,7 @@ function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
 }, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
-    raw = JSON.parse(fs21.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs23.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -6581,7 +6927,7 @@ network: there is no Bash tool, so do not try to run \`git\` or any command.
 
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: "search and read it", worktree: args.worktree })}
 
-${materializedDiffClause(args)}
+${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...args.scope ? { scope: args.scope } : {} })}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 
@@ -6633,6 +6979,7 @@ async function runHolisticLens(opts) {
     diff: opts.diff,
     headSha: opts.headSha,
     history: hasHistory,
+    ...opts.scope ? { scope: opts.scope } : {},
     worktree: opts.worktree
   });
   const fail = (summary) => ({
@@ -6708,24 +7055,24 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs22.realpathSync(path18.resolve(worktreeDir));
+    root = fs24.realpathSync(path19.resolve(worktreeDir));
   } catch {
     return () => null;
   }
   const inside = (p) => {
-    const rel = path18.relative(root, p);
+    const rel = path19.relative(root, p);
     return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
-      if (!file || file.includes("\0") || path18.isAbsolute(file)) return null;
-      const target = path18.resolve(root, file);
+      if (!file || file.includes("\0") || path19.isAbsolute(file)) return null;
+      const target = path19.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs22.realpathSync(target);
+      const real = fs24.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs22.statSync(real);
+      const st = fs24.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs22.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs24.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
@@ -8263,10 +8610,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path19.join(os13.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path20.join(os13.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path19.join(
+  return path20.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -8287,11 +8634,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs23.mkdirSync(path19.dirname(file), { recursive: true, mode: 448 });
+  fs25.mkdirSync(path20.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs23.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs23.chmodSync(tmp, 384);
-  fs23.renameSync(tmp, file);
+  fs25.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs25.chmodSync(tmp, 384);
+  fs25.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -8373,7 +8720,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs23.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs25.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -8638,6 +8985,7 @@ function persistAttempt(args, prompt, result, timing) {
   const terminalState = parsed && !parsed.parseError && !result.timedOut ? "reviewed" : "failed-reviewer";
   const summary = result.timedOut ? timedOutSummary(result, timing) : parsed?.summary || result.failWhy || `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || "no output"}`;
   return persistReview(args.out, {
+    ...args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {},
     diagnostics: seatDiagnostics(result, timing),
     findings: parsed?.findings ?? [],
     packet: args.packet,
@@ -8658,6 +9006,7 @@ async function runCoreSeat(args) {
       fallbackReason: null,
       realized: "packet",
       review: persistReview(args.out, {
+        ...args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {},
         findings: [],
         packet: args.packet,
         prompt: args.packetPrompt,
@@ -8889,13 +9238,28 @@ async function runReviewMode(opts) {
     diffMode: opts.diffMode,
     diffText: opts.diffText,
     headShaOverride: opts.headShaOverride,
+    maxChunks: opts.maxChunks ?? DEFAULT_MAX_CHUNKS,
+    // With the tree on disk, a changed file is classed by its OWN first line too (a mid-file hunk
+    // of an ORM client shows no `Code generated` header — the file does).
+    ...opts.worktree ? { readFirstLine: worktreeFirstLineReader(opts.worktree.dir) } : {},
     repoIdOverride: opts.repoIdOverride,
     staged: opts.staged,
     workingTree: opts.workingTree
   });
+  const partCount = acquired.plan.chunks.length;
   log(
-    `Diff: ${acquired.coverage.totalFiles} file(s), ${acquired.coverage.includedFiles} covered, ${acquired.coverage.omittedFiles} omitted \xB7 digest ${acquired.canonicalDigest.slice(0, 19)}\u2026`
+    `Diff: ${acquired.coverage.totalFiles} file(s), ${acquired.coverage.includedFiles} covered, ${acquired.coverage.omittedFiles} omitted${partCount > 1 ? ` \xB7 reviewed in ${partCount} parts (ceiling ${ceilingBytes.toLocaleString("en-US")} bytes)` : ""} \xB7 digest ${acquired.canonicalDigest.slice(0, 19)}\u2026`
   );
+  if (partCount > 1) {
+    for (const c of acquired.plan.chunks) {
+      log(`  \xB7 part ${c.index}/${partCount}: ${c.label} \u2014 ${c.paths.length} file(s), ${c.bytes.toLocaleString("en-US")} bytes`);
+    }
+    if (acquired.plan.overflow.length > 0) {
+      log(
+        `  \xB7 \u26A0 ${acquired.plan.overflow.length} file(s) past the ${opts.maxChunks ?? DEFAULT_MAX_CHUNKS}-part limit are NOT reviewed (named in coverage as over-limit; raise --max-chunks)`
+      );
+    }
+  }
   const depSurface = profile === "security" ? scanDependencySurface(acquired.files) : void 0;
   const coveredPaths = new Set(acquired.coverage.files.filter((f) => f.included).map((f) => f.path));
   let secretScan = scanDiffForSecrets(acquired.files, { allowSensitive: opts.allowSensitive, coveredPaths });
@@ -8962,32 +9326,50 @@ async function runReviewMode(opts) {
   }
   const ciEvidence = ci.kind === "text" ? ci.text : void 0;
   const ciEvidenceUnavailable = ci.kind === "unavailable" ? ci.reason : void 0;
-  const packet = assembleCodePacket({
-    agentsBudget: conventionManifest?.capBytes,
-    agentsMd,
-    authorSummary: opts.authorSummary,
-    ciEvidence,
-    ciEvidenceUnavailable,
-    diff: acquired.diff,
-    // The covered diff was admitted under THIS ceiling; the packet's diff section follows it so
-    // the coverage listing and the bytes the seats see cannot disagree.
-    diffBudget: ceilingBytes,
-    directive: opts.directive,
-    objective: opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE),
-    pr: 0,
-    repo: acquired.repoId ?? ""
-  });
+  const objective = opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE);
+  const scoped = partCount > 1 || acquired.plan.overflow.length > 0;
+  const scopeInput = { coverage: acquired.coverage, plan: acquired.plan };
+  const packets = (partCount > 0 ? acquired.plan.chunks : [null]).map(
+    (chunk) => assembleCodePacket({
+      agentsBudget: conventionManifest?.capBytes,
+      agentsMd,
+      authorSummary: opts.authorSummary,
+      ciEvidence,
+      ciEvidenceUnavailable,
+      diff: chunk ? chunk.diff : acquired.diff,
+      // The covered diff was admitted under THIS ceiling; the packet's diff section follows it so
+      // the coverage listing and the bytes the seats see cannot disagree.
+      diffBudget: ceilingBytes,
+      directive: opts.directive,
+      objective,
+      pr: 0,
+      repo: acquired.repoId ?? "",
+      ...chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index) } : {}
+    })
+  );
+  const packet = packets[0];
   if (ciEvidence) {
     try {
       writeTrailFile(opts.out, opts.runId, CI_EVIDENCE_TRAIL_FILE, ciEvidence);
     } catch {
     }
   }
-  const prompt = renderReviewPrompt(packet, profile);
+  const prompts = packets.map((p) => renderReviewPrompt(p, profile));
+  const prompt = prompts[0];
   if (!packet.complete) {
     log("Packet incomplete (no usable diff) \u2014 persisting an empty review.");
   }
-  const pinnedDiff = reviewerVisibleDiff(packet).text;
+  const parts = packets.map((p, i) => {
+    const chunk = acquired.plan.chunks[i];
+    return {
+      diff: reviewerVisibleDiff(p).text,
+      index: chunk?.index ?? 1,
+      label: chunk?.label ?? "(the change)",
+      prompt: prompts[i],
+      ...chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index) } : {}
+    };
+  });
+  const pinnedDiff = parts.map((p) => p.diff).join("");
   try {
     persistGatePacket(opts.out, opts.runId, {
       changedFiles: acquired.coverage.files.map((f) => f.path).filter((p) => p && p !== "unknown"),
@@ -8995,6 +9377,20 @@ async function runReviewMode(opts) {
       headSha: acquired.headSha
     });
   } catch {
+  }
+  let lensHandoff;
+  if (partCount > 1) {
+    const shown = [];
+    let bytes = 0;
+    for (const p of parts) {
+      if (shown.length > 0 && bytes + p.diff.length > ceilingBytes) break;
+      shown.push(p.index);
+      bytes += p.diff.length;
+    }
+    lensHandoff = {
+      diff: parts.filter((p) => shown.includes(p.index)).map((p) => p.diff).join(""),
+      scope: renderLensScope(scopeInput, shown)
+    };
   }
   log(
     reviewers.length > 0 ? `Running ${reviewers.length} reviewer(s): ${reviewers.join(", ")}\u2026` : "Running 0 core reviewer(s) \u2014 claude-only: the Opus reviewer, the lens (when requested) and the gate are the reviewers of record; no cross-vendor receipt will qualify"
@@ -9008,28 +9404,66 @@ async function runReviewMode(opts) {
   );
   const wt = opts.worktree;
   const quals = wt ? qualifyCoreSeats(reviewers, wt.dir, configs) : {};
-  const worktreePrompt = wt ? prompt + worktreePromptSuffix({ baseSha: wt.baseSha, headSha: wt.headSha, worktree: wt.dir }) : void 0;
+  const worktreePrompts = wt ? prompts.map((p) => p + worktreePromptSuffix({ baseSha: wt.baseSha, headSha: wt.headSha, worktree: wt.dir })) : void 0;
   if (wt) {
     log(`Worktree evidence: ${wt.dir} (detached at ${wt.headSha.slice(0, 12)})`);
   }
   const adapters = opts.adapters ?? REVIEW_ADAPTERS;
+  const partSeats = /* @__PURE__ */ new Map();
   const seatRuns = await Promise.all(
     reviewers.map(async (id) => {
       const reviewer = configs[id];
       log(`  \xB7 ${id} (${reviewer.vendor} \xB7 ${reviewer.model})\u2026`);
-      const seat = await runCoreSeat({
+      const runPart = (k, suffix) => runCoreSeat({
         adapter: adapters[id],
+        ...suffix ? { artifactSuffix: suffix } : {},
         log,
         out: opts.out,
-        packet,
-        packetComplete: packet.complete,
-        packetPrompt: prompt,
+        packet: packets[k],
+        packetComplete: packets[k].complete,
+        packetPrompt: prompts[k],
         qualification: quals[id],
         retryOnPacket: RETRIES_ON_PACKET[id],
         reviewer,
         runId: opts.runId,
-        ...wt ? { worktree: wt.dir, worktreePrompt } : {}
+        ...wt && worktreePrompts ? { worktree: wt.dir, worktreePrompt: worktreePrompts[k] } : {}
       });
+      const record = (k, s) => {
+        const idx = acquired.plan.chunks[k]?.index ?? 1;
+        const seats = partSeats.get(idx) ?? {};
+        seats[id] = {
+          ...s.review.diagnostics ? { elapsedMs: s.review.diagnostics.elapsedMs } : {},
+          findings: s.review.findings.length,
+          state: s.review.terminalState === "reviewed" ? "reviewed" : "failed-reviewer",
+          ...s.review.terminalState === "reviewed" ? {} : { why: scrubControl(s.review.summary).slice(0, 160) }
+        };
+        partSeats.set(idx, seats);
+      };
+      let seat;
+      if (packets.length <= 1) {
+        seat = await runPart(0);
+        record(0, seat);
+      } else {
+        const partRuns = [];
+        for (let k = 0; k < packets.length; k++) {
+          const chunk = acquired.plan.chunks[k];
+          log(`  \xB7 ${id}: part ${chunk.index}/${packets.length} \u2014 ${chunk.label}\u2026`);
+          const s = await runPart(k, `c${chunk.index}`);
+          record(k, s);
+          log(
+            `  \xB7 ${id}: part ${chunk.index}/${packets.length} ${s.review.terminalState} \u2014 ${s.review.findings.length} finding(s)${s.review.terminalState === "reviewed" ? "" : ` \u2014 ${scrubControl(s.review.summary).slice(0, 160)}`}`
+          );
+          partRuns.push({ index: chunk.index, label: chunk.label, seat: s });
+        }
+        seat = mergeChunkSeatRuns({
+          out: opts.out,
+          packet,
+          prompt,
+          reviewer,
+          runId: opts.runId,
+          runs: partRuns
+        });
+      }
       const cause = seat.review.terminalState === "reviewed" ? "" : ` \u2014 ${scrubControl(seat.review.summary).slice(0, 200)}`;
       log(
         `  \xB7 ${id}: ${seat.review.terminalState} \u2014 ${seat.review.findings.length} finding(s) \xB7 evidence ${seat.realized}${cause}`
@@ -9067,6 +9501,24 @@ async function runReviewMode(opts) {
     }
   }
   const evidence = { egressDenials, fallbacks, intended, realized, sandboxProfiles };
+  const chunksTrail = {
+    ceilingBytes,
+    chunks: acquired.plan.chunks.map((c, i) => ({
+      bytes: c.bytes,
+      files: c.files.map((f) => ({ added: f.added, path: f.path, removed: f.removed, test: isTestPath(f.path) })),
+      index: c.index,
+      label: c.label,
+      promptChars: prompts[i]?.length ?? 0,
+      seats: partSeats.get(c.index) ?? {}
+    })),
+    maxChunks: opts.maxChunks ?? DEFAULT_MAX_CHUNKS,
+    omitted: acquired.coverage.files.filter((f) => !f.included).map((f) => ({ kind: f.kind, path: f.path, reason: f.omitReason ?? "omitted" })),
+    schemaVersion: CHUNKS_TRAIL_SCHEMA_VERSION
+  };
+  try {
+    writeTrailFile(opts.out, opts.runId, CHUNKS_TRAIL_FILE, JSON.stringify(chunksTrail, null, 2));
+  } catch {
+  }
   const built = buildDiffReceipt({
     baseRef: acquired.baseRef,
     baseSha: acquired.baseSha,
@@ -9074,9 +9526,10 @@ async function runReviewMode(opts) {
     coveragePolicy: { ceilingBytes },
     diffDigest: acquired.canonicalDigest,
     diffMode: acquired.mode,
-    // The covered diff is truncated in the packet when it exceeds the diff budget;
-    // a truncated payload must not qualify a receipt (the reviewer saw head+tail).
-    diffTruncated: acquired.diff.length > PACKET_BUDGETS.diff,
+    // A part's diff is truncated in its packet only when ONE file alone exceeds the ceiling (the
+    // packet's diff budget follows the ceiling, and every part fits it); a truncated payload must
+    // not qualify a receipt (the reviewer saw head+tail of that part).
+    diffTruncated: packets.some((p) => reviewerVisibleDiff(p).truncated),
     headSha: acquired.headSha,
     // An all-packet run passes empty maps ⇒ a legacy (v1) receipt, byte-identical to what shipped
     // before evidence identity existed. Any worktree seat ⇒ v2. The realized map here covers the
@@ -9093,10 +9546,10 @@ async function runReviewMode(opts) {
   if (built.ok && built.receipt) {
     const store = opts.receiptStore ?? defaultReceiptStore();
     log("Receipt qualified by the core \u2014 deferred to the full-roster gate.");
-    return { acquired, blocked: false, conventionManifest, depSurface, evidence, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, depSurface, evidence, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, evidence, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, evidence, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan };
 }
 
 // src/modes/review/code-review-seat.ts
@@ -9174,7 +9627,7 @@ You have NO shell and NO network: there is no Bash tool, so do not try to run \`
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: "reach every file", worktree: args.worktree })} Read any file there for whole-project context: a finding may
 cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from).
 
-${materializedDiffClause(args)}${ci}
+${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...args.scope ? { scope: args.scope } : {} })}${ci}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 
@@ -9517,40 +9970,97 @@ async function runClaudeReviewLayer(opts) {
   const isCodeProfile = (opts.profile ?? "code") === "code";
   const hasHistory = historyPacketHasData(opts.historyPacket);
   const ciForProducer = resolveCiEvidence(opts.ciEvidence, opts.ciEvidenceUnavailable);
-  const producerPrompt = !opts.worktree ? opts.reviewPrompt : isCodeProfile && opts.baseSha && opts.pinnedDiff ? renderCodeReviewSeatPrompt({
+  const producerPromptFor = (part) => !opts.worktree ? part.prompt : isCodeProfile && opts.baseSha && part.diff ? renderCodeReviewSeatPrompt({
     baseSha: opts.baseSha,
     // ONE both-fields rule (./ci-evidence), applied HERE too: the layer must hand the
     // producer the same account of the head the packet seats were given, so the arbitration
     // cannot differ between the two hops.
     ...ciForProducer.kind === "text" ? { ciEvidence: ciForProducer.text } : {},
     ...ciForProducer.kind === "unavailable" ? { ciEvidenceUnavailable: ciForProducer.reason } : {},
-    diff: opts.pinnedDiff,
+    diff: part.diff,
     headSha: opts.expectedHeadSha,
     history: hasHistory,
+    ...part.scope ? { scope: part.scope } : {},
     worktree: opts.worktree
-  }) : opts.reviewPrompt + claudeWorktreePromptSuffix({
+  }) : part.prompt + claudeWorktreePromptSuffix({
     headSha: opts.expectedHeadSha,
     history: hasHistory,
     worktree: opts.worktree
   });
+  const parts = opts.parts && opts.parts.length > 1 ? opts.parts : [{ diff: opts.pinnedDiff ?? "", index: 1, label: "(the change)", prompt: opts.reviewPrompt }];
+  const producerTimeout = opts.timeoutMs ?? (opts.worktree ? CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS : void 0);
   let claudeReview = null;
   let claudeSpawned = false;
-  if (opts.includeClaudeReviewer) {
+  if (opts.includeClaudeReviewer && parts.length === 1) {
     log(
       opts.worktree ? `  \xB7 claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (cold single-pass peer)\u2026` : `  \xB7 claude (anthropic/${modelLabel}) reviewing the diff (cold)\u2026`
     );
     const { review, raw, spawned } = await runClaudeReviewer(
-      producerPrompt,
+      producerPromptFor(parts[0]),
       opts.claudeConfig,
       run,
       // A worktree producer gets the bigger watchdog UNLESS the caller set one explicitly.
-      opts.timeoutMs ?? (opts.worktree ? CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS : void 0),
+      producerTimeout,
       log,
       opts.worktree,
       opts.historyPacket
     );
     claudeSpawned = spawned;
     claudeReview = withSeatAdvisor(review, opts.claudeConfig);
+    try {
+      persistSeatReview(opts.baseDir, opts.runId, "claude", claudeReview, raw);
+    } catch (e) {
+      const why = e.message;
+      log(`  \xB7 claude: trail persist FAILED (${why}) \u2014 reviewer counted INCOMPLETE`);
+      claudeReview = {
+        ...claudeReview,
+        ok: false,
+        summary: `claude reviewed but FAILED to persist to the trail (${why}) \u2014 not a complete reviewer`
+      };
+    }
+  } else if (opts.includeClaudeReviewer) {
+    const n = parts.length;
+    log(`  \xB7 claude (anthropic/${modelLabel}) reviewing the change in ${n} parts at the PR head\u2026`);
+    const partReviews = [];
+    for (const part of parts) {
+      log(`  \xB7 claude: part ${part.index}/${n} \u2014 ${part.label}\u2026`);
+      const res = await runClaudeReviewer(
+        producerPromptFor(part),
+        opts.claudeConfig,
+        run,
+        producerTimeout,
+        log,
+        opts.worktree,
+        opts.historyPacket
+      );
+      partReviews.push({ part, ...res });
+      try {
+        writeTrailFile(opts.baseDir, opts.runId, `findings.claude.c${part.index}.json`, JSON.stringify(res.review.findings, null, 2));
+        if (res.raw !== null) writeTrailFile(opts.baseDir, opts.runId, `claude-review.c${part.index}.raw.md`, res.raw);
+      } catch (e) {
+        log(`  \xB7 claude: part ${part.index} trail write failed (${e.message}) \u2014 continuing`);
+      }
+    }
+    claudeSpawned = partReviews.some((p) => p.spawned);
+    const failed = partReviews.filter((p) => !p.review.ok);
+    const findings = [];
+    for (const p of partReviews) {
+      for (const f of p.review.findings) findings.push({ ...f, chunk: p.part.index, id: `f${findings.length + 1}` });
+    }
+    const summary = failed.length === 0 ? partReviews.map((p) => `Part ${p.part.index}/${n} (${p.part.label}): ${p.review.summary}`).join("\n") : [
+      `Reviewed in ${n} part(s); ${failed.length} part(s) did not complete, so this reviewer is INCOMPLETE for the change.`,
+      ...failed.map((p) => `Part ${p.part.index}/${n} (${p.part.label}) FAILED: ${p.review.summary}`),
+      ...partReviews.filter((p) => p.review.ok).map((p) => `Part ${p.part.index}/${n} (${p.part.label}): ${p.review.summary}`)
+    ].join("\n");
+    claudeReview = withSeatAdvisor(
+      { findings, ok: failed.length === 0, summary, voiceId: "claude" },
+      opts.claudeConfig
+    );
+    const raws = partReviews.filter((p) => p.raw !== null).map((p) => `## Part ${p.part.index} of ${n} \u2014 ${p.part.label}
+
+${p.raw}`);
+    const raw = raws.length > 0 ? raws.join("\n\n") : null;
+    log(`  \xB7 claude: ${failed.length === 0 ? "reviewed" : "INCOMPLETE"} \u2014 ${findings.length} finding(s) across ${n} parts`);
     try {
       persistSeatReview(opts.baseDir, opts.runId, "claude", claudeReview, raw);
     } catch (e) {
@@ -9579,9 +10089,11 @@ async function runClaudeReviewLayer(opts) {
     }
   }
   const holistic = opts.holistic;
+  const lensDiff = opts.lensHandoff?.diff ?? opts.pinnedDiff;
+  const lensScope = opts.lensHandoff?.scope;
   const plan = resolveHolisticPlan({
     baseSha: holistic?.baseSha,
-    diff: opts.pinnedDiff,
+    diff: lensDiff,
     requested: Boolean(holistic),
     worktree: opts.worktree
   });
@@ -9600,6 +10112,7 @@ async function runClaudeReviewLayer(opts) {
       ...opts.historyPacket ? { historyPacket: opts.historyPacket } : {},
       log,
       run,
+      ...lensScope ? { scope: lensScope } : {},
       // The lens only runs WITH worktree evidence (resolveHolisticPlan), so the
       // worktree-sized default applies whenever the caller didn't set one.
       timeoutMs: opts.timeoutMs ?? HOLISTIC_WORKTREE_TIMEOUT_MS,
@@ -9775,7 +10288,7 @@ function renderClaudeLayer(result) {
 }
 
 // src/modes/review/gate-seat.ts
-import fs24 from "fs";
+import fs26 from "fs";
 var GATE_VENDORS = /* @__PURE__ */ new Set(["anthropic", "codex"]);
 var CODEX_GATE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
 var CODEX_GATE_DEFAULTS = { effort: "xhigh", model: "gpt-5.6-sol" };
@@ -9921,7 +10434,7 @@ function resolveGateSeat(raw, flags, warn, parseAdvisor = parseSeatAdvisor) {
 }
 function readVoicesRaw(file, warn, seatLabel, fallbackNote) {
   try {
-    return JSON.parse(fs24.readFileSync(file, "utf8"));
+    return JSON.parse(fs26.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(
@@ -10003,12 +10516,12 @@ function shadowChampionConfig(claudeSeat, effort, warn) {
 }
 
 // src/modes/review/regate.ts
-import fs25 from "fs";
-import path20 from "path";
+import fs27 from "fs";
+import path21 from "path";
 function readConventionPathsFromTrail(baseDir, runId) {
   try {
     const raw = JSON.parse(
-      fs25.readFileSync(path20.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
+      fs27.readFileSync(path21.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
     );
     const paths = (raw.files ?? []).filter((f) => f.included === true && typeof f.path === "string").map((f) => f.path);
     return paths.length > 0 ? paths : void 0;
@@ -10057,8 +10570,8 @@ async function runRegate(opts) {
     ...opts.worktree ? { worktree: opts.worktree } : {}
   });
   try {
-    const p = path20.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
-    const existing = fs25.existsSync(p) ? JSON.parse(fs25.readFileSync(p, "utf8")) : {};
+    const p = path21.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
+    const existing = fs27.existsSync(p) ? JSON.parse(fs27.readFileSync(p, "utf8")) : {};
     writeTrailFile(
       opts.baseDir,
       opts.runId,
@@ -10089,8 +10602,8 @@ async function runRegate(opts) {
 }
 
 // src/modes/review/reseat.ts
-import fs26 from "fs";
-import path21 from "path";
+import fs28 from "fs";
+import path22 from "path";
 
 // src/modes/review/evidence-manifest.ts
 var EVIDENCE_MANIFEST_SCHEMA_VERSION = 1;
@@ -10183,7 +10696,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   if (!stored) return { error: `run ${runId} has no review.${seat}.json under ${baseDir}` };
   let parsed;
   try {
-    parsed = JSON.parse(fs26.readFileSync(path21.join(dir, `packet.${seat}.json`), "utf8"));
+    parsed = JSON.parse(fs28.readFileSync(path22.join(dir, `packet.${seat}.json`), "utf8"));
   } catch {
     return { error: `run ${runId} has no readable packet.${seat}.json` };
   }
@@ -10193,7 +10706,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   const packet = parsed;
   let prompt;
   try {
-    prompt = fs26.readFileSync(path21.join(dir, `prompt.${seat}.md`), "utf8");
+    prompt = fs28.readFileSync(path22.join(dir, `prompt.${seat}.md`), "utf8");
   } catch {
     return { error: `run ${runId} has no readable prompt.${seat}.md` };
   }
@@ -10252,25 +10765,25 @@ function readReseatLock(p) {
   let startedMs;
   let since;
   try {
-    const st = fs26.statSync(p);
+    const st = fs28.statSync(p);
     startedMs = st.mtimeMs;
     since = new Date(st.mtimeMs).toISOString();
   } catch {
     return null;
   }
   try {
-    const held = JSON.parse(fs26.readFileSync(p, "utf8"));
+    const held = JSON.parse(fs28.readFileSync(p, "utf8"));
     if (typeof held.at === "string") since = held.at;
   } catch {
   }
   return { since, startedMs };
 }
 function acquireReseatLock(baseDir, runId) {
-  const p = path21.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
+  const p = path22.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
   const held = () => `another reseat is already running on run ${runId} (lock ${RESEAT_LOCK_FILE}, since ${readReseatLock(p)?.since ?? "unknown"})`;
   const claim = () => {
     try {
-      return fs26.openSync(p, "wx");
+      return fs28.openSync(p, "wx");
     } catch {
       return null;
     }
@@ -10280,28 +10793,28 @@ function acquireReseatLock(baseDir, runId) {
     const prior = readReseatLock(p);
     if (prior && Date.now() - prior.startedMs <= RESEAT_LOCK_STALE_MS) throw new ReseatLockedError(held());
     try {
-      fs26.rmSync(p, { force: true });
+      fs28.rmSync(p, { force: true });
     } catch {
     }
     fd = claim();
     if (fd === null) throw new ReseatLockedError(held());
   }
   try {
-    fs26.writeFileSync(fd, JSON.stringify({ at: (/* @__PURE__ */ new Date()).toISOString(), pid: process.pid }));
+    fs28.writeFileSync(fd, JSON.stringify({ at: (/* @__PURE__ */ new Date()).toISOString(), pid: process.pid }));
   } finally {
-    fs26.closeSync(fd);
+    fs28.closeSync(fd);
   }
   return () => {
     try {
-      fs26.rmSync(p, { force: true });
+      fs28.rmSync(p, { force: true });
     } catch {
     }
   };
 }
 function foldSynthesis(baseDir, runId, patch, log) {
   try {
-    const p = path21.join(reviewDir(baseDir, runId), "claude-synthesis.json");
-    const existing = fs26.existsSync(p) ? JSON.parse(fs26.readFileSync(p, "utf8")) : {};
+    const p = path22.join(reviewDir(baseDir, runId), "claude-synthesis.json");
+    const existing = fs28.existsSync(p) ? JSON.parse(fs28.readFileSync(p, "utf8")) : {};
     writeTrailFile(baseDir, runId, "claude-synthesis.json", JSON.stringify(patch(existing), null, 2));
     return true;
   } catch (e) {
@@ -10313,8 +10826,8 @@ function appendEgressDenials(baseDir, runId, denials, log) {
   if (denials.length === 0) return;
   try {
     log(`reseat: \u26A0 egress fence: ${formatEgressDenialCounts(denials)}`);
-    const p = path21.join(reviewDir(baseDir, runId), "egress-denials.json");
-    const prior = fs26.existsSync(p) ? JSON.parse(fs26.readFileSync(p, "utf8")) : [];
+    const p = path22.join(reviewDir(baseDir, runId), "egress-denials.json");
+    const prior = fs28.existsSync(p) ? JSON.parse(fs28.readFileSync(p, "utf8")) : [];
     if (!Array.isArray(prior)) {
       log(
         "reseat: egress-denials.json is not an array \u2014 leaving it untouched; this retry's denials are in the result only"
@@ -10436,9 +10949,9 @@ async function reseatUnderLock(opts, pre) {
     log
   );
   try {
-    const mp = path21.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
-    if (fs26.existsSync(mp)) {
-      const manifest = JSON.parse(fs26.readFileSync(mp, "utf8"));
+    const mp = path22.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
+    if (fs28.existsSync(mp)) {
+      const manifest = JSON.parse(fs28.readFileSync(mp, "utf8"));
       manifest.realizedEvidence = {
         ...manifest.realizedEvidence ?? {},
         [seat]: seatRun.realized
@@ -11157,16 +11670,29 @@ function stageReview(payload, target, deps) {
 
 // src/plumbing/diff-preview.ts
 function buildPacketPreview(acquired, profile, agentsMd, agentsBudget, diffBudget) {
-  const packet = assembleCodePacket({
+  const objective = profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE;
+  const plan = acquired.plan;
+  const scoped = plan.chunks.length > 1 || plan.overflow.length > 0;
+  const scopeInput = { coverage: acquired.coverage, plan };
+  const build = (diff, chunkIndex) => assembleCodePacket({
     agentsBudget,
     agentsMd,
-    diff: acquired.diff,
+    diff,
     diffBudget,
-    objective: profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE,
+    objective,
     pr: 0,
-    repo: acquired.repoId ?? ""
+    repo: acquired.repoId ?? "",
+    ...chunkIndex !== void 0 && scoped ? { scope: renderChangeScope(scopeInput, chunkIndex) } : {}
   });
-  return { packet, prompt: renderReviewPrompt(packet, profile) };
+  if (plan.chunks.length <= 1) {
+    const packet = build(acquired.diff, plan.chunks[0]?.index);
+    return { packet, prompt: renderReviewPrompt(packet, profile) };
+  }
+  const parts = plan.chunks.map((c) => {
+    const packet = build(c.diff, c.index);
+    return { index: c.index, label: c.label, packet, prompt: renderReviewPrompt(packet, profile) };
+  });
+  return { packet: parts[0].packet, parts, prompt: parts[0].prompt };
 }
 function renderConventionManifest(m) {
   const out = [];
@@ -11199,8 +11725,23 @@ function renderPacketPreview(acquired, preview, opts) {
   for (const f of c.files.filter((x) => !x.included)) {
     out.push(`             ${omittedLine({ kind: f.kind, path: f.path, reason: f.omitReason })}`);
   }
+  const parts = preview.parts ?? [];
+  if (parts.length > 1) {
+    out.push(
+      `  parts:   ${parts.length} (ceiling ${acquired.plan.ceilingBytes.toLocaleString("en-US")} bytes per part) \u2014 each seat reviews every part; one gate judges them together`
+    );
+    for (const p of parts) {
+      const chunk = acquired.plan.chunks.find((x) => x.index === p.index);
+      out.push(
+        `             part ${p.index}: ${p.label} \u2014 ${chunk?.paths.length ?? "?"} file(s), ${(chunk?.bytes ?? 0).toLocaleString("en-US")} bytes \xB7 prompt ~${p.prompt.length.toLocaleString("en-US")} chars`
+      );
+    }
+    if (acquired.plan.overflow.length > 0) {
+      out.push(`             \u26A0 ${acquired.plan.overflow.length} file(s) past the part limit (over-limit above; raise --max-chunks)`);
+    }
+  }
   out.push("");
-  out.push("  packet sections (what the reviewer sees):");
+  out.push(parts.length > 1 ? "  packet sections (part 1 \u2014 what the reviewer sees):" : "  packet sections (what the reviewer sees):");
   for (const s of preview.packet.sections) {
     const flag = s.included ? s.truncated ? "~" : "\u2713" : "\xB7";
     out.push(`    ${flag} ${s.title} \u2014 ${s.note}`);
@@ -11211,13 +11752,22 @@ function renderPacketPreview(acquired, preview, opts) {
   }
   out.push("");
   out.push(`  packet complete: ${preview.packet.complete ? "yes" : "NO \u2014 a blind review (diff missing/too small)"}`);
+  const totalChars = parts.length > 1 ? parts.reduce((n, p) => n + p.prompt.length, 0) : preview.prompt.length;
   out.push(
-    `  cost preview:    ~${preview.prompt.length} prompt chars \xD7 ${opts.reviewers.length} reviewer(s) [${opts.reviewers.join(", ")}]`
+    `  cost preview:    ~${totalChars} prompt chars${parts.length > 1 ? ` across ${parts.length} parts` : ""} \xD7 ${opts.reviewers.length} reviewer(s) [${opts.reviewers.join(", ")}]`
   );
   if (opts.full) {
     out.push("");
-    out.push("  \u2500\u2500 rendered prompt \u2500\u2500");
-    out.push(preview.prompt);
+    if (parts.length > 1) {
+      for (const p of parts) {
+        out.push(`  \u2500\u2500 rendered prompt \u2014 part ${p.index} of ${parts.length}: ${p.label} \u2500\u2500`);
+        out.push(p.prompt);
+        out.push("");
+      }
+    } else {
+      out.push("  \u2500\u2500 rendered prompt \u2500\u2500");
+      out.push(preview.prompt);
+    }
   } else {
     out.push("  (pass --full to print the entire rendered prompt)");
   }
@@ -11532,7 +12082,10 @@ Options:
                         repo's own diff, else an OS temp dir \u2014 the path is printed)
   --sandbox <profile>   reviewer sandbox profile override (deny-by-default only)
   --allow-sensitive     review even if the diff carries secrets/sensitive paths
-  --ceiling <bytes>     coverage byte ceiling (default 200000)
+  --ceiling <bytes>     coverage byte ceiling (default 200000) \u2014 the size of ONE packet; a
+                        larger change is reviewed in PARTS of this size, each whole
+  --max-chunks <n>      cap on review parts (default ${DEFAULT_MAX_CHUNKS}); files past it are
+                        NAMED as over-limit, never silently dropped
   --convention-cap <bytes>  conventions byte cap (default 150000; a full review wants more)
   --cwd <dir>           repo working dir (default: cwd)
   --run-id <id>         trail/receipt run id (default: generated)
@@ -11587,28 +12140,28 @@ function genRunId() {
 }
 function clearReusedRunTrail(baseDir, trailDir) {
   try {
-    if (fs27.lstatSync(trailDir).isSymbolicLink()) return;
+    if (fs29.lstatSync(trailDir).isSymbolicLink()) return;
   } catch {
     return;
   }
   let realBase;
   let realTarget;
   try {
-    realBase = fs27.realpathSync(baseDir);
-    realTarget = fs27.realpathSync(trailDir);
+    realBase = fs29.realpathSync(baseDir);
+    realTarget = fs29.realpathSync(trailDir);
   } catch {
     return;
   }
-  const rel = path22.relative(realBase, realTarget);
+  const rel = path23.relative(realBase, realTarget);
   if (!rel || escapesRoot(rel)) {
     return;
   }
-  fs27.rmSync(realTarget, { force: true, recursive: true });
+  fs29.rmSync(realTarget, { force: true, recursive: true });
 }
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
   try {
-    const s = fs27.readFileSync(0, "utf8");
+    const s = fs29.readFileSync(0, "utf8");
     return s.trim() ? s : void 0;
   } catch {
     return void 0;
@@ -11654,9 +12207,9 @@ function gitToplevel(cwd) {
 }
 function resolveTrailBase(gitRoot, localRepoTrail) {
   if (gitRoot && localRepoTrail) {
-    return path22.join(gitRoot, ".ensemble-ai", "reviews");
+    return path23.join(gitRoot, ".ensemble-ai", "reviews");
   }
-  return path22.join(os14.tmpdir(), "ensemble-ai", "reviews");
+  return path23.join(os14.tmpdir(), "ensemble-ai", "reviews");
 }
 function ghConventionReader(repoSlug, ref, cwd) {
   const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
@@ -11783,7 +12336,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "diff-file": {
       let text;
       try {
-        text = fs27.readFileSync(String(selection.diffFile), "utf8");
+        text = fs29.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
@@ -11887,6 +12440,19 @@ function printSummary(result, profile) {
   out.push(`  files:   ${coverageCounts(a.coverage)}`);
   for (const f of a.coverage.files.filter((x) => !x.included)) {
     out.push(`             ${omittedLine({ kind: f.kind, path: f.path, reason: f.omitReason })}`);
+  }
+  const plan = a.plan;
+  if (plan && plan.chunks.length > 1) {
+    out.push(
+      `  parts:   ${plan.chunks.length} (ceiling ${plan.ceilingBytes.toLocaleString("en-US")} bytes per part) \u2014 every seat reviewed each part; one gate judged them together`
+    );
+    for (const c of plan.chunks) {
+      out.push(`             part ${c.index}: ${c.label} \u2014 ${c.paths.length} file(s), ${c.bytes.toLocaleString("en-US")} bytes`);
+    }
+    if (plan.overflow.length > 0) {
+      out.push(`             \u26A0 ${plan.overflow.length} file(s) past the part limit were NOT reviewed (listed above as over-limit; raise --max-chunks)`);
+    }
+    out.push("             overview: coverage-overview.md + chunks.json in the trail dir");
   }
   if (result.conventionManifest && result.conventionManifest.files.length > 0) {
     out.push(...renderConventionManifest(result.conventionManifest));
@@ -12120,6 +12686,7 @@ async function reviewCommand(args, profile = "code") {
         cwd: { type: "string" },
         "diff-file": { type: "string" },
         "gate-dismissals": { type: "boolean" },
+        "max-chunks": { type: "string" },
         "gate-effort": { type: "string" },
         "gate-model": { type: "string" },
         "gate-vendor": { type: "string" },
@@ -12160,7 +12727,7 @@ async function reviewCommand(args, profile = "code") {
     console.log(usage);
     return 0;
   }
-  const cwd = values.cwd ? path22.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path23.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
   const postComment = Boolean(values["post-comment"]);
@@ -12256,7 +12823,7 @@ async function runReviewPipeline(input) {
   const optionalReviewers = resolveOptionalReviewers(values["optional-reviewers"], roster.core, cmd);
   if ("code" in optionalReviewers) return optionalReviewers.code;
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-  const out = typeof values.out === "string" ? path22.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+  const out = typeof values.out === "string" ? path23.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
   const ceiling = positiveCeiling(
     typeof values.ceiling === "string" ? values.ceiling : void 0,
@@ -12270,6 +12837,12 @@ async function runReviewPipeline(input) {
     "--convention-cap"
   );
   if (typeof conventionCap === "object") return conventionCap.code;
+  const maxChunks = positiveCount(
+    typeof values["max-chunks"] === "string" ? values["max-chunks"] : void 0,
+    cmd,
+    "--max-chunks"
+  );
+  if (typeof maxChunks === "object") return maxChunks.code;
   const peerSeats = roster.claude ? [...HARNESS_SEATS] : [];
   let directive;
   if (source.postTarget) {
@@ -12350,6 +12923,7 @@ async function runReviewPipeline(input) {
       diffText: source.diffText,
       directive,
       headShaOverride: source.headShaOverride,
+      ...maxChunks !== void 0 ? { maxChunks } : {},
       noConventions,
       onProgress: (m) => console.error(`\xB7 ${m}`),
       out,
@@ -12485,6 +13059,10 @@ async function runReviewPipeline(input) {
         // The pinned reviewer-visible diff. Under the capability fence the Anthropic seats have no
         // Bash, so `/code-review` and the lens are HANDED the change instead of deriving it.
         pinnedDiff: result.pinnedDiff,
+        // A review in PARTS (chunks.ts): the producer reviews each part the core saw, and the
+        // lens is handed what one packet holds plus the listing of every other changed file.
+        ...result.parts && result.parts.length > 1 ? { parts: result.parts } : {},
+        ...result.lensHandoff ? { lensHandoff: result.lensHandoff } : {},
         // `security --repo` must NOT have its security-auditor prompt replaced by the
         // `/code-review` skill's structural-quality lens (codex-f3).
         profile,
@@ -12585,12 +13163,42 @@ async function runReviewPipeline(input) {
       result.receiptError = "review INCOMPLETE \u2014 the default-on Opus (claude) reviewer was expected but did not complete, so no fully-reviewed receipt was minted";
     }
   }
+  if (!result.blocked) {
+    try {
+      const trail = readTrailJson(out, runId, CHUNKS_TRAIL_FILE);
+      if (trail && Array.isArray(trail.chunks)) {
+        const claudeReview = claudeLayer?.claudeReview ?? null;
+        for (const c of trail.chunks) {
+          if (claudeLayerExpected) {
+            const partFindings = claudeReview?.findings.filter((f) => (f.chunk ?? 1) === c.index).length ?? 0;
+            c.seats.claude = claudeReview ? {
+              findings: partFindings,
+              state: claudeReview.ok ? "reviewed" : "failed-reviewer",
+              ...claudeReview.ok ? {} : { why: scrubControl(claudeReview.summary).slice(0, 160) }
+            } : { findings: 0, state: "skipped", why: "the claude layer did not run" };
+          }
+        }
+        writeTrailFile(out, runId, CHUNKS_TRAIL_FILE, JSON.stringify(trail, null, 2));
+        writeTrailFile(
+          out,
+          runId,
+          "coverage-overview.md",
+          renderCoverageOverview(trail, {
+            ...claudeLayer ? { gateCounts: verdictCounts(gateRecords) } : {},
+            headSha: result.acquired.headSha,
+            totalFiles: result.acquired.coverage.totalFiles
+          })
+        );
+      }
+    } catch {
+    }
+  }
   printSummary(result, profile);
   if (result.reviews.length > 0) {
     const first = result.reviews[0];
     const pinnedReviewerId = first.reviewerId ?? first.reviewer.vendor;
     console.log(
-      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path22.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
+      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path23.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
   }
   if (claudeLayer) {
@@ -12826,19 +13434,19 @@ async function brainstormCommand(args) {
     console.error(BRAINSTORM_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path22.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path23.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path22.resolve(cwd, values.file);
+    const filePath = path23.resolve(cwd, values.file);
     try {
-      const bytes = fs27.statSync(filePath).size;
+      const bytes = fs29.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs27.readFileSync(filePath, "utf8");
+      fileContext = fs29.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${e.message}`
@@ -12849,7 +13457,7 @@ async function brainstormCommand(args) {
   let evidenceInfo;
   if (typeof values["evidence-root"] === "string") {
     try {
-      evidenceInfo = openEvidenceRoot(path22.resolve(cwd, values["evidence-root"]));
+      evidenceInfo = openEvidenceRoot(path23.resolve(cwd, values["evidence-root"]));
     } catch (e) {
       console.error(`ensemble-ai: ${e.message}`);
       return 3;
@@ -13091,19 +13699,19 @@ async function consultCommand(args) {
     console.error(CONSULT_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path22.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path23.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path22.resolve(cwd, values.file);
+    const filePath = path23.resolve(cwd, values.file);
     try {
-      const bytes = fs27.statSync(filePath).size;
+      const bytes = fs29.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs27.readFileSync(filePath, "utf8");
+      fileContext = fs29.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai consult: cannot read --file ${values.file}: ${e.message}`
@@ -13114,7 +13722,7 @@ async function consultCommand(args) {
   let evidenceInfo;
   if (typeof values["evidence-root"] === "string") {
     try {
-      evidenceInfo = openEvidenceRoot(path22.resolve(cwd, values["evidence-root"]));
+      evidenceInfo = openEvidenceRoot(path23.resolve(cwd, values["evidence-root"]));
     } catch (e) {
       console.error(`ensemble-ai: ${e.message}`);
       return 3;
@@ -13253,6 +13861,16 @@ function parseConventionPaths(raw) {
   return list.length ? list : void 0;
 }
 var MAX_BYTES_FLAG = 64 * 1024 * 1024;
+var MAX_CHUNKS_FLAG = 64;
+function positiveCount(raw, cmd, flag) {
+  if (raw === void 0) return void 0;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0 || n > MAX_CHUNKS_FLAG) {
+    console.error(`ensemble-ai ${cmd}: ${flag} must be a positive integer (at most ${MAX_CHUNKS_FLAG})`);
+    return { code: 3 };
+  }
+  return n;
+}
 function positiveCeiling(raw, cmd, flag = "--ceiling") {
   if (raw === void 0) return void 0;
   const n = Number(raw);
@@ -13347,11 +13965,11 @@ async function receiptCommand(args) {
     console.log(RECEIPT_USAGE);
     return 0;
   }
-  const receiptPathArg = typeof positionals[0] === "string" ? path22.resolve(positionals[0]) : void 0;
+  const receiptPathArg = typeof positionals[0] === "string" ? path23.resolve(positionals[0]) : void 0;
   const readReceiptFile = (p) => {
     let raw;
     try {
-      raw = fs27.readFileSync(p, "utf8");
+      raw = fs29.readFileSync(p, "utf8");
     } catch (e) {
       return { error: `cannot read receipt ${p}: ${e.message}` };
     }
@@ -13392,8 +14010,8 @@ async function receiptCommand(args) {
     console.error(`ensemble-ai receipt ${sub}: choose at most one of --repo / --cwd (both name the repo to verify)`);
     return 3;
   }
-  const repoLocation = typeof values.repo === "string" ? path22.resolve(values.repo) : void 0;
-  const cwd = repoLocation ?? (values.cwd ? path22.resolve(String(values.cwd)) : process.cwd());
+  const repoLocation = typeof values.repo === "string" ? path23.resolve(values.repo) : void 0;
+  const cwd = repoLocation ?? (values.cwd ? path23.resolve(String(values.cwd)) : process.cwd());
   const intendedEvidence = repoLocation ? Object.fromEntries(required.map((id) => [id, "worktree"])) : void 0;
   const acceptDegraded = Boolean(values["accept-degraded"]);
   if (acceptDegraded && !intendedEvidence) {
@@ -13432,7 +14050,7 @@ async function receiptCommand(args) {
     }),
     repo: acquired.repoId
   };
-  const store = values.store ? path22.resolve(String(values.store)) : defaultReceiptStore();
+  const store = values.store ? path23.resolve(String(values.store)) : defaultReceiptStore();
   if (sub === "show") {
     const receipt = readReceipt(store, key);
     if (!receipt) {
@@ -13468,7 +14086,7 @@ async function receiptCommand(args) {
     // with isDiffReviewed so a digest-only drift still reports `stale`.
     readReceipt: receiptPathArg ? (k) => explicit && receiptIdentityMatches(explicit, k) ? explicit : null : (k) => readReceipt(store, k),
     strict: Boolean(values.strict || values["require-artifacts"]),
-    trailDir: typeof values.trail === "string" ? path22.resolve(values.trail) : void 0
+    trailDir: typeof values.trail === "string" ? path23.resolve(values.trail) : void 0
   };
   const state = verifyReceipt({ coverage: acquired.coverage, key, required }, verifyDeps);
   console.log(formatVerify(state, key));
@@ -13516,8 +14134,8 @@ async function reviewersCommand(args) {
     console.log(REVIEWERS_USAGE);
     return 0;
   }
-  const reviewersFile = typeof values["reviewers-file"] === "string" ? path22.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
-  const voicesFile = typeof values["voices-file"] === "string" ? path22.resolve(values["voices-file"]) : VOICES_FILE;
+  const reviewersFile = typeof values["reviewers-file"] === "string" ? path23.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
+  const voicesFile = typeof values["voices-file"] === "string" ? path23.resolve(values["voices-file"]) : VOICES_FILE;
   const warn = (m) => console.error(`\xB7 ${m}`);
   let gateAdvisor;
   const gateSeat = loadGateSeat(voicesFile, {}, warn, (v) => {
@@ -13550,10 +14168,10 @@ async function reviewersCommand(args) {
     offSeats: offSeatsOf(reviewersConfig, enabledIds),
     reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,
-    reviewersFileExists: fs27.existsSync(reviewersFile),
+    reviewersFileExists: fs29.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
     voicesFile,
-    voicesFileExists: fs27.existsSync(voicesFile)
+    voicesFileExists: fs29.existsSync(voicesFile)
   };
   if (values.json) console.log(JSON.stringify(view, null, 2));
   else console.log(renderRegistry(view));
@@ -13588,7 +14206,9 @@ Options:
   --reviewers <ids>     reviewers to size the cost preview against (default: all)
   --conventions <paths> extra convention files to gather (comma-separated, in-repo)
   --no-conventions      do NOT gather the repo's conventions into the packet
-  --ceiling <bytes>     coverage byte ceiling (default 200000)
+  --ceiling <bytes>     coverage byte ceiling (default 200000) \u2014 one packet; a larger change
+                        previews as PARTS of this size
+  --max-chunks <n>      cap on review parts (default ${DEFAULT_MAX_CHUNKS})
   --convention-cap <bytes>  conventions byte cap (default 150000)
   --full                print the ENTIRE rendered prompt (the literal payload)
   --json                print { packet, prompt } as JSON
@@ -13609,6 +14229,7 @@ async function diffCommand(args) {
         cwd: { type: "string" },
         "diff-file": { type: "string" },
         full: { type: "boolean" },
+        "max-chunks": { type: "string" },
         help: { short: "h", type: "boolean" },
         json: { type: "boolean" },
         "no-conventions": { type: "boolean" },
@@ -13655,7 +14276,13 @@ async function diffCommand(args) {
     "--convention-cap"
   );
   if (typeof conventionCap === "object") return conventionCap.code;
-  const cwd = values.cwd ? path22.resolve(String(values.cwd)) : process.cwd();
+  const maxChunks = positiveCount(
+    typeof values["max-chunks"] === "string" ? values["max-chunks"] : void 0,
+    "diff",
+    "--max-chunks"
+  );
+  if (typeof maxChunks === "object") return maxChunks.code;
+  const cwd = values.cwd ? path23.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
   let acquired;
@@ -13667,6 +14294,7 @@ async function diffCommand(args) {
       diffMode: source.diffMode,
       diffText: source.diffText,
       headShaOverride: source.headShaOverride,
+      ...maxChunks !== void 0 ? { maxChunks } : {},
       repoIdOverride: source.postTarget?.repoSlug ? repoIdFromSlug(source.postTarget.repoSlug) : void 0,
       staged: source.staged,
       workingTree: source.workingTree
@@ -13759,7 +14387,7 @@ async function pushFenceCommand(args) {
     );
     return 3;
   }
-  const cwd = values.cwd ? path22.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path23.resolve(String(values.cwd)) : process.cwd();
   const gh = ghRunner(cwd);
   const scope = selection.owner && selection.repo ? ["-R", `${selection.owner}/${selection.repo}`] : [];
   const view = gh([
@@ -13817,7 +14445,7 @@ Exit: 0 = current (or ahead of main); 3 = STALE or DIVERGED; 1 = error. A consum
 gates on the exit code, or parses --json for a softer "N behind" surface.`;
 function resolveSelfRepo(git2) {
   const r = git2(["rev-parse", "--show-toplevel"], {
-    cwd: path22.dirname(fileURLToPath2(import.meta.url))
+    cwd: path23.dirname(fileURLToPath2(import.meta.url))
   });
   return r.ok ? r.text.trim() : null;
 }
@@ -14284,7 +14912,7 @@ async function probeCommand(rest) {
   let brief = null;
   if (briefPath) {
     try {
-      brief = fs27.readFileSync(path22.resolve(cwd, briefPath), "utf8");
+      brief = fs29.readFileSync(path23.resolve(cwd, briefPath), "utf8");
       console.error(`\xB7 operator brief: ${briefPath} (${brief.length} chars)`);
     } catch (e) {
       if (briefFlag) {
@@ -14364,7 +14992,7 @@ async function probeCommand(rest) {
     }
     const directive = "directive" in directiveRes ? directiveRes.directive : null;
     const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-    const out = typeof values.out === "string" ? path22.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+    const out = typeof values.out === "string" ? path23.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
     const trailDir = reviewDir(out, runId);
     const prompt = renderProbePrompt({
       baseSha: source.prBaseSha,

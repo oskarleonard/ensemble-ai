@@ -7,7 +7,6 @@ import {
 import type { EgressDenial } from '../../core/egress-proxy';
 import {
   assembleCodePacket,
-  PACKET_BUDGETS,
   reviewerVisibleDiff,
 } from '../../core/packet';
 import { renderReviewPrompt } from '../../core/prompt';
@@ -21,12 +20,24 @@ import {
 } from '../../core/types';
 import { REVIEW_ADAPTERS } from '../../reviewers/registry';
 
+import { type ChunkSeatRun, mergeChunkSeatRuns } from './chunk-merge';
+import {
+  CHUNKS_TRAIL_FILE,
+  CHUNKS_TRAIL_SCHEMA_VERSION,
+  type ChunksTrail,
+  type ChunkTrailEntry,
+  DEFAULT_MAX_CHUNKS,
+  renderChangeScope,
+  renderLensScope,
+} from './chunks';
 import { CI_EVIDENCE_BOTH_REASON, CI_EVIDENCE_TRAIL_FILE, resolveCiEvidence } from './ci-evidence';
 import {
   acquireDiff,
   type AcquiredDiff,
   DEFAULT_COVERAGE_CEILING,
   type DiffMode,
+  isTestPath,
+  worktreeFirstLineReader,
 } from './diff';
 import {
   type DepSurfaceResult,
@@ -121,6 +132,9 @@ export interface ReviewModeOptions {
   // Override the headSha for a pre-supplied diffText (a URL PR's resolved head SHA,
   // so the receipt is content-tied to the exact PR head). See AcquireDiffOpts.
   headShaOverride?: string;
+  // Cap on review PARTS (chunks.ts): a change over the ceiling is reviewed in up to this many
+  // packets, each whole. Default DEFAULT_MAX_CHUNKS; files past it are `over-limit`, named.
+  maxChunks?: number;
   // Opt out of convention gathering entirely (`--no-conventions`).
   noConventions?: boolean;
   objective?: string;
@@ -166,14 +180,24 @@ export interface ReviewModeResult {
   // The run's per-seat evidence identity for the CORE seats (intent, fact, and the sandbox profiles
   // that fenced them). Present on every non-blocked run; all-`packet` in packet mode.
   evidence?: ReviewEvidence;
+  // The LENS handoff for a review in parts: as much of the union diff as one packet holds (part 1
+  // onward, whole parts only) plus the scope listing naming every other changed file. Absent on a
+  // single-part review — the lens then gets `pinnedDiff`, which IS the whole change.
+  lensHandoff?: { diff: string; scope: string };
+  // The review PARTS (chunks.ts): the exact prompt, reviewer-visible diff and scope note each
+  // packet carried, in part order. ONE entry on a single-packet review (then `prompt` and
+  // `pinnedDiff` are that entry's). The Claude producer reviews these one by one, as the core did.
+  parts?: ReviewPart[];
   // The pinned REVIEWER-VISIBLE diff — the exact bytes every reviewer saw in the packet. The
   // Anthropic seats have no shell under the capability fence, so they cannot run `git diff`: the
   // engine hands them this. Same bytes as the persisted gate packet, so a seat, the gate, and the
-  // trail can never disagree about what the change was. Absent only on a secret-scan block.
+  // trail can never disagree about what the change was. On a review in parts it is the UNION of
+  // every part's diff (what the gate pins). Absent only on a secret-scan block.
   pinnedDiff?: string;
   // The exact rendered prompt every core reviewer saw (byte-identical across reviewers) —
   // returned so the self-contained layer's cold Opus reviewer reviews the SAME pinned
-  // packet, never a re-derived diff. Absent only on a secret-scan block (no packet built).
+  // packet, never a re-derived diff. On a review in parts: part 1's prompt (see `parts`).
+  // Absent only on a secret-scan block (no packet built).
   prompt?: string;
   receipt?: DiffReviewReceipt;
   // The receipt the core (codex/grok) QUALIFIED but that is deliberately NOT yet written:
@@ -187,6 +211,18 @@ export interface ReviewModeResult {
   receiptStore?: string;
   reviews: StoredReview[];
   secretScan: SecretScanResult;
+}
+
+// One review PART as the seats were handed it (chunks.ts): the rendered packet prompt, the
+// reviewer-visible diff (the packet's diff-section body) and the scope note — what the Claude
+// producer needs to review the same part the core did.
+export interface ReviewPart {
+  diff: string;
+  index: number;
+  label: string;
+  prompt: string;
+  // Absent when the change fit one packet and nothing was omitted (no scope section was rendered).
+  scope?: string;
 }
 
 // The default `code`-profile review objective. Exported so the `diff` plumbing
@@ -243,13 +279,30 @@ export async function runReviewMode(
     diffMode: opts.diffMode,
     diffText: opts.diffText,
     headShaOverride: opts.headShaOverride,
+    maxChunks: opts.maxChunks ?? DEFAULT_MAX_CHUNKS,
+    // With the tree on disk, a changed file is classed by its OWN first line too (a mid-file hunk
+    // of an ORM client shows no `Code generated` header — the file does).
+    ...(opts.worktree ? { readFirstLine: worktreeFirstLineReader(opts.worktree.dir) } : {}),
     repoIdOverride: opts.repoIdOverride,
     staged: opts.staged,
     workingTree: opts.workingTree,
   });
+  const partCount = acquired.plan.chunks.length;
   log(
-    `Diff: ${acquired.coverage.totalFiles} file(s), ${acquired.coverage.includedFiles} covered, ${acquired.coverage.omittedFiles} omitted · digest ${acquired.canonicalDigest.slice(0, 19)}…`
+    `Diff: ${acquired.coverage.totalFiles} file(s), ${acquired.coverage.includedFiles} covered, ${acquired.coverage.omittedFiles} omitted${
+      partCount > 1 ? ` · reviewed in ${partCount} parts (ceiling ${ceilingBytes.toLocaleString('en-US')} bytes)` : ''
+    } · digest ${acquired.canonicalDigest.slice(0, 19)}…`
   );
+  if (partCount > 1) {
+    for (const c of acquired.plan.chunks) {
+      log(`  · part ${c.index}/${partCount}: ${c.label} — ${c.paths.length} file(s), ${c.bytes.toLocaleString('en-US')} bytes`);
+    }
+    if (acquired.plan.overflow.length > 0) {
+      log(
+        `  · ⚠ ${acquired.plan.overflow.length} file(s) past the ${opts.maxChunks ?? DEFAULT_MAX_CHUNKS}-part limit are NOT reviewed (named in coverage as over-limit; raise --max-chunks)`
+      );
+    }
+  }
 
   // The security profile adds a LOCAL dependency-surface flag over the FULL parsed
   // diff (manifest changes + risky imports) — no network, computed once and surfaced
@@ -344,23 +397,34 @@ export async function runReviewMode(
   const ciEvidence = ci.kind === 'text' ? ci.text : undefined;
   const ciEvidenceUnavailable = ci.kind === 'unavailable' ? ci.reason : undefined;
 
-  const packet = assembleCodePacket({
-    agentsBudget: conventionManifest?.capBytes,
-    agentsMd,
-    authorSummary: opts.authorSummary,
-    ciEvidence,
-    ciEvidenceUnavailable,
-    diff: acquired.diff,
-    // The covered diff was admitted under THIS ceiling; the packet's diff section follows it so
-    // the coverage listing and the bytes the seats see cannot disagree.
-    diffBudget: ceilingBytes,
-    directive: opts.directive,
-    objective:
-      opts.objective ??
-      (profile === 'security' ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE),
-    pr: 0,
-    repo: acquired.repoId ?? '',
-  });
+  // ONE PACKET PER PART (chunks.ts). A change that fits the ceiling is one part and assembles
+  // exactly the packet this engine always built. A larger change is several, each whole, each
+  // carrying the scope note (this part's files, the other parts' files, the omitted files) ahead
+  // of its diff. A scope note also rides a single part when files were left out past the part
+  // limit — a seat is never left to infer an omission from a listing it was not given.
+  const objective =
+    opts.objective ?? (profile === 'security' ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE);
+  const scoped = partCount > 1 || acquired.plan.overflow.length > 0;
+  const scopeInput = { coverage: acquired.coverage, plan: acquired.plan };
+  const packets = (partCount > 0 ? acquired.plan.chunks : [null]).map((chunk) =>
+    assembleCodePacket({
+      agentsBudget: conventionManifest?.capBytes,
+      agentsMd,
+      authorSummary: opts.authorSummary,
+      ciEvidence,
+      ciEvidenceUnavailable,
+      diff: chunk ? chunk.diff : acquired.diff,
+      // The covered diff was admitted under THIS ceiling; the packet's diff section follows it so
+      // the coverage listing and the bytes the seats see cannot disagree.
+      diffBudget: ceilingBytes,
+      directive: opts.directive,
+      objective,
+      pr: 0,
+      repo: acquired.repoId ?? '',
+      ...(chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index) } : {}),
+    })
+  );
+  const packet = packets[0];
   // The rendered CI evidence joins the trail for humans + dashboards (best-effort, like every
   // trail write). The packet manifest already records the section for the seats.
   if (ciEvidence) {
@@ -370,23 +434,34 @@ export async function runReviewMode(
       /* trail write is best-effort */
     }
   }
-  const prompt = renderReviewPrompt(packet, profile);
+  const prompts = packets.map((p) => renderReviewPrompt(p, profile));
+  const prompt = prompts[0];
   if (!packet.complete) {
     log('Packet incomplete (no usable diff) — persisting an empty review.');
   }
+  const parts: ReviewPart[] = packets.map((p, i) => {
+    const chunk = acquired.plan.chunks[i];
+    return {
+      diff: reviewerVisibleDiff(p).text,
+      index: chunk?.index ?? 1,
+      label: chunk?.label ?? '(the change)',
+      prompt: prompts[i],
+      ...(chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index) } : {}),
+    };
+  });
 
   // Materialize the PINNED gate packet ONCE per run: the exact REVIEWER-VISIBLE diff (the
   // packet's diff-section body — head+tail-truncated over the diff budget, exactly what every
-  // reviewer saw in the prompt) + the head SHA it was resolved at + EVERY path the change
-  // touches (included or omitted), so the holistic gate can ask "is this a file the PR
-  // changes?" without conflating it with "did the packet carry its hunks?". Pinning the reviewer-visible
-  // bytes (NOT the full pre-truncation acquired.diff) is the binding fix (grok-f1/codex-f3): a
-  // citation into bytes the reviewers did NOT see can never validate a dismissal. The verified
-  // gate's hunk-resolver + citation-validator read ONLY this artifact (never the working tree),
-  // so a tree that mutates between the run and the gate can change no authority outcome.
-  // Best-effort — a failure just means the gate later reads no packet and degrades
-  // all-`unverified` (fail-closed).
-  const pinnedDiff = reviewerVisibleDiff(packet).text;
+  // reviewer saw in the prompt; on a review in parts, the UNION of every part's body) + the head
+  // SHA it was resolved at + EVERY path the change touches (included or omitted), so the holistic
+  // gate can ask "is this a file the PR changes?" without conflating it with "did the packet carry
+  // its hunks?". Pinning the reviewer-visible bytes (NOT the full pre-truncation acquired.diff) is
+  // the binding fix (grok-f1/codex-f3): a citation into bytes the reviewers did NOT see can never
+  // validate a dismissal. The verified gate's hunk-resolver + citation-validator read ONLY this
+  // artifact (never the working tree), so a tree that mutates between the run and the gate can
+  // change no authority outcome. Best-effort — a failure just means the gate later reads no packet
+  // and degrades all-`unverified` (fail-closed).
+  const pinnedDiff = parts.map((p) => p.diff).join('');
   try {
     persistGatePacket(opts.out, opts.runId, {
       changedFiles: acquired.coverage.files.map((f) => f.path).filter((p) => p && p !== 'unknown'),
@@ -395,6 +470,24 @@ export async function runReviewMode(
     });
   } catch {
     /* trail write is best-effort — the gate fails closed if the packet is absent */
+  }
+  // THE LENS HANDOFF on a review in parts: the lens reads the whole tree, but its prompt holds one
+  // packet's worth of diff. It gets whole parts from part 1 up to the ceiling, and a listing that
+  // names every other changed file as changed — never the sentence "this is exactly the diff"
+  // over a slice (run 2026-10-10-18-51-44-9acc127a's lens was told that, and believed it).
+  let lensHandoff: { diff: string; scope: string } | undefined;
+  if (partCount > 1) {
+    const shown: number[] = [];
+    let bytes = 0;
+    for (const p of parts) {
+      if (shown.length > 0 && bytes + p.diff.length > ceilingBytes) break;
+      shown.push(p.index);
+      bytes += p.diff.length;
+    }
+    lensHandoff = {
+      diff: parts.filter((p) => shown.includes(p.index)).map((p) => p.diff).join(''),
+      scope: renderLensScope(scopeInput, shown),
+    };
   }
 
   log(
@@ -417,31 +510,76 @@ export async function runReviewMode(
   // prompt PLUS the whole-project preamble — a packet seat never sees it.
   const wt = opts.worktree;
   const quals = wt ? qualifyCoreSeats(reviewers, wt.dir, configs) : {};
-  const worktreePrompt = wt
-    ? prompt + worktreePromptSuffix({ baseSha: wt.baseSha, headSha: wt.headSha, worktree: wt.dir })
+  const worktreePrompts = wt
+    ? prompts.map((p) => p + worktreePromptSuffix({ baseSha: wt.baseSha, headSha: wt.headSha, worktree: wt.dir }))
     : undefined;
   if (wt) {
     log(`Worktree evidence: ${wt.dir} (detached at ${wt.headSha.slice(0, 12)})`);
   }
 
   const adapters = opts.adapters ?? REVIEW_ADAPTERS;
+  // Per-part seat facts for the chunk trail (what each seat did with each part).
+  const partSeats = new Map<number, ChunkTrailEntry['seats']>();
   const seatRuns = await Promise.all(
     reviewers.map(async (id) => {
       const reviewer = configs[id];
       log(`  · ${id} (${reviewer.vendor} · ${reviewer.model})…`);
-      const seat = await runCoreSeat({
-        adapter: adapters[id],
-        log,
-        out: opts.out,
-        packet,
-        packetComplete: packet.complete,
-        packetPrompt: prompt,
-        qualification: quals[id],
-        retryOnPacket: RETRIES_ON_PACKET[id],
-        reviewer,
-        runId: opts.runId,
-        ...(wt ? { worktree: wt.dir, worktreePrompt } : {}),
-      });
+      const runPart = (k: number, suffix?: string) =>
+        runCoreSeat({
+          adapter: adapters[id],
+          ...(suffix ? { artifactSuffix: suffix } : {}),
+          log,
+          out: opts.out,
+          packet: packets[k],
+          packetComplete: packets[k].complete,
+          packetPrompt: prompts[k],
+          qualification: quals[id],
+          retryOnPacket: RETRIES_ON_PACKET[id],
+          reviewer,
+          runId: opts.runId,
+          ...(wt && worktreePrompts ? { worktree: wt.dir, worktreePrompt: worktreePrompts[k] } : {}),
+        });
+      const record = (k: number, s: Awaited<ReturnType<typeof runCoreSeat>>): void => {
+        const idx = acquired.plan.chunks[k]?.index ?? 1;
+        const seats = partSeats.get(idx) ?? {};
+        seats[id] = {
+          ...(s.review.diagnostics ? { elapsedMs: s.review.diagnostics.elapsedMs } : {}),
+          findings: s.review.findings.length,
+          state: s.review.terminalState === 'reviewed' ? 'reviewed' : 'failed-reviewer',
+          ...(s.review.terminalState === 'reviewed' ? {} : { why: scrubControl(s.review.summary).slice(0, 160) }),
+        };
+        partSeats.set(idx, seats);
+      };
+      let seat: Awaited<ReturnType<typeof runCoreSeat>>;
+      if (packets.length <= 1) {
+        seat = await runPart(0);
+        record(0, seat);
+      } else {
+        // The parts run ONE AT A TIME per reviewer (reviewers still run side by side): a vendor
+        // seat is one CLI session with one rate budget, and N parallel sessions of the same seat
+        // would trip it for no wall-clock gain the cross-vendor fan-out does not already give.
+        const partRuns: ChunkSeatRun[] = [];
+        for (let k = 0; k < packets.length; k++) {
+          const chunk = acquired.plan.chunks[k];
+          log(`  · ${id}: part ${chunk.index}/${packets.length} — ${chunk.label}…`);
+          const s = await runPart(k, `c${chunk.index}`);
+          record(k, s);
+          log(
+            `  · ${id}: part ${chunk.index}/${packets.length} ${s.review.terminalState} — ${s.review.findings.length} finding(s)${
+              s.review.terminalState === 'reviewed' ? '' : ` — ${scrubControl(s.review.summary).slice(0, 160)}`
+            }`
+          );
+          partRuns.push({ index: chunk.index, label: chunk.label, seat: s });
+        }
+        seat = mergeChunkSeatRuns({
+          out: opts.out,
+          packet,
+          prompt,
+          reviewer,
+          runId: opts.runId,
+          runs: partRuns,
+        });
+      }
       // A failed seat names its cause on the outcome line: a consumer that reads only the log
       // tail (hugin distills a dead run's failure text from it) otherwise sees a state and no why.
       const cause =
@@ -517,6 +655,32 @@ export async function runReviewMode(
   }
   const evidence: ReviewEvidence = { egressDenials, fallbacks, intended, realized, sandboxProfiles };
 
+  // THE CHUNK TRAIL (chunks.json): the parts as planned, what each core seat did with each, and
+  // every file no seat saw — the record the coverage overview and the dashboard render. Written on
+  // EVERY run (one part included) so a consumer has one shape to read. The caller folds the
+  // Anthropic seats in after its layer runs. Best-effort, like every trail write.
+  const chunksTrail: ChunksTrail = {
+    ceilingBytes,
+    chunks: acquired.plan.chunks.map((c, i) => ({
+      bytes: c.bytes,
+      files: c.files.map((f) => ({ added: f.added, path: f.path, removed: f.removed, test: isTestPath(f.path) })),
+      index: c.index,
+      label: c.label,
+      promptChars: prompts[i]?.length ?? 0,
+      seats: partSeats.get(c.index) ?? {},
+    })),
+    maxChunks: opts.maxChunks ?? DEFAULT_MAX_CHUNKS,
+    omitted: acquired.coverage.files
+      .filter((f) => !f.included)
+      .map((f) => ({ kind: f.kind, path: f.path, reason: f.omitReason ?? 'omitted' })),
+    schemaVersion: CHUNKS_TRAIL_SCHEMA_VERSION,
+  };
+  try {
+    writeTrailFile(opts.out, opts.runId, CHUNKS_TRAIL_FILE, JSON.stringify(chunksTrail, null, 2));
+  } catch {
+    /* trail write is best-effort */
+  }
+
   // Build the content-tied receipt — only when every required reviewer completed
   // AND coverage has no omitted source file (else no receipt; the reason is
   // reported, the gate stays the consumer's).
@@ -527,9 +691,10 @@ export async function runReviewMode(
     coveragePolicy: { ceilingBytes },
     diffDigest: acquired.canonicalDigest,
     diffMode: acquired.mode,
-    // The covered diff is truncated in the packet when it exceeds the diff budget;
-    // a truncated payload must not qualify a receipt (the reviewer saw head+tail).
-    diffTruncated: acquired.diff.length > PACKET_BUDGETS.diff,
+    // A part's diff is truncated in its packet only when ONE file alone exceeds the ceiling (the
+    // packet's diff budget follows the ceiling, and every part fits it); a truncated payload must
+    // not qualify a receipt (the reviewer saw head+tail of that part).
+    diffTruncated: packets.some((p) => reviewerVisibleDiff(p).truncated),
     headSha: acquired.headSha,
     // An all-packet run passes empty maps ⇒ a legacy (v1) receipt, byte-identical to what shipped
     // before evidence identity existed. Any worktree seat ⇒ v2. The realized map here covers the
@@ -551,8 +716,8 @@ export async function runReviewMode(
     // caller writes receiptCandidate once the roster is verified complete.
     const store = opts.receiptStore ?? defaultReceiptStore();
     log('Receipt qualified by the core — deferred to the full-roster gate.');
-    return { acquired, blocked: false, conventionManifest, depSurface, evidence, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, depSurface, evidence, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
   }
   log(`No receipt — ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, evidence, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, evidence, ...(lensHandoff ? { lensHandoff } : {}), parts, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan };
 }
