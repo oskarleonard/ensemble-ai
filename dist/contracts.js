@@ -321,7 +321,7 @@ function assembleCodePacket(input) {
     DIFF_SECTION_TITLE,
     "the change itself \u2014 review THIS, not the whole repo",
     input.diff,
-    PACKET_BUDGETS.diff
+    Math.max(PACKET_BUDGETS.diff, input.diffBudget ?? 0)
   );
   sections.push(
     diff,

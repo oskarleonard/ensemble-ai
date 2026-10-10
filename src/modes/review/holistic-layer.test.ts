@@ -395,3 +395,71 @@ describe('the lens ON — seat, gate, and the host-verified guardrails end to en
     fs.rmSync(wt, { force: true, recursive: true });
   });
 });
+
+describe('a lens diff site is judged against the CHANGE, not against which hunks fit the packet', () => {
+  // Run 2026-10-10-14-16-53-f5983e4d: the packet's splice had dropped the hunks of files the PR
+  // ADDED, and the gate refused the lens's findings on them as "not a file this PR changes".
+  const OTHER_DIFF = `diff --git a/src/other.ts b/src/other.ts
+index 333..444 100644
+--- a/src/other.ts
++++ b/src/other.ts
+@@ -1,1 +1,2 @@
+ export const other = 1;
++export const more = 2;
+`;
+
+  it('a file the PR changes whose hunks the packet does not carry still grounds an agree', async () => {
+    const { baseDir, runId } = seed();
+    // The pinned diff carries src/other.ts only; src/x.ts (the lens's diff site) is a changed file
+    // whose hunks did not fit — exactly the over-limit / spliced shape.
+    persistGatePacket(baseDir, runId, { changedFiles: ['src/other.ts', 'src/x.ts'], diff: OTHER_DIFF, headSha: HEAD });
+    const wt = seedWorktree();
+    const { run } = makeRunner(true);
+    const result = await runClaudeReviewLayer({
+      ...layerArgs(baseDir, runId, run),
+      holistic: { baseSha: BASE, config: HOLISTIC_CFG },
+      worktree: wt,
+    });
+    const lens = result.gateVerdicts.find((r) => r.reviewer === HOLISTIC_SEAT_ID)!;
+    expect(lens.effectiveVerdict).toBe('agree');
+    expect(lens.downgradeReason).toBeNull();
+    expect(lens.holistic?.verifiedSites).toHaveLength(2);
+    fs.rmSync(baseDir, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  it('without the file list (a packet written before the field) the hunk keys still decide', async () => {
+    const { baseDir, runId } = seed();
+    persistGatePacket(baseDir, runId, { diff: OTHER_DIFF, headSha: HEAD });
+    const wt = seedWorktree();
+    const { run } = makeRunner(true);
+    const result = await runClaudeReviewLayer({
+      ...layerArgs(baseDir, runId, run),
+      holistic: { baseSha: BASE, config: HOLISTIC_CFG },
+      worktree: wt,
+    });
+    const lens = result.gateVerdicts.find((r) => r.reviewer === HOLISTIC_SEAT_ID)!;
+    expect(lens.effectiveVerdict).toBe('unverified');
+    expect(lens.downgradeReason).toBe('invalid-citation');
+    expect(lens.reason).toContain('is not a file this PR changes');
+    fs.rmSync(baseDir, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  it('a file the PR does NOT change is still refused, file list or not', async () => {
+    const { baseDir, runId } = seed();
+    persistGatePacket(baseDir, runId, { changedFiles: ['src/other.ts'], diff: OTHER_DIFF, headSha: HEAD });
+    const wt = seedWorktree();
+    const { run } = makeRunner(true);
+    const result = await runClaudeReviewLayer({
+      ...layerArgs(baseDir, runId, run),
+      holistic: { baseSha: BASE, config: HOLISTIC_CFG },
+      worktree: wt,
+    });
+    const lens = result.gateVerdicts.find((r) => r.reviewer === HOLISTIC_SEAT_ID)!;
+    expect(lens.effectiveVerdict).toBe('unverified');
+    expect(lens.downgradeReason).toBe('invalid-citation');
+    fs.rmSync(baseDir, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+});

@@ -25,9 +25,16 @@ import { parseDiffFiles } from './diff';
 // reviewer-VISIBLE diff bytes (the head+tail-truncated packet section the reviewers saw), so a
 // citation can only validate against bytes a reviewer actually saw — a stale v1 packet (which
 // pinned the FULL pre-truncation diff) is therefore treated as corrupt → packet-fail (safe).
+// `changedFiles` (additive, still v2) names EVERY path the change touches — included or omitted
+// over the ceiling — so "a file this PR changes" (the holistic lens's diff-site rule) is answered
+// by the change, not by which hunks happened to fit the packet: run 2026-10-10-14-16-53-f5983e4d
+// refused two lens findings as "not a file this PR changes" for files the PR ADDED, because the
+// packet's splice had dropped their hunks. A packet without the field (written before this) reads
+// fine; the gate then falls back to the hunk keys, the pre-field behavior.
 export const GATE_PACKET_SCHEMA_VERSION = 2;
 
 export interface GatePacket {
+  changedFiles?: string[];
   diff: string;
   headSha: string;
   schemaVersion: number;
@@ -41,9 +48,10 @@ export interface GatePacket {
 export function persistGatePacket(
   baseDir: string,
   runId: string,
-  input: { diff: string; headSha: string }
+  input: { changedFiles?: readonly string[]; diff: string; headSha: string }
 ): void {
   const packet: GatePacket = {
+    ...(input.changedFiles ? { changedFiles: [...input.changedFiles] } : {}),
     diff: input.diff,
     headSha: input.headSha,
     schemaVersion: GATE_PACKET_SCHEMA_VERSION,
@@ -54,7 +62,7 @@ export function persistGatePacket(
 export type GatePacketReadFailure = 'missing' | 'corrupt' | 'sha-mismatch';
 
 export type GatePacketRead =
-  | { diff: string; ok: true }
+  | { changedFiles?: string[]; diff: string; ok: true }
   | { ok: false; reason: GatePacketReadFailure };
 
 // Read the pinned packet back at gate time and PROVE its identity. Missing / unparseable /
@@ -94,7 +102,13 @@ export function readGatePacket(
     return { ok: false, reason: 'corrupt' };
   }
   if (raw.headSha !== expectedHeadSha) return { ok: false, reason: 'sha-mismatch' };
-  return { diff: raw.diff, ok: true };
+  // Optional + additive: present only when the writer knew the change's file list; anything but a
+  // clean string array is ignored (fall back to the hunk keys), never a reason to fail the packet.
+  const changedFiles =
+    Array.isArray(raw.changedFiles) && raw.changedFiles.every((p) => typeof p === 'string')
+      ? raw.changedFiles
+      : undefined;
+  return { ...(changedFiles ? { changedFiles } : {}), diff: raw.diff, ok: true };
 }
 
 // ── Unified-diff hunk parsing ─────────────────────────────────────────────────────────

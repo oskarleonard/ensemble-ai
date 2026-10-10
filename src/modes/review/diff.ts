@@ -210,24 +210,29 @@ export function omittedLine(o: {
 // and the gate had to mark every finding on those files "unverified — out of
 // diff". The entries keep DIFF order regardless, so coverage listings and receipts
 // read as before; only which files fit changes. The included sections are
-// concatenated into the diff the packet carries (so the reviewer sees exactly what
-// coverage says, with no mid-file truncation).
+// concatenated into the diff the packet carries in ADMISSION order — non-test source
+// first, then tests — so the reviewer reads the change before its tests, and if a
+// downstream budget ever cuts the shipped diff, the cut eats tests before the change:
+// run 2026-10-10-14-16-53-f5983e4d (lisk-app#409) shipped in path order under a
+// packet budget below the ceiling, and the head+tail splice landed on the one module
+// the PR was about while 65 KB of spec files survived ahead of it.
 export function computeCoverage(
   files: FileDiff[],
   ceilingBytes: number = DEFAULT_COVERAGE_CEILING
 ): { coverage: Coverage; includedDiff: string } {
   const source = files.filter((f) => f.kind === 'source');
   const admitted = new Set<FileDiff>();
+  const includedSections: string[] = [];
   let includedBytes = 0;
   for (const f of [...source.filter((f) => !isTestPath(f.path)), ...source.filter((f) => isTestPath(f.path))]) {
     // The first admitted file always fits, even alone over the ceiling — a review of
     // nothing is worse than a review of one large file.
     if (includedBytes + f.bytes > ceilingBytes && includedBytes > 0) continue;
     admitted.add(f);
+    includedSections.push(f.raw);
     includedBytes += f.bytes;
   }
   const entries: CoverageFileEntry[] = [];
-  const includedSections: string[] = [];
   for (const f of files) {
     const base = {
       added: f.added,
@@ -249,7 +254,6 @@ export function computeCoverage(
       continue;
     }
     entries.push({ ...base, included: true });
-    includedSections.push(f.raw);
   }
   const coverage: Coverage = {
     files: entries,

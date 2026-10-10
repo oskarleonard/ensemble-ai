@@ -1222,8 +1222,9 @@ export interface RunGateOptions {
   // `reference-not-found`; packet ⇒ it structurally cannot, and the cause is dropped.
   gateEvidence?: EvidenceClass;
   // Worktree-backed verification for the holistic lens's guardrails (spec §4). `diffFiles` is
-  // derived HERE from the pinned packet (the one source of "what this PR changes"), so a caller
-  // supplies only the tree reader + the run's gathered conventions paths.
+  // derived HERE from the pinned packet — its `changedFiles` (every path the change touches) when
+  // the writer recorded them, else the hunk keys — so a caller supplies only the tree reader + the
+  // run's gathered conventions paths.
   holistic?: Omit<HolisticPolicyDeps, 'diffFiles'>;
   log?: (m: string) => void;
   // The opt-in PREMISE PASS (spec §4, --premise) — default OFF. When on AND the gate's findings
@@ -1269,10 +1270,19 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // verdict difference must be judge vs judge, never a reconcile-input drift.
   const reconcileOpts = {
     gateEvidence: opts.gateEvidence,
-    // The pinned packet's file set IS "what this PR changes" — the same bytes the reviewers saw.
-    // A holistic `agree` must cite its reinvention inside it.
+    // "What this PR changes" is the pinned packet's `changedFiles` — EVERY path the change
+    // touches, including files coverage omitted over the ceiling — not merely the hunks that fit
+    // the packet: the lens reads the whole tree, and its two sites are verified verbatim at
+    // headSha regardless. A packet written before the field falls back to the hunk keys.
     ...(opts.holistic
-      ? { holistic: { ...opts.holistic, diffFiles: new Set(packetHunks.keys()) } }
+      ? {
+          holistic: {
+            ...opts.holistic,
+            diffFiles: new Set(
+              packet.ok && packet.changedFiles ? packet.changedFiles : packetHunks.keys()
+            ),
+          },
+        }
       : {}),
   };
 

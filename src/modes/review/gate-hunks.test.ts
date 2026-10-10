@@ -239,3 +239,35 @@ describe('readGatePacket — pinned-packet identity is PROVEN (fail-closed)', ()
     expect(readGatePacket(base, 'r6', 'x')).toEqual({ ok: false, reason: 'corrupt' });
   });
 });
+
+describe('the pinned packet names EVERY file the change touches (additive, still v2)', () => {
+  function tmp(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-gp-'));
+  }
+
+  it('round-trips changedFiles when the writer recorded them', () => {
+    const base = tmp();
+    const changedFiles = ['src/a.ts', 'src/omitted-over-limit.ts', 'src/a.test.ts'];
+    persistGatePacket(base, 'r1', { changedFiles, diff: MIXED, headSha: 'abc123' });
+    expect(readGatePacket(base, 'r1', 'abc123')).toEqual({ changedFiles, diff: MIXED, ok: true });
+    expect(GATE_PACKET_SCHEMA_VERSION).toBe(2); // additive — a packet written before the field still reads
+  });
+
+  it('a packet without the field reads as before (the gate falls back to the hunk keys)', () => {
+    const base = tmp();
+    persistGatePacket(base, 'r2', { diff: MIXED, headSha: 'abc123' });
+    const read = readGatePacket(base, 'r2', 'abc123');
+    expect(read).toEqual({ diff: MIXED, ok: true });
+    expect(read.ok && 'changedFiles' in read).toBe(false);
+  });
+
+  it('a malformed field is ignored, never a reason to fail the packet closed', () => {
+    const base = tmp();
+    fs.mkdirSync(reviewDir(base, 'r3'), { recursive: true });
+    fs.writeFileSync(
+      path.join(reviewDir(base, 'r3'), 'packet.gate.json'),
+      JSON.stringify({ changedFiles: 'src/a.ts', diff: MIXED, headSha: 'x', schemaVersion: GATE_PACKET_SCHEMA_VERSION })
+    );
+    expect(readGatePacket(base, 'r3', 'x')).toEqual({ diff: MIXED, ok: true });
+  });
+});

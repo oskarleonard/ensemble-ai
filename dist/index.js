@@ -669,7 +669,7 @@ function assembleCodePacket(input) {
     DIFF_SECTION_TITLE,
     "the change itself \u2014 review THIS, not the whole repo",
     input.diff,
-    PACKET_BUDGETS.diff
+    Math.max(PACKET_BUDGETS.diff, input.diffBudget ?? 0)
   );
   sections.push(
     diff,
@@ -3186,14 +3186,15 @@ function omittedLine(o) {
 function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
   const source = files.filter((f) => f.kind === "source");
   const admitted = /* @__PURE__ */ new Set();
+  const includedSections = [];
   let includedBytes = 0;
   for (const f of [...source.filter((f2) => !isTestPath(f2.path)), ...source.filter((f2) => isTestPath(f2.path))]) {
     if (includedBytes + f.bytes > ceilingBytes && includedBytes > 0) continue;
     admitted.add(f);
+    includedSections.push(f.raw);
     includedBytes += f.bytes;
   }
   const entries = [];
-  const includedSections = [];
   for (const f of files) {
     const base = {
       added: f.added,
@@ -3215,7 +3216,6 @@ function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
       continue;
     }
     entries.push({ ...base, included: true });
-    includedSections.push(f.raw);
   }
   const coverage = {
     files: entries,
@@ -3334,6 +3334,7 @@ function acquireDiff(opts) {
 var GATE_PACKET_SCHEMA_VERSION = 2;
 function persistGatePacket(baseDir, runId, input) {
   const packet = {
+    ...input.changedFiles ? { changedFiles: [...input.changedFiles] } : {},
     diff: input.diff,
     headSha: input.headSha,
     schemaVersion: GATE_PACKET_SCHEMA_VERSION
@@ -5469,6 +5470,9 @@ async function runReviewMode(opts) {
     ciEvidence,
     ciEvidenceUnavailable,
     diff: acquired.diff,
+    // The covered diff was admitted under THIS ceiling; the packet's diff section follows it so
+    // the coverage listing and the bytes the seats see cannot disagree.
+    diffBudget: ceilingBytes,
     directive: opts.directive,
     objective: opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE),
     pr: 0,
@@ -5487,6 +5491,7 @@ async function runReviewMode(opts) {
   const pinnedDiff = reviewerVisibleDiff(packet).text;
   try {
     persistGatePacket(opts.out, opts.runId, {
+      changedFiles: acquired.coverage.files.map((f) => f.path).filter((p) => p && p !== "unknown"),
       diff: pinnedDiff,
       headSha: acquired.headSha
     });
