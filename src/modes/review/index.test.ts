@@ -177,3 +177,156 @@ describe('runReviewMode — the gathered CI evidence reaches the packet and the 
     ).toBe(false);
   });
 });
+
+// A REVIEW IN PARTS (chunks.ts). Two files in two areas, a ceiling that holds one of them: the
+// engine plans two parts, every core seat reviews BOTH (one adapter call per part), the parts
+// merge into one review of record per seat, the gate packet pins the UNION, and the trail
+// records what each seat did with each part.
+describe('runReviewMode — a change over the ceiling is reviewed in parts', () => {
+  const part = (p: string, n: number): string =>
+    `diff --git a/${p} b/${p}\nindex 1..2 100644\n--- a/${p}\n+++ b/${p}\n@@ -1,1 +1,1 @@\n+${'x'.repeat(n)}\n`;
+  const TWO_AREAS = part('backend/a.go', 300) + part('web/c.ts', 300);
+  const FINDING_REVIEW = (file: string): string =>
+    '```json\n' +
+    JSON.stringify({
+      findings: [{ body: 'b', confidence: 'high', evidence: { file, line: 1 }, severity: 'low', title: `bug in ${file}` }],
+      summary: `looked at ${file}`,
+    }) +
+    '\n```';
+
+  let out: string;
+  let cwd: string;
+  beforeEach(() => {
+    out = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-parts-'));
+    cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-parts-cwd-'));
+  });
+  afterEach(() => {
+    for (const d of [out, cwd]) fs.rmSync(d, { force: true, recursive: true });
+  });
+
+  it('runs every seat once per part, merges, pins the union, and writes chunks.json', async () => {
+    const prompts: string[] = [];
+    const adapter: ReviewAdapter = async (prompt) => {
+      prompts.push(prompt);
+      const file = prompt.includes('diff --git a/backend/a.go') ? 'backend/a.go' : 'web/c.ts';
+      return { ok: true, raw: FINDING_REVIEW(file), stderrTail: '', timedOut: false };
+    };
+    const res = await runReviewMode({
+      adapters: { claude: adapter, codex: adapter, grok: adapter },
+      ceilingBytes: 400,
+      conventionReader: null,
+      cwd,
+      diffMode: 'pr',
+      diffText: TWO_AREAS,
+      headShaOverride: 'a'.repeat(40),
+      noConventions: true,
+      out,
+      receiptStore: path.join(out, 'receipts'),
+      reviewers: ['grok'],
+      reviewersFile: NO_REVIEWERS_FILE,
+      runId: 'parts-run',
+    });
+    expect(res.blocked).toBe(false);
+    // two parts, two adapter calls, each carrying its own hunks + the scope note
+    expect(res.acquired.plan.chunks.map((c) => c.paths)).toEqual([['backend/a.go'], ['web/c.ts']]);
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain('PART 1 of 2');
+    expect(prompts[0]).toContain('diff --git a/backend/a.go');
+    expect(prompts[0]).not.toContain('diff --git a/web/c.ts');
+    expect(prompts[0]).toContain('web/c.ts (+1/-0)'); // named as changed, hunks elsewhere
+    expect(prompts[1]).toContain('PART 2 of 2');
+    expect(prompts[1]).toContain('diff --git a/web/c.ts');
+    // the parts come back for the Claude producer, and the lens gets a handoff with a listing
+    expect(res.parts?.map((p) => p.index)).toEqual([1, 2]);
+    expect(res.parts?.[1].scope).toContain('PART 2 of 2');
+    expect(res.lensHandoff?.scope).toContain('part 1 — backend (hunks below)');
+    expect(res.lensHandoff?.scope).toContain('part 2 — web (hunks NOT below — read at head)');
+    // ONE review of record per seat: both parts' findings, in part order, tagged with their part
+    const grok = res.reviews.find((r) => r.reviewerId === 'grok');
+    expect(grok?.terminalState).toBe('reviewed');
+    expect(grok?.findings.map((f) => [f.id, f.chunk, f.evidence.file])).toEqual([
+      ['f1', 1, 'backend/a.go'],
+      ['f2', 2, 'web/c.ts'],
+    ]);
+    expect(grok?.summary).toContain('Part 1/2');
+    expect(grok?.summary).toContain('Part 2/2');
+    // the parts' own artifacts survive beside the merged set
+    const dir = reviewDir(out, 'parts-run');
+    for (const name of ['findings.grok.c1.json', 'findings.grok.c2.json', 'prompt.grok.c1.md', 'prompt.grok.c2.md', 'review.grok.c1.json', 'review.grok.json', 'findings.grok.json', 'grok-review.raw.md']) {
+      expect(fs.existsSync(path.join(dir, name)), name).toBe(true);
+    }
+    expect(fs.readFileSync(path.join(dir, 'grok-review.raw.md'), 'utf8')).toContain('## Part 2 of 2');
+    // the gate packet pins the UNION of what the seats saw
+    const gatePacket = JSON.parse(fs.readFileSync(path.join(dir, 'packet.gate.json'), 'utf8')) as { changedFiles: string[]; diff: string };
+    expect(gatePacket.diff).toContain('diff --git a/backend/a.go');
+    expect(gatePacket.diff).toContain('diff --git a/web/c.ts');
+    expect(gatePacket.changedFiles).toEqual(['backend/a.go', 'web/c.ts']);
+    expect(res.pinnedDiff).toBe(gatePacket.diff);
+    // the chunk trail: two parts, the seat's outcome on each, nothing omitted
+    const trail = JSON.parse(fs.readFileSync(path.join(dir, 'chunks.json'), 'utf8')) as { chunks: { index: number; seats: Record<string, { findings: number; state: string }> }[]; omitted: unknown[] };
+    expect(trail.chunks.map((c) => c.index)).toEqual([1, 2]);
+    expect(trail.chunks[0].seats.grok).toMatchObject({ findings: 1, state: 'reviewed' });
+    expect(trail.chunks[1].seats.grok).toMatchObject({ findings: 1, state: 'reviewed' });
+    expect(trail.omitted).toEqual([]);
+    // every source file was reviewed whole → the core qualifies the receipt
+    expect(res.receiptCandidate).toBeDefined();
+    expect(res.acquired.coverage.omittedFiles).toBe(0);
+  });
+
+  it('a part that fails leaves the seat INCOMPLETE — never a clean merge over a hole', async () => {
+    let calls = 0;
+    const adapter: ReviewAdapter = async () => {
+      calls++;
+      return calls === 2
+        ? { ok: false, raw: null, stderrTail: 'boom', timedOut: true }
+        : { ok: true, raw: FINDING_REVIEW('backend/a.go'), stderrTail: '', timedOut: false };
+    };
+    const res = await runReviewMode({
+      adapters: { claude: adapter, codex: adapter, grok: adapter },
+      ceilingBytes: 400,
+      conventionReader: null,
+      cwd,
+      diffMode: 'pr',
+      diffText: TWO_AREAS,
+      headShaOverride: 'a'.repeat(40),
+      noConventions: true,
+      out,
+      receiptStore: path.join(out, 'receipts'),
+      reviewers: ['grok'],
+      reviewersFile: NO_REVIEWERS_FILE,
+      runId: 'parts-fail',
+    });
+    const grok = res.reviews.find((r) => r.reviewerId === 'grok');
+    expect(grok?.terminalState).toBe('failed-reviewer');
+    expect(grok?.summary).toContain('1 part(s) did not complete');
+    expect(grok?.summary).toContain('Part 2/2');
+    expect(grok?.findings).toHaveLength(1); // part 1's finding is kept, flagged by the state
+    expect(res.receiptCandidate).toBeUndefined();
+    expect(res.receiptError).toContain('grok did not complete');
+  });
+
+  it('a change that fits one packet is one part — no scope section, no part artifacts (unchanged behavior)', async () => {
+    const res = await runReviewMode({
+      adapters: stubAdapters(),
+      conventionReader: null,
+      cwd,
+      diffMode: 'pr',
+      diffText: CODE_DIFF,
+      headShaOverride: 'a'.repeat(40),
+      noConventions: true,
+      out,
+      receiptStore: path.join(out, 'receipts'),
+      reviewers: ['grok'],
+      reviewersFile: NO_REVIEWERS_FILE,
+      runId: 'one-part',
+    });
+    expect(res.acquired.plan.chunks).toHaveLength(1);
+    expect(res.parts).toHaveLength(1);
+    expect(res.lensHandoff).toBeUndefined();
+    expect(res.prompt).not.toContain('Change scope');
+    const dir = reviewDir(out, 'one-part');
+    expect(fs.existsSync(path.join(dir, 'findings.grok.c1.json'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, 'chunks.json'))).toBe(true);
+    expect(res.reviews[0].findings.every((f) => f.chunk === undefined)).toBe(true);
+  });
+});

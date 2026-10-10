@@ -247,6 +247,9 @@ var PACKET_BUDGETS = {
   files: 4e4,
   history: 4e3,
   objective: 2e3,
+  // The change-scope listing for a review in parts (PacketInput.scope): one line per changed
+  // file, so ~60 chars × files. 64 K holds a thousand-file change whole.
+  scope: 64e3,
   summary: 4e3,
   tests: 8e3
 };
@@ -283,6 +286,7 @@ function section(title, why, body, budget) {
   };
 }
 var DIFF_SECTION_TITLE = "The diff under review";
+var SCOPE_SECTION_TITLE = "Change scope (this review runs in parts)";
 var CI_EVIDENCE_SECTION_TITLE = "CI evidence (checks + annotations at the PR head)";
 function reviewerVisibleDiff(packet) {
   const s = packet.sections.find((sec) => sec.title === DIFF_SECTION_TITLE);
@@ -314,6 +318,16 @@ function assembleCodePacket(input) {
         "what the author says the change does + why \u2014 weigh, don\u2019t trust",
         input.authorSummary,
         PACKET_BUDGETS.summary
+      )
+    );
+  }
+  if (input.scope) {
+    sections.push(
+      section(
+        SCOPE_SECTION_TITLE,
+        "this change is reviewed in parts \u2014 what this packet carries, what the other parts carry, what no reviewer sees",
+        input.scope,
+        PACKET_BUDGETS.scope
       )
     );
   }
@@ -544,6 +558,7 @@ export {
   FINDINGS_INSTRUCTIONS,
   PACKET_BUDGETS,
   REVIEWER_IDS,
+  SCOPE_SECTION_TITLE,
   SEVERITIES,
   SEVERITY_LABEL,
   SEVERITY_ORDER,

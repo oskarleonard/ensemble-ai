@@ -229,14 +229,27 @@ export interface PersistReviewInput {
   stream?: string;
   summary: string;
   terminalState: TerminalState;
+  // A review PART's artifacts (modes/review/chunks.ts) are written beside the reviewer's merged
+  // set under `<name>.<id>.<suffix>.<ext>` (e.g. `findings.codex.c2.json`), so the part's own
+  // packet/prompt/reply survive the merge that the un-suffixed files then describe. Absent ⇒ the
+  // reviewer's canonical files, exactly as before parts existed.
+  artifactSuffix?: string;
 }
 
 // Per-reviewer artifact file names. A run fans out to N reviewers, each writing
 // its OWN independent set so a codex finding never overwrites a grok one. The
 // legacy bare `review.json` (pre-fan-out, always Codex) is still READ for old
 // runs — see readReview.
-function reviewJson(reviewerId: ReviewerId): string {
-  return `review.${reviewerId}.json`;
+function reviewJson(reviewerId: ReviewerId, suffix?: string): string {
+  return `review.${reviewerId}${suffix ? `.${suffix}` : ''}.json`;
+}
+
+// Only a short, path-safe token may become part of a file name (`c1`, `c12`): anything else
+// would let a caller steer the write to a different artifact.
+function safeSuffix(suffix: string | undefined): string | undefined {
+  if (suffix === undefined) return undefined;
+  if (!/^[a-z0-9]{1,16}$/i.test(suffix)) throw new Error(`invalid artifact suffix: ${suffix}`);
+  return suffix;
 }
 
 // Phase-1 write (reviewer done): packet, prompt, raw reply, findings, and the
@@ -247,19 +260,21 @@ export function persistReview(
 ): StoredReview {
   const dir = reviewDir(baseDir, input.runId);
   const id = input.reviewer.id;
-  writeAtomic(baseDir, dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
-  writeAtomic(baseDir, dir, `prompt.${id}.md`, input.prompt);
+  const suffix = safeSuffix(input.artifactSuffix);
+  const tag = suffix ? `.${suffix}` : '';
+  writeAtomic(baseDir, dir, `packet.${id}${tag}.json`, JSON.stringify(input.packet, null, 2));
+  writeAtomic(baseDir, dir, `prompt.${id}${tag}.md`, input.prompt);
   // The reply and the stream are per-ATTEMPT: a packet re-run after a failed worktree attempt
   // rewrites the index, so an artifact the re-run did not produce is removed rather than left
   // beside an index it does not belong to.
-  if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review.raw.md`, input.raw);
-  else removeStale(baseDir, dir, `${id}-review.raw.md`);
-  if (input.stream) writeAtomic(baseDir, dir, `${id}-stream.jsonl`, input.stream);
-  else removeStale(baseDir, dir, `${id}-stream.jsonl`);
+  if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review${tag}.raw.md`, input.raw);
+  else removeStale(baseDir, dir, `${id}-review${tag}.raw.md`);
+  if (input.stream) writeAtomic(baseDir, dir, `${id}-stream${tag}.jsonl`, input.stream);
+  else removeStale(baseDir, dir, `${id}-stream${tag}.jsonl`);
   writeAtomic(
     baseDir,
     dir,
-    `findings.${id}.json`,
+    `findings.${id}${tag}.json`,
     JSON.stringify(input.findings, null, 2)
   );
   const stored: StoredReview = {
@@ -280,7 +295,7 @@ export function persistReview(
     summary: input.summary,
     terminalState: input.terminalState,
   };
-  writeAtomic(baseDir, dir, reviewJson(id), JSON.stringify(stored, null, 2));
+  writeAtomic(baseDir, dir, reviewJson(id, suffix), JSON.stringify(stored, null, 2));
   return stored;
 }
 

@@ -264,6 +264,16 @@ async function runClaudeReviewer(
 
 // ── The whole layer: Opus reviewer + per-reviewer files + the gate ────────────────────
 
+// One review part as the producer is handed it — the shape `modes/review` returns as
+// `ReviewModeResult.parts` (kept structurally here so this layer never imports the mode).
+export interface ProducerPart {
+  diff: string;
+  index: number;
+  label: string;
+  prompt: string;
+  scope?: string;
+}
+
 export interface ClaudeLayerOptions {
   baseDir: string;
   // The base SHA the PR diverged from. With a worktree it turns the `claude` seat into THE ONE
@@ -323,8 +333,17 @@ export interface ClaudeLayerOptions {
   historyPacket?: HistoryPacket;
   // The pinned reviewer-visible diff. Under the capability fence the Anthropic seats have no shell,
   // so the engine hands them the change instead of letting them run `git diff` (see ./claude).
-  // Absent ⇒ the seats fall back to the packet prompt, which already embeds the diff.
+  // Absent ⇒ the seats fall back to the packet prompt, which already embeds the diff. On a review
+  // in PARTS this is the union; the producer then reviews `parts` one by one instead.
   pinnedDiff?: string;
+  // The review PARTS (modes/review/chunks.ts) as the core seats were handed them. More than one ⇒
+  // the Claude producer reviews each part in turn (the same packet the core saw for that part)
+  // and the parts are MERGED into one `claude` review, exactly as a core seat's parts are.
+  // Absent or one ⇒ the single-pass producer, byte-identical to before parts existed.
+  parts?: ProducerPart[];
+  // The LENS handoff on a review in parts: as much of the union as one packet holds + the scope
+  // listing naming every other changed file. Absent ⇒ the lens is handed `pinnedDiff` whole.
+  lensHandoff?: { diff: string; scope: string };
   // The head SHA the reviewers saw — the gate reads the pinned packet keyed by it, and a
   // mismatch fails the packet closed (all verdicts unverified).
   expectedHeadSha: string;
@@ -436,50 +455,124 @@ export async function runClaudeReviewLayer(
   // evidence the seat cannot open (a shallow clone yields a README and nothing else).
   const hasHistory = historyPacketHasData(opts.historyPacket);
   const ciForProducer = resolveCiEvidence(opts.ciEvidence, opts.ciEvidenceUnavailable);
-  const producerPrompt = !opts.worktree
-    ? opts.reviewPrompt
-    : isCodeProfile && opts.baseSha && opts.pinnedDiff
-      ? renderCodeReviewSeatPrompt({
-          baseSha: opts.baseSha,
-          // ONE both-fields rule (./ci-evidence), applied HERE too: the layer must hand the
-          // producer the same account of the head the packet seats were given, so the arbitration
-          // cannot differ between the two hops.
-          ...(ciForProducer.kind === 'text' ? { ciEvidence: ciForProducer.text } : {}),
-          ...(ciForProducer.kind === 'unavailable'
-            ? { ciEvidenceUnavailable: ciForProducer.reason }
-            : {}),
-          diff: opts.pinnedDiff,
-          headSha: opts.expectedHeadSha,
-          history: hasHistory,
-          worktree: opts.worktree,
-        })
-      : opts.reviewPrompt +
-        claudeWorktreePromptSuffix({
-          headSha: opts.expectedHeadSha,
-          history: hasHistory,
-          worktree: opts.worktree,
-        });
+  // The producer prompt for ONE part: the packet prompt (packet mode), the `/code-review` seat
+  // prompt over that part's diff + scope (worktree, code profile), or the packet prompt plus the
+  // worktree preamble (worktree, other profiles). A single-part review passes the whole change.
+  const producerPromptFor = (part: { diff: string; prompt: string; scope?: string }): string =>
+    !opts.worktree
+      ? part.prompt
+      : isCodeProfile && opts.baseSha && part.diff
+        ? renderCodeReviewSeatPrompt({
+            baseSha: opts.baseSha,
+            // ONE both-fields rule (./ci-evidence), applied HERE too: the layer must hand the
+            // producer the same account of the head the packet seats were given, so the arbitration
+            // cannot differ between the two hops.
+            ...(ciForProducer.kind === 'text' ? { ciEvidence: ciForProducer.text } : {}),
+            ...(ciForProducer.kind === 'unavailable'
+              ? { ciEvidenceUnavailable: ciForProducer.reason }
+              : {}),
+            diff: part.diff,
+            headSha: opts.expectedHeadSha,
+            history: hasHistory,
+            ...(part.scope ? { scope: part.scope } : {}),
+            worktree: opts.worktree,
+          })
+        : part.prompt +
+          claudeWorktreePromptSuffix({
+            headSha: opts.expectedHeadSha,
+            history: hasHistory,
+            worktree: opts.worktree,
+          });
+  const parts: ProducerPart[] =
+    opts.parts && opts.parts.length > 1
+      ? opts.parts
+      : [{ diff: opts.pinnedDiff ?? '', index: 1, label: '(the change)', prompt: opts.reviewPrompt }];
+  const producerTimeout = opts.timeoutMs ?? (opts.worktree ? CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS : undefined);
 
   let claudeReview: VoiceReview | null = null;
   let claudeSpawned = false;
-  if (opts.includeClaudeReviewer) {
+  if (opts.includeClaudeReviewer && parts.length === 1) {
     log(
       opts.worktree
         ? `  · claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (cold single-pass peer)…`
         : `  · claude (anthropic/${modelLabel}) reviewing the diff (cold)…`
     );
     const { review, raw, spawned } = await runClaudeReviewer(
-      producerPrompt,
+      producerPromptFor(parts[0]),
       opts.claudeConfig,
       run,
       // A worktree producer gets the bigger watchdog UNLESS the caller set one explicitly.
-      opts.timeoutMs ?? (opts.worktree ? CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS : undefined),
+      producerTimeout,
       log,
       opts.worktree,
       opts.historyPacket
     );
     claudeSpawned = spawned;
     claudeReview = withSeatAdvisor(review, opts.claudeConfig);
+    try {
+      persistSeatReview(opts.baseDir, opts.runId, 'claude', claudeReview, raw);
+    } catch (e) {
+      const why = (e as Error).message;
+      log(`  · claude: trail persist FAILED (${why}) — reviewer counted INCOMPLETE`);
+      claudeReview = {
+        ...claudeReview,
+        ok: false,
+        summary: `claude reviewed but FAILED to persist to the trail (${why}) — not a complete reviewer`,
+      };
+    }
+  } else if (opts.includeClaudeReviewer) {
+    // A REVIEW IN PARTS: the producer reads each part in turn — the same packet, the same scope
+    // note the core seats got for that part — and the parts merge into ONE claude review under
+    // the rules chunk-merge.ts applies to a core seat: complete only if every part is, findings
+    // in part order with their `chunk`, nothing laundered. Each part's reply is kept on disk under
+    // its suffix so the merged `claude-review.raw.md` is a record, not the only copy.
+    const n = parts.length;
+    log(`  · claude (anthropic/${modelLabel}) reviewing the change in ${n} parts at the PR head…`);
+    const partReviews: { part: ProducerPart; raw: string | null; review: VoiceReview; spawned: boolean }[] = [];
+    for (const part of parts) {
+      log(`  · claude: part ${part.index}/${n} — ${part.label}…`);
+      const res = await runClaudeReviewer(
+        producerPromptFor(part),
+        opts.claudeConfig,
+        run,
+        producerTimeout,
+        log,
+        opts.worktree,
+        opts.historyPacket
+      );
+      partReviews.push({ part, ...res });
+      try {
+        writeTrailFile(opts.baseDir, opts.runId, `findings.claude.c${part.index}.json`, JSON.stringify(res.review.findings, null, 2));
+        if (res.raw !== null) writeTrailFile(opts.baseDir, opts.runId, `claude-review.c${part.index}.raw.md`, res.raw);
+      } catch (e) {
+        log(`  · claude: part ${part.index} trail write failed (${(e as Error).message}) — continuing`);
+      }
+    }
+    claudeSpawned = partReviews.some((p) => p.spawned);
+    const failed = partReviews.filter((p) => !p.review.ok);
+    const findings: ReviewFinding[] = [];
+    for (const p of partReviews) {
+      for (const f of p.review.findings) findings.push({ ...f, chunk: p.part.index, id: `f${findings.length + 1}` });
+    }
+    const summary =
+      failed.length === 0
+        ? partReviews.map((p) => `Part ${p.part.index}/${n} (${p.part.label}): ${p.review.summary}`).join('\n')
+        : [
+            `Reviewed in ${n} part(s); ${failed.length} part(s) did not complete, so this reviewer is INCOMPLETE for the change.`,
+            ...failed.map((p) => `Part ${p.part.index}/${n} (${p.part.label}) FAILED: ${p.review.summary}`),
+            ...partReviews
+              .filter((p) => p.review.ok)
+              .map((p) => `Part ${p.part.index}/${n} (${p.part.label}): ${p.review.summary}`),
+          ].join('\n');
+    claudeReview = withSeatAdvisor(
+      { findings, ok: failed.length === 0, summary, voiceId: 'claude' },
+      opts.claudeConfig
+    );
+    const raws = partReviews
+      .filter((p) => p.raw !== null)
+      .map((p) => `## Part ${p.part.index} of ${n} — ${p.part.label}\n\n${p.raw}`);
+    const raw = raws.length > 0 ? raws.join('\n\n') : null;
+    log(`  · claude: ${failed.length === 0 ? 'reviewed' : 'INCOMPLETE'} — ${findings.length} finding(s) across ${n} parts`);
     // The trail persist must SUCCEED for the claude voice to count as a complete reviewer:
     // if it fails, the review never reaches the trail (so the disk-read synthesis below
     // silently drops it) and its findings are unverifiable after the run. A completed-but-
@@ -523,9 +616,13 @@ export async function runClaudeReviewLayer(
   // architecture claim. Its persist is the same fail-loud contract as the claude reviewer's: a
   // review the trail did not take is not a review, because the gate reads voices off disk.
   const holistic = opts.holistic;
+  // On a review in parts the lens is handed what one packet holds plus the scope listing; the
+  // "exactly the diff" wording never reaches it over a slice (./worktree materializedDiffClause).
+  const lensDiff = opts.lensHandoff?.diff ?? opts.pinnedDiff;
+  const lensScope = opts.lensHandoff?.scope;
   const plan: HolisticPlan = resolveHolisticPlan({
     baseSha: holistic?.baseSha,
-    diff: opts.pinnedDiff,
+    diff: lensDiff,
     requested: Boolean(holistic),
     worktree: opts.worktree,
   });
@@ -544,6 +641,7 @@ export async function runClaudeReviewLayer(
       ...(opts.historyPacket ? { historyPacket: opts.historyPacket } : {}),
       log,
       run,
+      ...(lensScope ? { scope: lensScope } : {}),
       // The lens only runs WITH worktree evidence (resolveHolisticPlan), so the
       // worktree-sized default applies whenever the caller didn't set one.
       timeoutMs: opts.timeoutMs ?? HOLISTIC_WORKTREE_TIMEOUT_MS,

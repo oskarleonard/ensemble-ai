@@ -192,6 +192,10 @@ export interface HolisticPromptArgs {
   // is its heaviest consumer: "is this a reinvention, or the deliberate replacement of the util
   // three commits ago?" is a question only history answers. Omitted ⇒ no clause.
   history?: boolean;
+  // The change-scope note when the change was reviewed in PARTS (./chunks renderLensScope): the
+  // lens is handed as much of the diff as one packet holds and told, file by file, what else the
+  // PR changes. Omitted ⇒ the diff IS the whole change, as before.
+  scope?: string;
   worktree: string;
 }
 
@@ -211,7 +215,7 @@ network: there is no Bash tool, so do not try to run \`git\` or any command.
 
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: 'search and read it', worktree: args.worktree })}
 
-${materializedDiffClause(args)}
+${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...(args.scope ? { scope: args.scope } : {}) })}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 
@@ -274,6 +278,8 @@ export interface RunHolisticLensOptions {
   historyPacket?: HistoryPacket;
   log?: (m: string) => void;
   run: HolisticRunner;
+  // The change-scope note for a review in parts (HolisticPromptArgs.scope).
+  scope?: string;
   timeoutMs?: number;
   worktree: string;
 }
@@ -292,6 +298,7 @@ export async function runHolisticLens(
     diff: opts.diff,
     headSha: opts.headSha,
     history: hasHistory,
+    ...(opts.scope ? { scope: opts.scope } : {}),
     worktree: opts.worktree,
   });
   const fail = (summary: string): { raw: string | null; review: VoiceReview } => ({

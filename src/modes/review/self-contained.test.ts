@@ -852,3 +852,120 @@ describe('the execution settler stage — gate-tagged findings settled by runnin
     expect(quiet.settlerSkipped).toBeNull();
   });
 });
+
+// A REVIEW IN PARTS: the Claude producer reviews each part the core saw (one spawn per part, the
+// part's own diff + scope in its prompt) and the parts merge into ONE `claude` review — complete
+// only if every part is; findings in part order, tagged with their part.
+describe('runClaudeReviewLayer — the producer reviews a change in parts', () => {
+  const PART_DIFF = (p: string): string => `diff --git a/${p} b/${p}\n--- a/${p}\n+++ b/${p}\n@@ -1,1 +1,1 @@\n+x\n`;
+  const parts = [
+    { diff: PART_DIFF('backend/a.go'), index: 1, label: 'backend', prompt: 'PROMPT PART 1', scope: 'PART 1 of 2 — backend' },
+    { diff: PART_DIFF('web/c.ts'), index: 2, label: 'web', prompt: 'PROMPT PART 2', scope: 'PART 2 of 2 — web' },
+  ];
+  const reviewFor = (file: string): string =>
+    JSON.stringify({ findings: [{ body: 'b', confidence: 'high', evidence: { file, line: 1 }, severity: 'low', title: `in ${file}` }], summary: `read ${file}` });
+
+  it('spawns once per part, merges in part order, keeps each part on disk', async () => {
+    const base = tmpTrail();
+    const runId = 'parts';
+    seedCoreTrail(base, runId, [stored('codex')]);
+    const seen: string[] = [];
+    const run = async (prompt: string): Promise<VoiceRunResult> => {
+      if (prompt.includes('VERIFIED GATE')) return okRun(GATE);
+      seen.push(prompt);
+      return okRun(reviewFor(prompt.includes('PROMPT PART 1') || prompt.includes('backend/a.go') ? 'backend/a.go' : 'web/c.ts'));
+    };
+    const res = await runClaudeReviewLayer({
+      baseDir: base,
+      claudeConfig: CFG,
+      coreReviews: [stored('codex')],
+      expectedHeadSha: HEAD,
+      includeClaudeReviewer: true,
+      parts,
+      reviewPrompt: 'PROMPT PART 1',
+      run,
+      runId,
+    });
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toContain('PROMPT PART 1');
+    expect(seen[1]).toContain('PROMPT PART 2');
+    expect(res.claudeReview?.ok).toBe(true);
+    expect(res.claudeReview?.findings.map((f) => [f.id, f.chunk, f.evidence.file])).toEqual([
+      ['f1', 1, 'backend/a.go'],
+      ['f2', 2, 'web/c.ts'],
+    ]);
+    expect(res.claudeReview?.summary).toContain('Part 1/2 (backend)');
+    const dir = reviewDir(base, runId);
+    for (const name of ['findings.claude.c1.json', 'findings.claude.c2.json', 'claude-review.c1.raw.md', 'claude-review.c2.raw.md', 'review.claude.json', 'claude-review.raw.md']) {
+      expect(fs.existsSync(path.join(dir, name)), name).toBe(true);
+    }
+    expect(fs.readFileSync(path.join(dir, 'claude-review.raw.md'), 'utf8')).toContain('## Part 2 of 2 — web');
+    fs.rmSync(base, { force: true, recursive: true });
+  });
+
+  it('a part that fails leaves claude INCOMPLETE', async () => {
+    const base = tmpTrail();
+    const runId = 'parts-fail';
+    seedCoreTrail(base, runId, [stored('codex')]);
+    let n = 0;
+    const run = async (prompt: string): Promise<VoiceRunResult> => {
+      if (prompt.includes('VERIFIED GATE')) return okRun(GATE);
+      n++;
+      return n === 2 ? { ok: false, raw: null, stderrTail: 'boom', timedOut: true } : okRun(reviewFor('backend/a.go'));
+    };
+    const res = await runClaudeReviewLayer({
+      baseDir: base,
+      claudeConfig: CFG,
+      coreReviews: [stored('codex')],
+      expectedHeadSha: HEAD,
+      includeClaudeReviewer: true,
+      parts,
+      reviewPrompt: 'PROMPT PART 1',
+      run,
+      runId,
+    });
+    expect(res.claudeReview?.ok).toBe(false);
+    expect(res.claudeReview?.summary).toContain('1 part(s) did not complete');
+    expect(res.claudeReview?.findings).toHaveLength(1);
+    fs.rmSync(base, { force: true, recursive: true });
+  });
+
+  it('the lens handoff replaces the union diff and carries the scope into the lens prompt', async () => {
+    const base = tmpTrail();
+    const runId = 'parts-lens';
+    seedCoreTrail(base, runId, [stored('codex')]);
+    const lensPrompts: string[] = [];
+    const run = async (prompt: string): Promise<VoiceRunResult> => {
+      if (prompt.includes('VERIFIED GATE')) return okRun(GATE);
+      if (prompt.includes('HOLISTIC / ARCHITECTURE lens')) {
+        lensPrompts.push(prompt);
+        return okRun(JSON.stringify({ findings: [], summary: 'looked' }));
+      }
+      return okRun(reviewFor('backend/a.go'));
+    };
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-sc-wt-'));
+    await runClaudeReviewLayer({
+      baseDir: base,
+      baseSha: 'b'.repeat(40),
+      claudeConfig: CFG,
+      coreReviews: [stored('codex')],
+      expectedHeadSha: HEAD,
+      holistic: { baseSha: 'b'.repeat(40), config: CFG },
+      includeClaudeReviewer: false,
+      lensHandoff: { diff: PART_DIFF('backend/a.go'), scope: 'LENS SCOPE: part 2 — web (hunks NOT below — read at head)' },
+      parts,
+      pinnedDiff: PART_DIFF('backend/a.go') + PART_DIFF('web/c.ts'),
+      reviewPrompt: 'PROMPT PART 1',
+      run,
+      runId,
+      worktree: wt,
+    });
+    expect(lensPrompts).toHaveLength(1);
+    expect(lensPrompts[0]).toContain('handed over in PARTS');
+    expect(lensPrompts[0]).toContain('LENS SCOPE: part 2 — web');
+    expect(lensPrompts[0]).toContain('diff --git a/backend/a.go');
+    expect(lensPrompts[0]).not.toContain('diff --git a/web/c.ts');
+    fs.rmSync(base, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+});

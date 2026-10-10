@@ -595,6 +595,9 @@ var PACKET_BUDGETS = {
   files: 4e4,
   history: 4e3,
   objective: 2e3,
+  // The change-scope listing for a review in parts (PacketInput.scope): one line per changed
+  // file, so ~60 chars × files. 64 K holds a thousand-file change whole.
+  scope: 64e3,
   summary: 4e3,
   tests: 8e3
 };
@@ -631,6 +634,7 @@ function section(title, why, body, budget) {
   };
 }
 var DIFF_SECTION_TITLE = "The diff under review";
+var SCOPE_SECTION_TITLE = "Change scope (this review runs in parts)";
 var CI_EVIDENCE_SECTION_TITLE = "CI evidence (checks + annotations at the PR head)";
 function reviewerVisibleDiff(packet) {
   const s = packet.sections.find((sec) => sec.title === DIFF_SECTION_TITLE);
@@ -662,6 +666,16 @@ function assembleCodePacket(input) {
         "what the author says the change does + why \u2014 weigh, don\u2019t trust",
         input.authorSummary,
         PACKET_BUDGETS.summary
+      )
+    );
+  }
+  if (input.scope) {
+    sections.push(
+      section(
+        SCOPE_SECTION_TITLE,
+        "this change is reviewed in parts \u2014 what this packet carries, what the other parts carry, what no reviewer sees",
+        input.scope,
+        PACKET_BUDGETS.scope
       )
     );
   }
@@ -1487,22 +1501,29 @@ function manifestOf(packet) {
     truncated: s.truncated
   }));
 }
-function reviewJson(reviewerId) {
-  return `review.${reviewerId}.json`;
+function reviewJson(reviewerId, suffix) {
+  return `review.${reviewerId}${suffix ? `.${suffix}` : ""}.json`;
+}
+function safeSuffix(suffix) {
+  if (suffix === void 0) return void 0;
+  if (!/^[a-z0-9]{1,16}$/i.test(suffix)) throw new Error(`invalid artifact suffix: ${suffix}`);
+  return suffix;
 }
 function persistReview(baseDir, input) {
   const dir = reviewDir(baseDir, input.runId);
   const id = input.reviewer.id;
-  writeAtomic(baseDir, dir, `packet.${id}.json`, JSON.stringify(input.packet, null, 2));
-  writeAtomic(baseDir, dir, `prompt.${id}.md`, input.prompt);
-  if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review.raw.md`, input.raw);
-  else removeStale(baseDir, dir, `${id}-review.raw.md`);
-  if (input.stream) writeAtomic(baseDir, dir, `${id}-stream.jsonl`, input.stream);
-  else removeStale(baseDir, dir, `${id}-stream.jsonl`);
+  const suffix = safeSuffix(input.artifactSuffix);
+  const tag = suffix ? `.${suffix}` : "";
+  writeAtomic(baseDir, dir, `packet.${id}${tag}.json`, JSON.stringify(input.packet, null, 2));
+  writeAtomic(baseDir, dir, `prompt.${id}${tag}.md`, input.prompt);
+  if (input.raw !== null) writeAtomic(baseDir, dir, `${id}-review${tag}.raw.md`, input.raw);
+  else removeStale(baseDir, dir, `${id}-review${tag}.raw.md`);
+  if (input.stream) writeAtomic(baseDir, dir, `${id}-stream${tag}.jsonl`, input.stream);
+  else removeStale(baseDir, dir, `${id}-stream${tag}.jsonl`);
   writeAtomic(
     baseDir,
     dir,
-    `findings.${id}.json`,
+    `findings.${id}${tag}.json`,
     JSON.stringify(input.findings, null, 2)
   );
   const stored = {
@@ -1523,7 +1544,7 @@ function persistReview(baseDir, input) {
     summary: input.summary,
     terminalState: input.terminalState
   };
-  writeAtomic(baseDir, dir, reviewJson(id), JSON.stringify(stored, null, 2));
+  writeAtomic(baseDir, dir, reviewJson(id, suffix), JSON.stringify(stored, null, 2));
   return stored;
 }
 function isStoredReviewShape(v) {
@@ -2764,7 +2785,7 @@ async function runGrokReview(prompt, config, opts = {}) {
 }
 
 // src/modes/review/claude.ts
-import fs17 from "fs";
+import fs18 from "fs";
 import os10 from "os";
 
 // src/core/claude-stream.ts
@@ -3004,7 +3025,7 @@ async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
 }
 
 // src/modes/review/history-packet.ts
-import fs15 from "fs";
+import fs16 from "fs";
 import path14 from "path";
 
 // src/modes/review/ensemble-config.ts
@@ -3024,7 +3045,7 @@ function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
 }
 
 // src/modes/review/gate-hunks.ts
-import fs13 from "fs";
+import fs14 from "fs";
 import path12 from "path";
 
 // src/modes/review/trail-io.ts
@@ -3033,6 +3054,167 @@ import path10 from "path";
 
 // src/modes/review/diff.ts
 import { execFileSync as execFileSync4 } from "child_process";
+import fs13 from "fs";
+import nodePath from "path";
+
+// src/modes/review/chunks.ts
+var DEFAULT_MAX_CHUNKS = 8;
+function areaAt(path21, depth) {
+  const parts = path21.split("/");
+  const dirs = parts.slice(0, -1);
+  if (dirs.length === 0) return ".";
+  return dirs.slice(0, depth).join("/");
+}
+function groupByArea(files, ceilingBytes, depth) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const f of files) {
+    const key = areaAt(f.path, depth);
+    const g = groups.get(key);
+    if (g) g.push(f);
+    else groups.set(key, [f]);
+  }
+  const out = [];
+  for (const g of groups.values()) {
+    const bytes = g.reduce((n, f) => n + f.bytes, 0);
+    const splittable = g.some((f) => f.path.split("/").length - 1 > depth);
+    if (bytes > ceilingBytes && splittable && g.length > 1) {
+      out.push(...groupByArea(g, ceilingBytes, depth + 1));
+    } else {
+      out.push(g);
+    }
+  }
+  return out;
+}
+function sourceFirst(files) {
+  return [...files.filter((f) => !isTestPath(f.path)), ...files.filter((f) => isTestPath(f.path))];
+}
+function chunkLabel(paths) {
+  if (paths.length === 0) return "(empty)";
+  const dirLists = paths.map((p) => p.split("/").slice(0, -1));
+  let common = [...dirLists[0]];
+  for (const d of dirLists.slice(1)) {
+    let i = 0;
+    while (i < common.length && i < d.length && common[i] === d[i]) i++;
+    common = common.slice(0, i);
+  }
+  const prefix = common.join("/");
+  const next = /* @__PURE__ */ new Set();
+  for (const d of dirLists) {
+    const seg = d[common.length];
+    next.add(seg === void 0 ? "(files)" : seg);
+  }
+  const names = [...next];
+  if (names.length === 1 && names[0] === "(files)") return prefix || ".";
+  const shown = names.slice(0, 4).join(", ") + (names.length > 4 ? `, +${names.length - 4} more` : "");
+  return prefix ? `${prefix}/{${shown}}` : `{${shown}}`;
+}
+function planChunks(files, ceilingBytes, maxChunks) {
+  const cap3 = Math.max(1, Math.floor(maxChunks));
+  const total = files.reduce((n, f) => n + f.bytes, 0);
+  const finish = (parts2) => {
+    const chunks = parts2.slice(0, cap3).map((part, i) => ({
+      bytes: part.reduce((n, f) => n + f.bytes, 0),
+      diff: part.map((f) => f.raw).join(""),
+      files: part,
+      index: i + 1,
+      label: chunkLabel(part.map((f) => f.path)),
+      paths: part.map((f) => f.path)
+    }));
+    const overflow = parts2.slice(cap3).flat();
+    return { ceilingBytes, chunks, overflow };
+  };
+  if (files.length === 0) return { ceilingBytes, chunks: [], overflow: [] };
+  if (total <= ceilingBytes) return finish([sourceFirst(files)]);
+  const areas = groupByArea(files, ceilingBytes, 1).map(sourceFirst);
+  const parts = [];
+  let cur = [];
+  let curBytes = 0;
+  const close = () => {
+    if (cur.length > 0) parts.push(cur);
+    cur = [];
+    curBytes = 0;
+  };
+  for (const area of areas) {
+    const areaBytes = area.reduce((n, f) => n + f.bytes, 0);
+    if (cur.length > 0 && curBytes + areaBytes > ceilingBytes && areaBytes <= ceilingBytes) close();
+    for (const f of area) {
+      if (cur.length > 0 && curBytes + f.bytes > ceilingBytes) close();
+      cur.push(f);
+      curBytes += f.bytes;
+    }
+  }
+  close();
+  return finish(parts);
+}
+function fileLine(f) {
+  return `${f.path} (+${f.added}/-${f.removed})`;
+}
+function renderChangeScope(input, chunkIndex) {
+  const { coverage, plan } = input;
+  const byPath = new Map(coverage.files.map((f) => [f.path, f]));
+  const part = plan.chunks.find((c) => c.index === chunkIndex);
+  if (!part) return "";
+  const lines = [];
+  const n = plan.chunks.length;
+  lines.push(
+    `This change is larger than one review packet (ceiling ${plan.ceilingBytes.toLocaleString("en-US")} bytes), so it is reviewed in ${n} part(s) by the same reviewers. You are reading PART ${chunkIndex} of ${n}: ${part.label} \u2014 ${part.paths.length} file(s), ${part.bytes.toLocaleString("en-US")} bytes. Review the hunks in THIS part. Every part's findings are judged together by one verification gate.`
+  );
+  lines.push("");
+  lines.push(`Files in THIS part (their hunks are below):`);
+  for (const p of part.paths) {
+    const f = byPath.get(p);
+    lines.push(`  ${f ? fileLine(f) : p}`);
+  }
+  const others = plan.chunks.filter((c) => c.index !== chunkIndex);
+  if (others.length > 0) {
+    lines.push("");
+    lines.push(
+      `Files in the OTHER parts \u2014 also changed by this PR, reviewed separately. Their hunks are NOT below; if a finding depends on one of them, read the file as it exists at the PR head rather than assuming it is unchanged:`
+    );
+    for (const c of others) {
+      lines.push(`  part ${c.index} \u2014 ${c.label}:`);
+      for (const p of c.paths) {
+        const f = byPath.get(p);
+        lines.push(`    ${f ? fileLine(f) : p}`);
+      }
+    }
+  }
+  const omitted = coverage.files.filter((f) => !f.included);
+  if (omitted.length > 0) {
+    lines.push("");
+    lines.push(`Changed but NOT shipped to any reviewer (named so nothing is silently missing):`);
+    for (const f of omitted) {
+      lines.push(`  ${fileLine(f)} \u2014 ${f.omitReason ?? "omitted"}/${f.kind}`);
+    }
+  }
+  return lines.join("\n");
+}
+function renderLensScope(input, materializedChunks) {
+  const { coverage, plan } = input;
+  const lines = [];
+  const n = plan.chunks.length;
+  const shown = new Set(materializedChunks);
+  lines.push(
+    `This change touches ${coverage.totalFiles} file(s) and was reviewed in ${n} part(s). The diff materialized below carries part(s) ${[...shown].join(", ")}; every other changed file is listed here with its +/- line counts and is readable at the PR head in the worktree \u2014 it IS part of this change even though its hunks are not below.`
+  );
+  for (const c of plan.chunks) {
+    lines.push("");
+    lines.push(`part ${c.index} \u2014 ${c.label}${shown.has(c.index) ? " (hunks below)" : " (hunks NOT below \u2014 read at head)"}:`);
+    for (const p of c.paths) {
+      const f = coverage.files.find((x) => x.path === p);
+      lines.push(`  ${f ? fileLine(f) : p}`);
+    }
+  }
+  const omitted = coverage.files.filter((f) => !f.included);
+  if (omitted.length > 0) {
+    lines.push("");
+    lines.push(`Changed but not reviewed by any seat:`);
+    for (const f of omitted) lines.push(`  ${fileLine(f)} \u2014 ${f.omitReason ?? "omitted"}/${f.kind}`);
+  }
+  return lines.join("\n");
+}
+var CHUNKS_TRAIL_FILE = "chunks.json";
+var CHUNKS_TRAIL_SCHEMA_VERSION = 1;
 
 // src/modes/review/git-exec.ts
 import { execFileSync as execFileSync3 } from "child_process";
@@ -3112,7 +3294,9 @@ var GENERATED_PATTERNS = [
   /(^|\/)(generated|__generated__)\//,
   /\.gen\.[a-z]+$/,
   /\.pb\.go$/,
-  /[._]generated\.[a-z]+$/
+  // `-generated.json` joins `.generated.*` / `_generated.*`: an emitted API spec named that way
+  // (an `api-specs/<service>-generated.json`, 66 KB on run 2026-10-10-18-51-44-9acc127a) is generator output too.
+  /[._-]generated\.[a-z]+$/
 ];
 var GENERATED_FIRST_LINE = /Code generated .*DO NOT EDIT|@generated\b|DO NOT EDIT/;
 function hasGeneratedHeader(section2) {
@@ -3126,10 +3310,34 @@ function hasGeneratedHeader(section2) {
   }
   return false;
 }
-function classifyFileKind(path20, isBinary, section2 = "") {
+function hasGeneratedFirstLine(line) {
+  return typeof line === "string" && GENERATED_FIRST_LINE.test(line);
+}
+function classifyFileKind(path21, isBinary, section2 = "", firstLine2) {
   if (isBinary) return "binary";
-  if (GENERATED_PATTERNS.some((re) => re.test(path20))) return "generated";
-  return section2 && hasGeneratedHeader(section2) ? "generated" : "source";
+  if (GENERATED_PATTERNS.some((re) => re.test(path21))) return "generated";
+  if (section2 && hasGeneratedHeader(section2)) return "generated";
+  return hasGeneratedFirstLine(firstLine2) ? "generated" : "source";
+}
+function worktreeFirstLineReader(dir) {
+  const root = nodePath.resolve(dir);
+  return (p) => {
+    const full = nodePath.resolve(root, p);
+    if (full !== root && !full.startsWith(root + nodePath.sep)) return null;
+    let fd = null;
+    try {
+      fd = fs13.openSync(full, "r");
+      const buf = Buffer.alloc(512);
+      const n = fs13.readSync(fd, buf, 0, 512, 0);
+      const text = buf.subarray(0, n).toString("utf8");
+      const nl = text.indexOf("\n");
+      return nl < 0 ? text : text.slice(0, nl);
+    } catch {
+      return null;
+    } finally {
+      if (fd !== null) fs13.closeSync(fd);
+    }
+  };
 }
 var TEST_PATTERNS = [
   /(^|\/)(test|tests|__tests__|spec|specs|testdata|__snapshots__)\//,
@@ -3140,8 +3348,8 @@ var TEST_PATTERNS = [
   /Tests?\.(java|kt|swift|cs|scala)$/,
   /\.bats$/
 ];
-function isTestPath(path20) {
-  return TEST_PATTERNS.some((re) => re.test(path20));
+function isTestPath(path21) {
+  return TEST_PATTERNS.some((re) => re.test(path21));
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -3154,24 +3362,28 @@ function pathOfSection(section2) {
   if (header) return header[2].trim();
   return "unknown";
 }
-function parseDiffFiles(raw) {
+function parseDiffFiles(raw, opts = {}) {
   if (!raw.trim()) return [];
   const parts = raw.split(/^(?=diff --git )/m).filter((s) => s.trim());
   return parts.map((section2) => {
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path20 = pathOfSection(section2);
+    const path21 = pathOfSection(section2);
     let added = 0;
     let removed = 0;
     for (const line of section2.split("\n")) {
       if (line.startsWith("+") && !line.startsWith("+++")) added++;
       else if (line.startsWith("-") && !line.startsWith("---")) removed++;
     }
+    let kind = classifyFileKind(path21, isBinary, section2);
+    if (kind === "source" && opts.readFirstLine && path21 !== "unknown") {
+      kind = classifyFileKind(path21, isBinary, section2, opts.readFirstLine(path21));
+    }
     return {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
-      kind: classifyFileKind(path20, isBinary, section2),
-      path: path20,
+      kind,
+      path: path21,
       raw: section2,
       removed
     };
@@ -3183,18 +3395,13 @@ function coverageCounts(c) {
 function omittedLine(o) {
   return `omitted: ${o.path} (${o.reason ?? "omitted"}/${o.kind})`;
 }
-function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
+function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING, opts = {}) {
   const source = files.filter((f) => f.kind === "source");
-  const admitted = /* @__PURE__ */ new Set();
-  const includedSections = [];
-  let includedBytes = 0;
-  for (const f of [...source.filter((f2) => !isTestPath(f2.path)), ...source.filter((f2) => isTestPath(f2.path))]) {
-    if (includedBytes + f.bytes > ceilingBytes && includedBytes > 0) continue;
-    admitted.add(f);
-    includedSections.push(f.raw);
-    includedBytes += f.bytes;
-  }
+  const plan = planChunks(source, ceilingBytes, opts.maxChunks ?? DEFAULT_MAX_CHUNKS);
+  const chunkOf = /* @__PURE__ */ new Map();
+  for (const c of plan.chunks) for (const f of c.files) chunkOf.set(f, c.index);
   const entries = [];
+  let includedBytes = 0;
   for (const f of files) {
     const base = {
       added: f.added,
@@ -3211,13 +3418,16 @@ function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
       entries.push({ ...base, included: false, omitReason: "generated" });
       continue;
     }
-    if (!admitted.has(f)) {
+    const chunk = chunkOf.get(f);
+    if (chunk === void 0) {
       entries.push({ ...base, included: false, omitReason: "over-limit" });
       continue;
     }
-    entries.push({ ...base, included: true });
+    includedBytes += f.bytes;
+    entries.push({ ...base, chunk, included: true });
   }
   const coverage = {
+    chunks: plan.chunks.length,
     files: entries,
     includedBytes,
     includedFiles: entries.filter((e) => e.included).length,
@@ -3225,7 +3435,7 @@ function computeCoverage(files, ceilingBytes = DEFAULT_COVERAGE_CEILING) {
     totalBytes: files.reduce((n, f) => n + f.bytes, 0),
     totalFiles: files.length
   };
-  return { coverage, includedDiff: includedSections.join("") };
+  return { coverage, includedDiff: plan.chunks.map((c) => c.diff).join(""), plan };
 }
 function canonicalizeDiff(raw) {
   return raw.replace(/\r\n?/g, "\n").replace(/\n*$/, "\n");
@@ -3310,8 +3520,10 @@ function acquireDiff(opts) {
     headSha = gitOrNull(opts.cwd, ["rev-parse", "HEAD"]) ?? "working-tree (no commit identity)";
     rawDiff = git(opts.cwd, ["diff", `${base}...HEAD`]);
   }
-  const files = parseDiffFiles(rawDiff);
-  const { coverage, includedDiff } = computeCoverage(files, ceiling);
+  const files = parseDiffFiles(rawDiff, opts.readFirstLine ? { readFirstLine: opts.readFirstLine } : {});
+  const { coverage, includedDiff, plan } = computeCoverage(files, ceiling, {
+    ...opts.maxChunks !== void 0 ? { maxChunks: opts.maxChunks } : {}
+  });
   return {
     baseRef,
     baseSha,
@@ -3325,6 +3537,7 @@ function acquireDiff(opts) {
     files,
     headSha,
     mode,
+    plan,
     rawDiff,
     repoId
   };
@@ -3343,7 +3556,7 @@ function persistGatePacket(baseDir, runId, input) {
 }
 
 // src/modes/review/worktree.ts
-import fs14 from "fs";
+import fs15 from "fs";
 import path13 from "path";
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
@@ -3463,6 +3676,19 @@ ${args.headSha}). It is NOT your working directory \u2014 ${args.reach} by ABSOL
 directory, with Read, Grep, and Glob.`;
 }
 function materializedDiffClause(args) {
+  if (args.scope) {
+    return `The change under review is \`git diff ${args.baseSha}...${args.headSha}\`. It is larger than one
+packet, so it is handed over in PARTS: the scope note says which changed files' hunks are
+materialized below and which are not. Every file the note lists is changed by this PR \u2014 read the
+ones whose hunks are not below in the checkout at ${args.headSha} rather than assuming they are
+unchanged.
+
+${args.scope}
+
+\`\`\`diff
+${args.diff}
+\`\`\``;
+  }
   return `The change under review is exactly \`git diff ${args.baseSha}...${args.headSha}\`, already
 materialized for you:
 
@@ -3474,7 +3700,7 @@ function stripAgentInstructions(dir) {
   const removed = [];
   const remove = (rel) => {
     try {
-      fs14.rmSync(path13.join(dir, rel), { force: true, recursive: true });
+      fs15.rmSync(path13.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -3482,7 +3708,7 @@ function stripAgentInstructions(dir) {
   const walk = (rel) => {
     let entries;
     try {
-      entries = fs14.readdirSync(path13.join(dir, rel), { withFileTypes: true });
+      entries = fs15.readdirSync(path13.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -3492,7 +3718,7 @@ function stripAgentInstructions(dir) {
       if (isInstructionName(e.name)) {
         remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
-        if (fs14.existsSync(path13.join(dir, childRel, CURSOR_RULES))) {
+        if (fs15.existsSync(path13.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
         walk(childRel);
@@ -3508,7 +3734,7 @@ async function stripAgentInstructionsAsync(dir) {
   const removed = [];
   const remove = async (rel) => {
     try {
-      await fs14.promises.rm(path13.join(dir, rel), { force: true, recursive: true });
+      await fs15.promises.rm(path13.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -3516,7 +3742,7 @@ async function stripAgentInstructionsAsync(dir) {
   const walk = async (rel) => {
     let entries;
     try {
-      entries = await fs14.promises.readdir(path13.join(dir, rel), { withFileTypes: true });
+      entries = await fs15.promises.readdir(path13.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -3527,7 +3753,7 @@ async function stripAgentInstructionsAsync(dir) {
         await remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
         try {
-          await fs14.promises.access(path13.join(dir, childRel, CURSOR_RULES));
+          await fs15.promises.access(path13.join(dir, childRel, CURSOR_RULES));
           await remove(`${childRel}/${CURSOR_RULES}`);
         } catch {
         }
@@ -3549,9 +3775,9 @@ function completeSharedStore(repoRoot, git2) {
   const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
   const commonDir = path13.resolve(repoRoot, common.text.trim());
-  if (!fs14.existsSync(path13.join(commonDir, "objects"))) return null;
-  if (fs14.existsSync(path13.join(commonDir, "shallow"))) return null;
-  if (fs14.existsSync(path13.join(commonDir, ALTERNATES_REL))) return null;
+  if (!fs15.existsSync(path13.join(commonDir, "objects"))) return null;
+  if (fs15.existsSync(path13.join(commonDir, "shallow"))) return null;
+  if (fs15.existsSync(path13.join(commonDir, ALTERNATES_REL))) return null;
   if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
   return commonDir;
 }
@@ -3673,7 +3899,7 @@ var REAP_RM_OPTS = { force: true, maxRetries: 3, recursive: true, retryDelay: 50
 function reapParent(parent) {
   if (!path13.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    fs14.rmSync(parent, REAP_RM_OPTS);
+    fs15.rmSync(parent, REAP_RM_OPTS);
   } catch {
   }
 }
@@ -3775,7 +4001,7 @@ async function completeSharedStoreAsync(repoRoot, git2) {
   const common = await git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
   const commonDir = path13.resolve(repoRoot, common.text.trim());
-  const exists = (p) => fs14.promises.access(p).then(() => true, () => false);
+  const exists = (p) => fs15.promises.access(p).then(() => true, () => false);
   if (!await exists(path13.join(commonDir, "objects"))) return null;
   if (await exists(path13.join(commonDir, "shallow"))) return null;
   if (await exists(path13.join(commonDir, ALTERNATES_REL))) return null;
@@ -3795,7 +4021,7 @@ async function fetchEnvAsync(repoRoot, bare, git2) {
 async function reapParentAsync(parent) {
   if (!path13.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    await fs14.promises.rm(parent, REAP_RM_OPTS);
+    await fs15.promises.rm(parent, REAP_RM_OPTS);
   } catch {
   }
 }
@@ -3833,13 +4059,13 @@ function writeHistoryPacket(cwd, files) {
   for (const f of files) {
     const abs = containedPath(cwd, f.path);
     if (!abs) continue;
-    fs15.mkdirSync(path14.dirname(abs), { recursive: true });
-    fs15.writeFileSync(abs, f.contents, { mode: 256 });
+    fs16.mkdirSync(path14.dirname(abs), { recursive: true });
+    fs16.writeFileSync(abs, f.contents, { mode: 256 });
   }
 }
 
 // src/modes/review/companions.ts
-import fs16 from "fs";
+import fs17 from "fs";
 import path15 from "path";
 var COMPANIONS_DIR = ".companions";
 var STRIPPED_BASENAMES = new Set(STRIPPED_INSTRUCTION_PATHS.map((p) => path15.basename(p)));
@@ -3977,7 +4203,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
     }
   } finally {
     try {
-      fs17.rmSync(cwd, { force: true, recursive: true });
+      fs18.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
   }
@@ -4017,6 +4243,76 @@ var REVIEW_ADAPTERS = {
 // src/core/sanitize.ts
 function scrubControl(s) {
   return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// src/modes/review/chunk-merge.ts
+import fs19 from "fs";
+import path16 from "path";
+function mergedDiagnostics(runs) {
+  const ds = runs.map((r) => r.seat.review.diagnostics).filter((d) => Boolean(d));
+  if (ds.length === 0) return void 0;
+  const failed = runs.find((r) => r.seat.review.terminalState !== "reviewed")?.seat.review.diagnostics;
+  const timedOut = ds.find((d) => d.timedOutReason);
+  const failWhy = ds.map((d) => d.failWhy).filter(Boolean);
+  const warnings = ds.flatMap((d) => d.preflightWarnings ?? []);
+  return {
+    elapsedMs: ds.reduce((n, d) => n + d.elapsedMs, 0),
+    endedAt: ds.map((d) => d.endedAt).sort().at(-1),
+    ...failWhy.length > 0 ? { failWhy: failWhy.join(" \xB7 ") } : {},
+    ...warnings.length > 0 ? { preflightWarnings: [...new Set(warnings)] } : {},
+    startedAt: ds.map((d) => d.startedAt).sort()[0],
+    // The stderr that matters is the failing part's; a clean merge keeps the last part's tail.
+    stderrTail: (failed ?? ds[ds.length - 1]).stderrTail,
+    ...timedOut?.timedOutReason ? { timedOutReason: timedOut.timedOutReason } : {}
+  };
+}
+function mergeChunkSeatRuns(args) {
+  const runs = [...args.runs].sort((a, b) => a.index - b.index);
+  const n = runs.length;
+  const findings = [];
+  for (const r of runs) {
+    for (const f of r.seat.review.findings) {
+      findings.push({ ...f, chunk: r.index, id: `f${findings.length + 1}` });
+    }
+  }
+  const failed = runs.filter((r) => r.seat.review.terminalState !== "reviewed");
+  const terminalState = failed.length === 0 ? "reviewed" : "failed-reviewer";
+  const summary = failed.length === 0 ? runs.map((r) => `Part ${r.index}/${n} (${r.label}): ${r.seat.review.summary}`).join("\n") : [
+    `Reviewed in ${n} part(s); ${failed.length} part(s) did not complete, so this reviewer is INCOMPLETE for the change.`,
+    ...failed.map((r) => `Part ${r.index}/${n} (${r.label}) FAILED: ${r.seat.review.summary}`),
+    ...runs.filter((r) => r.seat.review.terminalState === "reviewed").map((r) => `Part ${r.index}/${n} (${r.label}): ${r.seat.review.summary}`)
+  ].join("\n");
+  const dir = reviewDir(args.out, args.runId);
+  const raws = runs.map((r) => {
+    try {
+      const raw = fs19.readFileSync(path16.join(dir, `${args.reviewer.id}-review.c${r.index}.raw.md`), "utf8");
+      return `## Part ${r.index} of ${n} \u2014 ${r.label}
+
+${raw}`;
+    } catch {
+      return null;
+    }
+  }).filter((x) => x !== null);
+  const review = persistReview(args.out, {
+    diagnostics: mergedDiagnostics(runs),
+    findings,
+    packet: args.packet,
+    prompt: args.prompt,
+    raw: raws.length > 0 ? raws.join("\n\n") : null,
+    reviewer: args.reviewer,
+    runId: args.runId,
+    summary,
+    terminalState
+  });
+  const realized = runs.every((r) => r.seat.realized === "worktree") ? "worktree" : "packet";
+  const fallbacks = runs.map((r) => r.seat.fallbackReason ? `part ${r.index}/${n}: ${r.seat.fallbackReason}` : null).filter((x) => x !== null);
+  const egressDenials = runs.flatMap((r) => [...r.seat.egressDenials]);
+  return {
+    egressDenials,
+    fallbackReason: fallbacks.length > 0 ? fallbacks.join("; ") : null,
+    realized,
+    review
+  };
 }
 
 // src/modes/review/dep-surface.ts
@@ -4113,9 +4409,9 @@ function hasDepSurface(r) {
 }
 
 // src/modes/review/receipt.ts
-import fs21 from "fs";
+import fs23 from "fs";
 import os12 from "os";
-import path18 from "path";
+import path19 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -4201,16 +4497,16 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/holistic-gate.ts
-import fs20 from "fs";
-import path17 from "path";
+import fs22 from "fs";
+import path18 from "path";
 
 // src/modes/review/holistic.ts
-import fs19 from "fs";
+import fs21 from "fs";
 
 // src/modes/brainstorm/voices.ts
-import fs18 from "fs";
+import fs20 from "fs";
 import os11 from "os";
-import path16 from "path";
+import path17 from "path";
 
 // src/modes/brainstorm/types.ts
 var VOICE_IDS = ["codex", "grok", "claude"];
@@ -4278,7 +4574,7 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), { ...o, ...c.web ? { web: true } : {} }),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), { ...o, ...c.web ? { web: true } : {} })
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path16.join(os11.homedir(), ".ensemble-ai", "voices.json");
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path17.join(os11.homedir(), ".ensemble-ai", "voices.json");
 function str2(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
@@ -4317,7 +4613,7 @@ function parseJudge(raw) {
 }
 function loadJudge(file = VOICES_FILE) {
   try {
-    return parseJudge(JSON.parse(fs18.readFileSync(file, "utf8")));
+    return parseJudge(JSON.parse(fs20.readFileSync(file, "utf8")));
   } catch {
     return {};
   }
@@ -4328,7 +4624,7 @@ function judgeConfig(spec, voiceId, configs) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs18.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs20.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
@@ -4384,7 +4680,7 @@ function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
 }, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
-    raw = JSON.parse(fs19.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs21.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`holistic seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -4422,7 +4718,7 @@ network: there is no Bash tool, so do not try to run \`git\` or any command.
 
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: "search and read it", worktree: args.worktree })}
 
-${materializedDiffClause(args)}
+${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...args.scope ? { scope: args.scope } : {} })}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 
@@ -4474,6 +4770,7 @@ async function runHolisticLens(opts) {
     diff: opts.diff,
     headSha: opts.headSha,
     history: hasHistory,
+    ...opts.scope ? { scope: opts.scope } : {},
     worktree: opts.worktree
   });
   const fail = (summary) => ({
@@ -4549,24 +4846,24 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs20.realpathSync(path17.resolve(worktreeDir));
+    root = fs22.realpathSync(path18.resolve(worktreeDir));
   } catch {
     return () => null;
   }
   const inside = (p) => {
-    const rel = path17.relative(root, p);
+    const rel = path18.relative(root, p);
     return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
-      if (!file || file.includes("\0") || path17.isAbsolute(file)) return null;
-      const target = path17.resolve(root, file);
+      if (!file || file.includes("\0") || path18.isAbsolute(file)) return null;
+      const target = path18.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs20.realpathSync(target);
+      const real = fs22.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs20.statSync(real);
+      const st = fs22.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs20.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs22.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
@@ -4777,10 +5074,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path18.join(os12.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path19.join(os12.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path18.join(
+  return path19.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -4801,11 +5098,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs21.mkdirSync(path18.dirname(file), { recursive: true, mode: 448 });
+  fs23.mkdirSync(path19.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs21.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs21.chmodSync(tmp, 384);
-  fs21.renameSync(tmp, file);
+  fs23.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs23.chmodSync(tmp, 384);
+  fs23.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -4887,7 +5184,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs21.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs23.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -5139,6 +5436,7 @@ function persistAttempt(args, prompt, result, timing) {
   const terminalState = parsed && !parsed.parseError && !result.timedOut ? "reviewed" : "failed-reviewer";
   const summary = result.timedOut ? timedOutSummary(result, timing) : parsed?.summary || result.failWhy || `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || "no output"}`;
   return persistReview(args.out, {
+    ...args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {},
     diagnostics: seatDiagnostics(result, timing),
     findings: parsed?.findings ?? [],
     packet: args.packet,
@@ -5159,6 +5457,7 @@ async function runCoreSeat(args) {
       fallbackReason: null,
       realized: "packet",
       review: persistReview(args.out, {
+        ...args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {},
         findings: [],
         packet: args.packet,
         prompt: args.packetPrompt,
@@ -5390,13 +5689,28 @@ async function runReviewMode(opts) {
     diffMode: opts.diffMode,
     diffText: opts.diffText,
     headShaOverride: opts.headShaOverride,
+    maxChunks: opts.maxChunks ?? DEFAULT_MAX_CHUNKS,
+    // With the tree on disk, a changed file is classed by its OWN first line too (a mid-file hunk
+    // of an ORM client shows no `Code generated` header — the file does).
+    ...opts.worktree ? { readFirstLine: worktreeFirstLineReader(opts.worktree.dir) } : {},
     repoIdOverride: opts.repoIdOverride,
     staged: opts.staged,
     workingTree: opts.workingTree
   });
+  const partCount = acquired.plan.chunks.length;
   log(
-    `Diff: ${acquired.coverage.totalFiles} file(s), ${acquired.coverage.includedFiles} covered, ${acquired.coverage.omittedFiles} omitted \xB7 digest ${acquired.canonicalDigest.slice(0, 19)}\u2026`
+    `Diff: ${acquired.coverage.totalFiles} file(s), ${acquired.coverage.includedFiles} covered, ${acquired.coverage.omittedFiles} omitted${partCount > 1 ? ` \xB7 reviewed in ${partCount} parts (ceiling ${ceilingBytes.toLocaleString("en-US")} bytes)` : ""} \xB7 digest ${acquired.canonicalDigest.slice(0, 19)}\u2026`
   );
+  if (partCount > 1) {
+    for (const c of acquired.plan.chunks) {
+      log(`  \xB7 part ${c.index}/${partCount}: ${c.label} \u2014 ${c.paths.length} file(s), ${c.bytes.toLocaleString("en-US")} bytes`);
+    }
+    if (acquired.plan.overflow.length > 0) {
+      log(
+        `  \xB7 \u26A0 ${acquired.plan.overflow.length} file(s) past the ${opts.maxChunks ?? DEFAULT_MAX_CHUNKS}-part limit are NOT reviewed (named in coverage as over-limit; raise --max-chunks)`
+      );
+    }
+  }
   const depSurface = profile === "security" ? scanDependencySurface(acquired.files) : void 0;
   const coveredPaths = new Set(acquired.coverage.files.filter((f) => f.included).map((f) => f.path));
   let secretScan = scanDiffForSecrets(acquired.files, { allowSensitive: opts.allowSensitive, coveredPaths });
@@ -5463,32 +5777,50 @@ async function runReviewMode(opts) {
   }
   const ciEvidence = ci.kind === "text" ? ci.text : void 0;
   const ciEvidenceUnavailable = ci.kind === "unavailable" ? ci.reason : void 0;
-  const packet = assembleCodePacket({
-    agentsBudget: conventionManifest?.capBytes,
-    agentsMd,
-    authorSummary: opts.authorSummary,
-    ciEvidence,
-    ciEvidenceUnavailable,
-    diff: acquired.diff,
-    // The covered diff was admitted under THIS ceiling; the packet's diff section follows it so
-    // the coverage listing and the bytes the seats see cannot disagree.
-    diffBudget: ceilingBytes,
-    directive: opts.directive,
-    objective: opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE),
-    pr: 0,
-    repo: acquired.repoId ?? ""
-  });
+  const objective = opts.objective ?? (profile === "security" ? SECURITY_OBJECTIVE : DEFAULT_OBJECTIVE);
+  const scoped = partCount > 1 || acquired.plan.overflow.length > 0;
+  const scopeInput = { coverage: acquired.coverage, plan: acquired.plan };
+  const packets = (partCount > 0 ? acquired.plan.chunks : [null]).map(
+    (chunk) => assembleCodePacket({
+      agentsBudget: conventionManifest?.capBytes,
+      agentsMd,
+      authorSummary: opts.authorSummary,
+      ciEvidence,
+      ciEvidenceUnavailable,
+      diff: chunk ? chunk.diff : acquired.diff,
+      // The covered diff was admitted under THIS ceiling; the packet's diff section follows it so
+      // the coverage listing and the bytes the seats see cannot disagree.
+      diffBudget: ceilingBytes,
+      directive: opts.directive,
+      objective,
+      pr: 0,
+      repo: acquired.repoId ?? "",
+      ...chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index) } : {}
+    })
+  );
+  const packet = packets[0];
   if (ciEvidence) {
     try {
       writeTrailFile(opts.out, opts.runId, CI_EVIDENCE_TRAIL_FILE, ciEvidence);
     } catch {
     }
   }
-  const prompt = renderReviewPrompt(packet, profile);
+  const prompts = packets.map((p) => renderReviewPrompt(p, profile));
+  const prompt = prompts[0];
   if (!packet.complete) {
     log("Packet incomplete (no usable diff) \u2014 persisting an empty review.");
   }
-  const pinnedDiff = reviewerVisibleDiff(packet).text;
+  const parts = packets.map((p, i) => {
+    const chunk = acquired.plan.chunks[i];
+    return {
+      diff: reviewerVisibleDiff(p).text,
+      index: chunk?.index ?? 1,
+      label: chunk?.label ?? "(the change)",
+      prompt: prompts[i],
+      ...chunk && scoped ? { scope: renderChangeScope(scopeInput, chunk.index) } : {}
+    };
+  });
+  const pinnedDiff = parts.map((p) => p.diff).join("");
   try {
     persistGatePacket(opts.out, opts.runId, {
       changedFiles: acquired.coverage.files.map((f) => f.path).filter((p) => p && p !== "unknown"),
@@ -5496,6 +5828,20 @@ async function runReviewMode(opts) {
       headSha: acquired.headSha
     });
   } catch {
+  }
+  let lensHandoff;
+  if (partCount > 1) {
+    const shown = [];
+    let bytes = 0;
+    for (const p of parts) {
+      if (shown.length > 0 && bytes + p.diff.length > ceilingBytes) break;
+      shown.push(p.index);
+      bytes += p.diff.length;
+    }
+    lensHandoff = {
+      diff: parts.filter((p) => shown.includes(p.index)).map((p) => p.diff).join(""),
+      scope: renderLensScope(scopeInput, shown)
+    };
   }
   log(
     reviewers.length > 0 ? `Running ${reviewers.length} reviewer(s): ${reviewers.join(", ")}\u2026` : "Running 0 core reviewer(s) \u2014 claude-only: the Opus reviewer, the lens (when requested) and the gate are the reviewers of record; no cross-vendor receipt will qualify"
@@ -5509,28 +5855,66 @@ async function runReviewMode(opts) {
   );
   const wt = opts.worktree;
   const quals = wt ? qualifyCoreSeats(reviewers, wt.dir, configs) : {};
-  const worktreePrompt = wt ? prompt + worktreePromptSuffix({ baseSha: wt.baseSha, headSha: wt.headSha, worktree: wt.dir }) : void 0;
+  const worktreePrompts = wt ? prompts.map((p) => p + worktreePromptSuffix({ baseSha: wt.baseSha, headSha: wt.headSha, worktree: wt.dir })) : void 0;
   if (wt) {
     log(`Worktree evidence: ${wt.dir} (detached at ${wt.headSha.slice(0, 12)})`);
   }
   const adapters = opts.adapters ?? REVIEW_ADAPTERS;
+  const partSeats = /* @__PURE__ */ new Map();
   const seatRuns = await Promise.all(
     reviewers.map(async (id) => {
       const reviewer = configs[id];
       log(`  \xB7 ${id} (${reviewer.vendor} \xB7 ${reviewer.model})\u2026`);
-      const seat = await runCoreSeat({
+      const runPart = (k, suffix) => runCoreSeat({
         adapter: adapters[id],
+        ...suffix ? { artifactSuffix: suffix } : {},
         log,
         out: opts.out,
-        packet,
-        packetComplete: packet.complete,
-        packetPrompt: prompt,
+        packet: packets[k],
+        packetComplete: packets[k].complete,
+        packetPrompt: prompts[k],
         qualification: quals[id],
         retryOnPacket: RETRIES_ON_PACKET[id],
         reviewer,
         runId: opts.runId,
-        ...wt ? { worktree: wt.dir, worktreePrompt } : {}
+        ...wt && worktreePrompts ? { worktree: wt.dir, worktreePrompt: worktreePrompts[k] } : {}
       });
+      const record = (k, s) => {
+        const idx = acquired.plan.chunks[k]?.index ?? 1;
+        const seats = partSeats.get(idx) ?? {};
+        seats[id] = {
+          ...s.review.diagnostics ? { elapsedMs: s.review.diagnostics.elapsedMs } : {},
+          findings: s.review.findings.length,
+          state: s.review.terminalState === "reviewed" ? "reviewed" : "failed-reviewer",
+          ...s.review.terminalState === "reviewed" ? {} : { why: scrubControl(s.review.summary).slice(0, 160) }
+        };
+        partSeats.set(idx, seats);
+      };
+      let seat;
+      if (packets.length <= 1) {
+        seat = await runPart(0);
+        record(0, seat);
+      } else {
+        const partRuns = [];
+        for (let k = 0; k < packets.length; k++) {
+          const chunk = acquired.plan.chunks[k];
+          log(`  \xB7 ${id}: part ${chunk.index}/${packets.length} \u2014 ${chunk.label}\u2026`);
+          const s = await runPart(k, `c${chunk.index}`);
+          record(k, s);
+          log(
+            `  \xB7 ${id}: part ${chunk.index}/${packets.length} ${s.review.terminalState} \u2014 ${s.review.findings.length} finding(s)${s.review.terminalState === "reviewed" ? "" : ` \u2014 ${scrubControl(s.review.summary).slice(0, 160)}`}`
+          );
+          partRuns.push({ index: chunk.index, label: chunk.label, seat: s });
+        }
+        seat = mergeChunkSeatRuns({
+          out: opts.out,
+          packet,
+          prompt,
+          reviewer,
+          runId: opts.runId,
+          runs: partRuns
+        });
+      }
       const cause = seat.review.terminalState === "reviewed" ? "" : ` \u2014 ${scrubControl(seat.review.summary).slice(0, 200)}`;
       log(
         `  \xB7 ${id}: ${seat.review.terminalState} \u2014 ${seat.review.findings.length} finding(s) \xB7 evidence ${seat.realized}${cause}`
@@ -5568,6 +5952,24 @@ async function runReviewMode(opts) {
     }
   }
   const evidence = { egressDenials, fallbacks, intended, realized, sandboxProfiles };
+  const chunksTrail = {
+    ceilingBytes,
+    chunks: acquired.plan.chunks.map((c, i) => ({
+      bytes: c.bytes,
+      files: c.files.map((f) => ({ added: f.added, path: f.path, removed: f.removed, test: isTestPath(f.path) })),
+      index: c.index,
+      label: c.label,
+      promptChars: prompts[i]?.length ?? 0,
+      seats: partSeats.get(c.index) ?? {}
+    })),
+    maxChunks: opts.maxChunks ?? DEFAULT_MAX_CHUNKS,
+    omitted: acquired.coverage.files.filter((f) => !f.included).map((f) => ({ kind: f.kind, path: f.path, reason: f.omitReason ?? "omitted" })),
+    schemaVersion: CHUNKS_TRAIL_SCHEMA_VERSION
+  };
+  try {
+    writeTrailFile(opts.out, opts.runId, CHUNKS_TRAIL_FILE, JSON.stringify(chunksTrail, null, 2));
+  } catch {
+  }
   const built = buildDiffReceipt({
     baseRef: acquired.baseRef,
     baseSha: acquired.baseSha,
@@ -5575,9 +5977,10 @@ async function runReviewMode(opts) {
     coveragePolicy: { ceilingBytes },
     diffDigest: acquired.canonicalDigest,
     diffMode: acquired.mode,
-    // The covered diff is truncated in the packet when it exceeds the diff budget;
-    // a truncated payload must not qualify a receipt (the reviewer saw head+tail).
-    diffTruncated: acquired.diff.length > PACKET_BUDGETS.diff,
+    // A part's diff is truncated in its packet only when ONE file alone exceeds the ceiling (the
+    // packet's diff budget follows the ceiling, and every part fits it); a truncated payload must
+    // not qualify a receipt (the reviewer saw head+tail of that part).
+    diffTruncated: packets.some((p) => reviewerVisibleDiff(p).truncated),
     headSha: acquired.headSha,
     // An all-packet run passes empty maps ⇒ a legacy (v1) receipt, byte-identical to what shipped
     // before evidence identity existed. Any worktree seat ⇒ v2. The realized map here covers the
@@ -5594,10 +5997,10 @@ async function runReviewMode(opts) {
   if (built.ok && built.receipt) {
     const store = opts.receiptStore ?? defaultReceiptStore();
     log("Receipt qualified by the core \u2014 deferred to the full-roster gate.");
-    return { acquired, blocked: false, conventionManifest, depSurface, evidence, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
+    return { acquired, blocked: false, conventionManifest, depSurface, evidence, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, receiptCandidate: built.receipt, receiptStore: store, reviews, secretScan };
   }
   log(`No receipt \u2014 ${built.error}`);
-  return { acquired, blocked: false, conventionManifest, depSurface, evidence, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan };
+  return { acquired, blocked: false, conventionManifest, depSurface, evidence, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt, receiptError: built.error, reviews, secretScan };
 }
 
 // src/modes/review/evidence-manifest.ts
@@ -5711,7 +6114,7 @@ You have NO shell and NO network: there is no Bash tool, so do not try to run \`
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: "reach every file", worktree: args.worktree })} Read any file there for whole-project context: a finding may
 cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from).
 
-${materializedDiffClause(args)}${ci}
+${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...args.scope ? { scope: args.scope } : {} })}${ci}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 
@@ -6057,8 +6460,8 @@ function stageReview(payload, target, deps) {
 }
 
 // src/modes/review/holistic-fixture.ts
-import fs22 from "fs";
-import path19 from "path";
+import fs24 from "fs";
+import path20 from "path";
 function anchor(v, where) {
   const e = v ?? {};
   if (typeof e.file !== "string" || typeof e.line !== "number" || typeof e.symbol !== "string")
@@ -6066,7 +6469,7 @@ function anchor(v, where) {
   return { file: e.file, line: e.line, symbol: e.symbol };
 }
 function loadHolisticFixture(dir) {
-  const raw = JSON.parse(fs22.readFileSync(path19.join(dir, "expectations.json"), "utf8"));
+  const raw = JSON.parse(fs24.readFileSync(path20.join(dir, "expectations.json"), "utf8"));
   const positives = Array.isArray(raw.plantedPositives) ? raw.plantedPositives : [];
   const misses = Array.isArray(raw.nearMisses) ? raw.nearMisses : [];
   if (positives.length === 0 || misses.length === 0)
@@ -6099,7 +6502,7 @@ function verifyFixtureAnchors(dir, fixture) {
   const check = (a, label2) => {
     let lines;
     try {
-      lines = fs22.readFileSync(path19.join(dir, a.file), "utf8").split(/\r?\n/);
+      lines = fs24.readFileSync(path20.join(dir, a.file), "utf8").split(/\r?\n/);
     } catch {
       broken.push(`${label2}: ${a.file} is unreadable`);
       return;
@@ -7476,6 +7879,7 @@ export {
   REVIEW_PROFILES,
   REVIEW_TIMEOUT_MS,
   SANDBOX_WRITABLE_TMP,
+  SCOPE_SECTION_TITLE,
   SECURITY_CLASSES,
   SECURITY_OBJECTIVE,
   SEVERITIES,
@@ -7558,6 +7962,7 @@ export {
   grokLoginWarningLine,
   grokToolFence,
   hasDepSurface,
+  hasGeneratedFirstLine,
   hasGeneratedHeader,
   holisticCapWasLifted,
   homeReadDenyRules,
@@ -7712,6 +8117,7 @@ export {
   validateReceiptShape,
   verifyFixtureAnchors,
   verifySiteAtHead,
+  worktreeFirstLineReader,
   worktreeReader,
   wrapWithSandbox,
   writeCodexSandboxProfile,

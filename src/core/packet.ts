@@ -11,7 +11,7 @@ import type { PacketSection, ReviewPacket } from './types';
 // certify code the reviewer never saw. The floor alone used to BE the budget, and
 // a caller raising --ceiling above it got coverage that said "150 files reviewed"
 // while the packet spliced out 300 KB of them in path order: run
-// 2026-10-10-14-16-53-f5983e4d (lisk-app#409, 204 files, ceiling 500 KB) shipped
+// 2026-10-10-14-16-53-f5983e4d (a 204-file PR, ceiling 500 KB) shipped
 // hunks for 65 of 150 covered files and every file of the module under review
 // fell in the cut. (A diff still over its budget — the first admitted file alone
 // over the ceiling — is truncated and the receipt is then disqualified — see
@@ -29,6 +29,9 @@ export const PACKET_BUDGETS = {
   files: 40_000,
   history: 4_000,
   objective: 2_000,
+  // The change-scope listing for a review in parts (PacketInput.scope): one line per changed
+  // file, so ~60 chars × files. 64 K holds a thousand-file change whole.
+  scope: 64_000,
   summary: 4_000,
   tests: 8_000,
 } as const;
@@ -63,6 +66,11 @@ export interface PacketInput {
   pr: number;
   repo: string;
   runHistory?: string; // recent run-log lines for this repo
+  // The CHANGE SCOPE note (modes/review/chunks.ts renderChangeScope): rendered when the change is
+  // reviewed in parts, or when files were left out of every part — which files THIS packet
+  // carries, which files the other parts carry, which no reviewer sees. Absent ⇒ no section,
+  // byte-identical to a packet assembled before parts existed.
+  scope?: string;
   surroundingFiles?: string; // full content of the changed files, pre-joined
   testOutput?: string; // the author's test run output / result
 }
@@ -138,6 +146,10 @@ export function section(
 // full pre-truncation diff) so a citation can only ever validate against bytes a reviewer saw.
 export const DIFF_SECTION_TITLE = 'The diff under review';
 
+// The change-scope section's title (a review in parts) — named so consumers can find it the way
+// they find the diff section.
+export const SCOPE_SECTION_TITLE = 'Change scope (this review runs in parts)';
+
 export const CI_EVIDENCE_SECTION_TITLE = 'CI evidence (checks + annotations at the PR head)';
 
 export function reviewerVisibleDiff(packet: ReviewPacket): {
@@ -194,6 +206,20 @@ export function assembleCodePacket(input: PacketInput): ReviewPacket {
         'what the author says the change does + why — weigh, don’t trust',
         input.authorSummary,
         PACKET_BUDGETS.summary
+      )
+    );
+  }
+  // The scope note precedes the diff so a seat reads "this is part k of N, here is what else
+  // changed" BEFORE the hunks — the bytes that stop "X has no caller" when the caller sits in
+  // another part. Its budget is generous (a 400-file listing is ~25 KB) and it never competes
+  // with the diff, which has its own budget.
+  if (input.scope) {
+    sections.push(
+      section(
+        SCOPE_SECTION_TITLE,
+        'this change is reviewed in parts — what this packet carries, what the other parts carry, what no reviewer sees',
+        input.scope,
+        PACKET_BUDGETS.scope
       )
     );
   }

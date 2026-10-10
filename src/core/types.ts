@@ -207,6 +207,10 @@ export interface Evidence {
 // f2, …) so dispositions can reference it stably across the artifact boundary.
 export interface ReviewFinding {
   body: string;
+  // The review PART (1-based) this finding came from when the change was reviewed in parts
+  // (modes/review/chunks.ts). Absent for a single-packet review. Advisory: a consumer renders
+  // it; nothing in the gate keys off it.
+  chunk?: number;
   confidence: Confidence;
   evidence: Evidence;
   id: string;

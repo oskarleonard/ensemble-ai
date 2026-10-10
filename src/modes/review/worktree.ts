@@ -311,7 +311,26 @@ export function materializedDiffClause(args: {
   baseSha: string;
   diff: string;
   headSha: string;
+  // The change-scope note (modes/review/chunks.ts) when the change is reviewed in PARTS: the
+  // bytes below are then one part of `git diff base...head`, not all of it, and the seat is told
+  // which changed files it was not handed. Saying "exactly the diff" over a part would be a lie
+  // the seat cannot detect — run 2026-10-10-18-51-44-9acc127a's lens was told a 70-file backend
+  // slice was the whole of a 411-file merge.
+  scope?: string;
 }): string {
+  if (args.scope) {
+    return `The change under review is \`git diff ${args.baseSha}...${args.headSha}\`. It is larger than one
+packet, so it is handed over in PARTS: the scope note says which changed files' hunks are
+materialized below and which are not. Every file the note lists is changed by this PR — read the
+ones whose hunks are not below in the checkout at ${args.headSha} rather than assuming they are
+unchanged.
+
+${args.scope}
+
+\`\`\`diff
+${args.diff}
+\`\`\``;
+  }
   return `The change under review is exactly \`git diff ${args.baseSha}...${args.headSha}\`, already
 materialized for you:
 
