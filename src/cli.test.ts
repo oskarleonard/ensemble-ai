@@ -86,7 +86,7 @@ function result(over: Partial<ReviewModeResult>): ReviewModeResult {
     },
     blocked: false,
     reviews: [],
-    secretScan: { blocked: false, inlineSecrets: [], overridden: false, sensitivePaths: [] },
+    secretScan: { blocked: false, inlineSecrets: [], inlineSecretsAllowlisted: [], inlineSecretsOmitted: [], overridden: false, sensitivePaths: [] },
     ...over,
   };
 }

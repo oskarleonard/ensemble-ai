@@ -3520,15 +3520,20 @@ function payloadLines(section2) {
 function scanDiffForSecrets(files, opts = {}) {
   const sensitivePaths = [];
   const inlineSecrets = [];
+  const inlineSecretsOmitted = [];
+  const inlineSecretsAllowlisted = [];
   for (const f of files) {
     for (const { label: label2, re } of SENSITIVE_PATH_PATTERNS) {
       if (label2 === "dotenv" && DOTENV_TEMPLATE_RE.test(f.path)) continue;
       if (re.test(f.path)) sensitivePaths.push({ label: label2, path: f.path });
     }
     if (f.isBinary) continue;
+    const transmitted = opts.coveredPaths ? opts.coveredPaths.has(f.path) : true;
     const lines = payloadLines(f.raw);
+    const allowlisted = opts.allowlistedPaths?.has(f.path) ?? false;
+    const bucket = !transmitted ? inlineSecretsOmitted : allowlisted ? inlineSecretsAllowlisted : inlineSecrets;
     for (const { label: label2, re } of INLINE_SECRET_PATTERNS) {
-      if (lines.some((line) => re.test(line))) inlineSecrets.push({ label: label2, path: f.path });
+      if (lines.some((line) => re.test(line))) bucket.push({ label: label2, path: f.path });
     }
   }
   const hasRisk = sensitivePaths.length > 0 || inlineSecrets.length > 0;
@@ -3536,6 +3541,8 @@ function scanDiffForSecrets(files, opts = {}) {
   return {
     blocked: hasRisk && !overridden,
     inlineSecrets,
+    inlineSecretsAllowlisted,
+    inlineSecretsOmitted,
     overridden,
     sensitivePaths
   };
@@ -8702,6 +8709,151 @@ var RETRIES_ON_PACKET = {
   grok: false
 };
 
+// src/modes/review/gitleaks-allowlist.ts
+var CONFIG_MAX_BYTES = 256 * 1024;
+var PATTERN_MAX_CHARS = 512;
+var SECTION_RE = /^[ \t]*\[\[?[ \t]*([A-Za-z0-9_.-]+)[ \t]*\]\]?[ \t]*(?:#.*)?$/gm;
+var PATHS_KEY_RE = /^[ \t]*paths[ \t]*=[ \t]*\[/m;
+function readTomlStringArray(text, from) {
+  const out = [];
+  let i = from;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === "]") break;
+    if (c === "#") {
+      const nl = text.indexOf("\n", i);
+      i = nl === -1 ? text.length : nl + 1;
+      continue;
+    }
+    if (text.startsWith("'''", i)) {
+      const end = text.indexOf("'''", i + 3);
+      if (end === -1) break;
+      out.push(text.slice(i + 3, end));
+      i = end + 3;
+      continue;
+    }
+    if (text.startsWith('"""', i)) {
+      const end = text.indexOf('"""', i + 3);
+      if (end === -1) break;
+      out.push(unescapeBasic(text.slice(i + 3, end)));
+      i = end + 3;
+      continue;
+    }
+    if (c === "'") {
+      const end = text.indexOf("'", i + 1);
+      if (end === -1) break;
+      out.push(text.slice(i + 1, end));
+      i = end + 1;
+      continue;
+    }
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      if (j >= text.length) break;
+      out.push(unescapeBasic(text.slice(i + 1, j)));
+      i = j + 1;
+      continue;
+    }
+    i++;
+  }
+  return out;
+}
+function unescapeBasic(s) {
+  return s.replace(/\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)/g, (_m, e) => {
+    switch (e[0]) {
+      case "n":
+        return "\n";
+      case "t":
+        return "	";
+      case "r":
+        return "\r";
+      case "u":
+      case "U":
+        return String.fromCodePoint(parseInt(e.slice(1), 16));
+      default:
+        return e;
+    }
+  });
+}
+function compileRe2(src) {
+  if (src.length > PATTERN_MAX_CHARS) return null;
+  let flags = "";
+  let body = src;
+  const m = /^\(\?([a-z]+)\)/.exec(body);
+  if (m) {
+    if (m[1] !== "i") return null;
+    flags = "i";
+    body = body.slice(m[0].length);
+  }
+  try {
+    return new RegExp(body, flags);
+  } catch {
+    return null;
+  }
+}
+function parseGitleaksAllowlistPaths(toml) {
+  const patterns = [];
+  const invalid = [];
+  const headers = [...toml.matchAll(SECTION_RE)];
+  for (let h = 0; h < headers.length; h++) {
+    const name2 = headers[h][1];
+    if (name2 !== "allowlist" && name2 !== "allowlists") continue;
+    const start = headers[h].index + headers[h][0].length;
+    const end = h + 1 < headers.length ? headers[h + 1].index : toml.length;
+    const body = toml.slice(start, end);
+    const key = PATHS_KEY_RE.exec(body);
+    if (!key) continue;
+    for (const src of readTomlStringArray(body, key.index + key[0].length)) {
+      const re = compileRe2(src);
+      if (re) patterns.push(re);
+      else invalid.push(src.slice(0, 80));
+    }
+  }
+  return { invalid, patterns };
+}
+function gitleaksConfigCandidates(filePath) {
+  const out = [{ configPath: ".gitleaks.toml", dir: "" }];
+  const parts = filePath.split("/");
+  for (let i = 1; i < parts.length; i++) {
+    const dir = parts.slice(0, i).join("/");
+    out.push({ configPath: `${dir}/.gitleaks.toml`, dir });
+  }
+  return out;
+}
+function gitleaksAllowlisted(a, filePath) {
+  const rel = a.dir && filePath.startsWith(`${a.dir}/`) ? filePath.slice(a.dir.length + 1) : filePath;
+  return a.patterns.some((re) => re.test(rel) || rel !== filePath && re.test(filePath));
+}
+async function resolveGitleaksExemptions(reader, paths) {
+  const cache = /* @__PURE__ */ new Map();
+  const configs = [];
+  const invalid = [];
+  const exempt = /* @__PURE__ */ new Map();
+  const load = async (configPath, dir) => {
+    if (cache.has(configPath)) return cache.get(configPath);
+    const text = await reader.read(configPath, CONFIG_MAX_BYTES);
+    let parsed = null;
+    if (text !== null) {
+      const p = parseGitleaksAllowlistPaths(text);
+      parsed = { configPath, dir, invalid: p.invalid, patterns: p.patterns };
+      configs.push(configPath);
+      for (const pattern of p.invalid) invalid.push({ configPath, pattern });
+    }
+    cache.set(configPath, parsed);
+    return parsed;
+  };
+  for (const filePath of paths) {
+    for (const { configPath, dir } of gitleaksConfigCandidates(filePath)) {
+      const a = await load(configPath, dir);
+      if (a && gitleaksAllowlisted(a, filePath)) {
+        exempt.set(filePath, configPath);
+        break;
+      }
+    }
+  }
+  return { configs, exempt, invalid };
+}
+
 // src/modes/review/index.ts
 var DEFAULT_OBJECTIVE = "Adversarial cross-vendor review of a code diff \u2014 find correctness, security, and convention issues a same-vendor author might miss.";
 function qualifyCoreSeats(reviewers, worktree, configs) {
@@ -8734,15 +8886,36 @@ async function runReviewMode(opts) {
     `Diff: ${acquired.coverage.totalFiles} file(s), ${acquired.coverage.includedFiles} covered, ${acquired.coverage.omittedFiles} omitted \xB7 digest ${acquired.canonicalDigest.slice(0, 19)}\u2026`
   );
   const depSurface = profile === "security" ? scanDependencySurface(acquired.files) : void 0;
-  const secretScan = scanDiffForSecrets(acquired.files, {
-    allowSensitive: opts.allowSensitive
-  });
+  const coveredPaths = new Set(acquired.coverage.files.filter((f) => f.included).map((f) => f.path));
+  let secretScan = scanDiffForSecrets(acquired.files, { allowSensitive: opts.allowSensitive, coveredPaths });
+  let allowlistNote = "";
+  if (secretScan.inlineSecrets.length > 0) {
+    if (opts.conventionReader) {
+      const hitPaths = [...new Set(secretScan.inlineSecrets.map((s) => s.path))];
+      const ex = await resolveGitleaksExemptions(opts.conventionReader, hitPaths);
+      for (const { configPath, pattern } of ex.invalid) {
+        log(`gitleaks allowlist: ${configPath} \u2014 pattern not compilable here, skipped: ${pattern}`);
+      }
+      if (ex.exempt.size > 0) {
+        secretScan = scanDiffForSecrets(acquired.files, {
+          allowSensitive: opts.allowSensitive,
+          allowlistedPaths: new Set(ex.exempt.keys()),
+          coveredPaths
+        });
+        for (const [p, cfg] of ex.exempt) log(`secret-scan: ${p} \u2014 allowlisted by ${cfg}; not blocking`);
+      } else if (ex.configs.length > 0) {
+        allowlistNote = ` (not exempted by ${ex.configs.join(", ")})`;
+      }
+    } else {
+      allowlistNote = " (no repo reader, so the gitleaks allowlist was not consulted)";
+    }
+  }
   if (secretScan.blocked) {
     const paths = [
       ...secretScan.sensitivePaths.map((p) => `${p.path} (${p.label})`),
       ...secretScan.inlineSecrets.map((s) => `${s.path} (${s.label})`)
     ];
-    const reason = `diff carries sensitive content: ${paths.join(", ")} \u2014 pass --allow-sensitive to review anyway`;
+    const reason = `diff carries sensitive content: ${paths.join(", ")}${allowlistNote} \u2014 pass --allow-sensitive to review anyway`;
     log(`BLOCKED \u2014 ${reason}`);
     return {
       acquired,
@@ -8752,6 +8925,9 @@ async function runReviewMode(opts) {
       reviews: [],
       secretScan
     };
+  }
+  for (const s of secretScan.inlineSecretsOmitted) {
+    log(`secret-scan: ${s.path} (${s.label}) \u2014 in an OMITTED file, not transmitted; not blocking`);
   }
   let agentsMd = opts.agentsMd;
   let conventionManifest;
@@ -11700,10 +11876,14 @@ function printSummary(result, profile) {
     out.push(...renderConventionManifest(result.conventionManifest));
   }
   const ss = result.secretScan;
-  if (ss.sensitivePaths.length || ss.inlineSecrets.length) {
+  if (ss.sensitivePaths.length || ss.inlineSecrets.length || ss.inlineSecretsOmitted.length || ss.inlineSecretsAllowlisted.length) {
+    const omitted = ss.inlineSecretsOmitted.length ? ` \xB7 ${ss.inlineSecretsOmitted.length} inline in omitted file(s), not transmitted` : "";
+    const allowlisted = ss.inlineSecretsAllowlisted.length ? ` \xB7 ${ss.inlineSecretsAllowlisted.length} inline allowlisted by the repo's .gitleaks.toml` : "";
     out.push(
-      `  secrets: ${ss.sensitivePaths.length} sensitive path(s), ${ss.inlineSecrets.length} inline${ss.overridden ? " (overridden)" : ""}`
+      `  secrets: ${ss.sensitivePaths.length} sensitive path(s), ${ss.inlineSecrets.length} inline${ss.overridden ? " (overridden)" : ""}${omitted}${allowlisted}`
     );
+    for (const s of ss.inlineSecretsOmitted) out.push(`             omitted-file hit: ${s.path} (${s.label})`);
+    for (const s of ss.inlineSecretsAllowlisted) out.push(`             allowlisted hit: ${s.path} (${s.label})`);
   }
   if (result.depSurface) out.push(...depSurfaceBlock(result.depSurface));
   if (result.blocked) {

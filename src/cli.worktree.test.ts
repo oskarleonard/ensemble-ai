@@ -61,7 +61,7 @@ const engineResult = (): ReviewModeResult =>
         terminalState: 'reviewed',
       },
     ],
-    secretScan: { blocked: false, inlineSecrets: [], overridden: false, sensitivePaths: [] },
+    secretScan: { blocked: false, inlineSecrets: [], inlineSecretsAllowlisted: [], inlineSecretsOmitted: [], overridden: false, sensitivePaths: [] },
   }) as unknown as ReviewModeResult;
 
 let reaps: number;
