@@ -58,6 +58,7 @@ import {
   RETRIES_ON_PACKET,
   runCoreSeat,
 } from './seat-run';
+import { resolveGitleaksExemptions } from './gitleaks-allowlist';
 import { scanDiffForSecrets, type SecretScanResult } from './secret-scan';
 
 // The detached, read-only worktree of the PR head this run materialized (spec §1) — one per run,
@@ -261,16 +262,42 @@ export async function runReviewMode(
   // omitted file's bytes never reach a vendor (the packet carries acquired.diff,
   // the covered subset; the raw diff feeds the digest only).
   // (acquireDiff already parsed these files for coverage — reuse, don't re-parse.)
-  const secretScan = scanDiffForSecrets(acquired.files, {
-    allowSensitive: opts.allowSensitive,
-    coveredPaths: new Set(acquired.coverage.files.filter((f) => f.included).map((f) => f.path)),
-  });
+  //
+  // Two passes, the second only when the first would block: a transmitted inline
+  // hit is checked against the repo's gitleaks allowlist (read through the
+  // conventions reader — fs locally, the PR's BASE on GitHub) and an exempted
+  // path is re-scanned as allowlisted. No reader (--no-conventions, no clone) →
+  // no exemption, and the block names that so the reader knows what to switch on.
+  const coveredPaths = new Set(acquired.coverage.files.filter((f) => f.included).map((f) => f.path));
+  let secretScan = scanDiffForSecrets(acquired.files, { allowSensitive: opts.allowSensitive, coveredPaths });
+  let allowlistNote = '';
+  if (secretScan.inlineSecrets.length > 0) {
+    if (opts.conventionReader) {
+      const hitPaths = [...new Set(secretScan.inlineSecrets.map((s) => s.path))];
+      const ex = await resolveGitleaksExemptions(opts.conventionReader, hitPaths);
+      for (const { configPath, pattern } of ex.invalid) {
+        log(`gitleaks allowlist: ${configPath} — pattern not compilable here, skipped: ${pattern}`);
+      }
+      if (ex.exempt.size > 0) {
+        secretScan = scanDiffForSecrets(acquired.files, {
+          allowSensitive: opts.allowSensitive,
+          allowlistedPaths: new Set(ex.exempt.keys()),
+          coveredPaths,
+        });
+        for (const [p, cfg] of ex.exempt) log(`secret-scan: ${p} — allowlisted by ${cfg}; not blocking`);
+      } else if (ex.configs.length > 0) {
+        allowlistNote = ` (not exempted by ${ex.configs.join(', ')})`;
+      }
+    } else {
+      allowlistNote = ' (no repo reader, so the gitleaks allowlist was not consulted)';
+    }
+  }
   if (secretScan.blocked) {
     const paths = [
       ...secretScan.sensitivePaths.map((p) => `${p.path} (${p.label})`),
       ...secretScan.inlineSecrets.map((s) => `${s.path} (${s.label})`),
     ];
-    const reason = `diff carries sensitive content: ${paths.join(', ')} — pass --allow-sensitive to review anyway`;
+    const reason = `diff carries sensitive content: ${paths.join(', ')}${allowlistNote} — pass --allow-sensitive to review anyway`;
     log(`BLOCKED — ${reason}`);
     return {
       acquired,

@@ -932,11 +932,13 @@ interface SecretScanResult {
     blocked: boolean;
     inlineSecrets: InlineSecretHit[];
     inlineSecretsOmitted: InlineSecretHit[];
+    inlineSecretsAllowlisted: InlineSecretHit[];
     overridden: boolean;
     sensitivePaths: SensitivePathHit[];
 }
 declare function scanDiffForSecrets(files: FileDiff[], opts?: {
     allowSensitive?: boolean;
+    allowlistedPaths?: ReadonlySet<string>;
     coveredPaths?: ReadonlySet<string>;
 }): SecretScanResult;
 

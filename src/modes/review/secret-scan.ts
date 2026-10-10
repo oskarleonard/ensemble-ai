@@ -102,6 +102,10 @@ export interface SecretScanResult {
   // generated, over-limit). Nothing of them reaches a vendor, so they never block —
   // but they are still NAMED here so the manifest reflects the whole change.
   inlineSecretsOmitted: InlineSecretHit[];
+  // Inline hits in TRANSMITTED files the repo's own gitleaks allowlist exempts
+  // (`.gitleaks.toml` paths — a self-test, a fixture). The repo declared them
+  // non-secret and its CI scans them so; they are named, never blocking.
+  inlineSecretsAllowlisted: InlineSecretHit[];
   // The caller's explicit acknowledgement (recorded for the manifest).
   overridden: boolean;
   sensitivePaths: SensitivePathHit[];
@@ -134,13 +138,21 @@ function payloadLines(section: string): string[] {
 // cut had already omitted that file as over-limit, and the review still died on
 // it — a veto over bytes no vendor was ever going to see. Without `coveredPaths`
 // (no cut known) every file counts as transmitted, as before.
+//
+// `allowlistedPaths` are files the repo's gitleaks allowlist exempts (see
+// gitleaks-allowlist.ts): a transmitted hit there is recorded, not blocking.
 export function scanDiffForSecrets(
   files: FileDiff[],
-  opts: { allowSensitive?: boolean; coveredPaths?: ReadonlySet<string> } = {}
+  opts: {
+    allowSensitive?: boolean;
+    allowlistedPaths?: ReadonlySet<string>;
+    coveredPaths?: ReadonlySet<string>;
+  } = {}
 ): SecretScanResult {
   const sensitivePaths: SensitivePathHit[] = [];
   const inlineSecrets: InlineSecretHit[] = [];
   const inlineSecretsOmitted: InlineSecretHit[] = [];
+  const inlineSecretsAllowlisted: InlineSecretHit[] = [];
   for (const f of files) {
     for (const { label, re } of SENSITIVE_PATH_PATTERNS) {
       if (label === 'dotenv' && DOTENV_TEMPLATE_RE.test(f.path)) continue;
@@ -149,9 +161,10 @@ export function scanDiffForSecrets(
     if (f.isBinary) continue;
     const transmitted = opts.coveredPaths ? opts.coveredPaths.has(f.path) : true;
     const lines = payloadLines(f.raw);
+    const allowlisted = opts.allowlistedPaths?.has(f.path) ?? false;
+    const bucket = !transmitted ? inlineSecretsOmitted : allowlisted ? inlineSecretsAllowlisted : inlineSecrets;
     for (const { label, re } of INLINE_SECRET_PATTERNS) {
-      if (!lines.some((line) => re.test(line))) continue;
-      (transmitted ? inlineSecrets : inlineSecretsOmitted).push({ label, path: f.path });
+      if (lines.some((line) => re.test(line))) bucket.push({ label, path: f.path });
     }
   }
   const hasRisk = sensitivePaths.length > 0 || inlineSecrets.length > 0;
@@ -159,6 +172,7 @@ export function scanDiffForSecrets(
   return {
     blocked: hasRisk && !overridden,
     inlineSecrets,
+    inlineSecretsAllowlisted,
     inlineSecretsOmitted,
     overridden,
     sensitivePaths,

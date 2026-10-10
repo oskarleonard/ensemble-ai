@@ -864,14 +864,18 @@ function printSummary(result: ReviewModeResult, profile: ReviewProfile): void {
     out.push(...renderConventionManifest(result.conventionManifest));
   }
   const ss = result.secretScan;
-  if (ss.sensitivePaths.length || ss.inlineSecrets.length || ss.inlineSecretsOmitted.length) {
+  if (ss.sensitivePaths.length || ss.inlineSecrets.length || ss.inlineSecretsOmitted.length || ss.inlineSecretsAllowlisted.length) {
     const omitted = ss.inlineSecretsOmitted.length
       ? ` · ${ss.inlineSecretsOmitted.length} inline in omitted file(s), not transmitted`
       : '';
+    const allowlisted = ss.inlineSecretsAllowlisted.length
+      ? ` · ${ss.inlineSecretsAllowlisted.length} inline allowlisted by the repo's .gitleaks.toml`
+      : '';
     out.push(
-      `  secrets: ${ss.sensitivePaths.length} sensitive path(s), ${ss.inlineSecrets.length} inline${ss.overridden ? ' (overridden)' : ''}${omitted}`
+      `  secrets: ${ss.sensitivePaths.length} sensitive path(s), ${ss.inlineSecrets.length} inline${ss.overridden ? ' (overridden)' : ''}${omitted}${allowlisted}`
     );
     for (const s of ss.inlineSecretsOmitted) out.push(`             omitted-file hit: ${s.path} (${s.label})`);
+    for (const s of ss.inlineSecretsAllowlisted) out.push(`             allowlisted hit: ${s.path} (${s.label})`);
   }
   if (result.depSurface) out.push(...depSurfaceBlock(result.depSurface));
   if (result.blocked) {

@@ -165,6 +165,33 @@ describe('scanDiffForSecrets — the coverage cut bounds the inline block', () =
   });
 });
 
+describe('scanDiffForSecrets — the repo gitleaks allowlist exempts a transmitted hit', () => {
+  const selftest = 'backend/scripts/gitleaks-selftest.sh';
+  const twoFiles =
+    diffFor('src/a.ts', ['const a = 1;']) +
+    diffFor(selftest, ['aws_access_key=AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE']);
+  const covered = new Set(['src/a.ts', selftest]);
+
+  it('an allowlisted COVERED hit is named under inlineSecretsAllowlisted and does not block', () => {
+    const r = scanDiffForSecrets(parseDiffFiles(twoFiles), { allowlistedPaths: new Set([selftest]), coveredPaths: covered });
+    expect(r.blocked).toBe(false);
+    expect(r.inlineSecrets).toHaveLength(0);
+    expect(r.inlineSecretsAllowlisted).toEqual([{ label: 'aws-access-key', path: selftest }]);
+  });
+
+  it('an allowlist for ANOTHER path changes nothing', () => {
+    const r = scanDiffForSecrets(parseDiffFiles(twoFiles), { allowlistedPaths: new Set(['src/a.ts']), coveredPaths: covered });
+    expect(r.blocked).toBe(true);
+    expect(r.inlineSecretsAllowlisted).toHaveLength(0);
+  });
+
+  it('omitted wins over allowlisted (the file was never transmitted)', () => {
+    const r = scanDiffForSecrets(parseDiffFiles(twoFiles), { allowlistedPaths: new Set([selftest]), coveredPaths: new Set(['src/a.ts']) });
+    expect(r.inlineSecretsOmitted).toHaveLength(1);
+    expect(r.inlineSecretsAllowlisted).toHaveLength(0);
+  });
+});
+
 describe('scanDiffForSecrets — clean diff', () => {
   it('does not block ordinary code', () => {
     const r = scanDiffForSecrets(parseDiffFiles(CLEAN));

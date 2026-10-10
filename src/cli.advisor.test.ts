@@ -80,7 +80,7 @@ describe('review — an invalid Anthropic-seat advisor fails BEFORE the core fan
       blocked: false,
       prompt: 'the packet',
       reviews: [],
-      secretScan: { blocked: false, inlineSecrets: [], inlineSecretsOmitted: [], overridden: false, sensitivePaths: [] },
+      secretScan: { blocked: false, inlineSecrets: [], inlineSecretsAllowlisted: [], inlineSecretsOmitted: [], overridden: false, sensitivePaths: [] },
     } as unknown as ReviewModeResult);
     mockLayer.mockRejectedValue(new Error('layer reached'));
     await main(['review', '--working-tree', '--holistic']);
