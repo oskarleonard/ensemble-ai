@@ -1312,6 +1312,50 @@ function memoryConventionReader(fileMap) {
     }
   };
 }
+function gitHasCommit(repoDir, sha) {
+  try {
+    execFileSync("git", ["-C", repoDir, "cat-file", "-e", `${sha}^{commit}`], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function gitConventionReader(repoDir, ref) {
+  const dir = path.resolve(repoDir);
+  const clean = (rel) => {
+    const n = rel.replace(/^\.\//, "").replace(/\/+$/, "");
+    if (!n || path.isAbsolute(n) || n.split("/").some((seg) => seg === ".." || seg === "")) return null;
+    return n;
+  };
+  const MAX_BLOB = 16 * 1024 * 1024;
+  return {
+    async read(rel, maxBytes) {
+      const p = clean(rel);
+      if (!p) return null;
+      try {
+        const type = execFileSync("git", ["-C", dir, "cat-file", "-t", `${ref}:${p}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+        if (type !== "blob") return null;
+        const size = Number(execFileSync("git", ["-C", dir, "cat-file", "-s", `${ref}:${p}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim());
+        if (!Number.isFinite(size) || size > MAX_BLOB) return null;
+        const buf = execFileSync("git", ["-C", dir, "cat-file", "blob", `${ref}:${p}`], { maxBuffer: MAX_BLOB + 1024, stdio: ["ignore", "pipe", "ignore"] });
+        const want = maxBytes === void 0 ? buf : buf.subarray(0, Math.min(maxBytes, buf.length));
+        return want.toString("utf8").replace(/�$/, "");
+      } catch {
+        return null;
+      }
+    },
+    async list(dirRel) {
+      const p = clean(dirRel);
+      if (!p) return [];
+      try {
+        const out = execFileSync("git", ["-C", dir, "ls-tree", "--name-only", `${ref}:${p}`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+        return out.split("\n").map((n) => n.trim()).filter((n) => n.endsWith(".md")).map((n) => joinDir(p, n));
+      } catch {
+        return [];
+      }
+    }
+  };
+}
 
 // src/core/reviewers.ts
 import fs2 from "fs";
@@ -5868,6 +5912,13 @@ async function runReviewMode(opts) {
       scope: boundedScope(renderLensScope(scopeInput, shown))
     };
   }
+  if (opts.onPacketsReady) {
+    try {
+      opts.onPacketsReady({ headSha: acquired.headSha, ...lensHandoff ? { lensHandoff } : {}, parts, pinnedDiff, prompt });
+    } catch (e) {
+      log(`onPacketsReady hook failed (${e.message}) \u2014 the Anthropic stages will run after the core instead`);
+    }
+  }
   log(
     reviewers.length > 0 ? `Running ${reviewers.length} reviewer(s): ${reviewers.join(", ")}\u2026` : "Running 0 core reviewer(s) \u2014 claude-only: the Opus reviewer, the lens (when requested) and the gate are the reviewers of record; no cross-vendor receipt will qualify"
   );
@@ -7983,6 +8034,8 @@ export {
   formatEvidenceShortfall,
   fsConventionReader,
   gatherConventions,
+  gitConventionReader,
+  gitHasCommit,
   grokAllowedTools,
   grokLoginWarningLine,
   grokToolFence,

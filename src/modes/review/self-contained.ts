@@ -344,6 +344,12 @@ export interface ClaudeLayerOptions {
   // The LENS handoff on a review in parts: as much of the union as one packet holds + the scope
   // listing naming every other changed file. Absent ⇒ the lens is handed `pinnedDiff` whole.
   lensHandoff?: { diff: string; scope: string };
+  // A producer stage the caller already STARTED (runClaudeProducer) from runReviewMode's
+  // onPacketsReady hook, so it ran alongside the core seats. Present ⇒ the layer awaits it and
+  // never spawns the producer itself. Absent ⇒ the layer runs the producer here, as before.
+  producer?: Promise<ClaudeProducerOutcome>;
+  // The lens stage, likewise pre-started (runHolisticStage). Absent ⇒ run here, as before.
+  lens?: Promise<HolisticStageOutcome>;
   // The head SHA the reviewers saw — the gate reads the pinned packet keyed by it, and a
   // mismatch fails the packet closed (all verdicts unverified).
   expectedHeadSha: string;
@@ -427,17 +433,45 @@ export function claudeModelLabel(config: VoiceConfig): string {
   return config.model && config.model !== 'default' ? config.model : 'opus';
 }
 
-// Run the cold Opus reviewer (when in the roster) over the SAME prompt + persist it, write
-// every reviewer's rendered review.<id>.md, then synthesize over the reviews LOADED from the
-// trail files. An Opus reviewer failure degrades to an ok:false voice (synthesis still runs
-// over codex+grok); an unavailable synthesizer degrades to the deterministic fallback.
-export async function runClaudeReviewLayer(
-  opts: ClaudeLayerOptions
-): Promise<ClaudeLayerResult> {
+// ── The producer stage, startable on its own ──────────────────────────────────────────
+//
+// The Claude producer depends on the PACKET (parts, pinned diff, scope), never on the core seats'
+// replies — so a caller may START it the moment the packet is pinned (runReviewMode's
+// onPacketsReady) and hand the promise to runClaudeReviewLayer, which then awaits it instead of
+// running it after the core finishes. On a 5-part change that takes a whole seat-phase off the
+// critical path: the producer's five parts overlap codex/grok's five instead of following them.
+
+export type ClaudeProducerOptions = Pick<
+  ClaudeLayerOptions,
+  | 'baseDir'
+  | 'baseSha'
+  | 'ciEvidence'
+  | 'ciEvidenceUnavailable'
+  | 'claudeConfig'
+  | 'expectedHeadSha'
+  | 'historyPacket'
+  | 'includeClaudeReviewer'
+  | 'log'
+  | 'parts'
+  | 'pinnedDiff'
+  | 'profile'
+  | 'reviewPrompt'
+  | 'run'
+  | 'runId'
+  | 'timeoutMs'
+  | 'worktree'
+>;
+
+export interface ClaudeProducerOutcome {
+  claudeParts?: ClaudeLayerResult['claudeParts'];
+  claudeReview: VoiceReview | null;
+  claudeSpawned: boolean;
+}
+
+export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<ClaudeProducerOutcome> {
   const log = opts.log ?? (() => {});
   const run: ClaudeRunner = opts.run ?? runClaudeReviewVoice;
   const modelLabel = claudeModelLabel(opts.claudeConfig);
-
   // THE ONE CLAUDE PRODUCER (spec §3). With worktree evidence the seat runs the built-in
   // `/code-review` methodology over the whole project at `headSha`; without it, the cold peer
   // reviewer on the pinned packet, exactly as before. `--add-dir` — not the cwd — is what grants the
@@ -597,25 +631,28 @@ export async function runClaudeReviewLayer(
     }
   }
 
-  // Write each reviewer's rendered review.<id>.md (durable, human-readable trail artifact).
-  // Each write is best-effort — one reviewer's FS error must not take down the others or
-  // the synthesis.
-  const coreVoices = opts.coreReviews.map(storedToVoiceReview);
-  for (const v of coreVoices) {
-    try {
-      writeTrailFile(opts.baseDir, opts.runId, `review.${v.voiceId}.md`, renderReviewMarkdown(v));
-    } catch (e) {
-      log(`  · trail write review.${v.voiceId}.md failed (${(e as Error).message}) — continuing`);
-    }
-  }
-  if (claudeReview) {
-    try {
-      writeTrailFile(opts.baseDir, opts.runId, 'review.claude.md', renderReviewMarkdown(claudeReview));
-    } catch (e) {
-      log(`  · trail write review.claude.md failed (${(e as Error).message}) — continuing`);
-    }
-  }
+  return { ...(claudeParts ? { claudeParts } : {}), claudeReview, claudeSpawned };
+}
 
+// ── The lens stage, startable on its own ─────────────────────────────────────────────
+//
+// Same reasoning as the producer: the lens reads the tree and the pinned diff, never the core
+// seats' replies, so it may start the moment the packet is pinned and overlap the whole fan-out.
+
+export type HolisticStageOptions = Pick<
+  ClaudeLayerOptions,
+  'baseDir' | 'expectedHeadSha' | 'historyPacket' | 'holistic' | 'lensHandoff' | 'log' | 'pinnedDiff' | 'run' | 'runId' | 'timeoutMs' | 'worktree'
+>;
+
+export interface HolisticStageOutcome {
+  holisticReview: VoiceReview | null;
+  // Null ⇒ the lens ran or was never requested; else why it did not run.
+  holisticSkipped: string | null;
+}
+
+export async function runHolisticStage(opts: HolisticStageOptions): Promise<HolisticStageOutcome> {
+  const log = opts.log ?? (() => {});
+  const run: ClaudeRunner = opts.run ?? runClaudeReviewVoice;
   // THE HOLISTIC LENS. Off by default; when requested it runs ONLY with worktree evidence, and a
   // requested-but-unavailable lens says so out loud rather than degrading to a packet-evidence
   // architecture claim. Its persist is the same fail-loud contract as the claude reviewer's: a
@@ -670,6 +707,47 @@ export async function runClaudeReviewLayer(
       log(`  · trail write review.${HOLISTIC_SEAT_ID}.md failed (${(e as Error).message}) — continuing`);
     }
   }
+
+  return { holisticReview, holisticSkipped: plan.run ? null : plan.skipReason };
+}
+
+// Run the cold Opus reviewer (when in the roster) over the SAME prompt + persist it, write
+// every reviewer's rendered review.<id>.md, then synthesize over the reviews LOADED from the
+// trail files. An Opus reviewer failure degrades to an ok:false voice (synthesis still runs
+// over codex+grok); an unavailable synthesizer degrades to the deterministic fallback.
+export async function runClaudeReviewLayer(
+  opts: ClaudeLayerOptions
+): Promise<ClaudeLayerResult> {
+  const log = opts.log ?? (() => {});
+  const run: ClaudeRunner = opts.run ?? runClaudeReviewVoice;
+  const modelLabel = claudeModelLabel(opts.claudeConfig);
+
+  const produced = opts.producer ? await opts.producer : await runClaudeProducer(opts);
+  const claudeReview = produced.claudeReview;
+  const claudeSpawned = produced.claudeSpawned;
+  const claudeParts = produced.claudeParts;
+
+  // Write each reviewer's rendered review.<id>.md (durable, human-readable trail artifact).
+  // Each write is best-effort — one reviewer's FS error must not take down the others or
+  // the synthesis.
+  const coreVoices = opts.coreReviews.map(storedToVoiceReview);
+  for (const v of coreVoices) {
+    try {
+      writeTrailFile(opts.baseDir, opts.runId, `review.${v.voiceId}.md`, renderReviewMarkdown(v));
+    } catch (e) {
+      log(`  · trail write review.${v.voiceId}.md failed (${(e as Error).message}) — continuing`);
+    }
+  }
+  if (claudeReview) {
+    try {
+      writeTrailFile(opts.baseDir, opts.runId, 'review.claude.md', renderReviewMarkdown(claudeReview));
+    } catch (e) {
+      log(`  · trail write review.claude.md failed (${(e as Error).message}) — continuing`);
+    }
+  }
+
+  const lensOutcome = opts.lens ? await opts.lens : await runHolisticStage(opts);
+  const holisticReview = lensOutcome.holisticReview;
 
   // Run the GATE over the reviews READ BACK from the trail files (the literal "reads the
   // three review files") — grounding each finding against the pinned packet hunks, tagging
@@ -764,7 +842,7 @@ export async function runClaudeReviewLayer(
     gateTrailWritten: gate.gateTrailWritten,
     gateVerdicts,
     holisticReview,
-    holisticSkipped: plan.run ? null : plan.skipReason,
+    holisticSkipped: lensOutcome.holisticSkipped,
     modelLabel,
     settlements,
     settlerSkipped,

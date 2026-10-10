@@ -330,3 +330,72 @@ describe('runReviewMode — a change over the ceiling is reviewed in parts', () 
     expect(res.reviews[0].findings.every((f) => f.chunk === undefined)).toBe(true);
   });
 });
+
+// The Anthropic stages depend on the packet, not on the core seats' replies — so the engine
+// hands the pinned packet over BEFORE the fan-out, and a caller can start them in parallel.
+describe('runReviewMode — onPacketsReady fires before any core seat spawns', () => {
+  let out: string;
+  let cwd: string;
+  beforeEach(() => {
+    out = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-ready-'));
+    cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-ready-cwd-'));
+  });
+  afterEach(() => {
+    for (const d of [out, cwd]) fs.rmSync(d, { force: true, recursive: true });
+  });
+
+  it('hands over the parts, the pinned diff and the head, then the seats run', async () => {
+    const order: string[] = [];
+    const adapter: ReviewAdapter = async () => {
+      order.push('seat');
+      return { ok: true, raw: REVIEW, stderrTail: '', timedOut: false };
+    };
+    const res = await runReviewMode({
+      adapters: { claude: adapter, codex: adapter, grok: adapter },
+      conventionReader: null,
+      cwd,
+      diffMode: 'pr',
+      diffText: CODE_DIFF,
+      headShaOverride: 'a'.repeat(40),
+      noConventions: true,
+      onPacketsReady: (ready) => {
+        order.push('ready');
+        expect(ready.headSha).toBe('a'.repeat(40));
+        expect(ready.parts).toHaveLength(1);
+        expect(ready.pinnedDiff).toContain('addTwoNumbersTogether');
+        expect(ready.prompt).toContain('The diff under review');
+      },
+      out,
+      receiptStore: path.join(out, 'receipts'),
+      reviewers: ['grok'],
+      reviewersFile: NO_REVIEWERS_FILE,
+      runId: 'ready-run',
+    });
+    expect(order).toEqual(['ready', 'seat']);
+    expect(res.blocked).toBe(false);
+  });
+
+  it('a throwing hook is reported and the review still runs', async () => {
+    const progress: string[] = [];
+    const res = await runReviewMode({
+      adapters: stubAdapters(),
+      conventionReader: null,
+      cwd,
+      diffMode: 'pr',
+      diffText: CODE_DIFF,
+      headShaOverride: 'a'.repeat(40),
+      noConventions: true,
+      onPacketsReady: () => {
+        throw new Error('caller bug');
+      },
+      onProgress: (m) => progress.push(m),
+      out,
+      receiptStore: path.join(out, 'receipts'),
+      reviewers: ['grok'],
+      reviewersFile: NO_REVIEWERS_FILE,
+      runId: 'ready-throw',
+    });
+    expect(res.reviews[0].terminalState).toBe('reviewed');
+    expect(progress.some((m) => m.includes('onPacketsReady hook failed (caller bug)'))).toBe(true);
+  });
+});
