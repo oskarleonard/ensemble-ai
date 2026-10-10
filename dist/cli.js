@@ -9292,7 +9292,7 @@ var RETRIES_ON_PACKET = {
 var DECL_PATTERNS = [
   /^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*[([]/,
   // go: func Name( / func (r *T) Name( / generic
-  /^\s*type\s+([A-Z][A-Za-z0-9_]*)\s+(?:struct|interface|func|=|[A-Za-z\[])/,
+  /^\s*type\s+([A-Z][A-Za-z0-9_]*)\s+(?:struct|interface|func|=|[A-Za-z[])/,
   // go: type Name struct|interface|…
   /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*[(<]/,
   // ts/js

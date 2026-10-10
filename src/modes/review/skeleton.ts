@@ -23,7 +23,7 @@ import type { Coverage, FileDiff } from './diff';
 // group 1. Conservative: a miss costs a symbol its seam note, never a wrong one.
 const DECL_PATTERNS: RegExp[] = [
   /^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*[([]/, // go: func Name( / func (r *T) Name( / generic
-  /^\s*type\s+([A-Z][A-Za-z0-9_]*)\s+(?:struct|interface|func|=|[A-Za-z\[])/, // go: type Name struct|interface|…
+  /^\s*type\s+([A-Z][A-Za-z0-9_]*)\s+(?:struct|interface|func|=|[A-Za-z[])/, // go: type Name struct|interface|…
   /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*[(<]/, // ts/js
   /^\s*export\s+(?:const|let|var|class|interface|type|enum|abstract\s+class)\s+([A-Za-z_$][A-Za-z0-9_$]*)/, // ts/js exports
   /^\s*(?:abstract\s+)?class\s+([A-Z][A-Za-z0-9_$]*)/, // class Name (ts/js/py/kt/swift/java)
