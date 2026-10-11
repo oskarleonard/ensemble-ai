@@ -47,10 +47,11 @@ export const GROK_WORKTREE_REVIEW_TIMEOUT_MS = 3_600_000; // 60 min runaway back
 // not per-completed-item), so 15 min of true silence is an even stronger wedge signal here.
 export const GROK_INACTIVITY_TIMEOUT_MS = 900_000; // 15 min of SILENCE
 
-// The bounded NDJSON tail kept as a diagnostic when a seat is reclaimed — what it was doing last.
-// Smaller than codex's 1 MB because grok streams per-TOKEN deltas: 100 KB is already thousands of
-// events, and the tail is a post-mortem, not the reply.
-const GROK_STREAM_TAIL_LIMIT = 100_000; // 100 KB
+// The bounded NDJSON tail persisted beside the reply — the post-mortem of a reclaimed seat AND,
+// since 2026-10-10, the read-depth telemetry's source (seat-usage.ts counts tool calls over it).
+// It was 100 KB because grok streams per-TOKEN deltas; that held about two messages of a 45-turn
+// review, so the head — where the tool calls are — was gone on every real run. Codex's 1 MB.
+const GROK_STREAM_TAIL_LIMIT = 1_000_000; // 1 MB
 
 // The seat's stderr tail — the noise channel the trail persists (its last 2000 chars, seat-run).
 const GROK_SEAT_STDERR_LIMIT = 2000;

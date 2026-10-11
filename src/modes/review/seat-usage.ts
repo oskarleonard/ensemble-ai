@@ -12,6 +12,14 @@
 //   · grok (claude-shaped stream): `stream_event` deltas whose `message_delta` carries `usage`
 //     per message (summed), and a final `result` with `num_turns` and `duration_api_ms`.
 // A stream this module cannot read yields an empty record — never a guess.
+//
+// THE TAIL IS NOT THE STREAM (2026-10-11): the persisted stream is a BOUNDED TAIL (spawn.ts
+// boundedStreamTail), so its head can be gone. Run 2026-10-11-14-26-29-57b963ab kept grok's last
+// message only: summing the surviving `message_delta` usage said 914 output tokens where the
+// final `result` event — which always survives, it is the last line — said 13,591 over 45 turns.
+// So grok's token totals come from `result.usage` whenever it carries them, and TOOL CALLS are
+// counted only when the stream still begins at its head (grok `system`/init, codex
+// `thread.started`); a tail that lost its head reports tool calls as unmeasured, not as few.
 
 export interface SeatUsage {
   // Prompt tokens the vendor served from cache (codex `cached_input_tokens`, grok
@@ -38,6 +46,8 @@ export function parseSeatUsage(stream: string | null | undefined): SeatUsage {
   let grokOut = 0;
   let grokCached = 0;
   let sawGrokUsage = false;
+  let resultUsage: { cached: number; input: number; output: number } | null = null;
+  let first: string | null = null;
   for (const line of stream.split('\n')) {
     if (!line.trim()) continue;
     let e: unknown;
@@ -48,6 +58,7 @@ export function parseSeatUsage(stream: string | null | undefined): SeatUsage {
     }
     if (!e || typeof e !== 'object') continue;
     const ev = e as Record<string, unknown>;
+    if (first === null) first = typeof ev.type === 'string' ? ev.type : '';
     // codex
     if (ev.type === 'item.started' && ev.item && typeof ev.item === 'object') {
       const it = ev.item as Record<string, unknown>;
@@ -99,14 +110,28 @@ export function parseSeatUsage(stream: string | null | undefined): SeatUsage {
     if (ev.type === 'result') {
       const t = num(ev.num_turns);
       if (t !== undefined) usage.turns = t;
+      if (ev.usage && typeof ev.usage === 'object') {
+        const u = ev.usage as Record<string, unknown>;
+        const output = num(u.output_tokens);
+        if (output !== undefined) {
+          resultUsage = { cached: num(u.cache_read_input_tokens) ?? 0, input: num(u.input_tokens) ?? 0, output };
+        }
+      }
     }
   }
-  if (sawGrokUsage) {
+  if (resultUsage) {
+    // The run's totals, from the one event that survives any tail cut.
+    usage.inputTokens = resultUsage.input + resultUsage.cached;
+    usage.outputTokens = resultUsage.output;
+    usage.cachedInputTokens = resultUsage.cached;
+  } else if (sawGrokUsage) {
     usage.inputTokens = grokIn + grokCached;
     usage.outputTokens = grokOut;
     usage.cachedInputTokens = grokCached;
   }
-  if (sawTool) usage.toolCalls = toolCalls;
+  // Tool calls are a COUNT over the whole stream; a tail that lost its head cannot give one.
+  const headIntact = first === 'system' || first === 'thread.started';
+  if (sawTool && headIntact) usage.toolCalls = toolCalls;
   return usage;
 }
 
