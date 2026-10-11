@@ -12,19 +12,32 @@ const codexStream = [
   JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 4546368, cached_input_tokens: 4123520, output_tokens: 8813, reasoning_output_tokens: 3181 } }),
 ].join('\n');
 
-const grokStream = [
+const grokBody = [
   JSON.stringify({ type: 'stream_event', event: { type: 'message_delta', usage: { input_tokens: 2061, output_tokens: 4075, cache_read_input_tokens: 169600 } } }),
   JSON.stringify({ type: 'assistant', message: { content: [{ type: 'thinking' }, { type: 'tool_use', name: 'Read' }, { type: 'tool_use', name: 'Grep' }] } }),
   JSON.stringify({ type: 'stream_event', event: { type: 'message_delta', usage: { input_tokens: 100, output_tokens: 25, cache_read_input_tokens: 1000 } } }),
-  JSON.stringify({ type: 'result', subtype: 'success', num_turns: 96, duration_ms: 1152792 }),
-].join('\n');
+];
+const grokInit = JSON.stringify({ type: 'system', subtype: 'init', session_id: 's' });
+const grokStream = [grokInit, ...grokBody, JSON.stringify({ type: 'result', subtype: 'success', num_turns: 96, duration_ms: 1152792 })].join('\n');
+// What run 2026-10-11-14-26-29-57b963ab persisted: the head cut off by the tail cap, and a final
+// `result` whose totals dwarf the one surviving message's delta.
+const grokTailOnly = [...grokBody, JSON.stringify({ type: 'result', subtype: 'success', num_turns: 45, usage: { input_tokens: 179384, output_tokens: 13591, cache_read_input_tokens: 3160832 } })].join('\n');
 
 describe('parseSeatUsage — tokens, tool calls and turns off the persisted stream', () => {
   it('reads a codex --json stream', () => {
     expect(parseSeatUsage(codexStream)).toEqual({ cachedInputTokens: 4123520, inputTokens: 4546368, outputTokens: 8813, toolCalls: 2, turns: 1 });
   });
-  it('reads a grok (claude-shaped) stream, summing per-message usage', () => {
+  it('reads a grok (claude-shaped) stream, summing per-message usage when the result carries none', () => {
     expect(parseSeatUsage(grokStream)).toEqual({ cachedInputTokens: 170600, inputTokens: 172761, outputTokens: 4100, toolCalls: 2, turns: 96 });
+  });
+  it("takes grok's totals from the result event, and leaves tool calls unmeasured when the head is gone", () => {
+    expect(parseSeatUsage(grokTailOnly)).toEqual({ cachedInputTokens: 3160832, inputTokens: 3340216, outputTokens: 13591, turns: 45 });
+    // The same totals with the head intact: tool calls are a real count again.
+    expect(parseSeatUsage([grokInit, grokTailOnly].join('\n')).toolCalls).toBe(2);
+  });
+  it('a codex tail that lost thread.started reports no tool-call count', () => {
+    const headless = codexStream.split('\n').slice(1).join('\n');
+    expect(parseSeatUsage(headless)).toEqual({ cachedInputTokens: 4123520, inputTokens: 4546368, outputTokens: 8813, turns: 1 });
   });
   it('yields nothing for an absent or unreadable stream — never a guess', () => {
     expect(parseSeatUsage(undefined)).toEqual({});
