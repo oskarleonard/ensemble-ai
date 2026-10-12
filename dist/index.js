@@ -2528,7 +2528,7 @@ async function decide(opts, cwd, proceed) {
 var GROK_PACKET_REVIEW_TIMEOUT_MS = 18e5;
 var GROK_WORKTREE_REVIEW_TIMEOUT_MS = 36e5;
 var GROK_INACTIVITY_TIMEOUT_MS = 9e5;
-var GROK_STREAM_TAIL_LIMIT = 1e5;
+var GROK_STREAM_TAIL_LIMIT = 1e6;
 var GROK_SEAT_STDERR_LIMIT = 2e3;
 var GROK_BIN_CANDIDATES = [path8.join(os7.homedir(), ".grok", "bin", "grok")];
 function resolveGrokBin() {
@@ -5503,6 +5503,8 @@ function parseSeatUsage(stream) {
   let grokOut = 0;
   let grokCached = 0;
   let sawGrokUsage = false;
+  let resultUsage = null;
+  let first = null;
   for (const line of stream.split("\n")) {
     if (!line.trim()) continue;
     let e;
@@ -5513,6 +5515,7 @@ function parseSeatUsage(stream) {
     }
     if (!e || typeof e !== "object") continue;
     const ev = e;
+    if (first === null) first = typeof ev.type === "string" ? ev.type : "";
     if (ev.type === "item.started" && ev.item && typeof ev.item === "object") {
       const it = ev.item;
       if (it.type === "command_execution" || it.type === "tool_call" || it.type === "mcp_tool_call") {
@@ -5562,14 +5565,26 @@ function parseSeatUsage(stream) {
     if (ev.type === "result") {
       const t = num(ev.num_turns);
       if (t !== void 0) usage.turns = t;
+      if (ev.usage && typeof ev.usage === "object") {
+        const u = ev.usage;
+        const output2 = num(u.output_tokens);
+        if (output2 !== void 0) {
+          resultUsage = { cached: num(u.cache_read_input_tokens) ?? 0, input: num(u.input_tokens) ?? 0, output: output2 };
+        }
+      }
     }
   }
-  if (sawGrokUsage) {
+  if (resultUsage) {
+    usage.inputTokens = resultUsage.input + resultUsage.cached;
+    usage.outputTokens = resultUsage.output;
+    usage.cachedInputTokens = resultUsage.cached;
+  } else if (sawGrokUsage) {
     usage.inputTokens = grokIn + grokCached;
     usage.outputTokens = grokOut;
     usage.cachedInputTokens = grokCached;
   }
-  if (sawTool) usage.toolCalls = toolCalls;
+  const headIntact = first === "system" || first === "thread.started";
+  if (sawTool && headIntact) usage.toolCalls = toolCalls;
   return usage;
 }
 var THIN_OUTPUT_TOKENS_PER_KB = 10;

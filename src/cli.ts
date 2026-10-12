@@ -18,6 +18,7 @@ import {
 } from './core/conventions';
 import { isEntrypoint } from './core/entrypoint';
 import { evidenceRef, SEVERITY_LABEL, SEVERITY_ORDER } from './core/findings';
+import { stampProgress } from './core/progress';
 import { loadReviewers, resolveReviewer, REVIEWERS_FILE } from './core/reviewers';
 import { scrubControl as clean } from './core/sanitize';
 import {
@@ -1791,7 +1792,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       ...(maxChunks !== undefined ? { maxChunks } : {}),
       noConventions,
       onPacketsReady: startAnthropicStages,
-      onProgress: (m) => console.error(`· ${m}`),
+      onProgress: stampProgress((line) => console.error(line)),
       out,
       peerSeats,
       profile,
@@ -2546,7 +2547,7 @@ async function brainstormCommand(args: string[]): Promise<number> {
     result = await runBrainstormMode({
       ...(evidenceInfo ? { evidenceRoot: evidenceInfo.root } : {}),
       fileContext,
-      onProgress: (m) => console.error(`· ${m}`),
+      onProgress: stampProgress((line) => console.error(line)),
       synthesizer,
       timeoutMs,
       topic,
@@ -2877,7 +2878,7 @@ async function consultCommand(args: string[]): Promise<number> {
       ...(debate ? { debate } : {}),
       ...(evidenceInfo ? { evidenceRoot: evidenceInfo.root } : {}),
       fileContext,
-      onProgress: (m) => console.error(`· ${m}`),
+      onProgress: stampProgress((line) => console.error(line)),
       question,
       synthesizer,
       timeoutMs,
