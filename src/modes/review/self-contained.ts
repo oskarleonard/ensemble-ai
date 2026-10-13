@@ -837,16 +837,17 @@ export async function runIntegrationStage(opts: IntegrationStageOptions): Promis
     skeleton: opts.skeleton,
     worktree: opts.worktree,
   });
-  const fail = (summary: string, raw: string | null): IntegrationStageOutcome => {
-    const review: VoiceReview = { findings: [], ok: false, summary, voiceId: INTEGRATION_SEAT_ID };
+  const fail = (summary: string, raw: string | null, diagnostics?: SeatDiagnostics, stream?: string | null): IntegrationStageOutcome => {
+    const review: VoiceReview = { ...(diagnostics ? { diagnostics } : {}), findings: [], ok: false, summary, voiceId: INTEGRATION_SEAT_ID };
     try {
-      persistSeatReview(opts.baseDir, opts.runId, INTEGRATION_SEAT_ID, review, raw);
+      persistSeatReview(opts.baseDir, opts.runId, INTEGRATION_SEAT_ID, review, raw, stream);
     } catch {
       /* a failed seat with no trail entry reads as absent — the gate simply has no voice */
     }
     return { integrationReview: review, integrationSkipped: null };
   };
   let res: VoiceRunResult;
+  const startedAt = Date.now();
   try {
     res = await run(prompt, opts.config, {
       ...(opts.historyPacket ? { historyPacket: opts.historyPacket.files } : {}),
@@ -857,22 +858,26 @@ export async function runIntegrationStage(opts: IntegrationStageOptions): Promis
     log(`  · integration: failed to run — ${(e as Error).message}`);
     return fail(`the integration seat did not run: ${(e as Error).message}`, null);
   }
+  // The seat's run facts, like the producer's and the lens's (2026-10-13: this seat was the one
+  // Anthropic stage left without timing, usage or a stream on run d5a1f648).
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+  const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output');
     log(`  · integration: ${why}`);
-    return fail(`the integration seat ${why}`, res.raw ?? null);
+    return fail(`the integration seat ${why}`, res.raw ?? null, diagnostics, stream);
   }
   const parsed = parseFindings(res.raw);
   if (parsed.parseError) {
     log(`  · integration: ${parsed.parseError}`);
-    return fail(`output not parseable (${parsed.parseError})`, res.raw);
+    return fail(`output not parseable (${parsed.parseError})`, res.raw, diagnostics, stream);
   }
   let review: VoiceReview = withSeatAdvisor(
-    { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: INTEGRATION_SEAT_ID },
+    { diagnostics, findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: INTEGRATION_SEAT_ID },
     opts.config
   );
   try {
-    persistSeatReview(opts.baseDir, opts.runId, INTEGRATION_SEAT_ID, review, res.raw);
+    persistSeatReview(opts.baseDir, opts.runId, INTEGRATION_SEAT_ID, review, res.raw, stream);
   } catch (e) {
     const why = (e as Error).message;
     log(`  · integration: trail persist FAILED (${why}) — the seat's findings are dropped from this run`);
@@ -883,7 +888,7 @@ export async function runIntegrationStage(opts: IntegrationStageOptions): Promis
   } catch (e) {
     log(`  · trail write review.${INTEGRATION_SEAT_ID}.md failed (${(e as Error).message}) — continuing`);
   }
-  log(`  · integration: reviewed the seams — ${review.findings.length} finding(s)`);
+  log(`  · integration: reviewed the seams — ${review.findings.length} finding(s) · ${describeRun(diagnostics)}`);
   return { integrationReview: review, integrationSkipped: null };
 }
 

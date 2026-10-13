@@ -301,7 +301,7 @@ export interface SeatDiagnostics {
   failWhy?: string;
   // Read-depth telemetry off the seat's own progress stream (modes/review/seat-usage.ts):
   // tokens, tool calls, turns. Absent when the stream carried none.
-  usage?: { cachedInputTokens?: number; inputTokens?: number; outputTokens?: number; toolCalls?: number; turns?: number };
+  usage?: { cachedInputTokens?: number; inputTokens?: number; outputTokens?: number; streamTruncated?: true; toolCalls?: number; turns?: number };
   // How far the seat's reads reached into the engine-written conventions file (seat-usage.ts
   // conventionsReadOf): `read` with the docs reached, `index-only`, or `unread`. Set only on a
   // run that handed the conventions over as a file AND whose stream could answer — never a guess.

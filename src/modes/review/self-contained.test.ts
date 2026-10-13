@@ -1080,6 +1080,8 @@ describe('runIntegrationStage — one seat over the skeleton, its review reaches
     expect(res.integrationReview?.ok).toBe(true);
     expect(res.integrationReview?.findings[0].title).toBe('client sends network, handler ignores it');
     expect(fs.existsSync(path.join(reviewDir(base, runId), 'review.integration.json'))).toBe(true);
+    // Parity with the producer and the lens (2026-10-13): the seat keeps its run facts.
+    expect(typeof res.integrationReview?.diagnostics?.elapsedMs).toBe('number');
     // the gate saw the integration voice (its finding id is minted from the voice id)
     expect(res.gateVerdicts.map((v) => v.findingId)).toContain('integration#1');
     fs.rmSync(base, { force: true, recursive: true });

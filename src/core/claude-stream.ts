@@ -125,3 +125,51 @@ export function streamActivityTail(stdout: string | null, limit = 600): string {
   }
   return summarized.join(' · ').slice(-limit);
 }
+
+// STRIP THE PAYLOADS (2026-10-13 fresh-eyes review #3). A claude-shaped stream carries every tool
+// RESULT in full — a 2000-line Read lands in a `user` event, and the CLI duplicates it as
+// `tool_use_result`. On run d5a1f648 those were ~60% of a 1 MB tail, and the 1 MB cut (made only
+// when building the trail copy — the whole stream was in memory) dropped the head with the init
+// event and the early tool calls. Nothing reads the result bodies back off disk: the telemetry
+// needs `tool_use_id` + `is_error` (seat-usage conventionsReadOf), the tokens come from the final
+// `result` event, and the worktree the results came from is on disk anyway. So the persisted copy
+// keeps every event and every tool CALL, and replaces each result body with its size. PURE.
+export function stripStreamPayloads(stream: string): string {
+  const out: string[] = [];
+  for (const line of stream.split('\n')) {
+    if (!line.startsWith('{') || !line.includes('"tool_result"') && !line.includes('"tool_use_result"')) {
+      out.push(line);
+      continue;
+    }
+    let e: unknown;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      out.push(line);
+      continue;
+    }
+    if (!e || typeof e !== 'object') {
+      out.push(line);
+      continue;
+    }
+    const ev = e as Record<string, unknown>;
+    if (ev.type !== 'user') {
+      out.push(line);
+      continue;
+    }
+    delete ev.tool_use_result;
+    delete ev.tool_result_meta;
+    const msg = ev.message;
+    if (msg && typeof msg === 'object' && Array.isArray((msg as Record<string, unknown>).content)) {
+      for (const c of (msg as { content: unknown[] }).content) {
+        if (!c || typeof c !== 'object') continue;
+        const block = c as Record<string, unknown>;
+        if (block.type !== 'tool_result' || block.content === undefined) continue;
+        const size = typeof block.content === 'string' ? block.content.length : JSON.stringify(block.content).length;
+        block.content = `[stripped ${size} chars — the seat's tool result; the tree is on disk]`;
+      }
+    }
+    out.push(JSON.stringify(ev));
+  }
+  return out.join('\n');
+}

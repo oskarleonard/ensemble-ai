@@ -1,3 +1,5 @@
+import { STREAM_CUT_EVENT } from '../../core/spawn';
+
 // READ-DEPTH TELEMETRY (step 1 of the 2026-10-10 architecture review). The gate verifies the
 // findings a seat returns; nothing verified that the seat READ. Run 2026-10-10-22-31-50-485c0df5
 // had codex return one finding on a 499 KB part after 93 seconds and ~1,200 output tokens, and the
@@ -22,6 +24,10 @@
 // `thread.started`); a tail that lost its head reports tool calls as unmeasured, not as few.
 
 export interface SeatUsage {
+  // The persisted stream lost its head (no init / thread.started first) or carries a cut marker
+  // (core/spawn STREAM_CUT_EVENT): `toolCalls` is then a FLOOR, not a count. Tokens are not
+  // affected — they come from the final result event, which always survives.
+  streamTruncated?: true;
   // Prompt tokens the vendor served from cache (codex `cached_input_tokens`, grok
   // `cache_read_input_tokens`).
   cachedInputTokens?: number;
@@ -37,6 +43,16 @@ function num(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
 }
 
+// What the stream's FIRST event says about its head: `init` when it is the real start (codex
+// `thread.started`; claude-shaped `system`/`init` — NOT any `system` event: a claude seat emits
+// one `system`/`thinking_tokens` per turn, so a lost-head tail starts with one of those more
+// often than not, which is how run d5a1f648's part 1 passed as intact), else what it was.
+function streamHeadKind(ev: Record<string, unknown>): string {
+  if (ev.type === 'thread.started') return 'init';
+  if (ev.type === 'system' && ev.subtype === 'init') return 'init';
+  return typeof ev.type === 'string' ? ev.type : '';
+}
+
 export function parseSeatUsage(stream: string | null | undefined): SeatUsage {
   if (!stream) return {};
   const usage: SeatUsage = {};
@@ -48,6 +64,7 @@ export function parseSeatUsage(stream: string | null | undefined): SeatUsage {
   let sawGrokUsage = false;
   let resultUsage: { cached: number; input: number; output: number } | null = null;
   let first: string | null = null;
+  let sawCut = false;
   for (const line of stream.split('\n')) {
     if (!line.trim()) continue;
     let e: unknown;
@@ -58,7 +75,8 @@ export function parseSeatUsage(stream: string | null | undefined): SeatUsage {
     }
     if (!e || typeof e !== 'object') continue;
     const ev = e as Record<string, unknown>;
-    if (first === null) first = typeof ev.type === 'string' ? ev.type : '';
+    if (first === null) first = streamHeadKind(ev);
+    if (ev.type === STREAM_CUT_EVENT) sawCut = true;
     // codex
     if (ev.type === 'item.started' && ev.item && typeof ev.item === 'object') {
       const it = ev.item as Record<string, unknown>;
@@ -129,9 +147,12 @@ export function parseSeatUsage(stream: string | null | undefined): SeatUsage {
     usage.outputTokens = grokOut;
     usage.cachedInputTokens = grokCached;
   }
-  // Tool calls are a COUNT over the whole stream; a tail that lost its head cannot give one.
-  const headIntact = first === 'system' || first === 'thread.started';
-  if (sawTool && headIntact) usage.toolCalls = toolCalls;
+  // Tool calls are a COUNT over the whole stream; a stream that lost its head, or carries a cut,
+  // gives a FLOOR — reported as such, never dressed as the count.
+  const truncated = first !== 'init' || sawCut;
+  if (sawTool) usage.toolCalls = toolCalls;
+  // A stream this module could not read at all stays an EMPTY record; the flag qualifies facts.
+  if (truncated && Object.keys(usage).length > 0) usage.streamTruncated = true;
   return usage;
 }
 
@@ -150,7 +171,8 @@ export function readDepthOf(usage: SeatUsage, partBytes: number, worktreeSeat: b
   if (partBytes < THIN_MIN_PART_BYTES) return 'ok';
   const floor = (partBytes / 1024) * THIN_OUTPUT_TOKENS_PER_KB;
   if (usage.outputTokens < floor) return 'thin';
-  if (worktreeSeat && usage.toolCalls !== undefined && usage.toolCalls === 0) return 'thin';
+  // A zero on a truncated stream is a floor, not "opened nothing".
+  if (worktreeSeat && usage.toolCalls !== undefined && usage.toolCalls === 0 && !usage.streamTruncated) return 'thin';
   return 'ok';
 }
 
@@ -160,6 +182,7 @@ export function describeUsage(u: SeatUsage): string {
   if (u.inputTokens !== undefined) bits.push(`${u.inputTokens.toLocaleString('en-US')} in${u.cachedInputTokens ? ` (${Math.round((u.cachedInputTokens / u.inputTokens) * 100)}% cached)` : ''}`);
   if (u.toolCalls !== undefined) bits.push(`${u.toolCalls} tool call${u.toolCalls === 1 ? '' : 's'}`);
   if (u.turns !== undefined && u.turns > 1) bits.push(`${u.turns} turns`);
+  if (u.streamTruncated) bits.push('stream truncated — tool-call counts are floors');
   return bits.join(' · ') || 'no usage recorded';
 }
 
@@ -231,7 +254,7 @@ export function conventionsReadOf(
     }
     if (!e || typeof e !== 'object') continue;
     const ev = e as Record<string, unknown>;
-    if (first === null) first = typeof ev.type === 'string' ? ev.type : '';
+    if (first === null) first = streamHeadKind(ev);
     if ((ev.type === 'item.started' || ev.type === 'item.completed') && ev.item && typeof ev.item === 'object') {
       const it = ev.item as Record<string, unknown>;
       if (it.type === 'command_execution' && typeof it.command === 'string' && ev.type === 'item.started') ranges.push(...codexRanges(it.command, needle));
@@ -276,7 +299,8 @@ export function conventionsReadOf(
   }
   ranges.push(...pending.values());
   if (first === null) return undefined;
-  const headIntact = first === 'system' || first === 'thread.started';
+  // A truncated stream can still PROVE a read (the call survived); it can never prove "unread".
+  const headIntact = first === 'init';
   if (ranges.length === 0) return headIntact ? { docsRead: [], state: 'unread' } : undefined;
   if (!layout) return { docsRead: [], state: 'read' };
   const beyondIndex = ranges.some((r) => r.grep || r.end > layout.indexEndLine);
