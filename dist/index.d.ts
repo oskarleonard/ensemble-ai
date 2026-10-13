@@ -1,7 +1,7 @@
-import { a as ReviewerConfig, R as ReviewerId, T as TerminalState, S as StoredReview, b as ReviewFinding, c as Severity, p as parseSeatAdvisor, d as SeatDiagnostics, e as ReviewPacket } from './types-aXkKFhdq.js';
-export { A as ADVISOR_MODEL_RE, f as ADVISOR_OFF, C as CONFIDENCES, g as CORE_REVIEWER_IDS, h as Confidence, i as CoreReviewerId, E as Evidence, M as ManifestEntry, P as PacketSection, j as REVIEWER_IDS, k as SEVERITIES, l as TERMINAL_STATES, m as enabledReviewerIds, n as isCoreReviewerId, o as isReviewerId, q as isSeatAdvisor, r as parseReviewerIds, s as parseSeatWindow, t as severityAtLeast, u as titleCase } from './types-aXkKFhdq.js';
-import { R as ReviewProfile } from './contracts-BAdUAbND.js';
-export { C as CI_EVIDENCE_SECTION_TITLE, D as DIFF_SECTION_TITLE, a as DIFF_USEFUL_FLOOR, F as FINDINGS_INSTRUCTIONS, P as PACKET_BUDGETS, b as PacketInput, c as ParsedReview, d as REVIEW_PROFILES, S as SCOPE_SECTION_TITLE, e as SECURITY_CLASSES, f as SECURITY_OBJECTIVE, g as SEVERITY_LABEL, h as SEVERITY_ORDER, i as SecurityClass, T as TRUNCATION_MARKER_RE, j as assembleCodePacket, k as classifySecurityFinding, l as escapeRawNewlinesInStrings, m as evidenceRef, n as extractJsonBlock, o as isReviewProfile, p as oneOf, q as parseFindings, r as renderReviewPrompt, s as reviewerVisibleDiff, t as section, u as securityClassLabel, v as segmentsWithoutTruncationSplices, w as stripSecurityTag, x as stripTrailingCommas } from './contracts-BAdUAbND.js';
+import { a as ReviewerConfig, R as ReviewerId, T as TerminalState, S as StoredReview, b as SeatDiagnostics, c as ReviewFinding, d as Severity, p as parseSeatAdvisor, e as ReviewPacket } from './types-Dkd70PTw.js';
+export { A as ADVISOR_MODEL_RE, f as ADVISOR_OFF, C as CONFIDENCES, g as CORE_REVIEWER_IDS, h as Confidence, i as CoreReviewerId, E as Evidence, M as ManifestEntry, P as PacketSection, j as REVIEWER_IDS, k as SEVERITIES, l as TERMINAL_STATES, m as enabledReviewerIds, n as isCoreReviewerId, o as isReviewerId, q as isSeatAdvisor, r as parseReviewerIds, s as parseSeatWindow, t as severityAtLeast, u as titleCase } from './types-Dkd70PTw.js';
+import { R as ReviewProfile } from './contracts-BhFZJhgo.js';
+export { C as CI_EVIDENCE_SECTION_TITLE, D as DIFF_SECTION_TITLE, a as DIFF_USEFUL_FLOOR, F as FINDINGS_INSTRUCTIONS, P as PACKET_BUDGETS, b as PacketInput, c as ParsedReview, d as REVIEW_PROFILES, S as SCOPE_SECTION_TITLE, e as SECURITY_CLASSES, f as SECURITY_OBJECTIVE, g as SEVERITY_LABEL, h as SEVERITY_ORDER, i as SecurityClass, T as TRUNCATION_MARKER_RE, j as assembleCodePacket, k as classifySecurityFinding, l as escapeRawNewlinesInStrings, m as evidenceRef, n as extractJsonBlock, o as isReviewProfile, p as oneOf, q as parseFindings, r as renderReviewPrompt, s as reviewerVisibleDiff, t as section, u as securityClassLabel, v as segmentsWithoutTruncationSplices, w as stripSecurityTag, x as stripTrailingCommas } from './contracts-BhFZJhgo.js';
 import { V as VoiceId, a as VoiceConfig, R as ResolvedVoiceConfig, I as Idea, S as SynthesisResult, b as VoiceGenerateResult, B as BrainstormResult, c as VoiceCritiqueResult$1, C as Critique, d as RawIdea, e as RankedIdea, f as CritiqueStance } from './types-DpTj1RQa.js';
 export { g as CRITIQUE_STANCES, h as VOICE_IDS, i as isVoiceId, p as parseVoiceIds } from './types-DpTj1RQa.js';
 
@@ -452,6 +452,7 @@ interface VerifiedKernel {
 
 interface VoiceReview {
     advisor?: string;
+    diagnostics?: SeatDiagnostics;
     findings: ReviewFinding[];
     ok: boolean;
     summary: string;
@@ -514,6 +515,7 @@ interface RunHolisticLensOptions {
 declare function runHolisticLens(opts: RunHolisticLensOptions): Promise<{
     raw: string | null;
     review: VoiceReview;
+    stream?: string | null;
 }>;
 
 declare const HOLISTIC_MIN_ANCHOR_NONWS = 16;
