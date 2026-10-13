@@ -337,7 +337,7 @@ export async function runHolisticLens(
   }
   // The lens's run facts — timing and read depth off its stream — on review.holistic.json, the
   // same record every other seat keeps (2026-10-13: the fast runs could not say how long it read).
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsInTree: Boolean(opts.conventionsPath) });
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = (res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output'));

@@ -349,7 +349,10 @@ export function conventionsFileClause(file: string): string {
 
 The repository's conventions (AGENTS.md, rules, docs the repo asks a reviewer to read, gathered at
 the PR BASE so the PR's own edits to them are not the rules it is judged by) are in ONE file:
-\`${file}\`. Read it before reviewing. Cite a rule by its heading when a finding rests on it.`;
+\`${file}\`. Read it before reviewing: its INDEX at the top names the docs nearest the files this change
+touches — read those in full. When a finding rests on a rule, cite it as \`path:line\` with one
+exact line quoted, where path is the ORIGINAL doc named in the \`===== path =====\` header above
+the rule and line is counted from the first line after that header. The host re-reads it there.`;
 }
 
 // Remove every agent-instruction file from a materialized worktree, recursively (a monorepo package

@@ -70,9 +70,9 @@ export const COLD_PEER_ROLE =
 // in the repo's operational files, never in sibling comments.
 export const OPERATOR_REVIEW_METHOD = `## How to review (in this order)
 
-1. Walk the diff hunk by hunk. For every touched function, read enough surrounding code —
-   its callers, its callees, the rest of the file — to judge the change in context, not in
-   isolation.
+1. Walk the diff hunk by hunk. For every touched function, read the WHOLE file it lives in —
+   not its first screen: the mechanism a hunk depends on is often hundreds of lines below the
+   hunk — then its callers and callees, to judge the change in context, not in isolation.
 2. Hunt FUNCTIONAL BUGS first: correctness defects, broken edge cases, regressions of
    behavior the diff did not intend to change, authorization gaps, contract drift (API
    shapes, DB writes, event payloads), and state/concurrency hazards.

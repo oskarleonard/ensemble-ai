@@ -38,6 +38,12 @@ const HOLISTIC_LINE_SLACK = 2;
 const MAX_QUOTE_CHARS = 2000;
 const MAX_FILE_BYTES = 1_048_576;
 const MAX_FILE_LINES = 20_000;
+// The engine-written conventions file inside the worktree (modes/review CONVENTIONS_IN_TREE_*),
+// repo-relative. Spelled here too so the gate never imports the mode; index.test pins the two.
+export const CONVENTIONS_IN_TREE_REL = '.ensemble-conventions/CONVENTIONS.md';
+const CONVENTIONS_IN_TREE_REL_LC = CONVENTIONS_IN_TREE_REL.toLowerCase();
+const isInTreeConventions = (rel: string): boolean =>
+  rel === CONVENTIONS_IN_TREE_REL_LC || rel.endsWith(`/${CONVENTIONS_IN_TREE_REL_LC}`);
 
 // ── The site + citation wire shapes ───────────────────────────────────────────────────
 
@@ -157,6 +163,57 @@ export function worktreeReader(worktreeDir: string): SiteReader {
   };
 }
 
+// THE CITATION SEAM (2026-10-13 fresh-eyes review). Under conventions-as-a-file the lens reads
+// `.ensemble-conventions/CONVENTIONS.md`, but the gate's reader only opened the worktree, where
+// stripAgentInstructions had REMOVED every CLAUDE.md / AGENTS.md / .claude/ doc — so a citation of
+// `backend/CLAUDE.md:40` could never verify and the MED-cap lift was unreachable. This reader
+// resolves both spellings: the in-tree file itself (whole), and a gathered doc's ORIGINAL path,
+// served from its `===== <path> =====` section of the in-tree file, line-for-line (the section
+// begins at the doc's line 1). The worktree is still tried first, so an unstripped doc (a docs/
+// page) reads from the tree exactly as before.
+export function conventionsAwareReader(
+  base: SiteReader,
+  conventionsFile: string | null,
+  gathered: readonly string[] = []
+): SiteReader {
+  let cached: string[] | null | undefined;
+  const whole = (): string[] | null => {
+    if (cached !== undefined) return cached;
+    cached = null;
+    if (conventionsFile) {
+      try {
+        const st = fs.statSync(conventionsFile);
+        if (st.isFile() && st.size <= MAX_FILE_BYTES) cached = fs.readFileSync(conventionsFile, 'utf8').split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      } catch {
+        cached = null;
+      }
+    }
+    return cached;
+  };
+  const gatheredLc = gathered.map((g) => normalizeRepoPath(g).toLowerCase());
+  return (file: string): string[] | null => {
+    const rel = normalizeRepoPath(file);
+    if (isInTreeConventions(rel.toLowerCase())) return whole();
+    const fromTree = base(file);
+    if (fromTree) return fromTree;
+    const idx = gatheredLc.indexOf(rel.toLowerCase());
+    if (idx < 0) return null;
+    const all = whole();
+    if (!all) return null;
+    const header = `===== ${gathered[idx]} =====`;
+    const start = all.indexOf(header);
+    if (start < 0) return null;
+    let end = all.length;
+    for (let i = start + 1; i < all.length; i++) {
+      if (/^===== .+ =====$/.test(all[i])) {
+        end = i;
+        break;
+      }
+    }
+    return all.slice(start + 1, end);
+  };
+}
+
 // ── Quote matching ────────────────────────────────────────────────────────────────────
 
 const norm = (s: string): string => s.replace(/\s+/g, ' ').trim();
@@ -258,6 +315,9 @@ const CANONICAL_CONVENTION_FILES = [
 
 export function isConventionsDoc(file: string, gathered?: readonly string[]): boolean {
   const rel = normalizeRepoPath(file).toLowerCase();
+  // The one file every seat was TOLD to read (2026-10-13): cited by its repo-relative path or by
+  // the absolute location the prompt printed.
+  if (isInTreeConventions(rel)) return true;
   if (gathered) return gathered.some((g) => normalizeRepoPath(g).toLowerCase() === rel);
   return CANONICAL_CONVENTION_FILES.includes(rel.split('/').pop() ?? '');
 }

@@ -5,7 +5,7 @@ import { execFileSync as execFileSync5 } from "child_process";
 import crypto2 from "crypto";
 import fs30 from "fs";
 import os14 from "os";
-import path24 from "path";
+import path25 from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 import { parseArgs } from "util";
 
@@ -306,6 +306,41 @@ function fileHeader(rel) {
 
 ===== ${rel} =====
 `;
+}
+function docHome(rel) {
+  let d = path2.posix.dirname(rel);
+  if (d === ".") d = "";
+  d = d.replace(/(^|\/)\.claude(\/rules)?$/, "$1").replace(/(^|\/)docs(\/.*)?$/, "$1");
+  return d.replace(/\/$/, "");
+}
+var INDEX_MAX_NEAREST = 12;
+function conventionsIndex(body, manifest, changedPaths) {
+  const included = manifest.files.filter((f) => f.included);
+  const changed = changedPaths.map((c) => c.replace(/\\/g, "/").replace(/^\.\//, ""));
+  const homes = new Map(included.map((f) => [f.path, docHome(f.path)]));
+  const near = included.filter((f) => {
+    const h = homes.get(f.path) ?? "";
+    return h !== "" && changed.some((c) => c.startsWith(`${h}/`));
+  }).sort((a, b) => (homes.get(b.path) ?? "").split("/").length - (homes.get(a.path) ?? "").split("/").length || a.path.localeCompare(b.path)).slice(0, INDEX_MAX_NEAREST);
+  const root = included.filter((f) => (homes.get(f.path) ?? "") === "" && f.tier === 0);
+  const left = manifest.files.filter((f) => !f.included && f.reason !== "duplicate");
+  const head = [
+    "# Conventions index",
+    `${included.length} doc(s) gathered at the PR base, ${manifest.totalBytes.toLocaleString("en-US")} bytes. Each doc follows a \`===== <path> =====\` header. Cite a rule as that path:line, the line counted from the first line after its header.`,
+    `Nearest to the files this change touches \u2014 read these in full first: ${near.length > 0 ? near.map((f) => f.path).join(" \xB7 ") : "none below the root"}`,
+    `Root rules (every change): ${root.length > 0 ? root.map((f) => f.path).join(" \xB7 ") : "none"}`,
+    ...left.length > 0 ? [`Not gathered (${left.length}, over the cap or the file ceiling): ${left.slice(0, 10).map((f) => f.path).join(" \xB7 ")}${left.length > 10 ? " \xB7 \u2026" : ""}`] : [],
+    ""
+  ];
+  const bodyLines = body.split("\n");
+  const rows = [];
+  const height = head.length + included.length;
+  for (const f of included) {
+    const at = bodyLines.indexOf(`===== ${f.path} =====`);
+    const line = at >= 0 ? height + at + 2 : null;
+    rows.push(`- ${f.path}${line ? ` \u2014 line ${line.toLocaleString("en-US")}` : ""} (tier ${f.tier ?? "?"}, ${f.bytes.toLocaleString("en-US")} bytes${f.truncated ? ", head only" : ""})`);
+  }
+  return [...head, ...rows, ""].join("\n");
 }
 function tierOfRef(parent, kind) {
   if (kind === "include") return parent;
@@ -3298,7 +3333,10 @@ function conventionsFileClause(file) {
 
 The repository's conventions (AGENTS.md, rules, docs the repo asks a reviewer to read, gathered at
 the PR BASE so the PR's own edits to them are not the rules it is judged by) are in ONE file:
-\`${file}\`. Read it before reviewing. Cite a rule by its heading when a finding rests on it.`;
+\`${file}\`. Read it before reviewing: its INDEX at the top names the docs nearest the files this change
+touches \u2014 read those in full. When a finding rests on a rule, cite it as \`path:line\` with one
+exact line quoted, where path is the ORIGINAL doc named in the \`===== path =====\` header above
+the rule and line is counted from the first line after that header. The host re-reads it there.`;
 }
 function stripAgentInstructions(dir) {
   const removed = [];
@@ -4140,8 +4178,8 @@ function sha256Hex(input) {
 
 // src/modes/review/chunks.ts
 var DEFAULT_MAX_CHUNKS = 8;
-function areaAt(path25, depth) {
-  const parts = path25.split("/");
+function areaAt(path26, depth) {
+  const parts = path26.split("/");
   const dirs = parts.slice(0, -1);
   if (dirs.length === 0) return ".";
   return dirs.slice(0, depth).join("/");
@@ -4322,6 +4360,9 @@ function renderCoverageOverview(trail, extra) {
   const thinReads = trail.chunks.flatMap(
     (c) => Object.entries(c.seats).filter(([, s]) => s.depth === "thin").map(([id]) => `${id} on part ${c.index}`)
   );
+  const unreadConventions = trail.chunks.flatMap(
+    (c) => Object.entries(c.seats).filter(([, s]) => s.conventions === "unread").map(([id]) => `${id} on part ${c.index}`)
+  );
   const overflow = trail.omitted.filter((o) => o.reason === "over-limit");
   const junk = trail.omitted.filter((o) => o.reason !== "over-limit");
   out.push(`# Coverage overview \u2014 ${extra.headSha.slice(0, 12)}`);
@@ -4332,6 +4373,10 @@ function renderCoverageOverview(trail, extra) {
   if (thinReads.length > 0) {
     out.push("");
     out.push(`\u26A0 THIN READS: ${thinReads.join(", ")} \u2014 the seat returned far too little work for the bytes it was handed (seat-usage.ts floor). Treat those parts as NOT reviewed by that seat.`);
+  }
+  if (unreadConventions.length > 0) {
+    out.push("");
+    out.push(`\u26A0 CONVENTIONS NOT READ: ${unreadConventions.join(", ")} \u2014 the seat never opened .ensemble-conventions/CONVENTIONS.md, so its findings were judged without the repo's rules.`);
   }
   if (extra.gateCounts) {
     const g = Object.entries(extra.gateCounts).filter(([, n]) => n > 0).map(([k, n]) => `${n} ${k}`).join(" \xB7 ");
@@ -4347,7 +4392,8 @@ function renderCoverageOverview(trail, extra) {
       const mins = s.elapsedMs !== void 0 ? ` ${Math.round(s.elapsedMs / 6e4)} min` : "";
       const out2 = s.usage?.outputTokens !== void 0 ? `, ${s.usage.outputTokens.toLocaleString("en-US")} out tokens` : "";
       const tools = s.usage?.toolCalls !== void 0 ? `, ${s.usage.toolCalls} tool calls` : "";
-      return `${id}${pin} ${s.state === "reviewed" ? `\u2713 ${s.findings} finding(s)${mins}${out2}${tools}${depth}` : `\u2717 ${s.state}${s.why ? ` \u2014 ${s.why}` : ""}`}`;
+      const conv = s.conventions === "read" ? ", conventions read" : s.conventions === "unread" ? " \u2014 \u26A0 CONVENTIONS NOT READ" : "";
+      return `${id}${pin} ${s.state === "reviewed" ? `\u2713 ${s.findings} finding(s)${mins}${out2}${tools}${conv}${depth}` : `\u2717 ${s.state}${s.why ? ` \u2014 ${s.why}` : ""}`}`;
     }).join(" \xB7 ");
     const tests = c.files.filter((f) => f.test).length;
     out.push("");
@@ -4424,9 +4470,9 @@ function hasGeneratedHeader(section2) {
 function hasGeneratedFirstLine(line) {
   return typeof line === "string" && GENERATED_FIRST_LINE.test(line);
 }
-function classifyFileKind(path25, isBinary, section2 = "", firstLine4) {
+function classifyFileKind(path26, isBinary, section2 = "", firstLine4) {
   if (isBinary) return "binary";
-  if (GENERATED_PATTERNS.some((re) => re.test(path25))) return "generated";
+  if (GENERATED_PATTERNS.some((re) => re.test(path26))) return "generated";
   if (section2 && hasGeneratedHeader(section2)) return "generated";
   return hasGeneratedFirstLine(firstLine4) ? "generated" : "source";
 }
@@ -4468,8 +4514,8 @@ var TEST_PATTERNS = [
   /Tests?\.(java|kt|swift|cs|scala)$/,
   /\.bats$/
 ];
-function isTestPath(path25) {
-  return TEST_PATTERNS.some((re) => re.test(path25));
+function isTestPath(path26) {
+  return TEST_PATTERNS.some((re) => re.test(path26));
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -4488,7 +4534,7 @@ function parseDiffFiles(raw, opts = {}) {
   return parts.map((part) => {
     let section2 = part;
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path25 = pathOfSection(section2);
+    const path26 = pathOfSection(section2);
     if (!section2.endsWith("\n")) section2 += "\n";
     let added = 0;
     let removed = 0;
@@ -4496,16 +4542,16 @@ function parseDiffFiles(raw, opts = {}) {
       if (line.startsWith("+") && !line.startsWith("+++")) added++;
       else if (line.startsWith("-") && !line.startsWith("---")) removed++;
     }
-    let kind = classifyFileKind(path25, isBinary, section2);
-    if (kind === "source" && opts.readFirstLine && path25 !== "unknown") {
-      kind = classifyFileKind(path25, isBinary, section2, opts.readFirstLine(path25));
+    let kind = classifyFileKind(path26, isBinary, section2);
+    if (kind === "source" && opts.readFirstLine && path26 !== "unknown") {
+      kind = classifyFileKind(path26, isBinary, section2, opts.readFirstLine(path26));
     }
     return {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
       kind,
-      path: path25,
+      path: path26,
       raw: section2,
       removed
     };
@@ -6544,7 +6590,7 @@ function isImplemented(mode) {
 
 // src/modes/review/index.ts
 import fs26 from "fs";
-import path21 from "path";
+import path22 from "path";
 
 // src/modes/review/profile.ts
 var SECURITY_OBJECTIVE = "Adversarial cross-vendor SECURITY audit of a code diff \u2014 hunt for exploitable vulnerabilities a same-vendor author might miss: injection, XSS, broken authn/authz, secret leakage, supply-chain risk, unsafe deserialization/eval, SSRF, path traversal, and crypto misuse.";
@@ -6881,7 +6927,7 @@ function scanDependencySurface(files) {
 // src/modes/review/receipt.ts
 import fs25 from "fs";
 import os13 from "os";
-import path20 from "path";
+import path21 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -6965,7 +7011,7 @@ function formatEvidenceShortfall(gaps) {
 
 // src/modes/review/holistic-gate.ts
 import fs24 from "fs";
-import path19 from "path";
+import path20 from "path";
 
 // src/modes/review/holistic.ts
 import fs23 from "fs";
@@ -7085,6 +7131,30 @@ function describeUsage(u) {
   if (u.turns !== void 0 && u.turns > 1) bits.push(`${u.turns} turns`);
   return bits.join(" \xB7 ") || "no usage recorded";
 }
+var CONVENTIONS_TOUCH_NEEDLE = ".ensemble-conventions";
+function conventionsTouched(stream, needle = CONVENTIONS_TOUCH_NEEDLE) {
+  if (!stream) return void 0;
+  let first = null;
+  let touched = false;
+  for (const line of stream.split("\n")) {
+    if (!line.trim()) continue;
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!e || typeof e !== "object") continue;
+    const ev = e;
+    if (first === null) first = typeof ev.type === "string" ? ev.type : "";
+    const own = ev.type === "item.started" || ev.type === "item.completed" || ev.type === "assistant" || ev.type === "stream_event";
+    if (own && line.includes(needle)) touched = true;
+  }
+  if (first === null) return void 0;
+  const headIntact = first === "system" || first === "thread.started";
+  if (touched) return true;
+  return headIntact ? false : void 0;
+}
 
 // src/modes/review/seat-run.ts
 async function adapterOnce(adapter, prompt, reviewer, opts) {
@@ -7110,11 +7180,13 @@ function timedOutSummary(result, timing) {
   ) : `the absolute backstop cut it after ${minutes} min`;
   return `The reviewer timed out before completing (${watchdog}) \u2014 its output is incomplete and not trusted.`;
 }
-function seatDiagnostics(result, timing) {
+function seatDiagnostics(result, timing, opts = {}) {
   const usage = parseSeatUsage(result.stream);
+  const touched = opts.conventionsInTree ? conventionsTouched(result.stream) : void 0;
   return {
     elapsedMs: timing.endedAt - timing.startedAt,
     ...Object.keys(usage).length > 0 ? { usage } : {},
+    ...touched !== void 0 ? { conventionsRead: touched } : {},
     endedAt: new Date(timing.endedAt).toISOString(),
     ...result.failWhy ? { failWhy: result.failWhy } : {},
     ...result.preflightWarnings?.length ? { preflightWarnings: [...result.preflightWarnings] } : {},
@@ -7129,7 +7201,7 @@ function persistAttempt(args, prompt, result, timing) {
   const summary = result.timedOut ? timedOutSummary(result, timing) : parsed?.summary || result.failWhy || `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || "no output"}`;
   return persistReview(args.out, {
     ...args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {},
-    diagnostics: seatDiagnostics(result, timing),
+    diagnostics: seatDiagnostics(result, timing, { conventionsInTree: args.conventionsInTree }),
     findings: parsed?.findings ?? [],
     packet: args.packet,
     prompt,
@@ -7212,13 +7284,16 @@ var RETRIES_ON_PACKET = {
   grok: false
 };
 
+// src/modes/review/self-contained.ts
+import path19 from "path";
+
 // src/modes/review/code-review-seat.ts
 var COLD_PEER_ROLE = "You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.";
 var OPERATOR_REVIEW_METHOD = `## How to review (in this order)
 
-1. Walk the diff hunk by hunk. For every touched function, read enough surrounding code \u2014
-   its callers, its callees, the rest of the file \u2014 to judge the change in context, not in
-   isolation.
+1. Walk the diff hunk by hunk. For every touched function, read the WHOLE file it lives in \u2014
+   not its first screen: the mechanism a hunk depends on is often hundreds of lines below the
+   hunk \u2014 then its callers and callees, to judge the change in context, not in isolation.
 2. Hunt FUNCTIONAL BUGS first: correctness defects, broken edge cases, regressions of
    behavior the diff did not intend to change, authorization gaps, contract drift (API
    shapes, DB writes, event payloads), and state/concurrency hazards.
@@ -7644,7 +7719,7 @@ var CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 108e5;
 var HOLISTIC_WORKTREE_TIMEOUT_MS = 18e5;
 var GATE_WORKTREE_TIMEOUT_MS = 72e5;
 var PRODUCER_PART_CONCURRENCY = 3;
-async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log, worktree, historyPacket) {
+async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log, worktree, historyPacket, conventionsInTree) {
   let res;
   const startedAt = Date.now();
   try {
@@ -7662,7 +7737,7 @@ async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log, work
       stream: null
     };
   }
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsInTree });
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
@@ -7685,7 +7760,8 @@ async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log, work
 }
 function describeRun2(d) {
   const mins = Math.max(1, Math.round(d.elapsedMs / 6e4));
-  return `${mins} min \xB7 ${describeUsage(d.usage ?? {})}`;
+  const conv = d.conventionsRead === true ? " \xB7 conventions read" : d.conventionsRead === false ? " \xB7 \u26A0 conventions NOT read" : "";
+  return `${mins} min \xB7 ${describeUsage(d.usage ?? {})}${conv}`;
 }
 function claudeModelLabel(config) {
   return config.model && config.model !== "default" ? config.model : "opus";
@@ -7733,7 +7809,8 @@ async function runClaudeProducer(opts) {
       producerTimeout,
       log,
       opts.worktree,
-      opts.historyPacket
+      opts.historyPacket,
+      Boolean(opts.conventionsPath)
     );
     claudeSpawned = spawned;
     claudeReview = withSeatAdvisor(review, opts.claudeConfig);
@@ -7765,7 +7842,8 @@ async function runClaudeProducer(opts) {
           producerTimeout,
           log,
           opts.worktree,
-          opts.historyPacket
+          opts.historyPacket,
+          Boolean(opts.conventionsPath)
         );
         partReviews[i] = { part, ...res };
         log(`  \xB7 claude: part ${part.index}/${n} ${res.review.ok ? "reviewed" : "FAILED"} \u2014 ${res.review.findings.length} finding(s)`);
@@ -7987,7 +8065,7 @@ async function runClaudeReviewLayer(opts) {
       gateEvidence: "worktree",
       holistic: {
         conventionPaths: opts.conventionPaths,
-        readAtHead: worktreeReader(opts.worktree)
+        readAtHead: conventionsAwareReader(worktreeReader(opts.worktree), path19.join(opts.worktree, CONVENTIONS_IN_TREE_REL), opts.conventionPaths ?? [])
       }
     } : {},
     log,
@@ -8302,7 +8380,7 @@ async function runHolisticLens(opts) {
     log(`  \xB7 holistic: failed to run \u2014 ${e.message}`);
     return fail(`the holistic lens did not run: ${e.message}`);
   }
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsInTree: Boolean(opts.conventionsPath) });
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
@@ -8329,6 +8407,9 @@ var HOLISTIC_LINE_SLACK = 2;
 var MAX_QUOTE_CHARS = 2e3;
 var MAX_FILE_BYTES = 1048576;
 var MAX_FILE_LINES = 2e4;
+var CONVENTIONS_IN_TREE_REL = ".ensemble-conventions/CONVENTIONS.md";
+var CONVENTIONS_IN_TREE_REL_LC = CONVENTIONS_IN_TREE_REL.toLowerCase();
+var isInTreeConventions = (rel) => rel === CONVENTIONS_IN_TREE_REL_LC || rel.endsWith(`/${CONVENTIONS_IN_TREE_REL_LC}`);
 var HOLISTIC_SITE_ROLES = ["diff", "pattern"];
 function normalizeRepoPath(p) {
   return p.replace(/\\/g, "/").replace(/^\.\//, "");
@@ -8364,18 +8445,18 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs24.realpathSync(path19.resolve(worktreeDir));
+    root = fs24.realpathSync(path20.resolve(worktreeDir));
   } catch {
     return () => null;
   }
   const inside = (p) => {
-    const rel = path19.relative(root, p);
+    const rel = path20.relative(root, p);
     return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
-      if (!file || file.includes("\0") || path19.isAbsolute(file)) return null;
-      const target = path19.resolve(root, file);
+      if (!file || file.includes("\0") || path20.isAbsolute(file)) return null;
+      const target = path20.resolve(root, file);
       if (!inside(target)) return null;
       const real = fs24.realpathSync(target);
       if (!inside(real)) return null;
@@ -8385,6 +8466,44 @@ function worktreeReader(worktreeDir) {
     } catch {
       return null;
     }
+  };
+}
+function conventionsAwareReader(base, conventionsFile, gathered = []) {
+  let cached;
+  const whole = () => {
+    if (cached !== void 0) return cached;
+    cached = null;
+    if (conventionsFile) {
+      try {
+        const st = fs24.statSync(conventionsFile);
+        if (st.isFile() && st.size <= MAX_FILE_BYTES) cached = fs24.readFileSync(conventionsFile, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      } catch {
+        cached = null;
+      }
+    }
+    return cached;
+  };
+  const gatheredLc = gathered.map((g) => normalizeRepoPath(g).toLowerCase());
+  return (file) => {
+    const rel = normalizeRepoPath(file);
+    if (isInTreeConventions(rel.toLowerCase())) return whole();
+    const fromTree = base(file);
+    if (fromTree) return fromTree;
+    const idx = gatheredLc.indexOf(rel.toLowerCase());
+    if (idx < 0) return null;
+    const all = whole();
+    if (!all) return null;
+    const header = `===== ${gathered[idx]} =====`;
+    const start = all.indexOf(header);
+    if (start < 0) return null;
+    let end = all.length;
+    for (let i = start + 1; i < all.length; i++) {
+      if (/^===== .+ =====$/.test(all[i])) {
+        end = i;
+        break;
+      }
+    }
+    return all.slice(start + 1, end);
   };
 }
 var norm = (s) => s.replace(/\s+/g, " ").trim();
@@ -8438,6 +8557,7 @@ var CANONICAL_CONVENTION_FILES = [
 ];
 function isConventionsDoc(file, gathered) {
   const rel = normalizeRepoPath(file).toLowerCase();
+  if (isInTreeConventions(rel)) return true;
   if (gathered) return gathered.some((g) => normalizeRepoPath(g).toLowerCase() === rel);
   return CANONICAL_CONVENTION_FILES.includes(rel.split("/").pop() ?? "");
 }
@@ -9927,10 +10047,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path20.join(os13.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path21.join(os13.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path20.join(
+  return path21.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -9951,7 +10071,7 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs25.mkdirSync(path20.dirname(file), { recursive: true, mode: 448 });
+  fs25.mkdirSync(path21.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
   fs25.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
   fs25.chmodSync(tmp, 384);
@@ -10608,7 +10728,7 @@ function conventionsPointer(file, chars, files) {
 
   ${file}
 
-Read that file BEFORE reviewing (it is the AGENTS.md / rules / docs web the repo asks a reviewer to read; the manifest of what it contains is conventions.json in the trail). Cite a rule by its heading when a finding rests on it.`;
+Read that file BEFORE reviewing (it is the AGENTS.md / rules / docs web the repo asks a reviewer to read; the manifest of what it contains is conventions.json in the trail). Its INDEX at the top names the docs nearest the files this change touches \u2014 read those in full. When a finding rests on a rule, cite it as \`path:line\` with one exact line quoted: path is the ORIGINAL doc named in the \`===== path =====\` header above the rule, line counted from the first line after that header.`;
 }
 var DEFAULT_OBJECTIVE = "Adversarial cross-vendor review of a code diff \u2014 find correctness, security, and convention issues a same-vendor author might miss.";
 function qualifyCoreSeats(reviewers, worktree, configs) {
@@ -10727,10 +10847,11 @@ async function runReviewMode(opts) {
   let conventionsPath;
   if (wt && everySeatReadsTree && agentsMd && agentsMd.length > CONVENTIONS_INLINE_MAX) {
     try {
-      const dir = path21.join(wt.dir, CONVENTIONS_IN_TREE_DIR);
+      const dir = path22.join(wt.dir, CONVENTIONS_IN_TREE_DIR);
       fs26.mkdirSync(dir, { recursive: true });
-      const file = path21.join(dir, CONVENTIONS_IN_TREE_FILE);
-      fs26.writeFileSync(file, agentsMd, { mode: 384 });
+      const file = path22.join(dir, CONVENTIONS_IN_TREE_FILE);
+      const indexed = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) + agentsMd : agentsMd;
+      fs26.writeFileSync(file, indexed, { mode: 384 });
       conventionsPath = file;
       const files = conventionManifest ? conventionManifest.files.filter((f) => f.included).length : void 0;
       agentsMd = conventionsPointer(file, agentsMd.length, files);
@@ -10848,6 +10969,7 @@ async function runReviewMode(opts) {
       const runPart = (k, suffix) => runCoreSeat({
         adapter: adapters[id],
         ...suffix ? { artifactSuffix: suffix } : {},
+        conventionsInTree: Boolean(conventionsPath),
         log,
         out: opts.out,
         packet: packets[k],
@@ -10870,7 +10992,12 @@ async function runReviewMode(opts) {
             `  \xB7 \u26A0 ${id}: THIN READ on part ${idx} \u2014 ${describeUsage(usage ?? {})} for ${(chunk?.bytes ?? 0).toLocaleString("en-US")} bytes of diff; the seat returned far too little work for what it was handed`
           );
         }
+        const conventionsRead = s.review.diagnostics?.conventionsRead;
+        if (conventionsRead === false) {
+          log(`  \xB7 \u26A0 ${id}: did NOT open the conventions file on part ${idx} (${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}) \u2014 its findings were judged without the repo's rules`);
+        }
         seats[id] = {
+          ...conventionsRead !== void 0 ? { conventions: conventionsRead ? "read" : "unread" } : {},
           ...depth ? { depth } : {},
           effort: reviewer.effort,
           ...s.review.diagnostics ? { elapsedMs: s.review.diagnostics.elapsedMs } : {},
@@ -11225,11 +11352,11 @@ function shadowChampionConfig(claudeSeat, effort, warn) {
 
 // src/modes/review/regate.ts
 import fs28 from "fs";
-import path22 from "path";
+import path23 from "path";
 function readConventionPathsFromTrail(baseDir, runId) {
   try {
     const raw = JSON.parse(
-      fs28.readFileSync(path22.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
+      fs28.readFileSync(path23.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
     );
     const paths = (raw.files ?? []).filter((f) => f.included === true && typeof f.path === "string").map((f) => f.path);
     return paths.length > 0 ? paths : void 0;
@@ -11263,7 +11390,7 @@ async function runRegate(opts) {
       gateEvidence: "worktree",
       holistic: {
         conventionPaths: opts.conventionPaths,
-        readAtHead: worktreeReader(opts.worktree)
+        readAtHead: conventionsAwareReader(worktreeReader(opts.worktree), path23.join(opts.worktree, CONVENTIONS_IN_TREE_REL), opts.conventionPaths ?? [])
       }
     } : {},
     log,
@@ -11278,7 +11405,7 @@ async function runRegate(opts) {
     ...opts.worktree ? { worktree: opts.worktree } : {}
   });
   try {
-    const p = path22.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
+    const p = path23.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
     const existing = fs28.existsSync(p) ? JSON.parse(fs28.readFileSync(p, "utf8")) : {};
     writeTrailFile(
       opts.baseDir,
@@ -11311,7 +11438,7 @@ async function runRegate(opts) {
 
 // src/modes/review/reseat.ts
 import fs29 from "fs";
-import path23 from "path";
+import path24 from "path";
 
 // src/modes/review/evidence-manifest.ts
 var EVIDENCE_MANIFEST_SCHEMA_VERSION = 1;
@@ -11404,7 +11531,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   if (!stored) return { error: `run ${runId} has no review.${seat}.json under ${baseDir}` };
   let parsed;
   try {
-    parsed = JSON.parse(fs29.readFileSync(path23.join(dir, `packet.${seat}.json`), "utf8"));
+    parsed = JSON.parse(fs29.readFileSync(path24.join(dir, `packet.${seat}.json`), "utf8"));
   } catch {
     return { error: `run ${runId} has no readable packet.${seat}.json` };
   }
@@ -11414,7 +11541,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   const packet = parsed;
   let prompt;
   try {
-    prompt = fs29.readFileSync(path23.join(dir, `prompt.${seat}.md`), "utf8");
+    prompt = fs29.readFileSync(path24.join(dir, `prompt.${seat}.md`), "utf8");
   } catch {
     return { error: `run ${runId} has no readable prompt.${seat}.md` };
   }
@@ -11424,7 +11551,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
     for (const c of trail.chunks) {
       let partPacket;
       try {
-        partPacket = JSON.parse(fs29.readFileSync(path23.join(dir, `packet.${seat}.c${c.index}.json`), "utf8"));
+        partPacket = JSON.parse(fs29.readFileSync(path24.join(dir, `packet.${seat}.c${c.index}.json`), "utf8"));
       } catch {
         return { error: `run ${runId} reviewed in ${trail.chunks.length} parts but has no readable packet.${seat}.c${c.index}.json` };
       }
@@ -11433,7 +11560,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
       }
       let partPrompt;
       try {
-        partPrompt = fs29.readFileSync(path23.join(dir, `prompt.${seat}.c${c.index}.md`), "utf8");
+        partPrompt = fs29.readFileSync(path24.join(dir, `prompt.${seat}.c${c.index}.md`), "utf8");
       } catch {
         return { error: `run ${runId} reviewed in ${trail.chunks.length} parts but has no readable prompt.${seat}.c${c.index}.md` };
       }
@@ -11533,7 +11660,7 @@ function readReseatLock(p) {
   return { since, startedMs };
 }
 function acquireReseatLock(baseDir, runId) {
-  const p = path23.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
+  const p = path24.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
   const held = () => `another reseat is already running on run ${runId} (lock ${RESEAT_LOCK_FILE}, since ${readReseatLock(p)?.since ?? "unknown"})`;
   const claim = () => {
     try {
@@ -11567,7 +11694,7 @@ function acquireReseatLock(baseDir, runId) {
 }
 function foldSynthesis(baseDir, runId, patch, log) {
   try {
-    const p = path23.join(reviewDir(baseDir, runId), "claude-synthesis.json");
+    const p = path24.join(reviewDir(baseDir, runId), "claude-synthesis.json");
     const existing = fs29.existsSync(p) ? JSON.parse(fs29.readFileSync(p, "utf8")) : {};
     writeTrailFile(baseDir, runId, "claude-synthesis.json", JSON.stringify(patch(existing), null, 2));
     return true;
@@ -11580,7 +11707,7 @@ function appendEgressDenials(baseDir, runId, denials, log) {
   if (denials.length === 0) return;
   try {
     log(`reseat: \u26A0 egress fence: ${formatEgressDenialCounts(denials)}`);
-    const p = path23.join(reviewDir(baseDir, runId), "egress-denials.json");
+    const p = path24.join(reviewDir(baseDir, runId), "egress-denials.json");
     const prior = fs29.existsSync(p) ? JSON.parse(fs29.readFileSync(p, "utf8")) : [];
     if (!Array.isArray(prior)) {
       log(
@@ -11653,7 +11780,7 @@ async function reseatUnderLock(opts, pre) {
     const runs = [];
     const manifestRealized = (() => {
       try {
-        const m = JSON.parse(fs29.readFileSync(path23.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE), "utf8"));
+        const m = JSON.parse(fs29.readFileSync(path24.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE), "utf8"));
         return m.realizedEvidence?.[seat] === "worktree" ? "worktree" : "packet";
       } catch {
         return "packet";
@@ -11751,7 +11878,7 @@ async function reseatUnderLock(opts, pre) {
     log
   );
   try {
-    const mp = path23.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
+    const mp = path24.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
     if (fs29.existsSync(mp)) {
       const manifest = JSON.parse(fs29.readFileSync(mp, "utf8"));
       manifest.realizedEvidence = {
@@ -11813,7 +11940,7 @@ async function reseatUnderLock(opts, pre) {
 }
 function readPartReview(baseDir, runId, seat, index) {
   try {
-    const raw = JSON.parse(fs29.readFileSync(path23.join(reviewDir(baseDir, runId), `review.${seat}.c${index}.json`), "utf8"));
+    const raw = JSON.parse(fs29.readFileSync(path24.join(reviewDir(baseDir, runId), `review.${seat}.c${index}.json`), "utf8"));
     if (typeof raw !== "object" || raw === null) return null;
     const r = raw;
     if (!Array.isArray(r.findings) || typeof r.terminalState !== "string" || typeof r.summary !== "string") return null;
@@ -12996,7 +13123,7 @@ function clearReusedRunTrail(baseDir, trailDir) {
   } catch {
     return;
   }
-  const rel = path24.relative(realBase, realTarget);
+  const rel = path25.relative(realBase, realTarget);
   if (!rel || escapesRoot(rel)) {
     return;
   }
@@ -13051,9 +13178,9 @@ function gitToplevel(cwd) {
 }
 function resolveTrailBase(gitRoot, localRepoTrail) {
   if (gitRoot && localRepoTrail) {
-    return path24.join(gitRoot, ".ensemble-ai", "reviews");
+    return path25.join(gitRoot, ".ensemble-ai", "reviews");
   }
-  return path24.join(os14.tmpdir(), "ensemble-ai", "reviews");
+  return path25.join(os14.tmpdir(), "ensemble-ai", "reviews");
 }
 function ghConventionReader(repoSlug, ref, cwd) {
   const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
@@ -13572,7 +13699,7 @@ async function reviewCommand(args, profile = "code") {
     console.log(usage);
     return 0;
   }
-  const cwd = values.cwd ? path24.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path25.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
   const postComment = Boolean(values["post-comment"]);
@@ -13675,7 +13802,7 @@ async function runReviewPipeline(input) {
   const optionalReviewers = resolveOptionalReviewers(values["optional-reviewers"], roster.core, cmd);
   if ("code" in optionalReviewers) return optionalReviewers.code;
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-  const out = typeof values.out === "string" ? path24.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+  const out = typeof values.out === "string" ? path25.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
   const ceiling = positiveCeiling(
     typeof values.ceiling === "string" ? values.ceiling : void 0,
@@ -14096,6 +14223,7 @@ async function runReviewPipeline(input) {
         const claudeReview = claudeLayer?.claudeReview ?? null;
         const claudePin = anthropicSeats ? { effort: anthropicSeats.claude.config.effort, model: anthropicSeats.claude.config.model } : {};
         const claudeFacts = (d, bytes) => d ? {
+          ...d.conventionsRead !== void 0 ? { conventions: d.conventionsRead ? "read" : "unread" } : {},
           depth: readDepthOf(d.usage ?? {}, bytes, Boolean(worktree)),
           elapsedMs: d.elapsedMs,
           ...d.usage ? { usage: d.usage } : {}
@@ -14137,7 +14265,7 @@ async function runReviewPipeline(input) {
     const first = result.reviews[0];
     const pinnedReviewerId = first.reviewerId ?? first.reviewer.vendor;
     console.log(
-      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path24.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
+      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path25.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
   }
   if (claudeLayer) {
@@ -14373,10 +14501,10 @@ async function brainstormCommand(args) {
     console.error(BRAINSTORM_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path24.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path25.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path24.resolve(cwd, values.file);
+    const filePath = path25.resolve(cwd, values.file);
     try {
       const bytes = fs30.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
@@ -14396,7 +14524,7 @@ async function brainstormCommand(args) {
   let evidenceInfo;
   if (typeof values["evidence-root"] === "string") {
     try {
-      evidenceInfo = openEvidenceRoot(path24.resolve(cwd, values["evidence-root"]));
+      evidenceInfo = openEvidenceRoot(path25.resolve(cwd, values["evidence-root"]));
     } catch (e) {
       console.error(`ensemble-ai: ${e.message}`);
       return 3;
@@ -14638,10 +14766,10 @@ async function consultCommand(args) {
     console.error(CONSULT_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path24.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path25.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path24.resolve(cwd, values.file);
+    const filePath = path25.resolve(cwd, values.file);
     try {
       const bytes = fs30.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
@@ -14661,7 +14789,7 @@ async function consultCommand(args) {
   let evidenceInfo;
   if (typeof values["evidence-root"] === "string") {
     try {
-      evidenceInfo = openEvidenceRoot(path24.resolve(cwd, values["evidence-root"]));
+      evidenceInfo = openEvidenceRoot(path25.resolve(cwd, values["evidence-root"]));
     } catch (e) {
       console.error(`ensemble-ai: ${e.message}`);
       return 3;
@@ -14904,7 +15032,7 @@ async function receiptCommand(args) {
     console.log(RECEIPT_USAGE);
     return 0;
   }
-  const receiptPathArg = typeof positionals[0] === "string" ? path24.resolve(positionals[0]) : void 0;
+  const receiptPathArg = typeof positionals[0] === "string" ? path25.resolve(positionals[0]) : void 0;
   const readReceiptFile = (p) => {
     let raw;
     try {
@@ -14949,8 +15077,8 @@ async function receiptCommand(args) {
     console.error(`ensemble-ai receipt ${sub}: choose at most one of --repo / --cwd (both name the repo to verify)`);
     return 3;
   }
-  const repoLocation = typeof values.repo === "string" ? path24.resolve(values.repo) : void 0;
-  const cwd = repoLocation ?? (values.cwd ? path24.resolve(String(values.cwd)) : process.cwd());
+  const repoLocation = typeof values.repo === "string" ? path25.resolve(values.repo) : void 0;
+  const cwd = repoLocation ?? (values.cwd ? path25.resolve(String(values.cwd)) : process.cwd());
   const intendedEvidence = repoLocation ? Object.fromEntries(required.map((id) => [id, "worktree"])) : void 0;
   const acceptDegraded = Boolean(values["accept-degraded"]);
   if (acceptDegraded && !intendedEvidence) {
@@ -14989,7 +15117,7 @@ async function receiptCommand(args) {
     }),
     repo: acquired.repoId
   };
-  const store = values.store ? path24.resolve(String(values.store)) : defaultReceiptStore();
+  const store = values.store ? path25.resolve(String(values.store)) : defaultReceiptStore();
   if (sub === "show") {
     const receipt = readReceipt(store, key);
     if (!receipt) {
@@ -15025,7 +15153,7 @@ async function receiptCommand(args) {
     // with isDiffReviewed so a digest-only drift still reports `stale`.
     readReceipt: receiptPathArg ? (k) => explicit && receiptIdentityMatches(explicit, k) ? explicit : null : (k) => readReceipt(store, k),
     strict: Boolean(values.strict || values["require-artifacts"]),
-    trailDir: typeof values.trail === "string" ? path24.resolve(values.trail) : void 0
+    trailDir: typeof values.trail === "string" ? path25.resolve(values.trail) : void 0
   };
   const state = verifyReceipt({ coverage: acquired.coverage, key, required }, verifyDeps);
   console.log(formatVerify(state, key));
@@ -15073,8 +15201,8 @@ async function reviewersCommand(args) {
     console.log(REVIEWERS_USAGE);
     return 0;
   }
-  const reviewersFile = typeof values["reviewers-file"] === "string" ? path24.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
-  const voicesFile = typeof values["voices-file"] === "string" ? path24.resolve(values["voices-file"]) : VOICES_FILE;
+  const reviewersFile = typeof values["reviewers-file"] === "string" ? path25.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
+  const voicesFile = typeof values["voices-file"] === "string" ? path25.resolve(values["voices-file"]) : VOICES_FILE;
   const warn = (m) => console.error(`\xB7 ${m}`);
   let gateAdvisor;
   const gateSeat = loadGateSeat(voicesFile, {}, warn, (v) => {
@@ -15221,7 +15349,7 @@ async function diffCommand(args) {
     "--max-chunks"
   );
   if (typeof maxChunks === "object") return maxChunks.code;
-  const cwd = values.cwd ? path24.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path25.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
   let acquired;
@@ -15326,7 +15454,7 @@ async function pushFenceCommand(args) {
     );
     return 3;
   }
-  const cwd = values.cwd ? path24.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path25.resolve(String(values.cwd)) : process.cwd();
   const gh = ghRunner(cwd);
   const scope = selection.owner && selection.repo ? ["-R", `${selection.owner}/${selection.repo}`] : [];
   const view = gh([
@@ -15384,7 +15512,7 @@ Exit: 0 = current (or ahead of main); 3 = STALE or DIVERGED; 1 = error. A consum
 gates on the exit code, or parses --json for a softer "N behind" surface.`;
 function resolveSelfRepo(git2) {
   const r = git2(["rev-parse", "--show-toplevel"], {
-    cwd: path24.dirname(fileURLToPath2(import.meta.url))
+    cwd: path25.dirname(fileURLToPath2(import.meta.url))
   });
   return r.ok ? r.text.trim() : null;
 }
@@ -15851,7 +15979,7 @@ async function probeCommand(rest) {
   let brief = null;
   if (briefPath) {
     try {
-      brief = fs30.readFileSync(path24.resolve(cwd, briefPath), "utf8");
+      brief = fs30.readFileSync(path25.resolve(cwd, briefPath), "utf8");
       console.error(`\xB7 operator brief: ${briefPath} (${brief.length} chars)`);
     } catch (e) {
       if (briefFlag) {
@@ -15931,7 +16059,7 @@ async function probeCommand(rest) {
     }
     const directive = "directive" in directiveRes ? directiveRes.directive : null;
     const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-    const out = typeof values.out === "string" ? path24.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+    const out = typeof values.out === "string" ? path25.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
     const trailDir = reviewDir(out, runId);
     const prompt = renderProbePrompt({
       baseSha: source.prBaseSha,

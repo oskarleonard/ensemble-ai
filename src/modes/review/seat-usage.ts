@@ -162,3 +162,36 @@ export function describeUsage(u: SeatUsage): string {
   if (u.turns !== undefined && u.turns > 1) bits.push(`${u.turns} turns`);
   return bits.join(' · ') || 'no usage recorded';
 }
+
+// DID THE SEAT OPEN THE CONVENTIONS FILE? (2026-10-13 fresh-eyes review). Under conventions-as-a-
+// file the only proof a seat read the rules is a tool call that touched the file; THIN never
+// catches a skipped read on a small part (it fires above 50 KB only). Named off the stream, never
+// guessed: `undefined` when the stream is absent or lost its head (the call may be in the cut
+// part), `false` only when the whole stream is there and no call reached the directory.
+export const CONVENTIONS_TOUCH_NEEDLE = '.ensemble-conventions';
+
+export function conventionsTouched(stream: string | null | undefined, needle = CONVENTIONS_TOUCH_NEEDLE): boolean | undefined {
+  if (!stream) return undefined;
+  let first: string | null = null;
+  let touched = false;
+  for (const line of stream.split('\n')) {
+    if (!line.trim()) continue;
+    let e: unknown;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!e || typeof e !== 'object') continue;
+    const ev = e as Record<string, unknown>;
+    if (first === null) first = typeof ev.type === 'string' ? ev.type : '';
+    // Only the seat's OWN calls count — a tool RESULT (`user`) or a result event that happens to
+    // mention the path is the engine or the tree talking, not the seat opening the file.
+    const own = ev.type === 'item.started' || ev.type === 'item.completed' || ev.type === 'assistant' || ev.type === 'stream_event';
+    if (own && line.includes(needle)) touched = true;
+  }
+  if (first === null) return undefined;
+  const headIntact = first === 'system' || first === 'thread.started';
+  if (touched) return true;
+  return headIntact ? false : undefined;
+}
