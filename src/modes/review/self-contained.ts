@@ -1,3 +1,4 @@
+import path from 'node:path';
 // The SELF-CONTAINED review layer: after the cross-vendor CORE (codex+grok) reviews the
 // pinned packet, add a THIRD blind peer reviewer — a COLD headless `claude -p` (Opus) —
 // on the SAME packet, then a separate `claude -p` GATE pass that reads all three
@@ -47,7 +48,7 @@ import {
   resolveHolisticPlan,
   runHolisticLens,
 } from './holistic';
-import { worktreeReader } from './holistic-gate';
+import { worktreeReader, conventionsAwareReader, CONVENTIONS_IN_TREE_REL } from './holistic-gate';
 import { INTEGRATION_SEAT_ID, renderIntegrationPrompt } from './integration';
 import { type HistoryPacket, historyPacketHasData } from './history-packet';
 import type { ReviewProfile } from './profile';
@@ -231,7 +232,9 @@ async function runClaudeReviewer(
   // file/git tools reach the project there). Absent ⇒ the throwaway tmpdir, as before.
   worktree?: string,
   // The history packet seeded into this seat's cwd, when one was built (./history-packet).
-  historyPacket?: HistoryPacket
+  historyPacket?: HistoryPacket,
+  // The conventions were handed over as a file this run — record whether this seat opened it.
+  conventionsInTree?: boolean
 ): Promise<{ review: VoiceReview; raw: string | null; spawned: boolean; stream: string | null }> {
   let res: VoiceRunResult;
   const startedAt = Date.now();
@@ -256,7 +259,7 @@ async function runClaudeReviewer(
   }
   // The seat's run facts — the same record the core seats keep — so review.claude.json says how
   // long the read took and how deep it went, not only what it found.
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsInTree });
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output');
@@ -285,7 +288,8 @@ async function runClaudeReviewer(
 /** `4 min · 9,120 out · 331,320 in (83% cached) · 31 tool calls` — one spelling for the log. */
 export function describeRun(d: SeatDiagnostics): string {
   const mins = Math.max(1, Math.round(d.elapsedMs / 60_000));
-  return `${mins} min · ${describeUsage(d.usage ?? {})}`;
+  const conv = d.conventionsRead === true ? ' · conventions read' : d.conventionsRead === false ? ' · ⚠ conventions NOT read' : '';
+  return `${mins} min · ${describeUsage(d.usage ?? {})}${conv}`;
 }
 
 // ── The whole layer: Opus reviewer + per-reviewer files + the gate ────────────────────
@@ -584,7 +588,8 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
       producerTimeout,
       log,
       opts.worktree,
-      opts.historyPacket
+      opts.historyPacket,
+      Boolean(opts.conventionsPath)
     );
     claudeSpawned = spawned;
     claudeReview = withSeatAdvisor(review, opts.claudeConfig);
@@ -625,7 +630,8 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
           producerTimeout,
           log,
           opts.worktree,
-          opts.historyPacket
+          opts.historyPacket,
+          Boolean(opts.conventionsPath)
         );
         partReviews[i] = { part, ...res };
         log(`  · claude: part ${part.index}/${n} ${res.review.ok ? 'reviewed' : 'FAILED'} — ${res.review.findings.length} finding(s)`);
@@ -937,7 +943,7 @@ export async function runClaudeReviewLayer(
           gateEvidence: 'worktree' as const,
           holistic: {
             conventionPaths: opts.conventionPaths,
-            readAtHead: worktreeReader(opts.worktree),
+            readAtHead: conventionsAwareReader(worktreeReader(opts.worktree), path.join(opts.worktree, CONVENTIONS_IN_TREE_REL), opts.conventionPaths ?? []),
           },
         }
       : {}),

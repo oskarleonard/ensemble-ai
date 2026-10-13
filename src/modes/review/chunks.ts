@@ -270,6 +270,10 @@ export const CHUNKS_TRAIL_FILE = 'chunks.json';
 export const CHUNKS_TRAIL_SCHEMA_VERSION = 1;
 
 export interface ChunkSeatRecord {
+  // Whether the seat opened the engine-written conventions file (seat-usage.ts
+  // conventionsTouched). Present only on a run that handed the conventions over as a file and
+  // whose stream could answer.
+  conventions?: 'read' | 'unread';
   // How deep the read was, off the seat's own stream (seat-usage.ts readDepthOf): `thin` is a
   // seat that returned far too little work for the bytes it was handed; `unmeasured` a stream
   // that carried no usage. Absent on records written before the telemetry existed.
@@ -320,6 +324,9 @@ export function renderCoverageOverview(
   const thinReads = trail.chunks.flatMap((c) =>
     Object.entries(c.seats).filter(([, s]) => s.depth === 'thin').map(([id]) => `${id} on part ${c.index}`)
   );
+  const unreadConventions = trail.chunks.flatMap((c) =>
+    Object.entries(c.seats).filter(([, s]) => s.conventions === 'unread').map(([id]) => `${id} on part ${c.index}`)
+  );
   const overflow = trail.omitted.filter((o) => o.reason === 'over-limit');
   const junk = trail.omitted.filter((o) => o.reason !== 'over-limit');
   out.push(`# Coverage overview — ${extra.headSha.slice(0, 12)}`);
@@ -330,6 +337,10 @@ export function renderCoverageOverview(
   if (thinReads.length > 0) {
     out.push('');
     out.push(`⚠ THIN READS: ${thinReads.join(', ')} — the seat returned far too little work for the bytes it was handed (seat-usage.ts floor). Treat those parts as NOT reviewed by that seat.`);
+  }
+  if (unreadConventions.length > 0) {
+    out.push('');
+    out.push(`⚠ CONVENTIONS NOT READ: ${unreadConventions.join(', ')} — the seat never opened .ensemble-conventions/CONVENTIONS.md, so its findings were judged without the repo's rules.`);
   }
   if (extra.gateCounts) {
     const g = Object.entries(extra.gateCounts)
@@ -349,7 +360,8 @@ export function renderCoverageOverview(
         const mins = s.elapsedMs !== undefined ? ` ${Math.round(s.elapsedMs / 60000)} min` : '';
         const out = s.usage?.outputTokens !== undefined ? `, ${s.usage.outputTokens.toLocaleString('en-US')} out tokens` : '';
         const tools = s.usage?.toolCalls !== undefined ? `, ${s.usage.toolCalls} tool calls` : '';
-        return `${id}${pin} ${s.state === 'reviewed' ? `✓ ${s.findings} finding(s)${mins}${out}${tools}${depth}` : `✗ ${s.state}${s.why ? ` — ${s.why}` : ''}`}`;
+        const conv = s.conventions === 'read' ? ', conventions read' : s.conventions === 'unread' ? ' — ⚠ CONVENTIONS NOT READ' : '';
+        return `${id}${pin} ${s.state === 'reviewed' ? `✓ ${s.findings} finding(s)${mins}${out}${tools}${conv}${depth}` : `✗ ${s.state}${s.why ? ` — ${s.why}` : ''}`}`;
       })
       .join(' · ');
     const tests = c.files.filter((f) => f.test).length;

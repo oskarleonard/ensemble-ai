@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { describeUsage, parseSeatUsage, readDepthOf } from './seat-usage';
+import { conventionsTouched, describeUsage, parseSeatUsage, readDepthOf } from './seat-usage';
 
 const codexStream = [
   JSON.stringify({ type: 'thread.started', thread_id: 't' }),
@@ -62,5 +62,26 @@ describe('readDepthOf — a THIN read is named, an unmeasured one is not called 
   it('describeUsage reads like a line in a log', () => {
     expect(describeUsage({ cachedInputTokens: 4123520, inputTokens: 4546368, outputTokens: 8813, toolCalls: 2 })).toBe('8,813 out · 4,546,368 in (91% cached) · 2 tool calls');
     expect(describeUsage({})).toBe('no usage recorded');
+  });
+});
+
+describe('conventionsTouched — did the seat open the conventions file (named, never guessed)', () => {
+  const init = JSON.stringify({ subtype: 'init', type: 'system' });
+  it('a codex command that reads the file, or a claude-shaped tool call with its path', () => {
+    const codex = [JSON.stringify({ type: 'thread.started' }), JSON.stringify({ item: { command: "/bin/zsh -lc 'cat .ensemble-conventions/CONVENTIONS.md'", type: 'command_execution' }, type: 'item.started' })].join('\n');
+    const claude = [init, JSON.stringify({ message: { content: [{ input: { file_path: '/wt/.ensemble-conventions/CONVENTIONS.md' }, name: 'Read', type: 'tool_use' }] }, type: 'assistant' })].join('\n');
+    expect(conventionsTouched(codex)).toBe(true);
+    expect(conventionsTouched(claude)).toBe(true);
+  });
+  it('a whole stream with no such call is false; a tool RESULT mentioning the path does not count', () => {
+    const none = [init, JSON.stringify({ message: { content: [{ input: { file_path: '/wt/src/x.ts' }, name: 'Read', type: 'tool_use' }] }, type: 'assistant' })].join('\n');
+    const resultOnly = [init, JSON.stringify({ message: { content: [{ content: 'see .ensemble-conventions/CONVENTIONS.md', type: 'tool_result' }] }, type: 'user' })].join('\n');
+    expect(conventionsTouched(none)).toBe(false);
+    expect(conventionsTouched(resultOnly)).toBe(false);
+  });
+  it('a stream that lost its head cannot say no — unmeasured', () => {
+    const headless = JSON.stringify({ message: { content: [{ input: { file_path: '/wt/src/x.ts' }, name: 'Read', type: 'tool_use' }] }, type: 'assistant' });
+    expect(conventionsTouched(headless)).toBeUndefined();
+    expect(conventionsTouched('')).toBeUndefined();
   });
 });

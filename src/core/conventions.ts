@@ -176,6 +176,57 @@ function fileHeader(rel: string): string {
   return `\n\n===== ${rel} =====\n`;
 }
 
+// The doc's "home" directory for nearness: `backend/.claude/rules/x.md` and `backend/docs/y.md`
+// both govern `backend/`; `.claude/rules/x.md` and `docs/y.md` govern the root.
+function docHome(rel: string): string {
+  let d = path.posix.dirname(rel);
+  if (d === '.') d = '';
+  d = d.replace(/(^|\/)\.claude(\/rules)?$/, '$1').replace(/(^|\/)docs(\/.*)?$/, '$1');
+  return d.replace(/\/$/, '');
+}
+
+const INDEX_MAX_NEAREST = 12;
+
+/** THE INDEX (2026-10-13 fresh-eyes review): the gathered text is one ~350 KB file with a
+ *  `===== <path> =====` header per doc and nothing else — codex had to grep the separators to
+ *  find its way, then re-read ~95 KB by line ranges. This block goes at the TOP of the file:
+ *  which docs are nearest the files the change touches (read those first), the root rules every
+ *  change answers to, what was left out, and every doc's first line so a seat can jump. Line
+ *  numbers are of the FINAL file (this block included). PURE. */
+export function conventionsIndex(body: string, manifest: ConventionManifest, changedPaths: readonly string[]): string {
+  const included = manifest.files.filter((f) => f.included);
+  const changed = changedPaths.map((c) => c.replace(/\\/g, '/').replace(/^\.\//, ''));
+  const homes = new Map(included.map((f) => [f.path, docHome(f.path)]));
+  const near = included
+    .filter((f) => {
+      const h = homes.get(f.path) ?? '';
+      return h !== '' && changed.some((c) => c.startsWith(`${h}/`));
+    })
+    .sort((a, b) => (homes.get(b.path) ?? '').split('/').length - (homes.get(a.path) ?? '').split('/').length || a.path.localeCompare(b.path))
+    .slice(0, INDEX_MAX_NEAREST);
+  const root = included.filter((f) => (homes.get(f.path) ?? '') === '' && f.tier === 0);
+  const left = manifest.files.filter((f) => !f.included && f.reason !== 'duplicate');
+  const head: string[] = [
+    '# Conventions index',
+    `${included.length} doc(s) gathered at the PR base, ${manifest.totalBytes.toLocaleString('en-US')} bytes. Each doc follows a \`===== <path> =====\` header. Cite a rule as that path:line, the line counted from the first line after its header.`,
+    `Nearest to the files this change touches — read these in full first: ${near.length > 0 ? near.map((f) => f.path).join(' · ') : 'none below the root'}`,
+    `Root rules (every change): ${root.length > 0 ? root.map((f) => f.path).join(' · ') : 'none'}`,
+    ...(left.length > 0 ? [`Not gathered (${left.length}, over the cap or the file ceiling): ${left.slice(0, 10).map((f) => f.path).join(' · ')}${left.length > 10 ? ' · …' : ''}`] : []),
+    '',
+  ];
+  // Every doc's first content line in the FINAL file: this block's height + its header's
+  // position in the body + 1 (header line) + 1 (1-based).
+  const bodyLines = body.split('\n');
+  const rows: string[] = [];
+  const height = head.length + included.length; // lines this block adds (its trailing newline ends the last row)
+  for (const f of included) {
+    const at = bodyLines.indexOf(`===== ${f.path} =====`);
+    const line = at >= 0 ? height + at + 2 : null;
+    rows.push(`- ${f.path}${line ? ` — line ${line.toLocaleString('en-US')}` : ''} (tier ${f.tier ?? '?'}, ${f.bytes.toLocaleString('en-US')} bytes${f.truncated ? ', head only' : ''})`);
+  }
+  return [...head, ...rows, ''].join('\n');
+}
+
 // The tier a reference confers on its target, given the referring file's tier: an
 // @-include is read as part of its carrier (same tier); anything else is one tier weaker,
 // bottoming out at SWEPT.

@@ -7,7 +7,7 @@ import type { ResolvedVoiceConfig } from '../brainstorm/types';
 import { runClaudeReviewVoice } from './claude';
 import { type GateVerdictRecord, runGate } from './gate';
 import { readGatePacketHeadSha } from './gate-hunks';
-import { worktreeReader } from './holistic-gate';
+import { worktreeReader, conventionsAwareReader, CONVENTIONS_IN_TREE_REL } from './holistic-gate';
 import {
   GATE_WORKTREE_TIMEOUT_MS,
   loadVoiceReviewsFromTrail,
@@ -109,7 +109,7 @@ export async function runRegate(opts: RegateOptions): Promise<RegateResult> {
           gateEvidence: 'worktree' as const,
           holistic: {
             conventionPaths: opts.conventionPaths,
-            readAtHead: worktreeReader(opts.worktree),
+            readAtHead: conventionsAwareReader(worktreeReader(opts.worktree), path.join(opts.worktree, CONVENTIONS_IN_TREE_REL), opts.conventionPaths ?? []),
           },
         }
       : {}),

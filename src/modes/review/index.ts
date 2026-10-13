@@ -5,6 +5,7 @@ import { writeTrailFile } from '../../core/artifacts';
 import {
   type ConventionManifest,
   type ConventionReader,
+  conventionsIndex,
   gatherConventions,
 } from '../../core/conventions';
 import type { EgressDenial } from '../../core/egress-proxy';
@@ -271,7 +272,7 @@ export function conventionsPointer(file: string, chars: number, files?: number):
 
   ${file}
 
-Read that file BEFORE reviewing (it is the AGENTS.md / rules / docs web the repo asks a reviewer to read; the manifest of what it contains is conventions.json in the trail). Cite a rule by its heading when a finding rests on it.`;
+Read that file BEFORE reviewing (it is the AGENTS.md / rules / docs web the repo asks a reviewer to read; the manifest of what it contains is conventions.json in the trail). Its INDEX at the top names the docs nearest the files this change touches — read those in full. When a finding rests on a rule, cite it as \`path:line\` with one exact line quoted: path is the ORIGINAL doc named in the \`===== path =====\` header above the rule, line counted from the first line after that header.`;
 }
 
 // The default `code`-profile review objective. Exported so the `diff` plumbing
@@ -463,7 +464,10 @@ export async function runReviewMode(
       const dir = path.join(wt.dir, CONVENTIONS_IN_TREE_DIR);
       fs.mkdirSync(dir, { recursive: true });
       const file = path.join(dir, CONVENTIONS_IN_TREE_FILE);
-      fs.writeFileSync(file, agentsMd, { mode: 0o600 });
+      // The index first (core/conventions conventionsIndex): nearest docs, root rules, a line per
+      // doc — so a seat reads the right sections instead of grepping for the separators.
+      const indexed = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) + agentsMd : agentsMd;
+      fs.writeFileSync(file, indexed, { mode: 0o600 });
       conventionsPath = file;
       const files = conventionManifest ? conventionManifest.files.filter((f) => f.included).length : undefined;
       agentsMd = conventionsPointer(file, agentsMd.length, files);
@@ -635,6 +639,7 @@ export async function runReviewMode(
         runCoreSeat({
           adapter: adapters[id],
           ...(suffix ? { artifactSuffix: suffix } : {}),
+          conventionsInTree: Boolean(conventionsPath),
           log,
           out: opts.out,
           packet: packets[k],
@@ -660,7 +665,12 @@ export async function runReviewMode(
             `  · ⚠ ${id}: THIN READ on part ${idx} — ${describeUsage(usage ?? {})} for ${(chunk?.bytes ?? 0).toLocaleString('en-US')} bytes of diff; the seat returned far too little work for what it was handed`
           );
         }
+        const conventionsRead = s.review.diagnostics?.conventionsRead;
+        if (conventionsRead === false) {
+          log(`  · ⚠ ${id}: did NOT open the conventions file on part ${idx} (${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}) — its findings were judged without the repo's rules`);
+        }
         seats[id] = {
+          ...(conventionsRead !== undefined ? { conventions: conventionsRead ? 'read' : 'unread' } : {}),
           ...(depth ? { depth } : {}),
           effort: reviewer.effort,
           ...(s.review.diagnostics ? { elapsedMs: s.review.diagnostics.elapsedMs } : {}),
