@@ -231,7 +231,12 @@ describe('runReviewerExec — stream liveness beside an outfile reply', () => {
       timeoutMs: 20_000,
     });
     expect(res.raw).toBe('REPLY');
-    expect(res.streamTail?.length).toBeLessThanOrEqual(120);
+    // Head + tail (2026-10-13): the retained stream is the first ≤ limit chars of whole lines,
+    // a one-line cut marker, and the ≤ limit tail — bounded, so a chatty seat still cannot grow
+    // the parent heap, and the stream's first events survive for the read-depth telemetry.
+    expect(res.streamTail?.length).toBeLessThanOrEqual(120 * 2 + 80);
+    expect(res.streamTail?.startsWith('event-1-')).toBe(true);
+    expect(res.streamTail).toContain('"type":"ensemble.stream_cut"');
     expect(res.streamTail).toContain('event-200');
   });
 });

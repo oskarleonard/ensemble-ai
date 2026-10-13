@@ -151,6 +151,25 @@ export interface ReviewerExecOpts {
 // of tool calls and reasoning before a kill, bounded so a chatty hour-long seat cannot grow the
 // parent's heap without limit.
 const STREAM_TAIL_LIMIT = 1_000_000;
+// HEAD + TAIL (2026-10-13): a tail alone loses the stream's first events — `thread.started` /
+// init and the early tool calls — exactly what the read-depth telemetry needs. The first
+// STREAM_HEAD_LIMIT chars are kept whole-line beside the tail; when the two do not meet, a
+// synthetic event names the gap so a reader knows its counts are floors.
+const STREAM_HEAD_LIMIT = 65_536;
+export const STREAM_CUT_EVENT = 'ensemble.stream_cut';
+
+// PURE: head (whole lines, ≤ limit) + a cut marker + tail, or the whole stream when nothing was
+// dropped. `total` is the stream's full length; `tail` is already line-bounded.
+export function joinStreamHeadTail(head: string, tail: string, total: number, headLimit = STREAM_HEAD_LIMIT): string {
+  if (total <= tail.length) return tail;
+  const room = Math.min(headLimit, total - tail.length);
+  let keep = head.slice(0, room);
+  const nl = keep.lastIndexOf('\n');
+  keep = nl >= 0 ? keep.slice(0, nl + 1) : '';
+  const dropped = total - keep.length - tail.length;
+  if (dropped <= 0) return keep + tail;
+  return `${keep}${JSON.stringify({ droppedChars: dropped, type: STREAM_CUT_EVENT })}\n${tail}`;
+}
 
 // Cut the tail on a LINE boundary: it is persisted as newline-delimited JSON, and a cut made on a
 // char boundary would hand a line-oriented reader a partial first object.
@@ -254,6 +273,8 @@ export function runReviewerExec(
     });
     let stdoutBuf = '';
     let streamTail = '';
+    let streamHead = '';
+    let streamTotal = 0;
     if (capture === 'stdout') {
       child.stdout?.on('data', (chunk: Buffer) => {
         armIdle();
@@ -266,6 +287,8 @@ export function runReviewerExec(
         armIdle();
         const text = chunk.toString('utf8');
         opts.onStdout?.(text);
+        streamTotal += text.length;
+        if (streamHead.length < Math.min(STREAM_HEAD_LIMIT, streamLimit)) streamHead += text;
         streamTail += text;
         // Trim at twice the cap, not on every chunk: an hour-long seat emits thousands of
         // events, and re-copying a 1 MB tail per event is avoidable churn. The bound the
@@ -302,7 +325,9 @@ export function runReviewerExec(
         ...(exitCode !== undefined ? { exitCode } : {}),
         raw,
         stderrTail,
-        ...(streamStdout ? { streamTail: boundedStreamTail(streamTail, streamLimit) } : {}),
+        ...(streamStdout
+          ? { streamTail: joinStreamHeadTail(streamHead, boundedStreamTail(streamTail, streamLimit), streamTotal, Math.min(STREAM_HEAD_LIMIT, streamLimit)) }
+          : {}),
         timedOut,
         ...(timedOutReason ? { timedOutReason } : {}),
       });

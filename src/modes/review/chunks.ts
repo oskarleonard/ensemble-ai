@@ -284,7 +284,7 @@ export interface ChunkSeatRecord {
   findings: number;
   model?: string;
   state: 'reviewed' | 'failed-reviewer' | 'skipped';
-  usage?: { cachedInputTokens?: number; inputTokens?: number; outputTokens?: number; toolCalls?: number; turns?: number };
+  usage?: { cachedInputTokens?: number; inputTokens?: number; outputTokens?: number; streamTruncated?: true; toolCalls?: number; turns?: number };
   // Why the seat ended short of `reviewed`, when it did (the seat's own summary head).
   why?: string;
 }
@@ -367,13 +367,14 @@ export function renderCoverageOverview(
         const depth = s.depth === 'thin' ? ' — THIN READ' : s.depth === 'unmeasured' ? ' — depth unmeasured' : '';
         const mins = s.elapsedMs !== undefined ? ` ${Math.round(s.elapsedMs / 60000)} min` : '';
         const out = s.usage?.outputTokens !== undefined ? `, ${s.usage.outputTokens.toLocaleString('en-US')} out tokens` : '';
-        const tools = s.usage?.toolCalls !== undefined ? `, ${s.usage.toolCalls} tool calls` : '';
+        const tools = s.usage?.toolCalls !== undefined ? `, ${s.usage.toolCalls}${s.usage.streamTruncated ? '+' : ''} tool calls` : '';
+        const cut = s.usage?.streamTruncated ? ' (stream truncated — counts are floors)' : '';
         const conv =
           s.conventions === 'read' ? `, conventions read${s.conventionsDocs !== undefined ? ` (${s.conventionsDocs} doc${s.conventionsDocs === 1 ? '' : 's'})` : ''}`
           : s.conventions === 'index-only' ? ' — ⚠ CONVENTIONS INDEX ONLY'
           : s.conventions === 'unread' ? ' — ⚠ CONVENTIONS NOT READ'
           : '';
-        return `${id}${pin} ${s.state === 'reviewed' ? `✓ ${s.findings} finding(s)${mins}${out}${tools}${conv}${depth}` : `✗ ${s.state}${s.why ? ` — ${s.why}` : ''}`}`;
+        return `${id}${pin} ${s.state === 'reviewed' ? `✓ ${s.findings} finding(s)${mins}${out}${tools}${conv}${depth}${cut}` : `✗ ${s.state}${s.why ? ` — ${s.why}` : ''}`}`;
       })
       .join(' · ');
     const tests = c.files.filter((f) => f.test).length;

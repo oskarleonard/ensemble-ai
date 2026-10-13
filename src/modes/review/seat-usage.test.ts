@@ -31,13 +31,20 @@ describe('parseSeatUsage — tokens, tool calls and turns off the persisted stre
     expect(parseSeatUsage(grokStream)).toEqual({ cachedInputTokens: 170600, inputTokens: 172761, outputTokens: 4100, toolCalls: 2, turns: 96 });
   });
   it("takes grok's totals from the result event, and leaves tool calls unmeasured when the head is gone", () => {
-    expect(parseSeatUsage(grokTailOnly)).toEqual({ cachedInputTokens: 3160832, inputTokens: 3340216, outputTokens: 13591, turns: 45 });
-    // The same totals with the head intact: tool calls are a real count again.
-    expect(parseSeatUsage([grokInit, grokTailOnly].join('\n')).toolCalls).toBe(2);
+    // Tool calls survive as a FLOOR, flagged; tokens come from the result event regardless.
+    expect(parseSeatUsage(grokTailOnly)).toEqual({ cachedInputTokens: 3160832, inputTokens: 3340216, outputTokens: 13591, streamTruncated: true, toolCalls: 2, turns: 45 });
+    // The same totals with the head intact: a real count, no flag.
+    expect(parseSeatUsage([grokInit, grokTailOnly].join('\n'))).toEqual({ cachedInputTokens: 3160832, inputTokens: 3340216, outputTokens: 13591, toolCalls: 2, turns: 45 });
   });
-  it('a codex tail that lost thread.started reports no tool-call count', () => {
+  it('a codex tail that lost thread.started reports its tool calls as a floor', () => {
     const headless = codexStream.split('\n').slice(1).join('\n');
-    expect(parseSeatUsage(headless)).toEqual({ cachedInputTokens: 4123520, inputTokens: 4546368, outputTokens: 8813, turns: 1 });
+    expect(parseSeatUsage(headless)).toEqual({ cachedInputTokens: 4123520, inputTokens: 4546368, outputTokens: 8813, streamTruncated: true, toolCalls: 2, turns: 1 });
+  });
+  it('a claude-shaped tail starting on a per-turn system event is NOT an intact head (run d5a1f648 part 1); a cut marker flags a head+tail stream', () => {
+    const perTurn = [JSON.stringify({ subtype: 'thinking_tokens', type: 'system' }), ...grokBody, JSON.stringify({ subtype: 'success', type: 'result', num_turns: 3 })].join('\n');
+    expect(parseSeatUsage(perTurn).streamTruncated).toBe(true);
+    const cut = [grokInit, JSON.stringify({ droppedChars: 5000, type: 'ensemble.stream_cut' }), ...grokBody, JSON.stringify({ subtype: 'success', type: 'result', num_turns: 3 })].join('\n');
+    expect(parseSeatUsage(cut)).toMatchObject({ streamTruncated: true, toolCalls: 2 });
   });
   it('yields nothing for an absent or unreadable stream — never a guess', () => {
     expect(parseSeatUsage(undefined)).toEqual({});
@@ -52,8 +59,9 @@ describe('readDepthOf — a THIN read is named, an unmeasured one is not called 
     expect(readDepthOf({ outputTokens: 8813, toolCalls: 40 }, 499_000, true)).toBe('ok');
     expect(readDepthOf({ outputTokens: 200, toolCalls: 1 }, 20_000, true)).toBe('ok'); // under the min part size
   });
-  it('a worktree seat that opened nothing on a large part is thin even with many tokens', () => {
+  it('a worktree seat that opened nothing on a large part is thin even with many tokens — unless the zero is a truncated floor', () => {
     expect(readDepthOf({ outputTokens: 9000, toolCalls: 0 }, 300_000, true)).toBe('thin');
+    expect(readDepthOf({ outputTokens: 9000, streamTruncated: true, toolCalls: 0 }, 300_000, true)).toBe('ok');
     expect(readDepthOf({ outputTokens: 9000, toolCalls: 0 }, 300_000, false)).toBe('ok'); // a packet seat has nothing to open
   });
   it('no usage ⇒ unmeasured', () => {
@@ -62,6 +70,7 @@ describe('readDepthOf — a THIN read is named, an unmeasured one is not called 
   it('describeUsage reads like a line in a log', () => {
     expect(describeUsage({ cachedInputTokens: 4123520, inputTokens: 4546368, outputTokens: 8813, toolCalls: 2 })).toBe('8,813 out · 4,546,368 in (91% cached) · 2 tool calls');
     expect(describeUsage({})).toBe('no usage recorded');
+    expect(describeUsage({ outputTokens: 10, streamTruncated: true, toolCalls: 3 })).toBe('10 out · 3 tool calls · stream truncated — tool-call counts are floors');
   });
 });
 

@@ -1456,6 +1456,19 @@ function killTree(child, signal, signalGroup = (pid, sig) => process.kill(-pid, 
   }
 }
 var STREAM_TAIL_LIMIT = 1e6;
+var STREAM_HEAD_LIMIT = 65536;
+var STREAM_CUT_EVENT = "ensemble.stream_cut";
+function joinStreamHeadTail(head, tail, total, headLimit = STREAM_HEAD_LIMIT) {
+  if (total <= tail.length) return tail;
+  const room = Math.min(headLimit, total - tail.length);
+  let keep = head.slice(0, room);
+  const nl = keep.lastIndexOf("\n");
+  keep = nl >= 0 ? keep.slice(0, nl + 1) : "";
+  const dropped = total - keep.length - tail.length;
+  if (dropped <= 0) return keep + tail;
+  return `${keep}${JSON.stringify({ droppedChars: dropped, type: STREAM_CUT_EVENT })}
+${tail}`;
+}
 function boundedStreamTail(tail, limit) {
   if (tail.length <= limit) return tail;
   return tail.slice(-limit).replace(/^[^\n]*\n/, "");
@@ -1509,6 +1522,8 @@ function runReviewerExec(opts) {
     });
     let stdoutBuf = "";
     let streamTail = "";
+    let streamHead = "";
+    let streamTotal = 0;
     if (capture2 === "stdout") {
       child.stdout?.on("data", (chunk) => {
         armIdle();
@@ -1521,6 +1536,8 @@ function runReviewerExec(opts) {
         armIdle();
         const text = chunk.toString("utf8");
         opts.onStdout?.(text);
+        streamTotal += text.length;
+        if (streamHead.length < Math.min(STREAM_HEAD_LIMIT, streamLimit)) streamHead += text;
         streamTail += text;
         if (streamTail.length > streamLimit * 2) streamTail = streamTail.slice(-streamLimit);
       });
@@ -1553,7 +1570,7 @@ function runReviewerExec(opts) {
         ...exitCode !== void 0 ? { exitCode } : {},
         raw,
         stderrTail,
-        ...streamStdout ? { streamTail: boundedStreamTail(streamTail, streamLimit) } : {},
+        ...streamStdout ? { streamTail: joinStreamHeadTail(streamHead, boundedStreamTail(streamTail, streamLimit), streamTotal, Math.min(STREAM_HEAD_LIMIT, streamLimit)) } : {},
         timedOut,
         ...timedOutReason ? { timedOutReason } : {}
       });
@@ -2448,6 +2465,45 @@ function streamActivityTail(stdout, limit = 600) {
     }
   }
   return summarized.join(" \xB7 ").slice(-limit);
+}
+function stripStreamPayloads(stream) {
+  const out = [];
+  for (const line of stream.split("\n")) {
+    if (!line.startsWith("{") || !line.includes('"tool_result"') && !line.includes('"tool_use_result"')) {
+      out.push(line);
+      continue;
+    }
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      out.push(line);
+      continue;
+    }
+    if (!e || typeof e !== "object") {
+      out.push(line);
+      continue;
+    }
+    const ev = e;
+    if (ev.type !== "user") {
+      out.push(line);
+      continue;
+    }
+    delete ev.tool_use_result;
+    delete ev.tool_result_meta;
+    const msg = ev.message;
+    if (msg && typeof msg === "object" && Array.isArray(msg.content)) {
+      for (const c of msg.content) {
+        if (!c || typeof c !== "object") continue;
+        const block = c;
+        if (block.type !== "tool_result" || block.content === void 0) continue;
+        const size = typeof block.content === "string" ? block.content.length : JSON.stringify(block.content).length;
+        block.content = `[stripped ${size} chars \u2014 the seat's tool result; the tree is on disk]`;
+      }
+    }
+    out.push(JSON.stringify(ev));
+  }
+  return out.join("\n");
 }
 
 // src/modes/brainstorm/claude.ts
@@ -4432,9 +4488,10 @@ function renderCoverageOverview(trail, extra) {
       const depth = s.depth === "thin" ? " \u2014 THIN READ" : s.depth === "unmeasured" ? " \u2014 depth unmeasured" : "";
       const mins = s.elapsedMs !== void 0 ? ` ${Math.round(s.elapsedMs / 6e4)} min` : "";
       const out2 = s.usage?.outputTokens !== void 0 ? `, ${s.usage.outputTokens.toLocaleString("en-US")} out tokens` : "";
-      const tools = s.usage?.toolCalls !== void 0 ? `, ${s.usage.toolCalls} tool calls` : "";
+      const tools = s.usage?.toolCalls !== void 0 ? `, ${s.usage.toolCalls}${s.usage.streamTruncated ? "+" : ""} tool calls` : "";
+      const cut = s.usage?.streamTruncated ? " (stream truncated \u2014 counts are floors)" : "";
       const conv = s.conventions === "read" ? `, conventions read${s.conventionsDocs !== void 0 ? ` (${s.conventionsDocs} doc${s.conventionsDocs === 1 ? "" : "s"})` : ""}` : s.conventions === "index-only" ? " \u2014 \u26A0 CONVENTIONS INDEX ONLY" : s.conventions === "unread" ? " \u2014 \u26A0 CONVENTIONS NOT READ" : "";
-      return `${id}${pin} ${s.state === "reviewed" ? `\u2713 ${s.findings} finding(s)${mins}${out2}${tools}${conv}${depth}` : `\u2717 ${s.state}${s.why ? ` \u2014 ${s.why}` : ""}`}`;
+      return `${id}${pin} ${s.state === "reviewed" ? `\u2713 ${s.findings} finding(s)${mins}${out2}${tools}${conv}${depth}${cut}` : `\u2717 ${s.state}${s.why ? ` \u2014 ${s.why}` : ""}`}`;
     }).join(" \xB7 ");
     const tests = c.files.filter((f) => f.test).length;
     out.push("");
@@ -5214,7 +5271,7 @@ function makeNeutralSeatCwd() {
   return makeOwnerOnlyTempDir("ensemble-seat-cwd-");
 }
 var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-var CLAUDE_STREAM_TAIL_LIMIT = 1e6;
+var CLAUDE_STREAM_TAIL_LIMIT = 8e6;
 async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
   const exec = seams.exec ?? runReviewerExec;
   const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
@@ -5294,7 +5351,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
           ok: false,
           raw: null,
           stderrTail,
-          ...typeof raw === "string" && raw ? { stream: boundedStreamTail(raw, CLAUDE_STREAM_TAIL_LIMIT) } : {},
+          ...typeof raw === "string" && raw ? { stream: boundedStreamTail(stripStreamPayloads(raw), CLAUDE_STREAM_TAIL_LIMIT) } : {},
           timedOut: true
         };
       }
@@ -5306,7 +5363,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
         stderrTail: retryNote ? `${retryNote}${stderrTail ?? ""}` : stderrTail,
         // The stream-json transcript the reply was extracted from — tokens, turns and tool calls
         // for the read-depth telemetry (seat-usage.ts), persisted beside the reply like codex's.
-        ...typeof raw === "string" && raw ? { stream: boundedStreamTail(raw, CLAUDE_STREAM_TAIL_LIMIT) } : {},
+        ...typeof raw === "string" && raw ? { stream: boundedStreamTail(stripStreamPayloads(raw), CLAUDE_STREAM_TAIL_LIMIT) } : {},
         timedOut
       };
     }
@@ -7061,6 +7118,11 @@ import fs23 from "fs";
 function num(v) {
   return typeof v === "number" && Number.isFinite(v) ? v : void 0;
 }
+function streamHeadKind(ev) {
+  if (ev.type === "thread.started") return "init";
+  if (ev.type === "system" && ev.subtype === "init") return "init";
+  return typeof ev.type === "string" ? ev.type : "";
+}
 function parseSeatUsage(stream) {
   if (!stream) return {};
   const usage = {};
@@ -7072,6 +7134,7 @@ function parseSeatUsage(stream) {
   let sawGrokUsage = false;
   let resultUsage = null;
   let first = null;
+  let sawCut = false;
   for (const line of stream.split("\n")) {
     if (!line.trim()) continue;
     let e;
@@ -7082,7 +7145,8 @@ function parseSeatUsage(stream) {
     }
     if (!e || typeof e !== "object") continue;
     const ev = e;
-    if (first === null) first = typeof ev.type === "string" ? ev.type : "";
+    if (first === null) first = streamHeadKind(ev);
+    if (ev.type === STREAM_CUT_EVENT) sawCut = true;
     if (ev.type === "item.started" && ev.item && typeof ev.item === "object") {
       const it = ev.item;
       if (it.type === "command_execution" || it.type === "tool_call" || it.type === "mcp_tool_call") {
@@ -7150,8 +7214,9 @@ function parseSeatUsage(stream) {
     usage.outputTokens = grokOut;
     usage.cachedInputTokens = grokCached;
   }
-  const headIntact = first === "system" || first === "thread.started";
-  if (sawTool && headIntact) usage.toolCalls = toolCalls;
+  const truncated = first !== "init" || sawCut;
+  if (sawTool) usage.toolCalls = toolCalls;
+  if (truncated && Object.keys(usage).length > 0) usage.streamTruncated = true;
   return usage;
 }
 var THIN_OUTPUT_TOKENS_PER_KB = 10;
@@ -7161,7 +7226,7 @@ function readDepthOf(usage, partBytes, worktreeSeat) {
   if (partBytes < THIN_MIN_PART_BYTES) return "ok";
   const floor = partBytes / 1024 * THIN_OUTPUT_TOKENS_PER_KB;
   if (usage.outputTokens < floor) return "thin";
-  if (worktreeSeat && usage.toolCalls !== void 0 && usage.toolCalls === 0) return "thin";
+  if (worktreeSeat && usage.toolCalls !== void 0 && usage.toolCalls === 0 && !usage.streamTruncated) return "thin";
   return "ok";
 }
 function describeUsage(u) {
@@ -7170,6 +7235,7 @@ function describeUsage(u) {
   if (u.inputTokens !== void 0) bits.push(`${u.inputTokens.toLocaleString("en-US")} in${u.cachedInputTokens ? ` (${Math.round(u.cachedInputTokens / u.inputTokens * 100)}% cached)` : ""}`);
   if (u.toolCalls !== void 0) bits.push(`${u.toolCalls} tool call${u.toolCalls === 1 ? "" : "s"}`);
   if (u.turns !== void 0 && u.turns > 1) bits.push(`${u.turns} turns`);
+  if (u.streamTruncated) bits.push("stream truncated \u2014 tool-call counts are floors");
   return bits.join(" \xB7 ") || "no usage recorded";
 }
 var CONVENTIONS_TOUCH_NEEDLE = ".ensemble-conventions";
@@ -7201,7 +7267,7 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
     }
     if (!e || typeof e !== "object") continue;
     const ev = e;
-    if (first === null) first = typeof ev.type === "string" ? ev.type : "";
+    if (first === null) first = streamHeadKind(ev);
     if ((ev.type === "item.started" || ev.type === "item.completed") && ev.item && typeof ev.item === "object") {
       const it = ev.item;
       if (it.type === "command_execution" && typeof it.command === "string" && ev.type === "item.started") ranges.push(...codexRanges(it.command, needle));
@@ -7246,7 +7312,7 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
   }
   ranges.push(...pending.values());
   if (first === null) return void 0;
-  const headIntact = first === "system" || first === "thread.started";
+  const headIntact = first === "init";
   if (ranges.length === 0) return headIntact ? { docsRead: [], state: "unread" } : void 0;
   if (!layout) return { docsRead: [], state: "read" };
   const beyondIndex = ranges.some((r) => r.grep || r.end > layout.indexEndLine);
@@ -8091,15 +8157,16 @@ async function runIntegrationStage(opts) {
     skeleton: opts.skeleton,
     worktree: opts.worktree
   });
-  const fail = (summary, raw) => {
-    const review2 = { findings: [], ok: false, summary, voiceId: INTEGRATION_SEAT_ID };
+  const fail = (summary, raw, diagnostics2, stream2) => {
+    const review2 = { ...diagnostics2 ? { diagnostics: diagnostics2 } : {}, findings: [], ok: false, summary, voiceId: INTEGRATION_SEAT_ID };
     try {
-      persistSeatReview(opts.baseDir, opts.runId, INTEGRATION_SEAT_ID, review2, raw);
+      persistSeatReview(opts.baseDir, opts.runId, INTEGRATION_SEAT_ID, review2, raw, stream2);
     } catch {
     }
     return { integrationReview: review2, integrationSkipped: null };
   };
   let res;
+  const startedAt = Date.now();
   try {
     res = await run(prompt, opts.config, {
       ...opts.historyPacket ? { historyPacket: opts.historyPacket.files } : {},
@@ -8110,22 +8177,24 @@ async function runIntegrationStage(opts) {
     log(`  \xB7 integration: failed to run \u2014 ${e.message}`);
     return fail(`the integration seat did not run: ${e.message}`, null);
   }
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+  const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
     log(`  \xB7 integration: ${why}`);
-    return fail(`the integration seat ${why}`, res.raw ?? null);
+    return fail(`the integration seat ${why}`, res.raw ?? null, diagnostics, stream);
   }
   const parsed = parseFindings(res.raw);
   if (parsed.parseError) {
     log(`  \xB7 integration: ${parsed.parseError}`);
-    return fail(`output not parseable (${parsed.parseError})`, res.raw);
+    return fail(`output not parseable (${parsed.parseError})`, res.raw, diagnostics, stream);
   }
   let review = withSeatAdvisor(
-    { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: INTEGRATION_SEAT_ID },
+    { diagnostics, findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: INTEGRATION_SEAT_ID },
     opts.config
   );
   try {
-    persistSeatReview(opts.baseDir, opts.runId, INTEGRATION_SEAT_ID, review, res.raw);
+    persistSeatReview(opts.baseDir, opts.runId, INTEGRATION_SEAT_ID, review, res.raw, stream);
   } catch (e) {
     const why = e.message;
     log(`  \xB7 integration: trail persist FAILED (${why}) \u2014 the seat's findings are dropped from this run`);
@@ -8136,7 +8205,7 @@ async function runIntegrationStage(opts) {
   } catch (e) {
     log(`  \xB7 trail write review.${INTEGRATION_SEAT_ID}.md failed (${e.message}) \u2014 continuing`);
   }
-  log(`  \xB7 integration: reviewed the seams \u2014 ${review.findings.length} finding(s)`);
+  log(`  \xB7 integration: reviewed the seams \u2014 ${review.findings.length} finding(s) \xB7 ${describeRun2(diagnostics)}`);
   return { integrationReview: review, integrationSkipped: null };
 }
 async function runClaudeReviewLayer(opts) {
