@@ -349,8 +349,10 @@ export function conventionsFileClause(file: string): string {
 
 The repository's conventions (AGENTS.md, rules, docs the repo asks a reviewer to read, gathered at
 the PR BASE so the PR's own edits to them are not the rules it is judged by) are in ONE file:
-\`${file}\`. Read it before reviewing: its INDEX at the top names the docs nearest the files this change
-touches — read those in full. When a finding rests on a rule, cite it as \`path:line\` with one
+\`${file}\`. Read it before reviewing. It is larger than one read: read it in ranges (offset/limit), or grep
+it. Its INDEX at the top lists the docs to read IN FULL (the CLAUDE.md / AGENTS.md / rules chain
+for the files this change touches, and the root rules) and the nearest docs to open by grep when a
+hunk touches their subject. When a finding rests on a rule, cite it as \`path:line\` with one
 exact line quoted, where path is the ORIGINAL doc named in the \`===== path =====\` header above
 the rule and line is counted from the first line after that header. The host re-reads it there.`;
 }

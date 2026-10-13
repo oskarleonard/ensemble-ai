@@ -61,6 +61,10 @@ export interface ConventionManifest {
   capBytes: number;
   totalBytes: number; // included bytes in `text`
   files: ConventionFileEntry[];
+  // Set when the run wrote the gathered text into the worktree as one indexed file
+  // (modes/review CONVENTIONS_IN_TREE_*): where it is and how it is laid out, so the trail can
+  // say which docs a seat's reads reached (seat-usage.ts conventionsReadOf).
+  inTree?: { file: string; indexEndLine: number; jumpTo: string[]; readInFull: string[]; spans: ConventionSpan[] };
 }
 
 export interface GatheredConventions {
@@ -187,44 +191,106 @@ function docHome(rel: string): string {
 
 const INDEX_MAX_NEAREST = 12;
 
-/** THE INDEX (2026-10-13 fresh-eyes review): the gathered text is one ~350 KB file with a
+/** One gathered doc's place in the in-tree conventions file: its body runs startLine..endLine
+ *  (1-based, of the FINAL file), beginning at the doc's own line 1. */
+export interface ConventionSpan {
+  endLine: number;
+  path: string;
+  startLine: number;
+}
+
+export interface ConventionsIndex {
+  // The last line of the index block itself (1-based). A read that ends at or before it saw
+  // only the index.
+  indexEndLine: number;
+  // Nearest docs a seat opens by grep when a hunk touches their subject (tier 1–2).
+  jumpTo: string[];
+  // The CLAUDE.md / AGENTS.md / rules chain for the touched paths plus the root rules: read in full.
+  readInFull: string[];
+  spans: ConventionSpan[];
+  text: string;
+}
+
+/** THE INDEX (2026-10-13 fresh-eyes review). The gathered text is one ~350 KB file with a
  *  `===== <path> =====` header per doc and nothing else — codex had to grep the separators to
- *  find its way, then re-read ~95 KB by line ranges. This block goes at the TOP of the file:
- *  which docs are nearest the files the change touches (read those first), the root rules every
- *  change answers to, what was left out, and every doc's first line so a seat can jump. Line
- *  numbers are of the FINAL file (this block included). PURE. */
-export function conventionsIndex(body: string, manifest: ConventionManifest, changedPaths: readonly string[]): string {
+ *  find its way, then re-read ~95 KB by line ranges; the Claude producer, told to "read the
+ *  nearest docs in full", faced ~125 KB of architecture/product pages for a one-component
+ *  change and read none. So the block names two lists: the rules chain to read IN FULL (tier 0
+ *  on the touched paths, plus the root rules) and the nearest docs to open BY GREP; then what
+ *  was left out, and every doc's line span. Line numbers are of the FINAL file (block
+ *  included). PURE; the layout it returns is also what seat-usage reads back off the file. */
+export function conventionsIndex(body: string, manifest: ConventionManifest, changedPaths: readonly string[]): ConventionsIndex {
   const included = manifest.files.filter((f) => f.included);
   const changed = changedPaths.map((c) => c.replace(/\\/g, '/').replace(/^\.\//, ''));
   const homes = new Map(included.map((f) => [f.path, docHome(f.path)]));
+  const depth = (f: ConventionFileEntry): number => (homes.get(f.path) ?? '').split('/').length;
   const near = included
     .filter((f) => {
       const h = homes.get(f.path) ?? '';
       return h !== '' && changed.some((c) => c.startsWith(`${h}/`));
     })
-    .sort((a, b) => (homes.get(b.path) ?? '').split('/').length - (homes.get(a.path) ?? '').split('/').length || a.path.localeCompare(b.path))
-    .slice(0, INDEX_MAX_NEAREST);
+    .sort((a, b) => depth(b) - depth(a) || a.path.localeCompare(b.path));
   const root = included.filter((f) => (homes.get(f.path) ?? '') === '' && f.tier === 0);
+  const readInFull = [...near.filter((f) => f.tier === 0), ...root].map((f) => f.path);
+  const jumpTo = near
+    .filter((f) => f.tier !== 0)
+    .slice(0, INDEX_MAX_NEAREST)
+    .map((f) => f.path);
   const left = manifest.files.filter((f) => !f.included && f.reason !== 'duplicate');
   const head: string[] = [
     '# Conventions index',
-    `${included.length} doc(s) gathered at the PR base, ${manifest.totalBytes.toLocaleString('en-US')} bytes. Each doc follows a \`===== <path> =====\` header. Cite a rule as that path:line, the line counted from the first line after its header.`,
-    `Nearest to the files this change touches — read these in full first: ${near.length > 0 ? near.map((f) => f.path).join(' · ') : 'none below the root'}`,
-    `Root rules (every change): ${root.length > 0 ? root.map((f) => f.path).join(' · ') : 'none'}`,
+    `${included.length} doc(s) gathered at the PR base, ${manifest.totalBytes.toLocaleString('en-US')} bytes. Each doc follows a \`===== <path> =====\` header. Cite a rule as that path:line, the line counted from the first line after its header. The file is larger than one read: read it in ranges, or grep it.`,
+    `Read IN FULL (the CLAUDE.md / AGENTS.md / rules chain for the files this change touches, and the root rules): ${readInFull.length > 0 ? readInFull.join(' · ') : 'none'}`,
+    `Open by grep when a hunk touches their subject (nearest docs): ${jumpTo.length > 0 ? jumpTo.join(' · ') : 'none'}`,
     ...(left.length > 0 ? [`Not gathered (${left.length}, over the cap or the file ceiling): ${left.slice(0, 10).map((f) => f.path).join(' · ')}${left.length > 10 ? ' · …' : ''}`] : []),
     '',
   ];
-  // Every doc's first content line in the FINAL file: this block's height + its header's
-  // position in the body + 1 (header line) + 1 (1-based).
+  // Every doc's span in the FINAL file: this block's height + its header's position in the
+  // body + 1 (header line) + 1 (1-based) is the doc's first line; it ends two blank lines
+  // before the next header, or at the last line.
   const bodyLines = body.split('\n');
-  const rows: string[] = [];
   const height = head.length + included.length; // lines this block adds (its trailing newline ends the last row)
-  for (const f of included) {
-    const at = bodyLines.indexOf(`===== ${f.path} =====`);
-    const line = at >= 0 ? height + at + 2 : null;
-    rows.push(`- ${f.path}${line ? ` — line ${line.toLocaleString('en-US')}` : ''} (tier ${f.tier ?? '?'}, ${f.bytes.toLocaleString('en-US')} bytes${f.truncated ? ', head only' : ''})`);
+  const headerAt = included.map((f) => bodyLines.indexOf(`===== ${f.path} =====`));
+  const spans: ConventionSpan[] = [];
+  const rows: string[] = [];
+  included.forEach((f, i) => {
+    const at = headerAt[i];
+    if (at < 0) {
+      rows.push(`- ${f.path} (tier ${f.tier ?? '?'}, ${f.bytes.toLocaleString('en-US')} bytes${f.truncated ? ', head only' : ''})`);
+      return;
+    }
+    const nextAt = headerAt.filter((n) => n > at).sort((a, b) => a - b)[0];
+    const startLine = height + at + 2;
+    // The next header sits at height + nextAt + 1 (1-based); two blank lines precede it.
+    const endLine = nextAt !== undefined ? height + nextAt + 1 - 3 : height + bodyLines.length;
+    spans.push({ endLine, path: f.path, startLine });
+    rows.push(`- ${f.path} — lines ${startLine.toLocaleString('en-US')}–${endLine.toLocaleString('en-US')} (tier ${f.tier ?? '?'}, ${f.bytes.toLocaleString('en-US')} bytes${f.truncated ? ', head only' : ''})`);
+  });
+  return { indexEndLine: height, jumpTo, readInFull, spans, text: [...head, ...rows, ''].join('\n') };
+}
+
+/** The layout of an in-tree conventions file read BACK off the file (the trail's seat
+ *  diagnostics run after the fact, with only the path in hand): where the index ends and each
+ *  doc's span, from the `===== <path> =====` headers. Null when the file cannot be read. */
+export function readConventionsLayout(file: string): { indexEndLine: number; spans: ConventionSpan[] } | null {
+  let lines: string[];
+  try {
+    lines = fs.readFileSync(file, 'utf8').split('\n');
+  } catch {
+    return null;
   }
-  return [...head, ...rows, ''].join('\n');
+  const headers: { line: number; path: string }[] = [];
+  lines.forEach((l, i) => {
+    const m = /^===== (.+) =====$/.exec(l);
+    if (m) headers.push({ line: i + 1, path: m[1] });
+  });
+  if (headers.length === 0) return null;
+  const spans = headers.map((h, i) => ({
+    endLine: i + 1 < headers.length ? headers[i + 1].line - 3 : lines.length,
+    path: h.path,
+    startLine: h.line + 1,
+  }));
+  return { indexEndLine: Math.max(0, headers[0].line - 3), spans };
 }
 
 // The tier a reference confers on its target, given the referring file's tier: an

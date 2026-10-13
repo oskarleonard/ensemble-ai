@@ -272,7 +272,7 @@ export function conventionsPointer(file: string, chars: number, files?: number):
 
   ${file}
 
-Read that file BEFORE reviewing (it is the AGENTS.md / rules / docs web the repo asks a reviewer to read; the manifest of what it contains is conventions.json in the trail). Its INDEX at the top names the docs nearest the files this change touches — read those in full. When a finding rests on a rule, cite it as \`path:line\` with one exact line quoted: path is the ORIGINAL doc named in the \`===== path =====\` header above the rule, line counted from the first line after that header.`;
+Read that file BEFORE reviewing (it is the AGENTS.md / rules / docs web the repo asks a reviewer to read; the manifest of what it contains is conventions.json in the trail). It is larger than one read: read it in ranges, or grep it. Its INDEX at the top lists the docs to read IN FULL (the CLAUDE.md / AGENTS.md / rules chain for the files this change touches) and the nearest docs to open by grep when a hunk touches their subject. When a finding rests on a rule, cite it as \`path:line\` with one exact line quoted: path is the ORIGINAL doc named in the \`===== path =====\` header above the rule, line counted from the first line after that header.`;
 }
 
 // The default `code`-profile review objective. Exported so the `diff` plumbing
@@ -466,8 +466,11 @@ export async function runReviewMode(
       const file = path.join(dir, CONVENTIONS_IN_TREE_FILE);
       // The index first (core/conventions conventionsIndex): nearest docs, root rules, a line per
       // doc — so a seat reads the right sections instead of grepping for the separators.
-      const indexed = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) + agentsMd : agentsMd;
-      fs.writeFileSync(file, indexed, { mode: 0o600 });
+      const index = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) : null;
+      fs.writeFileSync(file, index ? index.text + agentsMd : agentsMd, { mode: 0o600 });
+      if (conventionManifest && index) {
+        conventionManifest.inTree = { file, indexEndLine: index.indexEndLine, jumpTo: index.jumpTo, readInFull: index.readInFull, spans: index.spans };
+      }
       conventionsPath = file;
       const files = conventionManifest ? conventionManifest.files.filter((f) => f.included).length : undefined;
       agentsMd = conventionsPointer(file, agentsMd.length, files);
@@ -639,7 +642,7 @@ export async function runReviewMode(
         runCoreSeat({
           adapter: adapters[id],
           ...(suffix ? { artifactSuffix: suffix } : {}),
-          conventionsInTree: Boolean(conventionsPath),
+          ...(conventionsPath ? { conventionsFile: conventionsPath } : {}),
           log,
           out: opts.out,
           packet: packets[k],
@@ -665,12 +668,14 @@ export async function runReviewMode(
             `  · ⚠ ${id}: THIN READ on part ${idx} — ${describeUsage(usage ?? {})} for ${(chunk?.bytes ?? 0).toLocaleString('en-US')} bytes of diff; the seat returned far too little work for what it was handed`
           );
         }
-        const conventionsRead = s.review.diagnostics?.conventionsRead;
-        if (conventionsRead === false) {
+        const conv = s.review.diagnostics?.conventions;
+        if (conv?.state === 'unread') {
           log(`  · ⚠ ${id}: did NOT open the conventions file on part ${idx} (${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}) — its findings were judged without the repo's rules`);
+        } else if (conv?.state === 'index-only') {
+          log(`  · ⚠ ${id}: opened only the INDEX of the conventions file on part ${idx} — none of the rules it points at`);
         }
         seats[id] = {
-          ...(conventionsRead !== undefined ? { conventions: conventionsRead ? 'read' : 'unread' } : {}),
+          ...(conv ? { conventions: conv.state, conventionsDocs: conv.docsRead.length } : {}),
           ...(depth ? { depth } : {}),
           effort: reviewer.effort,
           ...(s.review.diagnostics ? { elapsedMs: s.review.diagnostics.elapsedMs } : {}),

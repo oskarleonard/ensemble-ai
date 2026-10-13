@@ -7,7 +7,6 @@ import {
   materializedDiffClause,
   readOnlyWorktreeClause,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
-  conventionsFileClause,
 } from './worktree';
 
 // THE ONE CLAUDE PRODUCER (spec §3) — the worktree-mode Claude seat, running the built-in
@@ -68,6 +67,33 @@ export const COLD_PEER_ROLE =
 // script, runbook, or deploy step performs. The maintainer rejected it; the finding worth posting
 // was the gap between the comment and the practice. The self-check now grounds a claimed practice
 // in the repo's operational files, never in sibling comments.
+// STEP 0 (2026-10-13): the conventions as a NUMBERED step. The first four runs after conventions
+// became a file showed the Claude producer following the numbered method and skipping the
+// standalone clause above it — two runs never opened the file, two read only its index. A model
+// handed an ordered method follows the method; so when the run has the file, reading it IS the
+// method's first step, and the standalone clause is not rendered for this prompt (one home).
+// Narrow on purpose: the CLAUDE.md / AGENTS.md / rules chain in full, the nearest docs by grep —
+// "read the nearest docs in full" was ~125 KB of architecture/product pages for a one-component
+// change, which is why it was skipped.
+export function conventionsStep(file: string): string {
+  return `0. Open the conventions file \`${file}\`. It is larger than one read: read it in ranges
+   (offset/limit, or \`sed -n 'A,Bp'\`), or grep it. Read its INDEX (the first ~40 lines) first;
+   then read IN FULL every doc the index lists under "Read IN FULL" — the CLAUDE.md / AGENTS.md /
+   rules chain for the files this change touches, and the root rules. The docs under "Open by
+   grep" you open only when a hunk touches their subject. These are the rules the change is
+   judged against, gathered at the PR BASE. A finding that rests on a rule cites it as path:line
+   with one exact line quoted — path is the ORIGINAL doc named in the \`===== path =====\` header
+   above the rule, line counted from the first line after that header.
+`;
+}
+
+/** The method, with the conventions as step 0 when this run handed them over as a file. */
+export function reviewMethod(conventionsPath?: string): string {
+  const heading = '## How to review (in this order)\n\n';
+  if (!conventionsPath) return OPERATOR_REVIEW_METHOD;
+  return OPERATOR_REVIEW_METHOD.replace(heading, `${heading}${conventionsStep(conventionsPath)}`);
+}
+
 export const OPERATOR_REVIEW_METHOD = `## How to review (in this order)
 
 1. Walk the diff hunk by hunk. For every touched function, read the WHOLE file it lives in —
@@ -197,9 +223,9 @@ cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from)
 
 ${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...(args.scope ? { scope: args.scope } : {}) })}${ci}
 
-${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${args.conventionsPath ? conventionsFileClause(args.conventionsPath) : ''}${history}
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 
-${OPERATOR_REVIEW_METHOD}
+${reviewMethod(args.conventionsPath)}
 
 ${QUALITY_LENS}
 

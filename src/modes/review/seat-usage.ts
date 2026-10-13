@@ -163,17 +163,64 @@ export function describeUsage(u: SeatUsage): string {
   return bits.join(' · ') || 'no usage recorded';
 }
 
-// DID THE SEAT OPEN THE CONVENTIONS FILE? (2026-10-13 fresh-eyes review). Under conventions-as-a-
-// file the only proof a seat read the rules is a tool call that touched the file; THIN never
-// catches a skipped read on a small part (it fires above 50 KB only). Named off the stream, never
-// guessed: `undefined` when the stream is absent or lost its head (the call may be in the cut
-// part), `false` only when the whole stream is there and no call reached the directory.
+// DID THE SEAT READ THE CONVENTIONS? (2026-10-13, twice.) Under conventions-as-a-file the only
+// proof a seat read the rules is a tool call that reached them; THIN never catches a skipped read
+// on a small part (it fires above 50 KB only). First cut counted any touch as "read" — and the
+// first four runs showed the Claude producer opening the first 60–80 lines (the index) and
+// nothing it points at, counted as read, plus a lens whose first bare Read of the 344 KB file
+// ERRORED on size and was counted too. So this is three-valued and span-aware: every successful
+// read of the file becomes a line range (codex `sed -n 'A,Bp'` / `head -n N` / `cat`; a claude-
+// shaped Read's offset/limit; a grep of the file counts as reaching whatever it searched),
+// errored results (`tool_result` with `is_error`) are dropped, and the ranges are laid over the
+// file's own layout (core/conventions readConventionsLayout): `index-only` when every range ends
+// inside the index, `read` with the docs the ranges reached otherwise, `unread` when nothing
+// reached the file. `undefined` when the stream is absent or lost its head — never a guess.
 export const CONVENTIONS_TOUCH_NEEDLE = '.ensemble-conventions';
 
-export function conventionsTouched(stream: string | null | undefined, needle = CONVENTIONS_TOUCH_NEEDLE): boolean | undefined {
+export interface ConventionsLayout {
+  indexEndLine: number;
+  spans: readonly { endLine: number; path: string; startLine: number }[];
+}
+
+export interface ConventionsRead {
+  // The gathered docs (by original path) at least one successful read or grep reached.
+  docsRead: string[];
+  state: 'read' | 'index-only' | 'unread';
+}
+
+// A claude-shaped Read with no limit returns up to this many lines (the CLI's default window).
+const CLAUDE_READ_DEFAULT_LINES = 2000;
+
+interface LineRange {
+  end: number;
+  grep: boolean;
+  start: number;
+}
+
+function codexRanges(command: string, needle: string): LineRange[] {
+  if (!command.includes(needle)) return [];
+  const out: LineRange[] = [];
+  // Every `sed -n 'A,Bp'` / `sed -n A,Bp` / `sed -n 'Ap'` in the command (chained commands count each).
+  for (const m of command.matchAll(/sed\s+-n\s+['"]?(\d+)(?:,(\d+))?p['"]?/g)) {
+    const a = Number(m[1]);
+    out.push({ end: m[2] ? Number(m[2]) : a, grep: false, start: a });
+  }
+  for (const m of command.matchAll(/head\s+-n\s*(\d+)/g)) out.push({ end: Number(m[1]), grep: false, start: 1 });
+  if (/\b(rg|grep|ag)\b/.test(command)) out.push({ end: Number.MAX_SAFE_INTEGER, grep: true, start: 1 });
+  if (out.length === 0 && /\b(cat|less|more|bat)\b/.test(command)) out.push({ end: Number.MAX_SAFE_INTEGER, grep: false, start: 1 });
+  return out;
+}
+
+export function conventionsReadOf(
+  stream: string | null | undefined,
+  layout: ConventionsLayout | null,
+  needle = CONVENTIONS_TOUCH_NEEDLE
+): ConventionsRead | undefined {
   if (!stream) return undefined;
   let first: string | null = null;
-  let touched = false;
+  const ranges: LineRange[] = [];
+  // claude-shaped: a Read/Grep is recorded by tool_use id so an errored tool_result can drop it.
+  const pending = new Map<string, LineRange>();
   for (const line of stream.split('\n')) {
     if (!line.trim()) continue;
     let e: unknown;
@@ -185,13 +232,57 @@ export function conventionsTouched(stream: string | null | undefined, needle = C
     if (!e || typeof e !== 'object') continue;
     const ev = e as Record<string, unknown>;
     if (first === null) first = typeof ev.type === 'string' ? ev.type : '';
-    // Only the seat's OWN calls count — a tool RESULT (`user`) or a result event that happens to
-    // mention the path is the engine or the tree talking, not the seat opening the file.
-    const own = ev.type === 'item.started' || ev.type === 'item.completed' || ev.type === 'assistant' || ev.type === 'stream_event';
-    if (own && line.includes(needle)) touched = true;
+    if ((ev.type === 'item.started' || ev.type === 'item.completed') && ev.item && typeof ev.item === 'object') {
+      const it = ev.item as Record<string, unknown>;
+      if (it.type === 'command_execution' && typeof it.command === 'string' && ev.type === 'item.started') ranges.push(...codexRanges(it.command, needle));
+      continue;
+    }
+    if (ev.type === 'assistant' && ev.message && typeof ev.message === 'object') {
+      const content = (ev.message as Record<string, unknown>).content;
+      if (!Array.isArray(content)) continue;
+      for (const c of content) {
+        if (!c || typeof c !== 'object' || (c as Record<string, unknown>).type !== 'tool_use') continue;
+        const tu = c as Record<string, unknown>;
+        const input = (tu.input && typeof tu.input === 'object' ? tu.input : {}) as Record<string, unknown>;
+        const target = [input.file_path, input.path, input.command].find((v) => typeof v === 'string' && v.includes(needle));
+        if (!target) continue;
+        const id = typeof tu.id === 'string' ? tu.id : `${pending.size}`;
+        if (typeof input.command === 'string') {
+          for (const r of codexRanges(input.command, needle)) pending.set(`${id}:${pending.size}`, r);
+          continue;
+        }
+        if (typeof input.pattern === 'string' || tu.name === 'Grep' || tu.name === 'grep') {
+          pending.set(id, { end: Number.MAX_SAFE_INTEGER, grep: true, start: 1 });
+          continue;
+        }
+        const offset = typeof input.offset === 'number' && input.offset > 0 ? input.offset : 1;
+        const limit = typeof input.limit === 'number' && input.limit > 0 ? input.limit : CLAUDE_READ_DEFAULT_LINES;
+        pending.set(id, { end: offset + limit - 1, grep: false, start: offset });
+      }
+      continue;
+    }
+    if (ev.type === 'user' && ev.message && typeof ev.message === 'object') {
+      const content = (ev.message as Record<string, unknown>).content;
+      if (!Array.isArray(content)) continue;
+      for (const c of content) {
+        if (!c || typeof c !== 'object') continue;
+        const tr = c as Record<string, unknown>;
+        if (tr.type !== 'tool_result' || typeof tr.tool_use_id !== 'string') continue;
+        if (tr.is_error === true) {
+          for (const k of [...pending.keys()]) if (k === tr.tool_use_id || k.startsWith(`${tr.tool_use_id}:`)) pending.delete(k);
+        }
+      }
+    }
   }
+  ranges.push(...pending.values());
   if (first === null) return undefined;
   const headIntact = first === 'system' || first === 'thread.started';
-  if (touched) return true;
-  return headIntact ? false : undefined;
+  if (ranges.length === 0) return headIntact ? { docsRead: [], state: 'unread' } : undefined;
+  if (!layout) return { docsRead: [], state: 'read' };
+  const beyondIndex = ranges.some((r) => r.grep || r.end > layout.indexEndLine);
+  if (!beyondIndex) return { docsRead: [], state: 'index-only' };
+  const docsRead = layout.spans
+    .filter((sp) => ranges.some((r) => !r.grep && r.start <= sp.endLine && r.end >= sp.startLine))
+    .map((sp) => sp.path);
+  return { docsRead, state: 'read' };
 }
