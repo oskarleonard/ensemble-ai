@@ -184,6 +184,10 @@ describe('runHolisticLens — the seat run', () => {
     expect(review.ok).toBe(true);
     expect(review.findings).toHaveLength(1);
     expect(run).toHaveBeenCalledOnce();
+    // The lens keeps its run facts like every other seat (2026-10-13) — timing always, usage
+    // when its runner kept a stream (this stub kept none, so no usage is claimed).
+    expect(typeof review.diagnostics?.elapsedMs).toBe('number');
+    expect(review.diagnostics?.usage).toBeUndefined();
   });
 
   it('hands the packet FILES to the seat, and claims history in the prompt only when it has bytes', async () => {

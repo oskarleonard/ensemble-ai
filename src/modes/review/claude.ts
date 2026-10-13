@@ -17,7 +17,7 @@ import {
   USAGE_LIMIT_FAIL_PREFIX,
 } from '../../core/claude-stream';
 import { CLAUDE_REVIEW_DENIED_TOOLS, homeReadDenyRules } from '../../core/claude-fence';
-import { runReviewerExec } from '../../core/spawn';
+import { boundedStreamTail, runReviewerExec } from '../../core/spawn';
 import { type RunReviewOpts, REVIEW_TIMEOUT_MS } from '../../reviewers/codex';
 
 import type { SandboxProfileRef } from './evidence';
@@ -176,6 +176,10 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 // short wait, up to TRANSIENT_RETRY_DELAYS_MS.length extra attempts. Anything else —
 // a timeout, a long attempt, a real reply — is returned as-is. The retry is surfaced
 // on stderrTail so the trail records that the seat needed it.
+// The bounded stream-json tail persisted as `<seat>-stream.jsonl` — the same 1 MB as codex and
+// grok (2026-10-11), so a 45-turn read keeps its head and its tool calls stay countable.
+const CLAUDE_STREAM_TAIL_LIMIT = 1_000_000;
+
 export async function runClaudeReviewVoice(
   prompt: string,
   config: VoiceConfig,
@@ -296,6 +300,7 @@ export async function runClaudeReviewVoice(
           ok: false,
           raw: null,
           stderrTail,
+          ...(typeof raw === 'string' && raw ? { stream: boundedStreamTail(raw, CLAUDE_STREAM_TAIL_LIMIT) } : {}),
           timedOut: true,
         };
       }
@@ -305,6 +310,9 @@ export async function runClaudeReviewVoice(
         ok: reply !== null && !timedOut,
         raw: reply,
         stderrTail: retryNote ? `${retryNote}${stderrTail ?? ''}` : stderrTail,
+        // The stream-json transcript the reply was extracted from — tokens, turns and tool calls
+        // for the read-depth telemetry (seat-usage.ts), persisted beside the reply like codex's.
+        ...(typeof raw === 'string' && raw ? { stream: boundedStreamTail(raw, CLAUDE_STREAM_TAIL_LIMIT) } : {}),
         timedOut,
       };
     }

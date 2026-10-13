@@ -9,7 +9,10 @@ import type { VoiceConfig } from '../brainstorm/types';
 // Mock the shared spawn so we can inspect the argv + cwd of a REAL runClaudeReviewVoice call
 // without launching a `claude` binary. This is the only way to prove "the cwd is never the
 // worktree" — the property lives in the spawn, not in the pure arg builder.
-vi.mock('../../core/spawn', () => ({ runReviewerExec: vi.fn() }));
+vi.mock('../../core/spawn', async (importActual) => ({
+  ...(await importActual<typeof import('../../core/spawn')>()),
+  runReviewerExec: vi.fn(),
+}));
 vi.mock('../brainstorm/claude', async (importActual) => ({
   ...(await importActual<typeof import('../brainstorm/claude')>()),
   resolveClaudeBin: () => '/usr/bin/claude',

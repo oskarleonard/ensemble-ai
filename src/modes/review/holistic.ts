@@ -9,6 +9,8 @@ import { VOICE_DEFAULTS, VOICES_FILE } from '../brainstorm/voices';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { CLAUDE_EFFORTS } from './claude';
+import { seatDiagnostics } from './seat-run';
+import { describeRun } from './self-contained';
 import { HISTORY_PACKET_CLAUSE, historyPacketHasData, type HistoryPacket } from './history-packet';
 import type { VoiceReview } from './synthesis';
 import {
@@ -303,7 +305,7 @@ export interface RunHolisticLensOptions {
 // ok:false voice, never a throw and never a silently-empty clean pass.
 export async function runHolisticLens(
   opts: RunHolisticLensOptions
-): Promise<{ raw: string | null; review: VoiceReview }> {
+): Promise<{ raw: string | null; review: VoiceReview; stream?: string | null }> {
   const log = opts.log ?? (() => {});
   const hasHistory = historyPacketHasData(opts.historyPacket);
   const prompt = renderHolisticPrompt({
@@ -322,6 +324,7 @@ export async function runHolisticLens(
   });
 
   let res: VoiceRunResult;
+  const startedAt = Date.now();
   try {
     res = await opts.run(prompt, opts.config, {
       ...(opts.historyPacket ? { historyPacket: opts.historyPacket.files } : {}),
@@ -332,19 +335,25 @@ export async function runHolisticLens(
     log(`  · holistic: failed to run — ${(e as Error).message}`);
     return fail(`the holistic lens did not run: ${(e as Error).message}`);
   }
+  // The lens's run facts — timing and read depth off its stream — on review.holistic.json, the
+  // same record every other seat keeps (2026-10-13: the fast runs could not say how long it read).
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt });
+  const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = (res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output'));
     log(`  · holistic: ${why}`);
-    return { ...fail(`the holistic lens ${why}`), raw: res.raw ?? null };
+    const f = fail(`the holistic lens ${why}`);
+    return { raw: res.raw ?? null, review: { ...f.review, diagnostics }, stream };
   }
   const parsed = parseFindings(res.raw);
   if (parsed.parseError) {
     log(`  · holistic: ${parsed.parseError}`);
-    return { raw: res.raw, review: { findings: [], ok: false, summary: `output not parseable (${parsed.parseError})`, voiceId: HOLISTIC_SEAT_ID } };
+    return { raw: res.raw, review: { diagnostics, findings: [], ok: false, summary: `output not parseable (${parsed.parseError})`, voiceId: HOLISTIC_SEAT_ID }, stream };
   }
-  log(`  · holistic: reviewed the whole tree — ${parsed.findings.length} finding(s)`);
+  log(`  · holistic: reviewed the whole tree — ${parsed.findings.length} finding(s) · ${describeRun(diagnostics)}`);
   return {
     raw: res.raw,
-    review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: HOLISTIC_SEAT_ID },
+    review: { diagnostics, findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: HOLISTIC_SEAT_ID },
+    stream,
   };
 }

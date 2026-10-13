@@ -28,6 +28,9 @@ import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { resolveCiEvidence } from './ci-evidence';
 import { claudeWorktreePromptSuffix, runClaudeReviewVoice } from './claude';
+import { seatDiagnostics } from './seat-run';
+import { describeUsage } from './seat-usage';
+import type { SeatDiagnostics } from '../../core/types';
 import { renderCodeReviewSeatPrompt } from './code-review-seat';
 import {
   type GateRunner,
@@ -142,10 +145,14 @@ export function persistSeatReview(
   runId: string,
   seatId: string,
   review: VoiceReview,
-  raw: string | null
+  raw: string | null,
+  // The seat's bounded progress stream, when its runner kept one — `<seat>-stream.jsonl`, the
+  // same file the core seats leave, so the read-depth telemetry has one source for every seat.
+  stream?: string | null
 ): void {
   writeTrailFile(baseDir, runId, `findings.${seatId}.json`, JSON.stringify(review.findings, null, 2));
   if (raw !== null) writeTrailFile(baseDir, runId, `${seatId}-review.raw.md`, raw);
+  if (typeof stream === 'string' && stream) writeTrailFile(baseDir, runId, `${seatId}-stream.jsonl`, stream);
   writeTrailFile(baseDir, runId, `review.${seatId}.json`, JSON.stringify(review, null, 2));
 }
 
@@ -225,8 +232,9 @@ async function runClaudeReviewer(
   worktree?: string,
   // The history packet seeded into this seat's cwd, when one was built (./history-packet).
   historyPacket?: HistoryPacket
-): Promise<{ review: VoiceReview; raw: string | null; spawned: boolean }> {
+): Promise<{ review: VoiceReview; raw: string | null; spawned: boolean; stream: string | null }> {
   let res: VoiceRunResult;
+  const startedAt = Date.now();
   try {
     res = await run(reviewPrompt, config, {
       timeoutMs,
@@ -243,12 +251,17 @@ async function runClaudeReviewer(
       raw: null,
       review: { findings: [], ok: false, summary: `claude did not run: ${(e as Error).message}`, voiceId: 'claude' },
       spawned: false,
+      stream: null,
     };
   }
+  // The seat's run facts — the same record the core seats keep — so review.claude.json says how
+  // long the read took and how deep it went, not only what it found.
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt });
+  const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output');
     log(`  · claude: ${why}`);
-    return { raw: res.raw ?? null, review: { findings: [], ok: false, summary: `claude ${why}`, voiceId: 'claude' }, spawned: true };
+    return { raw: res.raw ?? null, review: { diagnostics, findings: [], ok: false, summary: `claude ${why}`, voiceId: 'claude' }, spawned: true, stream };
   }
   const parsed = parseFindings(res.raw);
   if (parsed.parseError) {
@@ -260,12 +273,19 @@ async function runClaudeReviewer(
     const detail = parsed.summary ? `; model said: ${parsed.summary}` : '';
     return {
       raw: res.raw,
-      review: { findings: [], ok: false, summary: `output not parseable (${parsed.parseError})${detail}`, voiceId: 'claude' },
+      review: { diagnostics, findings: [], ok: false, summary: `output not parseable (${parsed.parseError})${detail}`, voiceId: 'claude' },
       spawned: true,
+      stream,
     };
   }
-  log(`  · claude: reviewed — ${parsed.findings.length} finding(s)`);
-  return { raw: res.raw, review: { findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: 'claude' }, spawned: true };
+  log(`  · claude: reviewed — ${parsed.findings.length} finding(s) · ${describeRun(diagnostics)}`);
+  return { raw: res.raw, review: { diagnostics, findings: parsed.findings, ok: true, summary: parsed.summary, voiceId: 'claude' }, spawned: true, stream };
+}
+
+/** `4 min · 9,120 out · 331,320 in (83% cached) · 31 tool calls` — one spelling for the log. */
+export function describeRun(d: SeatDiagnostics): string {
+  const mins = Math.max(1, Math.round(d.elapsedMs / 60_000));
+  return `${mins} min · ${describeUsage(d.usage ?? {})}`;
 }
 
 // ── The whole layer: Opus reviewer + per-reviewer files + the gate ────────────────────
@@ -403,7 +423,7 @@ export interface ClaudeLayerResult {
   claudeReview: VoiceReview | null;
   // The producer's outcome PER PART on a review in parts (chunks.ts) — what the chunk trail and
   // the coverage overview record for the claude seat on each part. Absent on a single-part review.
-  claudeParts?: { findings: number; index: number; ok: boolean; summary: string }[];
+  claudeParts?: { diagnostics?: SeatDiagnostics; findings: number; index: number; ok: boolean; summary: string }[];
   // Whether the claude PRODUCER seat actually spawned (see GateRunResult.gateSpawned, which this
   // mirrors). Its REALIZED evidence is derived from this: a producer whose spawn threw — claude is
   // not installed, or the capability fence refused an unfenceable read root — read NOTHING, and must
@@ -556,7 +576,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
         ? `  · claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (cold single-pass peer)…`
         : `  · claude (anthropic/${modelLabel}) reviewing the diff (cold)…`
     );
-    const { review, raw, spawned } = await runClaudeReviewer(
+    const { review, raw, spawned, stream } = await runClaudeReviewer(
       producerPromptFor(parts[0]),
       opts.claudeConfig,
       run,
@@ -569,7 +589,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
     claudeSpawned = spawned;
     claudeReview = withSeatAdvisor(review, opts.claudeConfig);
     try {
-      persistSeatReview(opts.baseDir, opts.runId, 'claude', claudeReview, raw);
+      persistSeatReview(opts.baseDir, opts.runId, 'claude', claudeReview, raw, stream);
     } catch (e) {
       const why = (e as Error).message;
       log(`  · claude: trail persist FAILED (${why}) — reviewer counted INCOMPLETE`);
@@ -591,7 +611,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
     // at a time (the producer was the long pole of a review in parts: ~17 min per part, one after
     // another). Bounded, not all at once: each is a headless claude spawn with its own context.
     // Results are kept in PART ORDER whatever order they finish in.
-    const partReviews: { part: ProducerPart; raw: string | null; review: VoiceReview; spawned: boolean }[] = new Array(n);
+    const partReviews: { part: ProducerPart; raw: string | null; review: VoiceReview; spawned: boolean; stream: string | null }[] = new Array(n);
     let next = 0;
     const worker = async (): Promise<void> => {
       while (next < n) {
@@ -612,6 +632,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
         try {
           writeTrailFile(opts.baseDir, opts.runId, `findings.claude.c${part.index}.json`, JSON.stringify(res.review.findings, null, 2));
           if (res.raw !== null) writeTrailFile(opts.baseDir, opts.runId, `claude-review.c${part.index}.raw.md`, res.raw);
+          if (res.stream) writeTrailFile(opts.baseDir, opts.runId, `claude-stream.c${part.index}.jsonl`, res.stream);
         } catch (e) {
           log(`  · claude: part ${part.index} trail write failed (${(e as Error).message}) — continuing`);
         }
@@ -619,7 +640,13 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
     };
     await Promise.all(Array.from({ length: Math.min(PRODUCER_PART_CONCURRENCY, n) }, () => worker()));
     claudeSpawned = partReviews.some((p) => p.spawned);
-    claudeParts = partReviews.map((p) => ({ findings: p.review.findings.length, index: p.part.index, ok: p.review.ok, summary: p.review.summary }));
+    claudeParts = partReviews.map((p) => ({
+      ...(p.review.diagnostics ? { diagnostics: p.review.diagnostics } : {}),
+      findings: p.review.findings.length,
+      index: p.part.index,
+      ok: p.review.ok,
+      summary: p.review.summary,
+    }));
     const failed = partReviews.filter((p) => !p.review.ok);
     const findings: ReviewFinding[] = [];
     for (const p of partReviews) {
@@ -707,7 +734,7 @@ export async function runHolisticStage(opts: HolisticStageOptions): Promise<Holi
     if (!holistic.config) throw new Error('holistic lens: a run with worktree evidence needs the resolved lens seat (`holistic.config`)');
     const lensConfig = holistic.config;
     log(`  · holistic lens (anthropic/${lensConfig.model} @ ${lensConfig.effort}) reading the whole project…`);
-    const { raw, review } = await runHolisticLens({
+    const { raw, review, stream } = await runHolisticLens({
       baseSha: plan.baseSha,
       config: lensConfig,
       diff: plan.diff,
@@ -725,7 +752,7 @@ export async function runHolisticStage(opts: HolisticStageOptions): Promise<Holi
     });
     holisticReview = withSeatAdvisor(review, lensConfig);
     try {
-      persistSeatReview(opts.baseDir, opts.runId, HOLISTIC_SEAT_ID, holisticReview, raw);
+      persistSeatReview(opts.baseDir, opts.runId, HOLISTIC_SEAT_ID, holisticReview, raw, stream);
     } catch (e) {
       const why = (e as Error).message;
       log(`  · holistic: trail persist FAILED (${why}) — the lens's findings are dropped from this run`);
