@@ -65,7 +65,7 @@ export interface RunCoreSeatArgs {
 
 // Wall-clock of one adapter attempt, persisted with the seat's artifact: the trail's answer to
 // "how long did it actually run" — which a timeout summary alone cannot give.
-interface SeatTiming {
+export interface SeatTiming {
   endedAt: number;
   startedAt: number;
 }
@@ -111,7 +111,7 @@ function timedOutSummary(result: CodexReviewResult, timing: SeatTiming): string 
 // channel bounded by the adapter (2000 chars) — kept here rather than dropped, because on a
 // timeout it is the only text the seat left behind. Pre-flight warnings ride their own field, so
 // the summaries below (which quote the head of stderrTail) never show a warning in the seat's place.
-function seatDiagnostics(result: CodexReviewResult, timing: SeatTiming): SeatDiagnostics {
+export function seatDiagnostics(result: CodexReviewResult, timing: SeatTiming): SeatDiagnostics {
   const usage = parseSeatUsage(result.stream);
   return {
     elapsedMs: timing.endedAt - timing.startedAt,

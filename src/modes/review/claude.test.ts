@@ -236,6 +236,8 @@ describe('runClaudeReviewVoice — stream-json integration', () => {
     const res = await runClaudeReviewVoice('p', CFG(), {}, { exec, retryDelaysMs: [0, 0] });
     expect(res.ok).toBe(true);
     expect(res.raw).toBe('FINAL REVIEW TEXT');
+    // The transcript rides beside the reply — the read-depth telemetry's source (seat-usage.ts).
+    expect(res.stream).toBe(GOOD_STREAM);
   });
 
   it('retries a fast error-shaped result event (529 via api_error_status)', async () => {

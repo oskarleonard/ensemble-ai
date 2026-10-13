@@ -7,7 +7,7 @@
 // agreement-corroboration guard (reconcileSynthesis) + the deterministic fallback; the gate
 // prompt + envelope parse live in ./gate-prompt and ./gate. No node imports (pure).
 
-import type { ReviewFinding } from '../../core/types';
+import type { ReviewFinding, SeatDiagnostics } from '../../core/types';
 
 // One voice's review of the diff, labeled by voice id (codex/grok/claude), reduced
 // to what the synthesizer needs. Built from a StoredReview (codex/grok) or the
@@ -17,6 +17,10 @@ export interface VoiceReview {
   // (review.claude.json / review.holistic.json) beside the review; absent = the seat inherited the
   // operator's settings — so the trail tells "off" from inherit. Never set on codex/grok.
   advisor?: string;
+  // The seat's run FACTS (timing, stderr tail, read-depth usage off its stream) — the same record
+  // the core seats keep (seat-run.ts seatDiagnostics). Set on the Anthropic stages since
+  // 2026-10-13; absent on a voice whose runner never spawned, and on older trails.
+  diagnostics?: SeatDiagnostics;
   findings: ReviewFinding[];
   ok: boolean;
   summary: string;

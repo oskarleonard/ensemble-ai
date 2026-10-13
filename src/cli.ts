@@ -187,6 +187,8 @@ import {
   verifyExitCode,
   verifyReceipt,
 } from './plumbing/verify';
+import { readDepthOf } from './modes/review/seat-usage';
+import type { SeatDiagnostics } from './core/types';
 
 const USAGE = `ensemble-ai — convene multiple AI models on a task. Read-only, with one
 named exception: \`probe\` (and the review pipeline's settler stage) EXECUTES the PR's code
@@ -2120,6 +2122,17 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       const trail = readTrailJson<ChunksTrail>(out, runId, CHUNKS_TRAIL_FILE);
       if (trail && Array.isArray(trail.chunks)) {
         const claudeReview = claudeLayer?.claudeReview ?? null;
+        // The claude seat's pin and run facts, the same columns the core seats fill: model/effort
+        // from the resolved seat, timing + usage + read depth from the stage's diagnostics.
+        const claudePin = anthropicSeats ? { effort: anthropicSeats.claude.config.effort, model: anthropicSeats.claude.config.model } : {};
+        const claudeFacts = (d: SeatDiagnostics | undefined, bytes: number) =>
+          d
+            ? {
+                depth: readDepthOf(d.usage ?? {}, bytes, Boolean(worktree)),
+                elapsedMs: d.elapsedMs,
+                ...(d.usage ? { usage: d.usage } : {}),
+              }
+            : {};
         for (const c of trail.chunks) {
           if (!claudeLayerExpected) continue;
           // Per PART when the producer ran in parts — the trail must say which part failed, not
@@ -2127,12 +2140,16 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
           const part = claudeLayer?.claudeParts?.find((p) => p.index === c.index);
           c.seats.claude = part
             ? {
+                ...claudePin,
+                ...claudeFacts(part.diagnostics, c.bytes),
                 findings: part.findings,
                 state: part.ok ? 'reviewed' : 'failed-reviewer',
                 ...(part.ok ? {} : { why: clean(part.summary).slice(0, 160) }),
               }
             : claudeReview
               ? {
+                  ...claudePin,
+                  ...claudeFacts(claudeReview.diagnostics, c.bytes),
                   findings: claudeReview.findings.filter((f) => (f.chunk ?? 1) === c.index).length,
                   state: claudeReview.ok ? 'reviewed' : 'failed-reviewer',
                   ...(claudeReview.ok ? {} : { why: clean(claudeReview.summary).slice(0, 160) }),
