@@ -1000,29 +1000,61 @@ function conventionsIndex(body, manifest, changedPaths) {
   const included = manifest.files.filter((f) => f.included);
   const changed = changedPaths.map((c) => c.replace(/\\/g, "/").replace(/^\.\//, ""));
   const homes = new Map(included.map((f) => [f.path, docHome(f.path)]));
+  const depth = (f) => (homes.get(f.path) ?? "").split("/").length;
   const near = included.filter((f) => {
     const h = homes.get(f.path) ?? "";
     return h !== "" && changed.some((c) => c.startsWith(`${h}/`));
-  }).sort((a, b) => (homes.get(b.path) ?? "").split("/").length - (homes.get(a.path) ?? "").split("/").length || a.path.localeCompare(b.path)).slice(0, INDEX_MAX_NEAREST);
+  }).sort((a, b) => depth(b) - depth(a) || a.path.localeCompare(b.path));
   const root = included.filter((f) => (homes.get(f.path) ?? "") === "" && f.tier === 0);
+  const readInFull = [...near.filter((f) => f.tier === 0), ...root].map((f) => f.path);
+  const jumpTo = near.filter((f) => f.tier !== 0).slice(0, INDEX_MAX_NEAREST).map((f) => f.path);
   const left = manifest.files.filter((f) => !f.included && f.reason !== "duplicate");
   const head = [
     "# Conventions index",
-    `${included.length} doc(s) gathered at the PR base, ${manifest.totalBytes.toLocaleString("en-US")} bytes. Each doc follows a \`===== <path> =====\` header. Cite a rule as that path:line, the line counted from the first line after its header.`,
-    `Nearest to the files this change touches \u2014 read these in full first: ${near.length > 0 ? near.map((f) => f.path).join(" \xB7 ") : "none below the root"}`,
-    `Root rules (every change): ${root.length > 0 ? root.map((f) => f.path).join(" \xB7 ") : "none"}`,
+    `${included.length} doc(s) gathered at the PR base, ${manifest.totalBytes.toLocaleString("en-US")} bytes. Each doc follows a \`===== <path> =====\` header. Cite a rule as that path:line, the line counted from the first line after its header. The file is larger than one read: read it in ranges, or grep it.`,
+    `Read IN FULL (the CLAUDE.md / AGENTS.md / rules chain for the files this change touches, and the root rules): ${readInFull.length > 0 ? readInFull.join(" \xB7 ") : "none"}`,
+    `Open by grep when a hunk touches their subject (nearest docs): ${jumpTo.length > 0 ? jumpTo.join(" \xB7 ") : "none"}`,
     ...left.length > 0 ? [`Not gathered (${left.length}, over the cap or the file ceiling): ${left.slice(0, 10).map((f) => f.path).join(" \xB7 ")}${left.length > 10 ? " \xB7 \u2026" : ""}`] : [],
     ""
   ];
   const bodyLines = body.split("\n");
-  const rows = [];
   const height = head.length + included.length;
-  for (const f of included) {
-    const at = bodyLines.indexOf(`===== ${f.path} =====`);
-    const line = at >= 0 ? height + at + 2 : null;
-    rows.push(`- ${f.path}${line ? ` \u2014 line ${line.toLocaleString("en-US")}` : ""} (tier ${f.tier ?? "?"}, ${f.bytes.toLocaleString("en-US")} bytes${f.truncated ? ", head only" : ""})`);
+  const headerAt = included.map((f) => bodyLines.indexOf(`===== ${f.path} =====`));
+  const spans = [];
+  const rows = [];
+  included.forEach((f, i) => {
+    const at = headerAt[i];
+    if (at < 0) {
+      rows.push(`- ${f.path} (tier ${f.tier ?? "?"}, ${f.bytes.toLocaleString("en-US")} bytes${f.truncated ? ", head only" : ""})`);
+      return;
+    }
+    const nextAt = headerAt.filter((n) => n > at).sort((a, b) => a - b)[0];
+    const startLine = height + at + 2;
+    const endLine = nextAt !== void 0 ? height + nextAt + 1 - 3 : height + bodyLines.length;
+    spans.push({ endLine, path: f.path, startLine });
+    rows.push(`- ${f.path} \u2014 lines ${startLine.toLocaleString("en-US")}\u2013${endLine.toLocaleString("en-US")} (tier ${f.tier ?? "?"}, ${f.bytes.toLocaleString("en-US")} bytes${f.truncated ? ", head only" : ""})`);
+  });
+  return { indexEndLine: height, jumpTo, readInFull, spans, text: [...head, ...rows, ""].join("\n") };
+}
+function readConventionsLayout(file) {
+  let lines;
+  try {
+    lines = fs.readFileSync(file, "utf8").split("\n");
+  } catch {
+    return null;
   }
-  return [...head, ...rows, ""].join("\n");
+  const headers = [];
+  lines.forEach((l, i) => {
+    const m = /^===== (.+) =====$/.exec(l);
+    if (m) headers.push({ line: i + 1, path: m[1] });
+  });
+  if (headers.length === 0) return null;
+  const spans = headers.map((h, i) => ({
+    endLine: i + 1 < headers.length ? headers[i + 1].line - 3 : lines.length,
+    path: h.path,
+    startLine: h.line + 1
+  }));
+  return { indexEndLine: Math.max(0, headers[0].line - 3), spans };
 }
 function tierOfRef(parent, kind) {
   if (kind === "include") return parent;
@@ -3811,8 +3843,10 @@ function conventionsFileClause(file) {
 
 The repository's conventions (AGENTS.md, rules, docs the repo asks a reviewer to read, gathered at
 the PR BASE so the PR's own edits to them are not the rules it is judged by) are in ONE file:
-\`${file}\`. Read it before reviewing: its INDEX at the top names the docs nearest the files this change
-touches \u2014 read those in full. When a finding rests on a rule, cite it as \`path:line\` with one
+\`${file}\`. Read it before reviewing. It is larger than one read: read it in ranges (offset/limit), or grep
+it. Its INDEX at the top lists the docs to read IN FULL (the CLAUDE.md / AGENTS.md / rules chain
+for the files this change touches, and the root rules) and the nearest docs to open by grep when a
+hunk touches their subject. When a finding rests on a rule, cite it as \`path:line\` with one
 exact line quoted, where path is the ORIGINAL doc named in the \`===== path =====\` header above
 the rule and line is counted from the first line after that header. The host re-reads it there.`;
 }
@@ -4882,10 +4916,24 @@ function describeUsage(u) {
   return bits.join(" \xB7 ") || "no usage recorded";
 }
 var CONVENTIONS_TOUCH_NEEDLE = ".ensemble-conventions";
-function conventionsTouched(stream, needle = CONVENTIONS_TOUCH_NEEDLE) {
+var CLAUDE_READ_DEFAULT_LINES = 2e3;
+function codexRanges(command, needle) {
+  if (!command.includes(needle)) return [];
+  const out = [];
+  for (const m of command.matchAll(/sed\s+-n\s+['"]?(\d+)(?:,(\d+))?p['"]?/g)) {
+    const a = Number(m[1]);
+    out.push({ end: m[2] ? Number(m[2]) : a, grep: false, start: a });
+  }
+  for (const m of command.matchAll(/head\s+-n\s*(\d+)/g)) out.push({ end: Number(m[1]), grep: false, start: 1 });
+  if (/\b(rg|grep|ag)\b/.test(command)) out.push({ end: Number.MAX_SAFE_INTEGER, grep: true, start: 1 });
+  if (out.length === 0 && /\b(cat|less|more|bat)\b/.test(command)) out.push({ end: Number.MAX_SAFE_INTEGER, grep: false, start: 1 });
+  return out;
+}
+function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
   if (!stream) return void 0;
   let first = null;
-  let touched = false;
+  const ranges = [];
+  const pending = /* @__PURE__ */ new Map();
   for (const line of stream.split("\n")) {
     if (!line.trim()) continue;
     let e;
@@ -4897,13 +4945,57 @@ function conventionsTouched(stream, needle = CONVENTIONS_TOUCH_NEEDLE) {
     if (!e || typeof e !== "object") continue;
     const ev = e;
     if (first === null) first = typeof ev.type === "string" ? ev.type : "";
-    const own = ev.type === "item.started" || ev.type === "item.completed" || ev.type === "assistant" || ev.type === "stream_event";
-    if (own && line.includes(needle)) touched = true;
+    if ((ev.type === "item.started" || ev.type === "item.completed") && ev.item && typeof ev.item === "object") {
+      const it = ev.item;
+      if (it.type === "command_execution" && typeof it.command === "string" && ev.type === "item.started") ranges.push(...codexRanges(it.command, needle));
+      continue;
+    }
+    if (ev.type === "assistant" && ev.message && typeof ev.message === "object") {
+      const content = ev.message.content;
+      if (!Array.isArray(content)) continue;
+      for (const c of content) {
+        if (!c || typeof c !== "object" || c.type !== "tool_use") continue;
+        const tu = c;
+        const input = tu.input && typeof tu.input === "object" ? tu.input : {};
+        const target = [input.file_path, input.path, input.command].find((v) => typeof v === "string" && v.includes(needle));
+        if (!target) continue;
+        const id = typeof tu.id === "string" ? tu.id : `${pending.size}`;
+        if (typeof input.command === "string") {
+          for (const r of codexRanges(input.command, needle)) pending.set(`${id}:${pending.size}`, r);
+          continue;
+        }
+        if (typeof input.pattern === "string" || tu.name === "Grep" || tu.name === "grep") {
+          pending.set(id, { end: Number.MAX_SAFE_INTEGER, grep: true, start: 1 });
+          continue;
+        }
+        const offset = typeof input.offset === "number" && input.offset > 0 ? input.offset : 1;
+        const limit = typeof input.limit === "number" && input.limit > 0 ? input.limit : CLAUDE_READ_DEFAULT_LINES;
+        pending.set(id, { end: offset + limit - 1, grep: false, start: offset });
+      }
+      continue;
+    }
+    if (ev.type === "user" && ev.message && typeof ev.message === "object") {
+      const content = ev.message.content;
+      if (!Array.isArray(content)) continue;
+      for (const c of content) {
+        if (!c || typeof c !== "object") continue;
+        const tr = c;
+        if (tr.type !== "tool_result" || typeof tr.tool_use_id !== "string") continue;
+        if (tr.is_error === true) {
+          for (const k of [...pending.keys()]) if (k === tr.tool_use_id || k.startsWith(`${tr.tool_use_id}:`)) pending.delete(k);
+        }
+      }
+    }
   }
+  ranges.push(...pending.values());
   if (first === null) return void 0;
   const headIntact = first === "system" || first === "thread.started";
-  if (touched) return true;
-  return headIntact ? false : void 0;
+  if (ranges.length === 0) return headIntact ? { docsRead: [], state: "unread" } : void 0;
+  if (!layout) return { docsRead: [], state: "read" };
+  const beyondIndex = ranges.some((r) => r.grep || r.end > layout.indexEndLine);
+  if (!beyondIndex) return { docsRead: [], state: "index-only" };
+  const docsRead = layout.spans.filter((sp) => ranges.some((r) => !r.grep && r.start <= sp.endLine && r.end >= sp.startLine)).map((sp) => sp.path);
+  return { docsRead, state: "read" };
 }
 
 // src/modes/review/seat-run.ts
@@ -4932,11 +5024,11 @@ function timedOutSummary(result, timing) {
 }
 function seatDiagnostics(result, timing, opts = {}) {
   const usage = parseSeatUsage(result.stream);
-  const touched = opts.conventionsInTree ? conventionsTouched(result.stream) : void 0;
+  const conventions = opts.conventionsFile ? conventionsReadOf(result.stream, readConventionsLayout(opts.conventionsFile)) : void 0;
   return {
     elapsedMs: timing.endedAt - timing.startedAt,
     ...Object.keys(usage).length > 0 ? { usage } : {},
-    ...touched !== void 0 ? { conventionsRead: touched } : {},
+    ...conventions ? { conventions } : {},
     endedAt: new Date(timing.endedAt).toISOString(),
     ...result.failWhy ? { failWhy: result.failWhy } : {},
     ...result.preflightWarnings?.length ? { preflightWarnings: [...result.preflightWarnings] } : {},
@@ -4951,7 +5043,7 @@ function persistAttempt(args, prompt, result, timing) {
   const summary = result.timedOut ? timedOutSummary(result, timing) : parsed?.summary || result.failWhy || `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || "no output"}`;
   return persistReview(args.out, {
     ...args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {},
-    diagnostics: seatDiagnostics(result, timing, { conventionsInTree: args.conventionsInTree }),
+    diagnostics: seatDiagnostics(result, timing, { conventionsFile: args.conventionsFile }),
     findings: parsed?.findings ?? [],
     packet: args.packet,
     prompt,
@@ -5039,6 +5131,22 @@ import path18 from "path";
 
 // src/modes/review/code-review-seat.ts
 var COLD_PEER_ROLE = "You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.";
+function conventionsStep(file) {
+  return `0. Open the conventions file \`${file}\`. It is larger than one read: read it in ranges
+   (offset/limit, or \`sed -n 'A,Bp'\`), or grep it. Read its INDEX (the first ~40 lines) first;
+   then read IN FULL every doc the index lists under "Read IN FULL" \u2014 the CLAUDE.md / AGENTS.md /
+   rules chain for the files this change touches, and the root rules. The docs under "Open by
+   grep" you open only when a hunk touches their subject. These are the rules the change is
+   judged against, gathered at the PR BASE. A finding that rests on a rule cites it as path:line
+   with one exact line quoted \u2014 path is the ORIGINAL doc named in the \`===== path =====\` header
+   above the rule, line counted from the first line after that header.
+`;
+}
+function reviewMethod(conventionsPath) {
+  const heading = "## How to review (in this order)\n\n";
+  if (!conventionsPath) return OPERATOR_REVIEW_METHOD;
+  return OPERATOR_REVIEW_METHOD.replace(heading, `${heading}${conventionsStep(conventionsPath)}`);
+}
 var OPERATOR_REVIEW_METHOD = `## How to review (in this order)
 
 1. Walk the diff hunk by hunk. For every touched function, read the WHOLE file it lives in \u2014
@@ -5114,9 +5222,9 @@ cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from)
 
 ${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...args.scope ? { scope: args.scope } : {} })}${ci}
 
-${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${args.conventionsPath ? conventionsFileClause(args.conventionsPath) : ""}${history}
+${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 
-${OPERATOR_REVIEW_METHOD}
+${reviewMethod(args.conventionsPath)}
 
 ${QUALITY_LENS}
 
@@ -5130,7 +5238,8 @@ ${SCHEMA_BLOCK}`;
 // src/modes/review/self-contained.ts
 function describeRun2(d) {
   const mins = Math.max(1, Math.round(d.elapsedMs / 6e4));
-  const conv = d.conventionsRead === true ? " \xB7 conventions read" : d.conventionsRead === false ? " \xB7 \u26A0 conventions NOT read" : "";
+  const c = d.conventions;
+  const conv = c?.state === "read" ? ` \xB7 conventions read (${c.docsRead.length} doc${c.docsRead.length === 1 ? "" : "s"})` : c?.state === "index-only" ? " \xB7 \u26A0 conventions INDEX ONLY" : c?.state === "unread" ? " \xB7 \u26A0 conventions NOT read" : "";
   return `${mins} min \xB7 ${describeUsage(d.usage ?? {})}${conv}`;
 }
 
@@ -5294,7 +5403,7 @@ async function runHolisticLens(opts) {
     log(`  \xB7 holistic: failed to run \u2014 ${e.message}`);
     return fail(`the holistic lens did not run: ${e.message}`);
   }
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsInTree: Boolean(opts.conventionsPath) });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
@@ -6294,7 +6403,7 @@ function conventionsPointer(file, chars, files) {
 
   ${file}
 
-Read that file BEFORE reviewing (it is the AGENTS.md / rules / docs web the repo asks a reviewer to read; the manifest of what it contains is conventions.json in the trail). Its INDEX at the top names the docs nearest the files this change touches \u2014 read those in full. When a finding rests on a rule, cite it as \`path:line\` with one exact line quoted: path is the ORIGINAL doc named in the \`===== path =====\` header above the rule, line counted from the first line after that header.`;
+Read that file BEFORE reviewing (it is the AGENTS.md / rules / docs web the repo asks a reviewer to read; the manifest of what it contains is conventions.json in the trail). It is larger than one read: read it in ranges, or grep it. Its INDEX at the top lists the docs to read IN FULL (the CLAUDE.md / AGENTS.md / rules chain for the files this change touches) and the nearest docs to open by grep when a hunk touches their subject. When a finding rests on a rule, cite it as \`path:line\` with one exact line quoted: path is the ORIGINAL doc named in the \`===== path =====\` header above the rule, line counted from the first line after that header.`;
 }
 var DEFAULT_OBJECTIVE = "Adversarial cross-vendor review of a code diff \u2014 find correctness, security, and convention issues a same-vendor author might miss.";
 function qualifyCoreSeats(reviewers, worktree, configs) {
@@ -6416,8 +6525,11 @@ async function runReviewMode(opts) {
       const dir = path21.join(wt.dir, CONVENTIONS_IN_TREE_DIR);
       fs24.mkdirSync(dir, { recursive: true });
       const file = path21.join(dir, CONVENTIONS_IN_TREE_FILE);
-      const indexed = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) + agentsMd : agentsMd;
-      fs24.writeFileSync(file, indexed, { mode: 384 });
+      const index = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) : null;
+      fs24.writeFileSync(file, index ? index.text + agentsMd : agentsMd, { mode: 384 });
+      if (conventionManifest && index) {
+        conventionManifest.inTree = { file, indexEndLine: index.indexEndLine, jumpTo: index.jumpTo, readInFull: index.readInFull, spans: index.spans };
+      }
       conventionsPath = file;
       const files = conventionManifest ? conventionManifest.files.filter((f) => f.included).length : void 0;
       agentsMd = conventionsPointer(file, agentsMd.length, files);
@@ -6535,7 +6647,7 @@ async function runReviewMode(opts) {
       const runPart = (k, suffix) => runCoreSeat({
         adapter: adapters[id],
         ...suffix ? { artifactSuffix: suffix } : {},
-        conventionsInTree: Boolean(conventionsPath),
+        ...conventionsPath ? { conventionsFile: conventionsPath } : {},
         log,
         out: opts.out,
         packet: packets[k],
@@ -6558,12 +6670,14 @@ async function runReviewMode(opts) {
             `  \xB7 \u26A0 ${id}: THIN READ on part ${idx} \u2014 ${describeUsage(usage ?? {})} for ${(chunk?.bytes ?? 0).toLocaleString("en-US")} bytes of diff; the seat returned far too little work for what it was handed`
           );
         }
-        const conventionsRead = s.review.diagnostics?.conventionsRead;
-        if (conventionsRead === false) {
+        const conv = s.review.diagnostics?.conventions;
+        if (conv?.state === "unread") {
           log(`  \xB7 \u26A0 ${id}: did NOT open the conventions file on part ${idx} (${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}) \u2014 its findings were judged without the repo's rules`);
+        } else if (conv?.state === "index-only") {
+          log(`  \xB7 \u26A0 ${id}: opened only the INDEX of the conventions file on part ${idx} \u2014 none of the rules it points at`);
         }
         seats[id] = {
-          ...conventionsRead !== void 0 ? { conventions: conventionsRead ? "read" : "unread" } : {},
+          ...conv ? { conventions: conv.state, conventionsDocs: conv.docsRead.length } : {},
           ...depth ? { depth } : {},
           effort: reviewer.effort,
           ...s.review.diagnostics ? { elapsedMs: s.review.diagnostics.elapsedMs } : {},
@@ -8533,6 +8647,7 @@ export {
   conventionsFileClause,
   conventionsIndex,
   conventionsPointer,
+  conventionsStep,
   coverageCounts,
   coverageShortfall,
   defaultCodexSandboxPaths,
@@ -8642,6 +8757,7 @@ export {
   pickSynthesizer,
   planPlacement,
   proxyEnv,
+  readConventionsLayout,
   readEnsembleConfig,
   readOnlyWorktreeClause,
   readReadableSurface,
@@ -8686,6 +8802,7 @@ export {
   resolveReviewSandbox,
   resolveReviewer,
   reviewDir,
+  reviewMethod,
   reviewerVisibleDiff,
   rootAllowed,
   runBrainstormMode,

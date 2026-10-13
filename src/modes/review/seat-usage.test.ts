@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { conventionsTouched, describeUsage, parseSeatUsage, readDepthOf } from './seat-usage';
+import { conventionsReadOf, describeUsage, parseSeatUsage, readDepthOf } from './seat-usage';
 
 const codexStream = [
   JSON.stringify({ type: 'thread.started', thread_id: 't' }),
@@ -65,23 +65,35 @@ describe('readDepthOf — a THIN read is named, an unmeasured one is not called 
   });
 });
 
-describe('conventionsTouched — did the seat open the conventions file (named, never guessed)', () => {
+describe('conventionsReadOf — how far a seat read into the conventions file (named, never guessed)', () => {
   const init = JSON.stringify({ subtype: 'init', type: 'system' });
-  it('a codex command that reads the file, or a claude-shaped tool call with its path', () => {
-    const codex = [JSON.stringify({ type: 'thread.started' }), JSON.stringify({ item: { command: "/bin/zsh -lc 'cat .ensemble-conventions/CONVENTIONS.md'", type: 'command_execution' }, type: 'item.started' })].join('\n');
-    const claude = [init, JSON.stringify({ message: { content: [{ input: { file_path: '/wt/.ensemble-conventions/CONVENTIONS.md' }, name: 'Read', type: 'tool_use' }] }, type: 'assistant' })].join('\n');
-    expect(conventionsTouched(codex)).toBe(true);
-    expect(conventionsTouched(claude)).toBe(true);
+  const layout = { indexEndLine: 33, spans: [{ endLine: 80, path: 'CLAUDE.md', startLine: 36 }, { endLine: 900, path: 'backend/CLAUDE.md', startLine: 83 }] };
+  const F = '/wt/.ensemble-conventions/CONVENTIONS.md';
+  const codex = (...cmds: string[]) => [JSON.stringify({ type: 'thread.started' }), ...cmds.map((command) => JSON.stringify({ item: { command, type: 'command_execution' }, type: 'item.started' }))].join('\n');
+  const claude = (...events: string[]) => [init, ...events].join('\n');
+  const read = (id: string, input: Record<string, unknown>) => JSON.stringify({ message: { content: [{ id, input, name: 'Read', type: 'tool_use' }] }, type: 'assistant' });
+  const result = (id: string, isError: boolean) => JSON.stringify({ message: { content: [{ content: isError ? 'File content (344.4KB) exceeds maximum allowed size' : 'ok', is_error: isError, tool_use_id: id, type: 'tool_result' }] }, type: 'user' });
+
+  it('codex: the index alone is index-only; a range into a doc is read with that doc named; cat is everything', () => {
+    expect(conventionsReadOf(codex("/bin/zsh -lc \"sed -n '1,30p' .ensemble-conventions/CONVENTIONS.md\""), layout)).toEqual({ docsRead: [], state: 'index-only' });
+    expect(conventionsReadOf(codex("/bin/zsh -lc \"sed -n '1,180p' .ensemble-conventions/CONVENTIONS.md\"", "/bin/zsh -lc \"sed -n '570,1084p' .ensemble-conventions/CONVENTIONS.md\""), layout)).toEqual({ docsRead: ['CLAUDE.md', 'backend/CLAUDE.md'], state: 'read' });
+    expect(conventionsReadOf(codex("/bin/zsh -lc 'cat .ensemble-conventions/CONVENTIONS.md'"), layout)).toEqual({ docsRead: ['CLAUDE.md', 'backend/CLAUDE.md'], state: 'read' });
+    expect(conventionsReadOf(codex("/bin/zsh -lc 'rg -n \"bun\" .ensemble-conventions/CONVENTIONS.md'"), layout)).toEqual({ docsRead: [], state: 'read' });
   });
-  it('a whole stream with no such call is false; a tool RESULT mentioning the path does not count', () => {
-    const none = [init, JSON.stringify({ message: { content: [{ input: { file_path: '/wt/src/x.ts' }, name: 'Read', type: 'tool_use' }] }, type: 'assistant' })].join('\n');
-    const resultOnly = [init, JSON.stringify({ message: { content: [{ content: 'see .ensemble-conventions/CONVENTIONS.md', type: 'tool_result' }] }, type: 'user' })].join('\n');
-    expect(conventionsTouched(none)).toBe(false);
-    expect(conventionsTouched(resultOnly)).toBe(false);
+  it('claude-shaped: a bare Read that ERRORED on size is dropped; 80 lines reaches the root rules; a Grep of the file is a read', () => {
+    expect(conventionsReadOf(claude(read('t1', { file_path: F }), result('t1', true)), layout)).toEqual({ docsRead: [], state: 'unread' });
+    expect(conventionsReadOf(claude(read('t1', { file_path: F }), result('t1', true), read('t2', { file_path: F, limit: 80 }), result('t2', false)), layout)).toEqual({ docsRead: ['CLAUDE.md'], state: 'read' });
+    expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 30 }), result('t1', false)), layout)).toEqual({ docsRead: [], state: 'index-only' });
+    const grep = JSON.stringify({ message: { content: [{ id: 'g1', input: { path: F, pattern: 'bun' }, name: 'Grep', type: 'tool_use' }] }, type: 'assistant' });
+    expect(conventionsReadOf(claude(grep), layout)).toEqual({ docsRead: [], state: 'read' });
   });
-  it('a stream that lost its head cannot say no — unmeasured', () => {
-    const headless = JSON.stringify({ message: { content: [{ input: { file_path: '/wt/src/x.ts' }, name: 'Read', type: 'tool_use' }] }, type: 'assistant' });
-    expect(conventionsTouched(headless)).toBeUndefined();
-    expect(conventionsTouched('')).toBeUndefined();
+  it('a whole stream with no call on the file is unread; a tool RESULT mentioning the path does not count', () => {
+    expect(conventionsReadOf(claude(read('t1', { file_path: '/wt/src/x.ts' })), layout)).toEqual({ docsRead: [], state: 'unread' });
+    expect(conventionsReadOf(claude(JSON.stringify({ message: { content: [{ content: `see ${F}`, tool_use_id: 'x', type: 'tool_result' }] }, type: 'user' })), layout)).toEqual({ docsRead: [], state: 'unread' });
+  });
+  it('no layout (file unreadable after the fact) ⇒ read vs unread only; a headless stream cannot say no', () => {
+    expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 30 })), null)).toEqual({ docsRead: [], state: 'read' });
+    expect(conventionsReadOf(read('t1', { file_path: '/wt/src/x.ts' }), layout)).toBeUndefined();
+    expect(conventionsReadOf('', layout)).toBeUndefined();
   });
 });

@@ -1043,11 +1043,11 @@ describe('the producer seat keeps its run facts (2026-10-13)', () => {
     const res = await runClaudeProducer({ baseDir: base, claudeConfig: CFG, conventionsPath: '/wt/.ensemble-conventions/CONVENTIONS.md', expectedHeadSha: HEAD, includeClaudeReviewer: true, reviewPrompt: 'PROMPT', run, runId });
     const d = res.claudeReview?.diagnostics;
     expect(d?.usage).toEqual({ cachedInputTokens: 9000, inputTokens: 10000, outputTokens: 4321, toolCalls: 1, turns: 7 });
-    expect(d?.conventionsRead).toBe(true); // the one tool call opened the conventions file
+    expect(d?.conventions).toEqual({ docsRead: [], state: 'read' }); // the one tool call opened the conventions file (no layout: the test file does not exist)
     expect(typeof d?.elapsedMs).toBe('number');
     // Inline conventions (no file) ⇒ the fact is never written.
     const inline = await runClaudeProducer({ baseDir: base, claudeConfig: CFG, expectedHeadSha: HEAD, includeClaudeReviewer: true, reviewPrompt: 'PROMPT', run, runId: `${runId}-inline` });
-    expect(inline.claudeReview?.diagnostics?.conventionsRead).toBeUndefined();
+    expect(inline.claudeReview?.diagnostics?.conventions).toBeUndefined();
     const dir = reviewDir(base, runId);
     expect(JSON.parse(fs.readFileSync(path.join(dir, 'review.claude.json'), 'utf8')).diagnostics.usage.outputTokens).toBe(4321);
     expect(fs.readFileSync(path.join(dir, 'claude-stream.jsonl'), 'utf8')).toBe(stream);

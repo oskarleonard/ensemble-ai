@@ -233,8 +233,8 @@ async function runClaudeReviewer(
   worktree?: string,
   // The history packet seeded into this seat's cwd, when one was built (./history-packet).
   historyPacket?: HistoryPacket,
-  // The conventions were handed over as a file this run — record whether this seat opened it.
-  conventionsInTree?: boolean
+  // The conventions were handed over as a file this run, at this path — record how far this seat read into it.
+  conventionsFile?: string
 ): Promise<{ review: VoiceReview; raw: string | null; spawned: boolean; stream: string | null }> {
   let res: VoiceRunResult;
   const startedAt = Date.now();
@@ -259,7 +259,7 @@ async function runClaudeReviewer(
   }
   // The seat's run facts — the same record the core seats keep — so review.claude.json says how
   // long the read took and how deep it went, not only what it found.
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsInTree });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile });
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output');
@@ -288,7 +288,12 @@ async function runClaudeReviewer(
 /** `4 min · 9,120 out · 331,320 in (83% cached) · 31 tool calls` — one spelling for the log. */
 export function describeRun(d: SeatDiagnostics): string {
   const mins = Math.max(1, Math.round(d.elapsedMs / 60_000));
-  const conv = d.conventionsRead === true ? ' · conventions read' : d.conventionsRead === false ? ' · ⚠ conventions NOT read' : '';
+  const c = d.conventions;
+  const conv =
+    c?.state === 'read' ? ` · conventions read (${c.docsRead.length} doc${c.docsRead.length === 1 ? '' : 's'})`
+    : c?.state === 'index-only' ? ' · ⚠ conventions INDEX ONLY'
+    : c?.state === 'unread' ? ' · ⚠ conventions NOT read'
+    : '';
   return `${mins} min · ${describeUsage(d.usage ?? {})}${conv}`;
 }
 
@@ -589,7 +594,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
       log,
       opts.worktree,
       opts.historyPacket,
-      Boolean(opts.conventionsPath)
+      opts.conventionsPath
     );
     claudeSpawned = spawned;
     claudeReview = withSeatAdvisor(review, opts.claudeConfig);
@@ -631,7 +636,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
           log,
           opts.worktree,
           opts.historyPacket,
-          Boolean(opts.conventionsPath)
+          opts.conventionsPath
         );
         partReviews[i] = { part, ...res };
         log(`  · claude: part ${part.index}/${n} ${res.review.ok ? 'reviewed' : 'FAILED'} — ${res.review.findings.length} finding(s)`);

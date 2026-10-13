@@ -2128,7 +2128,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         const claudeFacts = (d: SeatDiagnostics | undefined, bytes: number) =>
           d
             ? {
-                ...(d.conventionsRead !== undefined ? { conventions: d.conventionsRead ? ('read' as const) : ('unread' as const) } : {}),
+                ...(d.conventions ? { conventions: d.conventions.state, conventionsDocs: d.conventions.docsRead.length } : {}),
                 depth: readDepthOf(d.usage ?? {}, bytes, Boolean(worktree)),
                 elapsedMs: d.elapsedMs,
                 ...(d.usage ? { usage: d.usage } : {}),

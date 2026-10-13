@@ -13,7 +13,8 @@ import type { CodexReviewResult, RunReviewOpts } from '../../reviewers/codex';
 
 import type { EvidenceClass } from './evidence';
 import type { SeatQualification } from './seat-evidence';
-import { conventionsTouched, parseSeatUsage } from './seat-usage';
+import { conventionsReadOf, parseSeatUsage } from './seat-usage';
+import { readConventionsLayout } from '../../core/conventions';
 
 // ONE CORE SEAT (codex / grok), run with the evidence its policy qualified it for, and its trail
 // artifact persisted. This is where INTENT becomes FACT: the returned `realized` class is what the
@@ -44,8 +45,8 @@ export interface RunCoreSeatArgs {
   // the canonical files, as before.
   artifactSuffix?: string;
   // The conventions were handed over as a file in the worktree this run (modes/review
-  // CONVENTIONS_IN_TREE_*): record whether this seat opened it.
-  conventionsInTree?: boolean;
+  // CONVENTIONS_IN_TREE_*), at this absolute path: record how far this seat read into it.
+  conventionsFile?: string;
   log: (m: string) => void;
   out: string;
   packet: ReturnType<typeof assembleCodePacket>;
@@ -117,16 +118,16 @@ function timedOutSummary(result: CodexReviewResult, timing: SeatTiming): string 
 export function seatDiagnostics(
   result: CodexReviewResult,
   timing: SeatTiming,
-  // `conventionsInTree`: this run handed the conventions over as a file, so whether the seat
-  // opened it is a fact worth recording. Off (inline conventions) ⇒ the field is never written.
-  opts: { conventionsInTree?: boolean } = {}
+  // `conventionsFile`: this run handed the conventions over as a file at this path, so how far
+  // the seat read into it is a fact worth recording. Absent (inline) ⇒ the field is never written.
+  opts: { conventionsFile?: string } = {}
 ): SeatDiagnostics {
   const usage = parseSeatUsage(result.stream);
-  const touched = opts.conventionsInTree ? conventionsTouched(result.stream) : undefined;
+  const conventions = opts.conventionsFile ? conventionsReadOf(result.stream, readConventionsLayout(opts.conventionsFile)) : undefined;
   return {
     elapsedMs: timing.endedAt - timing.startedAt,
     ...(Object.keys(usage).length > 0 ? { usage } : {}),
-    ...(touched !== undefined ? { conventionsRead: touched } : {}),
+    ...(conventions ? { conventions } : {}),
     endedAt: new Date(timing.endedAt).toISOString(),
     ...(result.failWhy ? { failWhy: result.failWhy } : {}),
     ...(result.preflightWarnings?.length ? { preflightWarnings: [...result.preflightWarnings] } : {}),
@@ -158,7 +159,7 @@ function persistAttempt(
       `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || 'no output'}`;
   return persistReview(args.out, {
     ...(args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {}),
-    diagnostics: seatDiagnostics(result, timing, { conventionsInTree: args.conventionsInTree }),
+    diagnostics: seatDiagnostics(result, timing, { conventionsFile: args.conventionsFile }),
     findings: parsed?.findings ?? [],
     packet: args.packet,
     prompt,
