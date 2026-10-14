@@ -67,9 +67,21 @@ describe('findingScope — pure, decided from host-owned facts', () => {
     expect(findingScope(outOfDiff, undefined, 'worktree', undefined, changedFiles).kind).toBe('unknown');
   });
 
-  it('a cite into a changed file whose hunks coverage omitted ⇒ unknown (never demoted)', () => {
-    const f = { ...outOfDiff, file: 'src/omitted-over-ceiling.ts' };
-    expect(findingScope(f, undefined, 'worktree', hunks, changedFiles).kind).toBe('unknown');
+  it('a cite into a file this PR CHANGES — off-hunk, file-level, or coverage-omitted — ⇒ in-file (never demoted)', () => {
+    // Off every pinned hunk of a changed file (the common shape: a reviewer cites a few lines away).
+    const offHunk = { ...outOfDiff, file: 'src/changed.ts', line: 40 };
+    expect(findingScope(offHunk, undefined, 'worktree', hunks, changedFiles).kind).toBe('in-file');
+    // File-level cite (line null) on a changed file.
+    const fileLevel = { ...outOfDiff, file: 'src/changed.ts', line: null };
+    expect(findingScope(fileLevel, 'none', 'worktree', hunks, changedFiles).kind).toBe('in-file');
+    // Changed file whose hunks the packet splice dropped.
+    const omitted = { ...outOfDiff, file: 'src/omitted-over-ceiling.ts' };
+    expect(findingScope(omitted, undefined, 'worktree', hunks, changedFiles).kind).toBe('in-file');
+  });
+
+  it('a dependsOn that lands on an unchanged CONTEXT line of a hunk is not a dependency ⇒ pre-existing', () => {
+    // Line 2 of src/changed.ts is `  const a = compute();` — context, not + or -.
+    expect(findingScope(outOfDiff, { file: 'src/changed.ts', line: 2 }, 'worktree', hunks, changedFiles).kind).toBe('pre-existing');
   });
 
   it('a dependsOn that RESOLVES to a pinned hunk ⇒ blast-radius, with the resolved pointer', () => {
@@ -144,6 +156,14 @@ describe('reconcile — an out-of-diff agree/partial without a resolving depende
     const { records } = reconcileGateVerdicts([outOfDiff], envelope('agree'), { gateEvidence: 'worktree' });
     expect(records[0].effectiveVerdict).toBe('agree');
     expect(records[0].scope).toEqual({ dependsOn: null, kind: 'unknown' });
+  });
+
+  it('an agree on an off-hunk cite in a CHANGED file is untouched (in-file), with or without dependsOn', () => {
+    const offHunk = { ...outOfDiff, file: 'src/changed.ts', line: 40 };
+    const { records } = reconcileGateVerdicts([offHunk], envelope('agree', { dependsOn: 'none' }), worktree);
+    expect(records[0].effectiveVerdict).toBe('agree');
+    expect(records[0].downgradeReason).toBeNull();
+    expect(records[0].scope).toEqual({ dependsOn: null, kind: 'in-file' });
   });
 
   it('an in-diff agree carries scope in-diff and is untouched', () => {

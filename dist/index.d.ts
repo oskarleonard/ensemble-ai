@@ -707,7 +707,7 @@ type GateVerdict = (typeof GATE_VERDICTS)[number];
 declare const DOWNGRADE_REASONS: readonly ["truncated", "invalid-citation", "duplicate", "missing", "bad-enum", "packet-fail", "gate-failed", "unknown-schema", "trail-write-failed", "reference-not-found", "external-testimony", "pre-existing"];
 type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
 type AnchorSide = 'new' | 'old' | null;
-declare const SCOPE_KINDS: readonly ["in-diff", "blast-radius", "pre-existing", "unknown"];
+declare const SCOPE_KINDS: readonly ["in-diff", "in-file", "blast-radius", "pre-existing", "unknown"];
 type ScopeKind = (typeof SCOPE_KINDS)[number];
 interface FindingScope {
     kind: ScopeKind;

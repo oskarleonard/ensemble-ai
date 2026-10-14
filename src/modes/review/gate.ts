@@ -553,10 +553,15 @@ function parseDependsOn(v: unknown): DependsOn | undefined {
 
 // ── Scope: is this the PR's defect? (trail v11) ───────────────────────────────────────
 
-export const SCOPE_KINDS = ['in-diff', 'blast-radius', 'pre-existing', 'unknown'] as const;
+export const SCOPE_KINDS = ['in-diff', 'in-file', 'blast-radius', 'pre-existing', 'unknown'] as const;
 export type ScopeKind = (typeof SCOPE_KINDS)[number];
 export interface FindingScope {
   // in-diff: the cite resolved to a hunk of the pinned diff — the finding IS about the change.
+  // in-file: the cite names a file this PR CHANGES but sits off every pinned hunk (a few lines
+  //   away, a file-level cite, a hunk the packet splice dropped). The change is in play and the
+  //   host cannot tell mechanically whether it caused the defect — never demoted; the gate's own
+  //   verdict (and its pre-existing: reason, if any) stands. Review of #126: 17% of all cites are
+  //   unresolved, and a changed-file off-hunk cite was the common shape among confirmed ones.
   // blast-radius: the cite is out-of-diff, and the gate named a hunk of THIS diff the defect
   //   depends on, which the host resolved against the pinned hunks — the change made untouched
   //   code wrong (a removed guard, a changed caller, a table added without its grant).
@@ -581,12 +586,16 @@ export function findingScope(
 ): FindingScope {
   if (f.resolved) return { dependsOn: null, kind: 'in-diff' };
   if (gateEvidence !== 'worktree' || !packetHunks) return { dependsOn: null, kind: 'unknown' };
-  // The cite names a file the change DOES touch, but its hunks are not in the packet (coverage
-  // omitted them over the ceiling): the line may well be inside the change — undecidable here.
-  if (changedFiles?.has(f.file) && !packetHunks.has(f.file)) return { dependsOn: null, kind: 'unknown' };
+  // A file this PR changes — whether its hunks are pinned (the cite is merely off-hunk) or
+  // coverage omitted them: the change is in play, and "did the diff cause it" is not decidable
+  // from line arithmetic. Never demoted (see FindingScope.in-file).
+  if (changedFiles?.has(f.file) || packetHunks.has(f.file)) return { dependsOn: null, kind: 'in-file' };
   if (dependsOn && dependsOn !== 'none') {
     const hunks = packetHunks.get(dependsOn.file);
-    if (hunks && resolveFindingHunk(hunks, dependsOn.line))
+    const r = hunks ? resolveFindingHunk(hunks, dependsOn.line) : null;
+    // The dependency must be a line the diff ADDS or REMOVES — a hunk's unchanged context line is
+    // not a change, and accepting it would let any hunk be named to mint "blast-radius".
+    if (r && /^[+-]/.test(r.hunk.body[r.bodyIndex] ?? ''))
       return { dependsOn: { file: dependsOn.file, line: dependsOn.line }, kind: 'blast-radius' };
   }
   return { dependsOn: null, kind: 'pre-existing' };
@@ -1585,6 +1594,9 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     // Each key is passed ONLY when set, so the shared prompt (primary + shadow) stays
     // byte-identical to the 3-arg call on a run with none of them.
     ...(opts.premise ? { premise: true } : {}),
+    // The scope rule's host line needs to tell "off-hunk in a CHANGED file" from "file NOT in
+    // this diff" — worktree evidence only, where the rule applies (packet prompt unchanged).
+    ...(opts.gateEvidence === 'worktree' ? { changedFiles } : {}),
     ...(opts.directive ? { directive: opts.directive } : {}),
     ...(opts.intent ? { intent: opts.intent } : {}),
     ...(opts.gateEvidence === 'worktree' && opts.conventionsPath ? { conventionsFile: opts.conventionsPath } : {}),
