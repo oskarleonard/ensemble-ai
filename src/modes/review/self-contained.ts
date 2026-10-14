@@ -369,6 +369,10 @@ export interface ClaudeLayerOptions {
   // The conventions file in the worktree (modes/review CONVENTIONS_IN_TREE_*), when the run handed
   // the gathered rules over by path — the producer and the lens prompts point at it.
   conventionsPath?: string;
+  // The author's stated intent — the PR title + body (cli.ts fetchPrDirective). Reaches the
+  // producer, the lens, the integration seat AND the gate (2026-10-14: none of them had it; only
+  // the packet seats did). Omitted ⇒ no section anywhere.
+  directive?: string;
   // The pinned reviewer-visible diff. Under the capability fence the Anthropic seats have no shell,
   // so the engine hands them the change instead of letting them run `git diff` (see ./claude).
   // Absent ⇒ the seats fall back to the packet prompt, which already embeds the diff. On a review
@@ -497,6 +501,7 @@ export type ClaudeProducerOptions = Pick<
   | 'ciEvidenceUnavailable'
   | 'claudeConfig'
   | 'conventionsPath'
+  | 'directive'
   | 'expectedHeadSha'
   | 'historyPacket'
   | 'includeClaudeReviewer'
@@ -558,6 +563,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
               ? { ciEvidenceUnavailable: ciForProducer.reason }
               : {}),
             ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
+            ...(opts.directive ? { directive: opts.directive } : {}),
             diff: part.diff,
             headSha: opts.expectedHeadSha,
             history: hasHistory,
@@ -711,7 +717,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
 
 export type HolisticStageOptions = Pick<
   ClaudeLayerOptions,
-  'baseDir' | 'conventionsPath' | 'expectedHeadSha' | 'historyPacket' | 'holistic' | 'lensHandoff' | 'log' | 'pinnedDiff' | 'run' | 'runId' | 'skeleton' | 'timeoutMs' | 'worktree'
+  'baseDir' | 'conventionsPath' | 'directive' | 'expectedHeadSha' | 'historyPacket' | 'holistic' | 'lensHandoff' | 'log' | 'pinnedDiff' | 'run' | 'runId' | 'skeleton' | 'timeoutMs' | 'worktree'
 >;
 
 export interface HolisticStageOutcome {
@@ -751,6 +757,7 @@ export async function runHolisticStage(opts: HolisticStageOptions): Promise<Holi
       diff: plan.diff,
       headSha: opts.expectedHeadSha,
       ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
+      ...(opts.directive ? { directive: opts.directive } : {}),
       ...(opts.historyPacket ? { historyPacket: opts.historyPacket } : {}),
       log,
       run,
@@ -795,6 +802,7 @@ export interface IntegrationStageOptions {
   baseSha: string | null;
   config: ResolvedVoiceConfig;
   conventionsPath?: string;
+  directive?: string;
   expectedHeadSha: string;
   historyPacket?: HistoryPacket;
   log?: (m: string) => void;
@@ -831,6 +839,7 @@ export async function runIntegrationStage(opts: IntegrationStageOptions): Promis
   const prompt = renderIntegrationPrompt({
     baseSha: opts.baseSha,
     ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
+    ...(opts.directive ? { directive: opts.directive } : {}),
     headSha: opts.expectedHeadSha,
     history: historyPacketHasData(opts.historyPacket),
     scope: opts.scope,
@@ -944,6 +953,11 @@ export async function runClaudeReviewLayer(
     // The GATE spawns its OWN configured seat (model/effort), NOT necessarily the reviewer's —
     // defaulting to claudeConfig keeps the one-seat behavior when no `gate` entry is configured.
     config: opts.gateConfig ?? opts.claudeConfig,
+    // The gate's run facts name how far it read the conventions file (gate-diagnostics.json), and
+    // its prompt names the file so a citation into a stripped path is looked up there.
+    ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
+    // The author's stated intent: a premise the gate checks a finding against, never evidence.
+    ...(opts.directive ? { directive: opts.directive } : {}),
     expectedHeadSha: opts.expectedHeadSha,
     // With a worktree the gate is an evidence-bearing actor over the PR head: it may emit
     // `reference-not-found`, and it can verify a holistic finding's two sites. Without one, both

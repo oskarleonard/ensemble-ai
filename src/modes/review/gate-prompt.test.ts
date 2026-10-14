@@ -420,3 +420,32 @@ describe('premiseClusters — the subsystem proximity rule, not same-file-anywhe
     expect(cs).toEqual([{ findingIds: ['claude#1', 'codex#1', 'grok#1'], reviewers: ['claude', 'codex', 'grok'] }]);
   });
 });
+
+// 2026-10-14, run 28b174b3: the gate called `CLAUDE.md:12` and `backend/.claude/rules/x.md:45`
+// "not found" with the tree open — those paths are STRIPPED from the checkout, and the rules live
+// in the conventions file. And no gate had ever seen the PR body it was judging findings about.
+describe('renderGatePrompt — stripped paths and the stated intent', () => {
+  it('on worktree evidence tells the judge the strip set and where a conventions citation lives', () => {
+    const wt = renderGatePrompt([], [], 'worktree', { conventionsFile: '/wt/.ensemble-conventions/CONVENTIONS.md' });
+    expect(wt).toContain('STRIPPED PATHS');
+    expect(wt).toContain('CLAUDE.md, AGENTS.md, .claude, .cursor/rules');
+    expect(wt).toContain('/wt/.ensemble-conventions/CONVENTIONS.md');
+    expect(wt).toMatch(/look a conventions citation up THERE before judging it absent/);
+    // Without the file path the clause still names the strip, just not where to look.
+    const bare = renderGatePrompt([], [], 'worktree');
+    expect(bare).toContain('STRIPPED PATHS');
+    expect(bare).not.toContain('CONVENTIONS.md');
+    // A packet-fed gate has no tree, so it is told nothing about the tree's strip.
+    expect(renderGatePrompt([], [], 'packet', { conventionsFile: '/wt/x.md' })).not.toContain('STRIPPED PATHS');
+  });
+
+  it('renders the stated intent as testimony — a premise, never a refutation — only when passed', () => {
+    const p = renderGatePrompt([], [], 'packet', { directive: 'Keep the 403 declarations and update their descriptions.' });
+    expect(p).toContain("## The author's stated intent (PR title + description)");
+    expect(p).toContain('Keep the 403 declarations and update their descriptions.');
+    expect(p).toMatch(/it never refutes one/);
+    expect(renderGatePrompt([], [], 'packet')).not.toContain("## The author's stated intent");
+    // Empty opts ⇒ byte-identical to the 3-arg call (the primary/shadow prompt contract).
+    expect(renderGatePrompt([], [], 'worktree', {})).toBe(renderGatePrompt([], [], 'worktree'));
+  });
+});

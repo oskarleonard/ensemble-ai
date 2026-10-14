@@ -829,6 +829,36 @@ describe('runGate — end-to-end (DC3 · DC5 · DC12)', () => {
     }
   });
 
+  // 2026-10-14: no gate, on either vendor, left timing, usage or a stream — a verdict that said a
+  // cited file "was not found" with the tree open could not be checked. Now the primary leaves
+  // gate-diagnostics.json + gate-stream.jsonl beside gate.raw.md, the shadow its own pair, and the
+  // facts land on a FAILED gate too (that is the run that most needs reading).
+  it('persists the gate run facts + stream for the primary and the shadow, on success and on failure', async () => {
+    const stream = '{"type":"system","subtype":"init"}\n{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/wt/a.ts"}}]}}\n';
+    const withStream = (raw: string | null): VoiceRunResult => ({ ok: raw !== null, raw, stderrTail: '', stream, timedOut: false });
+    const { base, runId } = seed();
+    const shadowCfg: ResolvedVoiceConfig = { ...CFG, id: 'codex', model: 'gpt-x', vendor: 'openai' };
+    const res = await runGate({
+      baseDir: base, config: CFG, expectedHeadSha: HEAD, reviews, run: async () => withStream(goodEnvelope), runId,
+      shadow: { config: shadowCfg, run: async () => withStream(goodEnvelope) },
+    });
+    expect(res.synthesis.degraded).toBe(false);
+    const dir = reviewDir(base, runId);
+    const diag = JSON.parse(fs.readFileSync(path.join(dir, 'gate-diagnostics.json'), 'utf8')) as { elapsedMs: number; usage?: { toolCalls?: number } };
+    expect(diag.elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(diag.usage?.toolCalls).toBe(1);
+    expect(fs.readFileSync(path.join(dir, 'gate-stream.jsonl'), 'utf8')).toBe(stream);
+    expect(fs.existsSync(path.join(dir, 'shadow-gate-codex-diagnostics.json'))).toBe(true);
+    expect(fs.readFileSync(path.join(dir, 'shadow-gate-codex-stream.jsonl'), 'utf8')).toBe(stream);
+
+    // A gate that produced nothing still leaves its facts (and no stream file when it kept none).
+    const dead = seed();
+    await runGate({ baseDir: dead.base, config: CFG, expectedHeadSha: HEAD, reviews, run: async () => ({ failWhy: 'reviewer returned an error result (API status 529)', ok: false, raw: null, stderrTail: 'tail', timedOut: false }), runId: dead.runId });
+    const deadDiag = JSON.parse(fs.readFileSync(path.join(reviewDir(dead.base, dead.runId), 'gate-diagnostics.json'), 'utf8')) as { failWhy?: string };
+    expect(deadDiag.failWhy).toContain('API status 529');
+    expect(fs.existsSync(path.join(reviewDir(dead.base, dead.runId), 'gate-stream.jsonl'))).toBe(false);
+  });
+
   // `gateSpawned` is what the run's REALIZED evidence for the `gate` seat is derived from. A gate
   // that never spawned read NOTHING, so a receipt must not attest it read the worktree; one that
   // spawned and returned garbage DID have the tree open, and says so honestly.
