@@ -141,6 +141,7 @@ describe('`review --pr <url> --repo <dir>` materializes ONE worktree and hands i
 
     expect(mockOpen).toHaveBeenCalledTimes(1);
     expect(mockOpen.mock.calls[0][0]).toEqual({
+      baseRef: null, // the fixture PR carries no base ref ⇒ no base-tip fetch
       baseSha: BASE,
       headSha: HEAD,
       pr: 7,

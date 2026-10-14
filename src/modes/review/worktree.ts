@@ -691,7 +691,7 @@ function parseConfigList(text: string): Array<[string, string]> {
 // byte-identical (tests pin it), and a base that cannot be fetched (auth, deleted branch) costs the
 // run nothing but the drift labels.
 export const BASE_TIP_REF = 'refs/ensemble/base';
-const SAFE_BRANCH_REF = /^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._\/-]{1,200}$/;
+const SAFE_BRANCH_REF = /^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]{1,200}$/;
 export function baseFetchRefspec(baseRef: string | null | undefined): string | null {
   return baseRef && SAFE_BRANCH_REF.test(baseRef) && !baseRef.endsWith('/') && !baseRef.endsWith('.lock')
     ? `+refs/heads/${baseRef}:${BASE_TIP_REF}`

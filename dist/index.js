@@ -4157,7 +4157,7 @@ function parseConfigList(text) {
   return out;
 }
 var BASE_TIP_REF = "refs/ensemble/base";
-var SAFE_BRANCH_REF = /^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._\/-]{1,200}$/;
+var SAFE_BRANCH_REF = /^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]{1,200}$/;
 function baseFetchRefspec(baseRef) {
   return baseRef && SAFE_BRANCH_REF.test(baseRef) && !baseRef.endsWith("/") && !baseRef.endsWith(".lock") ? `+refs/heads/${baseRef}:${BASE_TIP_REF}` : null;
 }

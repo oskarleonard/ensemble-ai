@@ -122,6 +122,7 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
     // The success outcome pinned CONCRETELY (not just twin-equal — twin-equal alone is
     // satisfied by both twins failing the same way): a real Worktree at the right SHA.
     expect(normalize(syncOut)).toEqual({
+      baseTip: null, // no base ref named ⇒ no second fetch, on both twins
       dir: '<dir>',
       headSha: HEAD_SHA,
       strippedInstructionFiles: [],
