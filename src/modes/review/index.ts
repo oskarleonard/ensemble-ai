@@ -137,6 +137,10 @@ export interface ReviewModeOptions {
   // read a deliberate change as deliberate instead of guessing at scope from the diff alone.
   // Absent ⇒ the section is simply not rendered (its absence is not notable, unlike the diff's).
   directive?: string;
+  // STATED INTENT beyond the PR body: tracker/spec text the host resolved (cli.ts --intent).
+  // Fills the packet's `intent` section; the Anthropic stages and the gate take it from the
+  // layer. Absent ⇒ no section anywhere.
+  intent?: string;
   // Override the headSha for a pre-supplied diffText (a URL PR's resolved head SHA,
   // so the receipt is content-tied to the exact PR head). See AcquireDiffOpts.
   headShaOverride?: string;
@@ -530,6 +534,7 @@ export async function runReviewMode(
       // the coverage listing and the bytes the seats see cannot disagree.
       diffBudget: ceilingBytes,
       directive: opts.directive,
+      ...(opts.intent ? { intent: opts.intent } : {}),
       objective,
       pr: 0,
       repo: acquired.repoId ?? '',

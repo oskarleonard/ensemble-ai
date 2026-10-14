@@ -76,6 +76,19 @@ describe('assembleCodePacket', () => {
     ).toBe(true);
   });
 
+  // STATED INTENT beyond the PR body (2026-10-14): tracker/spec text the host resolved. Hedged on
+  // its own terms — not the author's words, a premise checked both ways.
+  it('includes the stated-intent section only when intent is given, hedged as a two-way premise', () => {
+    expect(assembleCodePacket(base).sections.some((s) => s.title.startsWith('Stated intent'))).toBe(false);
+    const p = assembleCodePacket({ ...base, intent: 'Keep the 403 declarations and update their descriptions.' });
+    const intent = p.sections.find((s) => s.title.startsWith('Stated intent'));
+    expect(intent?.included).toBe(true);
+    expect(intent?.body).toBe('Keep the 403 declarations and update their descriptions.');
+    expect(intent?.note).toContain("not the author's words");
+    expect(intent?.note).toMatch(/promised and not delivered/);
+    expect(intent?.note).toMatch(/ruled out and done anyway/);
+  });
+
   // On the `--pr` path this section IS the pull request's description — text the CONTRIBUTOR wrote,
   // landing verbatim in every seat's prompt. The section note is the channel that says so (the same
   // one the author-summary section hedges through), so it is pinned: the body carries intent, the

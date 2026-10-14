@@ -449,3 +449,13 @@ describe('renderGatePrompt — stripped paths and the stated intent', () => {
     expect(renderGatePrompt([], [], 'worktree', {})).toBe(renderGatePrompt([], [], 'worktree'));
   });
 });
+
+describe('renderGatePrompt — tracker text (--intent) as testimony', () => {
+  it('renders the section only when passed, grounded both halves', () => {
+    const p = renderGatePrompt([], [], 'packet', { intent: 'A suspended member still gets 403.' });
+    expect(p).toContain('## Stated intent — tracker text (host-supplied)');
+    expect(p).toContain('A suspended member still gets 403.');
+    expect(p).toMatch(/grounded\s+when BOTH halves are/);
+    expect(renderGatePrompt([], [], 'packet')).not.toContain('## Stated intent');
+  });
+});

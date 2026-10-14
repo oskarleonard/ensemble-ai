@@ -1236,6 +1236,8 @@ export interface RunGateOptions {
   conventionsPath?: string;
   // The author's stated intent (PR title + body) — a premise for the judge, never evidence.
   directive?: string;
+  // Tracker/spec text the host resolved — the same kind of testimony.
+  intent?: string;
   expectedHeadSha: string;
   // The gate's REALIZED evidence (default 'packet'). The gate is an EVIDENCE-BEARING ACTOR, not a
   // neutral judge (gate-r3 pin 1): worktree ⇒ it read the PR head and may emit
@@ -1471,6 +1473,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     // byte-identical to the 3-arg call on a run with none of them.
     ...(opts.premise ? { premise: true } : {}),
     ...(opts.directive ? { directive: opts.directive } : {}),
+    ...(opts.intent ? { intent: opts.intent } : {}),
     ...(opts.gateEvidence === 'worktree' && opts.conventionsPath ? { conventionsFile: opts.conventionsPath } : {}),
   });
   // THE GATE'S RUN FACTS (2026-10-14): timing, usage, tool calls, how far it read the conventions

@@ -8,6 +8,7 @@ import {
   readOnlyWorktreeClause,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
   directiveClause,
+  intentClause,
 } from './worktree';
 
 // THE ONE CLAUDE PRODUCER (spec §3) — the worktree-mode Claude seat, running the built-in
@@ -100,6 +101,13 @@ export const OPERATOR_REVIEW_METHOD = `## How to review (in this order)
 1. Walk the diff hunk by hunk. For every touched function, read the WHOLE file it lives in —
    not its first screen: the mechanism a hunk depends on is often hundreds of lines below the
    hunk — then its callers and callees, to judge the change in context, not in isolation.
+   INTENT CONFORMANCE: when the prompt carries a stated-intent section (the PR description, a
+   tracker ticket, a spec excerpt), read it before the diff and keep two lists — what it PROMISES
+   and what it RULES OUT or says to KEEP. Then check the diff against both: a promised behavior
+   the diff does not deliver, a "keep X" the diff changes, an accepted side effect the diff
+   exceeds — each is a finding that cites the intent line beside the code (a ticket said "keep
+   the 403 declarations and update their descriptions"; the diff rewrote one shared description
+   instead, and no seat had read the ticket).
 2. Hunt FUNCTIONAL BUGS first: correctness defects, broken edge cases, regressions of
    behavior the diff did not intend to change, authorization gaps, contract drift (API
    shapes, DB writes, event payloads), and state/concurrency hazards.
@@ -199,6 +207,8 @@ export interface CodeReviewSeatPromptArgs {
   // The author's stated intent — the PR title + body (worktree.ts directiveClause). The packet
   // seats always had it; this seat reviewed with none until 2026-10-14. Omitted ⇒ no section.
   directive?: string;
+  // Tracker/spec text the host resolved (worktree.ts intentClause). Omitted ⇒ no section.
+  intent?: string;
   // The change-scope note when the change is reviewed in PARTS (./chunks renderChangeScope):
   // `diff` is then one part, and the seat is told which other changed files exist. Omitted ⇒
   // `diff` is the whole change, as before.
@@ -240,7 +250,7 @@ You have NO shell and NO network: there is no Bash tool, so do not try to run \`
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: 'reach every file', worktree: args.worktree })} Read any file there for whole-project context: a finding may
 cite an UNCHANGED file (a reinvented utility, a convention the diff drifts from).
 
-${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...(args.scope ? { scope: args.scope } : {}) })}${ci}${args.directive ? directiveClause(args.directive) : ''}
+${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...(args.scope ? { scope: args.scope } : {}) })}${ci}${args.directive ? directiveClause(args.directive) : ''}${args.intent ? intentClause(args.intent) : ''}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${history}
 

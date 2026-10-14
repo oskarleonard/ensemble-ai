@@ -373,6 +373,9 @@ export interface ClaudeLayerOptions {
   // producer, the lens, the integration seat AND the gate (2026-10-14: none of them had it; only
   // the packet seats did). Omitted ⇒ no section anywhere.
   directive?: string;
+  // STATED INTENT beyond the PR body (cli.ts --intent): tracker/spec text, host-resolved. Same
+  // reach as `directive`. Absent ⇒ no section anywhere.
+  intent?: string;
   // The pinned reviewer-visible diff. Under the capability fence the Anthropic seats have no shell,
   // so the engine hands them the change instead of letting them run `git diff` (see ./claude).
   // Absent ⇒ the seats fall back to the packet prompt, which already embeds the diff. On a review
@@ -502,6 +505,7 @@ export type ClaudeProducerOptions = Pick<
   | 'claudeConfig'
   | 'conventionsPath'
   | 'directive'
+  | 'intent'
   | 'expectedHeadSha'
   | 'historyPacket'
   | 'includeClaudeReviewer'
@@ -564,6 +568,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
               : {}),
             ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
             ...(opts.directive ? { directive: opts.directive } : {}),
+            ...(opts.intent ? { intent: opts.intent } : {}),
             diff: part.diff,
             headSha: opts.expectedHeadSha,
             history: hasHistory,
@@ -717,7 +722,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
 
 export type HolisticStageOptions = Pick<
   ClaudeLayerOptions,
-  'baseDir' | 'conventionsPath' | 'directive' | 'expectedHeadSha' | 'historyPacket' | 'holistic' | 'lensHandoff' | 'log' | 'pinnedDiff' | 'run' | 'runId' | 'skeleton' | 'timeoutMs' | 'worktree'
+  'baseDir' | 'conventionsPath' | 'directive' | 'expectedHeadSha' | 'intent' | 'historyPacket' | 'holistic' | 'lensHandoff' | 'log' | 'pinnedDiff' | 'run' | 'runId' | 'skeleton' | 'timeoutMs' | 'worktree'
 >;
 
 export interface HolisticStageOutcome {
@@ -758,6 +763,7 @@ export async function runHolisticStage(opts: HolisticStageOptions): Promise<Holi
       headSha: opts.expectedHeadSha,
       ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
       ...(opts.directive ? { directive: opts.directive } : {}),
+      ...(opts.intent ? { intent: opts.intent } : {}),
       ...(opts.historyPacket ? { historyPacket: opts.historyPacket } : {}),
       log,
       run,
@@ -803,6 +809,7 @@ export interface IntegrationStageOptions {
   config: ResolvedVoiceConfig;
   conventionsPath?: string;
   directive?: string;
+  intent?: string;
   expectedHeadSha: string;
   historyPacket?: HistoryPacket;
   log?: (m: string) => void;
@@ -840,6 +847,7 @@ export async function runIntegrationStage(opts: IntegrationStageOptions): Promis
     baseSha: opts.baseSha,
     ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
     ...(opts.directive ? { directive: opts.directive } : {}),
+    ...(opts.intent ? { intent: opts.intent } : {}),
     headSha: opts.expectedHeadSha,
     history: historyPacketHasData(opts.historyPacket),
     scope: opts.scope,
@@ -958,6 +966,7 @@ export async function runClaudeReviewLayer(
     ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
     // The author's stated intent: a premise the gate checks a finding against, never evidence.
     ...(opts.directive ? { directive: opts.directive } : {}),
+    ...(opts.intent ? { intent: opts.intent } : {}),
     expectedHeadSha: opts.expectedHeadSha,
     // With a worktree the gate is an evidence-bearing actor over the PR head: it may emit
     // `reference-not-found`, and it can verify a holistic finding's two sites. Without one, both
