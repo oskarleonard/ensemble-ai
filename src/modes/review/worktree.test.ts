@@ -19,6 +19,7 @@ import {
   transportEnv,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
   type GitRun,
+  baseFetchRefspec,
 } from './worktree';
 
 // The clause is the in-file half of the instruction fence (the strip closes the FILE half). Since
@@ -209,6 +210,30 @@ describe('materialization hardening — untrusted content is checked out INERT i
     expect(fetch).not.toContain('origin');
     // Never shallow: the fetch carries no --depth, so history reads keep working (history-packet.ts).
     expect(fetch).not.toContain('--depth');
+  });
+
+  it('fetches the base TIP by a SECOND best-effort fetch into a private ref when a base ref is named — the head fetch is unchanged', () => {
+    const { calls, git } = harness(headSha);
+    const made = materializeWorktree({ baseRef: 'develop-fixture', headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git });
+    const fetches = calls.filter((c) => c.includes('fetch'));
+    expect(fetches).toHaveLength(2);
+    expect(fetches[0]).toContain('pull/7/head');
+    expect(fetches[0]).not.toContain('refs/ensemble/base');
+    expect(fetches[1]).toContain('+refs/heads/develop-fixture:refs/ensemble/base');
+    expect(fetches[1]).toContain('https://github.com/o/r.git');
+    expect(fetches[1]).not.toContain('origin');
+    expect(calls.some((c) => c[0] === 'rev-parse' && c.includes('refs/ensemble/base'))).toBe(true);
+    expect('baseTip' in made).toBe(true);
+  });
+
+  it('no base ref, or a ref that fails the safety regex ⇒ no second fetch, baseTip null', () => {
+    for (const baseRef of [null, undefined, '-x', 'a..b', 'bad//ref', 'trailing/', 'x.lock']) {
+      const { calls, git } = harness(headSha);
+      const made = materializeWorktree({ baseRef, headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git });
+      expect(calls.filter((c) => c.includes('fetch'))).toHaveLength(1);
+      expect((made as { baseTip?: string | null }).baseTip ?? null).toBeNull();
+    }
+    expect(baseFetchRefspec('release/1.2')).toBe('+refs/heads/release/1.2:refs/ensemble/base');
   });
 
   it('creates the worktree from a PRIVATE bare repo (init --bare), never the shared checkout', () => {

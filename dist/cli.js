@@ -3629,6 +3629,11 @@ function parseConfigList(text) {
   }
   return out;
 }
+var BASE_TIP_REF = "refs/ensemble/base";
+var SAFE_BRANCH_REF = /^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._\/-]{1,200}$/;
+function baseFetchRefspec(baseRef) {
+  return baseRef && SAFE_BRANCH_REF.test(baseRef) && !baseRef.endsWith("/") && !baseRef.endsWith(".lock") ? `+refs/heads/${baseRef}:${BASE_TIP_REF}` : null;
+}
 function materializeWorktree(args, deps) {
   const { location } = args;
   const shared = completeSharedStore(location.repoRoot, deps.git);
@@ -3658,6 +3663,16 @@ function materializeWorktree(args, deps) {
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
+    let baseTip = null;
+    const baseSpec = baseFetchRefspec(args.baseRef);
+    if (baseSpec) {
+      const baseFetched = deps.git(
+        [...INERT_GIT_CONFIG, "fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", location.fetchUrl, baseSpec],
+        { cwd: bare, env: fetchEnv(location.repoRoot, bare, deps.git) }
+      );
+      const tip = baseFetched.ok ? deps.git(["rev-parse", "--verify", BASE_TIP_REF], { cwd: bare, env: INERT_ENV }) : null;
+      baseTip = tip && tip.ok && /^[0-9a-f]{40,64}$/.test(tip.text.trim()) ? tip.text.trim() : null;
+    }
     const dir = path13.join(parent, "head");
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
@@ -3676,6 +3691,7 @@ function materializeWorktree(args, deps) {
       };
     }
     const made = {
+      baseTip,
       dir,
       headSha: args.headSha,
       strippedInstructionFiles: stripAgentInstructions(dir)
@@ -8412,6 +8428,7 @@ async function runClaudeReviewLayer(opts) {
     // A worktree gate verifies against the tree (evidence-bearing) — give it the
     // worktree-sized watchdog; packet mode keeps the shared default.
     timeoutMs: opts.timeoutMs ?? (opts.worktree ? GATE_WORKTREE_TIMEOUT_MS : void 0),
+    ...opts.base ? { base: opts.base } : {},
     // The gate reads the same worktree the seats did (spec §5) — its own spawn cwd.
     ...opts.worktree ? { worktree: opts.worktree } : {}
   });
@@ -9659,7 +9676,7 @@ var WHOLE_ENVELOPE_ADVICE = {
 };
 var TOOTHLESS_GATE_ADVICE = "  gate teeth did not engage \u2014 consider a stronger gate model";
 var GATE_ENVELOPE_SCHEMA_VERSION = 1;
-var GATE_TRAIL_SCHEMA_VERSION = 11;
+var GATE_TRAIL_SCHEMA_VERSION = 12;
 var REASON_CAP2 = 700;
 var CITATION_CAP = 500;
 var TLDR_CAP2 = 280;
@@ -9833,6 +9850,37 @@ function parseDependsOn(v) {
   const file = typeof o.file === "string" ? o.file.trim() : "";
   const line = typeof o.line === "number" && Number.isInteger(o.line) && o.line > 0 ? o.line : null;
   return file && line ? { file, line } : void 0;
+}
+function annotateBaseDrift(records, base, headSha, git2, cwd) {
+  if (!base?.tip) return { base: null, records };
+  const tip = base.tip;
+  const mb = git2(["merge-base", tip, headSha], { cwd });
+  const branchPoint = mb.ok && mb.text.trim() ? mb.text.trim() : base.sha;
+  const count = git2(["rev-list", "--count", `${headSha}..${tip}`], { cwd });
+  const behindBy = count.ok && /^\d+$/.test(count.text.trim()) ? Number(count.text.trim()) : null;
+  const probe = /* @__PURE__ */ new Map();
+  const moved = (file) => {
+    if (!branchPoint) return null;
+    if (probe.has(file)) return probe.get(file) ?? null;
+    const d = git2(["diff", "--name-only", branchPoint, tip, "--", file], { cwd });
+    const v = d.ok ? d.text.trim().length > 0 : null;
+    probe.set(file, v);
+    return v;
+  };
+  const out = records.map(
+    (r) => r.scope && (r.scope.kind === "pre-existing" || r.scope.kind === "blast-radius") && r.file ? { ...r, scope: { ...r.scope, movedOnBase: moved(r.file) } } : r
+  );
+  return { base: { ...base, behindBy, branchPoint }, records: out };
+}
+function carryBaseDrift(records, prior) {
+  if (!prior?.base) return { base: null, records };
+  const moved = new Map(
+    (prior.verdicts ?? []).filter((v) => v.scope && "movedOnBase" in v.scope).map((v) => [v.findingId, v.scope?.movedOnBase ?? null])
+  );
+  const out = records.map(
+    (r) => r.scope && (r.scope.kind === "pre-existing" || r.scope.kind === "blast-radius") && moved.has(r.findingId) ? { ...r, scope: { ...r.scope, movedOnBase: moved.get(r.findingId) ?? null } } : r
+  );
+  return { base: prior.base, records: out };
 }
 function findingScope(f, dependsOn, gateEvidence, packetHunks, changedFiles) {
   if (f.resolved) return { dependsOn: null, kind: "in-diff" };
@@ -10136,11 +10184,12 @@ function renderHighGate(records, decision, opts) {
 function gateDispositionSummary(records, dismissedHighIds, trailWritten) {
   return { dismissedHighIds, trailWritten, verdictCounts: verdictCounts(records) };
 }
-function writeGateVerdictsTrail(baseDir, runId, records) {
+function writeGateVerdictsTrail(baseDir, runId, records, base = null) {
   const trail = {
     runId,
     schemaVersion: GATE_TRAIL_SCHEMA_VERSION,
-    verdicts: records
+    verdicts: records,
+    ...base ? { base } : {}
   };
   try {
     writeTrailFile(baseDir, runId, "gate-verdicts.json", JSON.stringify(trail, null, 2));
@@ -10162,7 +10211,7 @@ function renderGateVerdicts(records, opts) {
   } else {
     for (const r of records) {
       const where = evidenceRef(r.file, r.line, s);
-      const dg = r.downgradeReason ? `  (host: ${r.downgradeReason})` : "";
+      const dg = r.downgradeReason ? `  (host: ${r.downgradeReason}${r.scope?.movedOnBase === true ? " \xB7 the base already changed this file \u2014 a rebase picks it up" : ""})` : r.scope?.movedOnBase === true ? "  (base already changed this file since the branch point)" : "";
       const reason = r.reason ? ` \u2014 ${s(r.reason).slice(0, 200)}` : "";
       const lens = r.holistic ? `  [holistic lens \xB7 single seat${r.holistic.cappedFrom ? ` \xB7 severity capped from ${r.holistic.cappedFrom}` : ""}${holisticCapWasLifted(r) ? " \xB7 MED cap lifted by a verified conventions citation" : ""}]` : "";
       out.push(
@@ -10310,8 +10359,15 @@ async function runGate(opts) {
   const finalize = async (synthesis2, parsed2, gateSpawned) => {
     const { records: reconciled, warnings } = reconcileGateVerdicts(findings, parsed2, reconcileOpts);
     for (const w of warnings) log(`  \xB7 ${w}`);
-    const records = clusterPostable(reconciled);
-    const gateTrailWritten = writeGateVerdictsTrail(opts.baseDir, opts.runId, records);
+    const drift = opts.base && opts.worktree ? annotateBaseDrift(reconciled, opts.base, opts.expectedHeadSha, opts.git ?? execGit(), opts.worktree) : carryBaseDrift(reconciled, opts.priorDrift);
+    if (drift.base) {
+      const movedCount = drift.records.filter((r) => r.scope?.movedOnBase === true).length;
+      log(
+        `  \xB7 base drift: ${drift.base.ref ?? "base"} @ ${(drift.base.tip ?? "?").slice(0, 12)} \xB7 branch point ${(drift.base.branchPoint ?? "?").slice(0, 12)} \xB7 behind by ${drift.base.behindBy ?? "?"} commit(s)${movedCount ? ` \xB7 ${movedCount} finding(s) cite a file the base already changed` : ""}`
+      );
+    }
+    const records = clusterPostable(drift.records);
+    const gateTrailWritten = writeGateVerdictsTrail(opts.baseDir, opts.runId, records, drift.base);
     if (!gateTrailWritten) {
       log("  \xB7 gate: gate-verdicts.json FAILED to write \u2014 dismissals not honored (trail loss is LOUD)");
     }
@@ -11820,10 +11876,12 @@ async function runRegate(opts) {
   log(
     `regate: ${reviews.length} persisted reviewer voice(s) rehydrated \xB7 head ${headSha.slice(0, 12)} \xB7 ${opts.worktree ? "worktree evidence" : "packet evidence"}`
   );
+  const priorDrift = readTrailJson(opts.baseDir, opts.runId, "gate-verdicts.json");
   const gate = await runGate({
     baseDir: opts.baseDir,
     config: opts.gateConfig,
     expectedHeadSha: headSha,
+    ...priorDrift?.base ? { priorDrift } : {},
     ...opts.worktree ? {
       gateEvidence: "worktree",
       holistic: {
@@ -12504,14 +12562,16 @@ function openWorktree(args, deps = {}) {
   if (isPreflightError(location)) return location;
   let made;
   try {
-    made = materializeWorktree({ headSha: args.headSha, location, pr: args.pr }, { git: git2 });
+    made = materializeWorktree({ baseRef: args.baseRef ?? null, headSha: args.headSha, location, pr: args.pr }, { git: git2 });
   } catch (e) {
     return { kind: "materialize-failed", message: e.message };
   }
   if (isPreflightError(made)) return made;
   let reaped = false;
   return {
+    baseRef: args.baseRef ?? null,
     baseSha: args.baseSha,
+    baseTip: made.baseTip,
     dir: made.dir,
     headSha: made.headSha,
     readableSurface: () => readReadableSurface(made.dir, made.headSha, { git: git2 }).filter(
@@ -12657,7 +12717,7 @@ function gateSection(records, trailWritten) {
   for (const r of records) {
     const where = evidenceRef(r.file, r.line, code);
     const reason = r.reason ? ` \u2014 ${md(r.reason)}` : "";
-    const dg = r.downgradeReason ? `  _(host: ${md(r.downgradeReason)})_` : "";
+    const dg = r.downgradeReason ? `  _(host: ${md(r.downgradeReason)}${r.scope?.movedOnBase === true ? "; already changed on the base branch \u2014 a rebase picks it up" : ""})_` : "";
     out.push(
       `- **[${VERDICT_TAG[r.effectiveVerdict]}]** \`${code(r.findingId)}\` \xB7 ${SEVERITY_LABEL[r.severity]} \xB7 \`${where}\` \u2014 ${md(r.title).slice(0, 160)}${reason}${dg}`
     );
@@ -13705,16 +13765,18 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
             "api",
             `repos/${repoSlug}/pulls/${selection.pr}`,
             "--jq",
-            "{base: .base.sha, head: .head.sha}"
+            "{base: .base.sha, baseRef: .base.ref, head: .head.sha}"
           ],
           cwd
         );
         let baseSha;
+        let baseRef;
         let headSha;
         if (meta.ok) {
           try {
             const o = JSON.parse(meta.text);
             if (typeof o.base === "string" && o.base.trim()) baseSha = o.base.trim();
+            if (typeof o.baseRef === "string" && o.baseRef.trim()) baseRef = o.baseRef.trim();
             if (typeof o.head === "string" && o.head.trim()) headSha = o.head.trim();
           } catch {
           }
@@ -13732,7 +13794,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
             cwd
           );
           const r2 = prResult(cmp, label4, headSha);
-          return "code" in r2 ? r2 : { ...r2, conventionsCtx: { ref: baseSha, repoSlug }, prBaseSha: baseSha };
+          return "code" in r2 ? r2 : { ...r2, conventionsCtx: { ref: baseSha, repoSlug }, prBaseSha: baseSha, ...baseRef ? { prBaseRef: baseRef } : {} };
         }
         const label3 = `gh pr diff ${selection.pr} -R ${repoSlug}`;
         const cap5 = capture(
@@ -14190,6 +14252,7 @@ async function reviewCommand(args, profile = "code") {
   if (repoFlag && source.postTarget && source.headShaOverride && source.prBaseSha) {
     console.error(`\xB7 materializing the PR head as a read-only worktree of ${repoFlag}\u2026`);
     const opened = openWorktree({
+      baseRef: source.prBaseRef ?? null,
       baseSha: source.prBaseSha,
       headSha: source.headShaOverride,
       pr: source.postTarget.pr,
@@ -14201,6 +14264,9 @@ async function reviewCommand(args, profile = "code") {
       return 3;
     }
     worktree = opened;
+    console.error(
+      opened.baseTip ? `\xB7 base tip: ${opened.baseRef} @ ${opened.baseTip.slice(0, 12)} fetched beside the head \u2014 a pre-existing finding can say whether the base already changed its file` : `\xB7 base tip: not fetched${opened.baseRef ? ` (${opened.baseRef})` : " (no base ref)"} \u2014 base-drift labels off this run`
+    );
     if (companions.length > 0) {
       const installed = installCompanions(worktree.dir, companions);
       for (const c of installed)
@@ -14393,7 +14459,7 @@ async function runReviewPipeline(input) {
       profile,
       reviewPrompt: ready.prompt,
       runId,
-      ...worktree ? { worktree: worktree.dir } : {}
+      ...worktree ? { worktree: worktree.dir, base: { ref: worktree.baseRef, sha: worktree.baseSha, tip: worktree.baseTip } } : {}
     });
     producerStage.catch(() => {
     });
@@ -16148,6 +16214,8 @@ async function regateCommand(args) {
     }
     console.error(`\xB7 re-materializing the PR head as a read-only worktree of ${repoFlag}\u2026`);
     const made = openWorktree({
+      baseRef: null,
+      // a regate reuses the review-time base-drift facts from the trail (regate.ts)
       baseSha: null,
       headSha,
       pr: ref.pr,
@@ -16311,7 +16379,7 @@ async function reseatCommand(args) {
       return 3;
     }
     console.error(`\xB7 re-materializing the PR head as a read-only worktree of ${repoFlag}\u2026`);
-    const made = openWorktree({ baseSha: pre.split.baseSha, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
+    const made = openWorktree({ baseRef: null, baseSha: pre.split.baseSha, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
     if (isPreflightError(made)) {
       const why = redactUrlCredentials(scrubControl(made.message)).slice(0, 300);
       worktreeUnavailable = `worktree unavailable (${made.kind}: ${why}) \u2014 re-ran on PACKET evidence`;
@@ -16503,6 +16571,7 @@ async function probeCommand(rest) {
   if (!gateSeat) return 3;
   console.error(`\xB7 materializing the PR head as a disposable worktree of ${repoFlag}\u2026`);
   const opened = openWorktree({
+    baseRef: source.prBaseRef ?? null,
     baseSha: source.prBaseSha,
     headSha: source.headShaOverride,
     pr: source.postTarget.pr,

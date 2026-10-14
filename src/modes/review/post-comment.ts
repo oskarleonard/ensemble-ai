@@ -193,7 +193,9 @@ function gateSection(records: GateVerdictRecord[], trailWritten: boolean): strin
     const where = evidenceRef(r.file, r.line, code);
     // r.reason is already capped (+ ellipsized) by the gate; don't re-clip it here.
     const reason = r.reason ? ` — ${md(r.reason)}` : '';
-    const dg = r.downgradeReason ? `  _(host: ${md(r.downgradeReason)})_` : '';
+    const dg = r.downgradeReason
+      ? `  _(host: ${md(r.downgradeReason)}${r.scope?.movedOnBase === true ? '; already changed on the base branch — a rebase picks it up' : ''})_`
+      : '';
     out.push(
       `- **[${VERDICT_TAG[r.effectiveVerdict]}]** \`${code(r.findingId)}\` · ${SEVERITY_LABEL[r.severity]} · \`${where}\` — ${md(r.title).slice(0, 160)}${reason}${dg}`
     );

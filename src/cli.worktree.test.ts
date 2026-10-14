@@ -69,7 +69,9 @@ let repoDir: string;
 
 function session(): WorktreeSession {
   return {
+    baseRef: null,
     baseSha: BASE,
+    baseTip: null,
     dir: '/tmp/ensemble-worktree-xyz',
     headSha: HEAD,
     readableSurface: () => [],

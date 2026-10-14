@@ -22,6 +22,10 @@ import {
 // order, and the reap can never be forgotten by a new call site.
 
 export interface WorktreeSession {
+  // The base branch name and its TIP sha, when the caller named the ref and the best-effort base
+  // fetch succeeded (worktree.ts). Base drift (gate trail v12) reads both; null ⇒ labels off.
+  baseRef: string | null;
+  baseTip: string | null;
   baseSha: string | null;
   dir: string;
   headSha: string;
@@ -39,6 +43,10 @@ export interface WorktreeSession {
 }
 
 export interface OpenWorktreeArgs {
+  // The PR's base BRANCH name (`.base.ref`). Named ⇒ the materializer also fetches its tip
+  // (best-effort) so the gate can tell "already changed on the base since the branch point".
+  // Optional: older callers and tests pass none ⇒ no base fetch.
+  baseRef?: string | null;
   // The PR's base SHA, for the seats' `git diff <base>...<head>` range. Prompt context only.
   baseSha: string | null;
   // The head SHA the receipt is tied to. Materialization ASSERTS the worktree resolves to it.
@@ -73,7 +81,7 @@ export function openWorktree(
   // There is no longer a lock to contend for: each review materializes into its own private repo.
   let made: PreflightError | Worktree;
   try {
-    made = materializeWorktree({ headSha: args.headSha, location, pr: args.pr }, { git });
+    made = materializeWorktree({ baseRef: args.baseRef ?? null, headSha: args.headSha, location, pr: args.pr }, { git });
   } catch (e) {
     return { kind: 'materialize-failed', message: (e as Error).message };
   }
@@ -81,7 +89,9 @@ export function openWorktree(
 
   let reaped = false;
   return {
+    baseRef: args.baseRef ?? null,
     baseSha: args.baseSha,
+    baseTip: made.baseTip,
     dir: made.dir,
     headSha: made.headSha,
     readableSurface: () =>
