@@ -168,6 +168,16 @@ describe('renderGatePrompt — the reference-not-found cause is taught ONLY on w
   // letter never opens a file. The first shadow-gate run proved it: 8 of 15 primary verdicts
   // downgraded with "outside the hunk" reasons, while the primary's tree-verified agrees
   // spot-checked real. On worktree evidence the hunk is the CITATION, the tree is the EVIDENCE.
+  it('a worktree-fed gate is told the SCOPE rule (dependsOn / pre-existing); a packet gate is not', () => {
+    const wt = renderGatePrompt(findings, injections, 'worktree');
+    expect(wt).toContain('SCOPE (worktree evidence)');
+    expect(wt).toContain('"dependsOn"');
+    expect(wt).toContain('PRE-EXISTING');
+    const pk = renderGatePrompt(findings, injections, 'packet');
+    expect(pk).not.toContain('SCOPE (worktree evidence)');
+    expect(pk).not.toContain('"dependsOn"');
+  });
+
   it('a worktree-fed gate is told the hunk is not its evidence boundary (GROUND IN THE TREE)', () => {
     const prompt = renderGatePrompt(findings, injections, 'worktree');
     expect(prompt).toContain('GROUND IN THE TREE');

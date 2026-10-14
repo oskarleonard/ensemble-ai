@@ -9116,6 +9116,18 @@ var WORKTREE_GROUNDING_CLAUSE = `
   never mints a "false": a dismissal still requires the hunk-quoted refutation above \u2014 what the
   tree can contribute AGAINST a finding is "cause": "reference-not-found" or a premise-conflict
   (below), each of which the host verifies itself.`;
+var SCOPE_CLAUSE = `
+- SCOPE (worktree evidence): a finding whose host line says "hunk unavailable (cite is
+  out-of-diff)" points at code this PR did not change. It is THIS PR's defect ONLY if a hunk of
+  this diff causes it \u2014 a changed caller, a removed guard, a renamed symbol the untouched file
+  still depends on, a table added without its grant. On an "agree" or "partial" for such a
+  finding you MUST send "dependsOn": {"file","line"} naming the line INSIDE the diff that makes
+  the untouched code wrong; the host resolves it against the pinned hunks. If the defect would be
+  there with this PR reverted \u2014 the same bytes exist without it \u2014 it is PRE-EXISTING: send
+  "dependsOn": "none" and verdict "unverified" with a reason starting "pre-existing:". The host
+  demotes an agree/partial on an out-of-diff cite that names no resolving dependsOn to
+  unverified (pre-existing); it never posts. A stated-intent item the diff simply does not do is
+  the same case: a conformance note for the author, never a defect confirmed against this PR.`;
 var strippedPathsClause = (conventionsFile) => `
 - STRIPPED PATHS: this checkout has the author's agent-instruction files REMOVED
   (${STRIPPED_INSTRUCTION_PATHS.join(", ")}) \u2014 a citation into one of those paths is NOT
@@ -9219,7 +9231,7 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   shown), set it to that findingId instead of merely saying so in prose. Your "reason" must still
   state what THIS finding claims that the primary's body does NOT \u2014 the host threads that claim onto
   the primary for the human, so a sharper framing (e.g. one reviewer names the direction that FAILS,
-  the other names the direction that wrongly PASSES) is never lost to dedup.${gateEvidence === "worktree" ? WORKTREE_GROUNDING_CLAUSE + strippedPathsClause(conventionsFile) + REFERENCE_NOT_FOUND_CLAUSE : ""}${hasHolistic ? holisticClause : ""}`;
+  the other names the direction that wrongly PASSES) is never lost to dedup.${gateEvidence === "worktree" ? WORKTREE_GROUNDING_CLAUSE + SCOPE_CLAUSE + strippedPathsClause(conventionsFile) + REFERENCE_NOT_FOUND_CLAUSE : ""}${hasHolistic ? holisticClause : ""}`;
 function premiseClusters(findings) {
   const eligible = findings.filter(
     (f) => (
@@ -9638,7 +9650,7 @@ var WHOLE_ENVELOPE_ADVICE = {
 };
 var TOOTHLESS_GATE_ADVICE = "  gate teeth did not engage \u2014 consider a stronger gate model";
 var GATE_ENVELOPE_SCHEMA_VERSION = 1;
-var GATE_TRAIL_SCHEMA_VERSION = 10;
+var GATE_TRAIL_SCHEMA_VERSION = 11;
 var REASON_CAP2 = 700;
 var CITATION_CAP = 500;
 var TLDR_CAP2 = 280;
@@ -9799,10 +9811,30 @@ function parseVerdicts(v) {
       ...e.verify === "run" ? { verify: "run" } : {},
       // Only the literal value is honored — an unrecognized premise class parses to absent, so a
       // creative model cannot mint new provenance semantics the host has never reasoned about.
-      ...e.premise === "external-testimony" ? { premise: "external-testimony" } : {}
+      ...e.premise === "external-testimony" ? { premise: "external-testimony" } : {},
+      ...parseDependsOn(e.dependsOn) !== void 0 ? { dependsOn: parseDependsOn(e.dependsOn) } : {}
     });
   }
   return out;
+}
+function parseDependsOn(v) {
+  if (v === "none") return "none";
+  if (!v || typeof v !== "object") return void 0;
+  const o = v;
+  const file = typeof o.file === "string" ? o.file.trim() : "";
+  const line = typeof o.line === "number" && Number.isInteger(o.line) && o.line > 0 ? o.line : null;
+  return file && line ? { file, line } : void 0;
+}
+function findingScope(f, dependsOn, gateEvidence, packetHunks, changedFiles) {
+  if (f.resolved) return { dependsOn: null, kind: "in-diff" };
+  if (gateEvidence !== "worktree" || !packetHunks) return { dependsOn: null, kind: "unknown" };
+  if (changedFiles?.has(f.file) && !packetHunks.has(f.file)) return { dependsOn: null, kind: "unknown" };
+  if (dependsOn && dependsOn !== "none") {
+    const hunks = packetHunks.get(dependsOn.file);
+    if (hunks && resolveFindingHunk(hunks, dependsOn.line))
+      return { dependsOn: { file: dependsOn.file, line: dependsOn.line }, kind: "blast-radius" };
+  }
+  return { dependsOn: null, kind: "pre-existing" };
 }
 function parseGateEnvelope(raw) {
   const obj = extractJsonBlock(raw);
@@ -9935,6 +9967,23 @@ function reconcileGateVerdicts(findings, parsed, opts = {}) {
         );
       }
     }
+    const scope = !isHolisticRecord(f) && (e.verdict === "agree" || e.verdict === "partial" || e.verdict === "unverified") ? findingScope(f, e.dependsOn, gateEvidence, opts.packetHunks, opts.changedFiles) : void 0;
+    if (scope && scope.kind === "pre-existing" && (e.verdict === "agree" || e.verdict === "partial")) {
+      if (e.dependsOn && e.dependsOn !== "none")
+        warnings.push(
+          `gate: "dependsOn" on ${f.findingId} (${e.dependsOn.file}:${e.dependsOn.line}) resolves to no hunk of the pinned diff \u2014 demoted to pre-existing`
+        );
+      return {
+        ...base,
+        citation,
+        downgradeReason: "pre-existing",
+        effectiveVerdict: "unverified",
+        rawVerdict,
+        reason: `pre-existing: the cited code is outside this diff and the gate named no hunk of the change it depends on \u2014 true at the head, not caused by this PR (a rebase or the base branch may already carry the fix) \u2014 ${e.reason || "no reason given"}`,
+        scope,
+        ...premise ? { premise } : {}
+      };
+    }
     return {
       ...base,
       citation,
@@ -9942,6 +9991,7 @@ function reconcileGateVerdicts(findings, parsed, opts = {}) {
       effectiveVerdict: e.verdict,
       rawVerdict,
       reason: e.reason,
+      ...scope ? { scope } : {},
       ...duplicateOf ? { duplicateOf } : {},
       ...premise ? { premise } : {},
       // verify-by-run rides only a CONFIRMED verdict — a hedge on unverified is what the
@@ -10148,8 +10198,12 @@ async function runGate(opts) {
   const partCount = Array.isArray(chunkTrail?.chunks) ? Math.max(1, chunkTrail.chunks.length) : 1;
   const { findings, injections } = prepareGateFindings(healthy, packetHunks, gateHunkBudgetFor(partCount));
   if (partCount > 1) log(`  \xB7 gate: ${partCount} parts \u2014 hunk budget ${gateHunkBudgetFor(partCount)} bytes`);
+  const changedFiles = new Set(packet.ok && packet.changedFiles ? packet.changedFiles : packetHunks.keys());
   const reconcileOpts = {
     gateEvidence: opts.gateEvidence,
+    // The scope rule (trail v11) reads the same pinned facts the hunk resolver does.
+    packetHunks,
+    changedFiles,
     // "What this PR changes" is the pinned packet's `changedFiles` — EVERY path the change
     // touches, including files coverage omitted over the ceiling — not merely the hunks that fit
     // the packet: the lens reads the whole tree, and its two sites are verified verbatim at
@@ -10157,9 +10211,7 @@ async function runGate(opts) {
     ...opts.holistic ? {
       holistic: {
         ...opts.holistic,
-        diffFiles: new Set(
-          packet.ok && packet.changedFiles ? packet.changedFiles : packetHunks.keys()
-        )
+        diffFiles: changedFiles
       }
     } : {}
   };

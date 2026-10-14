@@ -106,6 +106,15 @@ export const DOWNGRADE_REASONS = [
   // corroborated by an `as never` fixture led the gate to confirm a finding the backend's own
   // contract (a closed DB/API enum) refutes.
   'external-testimony',
+  // ADDITIVE (scope, 2026-10-14): the gate confirmed a finding whose cite is OUT-OF-DIFF and named
+  // no hunk of THIS diff that the defect depends on — so the defect would exist with the PR
+  // reverted. True at the head, not caused by the change: a stale branch, a teammate's fix already
+  // on the base tip, a tracker item the diff never attempted. Proven on a live run: a HIGH about an
+  // endpoint path in an UNTOUCHED file, already fixed on the base branch, reached a foreign PR as
+  // its lead item with the gate's own reason ending "nothing in the diff touches these files".
+  // Emitted ONLY on worktree evidence (a packet gate cannot walk the tree to find the dependency)
+  // and only for an agree/partial; the holistic lens has its own in-diff rule (holistic-gate.ts).
+  'pre-existing',
 ] as const;
 export type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
 
@@ -174,7 +183,11 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // verified core is a cheap fix is exactly the finding triage otherwise buries (proven on a real
 // run: a partial/low carrying a 15-minute extraction was deferred as a refactor, then re-raised
 // verbatim by a human reviewer).
-export const GATE_TRAIL_SCHEMA_VERSION = 10;
+// v11: adds `scope` — the host's answer to "is this the PR's defect?" for every agree/partial
+// (in-diff / blast-radius / pre-existing / unknown) and the `dependsOn` hunk the gate named for an
+// out-of-diff cite. Additive like v5-v10: absent on records the rule never looked at. The
+// 'pre-existing' kind is also a DowngradeReason: the verdict fails closed to unverified.
+export const GATE_TRAIL_SCHEMA_VERSION = 11;
 
 const REASON_CAP = 700;
 const CITATION_CAP = 500;
@@ -446,6 +459,10 @@ export interface RawVerdictEntry {
   // the literal 'external-testimony' is honored. Carried on partial/unverified; an "agree"
   // bearing it is host-downgraded (see reconcileGateVerdicts).
   premise?: string;
+  // Trail v11: for a finding whose cite is OUT-OF-DIFF, the line INSIDE the diff that makes the
+  // untouched code wrong — or the literal 'none' (the defect stands without this PR). The host
+  // resolves the pointer against the pinned hunks; see findingScope.
+  dependsOn?: DependsOn;
   // The plain-English, user-visible summary of a CONFIRMED finding (agree/partial). Asked for at
   // ≤280 chars; host-capped. Absent ⇒ the model omitted it, which never invalidates the verdict.
   tldr?: string;
@@ -515,9 +532,64 @@ function parseVerdicts(v: unknown): RawVerdictEntry[] {
       // Only the literal value is honored — an unrecognized premise class parses to absent, so a
       // creative model cannot mint new provenance semantics the host has never reasoned about.
       ...(e.premise === 'external-testimony' ? { premise: 'external-testimony' } : {}),
+      ...(parseDependsOn(e.dependsOn) !== undefined ? { dependsOn: parseDependsOn(e.dependsOn) } : {}),
     });
   }
   return out;
+}
+
+// The gate's dependency pointer for an out-of-diff cite (trail v11). Only the two exact shapes are
+// honored — {file, line} with a positive integer line, or the literal 'none'; anything else parses
+// to absent, which the scope rule treats exactly like 'none' (fail-closed: no named dependency).
+export type DependsOn = { file: string; line: number } | 'none';
+function parseDependsOn(v: unknown): DependsOn | undefined {
+  if (v === 'none') return 'none';
+  if (!v || typeof v !== 'object') return undefined;
+  const o = v as Record<string, unknown>;
+  const file = typeof o.file === 'string' ? o.file.trim() : '';
+  const line = typeof o.line === 'number' && Number.isInteger(o.line) && o.line > 0 ? o.line : null;
+  return file && line ? { file, line } : undefined;
+}
+
+// ── Scope: is this the PR's defect? (trail v11) ───────────────────────────────────────
+
+export const SCOPE_KINDS = ['in-diff', 'blast-radius', 'pre-existing', 'unknown'] as const;
+export type ScopeKind = (typeof SCOPE_KINDS)[number];
+export interface FindingScope {
+  // in-diff: the cite resolved to a hunk of the pinned diff — the finding IS about the change.
+  // blast-radius: the cite is out-of-diff, and the gate named a hunk of THIS diff the defect
+  //   depends on, which the host resolved against the pinned hunks — the change made untouched
+  //   code wrong (a removed guard, a changed caller, a table added without its grant).
+  // pre-existing: the cite is out-of-diff and the gate named no resolving dependency — the defect
+  //   would exist with the PR reverted. An agree/partial carrying it fails closed to unverified.
+  // unknown: the host cannot decide — packet evidence (no tree to walk), no pinned hunks, or a cite
+  //   into a changed file whose hunks coverage omitted. Never demotes.
+  kind: ScopeKind;
+  // The resolved dependency on blast-radius; null otherwise.
+  dependsOn: { file: string; line: number } | null;
+}
+
+// Decide a finding's scope DETERMINISTICALLY from host-owned facts: whether its own cite resolved
+// (GateFinding.resolved), the gate's realized evidence, the pinned hunks, and the gate's
+// `dependsOn` pointer — which the host RESOLVES (resolveFindingHunk) rather than trusts. Pure.
+export function findingScope(
+  f: Pick<GateFinding, 'file' | 'resolved'>,
+  dependsOn: DependsOn | undefined,
+  gateEvidence: EvidenceClass,
+  packetHunks: ReadonlyMap<string, Hunk[]> | undefined,
+  changedFiles: ReadonlySet<string> | undefined
+): FindingScope {
+  if (f.resolved) return { dependsOn: null, kind: 'in-diff' };
+  if (gateEvidence !== 'worktree' || !packetHunks) return { dependsOn: null, kind: 'unknown' };
+  // The cite names a file the change DOES touch, but its hunks are not in the packet (coverage
+  // omitted them over the ceiling): the line may well be inside the change — undecidable here.
+  if (changedFiles?.has(f.file) && !packetHunks.has(f.file)) return { dependsOn: null, kind: 'unknown' };
+  if (dependsOn && dependsOn !== 'none') {
+    const hunks = packetHunks.get(dependsOn.file);
+    if (hunks && resolveFindingHunk(hunks, dependsOn.line))
+      return { dependsOn: { file: dependsOn.file, line: dependsOn.line }, kind: 'blast-radius' };
+  }
+  return { dependsOn: null, kind: 'pre-existing' };
 }
 
 // Parse the composite envelope. Unparseable ⇒ gate-failed; a missing / unsupported
@@ -614,6 +686,11 @@ export interface GateVerdictRecord {
   // should surface the weaker premise class rather than presenting the claim as fact.
   premise?: 'external-testimony';
   rawVerdict: string | null; // exactly what the model returned (may be an invalid enum), null if none
+  // Trail v11 (additive): the host's scope decision for an agree/partial — see FindingScope. Absent
+  // on dismissals, on host-forced downgrades that never reached the rule, and on holistic records
+  // (the lens has its own in-diff requirement). A 'pre-existing' scope always pairs with the
+  // 'pre-existing' downgrade: the verdict was demoted, never posted.
+  scope?: FindingScope;
   reason: string;
   rescoredSeverity: Severity | null; // gate's down-scored severity for a partial; null ⇒ unchanged
   // The execution settler's verdict-by-running (trail schema v6). Present ONLY on a finding the
@@ -703,7 +780,14 @@ export function reconcileGateVerdicts(
   // The gate's REALIZED evidence class. Defaults to 'packet' — the pre-worktree behavior.
   // `holistic` supplies the worktree-backed verification the lens's own guardrails need; absent
   // ⇒ any holistic record present is fail-closed (it cannot be verified against anything).
-  opts: { gateEvidence?: EvidenceClass; holistic?: HolisticPolicyDeps } = {}
+  opts: {
+    gateEvidence?: EvidenceClass;
+    holistic?: HolisticPolicyDeps;
+    // The scope rule's facts (trail v11): the pinned hunks and every path the change touches. Both
+    // absent ⇒ every scope is 'unknown' and nothing is demoted — the pre-v11 behavior.
+    packetHunks?: ReadonlyMap<string, Hunk[]>;
+    changedFiles?: ReadonlySet<string>;
+  } = {}
 ): { records: GateVerdictRecord[]; warnings: string[] } {
   const gateEvidence: EvidenceClass = opts.gateEvidence ?? 'packet';
   if ('failure' in parsed) {
@@ -817,6 +901,32 @@ export function reconcileGateVerdicts(
         );
       }
     }
+    // SCOPE (trail v11): a confirmed finding must be THIS PR's defect. The cite resolved to a hunk
+    // ⇒ in-diff. Out-of-diff ⇒ the gate must have named a hunk of this diff the defect depends on,
+    // and the host resolves that pointer itself; none ⇒ pre-existing, and the agree/partial fails
+    // closed to unverified so a defect the change did not cause never crosses to a foreign PR.
+    // Holistic records are exempt: the lens's own policy already requires its diff site inside
+    // the change (holistic-gate.ts). Unverified verdicts carry the scope as data only.
+    const scope =
+      !isHolisticRecord(f) && (e.verdict === 'agree' || e.verdict === 'partial' || e.verdict === 'unverified')
+        ? findingScope(f, e.dependsOn, gateEvidence, opts.packetHunks, opts.changedFiles)
+        : undefined;
+    if (scope && scope.kind === 'pre-existing' && (e.verdict === 'agree' || e.verdict === 'partial')) {
+      if (e.dependsOn && e.dependsOn !== 'none')
+        warnings.push(
+          `gate: "dependsOn" on ${f.findingId} (${e.dependsOn.file}:${e.dependsOn.line}) resolves to no hunk of the pinned diff — demoted to pre-existing`
+        );
+      return {
+        ...base,
+        citation,
+        downgradeReason: 'pre-existing',
+        effectiveVerdict: 'unverified',
+        rawVerdict,
+        reason: `pre-existing: the cited code is outside this diff and the gate named no hunk of the change it depends on — true at the head, not caused by this PR (a rebase or the base branch may already carry the fix) — ${e.reason || 'no reason given'}`,
+        scope,
+        ...(premise ? { premise } : {}),
+      };
+    }
     // agree / partial / unverified pass through — not dismissals, so truncation does not force them.
     return {
       ...base,
@@ -825,6 +935,7 @@ export function reconcileGateVerdicts(
       effectiveVerdict: e.verdict,
       rawVerdict,
       reason: e.reason,
+      ...(scope ? { scope } : {}),
       ...(duplicateOf ? { duplicateOf } : {}),
       ...(premise ? { premise } : {}),
       // verify-by-run rides only a CONFIRMED verdict — a hedge on unverified is what the
@@ -1295,8 +1406,12 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
 
   // ONE reconcile config for the primary AND the shadow — property 3 of the shadow gate: a
   // verdict difference must be judge vs judge, never a reconcile-input drift.
+  const changedFiles = new Set(packet.ok && packet.changedFiles ? packet.changedFiles : packetHunks.keys());
   const reconcileOpts = {
     gateEvidence: opts.gateEvidence,
+    // The scope rule (trail v11) reads the same pinned facts the hunk resolver does.
+    packetHunks,
+    changedFiles,
     // "What this PR changes" is the pinned packet's `changedFiles` — EVERY path the change
     // touches, including files coverage omitted over the ceiling — not merely the hunks that fit
     // the packet: the lens reads the whole tree, and its two sites are verified verbatim at
@@ -1305,9 +1420,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
       ? {
           holistic: {
             ...opts.holistic,
-            diffFiles: new Set(
-              packet.ok && packet.changedFiles ? packet.changedFiles : packetHunks.keys()
-            ),
+            diffFiles: changedFiles,
           },
         }
       : {}),

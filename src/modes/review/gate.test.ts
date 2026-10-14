@@ -311,8 +311,8 @@ describe('reconcileGateVerdicts — postable text (A+)', () => {
     expect(u).toMatchObject({ effectiveVerdict: 'unverified', postableBody: null, postableStatus: 'not-postable' });
   });
 
-  it('the durable trail schema is bumped to v10 (verifiedKernel; premise was v9, duplicateOf/duplicates v8, verifyRequested v7, settlement v6, postable/placement/anchorSide/tldr v2–v5)', () => {
-    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(10);
+  it('the durable trail schema is bumped to v11 (scope; verifiedKernel was v10, premise v9, duplicateOf/duplicates v8, verifyRequested v7, settlement v6, postable/placement/anchorSide/tldr v2–v5)', () => {
+    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(11);
   });
 
   describe('duplicateOf → threaded duplicate echoes (trail v8)', () => {
