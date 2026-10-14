@@ -704,9 +704,18 @@ declare function applyHolisticPolicy(records: GateVerdictRecord[], entryById: Re
 
 declare const GATE_VERDICTS: readonly ["agree", "partial", "false", "unverified"];
 type GateVerdict = (typeof GATE_VERDICTS)[number];
-declare const DOWNGRADE_REASONS: readonly ["truncated", "invalid-citation", "duplicate", "missing", "bad-enum", "packet-fail", "gate-failed", "unknown-schema", "trail-write-failed", "reference-not-found", "external-testimony"];
+declare const DOWNGRADE_REASONS: readonly ["truncated", "invalid-citation", "duplicate", "missing", "bad-enum", "packet-fail", "gate-failed", "unknown-schema", "trail-write-failed", "reference-not-found", "external-testimony", "pre-existing"];
 type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
 type AnchorSide = 'new' | 'old' | null;
+declare const SCOPE_KINDS: readonly ["in-diff", "blast-radius", "pre-existing", "unknown"];
+type ScopeKind = (typeof SCOPE_KINDS)[number];
+interface FindingScope {
+    kind: ScopeKind;
+    dependsOn: {
+        file: string;
+        line: number;
+    } | null;
+}
 declare const SETTLEMENT_OUTCOMES: readonly ["confirmed", "refuted", "inconclusive"];
 type SettlementOutcome = (typeof SETTLEMENT_OUTCOMES)[number];
 interface SettlementRecord {
@@ -744,6 +753,7 @@ interface GateVerdictRecord {
     verifiedKernel?: VerifiedKernel;
     premise?: 'external-testimony';
     rawVerdict: string | null;
+    scope?: FindingScope;
     reason: string;
     rescoredSeverity: Severity | null;
     settlement?: SettlementRecord;

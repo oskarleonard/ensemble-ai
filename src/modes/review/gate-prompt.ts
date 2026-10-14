@@ -103,6 +103,25 @@ const WORKTREE_GROUNDING_CLAUSE = `
   tree can contribute AGAINST a finding is "cause": "reference-not-found" or a premise-conflict
   (below), each of which the host verifies itself.`;
 
+// SCOPE, told to the judge (2026-10-14): on worktree evidence the gate may confirm a finding that
+// cites code OUTSIDE the diff — that is the whole point of tree grounding — but "true at the head"
+// is not "caused by this PR". A stale branch carries defects its base tip has already fixed; a
+// tracker item the diff never attempted reads as a missing fix. The host decides scope
+// mechanically (gate.ts findingScope: the gate's `dependsOn` pointer is RESOLVED against the pinned
+// hunks, never trusted), so the clause tells the judge exactly what will be checked.
+const SCOPE_CLAUSE = `
+- SCOPE (worktree evidence): a finding whose host line says "hunk unavailable (cite is
+  out-of-diff)" points at code this PR did not change. It is THIS PR's defect ONLY if a hunk of
+  this diff causes it — a changed caller, a removed guard, a renamed symbol the untouched file
+  still depends on, a table added without its grant. On an "agree" or "partial" for such a
+  finding you MUST send "dependsOn": {"file","line"} naming the line INSIDE the diff that makes
+  the untouched code wrong; the host resolves it against the pinned hunks. If the defect would be
+  there with this PR reverted — the same bytes exist without it — it is PRE-EXISTING: send
+  "dependsOn": "none" and verdict "unverified" with a reason starting "pre-existing:". The host
+  demotes an agree/partial on an out-of-diff cite that names no resolving dependsOn to
+  unverified (pre-existing); it never posts. A stated-intent item the diff simply does not do is
+  the same case: a conformance note for the author, never a defect confirmed against this PR.`;
+
 // THE STRIP, told to the judge (2026-10-14, run 28b174b3): the worktree has the author's
 // agent-instruction files removed (worktree.ts stripAgentInstructions), and the reviewers read
 // those rules through the conventions file instead — so a finding that cites `CLAUDE.md:12` or
@@ -231,7 +250,7 @@ The verdict decides what (if anything) gets posted to the PR, so it must be POST
   state what THIS finding claims that the primary's body does NOT — the host threads that claim onto
   the primary for the human, so a sharper framing (e.g. one reviewer names the direction that FAILS,
   the other names the direction that wrongly PASSES) is never lost to dedup.${
-    gateEvidence === 'worktree' ? WORKTREE_GROUNDING_CLAUSE + strippedPathsClause(conventionsFile) + REFERENCE_NOT_FOUND_CLAUSE : ''
+    gateEvidence === 'worktree' ? WORKTREE_GROUNDING_CLAUSE + SCOPE_CLAUSE + strippedPathsClause(conventionsFile) + REFERENCE_NOT_FOUND_CLAUSE : ''
   }${hasHolistic ? holisticClause : ''}`;
 
 // ── The PREMISE PASS (spec 2026-09-09-review-premise-pass §4, opt-in --premise) ─────────
