@@ -178,6 +178,20 @@ describe('renderGatePrompt — the reference-not-found cause is taught ONLY on w
     expect(pk).not.toContain('"dependsOn"');
   });
 
+  it('with the changed-file set, an unresolved cite is told apart: off-hunk in a CHANGED file vs a file NOT in this diff', () => {
+    const unresolvedChanged = prepareGateFindings([review('codex', [f({ evidence: { file: 'src/x.ts', line: 900 } })])], parsePacketHunks(DIFF));
+    const unresolvedOther = prepareGateFindings([review('codex', [f({ evidence: { file: 'src/untouched.ts', line: 3 } })])], parsePacketHunks(DIFF));
+    const changedFiles = new Set(['src/x.ts']);
+    expect(renderGatePrompt(unresolvedChanged.findings, unresolvedChanged.injections, 'worktree', { changedFiles })).toContain(
+      'off every pinned hunk of this CHANGED file'
+    );
+    expect(renderGatePrompt(unresolvedOther.findings, unresolvedOther.injections, 'worktree', { changedFiles })).toContain(
+      'file is NOT in this diff'
+    );
+    // Without the set: the pre-v11 wording, byte-identical.
+    expect(renderGatePrompt(unresolvedOther.findings, unresolvedOther.injections, 'worktree')).toContain('cite is out-of-diff');
+  });
+
   it('a worktree-fed gate is told the hunk is not its evidence boundary (GROUND IN THE TREE)', () => {
     const prompt = renderGatePrompt(findings, injections, 'worktree');
     expect(prompt).toContain('GROUND IN THE TREE');
