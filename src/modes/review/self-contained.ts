@@ -40,6 +40,7 @@ import {
   type ShadowGateSeat,
   renderGateVerdicts,
   runGate,
+  type GateBaseFacts,
 } from './gate';
 import { renderSettlements, runSettler, selectSettleTargets, type SettlerRunner } from './settler';
 import {
@@ -432,6 +433,9 @@ export interface ClaudeLayerOptions {
   // presence makes the GATE worktree-fed (spec §5: "the gate reads the same worktree") and is the
   // precondition for the lens. Absent ⇒ every seat and the gate stay on the packet, as before.
   worktree?: string;
+  // Base drift (gate trail v12): the base sha/ref/tip the worktree session resolved — handed to the
+  // gate so a pre-existing finding can say whether the base already changed its file.
+  base?: GateBaseFacts;
 }
 
 export interface ClaudeLayerResult {
@@ -993,6 +997,7 @@ export async function runClaudeReviewLayer(
     // A worktree gate verifies against the tree (evidence-bearing) — give it the
     // worktree-sized watchdog; packet mode keeps the shared default.
     timeoutMs: opts.timeoutMs ?? (opts.worktree ? GATE_WORKTREE_TIMEOUT_MS : undefined),
+    ...(opts.base ? { base: opts.base } : {}),
     // The gate reads the same worktree the seats did (spec §5) — its own spawn cwd.
     ...(opts.worktree ? { worktree: opts.worktree } : {}),
   });

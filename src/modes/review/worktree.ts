@@ -238,6 +238,10 @@ const WORKTREE_PARENT_PREFIX = 'ensemble-worktree-';
 export interface Worktree {
   dir: string;
   headSha: string;
+  // The base BRANCH tip, fetched beside the head when the caller named the base ref (base drift,
+  // gate trail v12): null when no ref was given or the best-effort fetch failed — the head still
+  // materializes either way.
+  baseTip: string | null;
   // Repo-relative paths of the agent-instruction files STRIPPED from the checkout before any seat
   // ran (see stripAgentInstructions). Sorted. The evidence manifest subtracts them, so no artifact
   // ever claims a seat could read a file the engine removed.
@@ -682,8 +686,20 @@ function parseConfigList(text: string): Array<[string, string]> {
 // fetch cheap — it downloads only the objects the shared store lacks (the PR's own commits), the
 // same economics as the old fetch-into-shared-.git path — and a URL-only location (no shared store)
 // simply fetches the full ancestry, exactly as a clone would.
+// The base branch tip is fetched into a private ref of the bare repo — never into the shared
+// checkout — by a SECOND, best-effort fetch after the head fetch: the head fetch and its argv stay
+// byte-identical (tests pin it), and a base that cannot be fetched (auth, deleted branch) costs the
+// run nothing but the drift labels.
+export const BASE_TIP_REF = 'refs/ensemble/base';
+const SAFE_BRANCH_REF = /^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]{1,200}$/;
+export function baseFetchRefspec(baseRef: string | null | undefined): string | null {
+  return baseRef && SAFE_BRANCH_REF.test(baseRef) && !baseRef.endsWith('/') && !baseRef.endsWith('.lock')
+    ? `+refs/heads/${baseRef}:${BASE_TIP_REF}`
+    : null;
+}
+
 export function materializeWorktree(
-  args: { headSha: string; location: RepoLocation; pr: number; worktreeRoot?: string },
+  args: { baseRef?: string | null; headSha: string; location: RepoLocation; pr: number; worktreeRoot?: string },
   deps: { git: GitRun }
 ): PreflightError | Worktree {
   const { location } = args;
@@ -716,6 +732,16 @@ export function materializeWorktree(
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`,
       };
     }
+    let baseTip: string | null = null;
+    const baseSpec = baseFetchRefspec(args.baseRef);
+    if (baseSpec) {
+      const baseFetched = deps.git(
+        [...INERT_GIT_CONFIG, 'fetch', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head', location.fetchUrl, baseSpec],
+        { cwd: bare, env: fetchEnv(location.repoRoot, bare, deps.git) }
+      );
+      const tip = baseFetched.ok ? deps.git(['rev-parse', '--verify', BASE_TIP_REF], { cwd: bare, env: INERT_ENV }) : null;
+      baseTip = tip && tip.ok && /^[0-9a-f]{40,64}$/.test(tip.text.trim()) ? tip.text.trim() : null;
+    }
     // Materialize by SHA, not FETCH_HEAD: the fetch proved the object exists locally, and checking
     // out the receipt's own headSha removes any window where FETCH_HEAD could have drifted.
     //
@@ -743,6 +769,7 @@ export function materializeWorktree(
     // STRIP AFTER the HEAD assert, BEFORE any seat can run: the assert proves we materialized the
     // reviewed content, and the strip then removes the PR author's instruction channel from it.
     const made = {
+      baseTip,
       dir,
       headSha: args.headSha,
       strippedInstructionFiles: stripAgentInstructions(dir),
@@ -853,7 +880,7 @@ export async function resolveRepoLocationAsync(
 // + awaited fs. No lock: each review materializes into its own private repo, so a server can run N
 // concurrent materializations of one repo with nothing to serialize on.
 export async function materializeWorktreeAsync(
-  args: { headSha: string; location: RepoLocation; pr: number; worktreeRoot?: string },
+  args: { baseRef?: string | null; headSha: string; location: RepoLocation; pr: number; worktreeRoot?: string },
   deps: { git: GitRunAsync }
 ): Promise<PreflightError | Worktree> {
   const { location } = args;
@@ -884,6 +911,16 @@ export async function materializeWorktreeAsync(
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`,
       };
     }
+    let baseTip: string | null = null;
+    const baseSpec = baseFetchRefspec(args.baseRef);
+    if (baseSpec) {
+      const baseFetched = await deps.git(
+        [...INERT_GIT_CONFIG, 'fetch', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head', location.fetchUrl, baseSpec],
+        { cwd: bare, env: await fetchEnvAsync(location.repoRoot, bare, deps.git) }
+      );
+      const tip = baseFetched.ok ? await deps.git(['rev-parse', '--verify', BASE_TIP_REF], { cwd: bare, env: INERT_ENV }) : null;
+      baseTip = tip && tip.ok && /^[0-9a-f]{40,64}$/.test(tip.text.trim()) ? tip.text.trim() : null;
+    }
     const dir = path.join(parent, 'head');
     const added = await deps.git(
       [...INERT_GIT_CONFIG, 'worktree', 'add', '--detach', dir, args.headSha],
@@ -904,6 +941,7 @@ export async function materializeWorktreeAsync(
       };
     }
     const made = {
+      baseTip,
       dir,
       headSha: args.headSha,
       strippedInstructionFiles: await stripAgentInstructionsAsync(dir),

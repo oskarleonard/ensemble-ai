@@ -5,9 +5,12 @@ import { reviewDir, writeTrailFile } from '../../core/artifacts';
 import type { ResolvedVoiceConfig } from '../brainstorm/types';
 
 import { runClaudeReviewVoice } from './claude';
-import { type GateVerdictRecord, runGate } from './gate';
+import { type GateVerdictRecord, runGate,
+  type GateBaseTrail,
+} from './gate';
 import { readGatePacketHeadSha } from './gate-hunks';
 import { worktreeReader, conventionsAwareReader, CONVENTIONS_IN_TREE_REL } from './holistic-gate';
+import { readTrailJson } from './trail-io';
 import {
   GATE_WORKTREE_TIMEOUT_MS,
   loadVoiceReviewsFromTrail,
@@ -100,10 +103,14 @@ export async function runRegate(opts: RegateOptions): Promise<RegateResult> {
     }`
   );
 
+  // Base drift (trail v12): a regate carries the REVIEW-TIME facts forward (the head is unchanged,
+  // the base is not) — read before runGate overwrites the trail.
+  const priorDrift = readTrailJson<{ base?: GateBaseTrail | null; verdicts?: GateVerdictRecord[] }>(opts.baseDir, opts.runId, 'gate-verdicts.json');
   const gate = await runGate({
     baseDir: opts.baseDir,
     config: opts.gateConfig,
     expectedHeadSha: headSha,
+    ...(priorDrift?.base ? { priorDrift } : {}),
     ...(opts.worktree
       ? {
           gateEvidence: 'worktree' as const,

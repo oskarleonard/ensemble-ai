@@ -4156,6 +4156,11 @@ function parseConfigList(text) {
   }
   return out;
 }
+var BASE_TIP_REF = "refs/ensemble/base";
+var SAFE_BRANCH_REF = /^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]{1,200}$/;
+function baseFetchRefspec(baseRef) {
+  return baseRef && SAFE_BRANCH_REF.test(baseRef) && !baseRef.endsWith("/") && !baseRef.endsWith(".lock") ? `+refs/heads/${baseRef}:${BASE_TIP_REF}` : null;
+}
 function materializeWorktree(args, deps) {
   const { location } = args;
   const shared = completeSharedStore(location.repoRoot, deps.git);
@@ -4185,6 +4190,16 @@ function materializeWorktree(args, deps) {
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
+    let baseTip = null;
+    const baseSpec = baseFetchRefspec(args.baseRef);
+    if (baseSpec) {
+      const baseFetched = deps.git(
+        [...INERT_GIT_CONFIG, "fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", location.fetchUrl, baseSpec],
+        { cwd: bare, env: fetchEnv(location.repoRoot, bare, deps.git) }
+      );
+      const tip = baseFetched.ok ? deps.git(["rev-parse", "--verify", BASE_TIP_REF], { cwd: bare, env: INERT_ENV }) : null;
+      baseTip = tip && tip.ok && /^[0-9a-f]{40,64}$/.test(tip.text.trim()) ? tip.text.trim() : null;
+    }
     const dir = path13.join(parent, "head");
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
@@ -4203,6 +4218,7 @@ function materializeWorktree(args, deps) {
       };
     }
     const made = {
+      baseTip,
       dir,
       headSha: args.headSha,
       strippedInstructionFiles: stripAgentInstructions(dir)
@@ -4287,6 +4303,16 @@ async function materializeWorktreeAsync(args, deps) {
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
+    let baseTip = null;
+    const baseSpec = baseFetchRefspec(args.baseRef);
+    if (baseSpec) {
+      const baseFetched = await deps.git(
+        [...INERT_GIT_CONFIG, "fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", location.fetchUrl, baseSpec],
+        { cwd: bare, env: await fetchEnvAsync(location.repoRoot, bare, deps.git) }
+      );
+      const tip = baseFetched.ok ? await deps.git(["rev-parse", "--verify", BASE_TIP_REF], { cwd: bare, env: INERT_ENV }) : null;
+      baseTip = tip && tip.ok && /^[0-9a-f]{40,64}$/.test(tip.text.trim()) ? tip.text.trim() : null;
+    }
     const dir = path13.join(parent, "head");
     const added = await deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
@@ -4305,6 +4331,7 @@ async function materializeWorktreeAsync(args, deps) {
       };
     }
     const made = {
+      baseTip,
       dir,
       headSha: args.headSha,
       strippedInstructionFiles: await stripAgentInstructionsAsync(dir)
@@ -8717,6 +8744,7 @@ export {
   ADVISOR_MODEL_RE,
   ADVISOR_OFF,
   AGENT_INSTRUCTION_NAMES,
+  BASE_TIP_REF,
   CI_EVIDENCE_BOTH_REASON,
   CI_EVIDENCE_LIMITS,
   CI_EVIDENCE_SECTION_TITLE,
@@ -8823,6 +8851,7 @@ export {
   asRecord2 as asRecord,
   assembleCodePacket,
   assertRosterAdvisors,
+  baseFetchRefspec,
   boundedStreamTail,
   buildClaudeEvidenceArgs,
   buildClaudeReviewArgs,

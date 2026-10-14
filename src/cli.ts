@@ -654,6 +654,10 @@ function resolveSource(
       // deliberately NOT fed to `acquireDiff`: the receipt's `baseSha` is part of the receipt KEY,
       // so populating it here would stale every PR-mode receipt on disk.
       prBaseSha?: string;
+      // The PR's base BRANCH name (`.base.ref`) — lets the worktree fetch the base TIP beside the
+      // head, so the gate can tell "pre-existing, already changed on the base since the branch
+      // point" from a plain pre-existing (base drift, gate trail v12). Optional: absent ⇒ no fetch.
+      prBaseRef?: string;
       staged?: boolean;
       workingTree?: boolean;
     } {
@@ -696,16 +700,18 @@ function resolveSource(
             'api',
             `repos/${repoSlug}/pulls/${selection.pr}`,
             '--jq',
-            '{base: .base.sha, head: .head.sha}',
+            '{base: .base.sha, baseRef: .base.ref, head: .head.sha}',
           ],
           cwd
         );
         let baseSha: string | undefined;
+        let baseRef: string | undefined;
         let headSha: string | undefined;
         if (meta.ok) {
           try {
-            const o = JSON.parse(meta.text) as { base?: unknown; head?: unknown };
+            const o = JSON.parse(meta.text) as { base?: unknown; baseRef?: unknown; head?: unknown };
             if (typeof o.base === 'string' && o.base.trim()) baseSha = o.base.trim();
+            if (typeof o.baseRef === 'string' && o.baseRef.trim()) baseRef = o.baseRef.trim();
             if (typeof o.head === 'string' && o.head.trim()) headSha = o.head.trim();
           } catch {
             /* unresolved → fall through to the unbound gh pr diff below */
@@ -732,7 +738,7 @@ function resolveSource(
           // same files from the checkout — belt and braces, see worktree.ts stripAgentInstructions.)
           return 'code' in r
             ? r
-            : { ...r, conventionsCtx: { ref: baseSha, repoSlug }, prBaseSha: baseSha };
+            : { ...r, conventionsCtx: { ref: baseSha, repoSlug }, prBaseSha: baseSha, ...(baseRef ? { prBaseRef: baseRef } : {}) };
         }
         // SHAs unresolved → unbound `gh pr diff -R` (no SHA binding, generic label). A
         // URL PR reviews a DIFFERENT repo than the cwd, so its conventions must come ONLY
@@ -1408,6 +1414,7 @@ async function reviewCommand(
   if (repoFlag && source.postTarget && source.headShaOverride && source.prBaseSha) {
     console.error(`· materializing the PR head as a read-only worktree of ${repoFlag}…`);
     const opened = openWorktree({
+      baseRef: source.prBaseRef ?? null,
       baseSha: source.prBaseSha,
       headSha: source.headShaOverride,
       pr: source.postTarget.pr,
@@ -1419,6 +1426,11 @@ async function reviewCommand(
       return 3;
     }
     worktree = opened;
+    console.error(
+      opened.baseTip
+        ? `· base tip: ${opened.baseRef} @ ${opened.baseTip.slice(0, 12)} fetched beside the head — a pre-existing finding can say whether the base already changed its file`
+        : `· base tip: not fetched${opened.baseRef ? ` (${opened.baseRef})` : ' (no base ref)'} — base-drift labels off this run`
+    );
     // Companion repos (hugin spec doc-review-evidence §8): placed INSIDE the worktree before any
     // seat spawns, so every fenced seat reaches them through the one read root it already has.
     if (companions.length > 0) {
@@ -1754,7 +1766,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       profile,
       reviewPrompt: ready.prompt,
       runId,
-      ...(worktree ? { worktree: worktree.dir } : {}),
+      ...(worktree ? { worktree: worktree.dir, base: { ref: worktree.baseRef, sha: worktree.baseSha, tip: worktree.baseTip } } : {}),
     });
     // A rejection is caught by the layer's await (and its crash backstop); this only keeps an
     // early failure from surfacing as an unhandled rejection while the core is still running.
@@ -3918,6 +3930,7 @@ async function regateCommand(args: string[]): Promise<number> {
     }
     console.error(`· re-materializing the PR head as a read-only worktree of ${repoFlag}…`);
     const made = openWorktree({
+      baseRef: null, // a regate reuses the review-time base-drift facts from the trail (regate.ts)
       baseSha: null,
       headSha,
       pr: ref.pr,
@@ -4109,7 +4122,7 @@ async function reseatCommand(args: string[]): Promise<number> {
     // saying "no base range" while the preamble it produced re-issued one: the seat was told to
     // review `git diff <base>...<head>` in a tree whose own record of the range was empty, and the
     // two disagreed about what the change under review even was.
-    const made = openWorktree({ baseSha: pre.split.baseSha, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
+    const made = openWorktree({ baseRef: null, baseSha: pre.split.baseSha, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
     if (isPreflightError(made)) {
       // A reseat re-gates the WHOLE run, so a lost worktree costs more than the retried seat's own
       // evidence: the regate that follows also drops to packet grounding, and with it the gate's
@@ -4348,6 +4361,7 @@ async function probeCommand(rest: string[]): Promise<number> {
 
   console.error(`· materializing the PR head as a disposable worktree of ${repoFlag}…`);
   const opened = openWorktree({
+    baseRef: source.prBaseRef ?? null,
     baseSha: source.prBaseSha,
     headSha: source.headShaOverride,
     pr: source.postTarget.pr,

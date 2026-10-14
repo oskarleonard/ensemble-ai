@@ -7,6 +7,8 @@ import { type RunReviewOpts } from '../../reviewers/codex';
 
 import { isUsageLimitFailure } from './claude';
 import type { EvidenceClass } from './evidence';
+import { execGit } from './git-exec';
+import type { GitRun } from './worktree';
 import { type ClusterInfo, clusterPostable } from './gate-dedup';
 import { activePremiseClusters, renderGatePrompt } from './gate-prompt';
 import {
@@ -187,7 +189,11 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // (in-diff / blast-radius / pre-existing / unknown) and the `dependsOn` hunk the gate named for an
 // out-of-diff cite. Additive like v5-v10: absent on records the rule never looked at. The
 // 'pre-existing' kind is also a DowngradeReason: the verdict fails closed to unverified.
-export const GATE_TRAIL_SCHEMA_VERSION = 11;
+// v12: adds base drift — `scope.movedOnBase` per pre-existing/blast-radius record (did the base
+// branch change the cited file between the branch point and its current tip?) and a trail-level
+// `base` block (sha · ref · tip · branchPoint · behindBy). Label only: no verdict moves on it.
+// Additive like v5-v11: absent when the base tip was not fetched.
+export const GATE_TRAIL_SCHEMA_VERSION = 12;
 
 const REASON_CAP = 700;
 const CITATION_CAP = 500;
@@ -572,6 +578,85 @@ export interface FindingScope {
   kind: ScopeKind;
   // The resolved dependency on blast-radius; null otherwise.
   dependsOn: { file: string; line: number } | null;
+  // Trail v12 (additive): on pre-existing / blast-radius only — whether the BASE branch changed the
+  // cited file between the branch point and its tip at review time. true ⇒ "the base already moved
+  // this file: a rebase picks it up" (a stale branch, a teammate's fix); false ⇒ a real latent
+  // condition nobody has fixed; null ⇒ the git probe failed. Absent ⇒ no base tip this run.
+  movedOnBase?: boolean | null;
+}
+
+// ── Base drift (trail v12) ────────────────────────────────────────────────────────────
+
+export interface GateBaseFacts {
+  // The PR's base sha as GitHub reports it (the base tip at the PR's last sync — NOT the branch
+  // point; the branch point is computed locally from the fetched tip, see annotateBaseDrift).
+  sha: string | null;
+  ref: string | null;
+  tip: string | null;
+}
+
+export interface GateBaseTrail extends GateBaseFacts {
+  branchPoint: string | null;
+  // Commits on the base tip that the PR head does not have — "behind base by N".
+  behindBy: number | null;
+}
+
+// Label pre-existing / blast-radius records with whether the base branch changed their cited file
+// since the branch point. PURE over an injected GitRun: `git merge-base <tip> <head>` (the real
+// branch point — GitHub's base.sha is the tip at the PR's last sync and goes stale the moment the
+// author pushes after a teammate's merge), `git rev-list --count <head>..<tip>`, and per file
+// `git diff --name-only <branchPoint> <tip> -- <file>`. Never changes a verdict: a blast-radius
+// agree whose file moved on the base is still this PR's defect at this head. No tip ⇒ records
+// returned as-is, base null.
+export function annotateBaseDrift(
+  records: GateVerdictRecord[],
+  base: GateBaseFacts | undefined,
+  headSha: string,
+  git: GitRun,
+  cwd: string
+): { records: GateVerdictRecord[]; base: GateBaseTrail | null } {
+  if (!base?.tip) return { base: null, records };
+  const tip = base.tip;
+  const mb = git(['merge-base', tip, headSha], { cwd });
+  const branchPoint = mb.ok && mb.text.trim() ? mb.text.trim() : base.sha;
+  const count = git(['rev-list', '--count', `${headSha}..${tip}`], { cwd });
+  const behindBy = count.ok && /^\d+$/.test(count.text.trim()) ? Number(count.text.trim()) : null;
+  const probe = new Map<string, boolean | null>();
+  const moved = (file: string): boolean | null => {
+    if (!branchPoint) return null;
+    if (probe.has(file)) return probe.get(file) ?? null;
+    const d = git(['diff', '--name-only', branchPoint, tip, '--', file], { cwd });
+    const v = d.ok ? d.text.trim().length > 0 : null;
+    probe.set(file, v);
+    return v;
+  };
+  const out = records.map((r) =>
+    r.scope && (r.scope.kind === 'pre-existing' || r.scope.kind === 'blast-radius') && r.file
+      ? { ...r, scope: { ...r.scope, movedOnBase: moved(r.file) } }
+      : r
+  );
+  return { base: { ...base, behindBy, branchPoint }, records: out };
+}
+
+// A regate re-materializes the HEAD, which has not changed; the base has. Recomputing drift would
+// relabel review-time verdicts with post-review facts, so a regate carries the prior trail's
+// `movedOnBase` per finding and its `base` block forward verbatim.
+export function carryBaseDrift(
+  records: GateVerdictRecord[],
+  prior: { base?: GateBaseTrail | null; verdicts?: { findingId: string; scope?: { movedOnBase?: boolean | null } }[] } | null | undefined
+): { records: GateVerdictRecord[]; base: GateBaseTrail | null } {
+  if (!prior?.base) return { base: null, records };
+  const moved = new Map(
+    (prior.verdicts ?? [])
+      .filter((v) => v.scope && 'movedOnBase' in v.scope)
+      .map((v) => [v.findingId, v.scope?.movedOnBase ?? null] as const)
+  );
+  const out = records.map((r) =>
+    r.scope && (r.scope.kind === 'pre-existing' || r.scope.kind === 'blast-radius') && moved.has(r.findingId)
+      ? { ...r, scope: { ...r.scope, movedOnBase: moved.get(r.findingId) ?? null } }
+      : r
+  );
+  return { base: prior.base, records: out };
 }
 
 // Decide a finding's scope DETERMINISTICALLY from host-owned facts: whether its own cite resolved
@@ -1205,6 +1290,9 @@ export interface GateVerdictsTrail {
   runId: string;
   schemaVersion: number;
   verdicts: GateVerdictRecord[];
+  // Trail v12 (additive): the base-drift facts this run's labels rest on. Absent/null ⇒ no base
+  // tip was fetched (labels off).
+  base?: GateBaseTrail | null;
 }
 
 // Write gate-verdicts.json atomically. Returns whether it DURABLY wrote — the caller gates
@@ -1212,12 +1300,14 @@ export interface GateVerdictsTrail {
 export function writeGateVerdictsTrail(
   baseDir: string,
   runId: string,
-  records: GateVerdictRecord[]
+  records: GateVerdictRecord[],
+  base: GateBaseTrail | null = null
 ): boolean {
   const trail: GateVerdictsTrail = {
     runId,
     schemaVersion: GATE_TRAIL_SCHEMA_VERSION,
     verdicts: records,
+    ...(base ? { base } : {}),
   };
   try {
     writeTrailFile(baseDir, runId, 'gate-verdicts.json', JSON.stringify(trail, null, 2));
@@ -1249,7 +1339,11 @@ export function renderGateVerdicts(
   } else {
     for (const r of records) {
       const where = evidenceRef(r.file, r.line, s);
-      const dg = r.downgradeReason ? `  (host: ${r.downgradeReason})` : '';
+      const dg = r.downgradeReason
+        ? `  (host: ${r.downgradeReason}${r.scope?.movedOnBase === true ? ' · the base already changed this file — a rebase picks it up' : ''})`
+        : r.scope?.movedOnBase === true
+          ? '  (base already changed this file since the branch point)'
+          : '';
       const reason = r.reason ? ` — ${s(r.reason).slice(0, 200)}` : '';
       // A holistic record NAMES its lens inline. Its provenance is one seat that read the whole
       // tree — never the cross-reviewer corroboration the other records may carry. The cap is
@@ -1358,6 +1452,13 @@ export interface RunGateOptions {
   directive?: string;
   // Tracker/spec text the host resolved — the same kind of testimony.
   intent?: string;
+  // Base drift (trail v12): the base sha/ref/tip the worktree session resolved. Labels every
+  // pre-existing / blast-radius record with `movedOnBase`; absent or tip-less ⇒ labels off.
+  base?: GateBaseFacts;
+  // The git runner for the drift probes (default: the real one, cwd = the worktree).
+  git?: GitRun;
+  // A regate's carry-forward: the prior gate-verdicts.json (its `base` + per-finding movedOnBase).
+  priorDrift?: { base?: GateBaseTrail | null; verdicts?: GateVerdictRecord[] } | null;
   expectedHeadSha: string;
   // The gate's REALIZED evidence (default 'packet'). The gate is an EVIDENCE-BEARING ACTOR, not a
   // neutral judge (gate-r3 pin 1): worktree ⇒ it read the PR head and may emit
@@ -1543,8 +1644,20 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     // Cross-reviewer dedup by selection — one representative per cluster posts; corroboration
     // recorded. Runs AFTER reconcile (needs the full postable set) and BEFORE the trail write
     // (so cluster provenance is durable).
-    const records = clusterPostable(reconciled);
-    const gateTrailWritten = writeGateVerdictsTrail(opts.baseDir, opts.runId, records);
+    // Base drift (trail v12) — label only, between reconcile and the cluster pass so the labels
+    // are durable; a regate carries the review-time facts forward instead of re-probing.
+    const drift =
+      opts.base && opts.worktree
+        ? annotateBaseDrift(reconciled, opts.base, opts.expectedHeadSha, opts.git ?? execGit(), opts.worktree)
+        : carryBaseDrift(reconciled, opts.priorDrift);
+    if (drift.base) {
+      const movedCount = drift.records.filter((r) => r.scope?.movedOnBase === true).length;
+      log(
+        `  · base drift: ${drift.base.ref ?? 'base'} @ ${(drift.base.tip ?? '?').slice(0, 12)} · branch point ${(drift.base.branchPoint ?? '?').slice(0, 12)} · behind by ${drift.base.behindBy ?? '?'} commit(s)${movedCount ? ` · ${movedCount} finding(s) cite a file the base already changed` : ''}`
+      );
+    }
+    const records = clusterPostable(drift.records);
+    const gateTrailWritten = writeGateVerdictsTrail(opts.baseDir, opts.runId, records, drift.base);
     if (!gateTrailWritten) {
       log('  · gate: gate-verdicts.json FAILED to write — dismissals not honored (trail loss is LOUD)');
     }
