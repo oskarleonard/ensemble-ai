@@ -188,11 +188,14 @@ describe('materialization hardening — untrusted content is checked out INERT i
 
   // A mock git that reports NO shared checkout (`--git-common-dir` → a path with no objects/), so no
   // clone happens and the materialize proceeds purely through the scripted git.
-  function harness(headOut: string) {
+  const TIP_SHA = 'b'.repeat(40);
+  function harness(headOut: string, o: { baseFetchFails?: boolean } = {}) {
     const calls: string[][] = [];
     const git: GitRun = ((args: string[], opts?: { env?: Record<string, string> }) => {
       calls.push(args);
       if (args[0] === 'rev-parse' && args[1] === '--git-common-dir') return ok('/repo/.git');
+      if (args[0] === 'rev-parse' && args.includes('refs/ensemble/base')) return ok(`${TIP_SHA}\n`);
+      if (args.includes('fetch') && args.some((a) => a.includes('refs/ensemble/base')) && o.baseFetchFails) return err('remote: not found');
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(headOut);
       // record the env the fetch/add ran under
       if (opts?.env) calls.push([`ENV:${JSON.stringify(opts.env)}`]);
@@ -223,7 +226,16 @@ describe('materialization hardening — untrusted content is checked out INERT i
     expect(fetches[1]).toContain('https://github.com/o/r.git');
     expect(fetches[1]).not.toContain('origin');
     expect(calls.some((c) => c[0] === 'rev-parse' && c.includes('refs/ensemble/base'))).toBe(true);
-    expect('baseTip' in made).toBe(true);
+    expect((made as { baseTip?: string | null }).baseTip).toBe(TIP_SHA);
+  });
+
+  it('a failed base fetch costs only the tip: the head still materializes, baseTip null', () => {
+    const { calls, git } = harness(headSha, { baseFetchFails: true });
+    const made = materializeWorktree({ baseRef: 'develop-fixture', headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git });
+    expect('dir' in made).toBe(true);
+    expect((made as { baseTip?: string | null }).baseTip).toBeNull();
+    expect(calls.filter((c) => c.includes('fetch'))).toHaveLength(2);
+    expect(calls.some((c) => c[0] === 'rev-parse' && c.includes('refs/ensemble/base'))).toBe(false);
   });
 
   it('no base ref, or a ref that fails the safety regex ⇒ no second fetch, baseTip null', () => {
