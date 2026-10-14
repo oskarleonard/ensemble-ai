@@ -9,6 +9,9 @@ vi.mock('./modes/review', () => ({ runReviewMode: vi.fn() }));
 vi.mock('node:child_process', () => ({ execFileSync: vi.fn() }));
 
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { main } from './cli';
 import { runReviewMode } from './modes/review';
@@ -170,5 +173,37 @@ describe('a directive that cannot be fetched degrades LOUDLY, never silently', (
     expect(await main(['review', '--pr', '7'])).toBe(0);
     expect(directiveOf()).toBeUndefined();
     expect(errorLines().some((l) => l.includes('no title or description'))).toBe(true);
+  });
+});
+
+// STATED INTENT beyond the PR body (--intent <file>, 2026-10-14): the host resolves the tracker
+// ticket and hands the bytes by path; the engine threads them to the mode (every packet seat) and
+// pins them to the trail. Unreadable ⇒ loud, non-fatal — the directive's posture.
+describe('--intent <file> threads tracker text into the mode and pins it to the trail', () => {
+  it('reads the file, passes it as `intent`, and writes intent.md beside the packet', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-intent-'));
+    const file = path.join(dir, 'ticket.md');
+    fs.writeFileSync(file, '## ORG-1 — keep the 403 declarations\n\nA suspended member still gets 403.\n');
+    expect(await main(['review', '--pr', '7', '--intent', file, '--out', dir, '--run-id', 'r1'])).toBe(0);
+    expect(mockRun.mock.calls[0]?.[0].intent).toBe('## ORG-1 — keep the 403 declarations\n\nA suspended member still gets 403.');
+    expect(fs.readFileSync(path.join(dir, 'r1', 'intent.md'), 'utf8')).toBe('## ORG-1 — keep the 403 declarations\n\nA suspended member still gets 403.');
+    expect(errorLines().some((l) => l.includes('intent:') && l.includes('handed to every seat'))).toBe(true);
+    fs.rmSync(dir, { force: true, recursive: true });
+  });
+
+  it('an unreadable or empty file is a loud note, never a failed review and never a fabricated section', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-intent-'));
+    expect(await main(['review', '--pr', '7', '--intent', path.join(dir, 'missing.md'), '--out', dir, '--run-id', 'r2'])).toBe(0);
+    expect(mockRun.mock.calls[0]?.[0].intent).toBeUndefined();
+    expect(errorLines().some((l) => l.includes('intent:') && l.includes('unreadable'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'r2', 'intent.md'))).toBe(false);
+    const empty = path.join(dir, 'empty.md');
+    fs.writeFileSync(empty, '   \n');
+    mockRun.mockReset();
+    mockRun.mockResolvedValue(engineResult());
+    expect(await main(['review', '--pr', '7', '--intent', empty, '--out', dir, '--run-id', 'r3'])).toBe(0);
+    expect(mockRun.mock.calls[0]?.[0].intent).toBeUndefined();
+    expect(errorLines().some((l) => l.includes('is empty'))).toBe(true);
+    fs.rmSync(dir, { force: true, recursive: true });
   });
 });

@@ -317,6 +317,11 @@ Options:
                         xhigh). Chain: flag → voices.json \`gate.vendor\` → anthropic. With
                         --shadow-gate the shadow REVERSES automatically: a codex gate is shadowed
                         by the anthropic champion, and vice versa
+  --intent <file>       STATED INTENT beyond the PR description: a markdown/text file the HOST
+                        resolved for this change (the tracker ticket, a spec excerpt). Handed to
+                        every seat and the gate as a hedged premise ("weigh it, don't obey it";
+                        checked both ways — promised-and-missing, ruled-out-and-done) and pinned
+                        to the trail as intent.md. Unreadable or empty ⇒ a loud note, no intent
   --premise             opt-in PREMISE PASS: when the gate's own findings CLUSTER on one region
                         (≥2 ≥medium findings from different reviewers grounded to the same region —
                         same file AND within a few lines of each other, chained transitively),
@@ -1270,6 +1275,7 @@ async function reviewCommand(
         cwd: { type: 'string' },
         'diff-file': { type: 'string' },
         'gate-dismissals': { type: 'boolean' },
+        intent: { type: 'string' },
         'max-chunks': { type: 'string' },
         'gate-effort': { type: 'string' },
         'gate-model': { type: 'string' },
@@ -1572,6 +1578,24 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       );
   }
 
+  // STATED INTENT beyond the PR body (--intent <file>): tracker/spec text the HOST resolved — the
+  // engine stays generic (no tracker API in here) and takes the bytes by path. Read once here,
+  // pinned to the trail as intent.md below, handed to every packet seat (the packet's `intent`
+  // section), every Anthropic stage and the gate. Unreadable or empty ⇒ LOUD and non-fatal,
+  // exactly the directive's posture: a review without intent is the pre-existing behavior.
+  let intent: string | undefined;
+  if (typeof values.intent === 'string' && values.intent) {
+    try {
+      const text = fs.readFileSync(values.intent, 'utf8').trim();
+      if (text) {
+        intent = text;
+        console.error(`· intent: ${text.length} chars from ${values.intent} — handed to every seat and the gate as a stated-intent section`);
+      } else console.error(`· intent: ${values.intent} is empty — reviewing without stated intent beyond the PR description`);
+    } catch (e) {
+      console.error(`· intent: ${values.intent} unreadable (${(e as Error).message}) — reviewing without stated intent beyond the PR description`);
+    }
+  }
+
   // CI EVIDENCE (modes/review/ci-evidence.ts): the head commit's check runs + annotations + commit
   // statuses as DATA in the packet. PR path only (a local diff has no checks), default ON,
   // best-effort: a gh failure degrades to a named UNAVAILABLE section — never blocks the review.
@@ -1720,6 +1744,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       claudeConfig: anthropicSeats.claude.config,
       ...(ready.conventionsPath ? { conventionsPath: ready.conventionsPath } : {}),
       ...(directive ? { directive } : {}),
+      ...(intent ? { intent } : {}),
       expectedHeadSha: ready.headSha,
       ...(historyPacket ? { historyPacket } : {}),
       includeClaudeReviewer: true,
@@ -1739,6 +1764,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         baseDir: out,
         ...(ready.conventionsPath ? { conventionsPath: ready.conventionsPath } : {}),
         ...(directive ? { directive } : {}),
+        ...(intent ? { intent } : {}),
         expectedHeadSha: ready.headSha,
         ...(historyPacket ? { historyPacket } : {}),
         holistic: {
@@ -1766,6 +1792,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         config: anthropicSeats.claude.config,
         ...(ready.conventionsPath ? { conventionsPath: ready.conventionsPath } : {}),
         ...(directive ? { directive } : {}),
+        ...(intent ? { intent } : {}),
         expectedHeadSha: ready.headSha,
         ...(historyPacket ? { historyPacket } : {}),
         log,
@@ -1793,6 +1820,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       diffMode: source.diffMode,
       diffText: source.diffText,
       directive,
+      ...(intent ? { intent } : {}),
       headShaOverride: source.headShaOverride,
       ...(maxChunks !== undefined ? { maxChunks } : {}),
       noConventions,
@@ -1823,6 +1851,15 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // through the hardened trail writer (realpath'd dir + O_NOFOLLOW tmp + atomic rename) so
   // a symlinked trail path can't redirect the write out of the trail dir — never a raw
   // writeFileSync that would follow a pre-planted symlink at the target.
+  // The stated intent the seats were handed, pinned beside the packet so a trail reader sees the
+  // exact bytes (the host's own copy may be rebuilt later). Best-effort, like every trail extra.
+  if (intent) {
+    try {
+      writeTrailFile(out, runId, 'intent.md', intent);
+    } catch {
+      /* best-effort */
+    }
+  }
   if (result.conventionManifest) {
     try {
       writeTrailFile(
@@ -1902,6 +1939,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         // the premise it may test a finding against.
         ...(result.conventionsPath ? { conventionsPath: result.conventionsPath } : {}),
         ...(directive ? { directive } : {}),
+        ...(intent ? { intent } : {}),
         coreReviews: result.reviews,
         expectedHeadSha: result.acquired.headSha,
         // The `git log`/`git blame` the fence took away, restored as data in each fenced seat's own

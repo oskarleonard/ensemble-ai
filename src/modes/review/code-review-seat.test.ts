@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { COLD_PEER_ROLE, renderCodeReviewSeatPrompt } from './code-review-seat';
-import { DIRECTIVE_CLAUSE_BUDGET, directiveClause } from './worktree';
+import { DIRECTIVE_CLAUSE_BUDGET, directiveClause, INTENT_CLAUSE_BUDGET, intentClause } from './worktree';
 
 const args = {
   baseSha: 'b'.repeat(40),
@@ -199,5 +199,28 @@ describe('the stated intent (PR title + body) is handed to the seat as a hedged 
     expect(clause).toContain(`… [cut at ${DIRECTIVE_CLAUSE_BUDGET} chars of ${long.length}]`);
     expect(clause.length).toBeLessThan(long.length);
     expect(directiveClause('short')).not.toContain('[cut at');
+  });
+});
+
+// STATED INTENT beyond the PR body (2026-10-14): the ticket said "keep the 403 declarations in
+// openapi.yaml and update their descriptions" — the host had fetched it, after the review, to
+// annotate findings. Now it reaches the seat before the review, and the method says what to do
+// with it.
+describe('tracker/spec text (--intent) reaches the seat, and the method checks the diff against it both ways', () => {
+  it('renders the hedged section only when intent is passed, and the method carries INTENT CONFORMANCE', () => {
+    const p = renderCodeReviewSeatPrompt({ ...args, intent: 'Keep the 403 declarations in openapi.yaml and update their descriptions.' });
+    expect(p).toContain('## Stated intent — tracker text (host-supplied)');
+    expect(p).toContain('Keep the 403 declarations in openapi.yaml and update their descriptions.');
+    expect(p).toMatch(/not the author's words/);
+    expect(p).toMatch(/Check the diff against it BOTH ways/);
+    expect(p).toContain('INTENT CONFORMANCE');
+    expect(p).toMatch(/what it PROMISES\s+and what it RULES OUT/);
+    expect(renderCodeReviewSeatPrompt(args)).not.toContain('## Stated intent');
+  });
+
+  it('is bounded with a named cut, like the directive', () => {
+    const long = 'y'.repeat(INTENT_CLAUSE_BUDGET + 10);
+    expect(intentClause(long)).toContain(`… [cut at ${INTENT_CLAUSE_BUDGET} chars of ${long.length}]`);
+    expect(intentClause('  ')).toBe('');
   });
 });

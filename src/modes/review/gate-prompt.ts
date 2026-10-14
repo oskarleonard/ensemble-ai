@@ -12,7 +12,7 @@ import { HUNK_WINDOW_LINES } from './gate-hunks';
 import { HOLISTIC_SEAT_ID, HOLISTIC_SEVERITY_CAP } from './holistic';
 import { connectedComponents, proximate } from './gate-dedup';
 import { isHolisticRecord } from './holistic-gate';
-import { directiveClause, STRIPPED_INSTRUCTION_PATHS } from './worktree';
+import { directiveClause, intentClause, STRIPPED_INSTRUCTION_PATHS } from './worktree';
 
 // The hunk-fed GATE prompt. Unlike the old text-only synthesis prompt, the gate sees each
 // finding's CITED diff hunk (resolved from the pinned packet), so it can catch a
@@ -350,7 +350,7 @@ export function renderGatePrompt(
   // `directive`: the author's stated intent (worktree.ts directiveClause) — a PREMISE the gate may
   // check a finding against, never grounding for a verdict. `conventionsFile`: where a citation
   // into a stripped path is looked up (strippedPathsClause). Both absent ⇒ byte-identical prompt.
-  opts: { conventionsFile?: string; directive?: string; premise?: boolean } = {}
+  opts: { conventionsFile?: string; directive?: string; intent?: string; premise?: boolean } = {}
 ): string {
   const clusters = activePremiseClusters(findings, opts);
   return `You are the VERIFIED GATE for a multi-model CODE REVIEW. Several AI reviewers each
@@ -396,6 +396,9 @@ ${opts.directive ? `${directiveClause(opts.directive)}
 It is testimony like a code comment: it can tell you what the author MEANT (a deliberate change
 reads as deliberate), and a claim it makes that the tree contradicts SUPPORTS a finding that says
 so — it never refutes one.
+` : ''}${opts.intent ? `${intentClause(opts.intent)}
+Tracker text is testimony of the same kind: a finding that says the diff contradicts it is grounded
+when BOTH halves are — the code claim in the tree, and the intent line quoted as written above.
 ` : ''}
 ## The findings + their cited hunks
 Each finding's own title + body are wrapped in a <<<CLAIM …>>> … <<<END …>>> fence: that is

@@ -5,6 +5,7 @@ import {
   readOnlyWorktreeClause,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
   directiveClause,
+  intentClause,
 } from './worktree';
 
 // THE INTEGRATION SEAT (2026-10-10 architecture review, item 5): the reviewer whose job is the
@@ -29,6 +30,8 @@ export interface IntegrationPromptArgs {
   conventionsPath?: string;
   // The author's stated intent — the PR title + body (worktree.ts directiveClause). Omitted ⇒ no section.
   directive?: string;
+  // Tracker/spec text the host resolved (worktree.ts intentClause). Omitted ⇒ no section.
+  intent?: string;
   headSha: string;
   history?: boolean;
   // The change listing: every part and its files, every omitted file (chunks.ts renderLensScope).
@@ -58,7 +61,7 @@ ${args.scope}
 
 ## The whole change as a skeleton
 
-${args.skeleton}${args.directive ? directiveClause(args.directive) : ''}
+${args.skeleton}${args.directive ? directiveClause(args.directive) : ''}${args.intent ? intentClause(args.intent) : ''}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${args.conventionsPath ? conventionsFileClause(args.conventionsPath) : ''}${history}
 
