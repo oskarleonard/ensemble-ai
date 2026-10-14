@@ -134,12 +134,110 @@ interface StartEgressProxyOpts {
 }
 declare function startEgressProxy(opts: StartEgressProxyOpts): Promise<EgressProxy>;
 
+declare function resolveCodexBin(): string;
+declare function makeEscalatingKill(child: {
+    kill: (signal: NodeJS.Signals) => void;
+}, graceMs: number, schedule?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>, cancel?: (t: ReturnType<typeof setTimeout>) => void): {
+    clear: () => void;
+    kill: () => void;
+};
+declare function killTree(child: {
+    kill: (signal: NodeJS.Signals) => void;
+    pid?: number;
+}, signal: NodeJS.Signals, signalGroup?: (pid: number, signal: NodeJS.Signals) => void): void;
+interface ReviewerExecOpts {
+    /** The full CLI arg list — the caller encodes the call contract here. */
+    args: string[];
+    /** Resolved binary path. The CALLER resolves it (so tests can stub it). */
+    bin: string;
+    /**
+     * Where the reply is read from. `'outfile'` (codex): the reply lands in the
+     * `-o` tempfile and stdout is ignored. `'stdout'` (grok): the reply IS stdout
+     * (grok `-p --output-format json` prints the envelope and exits — there is no
+     * `-o` file). Defaults to `'outfile'` for the proven Codex path.
+     */
+    capture?: 'outfile' | 'stdout';
+    /**
+     * The spawn cwd. Defaults to a throwaway `os.tmpdir()` — the packet path, where a read tool has
+     * nothing of the repo to reach. A WORKTREE seat passes the detached read-only worktree here:
+     * for a harness-controlled CLI (claude), the cwd IS what grants whole-project read access. It is
+     * BORROWED, never owned — one worktree per run, shared by every seat, reaped by the run.
+     */
+    cwd?: string;
+    /**
+     * Extra env for the child, merged OVER `process.env`. A fenced seat passes the egress proxy's
+     * `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (+ an empty `NO_PROXY`) here — merging over the parent
+     * env is what lets `NO_PROXY: ''` OVERRIDE an operator's inherited `NO_PROXY=*`, which would
+     * otherwise let the seat bypass the proxy for exactly the hosts it most wants to reach. An
+     * `undefined` value REMOVES the inherited variable (Node's spawn drops undefined entries) — how
+     * the grok login pre-flight runs without the seat's GROK_SANDBOX.
+     */
+    env?: Record<string, string | undefined>;
+    /** Receives the kill handle so a caller (e.g. a cancel) can abort the child. */
+    onSpawn?: (kill: () => void) => void;
+    /**
+     * Sees every stdout chunk as it arrives (only while stdout is piped), BEFORE the run settles —
+     * so a caller can act on what the child announces at startup (grok's tool fence reads the
+     * stream's first line and kills the seat through `onSpawn`'s handle). Observation only: the
+     * reply, the watchdogs and the settle are untouched by it.
+     */
+    onStdout?: (chunk: string) => void;
+    /** The -o tempfile the reply is read from, then unlinked. Required for 'outfile'. */
+    outFile?: string;
+    /**
+     * LIVENESS watchdog (only while stdout is piped — `capture: 'stdout'` or `streamStdout`):
+     * kill the group after this long with NO data on stdout/stderr. A streaming CLI (claude
+     * `--output-format stream-json`, codex `--json`) emits an event every few seconds while it
+     * works, so silence this long means a wedged seat — while honest long work never trips it.
+     * This is the watchdog doing its actual job (reclaim wedges, never police honest work);
+     * `timeoutMs` then degrades to a pure runaway backstop. Ignored when stdout is not piped:
+     * an outfile-only seat is silent by construction, and arming it there would reclaim
+     * every honest run.
+     */
+    inactivityTimeoutMs?: number;
+    /** Cap the retained stderr tail (a noise channel) at this many chars. */
+    stderrLimit: number;
+    /** Cap the retained stream tail (see `streamStdout`) at this many chars. */
+    streamLimit?: number;
+    /**
+     * Pipe stdout for LIVENESS while the reply still comes from the `-o` file. For a CLI that
+     * emits a machine-readable progress stream beside its final-message file (codex `--json` +
+     * `-o`): every event resets the inactivity watchdog, and a bounded tail of the stream comes
+     * back as `streamTail`, so a seat the watchdog reclaims leaves a record of what it was doing
+     * instead of only "it timed out". Meaningless under `capture: 'stdout'`, where stdout is the
+     * reply and already drives liveness.
+     */
+    streamStdout?: boolean;
+    /** Watchdog timeout; on expiry the whole process GROUP is SIGTERM→SIGKILLed. */
+    timeoutMs: number;
+}
+declare const STREAM_CUT_EVENT = "ensemble.stream_cut";
+declare function joinStreamHeadTail(head: string, tail: string, total: number, headLimit?: number): string;
+declare function boundedStreamTail(tail: string, limit: number): string;
+interface ReviewerExecResult {
+    /** The child's `'error'` event, when one fired — most often a binary that could not be spawned (ENOENT, EACCES). */
+    error?: Error;
+    /** The child's exit code: null when a signal ended it, absent when it never exited before settle. */
+    exitCode?: number | null;
+    /** The reply (the -o file, or accumulated stdout) — or null if none produced. */
+    raw: string | null;
+    stderrTail: string;
+    /** The bounded tail of the progress stream (`streamStdout` only). */
+    streamTail?: string;
+    timedOut: boolean;
+    /** Which watchdog fired: the absolute backstop or the liveness (inactivity) one. */
+    timedOutReason?: 'absolute' | 'inactivity';
+}
+declare function runReviewerExec(opts: ReviewerExecOpts): Promise<ReviewerExecResult>;
+
 declare const REVIEW_TIMEOUT_MS = 900000;
 declare const CORE_WORKTREE_REVIEW_TIMEOUT_MS = 3600000;
 declare const CODEX_INACTIVITY_TIMEOUT_MS = 900000;
 interface CodexReviewResult {
     egressDenials?: readonly EgressDenial[];
     failWhy?: string;
+    failKind?: CodexFailKind;
+    exitCode?: number | null;
     ok: boolean;
     preflightWarnings?: readonly string[];
     raw: string | null;
@@ -159,7 +257,18 @@ interface RunReviewOpts {
     worktree?: string;
     web?: boolean;
 }
-declare function runCodexReview(prompt: string, config: ReviewerConfig, opts?: RunReviewOpts): Promise<CodexReviewResult>;
+type CodexFailKind = 'stalled' | 'transient-api' | 'usage-limit' | 'api-error';
+declare function codexStreamFailure(stream: string | undefined): {
+    kind: CodexFailKind;
+    message: string;
+} | null;
+declare function toCodexResult(res: ReviewerExecResult): CodexReviewResult;
+interface CodexReviewSeams {
+    fastFailMs?: number;
+    retryDelaysMs?: readonly number[];
+    sleep?: (ms: number) => Promise<void>;
+}
+declare function runCodexReview(prompt: string, config: ReviewerConfig, opts?: RunReviewOpts, seams?: CodexReviewSeams): Promise<CodexReviewResult>;
 
 type VoiceRunResult = CodexReviewResult;
 type SeatTimeoutReason = 'absolute' | 'inactivity';
@@ -747,102 +856,6 @@ interface PersistReviewInput {
 declare function persistReview(baseDir: string, input: PersistReviewInput): StoredReview;
 declare function readReview(baseDir: string, runId: string, reviewerId?: ReviewerId): StoredReview | null;
 declare function readReviewsForRun(baseDir: string, runId: string): StoredReview[];
-
-declare function resolveCodexBin(): string;
-declare function makeEscalatingKill(child: {
-    kill: (signal: NodeJS.Signals) => void;
-}, graceMs: number, schedule?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>, cancel?: (t: ReturnType<typeof setTimeout>) => void): {
-    clear: () => void;
-    kill: () => void;
-};
-declare function killTree(child: {
-    kill: (signal: NodeJS.Signals) => void;
-    pid?: number;
-}, signal: NodeJS.Signals, signalGroup?: (pid: number, signal: NodeJS.Signals) => void): void;
-interface ReviewerExecOpts {
-    /** The full CLI arg list — the caller encodes the call contract here. */
-    args: string[];
-    /** Resolved binary path. The CALLER resolves it (so tests can stub it). */
-    bin: string;
-    /**
-     * Where the reply is read from. `'outfile'` (codex): the reply lands in the
-     * `-o` tempfile and stdout is ignored. `'stdout'` (grok): the reply IS stdout
-     * (grok `-p --output-format json` prints the envelope and exits — there is no
-     * `-o` file). Defaults to `'outfile'` for the proven Codex path.
-     */
-    capture?: 'outfile' | 'stdout';
-    /**
-     * The spawn cwd. Defaults to a throwaway `os.tmpdir()` — the packet path, where a read tool has
-     * nothing of the repo to reach. A WORKTREE seat passes the detached read-only worktree here:
-     * for a harness-controlled CLI (claude), the cwd IS what grants whole-project read access. It is
-     * BORROWED, never owned — one worktree per run, shared by every seat, reaped by the run.
-     */
-    cwd?: string;
-    /**
-     * Extra env for the child, merged OVER `process.env`. A fenced seat passes the egress proxy's
-     * `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (+ an empty `NO_PROXY`) here — merging over the parent
-     * env is what lets `NO_PROXY: ''` OVERRIDE an operator's inherited `NO_PROXY=*`, which would
-     * otherwise let the seat bypass the proxy for exactly the hosts it most wants to reach. An
-     * `undefined` value REMOVES the inherited variable (Node's spawn drops undefined entries) — how
-     * the grok login pre-flight runs without the seat's GROK_SANDBOX.
-     */
-    env?: Record<string, string | undefined>;
-    /** Receives the kill handle so a caller (e.g. a cancel) can abort the child. */
-    onSpawn?: (kill: () => void) => void;
-    /**
-     * Sees every stdout chunk as it arrives (only while stdout is piped), BEFORE the run settles —
-     * so a caller can act on what the child announces at startup (grok's tool fence reads the
-     * stream's first line and kills the seat through `onSpawn`'s handle). Observation only: the
-     * reply, the watchdogs and the settle are untouched by it.
-     */
-    onStdout?: (chunk: string) => void;
-    /** The -o tempfile the reply is read from, then unlinked. Required for 'outfile'. */
-    outFile?: string;
-    /**
-     * LIVENESS watchdog (only while stdout is piped — `capture: 'stdout'` or `streamStdout`):
-     * kill the group after this long with NO data on stdout/stderr. A streaming CLI (claude
-     * `--output-format stream-json`, codex `--json`) emits an event every few seconds while it
-     * works, so silence this long means a wedged seat — while honest long work never trips it.
-     * This is the watchdog doing its actual job (reclaim wedges, never police honest work);
-     * `timeoutMs` then degrades to a pure runaway backstop. Ignored when stdout is not piped:
-     * an outfile-only seat is silent by construction, and arming it there would reclaim
-     * every honest run.
-     */
-    inactivityTimeoutMs?: number;
-    /** Cap the retained stderr tail (a noise channel) at this many chars. */
-    stderrLimit: number;
-    /** Cap the retained stream tail (see `streamStdout`) at this many chars. */
-    streamLimit?: number;
-    /**
-     * Pipe stdout for LIVENESS while the reply still comes from the `-o` file. For a CLI that
-     * emits a machine-readable progress stream beside its final-message file (codex `--json` +
-     * `-o`): every event resets the inactivity watchdog, and a bounded tail of the stream comes
-     * back as `streamTail`, so a seat the watchdog reclaims leaves a record of what it was doing
-     * instead of only "it timed out". Meaningless under `capture: 'stdout'`, where stdout is the
-     * reply and already drives liveness.
-     */
-    streamStdout?: boolean;
-    /** Watchdog timeout; on expiry the whole process GROUP is SIGTERM→SIGKILLed. */
-    timeoutMs: number;
-}
-declare const STREAM_CUT_EVENT = "ensemble.stream_cut";
-declare function joinStreamHeadTail(head: string, tail: string, total: number, headLimit?: number): string;
-declare function boundedStreamTail(tail: string, limit: number): string;
-interface ReviewerExecResult {
-    /** The child's `'error'` event, when one fired — most often a binary that could not be spawned (ENOENT, EACCES). */
-    error?: Error;
-    /** The child's exit code: null when a signal ended it, absent when it never exited before settle. */
-    exitCode?: number | null;
-    /** The reply (the -o file, or accumulated stdout) — or null if none produced. */
-    raw: string | null;
-    stderrTail: string;
-    /** The bounded tail of the progress stream (`streamStdout` only). */
-    streamTail?: string;
-    timedOut: boolean;
-    /** Which watchdog fired: the absolute backstop or the liveness (inactivity) one. */
-    timedOutReason?: 'absolute' | 'inactivity';
-}
-declare function runReviewerExec(opts: ReviewerExecOpts): Promise<ReviewerExecResult>;
 
 declare function resolveBin(name: string, opts?: {
     candidates?: string[];
@@ -1676,4 +1689,4 @@ declare function resolveMode(v: string): string;
 declare function isMode(v: string): v is ModeName;
 declare function isImplemented(mode: ModeName): boolean;
 
-export { AGENT_INSTRUCTION_NAMES, type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormClaudeSeams, type BrainstormOptions, BrainstormResult, type BuildReceiptResult, CI_EVIDENCE_BOTH_REASON, CI_EVIDENCE_LIMITS, CI_EVIDENCE_TRAIL_FILE, CI_OUTPUT_PATTERNS, CLAUDE_CAPABILITY_FENCE, CLAUDE_EFFORTS, CLAUDE_EVIDENCE_MAX_TURNS, CLAUDE_INACTIVITY_TIMEOUT_MS, CLAUDE_READ_TOOLS, CLAUDE_REVIEW_DENIED_TOOLS, CLAUDE_WEB_MAX_TURNS, CLAUDE_WEB_TOOLS, CODEX_INACTIVITY_TIMEOUT_MS, CODEX_SANDBOX_PROFILE, COLD_PEER_ROLE, CONVENTIONS_INLINE_MAX, CONVENTIONS_IN_TREE_DIR, CONVENTIONS_IN_TREE_FILE, CONVENTIONS_IN_TREE_REL, CORE_WORKTREE_REVIEW_TIMEOUT_MS, type CiEvidenceInput, type CiEvidenceLimits, type CiEvidenceResolution, type CiEvidenceResult, type ClaudeSeatFence, type ClaudeVoiceFence, type ClaudeVoiceSeams, type CodeReviewSeatPromptArgs, type CodexReviewResult, type CodexSandboxPaths, type ConsultResult, type ConsultSynthesis, type ConventionCitation, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type ConventionSpan, type ConventionTier, type ConventionsIndex, type Coverage, type CoverageFileEntry, type CoveragePolicy, Critique, CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_POSTURE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, ENSEMBLE_CONFIG_PATH, EVIDENCE_CLASSES, EVIDENCE_MANIFEST_FILE, EVIDENCE_MANIFEST_SCHEMA_VERSION, EVIDENCE_SEATS, type EgressDenial, type EgressProxy, type EnsureGrokLoginOpts, type EvidenceClass, type EvidenceGap, type EvidenceManifest, type EvidenceMap, type EvidenceSeat, FILE_CONTEXT_BUDGET, type FileDiff, type FileKind, type FixtureAnchor, type FixtureScore, GROK_CLI_SANDBOX, GROK_INACTIVITY_TIMEOUT_MS, GROK_LOGIN_EXPIRY_FAIL_PREFIX, GROK_LOGIN_MARGIN_MS, GROK_PACKET_REVIEW_TIMEOUT_MS, GROK_PREFLIGHT_CANCELLED_WHY, GROK_REVIEW_TOOLS, GROK_SANDBOX_PROFILE, GROK_STATUS_API_KEY, GROK_STATUS_AUTHENTICATED_VIA_PREFIX, GROK_STATUS_LOGGED_IN_PREFIX, GROK_STATUS_NOT_AUTHENTICATED, GROK_WEB_TOOL, GROK_WORKTREE_REVIEW_TIMEOUT_MS, type GatherConfig, type GatheredConventions, type GhResult, type GhRunner, type GitRun, type GitRunAsync, GrokLoginExpiryError, type GrokModelsResult, type GrokModelsRun, type GrokModelsRunner, GrokPreflightCancelledError, type GrokStreamSummary, type GrokToolFence, HARNESS_SEATS, HOLISTIC_DEFAULTS, HOLISTIC_MIN_ANCHOR_NONWS, HOLISTIC_SEAT_ID, HOLISTIC_SEVERITY_CAP, type HarnessSeat, type HolisticEntry, type HolisticFixture, type HolisticPlan, type HolisticPolicyDeps, type HolisticPromptArgs, type HolisticProvenance, type HolisticRunner, type HolisticSeatFlags, type HolisticSite, type HolisticSiteRole, IMPLEMENTED_MODES, Idea, type InlineSecretHit, type JudgeSpec, MDNS_RESPONDER_SOCKET, MODES, MODE_ALIASES, type ManifestBlob, type ModeName, type NearMiss, OPERATOR_REVIEW_METHOD, type OmitReason, POLICY_VERSIONS, POLICY_VERSION_EVIDENCE, POLICY_VERSION_LEGACY, type PacketsReady, type ParseDiffOptions, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PendingState, type PersistReviewInput, type PlacedFinding, type PlantedPositive, type PolicyHashInputs, type PostingPosture, type PrPushContext, type PreflightError, type PreflightErrorKind, type PushFenceVerdict, QUALIFY_PROBE_PORT, QUALITY_LENS, REPO_LOCATION_ENV, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, RankedIdea, RawIdea, type ReceiptCoverage, type ReceiptKey, type RepoLocation, ResolvedVoiceConfig, type ReviewEvidence, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, type ReviewPart, ReviewProfile, type ReviewSummary, ReviewerConfig, type ReviewerExec, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunHolisticLensOptions, type RunReviewOpts, SANDBOX_WRITABLE_TMP, SKELETON_TRAIL_FILE, STAGE_MARKER, STREAM_CUT_EVENT, STRIPPED_INSTRUCTION_PATHS, SUGGESTION_HARD_CAP, type SandboxProfileMap, type SandboxProfileRef, type ScoredFinding, type SeatCancel, SeatDiagnostics, type SeatTimeoutReason, type SecretScanResult, type SensitivePathHit, Severity, type SiteCheck, type SiteReader, type StageCounts, type StageFailure, type StagePlan, type StageResult, type StageSuccess, type StageTarget, type StagedComment, type StagedReviewPayload, type StartEgressProxyOpts, StoredReview, type StreamResultEvent, type SummaryBodyInput, SynthesisResult, TRANSIENT_FAST_FAIL_MS, TRANSIENT_RETRY_DELAYS_MS, TerminalState, type TextSecretHit, UNTRUSTED_INSTRUCTIONS_CLAUSE, USAGE_LIMIT_FAIL_PREFIX, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, type VerifySandboxPaths, type VoiceAnswerResult, VoiceConfig, VoiceCritiqueResult$1 as VoiceCritiqueResult, VoiceGenerateResult, VoiceId, type VoiceRunResult, type Worktree, type WorktreeEvidence, acquireDiff, allowedRootsFromConfig, applyHolisticPolicy, asRecord, assertRosterAdvisors, boundedStreamTail, buildClaudeEvidenceArgs, buildClaudeReviewArgs, buildClaudeVoiceArgs, buildCodexReviewArgs, buildCodexWorktreeArgs, buildDiffReceipt, buildEvidenceManifest, buildGrokReviewArgs, buildStagedReviewPayload, canonicalizeDiff, capHolisticSeverity, checkFreshness, classifyFileKind, classifyGitError, classifyPending, claudeAdvisorArgs, claudeAdvisorEnv, claudeWorktreePromptSuffix, codexSandboxSupported, computeCoverage, computePolicyHash, computePolicyHashAt, index as consult, conventionsAwareReader, conventionsFileClause, conventionsIndex, conventionsPointer, conventionsStep, coverageCounts, coverageShortfall, defaultCodexSandboxPaths, defaultReceiptStore, defuseUntrusted, diffDigest, effectiveSshFrom, ensureGrokLogin, ensureSandboxProfile, escapesRoot, evaluatePushFence, evidenceShortfall, extractDirRefs, extractGrokText, extractIncludes, extractRefs, extractStreamResult, fallbackSynthesis$1 as fallbackSynthesis, fetchCiEvidence, findQuoteSpan, findQuoteSpans, findingTrailer, formatEvidenceShortfall, fsConventionReader, gatherConventions, gitConventionReader, gitHasCommit, grokAllowedTools, grokLoginWarningLine, grokToolFence, hasDepSurface, hasGeneratedFirstLine, hasGeneratedHeader, holisticCapWasLifted, homeReadDenyRules, isCommitSha, isConventionsDoc, isDiffReviewed, isEnsembleStagedReview, isEvidenceClass, isEvidenceSeat, isGrokLoginExpiryFailure, isHolisticRecord, isImplemented, isMode, isPolicyVersion, isPreflightError, isRetryableApiStatus, isStrippedPath, isTestPath, isTransientApiErrorReply, isUnder, isUnsafeReadRoot, isUsageLimitFailure, isUsageLimitReply, joinStreamHeadTail, judgeConfig, keyOf, killTree, listReviewers, listVoices, loadHolisticFixture, loadHolisticSeat, loadJudge, loadPostingPosture, loadReviewers, loadVoices, makeEscalatingKill, makeNeutralSeatCwd, makeOwnerOnlyTempDir, materializeWorktree, materializeWorktreeAsync, materializedDiffClause, meetsInlineFloor, memoryConventionReader, missingConfig, omittedLine, parseConventionCitation, parseCritique, parseDiffFiles, parseGrokStream, parseHolisticSites, parseIdeas, parseJudge, parseLsTree, parsePushContext, parseReviewSummaries, parseReviewers, parseSeatAdvisor, parseSynthesis, parseTrailerIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, planPlacement, proxyEnv, readConventionsLayout, readEnsembleConfig, readOnlyWorktreeClause, readReadableSurface, readReceipt, readReview, readReviewsForRun, reapWorktree, reapWorktreeAsync, receiptIdentityMatches, receiptKeyHash, receiptPath, receiptPolicyVersion, redactUrlCredentials, remoteSlug, renderCodeReviewSeatPrompt, renderCodexSandboxProfile, renderCritiquePrompt, renderGeneratePrompt, renderHolisticPrompt, renderInlineComment, renderSummaryBody, renderSynthesisPrompt, renderVerifySandboxProfile, repoIdFromSlug, resolveBase, resolveBin, resolveCiEvidence, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveHolisticPlan, resolveHolisticSeat, resolveInRepo, resolveMode, resolvePolicyVersion, resolvePosture, resolveReceipt, resolveRepoId, resolveRepoLocation, resolveRepoLocationAsync, resolveReviewSandbox, resolveReviewer, reviewDir, reviewMethod, rootAllowed, runBrainstormMode, runClaudeReview, runClaudeReviewVoice, runClaudeVoice, runCodexReview, runGrokReview, runHolisticLens, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, scanTextForSecrets, scoreHolisticFixture, scrubRepoEnv, seatFailureMeta, setContextBudget, sha256Hex, stageReview, startEgressProxy, stripAgentInstructions, stripAgentInstructionsAsync, summarizeCoverage, trackSeatCancel, transportEnv, validateReceiptShape, verifyFixtureAnchors, verifySiteAtHead, worktreeFirstLineReader, worktreeReader, wrapWithSandbox, writeCodexSandboxProfile, writeEvidenceManifest, writeReceipt, writeTrailFile };
+export { AGENT_INSTRUCTION_NAMES, type AcquireDiffOpts, type AcquiredDiff, type AgreementPoint, type BrainstormClaudeSeams, type BrainstormOptions, BrainstormResult, type BuildReceiptResult, CI_EVIDENCE_BOTH_REASON, CI_EVIDENCE_LIMITS, CI_EVIDENCE_TRAIL_FILE, CI_OUTPUT_PATTERNS, CLAUDE_CAPABILITY_FENCE, CLAUDE_EFFORTS, CLAUDE_EVIDENCE_MAX_TURNS, CLAUDE_INACTIVITY_TIMEOUT_MS, CLAUDE_READ_TOOLS, CLAUDE_REVIEW_DENIED_TOOLS, CLAUDE_WEB_MAX_TURNS, CLAUDE_WEB_TOOLS, CODEX_INACTIVITY_TIMEOUT_MS, CODEX_SANDBOX_PROFILE, COLD_PEER_ROLE, CONVENTIONS_INLINE_MAX, CONVENTIONS_IN_TREE_DIR, CONVENTIONS_IN_TREE_FILE, CONVENTIONS_IN_TREE_REL, CORE_WORKTREE_REVIEW_TIMEOUT_MS, type CiEvidenceInput, type CiEvidenceLimits, type CiEvidenceResolution, type CiEvidenceResult, type ClaudeSeatFence, type ClaudeVoiceFence, type ClaudeVoiceSeams, type CodeReviewSeatPromptArgs, type CodexFailKind, type CodexReviewResult, type CodexReviewSeams, type CodexSandboxPaths, type ConsultResult, type ConsultSynthesis, type ConventionCitation, type ConventionFileEntry, type ConventionManifest, type ConventionReader, type ConventionSpan, type ConventionTier, type ConventionsIndex, type Coverage, type CoverageFileEntry, type CoveragePolicy, Critique, CritiqueStance, DEFAULT_COVERAGE_CEILING, DEFAULT_OBJECTIVE, DEFAULT_POSTURE, DEFAULT_VOICE_TIMEOUT_MS$1 as DEFAULT_VOICE_TIMEOUT_MS, type DepManifestHit, type DepSurfaceResult, type DiffMode, type DiffReviewReason, type DiffReviewReceipt, type DiffReviewState, type DivergencePoint, ENSEMBLE_CONFIG_PATH, EVIDENCE_CLASSES, EVIDENCE_MANIFEST_FILE, EVIDENCE_MANIFEST_SCHEMA_VERSION, EVIDENCE_SEATS, type EgressDenial, type EgressProxy, type EnsureGrokLoginOpts, type EvidenceClass, type EvidenceGap, type EvidenceManifest, type EvidenceMap, type EvidenceSeat, FILE_CONTEXT_BUDGET, type FileDiff, type FileKind, type FixtureAnchor, type FixtureScore, GROK_CLI_SANDBOX, GROK_INACTIVITY_TIMEOUT_MS, GROK_LOGIN_EXPIRY_FAIL_PREFIX, GROK_LOGIN_MARGIN_MS, GROK_PACKET_REVIEW_TIMEOUT_MS, GROK_PREFLIGHT_CANCELLED_WHY, GROK_REVIEW_TOOLS, GROK_SANDBOX_PROFILE, GROK_STATUS_API_KEY, GROK_STATUS_AUTHENTICATED_VIA_PREFIX, GROK_STATUS_LOGGED_IN_PREFIX, GROK_STATUS_NOT_AUTHENTICATED, GROK_WEB_TOOL, GROK_WORKTREE_REVIEW_TIMEOUT_MS, type GatherConfig, type GatheredConventions, type GhResult, type GhRunner, type GitRun, type GitRunAsync, GrokLoginExpiryError, type GrokModelsResult, type GrokModelsRun, type GrokModelsRunner, GrokPreflightCancelledError, type GrokStreamSummary, type GrokToolFence, HARNESS_SEATS, HOLISTIC_DEFAULTS, HOLISTIC_MIN_ANCHOR_NONWS, HOLISTIC_SEAT_ID, HOLISTIC_SEVERITY_CAP, type HarnessSeat, type HolisticEntry, type HolisticFixture, type HolisticPlan, type HolisticPolicyDeps, type HolisticPromptArgs, type HolisticProvenance, type HolisticRunner, type HolisticSeatFlags, type HolisticSite, type HolisticSiteRole, IMPLEMENTED_MODES, Idea, type InlineSecretHit, type JudgeSpec, MDNS_RESPONDER_SOCKET, MODES, MODE_ALIASES, type ManifestBlob, type ModeName, type NearMiss, OPERATOR_REVIEW_METHOD, type OmitReason, POLICY_VERSIONS, POLICY_VERSION_EVIDENCE, POLICY_VERSION_LEGACY, type PacketsReady, type ParseDiffOptions, type ParsedCritique, type ParsedIdeas, type ParsedSynthesis, type PeerReviewerRecord, type PendingState, type PersistReviewInput, type PlacedFinding, type PlantedPositive, type PolicyHashInputs, type PostingPosture, type PrPushContext, type PreflightError, type PreflightErrorKind, type PushFenceVerdict, QUALIFY_PROBE_PORT, QUALITY_LENS, REPO_LOCATION_ENV, REVIEWERS_FILE, REVIEWER_DEFAULTS, REVIEW_ADAPTERS, REVIEW_TIMEOUT_MS, RankedIdea, RawIdea, type ReceiptCoverage, type ReceiptKey, type RepoLocation, ResolvedVoiceConfig, type ReviewEvidence, ReviewFinding, type ReviewModeOptions, type ReviewModeResult, ReviewPacket, type ReviewPart, ReviewProfile, type ReviewSummary, ReviewerConfig, type ReviewerExec, type ReviewerExecOpts, type ReviewerExecResult, ReviewerId, type RiskyImportHit, type RunHolisticLensOptions, type RunReviewOpts, SANDBOX_WRITABLE_TMP, SKELETON_TRAIL_FILE, STAGE_MARKER, STREAM_CUT_EVENT, STRIPPED_INSTRUCTION_PATHS, SUGGESTION_HARD_CAP, type SandboxProfileMap, type SandboxProfileRef, type ScoredFinding, type SeatCancel, SeatDiagnostics, type SeatTimeoutReason, type SecretScanResult, type SensitivePathHit, Severity, type SiteCheck, type SiteReader, type StageCounts, type StageFailure, type StagePlan, type StageResult, type StageSuccess, type StageTarget, type StagedComment, type StagedReviewPayload, type StartEgressProxyOpts, StoredReview, type StreamResultEvent, type SummaryBodyInput, SynthesisResult, TRANSIENT_FAST_FAIL_MS, TRANSIENT_RETRY_DELAYS_MS, TerminalState, type TextSecretHit, UNTRUSTED_INSTRUCTIONS_CLAUSE, USAGE_LIMIT_FAIL_PREFIX, VOICES_FILE, VOICE_ADAPTERS, VOICE_DEFAULTS, type VerifySandboxPaths, type VoiceAnswerResult, VoiceConfig, VoiceCritiqueResult$1 as VoiceCritiqueResult, VoiceGenerateResult, VoiceId, type VoiceRunResult, type Worktree, type WorktreeEvidence, acquireDiff, allowedRootsFromConfig, applyHolisticPolicy, asRecord, assertRosterAdvisors, boundedStreamTail, buildClaudeEvidenceArgs, buildClaudeReviewArgs, buildClaudeVoiceArgs, buildCodexReviewArgs, buildCodexWorktreeArgs, buildDiffReceipt, buildEvidenceManifest, buildGrokReviewArgs, buildStagedReviewPayload, canonicalizeDiff, capHolisticSeverity, checkFreshness, classifyFileKind, classifyGitError, classifyPending, claudeAdvisorArgs, claudeAdvisorEnv, claudeWorktreePromptSuffix, codexSandboxSupported, codexStreamFailure, computeCoverage, computePolicyHash, computePolicyHashAt, index as consult, conventionsAwareReader, conventionsFileClause, conventionsIndex, conventionsPointer, conventionsStep, coverageCounts, coverageShortfall, defaultCodexSandboxPaths, defaultReceiptStore, defuseUntrusted, diffDigest, effectiveSshFrom, ensureGrokLogin, ensureSandboxProfile, escapesRoot, evaluatePushFence, evidenceShortfall, extractDirRefs, extractGrokText, extractIncludes, extractRefs, extractStreamResult, fallbackSynthesis$1 as fallbackSynthesis, fetchCiEvidence, findQuoteSpan, findQuoteSpans, findingTrailer, formatEvidenceShortfall, fsConventionReader, gatherConventions, gitConventionReader, gitHasCommit, grokAllowedTools, grokLoginWarningLine, grokToolFence, hasDepSurface, hasGeneratedFirstLine, hasGeneratedHeader, holisticCapWasLifted, homeReadDenyRules, isCommitSha, isConventionsDoc, isDiffReviewed, isEnsembleStagedReview, isEvidenceClass, isEvidenceSeat, isGrokLoginExpiryFailure, isHolisticRecord, isImplemented, isMode, isPolicyVersion, isPreflightError, isRetryableApiStatus, isStrippedPath, isTestPath, isTransientApiErrorReply, isUnder, isUnsafeReadRoot, isUsageLimitFailure, isUsageLimitReply, joinStreamHeadTail, judgeConfig, keyOf, killTree, listReviewers, listVoices, loadHolisticFixture, loadHolisticSeat, loadJudge, loadPostingPosture, loadReviewers, loadVoices, makeEscalatingKill, makeNeutralSeatCwd, makeOwnerOnlyTempDir, materializeWorktree, materializeWorktreeAsync, materializedDiffClause, meetsInlineFloor, memoryConventionReader, missingConfig, omittedLine, parseConventionCitation, parseCritique, parseDiffFiles, parseGrokStream, parseHolisticSites, parseIdeas, parseJudge, parseLsTree, parsePushContext, parseReviewSummaries, parseReviewers, parseSeatAdvisor, parseSynthesis, parseTrailerIds, parseVoices, persistReview, pickSynthesizer$1 as pickSynthesizer, planPlacement, proxyEnv, readConventionsLayout, readEnsembleConfig, readOnlyWorktreeClause, readReadableSurface, readReceipt, readReview, readReviewsForRun, reapWorktree, reapWorktreeAsync, receiptIdentityMatches, receiptKeyHash, receiptPath, receiptPolicyVersion, redactUrlCredentials, remoteSlug, renderCodeReviewSeatPrompt, renderCodexSandboxProfile, renderCritiquePrompt, renderGeneratePrompt, renderHolisticPrompt, renderInlineComment, renderSummaryBody, renderSynthesisPrompt, renderVerifySandboxProfile, repoIdFromSlug, resolveBase, resolveBin, resolveCiEvidence, resolveClaudeBin, resolveCodexBin, resolveGrokBin, resolveHolisticPlan, resolveHolisticSeat, resolveInRepo, resolveMode, resolvePolicyVersion, resolvePosture, resolveReceipt, resolveRepoId, resolveRepoLocation, resolveRepoLocationAsync, resolveReviewSandbox, resolveReviewer, reviewDir, reviewMethod, rootAllowed, runBrainstormMode, runClaudeReview, runClaudeReviewVoice, runClaudeVoice, runCodexReview, runGrokReview, runHolisticLens, runReviewMode, runReviewerExec, sanitizePathSegment, scanDependencySurface, scanDiffForSecrets, scanTextForSecrets, scoreHolisticFixture, scrubRepoEnv, seatFailureMeta, setContextBudget, sha256Hex, stageReview, startEgressProxy, stripAgentInstructions, stripAgentInstructionsAsync, summarizeCoverage, toCodexResult, trackSeatCancel, transportEnv, validateReceiptShape, verifyFixtureAnchors, verifySiteAtHead, worktreeFirstLineReader, worktreeReader, wrapWithSandbox, writeCodexSandboxProfile, writeEvidenceManifest, writeReceipt, writeTrailFile };

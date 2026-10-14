@@ -3,6 +3,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { makeOwnerOnlyTempDir } from '../core/artifacts';
+import {
+  TRANSIENT_FAST_FAIL_MS,
+  TRANSIENT_RETRY_DELAYS_MS,
+  USAGE_LIMIT_FAIL_PREFIX,
+} from '../core/claude-stream';
 import type { HistoryPacketFile } from '../modes/review/history-packet';
 import { type EgressDenial, type EgressProxy, proxyEnv } from '../core/egress-proxy';
 import { resolveCodexBin, type ReviewerExecResult, runReviewerExec } from '../core/spawn';
@@ -56,10 +61,17 @@ export interface CodexReviewResult {
   // outside its vendor allowlist — which, under a prompt-injectable shell, is the signal the fence
   // exists to catch. LOUD by contract: stderr at denial time, the run artifact, the posted footer.
   egressDenials?: readonly EgressDenial[];
-  // Set when the seat failed for a reason the {raw, timedOut} pair cannot express —
-  // today: a persistent transient API error (529/429) that exhausted its retries.
+  // Set when the seat failed for a reason the {raw, timedOut} pair cannot express: a stalled
+  // (wedged) seat, or a `turn.failed` the codex `--json` stream named — a transient API error
+  // (429/5xx) that exhausted its retries, the operator's usage limit, or any other API error.
   // Callers prefer this over the generic timed-out/no-output wording when present.
   failWhy?: string;
+  // The TYPED failure, for callers that must decide rather than display (seat-run's packet
+  // fallback stands down on a transient — the sandbox was not the problem). `failWhy` is the
+  // sentence; this is the fact.
+  failKind?: CodexFailKind;
+  // The child's exit code, carried through from the spawn (null = a signal ended it).
+  exitCode?: number | null;
   ok: boolean;
   // The grok login pre-flight's warnings (grok-login.ts), one message each — a field of their own,
   // never mixed into stderrTail, so a summary quoting the head of the seat's stderr shows the seat's
@@ -239,18 +251,74 @@ function refuseWorktree(message: string): Promise<CodexReviewResult> {
   return Promise.resolve({ ok: false, raw: null, stderrTail: message, timedOut: false });
 }
 
+export type CodexFailKind = 'stalled' | 'transient-api' | 'usage-limit' | 'api-error';
+
+// THE STREAM NAMES THE DEATH (run 2026-10-14-11-08-56-90dbf6a6): a codex seat that dies on the
+// API writes NOTHING to the -o file and only its stdin banner to stderr — the one channel that
+// carries the cause is the `--json` stream's terminal `turn.failed` event ("exceeded retry limit,
+// last status: 429 Too Many Requests"; codex had already retried ~5× internally). Without this the
+// trail said "produced no parseable findings: Reading additional input from stdin...", and the
+// orchestrator read the failure as sandbox breakage. PURE, and keyed on `turn.failed` ONLY: codex
+// also emits `{"type":"error","message":"Reconnecting... 2/5"}` mid-run on healthy reviews that go
+// on to `turn.completed` (runs 2583f8fd, 5a34ffbb), so the presence of an `error` event is not a
+// failure. The last `turn.failed` wins; a stream without one yields null.
+export function codexStreamFailure(stream: string | undefined): { kind: CodexFailKind; message: string } | null {
+  if (!stream) return null;
+  const lines = stream.split('\n');
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i].trim();
+    if (!line || !line.includes('turn.failed')) continue;
+    let ev: { error?: { message?: unknown }; type?: unknown };
+    try {
+      ev = JSON.parse(line) as typeof ev;
+    } catch {
+      continue;
+    }
+    if (ev.type !== 'turn.failed') continue;
+    const message = (typeof ev.error?.message === 'string' ? ev.error.message : '').trim() || 'turn.failed (no message)';
+    return { kind: classifyCodexFailure(message), message };
+  }
+  return null;
+}
+
+// codex 0.159's own vocabulary (its error codes: usage_limit_exceeded / rate_limit_exceeded /
+// server_overloaded / quota_exceeded / usage_not_included; "exceeded retry limit, last status:
+// <code>" after its internal retries). A usage limit is the operator's own window — it clears in
+// hours, never in 45 s — so it is named and NEVER retried, exactly as the claude seat treats its
+// "session limit" reply. A 429/5xx retry-limit is a burst (two codex seats in flight on one
+// account) and is retried on the same evidence.
+function classifyCodexFailure(message: string): CodexFailKind {
+  if (/\b(usage|quota|weekly) limit\b|usage_limit_exceeded|quota_exceeded|usage_not_included|try again at\b/i.test(message))
+    return 'usage-limit';
+  if (/last status:\s*(429|5\d\d)\b|rate_limit_exceeded|server_overloaded|\boverloaded\b|too many requests/i.test(message))
+    return 'transient-api';
+  return 'api-error';
+}
+
 // Fold a spawn result into the seat shape. A liveness reclaim names itself (failWhy) so the trail
 // says "it went silent", never the generic "timed out" that would hide the difference from an
-// honest seat the absolute backstop cut; the stream tail and the watchdog identity ride along
-// for the same reason.
-function toCodexResult(res: ReviewerExecResult): CodexReviewResult {
+// honest seat the absolute backstop cut; a `turn.failed` the stream carried names itself the same
+// way. The stream tail, the exit code and the watchdog identity ride along for the same reason.
+export function toCodexResult(res: ReviewerExecResult): CodexReviewResult {
   const stalled = res.timedOut && res.timedOutReason === 'inactivity';
-  return {
-    ...(stalled
+  const failure = !res.timedOut && res.raw === null ? codexStreamFailure(res.streamTail) : null;
+  const named = stalled
+    ? {
+        failKind: 'stalled' as const,
+        failWhy: `stalled: no --json output for ${Math.round(CODEX_INACTIVITY_TIMEOUT_MS / 60_000)} min (wedged seat reclaimed)`,
+      }
+    : failure
       ? {
-          failWhy: `stalled: no --json output for ${Math.round(CODEX_INACTIVITY_TIMEOUT_MS / 60_000)} min (wedged seat reclaimed)`,
+          failKind: failure.kind,
+          failWhy:
+            failure.kind === 'usage-limit'
+              ? `${USAGE_LIMIT_FAIL_PREFIX} — ${failure.message.slice(0, 160)}`
+              : `codex API error: ${failure.message.slice(0, 200)}`,
         }
-      : {}),
+      : {};
+  return {
+    ...named,
+    ...(res.exitCode !== undefined ? { exitCode: res.exitCode } : {}),
     ok: res.raw !== null,
     raw: res.raw,
     stderrTail: res.stderrTail,
@@ -361,11 +429,18 @@ async function runCodexWorktreeReview(
 // reclaims a silent seat long before that backstop). Parameterized for a review:
 // the configured strong model/effort and the packet timeout. The reply is read
 // from the -o file. On Codex's separate quota, never a shared pool.
-export function runCodexReview(
-  prompt: string,
-  config: ReviewerConfig,
-  opts: RunReviewOpts = {}
-): Promise<CodexReviewResult> {
+// Test seams for the transient retry: the waits and the schedule. Production callers pass nothing.
+export interface CodexReviewSeams {
+  fastFailMs?: number;
+  retryDelaysMs?: readonly number[];
+  sleep?: (ms: number) => Promise<void>;
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+// One attempt on whichever evidence the caller named: the worktree (or evidence root) under the
+// external wrapper, else the packet from a throwaway cwd.
+function runCodexAttempt(prompt: string, config: ReviewerConfig, opts: RunReviewOpts): Promise<CodexReviewResult> {
   const readRoot = opts.worktree ?? opts.evidenceRoot;
   if (readRoot) return runCodexWorktreeReview(prompt, config, readRoot, opts);
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
@@ -380,4 +455,46 @@ export function runCodexReview(
     streamStdout: true,
     onSpawn: opts.onSpawn,
   }).then(toCodexResult);
+}
+
+// TRANSIENT-ERROR RETRY (2026-10-14), the claude seat's rule applied to codex: an attempt whose
+// stream ended in a transient `turn.failed` (429/5xx retry limit, overloaded) AND that fast-failed
+// (under TRANSIENT_FAST_FAIL_MS) is retried on the SAME evidence after 15 s, then 45 s. A worktree
+// attempt stays a worktree attempt — the sandbox was never the problem, and the packet re-run the
+// orchestrator used to spend here hit the same limit 5 s later (run 90dbf6a6). Anything else — a
+// timeout, a long attempt that died late, a usage limit, a real reply — is returned as-is. The
+// retry is surfaced on stderrTail (a rescued seat) or in failWhy (an exhausted one); the failed
+// attempts' egress denials are kept — a seat that reached for a forbidden host and then
+// succeeded must not launder that away. This wraps EVERY codex spawn: the review seat, the codex
+// gate, the brainstorm/consult voices.
+export async function runCodexReview(
+  prompt: string,
+  config: ReviewerConfig,
+  opts: RunReviewOpts = {},
+  seams: CodexReviewSeams = {}
+): Promise<CodexReviewResult> {
+  const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
+  const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
+  const wait = seams.sleep ?? sleep;
+  const denials: EgressDenial[] = [];
+  let retried = 0;
+  for (;;) {
+    const startedAt = Date.now();
+    const res = await runCodexAttempt(prompt, config, opts);
+    const elapsedMs = Date.now() - startedAt;
+    if (res.egressDenials) denials.push(...res.egressDenials);
+    const withDenials = res.egressDenials ? { ...res, egressDenials: denials } : res;
+    const transient = res.failKind === 'transient-api' && elapsedMs < fastFailMs;
+    if (transient && retried < retryDelaysMs.length) {
+      await wait(retryDelaysMs[retried]);
+      retried += 1;
+      continue;
+    }
+    if (retried === 0) return withDenials;
+    const note = `retried ${retried}× after a transient API error`;
+    if (transient) {
+      return { ...withDenials, failWhy: `${res.failWhy ?? 'codex API error'} (after ${retried + 1} attempts)` };
+    }
+    return { ...withDenials, stderrTail: `${note}\n${res.stderrTail}`.trim() };
+  }
 }

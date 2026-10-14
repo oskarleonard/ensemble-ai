@@ -229,6 +229,14 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   // A TIMEOUT is not a sandbox-viability signal — the seat ran under its profile and simply did not
   // finish. Re-running it on the packet would spend a second full review budget to learn nothing,
   // so the failed seat stands (and, having completed no review, it cannot qualify a receipt).
+  // Neither is an API-NAMED death (run 2026-10-14-11-08-56-90dbf6a6): a 429 the adapter already
+  // retried, or the operator's usage limit, says nothing about the sandbox — the packet re-run met
+  // the same 429 five seconds later. The seat stands failed with the real cause on it; the
+  // dashboard's reseat heals it once the limit clears.
+  if (first.failKind === 'transient-api' || first.failKind === 'usage-limit') {
+    log(`  · ⚠ ${reviewer.id}: ${first.failWhy ?? first.failKind} — not a sandbox failure, so no packet re-run; the seat stands failed`);
+    return { egressDenials, fallbackReason: null, realized: 'worktree', review };
+  }
   if (first.timedOut || !args.retryOnPacket) {
     return { egressDenials, fallbackReason: null, realized: 'worktree', review };
   }
@@ -236,7 +244,7 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   // real review run, and it produced nothing usable. Fall back to the packet, LOUDLY — this seat
   // now runs BELOW the ratified acceptance bar (packet < the manual whole-repo baseline), which is
   // Oskar's ratification call to accept, never a silent downgrade.
-  const why = first.stderrTail.trim().slice(0, 300) || 'no output';
+  const why = first.failWhy ?? (first.stderrTail.trim().slice(0, 300) || 'no output');
   const reason = `${reviewer.id}: the worktree seat produced no usable review under its \`${args.qualification.profile.id}\` sandbox (${why}) — FELL BACK to the diff-only packet. This seat reviewed less than it would have in-project.`;
   log(`  · ⚠ ${reason}`);
   const { result: second, timing: secondTiming } = await adapterOnce(

@@ -1265,6 +1265,113 @@ import fs8 from "fs";
 import os5 from "os";
 import path6 from "path";
 
+// src/core/claude-stream.ts
+var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
+function isTransientApiErrorReply(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 1500) return false;
+  return /\bAPI Error:\s*(?:429|5\d\d)\b/i.test(trimmed) || /\boverloaded\b/i.test(trimmed);
+}
+function isUsageLimitReply(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 300) return false;
+  return /\b(session|usage|weekly) limit\b/i.test(trimmed) && /\b(reset|hit|reached)\b/i.test(trimmed);
+}
+function isRetryableApiStatus(status) {
+  return status === 429 || typeof status === "number" && status >= 500 && status <= 599;
+}
+var USAGE_LIMIT_FAIL_PREFIX = "operator usage limit reached";
+function isUsageLimitFailure(failWhy) {
+  return failWhy?.startsWith(USAGE_LIMIT_FAIL_PREFIX) ?? false;
+}
+var TRANSIENT_RETRY_DELAYS_MS = [15e3, 45e3];
+var TRANSIENT_FAST_FAIL_MS = 12e4;
+var CLAUDE_INACTIVITY_TIMEOUT_MS = 6e5;
+function extractStreamResult(stdout) {
+  let found = { apiErrorStatus: null, found: false, isError: false, text: null };
+  for (const line of stdout.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("{")) continue;
+    let obj;
+    try {
+      obj = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    if (!obj || typeof obj !== "object") continue;
+    const o = obj;
+    if (o.type !== "result") continue;
+    found = {
+      apiErrorStatus: typeof o.api_error_status === "number" ? o.api_error_status : null,
+      found: true,
+      isError: o.is_error === true,
+      text: typeof o.result === "string" ? o.result : null
+    };
+  }
+  return found;
+}
+function streamActivityTail(stdout, limit = 600) {
+  if (!stdout) return "";
+  const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+  const summarized = [];
+  for (const line of lines.slice(-12)) {
+    if (!line.startsWith("{")) {
+      summarized.push(line);
+      continue;
+    }
+    try {
+      const o = JSON.parse(line);
+      const type = typeof o.type === "string" ? o.type : "event";
+      const msg = o.message;
+      const content = Array.isArray(msg?.content) ? msg.content : [];
+      const tools = content.filter((c) => c?.type === "tool_use").map((c) => String(c.name ?? "tool"));
+      summarized.push(tools.length ? `${type}: ${tools.join(",")}` : type);
+    } catch {
+      summarized.push(line.slice(0, 80));
+    }
+  }
+  return summarized.join(" \xB7 ").slice(-limit);
+}
+function stripStreamPayloads(stream) {
+  const out = [];
+  for (const line of stream.split("\n")) {
+    if (!line.startsWith("{") || !line.includes('"tool_result"') && !line.includes('"tool_use_result"')) {
+      out.push(line);
+      continue;
+    }
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      out.push(line);
+      continue;
+    }
+    if (!e || typeof e !== "object") {
+      out.push(line);
+      continue;
+    }
+    const ev = e;
+    if (ev.type !== "user") {
+      out.push(line);
+      continue;
+    }
+    delete ev.tool_use_result;
+    delete ev.tool_result_meta;
+    const msg = ev.message;
+    if (msg && typeof msg === "object" && Array.isArray(msg.content)) {
+      for (const c of msg.content) {
+        if (!c || typeof c !== "object") continue;
+        const block = c;
+        if (block.type !== "tool_result" || block.content === void 0) continue;
+        const size = typeof block.content === "string" ? block.content.length : JSON.stringify(block.content).length;
+        block.content = `[stripped ${size} chars \u2014 the seat's tool result; the tree is on disk]`;
+      }
+    }
+    out.push(JSON.stringify(ev));
+  }
+  return out.join("\n");
+}
+
 // src/core/egress-proxy.ts
 import http from "http";
 import net from "net";
@@ -1860,12 +1967,44 @@ function worktreeReplyFile() {
 function refuseWorktree(message) {
   return Promise.resolve({ ok: false, raw: null, stderrTail: message, timedOut: false });
 }
+function codexStreamFailure(stream) {
+  if (!stream) return null;
+  const lines = stream.split("\n");
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i].trim();
+    if (!line || !line.includes("turn.failed")) continue;
+    let ev;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (ev.type !== "turn.failed") continue;
+    const message = (typeof ev.error?.message === "string" ? ev.error.message : "").trim() || "turn.failed (no message)";
+    return { kind: classifyCodexFailure(message), message };
+  }
+  return null;
+}
+function classifyCodexFailure(message) {
+  if (/\b(usage|quota|weekly) limit\b|usage_limit_exceeded|quota_exceeded|usage_not_included|try again at\b/i.test(message))
+    return "usage-limit";
+  if (/last status:\s*(429|5\d\d)\b|rate_limit_exceeded|server_overloaded|\boverloaded\b|too many requests/i.test(message))
+    return "transient-api";
+  return "api-error";
+}
 function toCodexResult(res) {
   const stalled = res.timedOut && res.timedOutReason === "inactivity";
+  const failure = !res.timedOut && res.raw === null ? codexStreamFailure(res.streamTail) : null;
+  const named = stalled ? {
+    failKind: "stalled",
+    failWhy: `stalled: no --json output for ${Math.round(CODEX_INACTIVITY_TIMEOUT_MS / 6e4)} min (wedged seat reclaimed)`
+  } : failure ? {
+    failKind: failure.kind,
+    failWhy: failure.kind === "usage-limit" ? `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${failure.message.slice(0, 160)}` : `codex API error: ${failure.message.slice(0, 200)}`
+  } : {};
   return {
-    ...stalled ? {
-      failWhy: `stalled: no --json output for ${Math.round(CODEX_INACTIVITY_TIMEOUT_MS / 6e4)} min (wedged seat reclaimed)`
-    } : {},
+    ...named,
+    ...res.exitCode !== void 0 ? { exitCode: res.exitCode } : {},
     ok: res.raw !== null,
     raw: res.raw,
     stderrTail: res.stderrTail,
@@ -1936,7 +2075,8 @@ async function runCodexWorktreeReview(prompt, config, worktree, opts) {
     throw e;
   }
 }
-function runCodexReview(prompt, config, opts = {}) {
+var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function runCodexAttempt(prompt, config, opts) {
   const readRoot = opts.worktree ?? opts.evidenceRoot;
   if (readRoot) return runCodexWorktreeReview(prompt, config, readRoot, opts);
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
@@ -1951,6 +2091,33 @@ function runCodexReview(prompt, config, opts = {}) {
     streamStdout: true,
     onSpawn: opts.onSpawn
   }).then(toCodexResult);
+}
+async function runCodexReview(prompt, config, opts = {}, seams = {}) {
+  const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
+  const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
+  const wait = seams.sleep ?? sleep;
+  const denials = [];
+  let retried = 0;
+  for (; ; ) {
+    const startedAt = Date.now();
+    const res = await runCodexAttempt(prompt, config, opts);
+    const elapsedMs = Date.now() - startedAt;
+    if (res.egressDenials) denials.push(...res.egressDenials);
+    const withDenials = res.egressDenials ? { ...res, egressDenials: denials } : res;
+    const transient = res.failKind === "transient-api" && elapsedMs < fastFailMs;
+    if (transient && retried < retryDelaysMs.length) {
+      await wait(retryDelaysMs[retried]);
+      retried += 1;
+      continue;
+    }
+    if (retried === 0) return withDenials;
+    const note = `retried ${retried}\xD7 after a transient API error`;
+    if (transient) {
+      return { ...withDenials, failWhy: `${res.failWhy ?? "codex API error"} (after ${retried + 1} attempts)` };
+    }
+    return { ...withDenials, stderrTail: `${note}
+${res.stderrTail}`.trim() };
+  }
 }
 
 // src/reviewers/grok.ts
@@ -2399,113 +2566,6 @@ async function runGrokReview(prompt, config, opts = {}) {
   }
 }
 
-// src/core/claude-stream.ts
-var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
-function isTransientApiErrorReply(raw) {
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 1500) return false;
-  return /\bAPI Error:\s*(?:429|5\d\d)\b/i.test(trimmed) || /\boverloaded\b/i.test(trimmed);
-}
-function isUsageLimitReply(raw) {
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 300) return false;
-  return /\b(session|usage|weekly) limit\b/i.test(trimmed) && /\b(reset|hit|reached)\b/i.test(trimmed);
-}
-function isRetryableApiStatus(status) {
-  return status === 429 || typeof status === "number" && status >= 500 && status <= 599;
-}
-var USAGE_LIMIT_FAIL_PREFIX = "operator usage limit reached";
-function isUsageLimitFailure(failWhy) {
-  return failWhy?.startsWith(USAGE_LIMIT_FAIL_PREFIX) ?? false;
-}
-var TRANSIENT_RETRY_DELAYS_MS = [15e3, 45e3];
-var TRANSIENT_FAST_FAIL_MS = 12e4;
-var CLAUDE_INACTIVITY_TIMEOUT_MS = 6e5;
-function extractStreamResult(stdout) {
-  let found = { apiErrorStatus: null, found: false, isError: false, text: null };
-  for (const line of stdout.split("\n")) {
-    const t = line.trim();
-    if (!t.startsWith("{")) continue;
-    let obj;
-    try {
-      obj = JSON.parse(t);
-    } catch {
-      continue;
-    }
-    if (!obj || typeof obj !== "object") continue;
-    const o = obj;
-    if (o.type !== "result") continue;
-    found = {
-      apiErrorStatus: typeof o.api_error_status === "number" ? o.api_error_status : null,
-      found: true,
-      isError: o.is_error === true,
-      text: typeof o.result === "string" ? o.result : null
-    };
-  }
-  return found;
-}
-function streamActivityTail(stdout, limit = 600) {
-  if (!stdout) return "";
-  const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
-  const summarized = [];
-  for (const line of lines.slice(-12)) {
-    if (!line.startsWith("{")) {
-      summarized.push(line);
-      continue;
-    }
-    try {
-      const o = JSON.parse(line);
-      const type = typeof o.type === "string" ? o.type : "event";
-      const msg = o.message;
-      const content = Array.isArray(msg?.content) ? msg.content : [];
-      const tools = content.filter((c) => c?.type === "tool_use").map((c) => String(c.name ?? "tool"));
-      summarized.push(tools.length ? `${type}: ${tools.join(",")}` : type);
-    } catch {
-      summarized.push(line.slice(0, 80));
-    }
-  }
-  return summarized.join(" \xB7 ").slice(-limit);
-}
-function stripStreamPayloads(stream) {
-  const out = [];
-  for (const line of stream.split("\n")) {
-    if (!line.startsWith("{") || !line.includes('"tool_result"') && !line.includes('"tool_use_result"')) {
-      out.push(line);
-      continue;
-    }
-    let e;
-    try {
-      e = JSON.parse(line);
-    } catch {
-      out.push(line);
-      continue;
-    }
-    if (!e || typeof e !== "object") {
-      out.push(line);
-      continue;
-    }
-    const ev = e;
-    if (ev.type !== "user") {
-      out.push(line);
-      continue;
-    }
-    delete ev.tool_use_result;
-    delete ev.tool_result_meta;
-    const msg = ev.message;
-    if (msg && typeof msg === "object" && Array.isArray(msg.content)) {
-      for (const c of msg.content) {
-        if (!c || typeof c !== "object") continue;
-        const block = c;
-        if (block.type !== "tool_result" || block.content === void 0) continue;
-        const size = typeof block.content === "string" ? block.content.length : JSON.stringify(block.content).length;
-        block.content = `[stripped ${size} chars \u2014 the seat's tool result; the tree is on disk]`;
-      }
-    }
-    out.push(JSON.stringify(ev));
-  }
-  return out.join("\n");
-}
-
 // src/modes/brainstorm/claude.ts
 import fs11 from "fs";
 import os8 from "os";
@@ -2580,7 +2640,7 @@ function buildClaudeVoiceArgs(prompt, config) {
   args.push(...claudeAdvisorArgs(config));
   return args;
 }
-var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
   const exec = seams.exec ?? runReviewerExec;
   const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
@@ -2611,7 +2671,7 @@ async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
       const activity = streamActivityTail(raw);
       const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
       if (transient && retried < retryDelaysMs.length) {
-        await sleep(retryDelaysMs[retried]);
+        await sleep2(retryDelaysMs[retried]);
         retried += 1;
         continue;
       }
@@ -5270,7 +5330,7 @@ function buildClaudeReviewArgs(prompt, config, fence = {}) {
 function makeNeutralSeatCwd() {
   return makeOwnerOnlyTempDir("ensemble-seat-cwd-");
 }
-var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var sleep3 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var CLAUDE_STREAM_TAIL_LIMIT = 8e6;
 async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
   const exec = seams.exec ?? runReviewerExec;
@@ -5311,7 +5371,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       const text = stream?.found ? stream.text : raw;
       const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
       if (transient && retried < retryDelaysMs.length) {
-        await sleep2(retryDelaysMs[retried]);
+        await sleep3(retryDelaysMs[retried]);
         retried += 1;
         continue;
       }
@@ -5412,7 +5472,7 @@ function buildClaudeExecArgs(prompt, config) {
   args.push("--disallowedTools", "Agent", "Task", "WebFetch", "WebSearch");
   return args;
 }
-var sleep3 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var sleep4 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function runClaudeExecVoice(prompt, config, opts, seams = {}) {
   const exec = seams.exec ?? runReviewerExec;
   const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
@@ -5439,7 +5499,7 @@ async function runClaudeExecVoice(prompt, config, opts, seams = {}) {
     const text = stream?.found ? stream.text : raw;
     const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
     if (transient && retried < retryDelaysMs.length) {
-      await sleep3(retryDelaysMs[retried]);
+      await sleep4(retryDelaysMs[retried]);
       retried += 1;
       continue;
     }
@@ -7422,10 +7482,14 @@ async function runCoreSeat(args) {
   if (review.terminalState === "reviewed") {
     return { egressDenials, fallbackReason: null, realized: "worktree", review };
   }
+  if (first.failKind === "transient-api" || first.failKind === "usage-limit") {
+    log(`  \xB7 \u26A0 ${reviewer.id}: ${first.failWhy ?? first.failKind} \u2014 not a sandbox failure, so no packet re-run; the seat stands failed`);
+    return { egressDenials, fallbackReason: null, realized: "worktree", review };
+  }
   if (first.timedOut || !args.retryOnPacket) {
     return { egressDenials, fallbackReason: null, realized: "worktree", review };
   }
-  const why = first.stderrTail.trim().slice(0, 300) || "no output";
+  const why = first.failWhy ?? (first.stderrTail.trim().slice(0, 300) || "no output");
   const reason = `${reviewer.id}: the worktree seat produced no usable review under its \`${args.qualification.profile.id}\` sandbox (${why}) \u2014 FELL BACK to the diff-only packet. This seat reviewed less than it would have in-project.`;
   log(`  \xB7 \u26A0 ${reason}`);
   const { result: second, timing: secondTiming } = await adapterOnce(
