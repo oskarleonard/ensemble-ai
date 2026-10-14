@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { buildCodexReviewArgs, runCodexReview } from './codex';
+import { buildCodexReviewArgs, codexStreamFailure, runCodexReview, toCodexResult } from './codex';
 import { codexSandboxSupported } from './codex-sandbox';
 import { startSeatEgressProxy } from './egress-seat';
 import { resolveCodexBin } from '../core/spawn';
@@ -42,6 +42,7 @@ type FakeChild = EventEmitter & {
   kill: (sig: string) => void;
   kills: string[];
   stderr: EventEmitter;
+  stdout: EventEmitter;
 };
 
 let child: FakeChild | null = null;
@@ -62,6 +63,7 @@ beforeEach(() => {
       c.kills.push(sig);
     };
     c.stderr = new EventEmitter();
+    c.stdout = new EventEmitter();
     child = c;
     lastArgs = args;
     lastStdio = opts.stdio;
@@ -370,5 +372,132 @@ describe('runCodexReview — worktree evidence runs under the external sandbox w
     // `--json`), while stdin stays closed.
     expect(args).toContain('--json');
     expect(lastStdio).toEqual(['ignore', 'pipe', 'pipe']);
+  });
+});
+
+// THE STREAM NAMES THE DEATH (run 2026-10-14-11-08-56-90dbf6a6): the -o file is never written and
+// stderr carries only the stdin banner; the `--json` stream's terminal `turn.failed` is the one
+// channel with the cause.
+const TURN_FAILED_429 =
+  '{"type":"thread.started","thread_id":"t"}\n{"type":"turn.started"}\n' +
+  '{"type":"error","message":"exceeded retry limit, last status: 429 Too Many Requests"}\n' +
+  '{"type":"turn.failed","error":{"message":"exceeded retry limit, last status: 429 Too Many Requests"}}\n';
+
+describe('codexStreamFailure — the --json stream names a dead seat', () => {
+  it('reads the terminal turn.failed and classes a 429 retry limit as transient', () => {
+    expect(codexStreamFailure(TURN_FAILED_429)).toEqual({
+      kind: 'transient-api',
+      message: 'exceeded retry limit, last status: 429 Too Many Requests',
+    });
+    expect(codexStreamFailure('{"type":"turn.failed","error":{"message":"exceeded retry limit, last status: 503 Service Unavailable"}}')?.kind).toBe('transient-api');
+  });
+
+  it('is keyed on turn.failed ONLY — reconnect `error` events on a healthy stream are not a failure', () => {
+    const healthy =
+      '{"type":"thread.started","thread_id":"t"}\n{"type":"error","message":"Reconnecting... 2/5"}\n' +
+      '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n{"type":"turn.completed","usage":{}}\n';
+    expect(codexStreamFailure(healthy)).toBeNull();
+    expect(codexStreamFailure(undefined)).toBeNull();
+    expect(codexStreamFailure('')).toBeNull();
+  });
+
+  it("names the operator's usage limit as such — never retried — and anything else as an api error", () => {
+    expect(codexStreamFailure('{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit. Try again at 5:10pm."}}')?.kind).toBe('usage-limit');
+    expect(codexStreamFailure('{"type":"turn.failed","error":{"message":"unauthorized: invalid api key"}}')).toEqual({
+      kind: 'api-error',
+      message: 'unauthorized: invalid api key',
+    });
+  });
+
+  it('survives a cut line and a non-JSON line, and takes the LAST turn.failed', () => {
+    const s = '{"type":"turn.failed","error":{"message":"first"}}\nnot json turn.failed\n{"type":"turn.fai' + '\n{"type":"turn.failed","error":{"message":"last"}}\n';
+    expect(codexStreamFailure(s)?.message).toBe('last');
+  });
+});
+
+describe('toCodexResult — a spawn result folds the named failure in', () => {
+  it('a reply-less exit whose stream ended in turn.failed carries failWhy + failKind + exitCode', () => {
+    const r = toCodexResult({ exitCode: 1, raw: null, stderrTail: 'Reading additional input from stdin...', streamTail: TURN_FAILED_429, timedOut: false });
+    expect(r.failKind).toBe('transient-api');
+    expect(r.failWhy).toBe('codex API error: exceeded retry limit, last status: 429 Too Many Requests');
+    expect(r.exitCode).toBe(1);
+    expect(r.ok).toBe(false);
+  });
+
+  it('a usage limit is named with the shared prefix the gate recognises cross-vendor', () => {
+    const r = toCodexResult({ raw: null, stderrTail: '', streamTail: '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again at 17:10."}}', timedOut: false });
+    expect(r.failKind).toBe('usage-limit');
+    expect(r.failWhy).toMatch(/^operator usage limit reached — You have hit your usage limit/);
+  });
+
+  it('a reply wins over a stray turn.failed, and a stall keeps its own name', () => {
+    expect(toCodexResult({ raw: 'REVIEW', stderrTail: '', streamTail: TURN_FAILED_429, timedOut: false }).failKind).toBeUndefined();
+    const stalled = toCodexResult({ raw: null, stderrTail: '', streamTail: TURN_FAILED_429, timedOut: true, timedOutReason: 'inactivity' });
+    expect(stalled.failKind).toBe('stalled');
+    expect(stalled.failWhy).toMatch(/^stalled:/);
+  });
+});
+
+describe('runCodexReview — a fast-failed transient 429 is retried on the SAME evidence', () => {
+  const seams = { fastFailMs: 120_000, retryDelaysMs: [0, 0], sleep: async () => {} };
+  const spawns = () => vi.mocked(spawn).mock.calls.length;
+  const settle = () => new Promise((r) => setTimeout(r, 5));
+
+  it('rescues the seat on the second attempt and records the retry on stderrTail', async () => {
+    const before = spawns();
+    const p = runCodexReview('PROMPT', CONFIG, { timeoutMs: 10_000 }, seams);
+    child?.stdout.emit('data', Buffer.from(TURN_FAILED_429));
+    child?.emit('close');
+    await settle();
+    expect(spawns()).toBe(before + 2);
+    const outFile = lastArgs[lastArgs.indexOf('-o') + 1];
+    fs.writeFileSync(outFile, 'CODEX REVIEW BODY');
+    child?.emit('close');
+    const result = await p;
+    expect(result.ok).toBe(true);
+    expect(result.raw).toBe('CODEX REVIEW BODY');
+    expect(result.failKind).toBeUndefined();
+    expect(result.stderrTail).toContain('retried 1× after a transient API error');
+  });
+
+  it('exhausts the schedule and names the real cause with the attempt count', async () => {
+    const before = spawns();
+    const p = runCodexReview('PROMPT', CONFIG, { timeoutMs: 10_000 }, seams);
+    for (let i = 0; i < 3; i += 1) {
+      child?.stdout.emit('data', Buffer.from(TURN_FAILED_429));
+      child?.emit('close');
+      await settle();
+    }
+    const result = await p;
+    expect(spawns()).toBe(before + 3);
+    expect(result.ok).toBe(false);
+    expect(result.failKind).toBe('transient-api');
+    expect(result.failWhy).toBe('codex API error: exceeded retry limit, last status: 429 Too Many Requests (after 3 attempts)');
+  });
+
+  it('never retries a usage limit or a plain empty exit', async () => {
+    const before = spawns();
+    const p = runCodexReview('PROMPT', CONFIG, { timeoutMs: 10_000 }, seams);
+    child?.stdout.emit('data', Buffer.from('{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again at 17:10."}}\n'));
+    child?.emit('close');
+    const result = await p;
+    expect(spawns()).toBe(before + 1);
+    expect(result.failKind).toBe('usage-limit');
+
+    const p2 = runCodexReview('PROMPT', CONFIG, { timeoutMs: 10_000 }, seams);
+    child?.emit('close');
+    expect((await p2).failKind).toBeUndefined();
+    expect(spawns()).toBe(before + 2);
+  });
+
+  it('a transient that died LATE (past the fast-fail bound) is named but not retried', async () => {
+    const before = spawns();
+    const p = runCodexReview('PROMPT', CONFIG, { timeoutMs: 10_000 }, { ...seams, fastFailMs: 0 });
+    child?.stdout.emit('data', Buffer.from(TURN_FAILED_429));
+    child?.emit('close');
+    const result = await p;
+    expect(spawns()).toBe(before + 1);
+    expect(result.failKind).toBe('transient-api');
+    expect(result.failWhy).toBe('codex API error: exceeded retry limit, last status: 429 Too Many Requests');
   });
 });

@@ -313,3 +313,70 @@ describe('a seat persists its run diagnostics and progress stream beside the rep
     expect(seat.review.diagnostics).not.toHaveProperty('preflightWarnings');
   });
 });
+
+// AN API-NAMED DEATH IS NOT SANDBOX BREAKAGE (run 2026-10-14-11-08-56-90dbf6a6): the adapter already
+// retried a burst 429 on the worktree; the packet re-run met the same limit 5 s later.
+describe('a worktree failure the adapter NAMED (transient 429 / usage limit) does NOT fall back to the packet', () => {
+  const named = (failKind: CodexReviewResult['failKind'], failWhy: string): CodexReviewResult => ({
+    failKind,
+    failWhy,
+    ok: false,
+    raw: null,
+    stderrTail: 'Reading additional input from stdin...',
+    timedOut: false,
+  });
+
+  it('a transient API error stands failed on worktree evidence with the real cause in the trail', async () => {
+    const { adapter, calls } = stubAdapter([named('transient-api', 'codex API error: exceeded retry limit, last status: 429 Too Many Requests (after 3 attempts)'), reviewed()]);
+    const logged: string[] = [];
+    const seat = await runCoreSeat({
+      ...base,
+      adapter,
+      log: (m) => logged.push(m),
+      out,
+      qualification: { profile: CODEX_SANDBOX_PROFILE, qualified: true, reason: null },
+      retryOnPacket: RETRIES_ON_PACKET.codex,
+      reviewer: CODEX,
+      worktree: '/tmp/wt',
+    });
+    expect(calls).toHaveLength(1);
+    expect(seat.realized).toBe('worktree');
+    expect(seat.fallbackReason).toBeNull();
+    expect(seat.review.terminalState).toBe('failed-reviewer');
+    expect(seat.review.summary).toContain('429 Too Many Requests');
+    expect(seat.review.summary).not.toContain('stdin');
+    expect(logged.join('\n')).toContain('no packet re-run');
+  });
+
+  it("the operator's usage limit stands the same way", async () => {
+    const { adapter, calls } = stubAdapter([named('usage-limit', 'operator usage limit reached — try again at 17:10'), reviewed()]);
+    const seat = await runCoreSeat({
+      ...base,
+      adapter,
+      out,
+      qualification: { profile: CODEX_SANDBOX_PROFILE, qualified: true, reason: null },
+      retryOnPacket: RETRIES_ON_PACKET.codex,
+      reviewer: CODEX,
+      worktree: '/tmp/wt',
+    });
+    expect(calls).toHaveLength(1);
+    expect(seat.realized).toBe('worktree');
+    expect(seat.review.summary).toContain('operator usage limit reached');
+  });
+
+  it('a genuine sandbox failure still falls back, and a named non-transient cause rides the reason', async () => {
+    const { adapter, calls } = stubAdapter([named('api-error', 'codex API error: unauthorized'), reviewed()]);
+    const seat = await runCoreSeat({
+      ...base,
+      adapter,
+      out,
+      qualification: { profile: CODEX_SANDBOX_PROFILE, qualified: true, reason: null },
+      retryOnPacket: RETRIES_ON_PACKET.codex,
+      reviewer: CODEX,
+      worktree: '/tmp/wt',
+    });
+    expect(calls).toHaveLength(2);
+    expect(seat.realized).toBe('packet');
+    expect(seat.fallbackReason).toContain('codex API error: unauthorized');
+  });
+});
