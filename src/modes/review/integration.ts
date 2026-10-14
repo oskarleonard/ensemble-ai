@@ -4,6 +4,7 @@ import {
   conventionsFileClause,
   readOnlyWorktreeClause,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
+  directiveClause,
 } from './worktree';
 
 // THE INTEGRATION SEAT (2026-10-10 architecture review, item 5): the reviewer whose job is the
@@ -26,6 +27,8 @@ const SCHEMA_BLOCK = `{"summary":"<one sentence: what you checked across the par
 export interface IntegrationPromptArgs {
   baseSha: string;
   conventionsPath?: string;
+  // The author's stated intent — the PR title + body (worktree.ts directiveClause). Omitted ⇒ no section.
+  directive?: string;
   headSha: string;
   history?: boolean;
   // The change listing: every part and its files, every omitted file (chunks.ts renderLensScope).
@@ -55,7 +58,7 @@ ${args.scope}
 
 ## The whole change as a skeleton
 
-${args.skeleton}
+${args.skeleton}${args.directive ? directiveClause(args.directive) : ''}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${args.conventionsPath ? conventionsFileClause(args.conventionsPath) : ''}${history}
 

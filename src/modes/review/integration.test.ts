@@ -19,3 +19,12 @@ describe('renderIntegrationPrompt — the seams reviewer', () => {
     expect(renderIntegrationPrompt({ ...base, conventionsPath: '/tmp/wt/.ensemble-conventions/CONVENTIONS.md' })).toContain('/tmp/wt/.ensemble-conventions/CONVENTIONS.md');
   });
 });
+
+describe('renderIntegrationPrompt — the stated intent', () => {
+  it('renders the hedged section only when a directive is passed', () => {
+    const base = { baseSha: 'b'.repeat(40), headSha: 'h'.repeat(40), scope: 'part 1', skeleton: '### a.go', worktree: '/tmp/wt' };
+    expect(renderIntegrationPrompt({ ...base, directive: 'Rename A to B everywhere.' })).toContain('Rename A to B everywhere.');
+    expect(renderIntegrationPrompt({ ...base, directive: 'Rename A to B everywhere.' })).toContain("## The author's stated intent");
+    expect(renderIntegrationPrompt(base)).not.toContain("## The author's stated intent");
+  });
+});

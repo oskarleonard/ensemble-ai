@@ -1719,6 +1719,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       ...(ciEvidenceUnavailable ? { ciEvidenceUnavailable } : {}),
       claudeConfig: anthropicSeats.claude.config,
       ...(ready.conventionsPath ? { conventionsPath: ready.conventionsPath } : {}),
+      ...(directive ? { directive } : {}),
       expectedHeadSha: ready.headSha,
       ...(historyPacket ? { historyPacket } : {}),
       includeClaudeReviewer: true,
@@ -1737,6 +1738,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       lensStage = runHolisticStage({
         baseDir: out,
         ...(ready.conventionsPath ? { conventionsPath: ready.conventionsPath } : {}),
+        ...(directive ? { directive } : {}),
         expectedHeadSha: ready.headSha,
         ...(historyPacket ? { historyPacket } : {}),
         holistic: {
@@ -1763,6 +1765,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         baseSha: stageBaseSha,
         config: anthropicSeats.claude.config,
         ...(ready.conventionsPath ? { conventionsPath: ready.conventionsPath } : {}),
+        ...(directive ? { directive } : {}),
         expectedHeadSha: ready.headSha,
         ...(historyPacket ? { historyPacket } : {}),
         log,
@@ -1894,6 +1897,11 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         // lift its MED severity cap (the gate re-reads the citation out of the tree regardless).
         conventionPaths: result.conventionManifest?.files.filter((f) => f.included).map((f) => f.path),
         gateConfig: gateSeat.config,
+        // The conventions file + the author's stated intent reach the GATE through the layer
+        // (self-contained runGate call): the gate's run facts and its stripped-path clause, and
+        // the premise it may test a finding against.
+        ...(result.conventionsPath ? { conventionsPath: result.conventionsPath } : {}),
+        ...(directive ? { directive } : {}),
         coreReviews: result.reviews,
         expectedHeadSha: result.acquired.headSha,
         // The `git log`/`git blame` the fence took away, restored as data in each fenced seat's own

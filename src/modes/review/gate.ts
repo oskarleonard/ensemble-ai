@@ -20,6 +20,7 @@ import {
   windowHunk,
 } from './gate-hunks';
 import { CHUNKS_TRAIL_FILE } from './chunks';
+import { seatDiagnostics } from './seat-run';
 import { readTrailJson } from './trail-io';
 import {
   type FixStatus,
@@ -1230,6 +1231,11 @@ export interface GateRunResult {
 export interface RunGateOptions {
   baseDir: string;
   config: ResolvedVoiceConfig;
+  // The conventions file in the worktree, when the run handed the rules over by path: the gate's
+  // diagnostics record how far it read it, and its prompt names it for stripped-path citations.
+  conventionsPath?: string;
+  // The author's stated intent (PR title + body) — a premise for the judge, never evidence.
+  directive?: string;
   expectedHeadSha: string;
   // The gate's REALIZED evidence (default 'packet'). The gate is an EVIDENCE-BEARING ACTOR, not a
   // neutral judge (gate-r3 pin 1): worktree ⇒ it read the PR head and may emit
@@ -1349,6 +1355,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     }
     const res = await shadowAttempt;
     if ('threw' in res) return stub(`spawn failed (${res.threw.message})`);
+    persistGateTrail(name, res, shadowStartedAt);
     if (res.raw) {
       // Persist the transcript BEFORE parsing, like the primary — an unparseable shadow reply
       // is exactly the one worth reading when judging the challenger.
@@ -1397,6 +1404,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   };
   // Bound to the spawn started below (null until then); finalize settles it on EVERY exit path.
   let shadowAttempt: Promise<VoiceRunResult | { threw: Error }> | null = null;
+  let shadowStartedAt = Date.now();
   // Set when the shadow was requested but deliberately not spawned (packet-fail) — the artifact
   // still lands as a stub so a trail reader never guesses whether the challenger ran.
   let shadowSkipReason: string | null = null;
@@ -1458,14 +1466,37 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // when no clause appeared (codex#f2: opts.premise alone is not proof it fired). Also drives the log.
   const premiseCluster = activePremiseClusters(findings, opts);
   const premiseActive = premiseCluster.length > 0;
-  const prompt = renderGatePrompt(
-    findings,
-    injections,
-    opts.gateEvidence ?? 'packet',
-    // Pass the 4th arg ONLY when premise is on, so the shared prompt (primary + shadow) stays
-    // byte-identical to the 3-arg call on every flag-off run.
-    opts.premise ? { premise: true } : {}
-  );
+  const prompt = renderGatePrompt(findings, injections, opts.gateEvidence ?? 'packet', {
+    // Each key is passed ONLY when set, so the shared prompt (primary + shadow) stays
+    // byte-identical to the 3-arg call on a run with none of them.
+    ...(opts.premise ? { premise: true } : {}),
+    ...(opts.directive ? { directive: opts.directive } : {}),
+    ...(opts.gateEvidence === 'worktree' && opts.conventionsPath ? { conventionsFile: opts.conventionsPath } : {}),
+  });
+  // THE GATE'S RUN FACTS (2026-10-14): timing, usage, tool calls, how far it read the conventions
+  // file, and its bounded stream — persisted beside gate.raw.md as `<prefix>-diagnostics.json` +
+  // `<prefix>-stream.jsonl`, the same facts every other seat leaves (seat-run seatDiagnostics).
+  // Until now no gate, on either vendor, left any: a verdict that said a cited file "was not
+  // found" with the tree open could not be checked. Best-effort, like the transcript: losing the
+  // facts must never cost the verdicts. Returns the diagnostics for the log line.
+  const persistGateTrail = (prefix: string, res: VoiceRunResult, startedAt: number): ReturnType<typeof seatDiagnostics> | null => {
+    try {
+      const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+      writeTrailFile(opts.baseDir, opts.runId, `${prefix}-diagnostics.json`, JSON.stringify(diagnostics, null, 2));
+      if (typeof res.stream === 'string' && res.stream) writeTrailFile(opts.baseDir, opts.runId, `${prefix}-stream.jsonl`, res.stream);
+      return diagnostics;
+    } catch {
+      return null;
+    }
+  };
+  const describeGate = (d: ReturnType<typeof seatDiagnostics>): string =>
+    [
+      `${Math.max(1, Math.round(d.elapsedMs / 60_000))} min`,
+      d.usage?.toolCalls !== undefined ? `${d.usage.toolCalls}${d.usage.streamTruncated ? '+' : ''} tool calls` : null,
+      d.conventions ? `conventions ${d.conventions.state}${d.conventions.docsRead.length ? ` (${d.conventions.docsRead.length} docs)` : ''}` : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
   // A --premise run must not leave the reader guessing whether the clause was appended (claude#f3) —
   // an absent `simplify` otherwise conflates flag-off / no-cluster / cluster-the-gate-declined.
   if (premiseActive) log(`premise pass: ${premiseCluster.length} cluster(s) — advisory clause appended`);
@@ -1484,6 +1515,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
       log(
         `  · shadow gate (${sh.config.id} · ${sh.config.model} @ ${sh.config.effort}) judging the same findings — audit-only, never authoritative…`
       );
+      shadowStartedAt = Date.now();
       shadowAttempt = sh
         .run(prompt, sh.config, {
           timeoutMs: opts.timeoutMs,
@@ -1505,6 +1537,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
       return { threw: e as Error };
     }
   };
+  const gateStartedAt = Date.now();
   let attempt = await spawn();
   // The first attempt's named cause, kept because the SECOND can be the less informative of the
   // two: a bare empty reply after a named 529 would otherwise erase the 529 — the exact
@@ -1542,6 +1575,8 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     );
   }
   const res: VoiceRunResult = attempt;
+  const gateDiagnostics = persistGateTrail('gate', res, gateStartedAt);
+  if (gateDiagnostics) log(`  · gate seat: ${describeGate(gateDiagnostics)}`);
   if (!res.raw || res.timedOut) {
     // The RUNNER already named the cause — a persistent transient API error, an operator usage
     // limit, an error result, a wedged seat reclaimed by the liveness watchdog. Collapsing all of

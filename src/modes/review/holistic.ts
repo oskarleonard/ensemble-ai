@@ -18,6 +18,7 @@ import {
   readOnlyWorktreeClause,
   UNTRUSTED_INSTRUCTIONS_CLAUSE,
   conventionsFileClause,
+  directiveClause,
 } from './worktree';
 
 // THE HOLISTIC / ARCHITECTURE LENS (spec §4) — a SEAT in the registry, not a parallel pipeline
@@ -199,6 +200,9 @@ export interface HolisticPromptArgs {
   // the gathered rules over by path — CONVENTION DRIFT is one of the three classes this lens
   // reports, and until now it had no conventions text at all. Omitted ⇒ no clause.
   conventionsPath?: string;
+  // The author's stated intent — the PR title + body (worktree.ts directiveClause). Omitted ⇒
+  // no section. A deliberate replacement reads as deliberate instead of as a reinvention.
+  directive?: string;
   // The change-scope note when the change was reviewed in PARTS (./chunks renderLensScope): the
   // lens is handed as much of the diff as one packet holds and told, file by file, what else the
   // PR changes. Omitted ⇒ the diff IS the whole change, as before.
@@ -226,7 +230,7 @@ network: there is no Bash tool, so do not try to run \`git\` or any command.
 
 ${readOnlyWorktreeClause({ headSha: args.headSha, reach: 'search and read it', worktree: args.worktree })}
 
-${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...(args.scope ? { scope: args.scope } : {}) })}${args.skeleton ? `\n\n## The whole change as a skeleton\n\nEvery changed file with the declarations its hunks add (+) and remove (−), at the PR head — including the parts whose hunks are not materialized above. Open a file for anything below signature level.\n\n${args.skeleton}` : ''}
+${materializedDiffClause({ baseSha: args.baseSha, diff: args.diff, headSha: args.headSha, ...(args.scope ? { scope: args.scope } : {}) })}${args.skeleton ? `\n\n## The whole change as a skeleton\n\nEvery changed file with the declarations its hunks add (+) and remove (−), at the PR head — including the parts whose hunks are not materialized above. Open a file for anything below signature level.\n\n${args.skeleton}` : ''}${args.directive ? directiveClause(args.directive) : ''}
 
 ${UNTRUSTED_INSTRUCTIONS_CLAUSE}${companionsClause()}${args.conventionsPath ? conventionsFileClause(args.conventionsPath) : ''}${history}
 
@@ -291,6 +295,8 @@ export interface RunHolisticLensOptions {
   run: HolisticRunner;
   // The conventions file in the worktree (HolisticPromptArgs.conventionsPath).
   conventionsPath?: string;
+  // The author's stated intent (HolisticPromptArgs.directive).
+  directive?: string;
   // The change-scope note for a review in parts (HolisticPromptArgs.scope).
   scope?: string;
   // The whole-change skeleton for a review in parts (HolisticPromptArgs.skeleton).
@@ -314,6 +320,7 @@ export async function runHolisticLens(
     headSha: opts.headSha,
     history: hasHistory,
     ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
+    ...(opts.directive ? { directive: opts.directive } : {}),
     ...(opts.scope ? { scope: opts.scope } : {}),
     ...(opts.skeleton ? { skeleton: opts.skeleton } : {}),
     worktree: opts.worktree,

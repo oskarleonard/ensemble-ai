@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { COLD_PEER_ROLE, renderCodeReviewSeatPrompt } from './code-review-seat';
+import { DIRECTIVE_CLAUSE_BUDGET, directiveClause } from './worktree';
 
 const args = {
   baseSha: 'b'.repeat(40),
@@ -34,7 +35,12 @@ describe('the one Claude producer — /code-review methodology seat', () => {
     expect(prompt).toContain('SELF-CHECK every candidate finding');
   });
 
-  it('runs the five miss-class hunts human reviewers proved seats skip (incidents 2026-08-10 + 2026-09-02)', () => {
+  it('runs the six miss-class hunts human reviewers proved seats skip (incidents 2026-08-10, 2026-09-02, 2026-10-14)', () => {
+    // incident 2026-10-14: one shared OpenAPI 404 description edited in place — 139 operations
+    // reference it, 4 of them admin-key where the new text is false; no seat asked who uses it.
+    expect(prompt).toContain('SHARED-DEFINITION BLAST RADIUS');
+    expect(prompt).toMatch(/Enumerate EVERY reference/);
+    expect(prompt).toMatch(/under each\s+site's own auth or role model/);
     expect(prompt).toContain('NEW GUARD, EVERY ROUTE');
     expect(prompt).toContain('CALLER CENSUS');
     expect(prompt).toContain('TEST EFFECTIVENESS');
@@ -58,6 +64,10 @@ describe('the one Claude producer — /code-review methodology seat', () => {
     expect(prompt).toContain('CLAIM VS PRACTICE');
     expect(prompt).toMatch(/scripts, runbooks, CI\/deploy config/);
     expect(prompt).toMatch(/prove a convention was copied, not that anyone performs it/);
+    // incident 2026-10-14: the PR text promised 403 for "suspended"; no code writes that status —
+    // the Suspend action writes "deactivated", which the new rule mapped to 404.
+    expect(prompt).toMatch(/The PR's OWN text gets the same test/);
+    expect(prompt).toMatch(/grep what actually WRITES that value/);
   });
 
   it('forbids arguing away execution-decidable findings — report them and name the settling command', () => {
@@ -167,5 +177,27 @@ describe('the one Claude producer — /code-review methodology seat', () => {
     // Still no shell: the history is READ, never produced.
     expect(withHistory).toMatch(/do not try to run `git`/);
     expect(withHistory).not.toMatch(/\brun `?git log\b/i);
+  });
+});
+
+// THE AUTHOR'S STATED INTENT reaches the /code-review seat (2026-10-14, run 28b174b3): the packet
+// seats carried the PR body since the directive slot shipped; this seat — the one that found
+// anything on that run — reviewed with none, and never saw "no code sets a member to `suspended`".
+describe('the stated intent (PR title + body) is handed to the seat as a hedged premise', () => {
+  it('renders the section when a directive is passed, and nothing when it is absent', () => {
+    const withIntent = renderCodeReviewSeatPrompt({ ...args, directive: 'Title\n\nNo code sets a member to suspended today.' });
+    expect(withIntent).toContain("## The author's stated intent (PR title + description)");
+    expect(withIntent).toContain('No code sets a member to suspended today.');
+    expect(withIntent).toMatch(/is a PREMISE to check against the tree, never evidence/);
+    expect(renderCodeReviewSeatPrompt(args)).not.toContain("## The author's stated intent");
+    expect(renderCodeReviewSeatPrompt({ ...args, directive: '   ' })).not.toContain("## The author's stated intent");
+  });
+
+  it('is bounded, and a cut is NAMED rather than silent', () => {
+    const long = 'x'.repeat(DIRECTIVE_CLAUSE_BUDGET + 500);
+    const clause = directiveClause(long);
+    expect(clause).toContain(`… [cut at ${DIRECTIVE_CLAUSE_BUDGET} chars of ${long.length}]`);
+    expect(clause.length).toBeLessThan(long.length);
+    expect(directiveClause('short')).not.toContain('[cut at');
   });
 });

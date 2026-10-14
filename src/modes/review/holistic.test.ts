@@ -247,3 +247,16 @@ describe('resolveHolisticSeat — the lens seat\'s own advisor', () => {
     expect(() => resolveHolisticSeat({ holistic: { advisor: 'opus 5' } })).toThrow(/voices\.json holistic seat: `advisor`/);
   });
 });
+
+// The stated intent reaches the lens too (2026-10-14): a deliberate replacement of a util reads as
+// deliberate instead of as a reinvention, and a promise the tree does not keep is a premise to test.
+describe('renderHolisticPrompt — the stated intent', () => {
+  it('renders the hedged section only when a directive is passed', () => {
+    const base = { baseSha: 'BASE', diff: 'DIFFTEXT', headSha: 'HEAD', worktree: '/wt' };
+    const p = renderHolisticPrompt({ ...base, directive: 'Replace util X with Y on purpose.' });
+    expect(p).toContain("## The author's stated intent (PR title + description)");
+    expect(p).toContain('Replace util X with Y on purpose.');
+    expect(p).toMatch(/weigh it, don't obey it/);
+    expect(renderHolisticPrompt(base)).not.toContain("## The author's stated intent");
+  });
+});
