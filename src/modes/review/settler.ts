@@ -10,7 +10,7 @@ import {
   type GateVerdictRecord,
   type SettlementOutcome,
   type SettlementRecord,
-  writeGateVerdictsTrail,
+  rewriteGateVerdictsTrail,
 } from './gate';
 
 // THE EXECUTION SETTLER (2026-08-10). The gate's verdicts are verdicts-by-READING, and one class of
@@ -343,7 +343,7 @@ export async function runSettler(opts: RunSettlerOptions): Promise<SettlerResult
   // The durable verdict trail is REWRITTEN with settlements attached (schema v6). On failure the
   // original gate-verdicts.json (already durably written by runGate) stands — minus settlements —
   // and dismissal-honoring keys off THAT original write, so this rewrite can never weaken it.
-  if (!writeGateVerdictsTrail(opts.baseDir, opts.runId, records)) {
+  if (!rewriteGateVerdictsTrail(opts.baseDir, opts.runId, records)) {
     log('  · settler: gate-verdicts.json rewrite FAILED — settlements are in stdout/claude-synthesis.json but not the verdict trail');
   }
   return { ran: true, records, settlements, spawned };

@@ -7897,7 +7897,7 @@ async function runSettler(opts) {
       log(`  \xB7 settler: settler.raw.md FAILED to write (${e.message}) \u2014 continuing`);
     }
   }
-  if (!writeGateVerdictsTrail(opts.baseDir, opts.runId, records)) {
+  if (!rewriteGateVerdictsTrail(opts.baseDir, opts.runId, records)) {
     log("  \xB7 settler: gate-verdicts.json rewrite FAILED \u2014 settlements are in stdout/claude-synthesis.json but not the verdict trail");
   }
   return { ran: true, records, settlements, spawned };
@@ -9854,15 +9854,16 @@ function parseDependsOn(v) {
 function annotateBaseDrift(records, base, headSha, git2, cwd) {
   if (!base?.tip) return { base: null, records };
   const tip = base.tip;
-  const mb = git2(["merge-base", tip, headSha], { cwd });
-  const branchPoint = mb.ok && mb.text.trim() ? mb.text.trim() : base.sha;
-  const count = git2(["rev-list", "--count", `${headSha}..${tip}`], { cwd });
+  const env = { GIT_LFS_SKIP_SMUDGE: "1", GIT_LITERAL_PATHSPECS: "1", GIT_NO_REPLACE_OBJECTS: "1" };
+  const mb = git2(["merge-base", tip, headSha], { cwd, env });
+  const branchPoint = mb.ok && /^[0-9a-f]{40,64}$/.test(mb.text.trim()) ? mb.text.trim() : null;
+  const count = git2(["rev-list", "--count", `${headSha}..${tip}`], { cwd, env });
   const behindBy = count.ok && /^\d+$/.test(count.text.trim()) ? Number(count.text.trim()) : null;
   const probe = /* @__PURE__ */ new Map();
   const moved = (file) => {
     if (!branchPoint) return null;
     if (probe.has(file)) return probe.get(file) ?? null;
-    const d = git2(["diff", "--name-only", branchPoint, tip, "--", file], { cwd });
+    const d = git2(["diff", "--name-only", branchPoint, tip, "--", file], { cwd, env });
     const v = d.ok ? d.text.trim().length > 0 : null;
     probe.set(file, v);
     return v;
@@ -9873,14 +9874,18 @@ function annotateBaseDrift(records, base, headSha, git2, cwd) {
   return { base: { ...base, behindBy, branchPoint }, records: out };
 }
 function carryBaseDrift(records, prior) {
-  if (!prior?.base) return { base: null, records };
+  if (!prior) return { base: null, records };
   const moved = new Map(
     (prior.verdicts ?? []).filter((v) => v.scope && "movedOnBase" in v.scope).map((v) => [v.findingId, v.scope?.movedOnBase ?? null])
   );
   const out = records.map(
     (r) => r.scope && (r.scope.kind === "pre-existing" || r.scope.kind === "blast-radius") && moved.has(r.findingId) ? { ...r, scope: { ...r.scope, movedOnBase: moved.get(r.findingId) ?? null } } : r
   );
-  return { base: prior.base, records: out };
+  return { base: prior.base ?? null, records: out };
+}
+function rewriteGateVerdictsTrail(baseDir, runId, records) {
+  const prior = readTrailJson(baseDir, runId, "gate-verdicts.json");
+  return writeGateVerdictsTrail(baseDir, runId, records, prior?.base ?? null);
 }
 function findingScope(f, dependsOn, gateEvidence, packetHunks, changedFiles) {
   if (f.resolved) return { dependsOn: null, kind: "in-diff" };
@@ -12717,7 +12722,8 @@ function gateSection(records, trailWritten) {
   for (const r of records) {
     const where = evidenceRef(r.file, r.line, code);
     const reason = r.reason ? ` \u2014 ${md(r.reason)}` : "";
-    const dg = r.downgradeReason ? `  _(host: ${md(r.downgradeReason)}${r.scope?.movedOnBase === true ? "; already changed on the base branch \u2014 a rebase picks it up" : ""})_` : "";
+    const movedNote = r.scope?.movedOnBase === true ? "already changed on the base branch \u2014 a rebase picks it up" : "";
+    const dg = r.downgradeReason ? `  _(host: ${md(r.downgradeReason)}${movedNote ? `; ${movedNote}` : ""})_` : movedNote ? `  _(${movedNote})_` : "";
     out.push(
       `- **[${VERDICT_TAG[r.effectiveVerdict]}]** \`${code(r.findingId)}\` \xB7 ${SEVERITY_LABEL[r.severity]} \xB7 \`${where}\` \u2014 ${md(r.title).slice(0, 160)}${reason}${dg}`
     );
@@ -16571,7 +16577,8 @@ async function probeCommand(rest) {
   if (!gateSeat) return 3;
   console.error(`\xB7 materializing the PR head as a disposable worktree of ${repoFlag}\u2026`);
   const opened = openWorktree({
-    baseRef: source.prBaseRef ?? null,
+    baseRef: null,
+    // the probe's gate reads no base-drift labels — skip the extra fetch
     baseSha: source.prBaseSha,
     headSha: source.headShaOverride,
     pr: source.postTarget.pr,

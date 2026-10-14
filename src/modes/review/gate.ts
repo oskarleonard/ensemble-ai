@@ -617,15 +617,21 @@ export function annotateBaseDrift(
 ): { records: GateVerdictRecord[]; base: GateBaseTrail | null } {
   if (!base?.tip) return { base: null, records };
   const tip = base.tip;
-  const mb = git(['merge-base', tip, headSha], { cwd });
-  const branchPoint = mb.ok && mb.text.trim() ? mb.text.trim() : base.sha;
-  const count = git(['rev-list', '--count', `${headSha}..${tip}`], { cwd });
+  // Probes run with LITERAL pathspecs: `file` is the reviewer's cite (an unresolved one, by
+  // definition of pre-existing), and `--` stops options but not pathspec magic (`:!x`, globs) that
+  // would match other files and mint a false "moved". Same inert posture as the fetches.
+  const env = { GIT_LFS_SKIP_SMUDGE: '1', GIT_LITERAL_PATHSPECS: '1', GIT_NO_REPLACE_OBJECTS: '1' };
+  const mb = git(['merge-base', tip, headSha], { cwd, env });
+  // No branch point ⇒ no labels (null), never a guess: GitHub's base.sha is the tip at the PR's
+  // last sync, and diffing from it reads "not moved" on exactly the incident shape.
+  const branchPoint = mb.ok && /^[0-9a-f]{40,64}$/.test(mb.text.trim()) ? mb.text.trim() : null;
+  const count = git(['rev-list', '--count', `${headSha}..${tip}`], { cwd, env });
   const behindBy = count.ok && /^\d+$/.test(count.text.trim()) ? Number(count.text.trim()) : null;
   const probe = new Map<string, boolean | null>();
   const moved = (file: string): boolean | null => {
     if (!branchPoint) return null;
     if (probe.has(file)) return probe.get(file) ?? null;
-    const d = git(['diff', '--name-only', branchPoint, tip, '--', file], { cwd });
+    const d = git(['diff', '--name-only', branchPoint, tip, '--', file], { cwd, env });
     const v = d.ok ? d.text.trim().length > 0 : null;
     probe.set(file, v);
     return v;
@@ -640,12 +646,13 @@ export function annotateBaseDrift(
 
 // A regate re-materializes the HEAD, which has not changed; the base has. Recomputing drift would
 // relabel review-time verdicts with post-review facts, so a regate carries the prior trail's
-// `movedOnBase` per finding and its `base` block forward verbatim.
+// `movedOnBase` per finding and its `base` block forward verbatim. The labels carry even when the
+// prior trail lost its `base` block (an older rewrite path): a label is a per-record fact.
 export function carryBaseDrift(
   records: GateVerdictRecord[],
   prior: { base?: GateBaseTrail | null; verdicts?: { findingId: string; scope?: { movedOnBase?: boolean | null } }[] } | null | undefined
 ): { records: GateVerdictRecord[]; base: GateBaseTrail | null } {
-  if (!prior?.base) return { base: null, records };
+  if (!prior) return { base: null, records };
   const moved = new Map(
     (prior.verdicts ?? [])
       .filter((v) => v.scope && 'movedOnBase' in v.scope)
@@ -656,7 +663,15 @@ export function carryBaseDrift(
       ? { ...r, scope: { ...r.scope, movedOnBase: moved.get(r.findingId) ?? null } }
       : r
   );
-  return { base: prior.base, records: out };
+  return { base: prior.base ?? null, records: out };
+}
+
+// Rewrite the trail with updated records (the settler attaches settlements) WITHOUT losing the
+// run-level `base` block the gate wrote — a plain writeGateVerdictsTrail(records) would drop it,
+// and a later regate would then find no base and strip every drift label.
+export function rewriteGateVerdictsTrail(baseDir: string, runId: string, records: GateVerdictRecord[]): boolean {
+  const prior = readTrailJson<{ base?: GateBaseTrail | null }>(baseDir, runId, 'gate-verdicts.json');
+  return writeGateVerdictsTrail(baseDir, runId, records, prior?.base ?? null);
 }
 
 // Decide a finding's scope DETERMINISTICALLY from host-owned facts: whether its own cite resolved

@@ -4361,7 +4361,7 @@ async function probeCommand(rest: string[]): Promise<number> {
 
   console.error(`· materializing the PR head as a disposable worktree of ${repoFlag}…`);
   const opened = openWorktree({
-    baseRef: source.prBaseRef ?? null,
+    baseRef: null, // the probe's gate reads no base-drift labels — skip the extra fetch
     baseSha: source.prBaseSha,
     headSha: source.headShaOverride,
     pr: source.postTarget.pr,

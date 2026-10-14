@@ -1,16 +1,20 @@
 import { describe, expect, it } from 'vitest';
 
-import { type GateVerdictRecord, annotateBaseDrift, carryBaseDrift } from './gate';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { type GateVerdictRecord, annotateBaseDrift, carryBaseDrift, rewriteGateVerdictsTrail, writeGateVerdictsTrail } from './gate';
 import type { GitRun } from './worktree';
 
 // Base drift (trail v12): a label, never a verdict. The branch point is computed locally
 // (`merge-base <tip> <head>`), because the host's base sha is the tip at the PR's last sync and
 // reads "not moved" on exactly the incident shape (author pushed after a teammate's merge).
 
-const HEAD = 'h'.repeat(40);
-const TIP = 't'.repeat(40);
-const SYNC = 's'.repeat(40);
-const POINT = 'p'.repeat(40);
+const HEAD = 'a'.repeat(40);
+const TIP = 'b'.repeat(40);
+const SYNC = 'c'.repeat(40);
+const POINT = 'd'.repeat(40);
 
 function rec(over: Partial<GateVerdictRecord>): GateVerdictRecord {
   return {
@@ -76,11 +80,24 @@ describe('annotateBaseDrift', () => {
     expect(annotateBaseDrift([rec({})], { ref: 'b', sha: SYNC, tip: TIP }, HEAD, failing.git, '/wt').records[0].scope?.movedOnBase).toBeNull();
   });
 
-  it('falls back to the host base sha as the branch point when merge-base fails', () => {
-    const { calls, git } = stubGit(new Set(), { failMergeBase: true });
-    const { base } = annotateBaseDrift([rec({})], { ref: 'b', sha: SYNC, tip: TIP }, HEAD, git, '/wt');
-    expect(base?.branchPoint).toBe(SYNC);
-    expect(calls.find((c) => c[0] === 'diff')![2]).toBe(SYNC);
+  it('no branch point (merge-base fails) ⇒ labels null, never a guess from the host base sha', () => {
+    const { calls, git } = stubGit(new Set(['src/untouched.ts']), { failMergeBase: true });
+    const { base, records } = annotateBaseDrift([rec({})], { ref: 'b', sha: SYNC, tip: TIP }, HEAD, git, '/wt');
+    expect(base?.branchPoint).toBeNull();
+    expect(records[0].scope?.movedOnBase).toBeNull();
+    expect(calls.find((c) => c[0] === 'diff')).toBeUndefined();
+  });
+
+  it('probes run with literal pathspecs and the inert env (a reviewer cite is never pathspec magic)', () => {
+    const seen: Record<string, string>[] = [];
+    const git: GitRun = (args, opts) => {
+      seen.push(opts?.env ?? {});
+      if (args[0] === 'merge-base') return { ok: true, text: `${POINT}\n` };
+      if (args[0] === 'rev-list') return { ok: true, text: '1\n' };
+      return { ok: true, text: '' };
+    };
+    annotateBaseDrift([rec({ file: ':!src/other.ts' })], { ref: 'b', sha: SYNC, tip: TIP }, HEAD, git, '/wt');
+    expect(seen.every((e) => e.GIT_LITERAL_PATHSPECS === '1' && e.GIT_NO_REPLACE_OBJECTS === '1')).toBe(true);
   });
 
   it('touches only pre-existing and blast-radius records; no tip ⇒ nothing', () => {
@@ -112,6 +129,23 @@ describe('carryBaseDrift — a regate reuses review-time facts', () => {
     expect(records[0].scope?.movedOnBase).toBe(true);
     expect(records[1].scope).toEqual({ dependsOn: null, kind: 'pre-existing' }); // unknown id: untouched
     expect(carryBaseDrift([rec({})], null).base).toBeNull();
-    expect(carryBaseDrift([rec({})], { base: null }).records[0].scope?.movedOnBase).toBeUndefined();
+    // A prior trail that lost its base block (an older rewrite) still carries per-record labels.
+    const noBase = carryBaseDrift([rec({})], { base: null, verdicts: [{ findingId: 'codex#1', scope: { movedOnBase: true } }] });
+    expect(noBase.base).toBeNull();
+    expect(noBase.records[0].scope?.movedOnBase).toBe(true);
+  });
+});
+
+
+describe('rewriteGateVerdictsTrail — the settler rewrite keeps the base block', () => {
+  it('a records-only rewrite still carries the base block the gate wrote', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-drift-'));
+    const base = { behindBy: 2, branchPoint: POINT, ref: 'b', sha: SYNC, tip: TIP };
+    expect(writeGateVerdictsTrail(dir, 'run-1', [rec({})], base)).toBe(true);
+    expect(rewriteGateVerdictsTrail(dir, 'run-1', [rec({ findingId: 'codex#1', reason: 'settled' })])).toBe(true);
+    const trail = JSON.parse(fs.readFileSync(path.join(dir, 'run-1', 'gate-verdicts.json'), 'utf8'));
+    expect(trail.base).toEqual(base);
+    expect(trail.verdicts[0].reason).toBe('settled');
+    fs.rmSync(dir, { force: true, recursive: true });
   });
 });
