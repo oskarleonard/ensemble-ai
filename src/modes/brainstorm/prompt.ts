@@ -1,4 +1,5 @@
 import type { Idea, VoiceCritiqueResult } from './types';
+import { LEAD_FIELD_DOC } from '../../core/lead-contract';
 
 // A stateless voice (no memory of the topic, the repo, or the other voices) has
 // ONLY this prompt text — so every round embeds exactly what the voice may see, and
@@ -166,6 +167,7 @@ ${JSON_RULE}
   "ranked": [
     {
       "title": "<short>",
+      "lead": "<the plain-language line — see below>",
       "why": "<why this ranks here>",
       "contributors": ["codex", "grok"],
       "risks": "<the main risk, or omit>"
@@ -174,5 +176,6 @@ ${JSON_RULE}
 }
 Rank best-first. Merge duplicates into one entry crediting all contributors. Prefer
 a tight ranked list of the genuinely strong ideas over a long one.
+${LEAD_FIELD_DOC}
 `;
 }

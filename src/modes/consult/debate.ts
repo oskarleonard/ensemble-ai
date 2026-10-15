@@ -1,4 +1,5 @@
 import { extractJsonBlock, oneOf } from '../../core/findings';
+import { LEAD_FIELD_DOC, capLead } from '../../core/lead-contract';
 
 import { cap, contextBlock, JSON_RULE } from './prompt';
 import {
@@ -254,12 +255,16 @@ ${JSON_RULE}
       "direction": "<settled/converged: the position that stands, and whose · judgement: the trade-off · unverified: the unchecked fact>",
       "why": "<the ruling's reason, resting on the evidence>",
       "evidenceCited": ["<voice>: <source>"],
+      "lead": "<the plain-language line: the question in plain words, then how you ruled — see below>",
       "whatWouldSettle": "<unverified only: the data, test or author's answer that would settle it>",
       "defaultIfUndecided": "<judgement/unverified: the default to take if the human does not decide>"
     }
   ],
   "recommendation": "<verdict sentence(s)\\n\\n1. <action or blocker>\\n2. …\\n\\n<how confident, given what is settled vs still a judgement call>"
 }
+In the recommendation's numbered list, prefix every item that must be fixed BEFORE the work
+proceeds with "BLOCKER: " — and nothing else with it; a reader counts the blockers.
+${LEAD_FIELD_DOC}
 Cover every split id. Keep the agreements as they are — they were not in dispute.
 `;
 }
@@ -373,10 +378,12 @@ export function parseJudgeReply(raw: string, splitIds: readonly string[]): Parse
       const evidenceCited = strList(r.evidenceCited);
       const whatWouldSettle = str(r.whatWouldSettle);
       const defaultIfUndecided = str(r.defaultIfUndecided);
+      const lead = capLead(r.lead);
       rulings.push({
         ...(defaultIfUndecided ? { defaultIfUndecided } : {}),
         direction,
         evidenceCited,
+        ...(lead ? { lead } : {}),
         // A "settled" ruling that cites nothing is the taste call the prompt forbids — it is a
         // judgement call for the reader, and the UI says so.
         outcome: outcome === 'settled' && evidenceCited.length === 0 ? 'judgement' : outcome,
