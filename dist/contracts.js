@@ -208,9 +208,9 @@ function extractJsonBlock(raw) {
     } catch {
     }
   }
-  for (const c of candidates) {
+  if (fenced) {
     try {
-      return JSON.parse(stripTrailingCommas(repairBrackets(escapeRawNewlinesInStrings(c))));
+      return JSON.parse(stripTrailingCommas(repairBrackets(escapeRawNewlinesInStrings(fenced))));
     } catch {
     }
   }

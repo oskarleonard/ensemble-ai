@@ -105,6 +105,7 @@ import { REVIEW_ADAPTERS } from './reviewers/registry';
 import { readGatePacketHeadSha } from './modes/review/gate-hunks';
 import { type GateSeat, loadClaudeReviewerSeat, loadGateSeat, shadowChampionConfig } from './modes/review/gate-seat';
 import { readConventionPathsFromTrail, runRegate } from './modes/review/regate';
+import { checkReparse, isReparseSeat, type ReparseSeat, runReparseSeat } from './modes/review/reparse-seat';
 import { checkReseat, ReseatLockedError, reseatRefusal, runReseat } from './modes/review/reseat';
 import { loadHolisticSeat } from './modes/review/holistic';
 import {
@@ -3985,7 +3986,7 @@ what every seat saw — then re-runs the gate over the union of all persisted vo
 gate-verdicts.json + claude-synthesis.json in place. No other seat is re-billed.
 
 Usage:
-  ensemble-ai reseat [<pr-url>] --out <dir> --run-id <id> --seat <codex|grok>
+  ensemble-ai reseat [<pr-url>] --out <dir> --run-id <id> --seat <codex|grok|claude>
                      [--repo <path>] [--gate-model <m>] [--gate-effort <e>]
                      [--reviewers-file <p>] [--sandbox <profile>] [--premise]
 
@@ -3993,9 +3994,14 @@ Usage:
                     --repo (the worktree re-materialization fetches pull/<N>/head)
   --out <dir>       the trail base the original run wrote (its <run-id>/ dir lives here)
   --run-id <id>     the original run's id
-  --seat <id>       the FAILED core seat to re-run. A seat that completed is refused —
-                    re-running a healthy seat is a new review. \`claude\` is not supported yet
-                    (the producer runs inside the claude layer; re-fire the review instead)
+  --seat <id>       the FAILED seat to heal. A seat that completed is refused — re-running a
+                    healthy seat is a new review. codex|grok are RE-RUN against the pinned
+                    packet. \`claude\` is RE-READ, never re-spawned: its persisted reply
+                    (claude-review.raw.md) is parsed again by THIS engine — the cure for a reply
+                    the parser of the day could not read (a stray bracket) — then the union is
+                    regated; nothing is billed but the gate. A claude reply that still does not
+                    parse, was cut off, or came in parts is refused (exit 3): the producer has no
+                    pinned prompt on disk, so re-fire the review instead
   --repo <path>     local clone of the PR's repo — re-materializes the head read-only so the
                     seat (when its sandbox qualifies) and the gate are evidence-bearing.
                     Unavailable/failed → LOUD fallback: the seat AND the regate of the WHOLE
@@ -4060,11 +4066,13 @@ async function reseatCommand(args: string[]): Promise<number> {
     console.error(RESEAT_USAGE);
     return 3;
   }
+  // The producer seat has no pinned prompt on disk, so it cannot be re-run from the trail — its
+  // heal is a RE-READ of the persisted reply (modes/review/reparse-seat.ts), and a reply this
+  // engine still cannot read is refused rather than re-spawned.
+  if (isReparseSeat(seatRaw)) return reparseSeatCommand(seatRaw, values, positionals);
   if (!isCoreReviewerId(seatRaw)) {
     console.error(
-      seatRaw === 'claude'
-        ? 'ensemble-ai reseat: --seat claude is not supported yet — the producer runs inside the claude layer; re-fire the review instead'
-        : `ensemble-ai reseat: --seat "${seatRaw}" — expected one of ${CORE_REVIEWER_IDS.join(', ')}`
+      `ensemble-ai reseat: --seat "${seatRaw}" — expected one of ${CORE_REVIEWER_IDS.join(', ')}, claude`
     );
     return 3;
   }
@@ -4205,6 +4213,100 @@ async function reseatCommand(args: string[]): Promise<number> {
     // above. Past this point the seat spawn is paid for — a trail write that failed, a gate that
     // threw — so a caller (or a runner script) must not read it as "the reseat never started".
     console.error(`ensemble-ai reseat: failed after the seat spawn — ${(e as Error).message}`);
+    return 1;
+  } finally {
+    session?.reap();
+  }
+}
+
+// reseat --seat claude: re-READ the producer's persisted reply with this engine's parser, rewrite
+// its trail artifacts as a healthy review, regate the union. No seat spawn — the only bill is the
+// gate's. Shares the regate command's worktree handling so the gate stays evidence-bearing.
+async function reparseSeatCommand(
+  seat: ReparseSeat,
+  values: Record<string, string | boolean | undefined>,
+  positionals: string[]
+): Promise<number> {
+  const out = (values.out as string).trim();
+  const runId = (values['run-id'] as string).trim();
+  // Every refusal BEFORE anything is touched (exit 3): a healthy seat, no reply, a cut-off reply, a
+  // reply this engine still cannot read, a reply in parts.
+  const pre = checkReparse(out, runId, seat);
+  if ('refusal' in pre) {
+    console.error(`ensemble-ai reseat: ${pre.refusal}`);
+    return 3;
+  }
+  const headSha = readGatePacketHeadSha(out, runId);
+  if (!headSha) {
+    console.error(
+      `ensemble-ai reseat: run ${runId} has no usable packet.gate.json under ${out} — nothing to ground the regate against (was this run made by \`review --out\`?)`
+    );
+    return 3;
+  }
+  const gateSeat = loadSeatsOrRefuse(() =>
+    loadGateSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values['gate-effort'] === 'string' ? values['gate-effort'] : undefined,
+        model: typeof values['gate-model'] === 'string' ? values['gate-model'] : undefined,
+        vendor: 'anthropic',
+      },
+      (m) => console.error(`· ${m}`)
+    )
+  );
+  if (!gateSeat) return 3;
+  console.error(
+    `· ${seat}'s persisted reply parses under this engine: ${pre.findings.length} finding(s) — re-reading it, no seat is re-run`
+  );
+
+  // Worktree evidence for the REGATE, opt-in and best-effort exactly as `regate` does it.
+  let session: WorktreeSession | null = null;
+  const repoFlag = typeof values.repo === 'string' ? values.repo.trim() : '';
+  if (repoFlag) {
+    const url = positionals[0]?.trim() ?? '';
+    const ref = url ? parsePrUrl(url) : null;
+    if (!ref) {
+      console.error('ensemble-ai reseat: --repo needs the original PR URL as the positional (the head is re-fetched as pull/<N>/head)');
+      return 3;
+    }
+    console.error(`· re-materializing the PR head as a read-only worktree of ${repoFlag}…`);
+    const made = openWorktree({ baseRef: null, baseSha: null, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
+    if (isPreflightError(made)) {
+      const why = redactUrlCredentials(clean(made.message)).slice(0, 300);
+      console.error(`· ⚠ worktree unavailable (${made.kind}: ${why}) — regating on PACKET evidence (reference-not-found + holistic verification OFF)`);
+    } else {
+      session = made;
+    }
+  }
+
+  try {
+    const res = await runReparseSeat({
+      baseDir: out,
+      gateConfig: gateSeat.config,
+      log: (m) => console.error(`· ${m}`),
+      ...(values.premise ? { premise: true } : {}),
+      runId,
+      seat,
+      ...(session ? { worktree: session.dir } : {}),
+    });
+    if (!res.stampWritten) {
+      console.error('· ⚠ the reseats[] provenance stamp could not be written — the trail does not record this heal');
+    }
+    console.log(renderGateVerdicts(res.gate.verdicts, { scrub: clean, trailWritten: true }).join('\n'));
+    const simplify = renderPremiseSimplify(res.gate.synthesis.simplify, clean);
+    if (simplify.length) console.log(simplify.join('\n'));
+    console.log(
+      res.ok
+        ? `\nreseat: ${seat} re-read (${res.review.findings.length} finding(s), no seat re-run) — gate completed over ${res.gate.reviews} voice(s); verdicts updated in ${out}/${runId}/`
+        : `\nreseat: ${seat} re-read, but the gate FAILED — verdicts remain fail-closed unverified (see stderr for the cause)`
+    );
+    return res.ok ? 0 : 1;
+  } catch (e) {
+    if (e instanceof ReseatLockedError) {
+      console.error(`ensemble-ai reseat: ${e.message}`);
+      return 3;
+    }
+    console.error(`ensemble-ai reseat: failed after the trail was rewritten — ${(e as Error).message}`);
     return 1;
   } finally {
     session?.reap();

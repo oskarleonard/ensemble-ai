@@ -466,7 +466,7 @@ function readReseatLock(p: string): { since: string; startedMs: number } | null 
 // concurrent retries interleave into last-writer-wins: one operator's attempt disappears from a
 // trail that still billed a seat spawn for it. O_EXCL is the whole mechanism: the create either wins
 // or it does not, with no window between the check and the claim.
-function acquireReseatLock(baseDir: string, runId: string): () => void {
+export function acquireReseatLock(baseDir: string, runId: string): () => void {
   const p = path.join(reviewDir(baseDir, runId), RESEAT_LOCK_FILE);
   const held = (): string =>
     `another reseat is already running on run ${runId} (lock ${RESEAT_LOCK_FILE}, since ${
@@ -512,7 +512,7 @@ function acquireReseatLock(baseDir: string, runId: string): () => void {
 // written, and a swallowed failure would leave a healed run whose trail says the seat simply
 // reviewed — with no record that a retry (and a second seat spawn) ever happened. Still best-effort
 // by contract, so it reports rather than throws: the seat is already paid for either way.
-function foldSynthesis(
+export function foldSynthesis(
   baseDir: string,
   runId: string,
   patch: (existing: Record<string, unknown>) => Record<string, unknown>,

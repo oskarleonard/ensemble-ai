@@ -3,9 +3,9 @@
 // src/cli.ts
 import { execFileSync as execFileSync5 } from "child_process";
 import crypto2 from "crypto";
-import fs30 from "fs";
+import fs31 from "fs";
 import os14 from "os";
-import path25 from "path";
+import path26 from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
 import { parseArgs } from "util";
 
@@ -899,9 +899,9 @@ function extractJsonBlock(raw) {
     } catch {
     }
   }
-  for (const c of candidates) {
+  if (fenced) {
     try {
-      return JSON.parse(stripTrailingCommas(repairBrackets(escapeRawNewlinesInStrings(c))));
+      return JSON.parse(stripTrailingCommas(repairBrackets(escapeRawNewlinesInStrings(fenced))));
     } catch {
     }
   }
@@ -4446,8 +4446,8 @@ function sha256Hex(input) {
 
 // src/modes/review/chunks.ts
 var DEFAULT_MAX_CHUNKS = 8;
-function areaAt(path26, depth) {
-  const parts = path26.split("/");
+function areaAt(path27, depth) {
+  const parts = path27.split("/");
   const dirs = parts.slice(0, -1);
   if (dirs.length === 0) return ".";
   return dirs.slice(0, depth).join("/");
@@ -4746,9 +4746,9 @@ function hasGeneratedHeader(section2) {
 function hasGeneratedFirstLine(line) {
   return typeof line === "string" && GENERATED_FIRST_LINE.test(line);
 }
-function classifyFileKind(path26, isBinary, section2 = "", firstLine4) {
+function classifyFileKind(path27, isBinary, section2 = "", firstLine4) {
   if (isBinary) return "binary";
-  if (GENERATED_PATTERNS.some((re) => re.test(path26))) return "generated";
+  if (GENERATED_PATTERNS.some((re) => re.test(path27))) return "generated";
   if (section2 && hasGeneratedHeader(section2)) return "generated";
   return hasGeneratedFirstLine(firstLine4) ? "generated" : "source";
 }
@@ -4790,8 +4790,8 @@ var TEST_PATTERNS = [
   /Tests?\.(java|kt|swift|cs|scala)$/,
   /\.bats$/
 ];
-function isTestPath(path26) {
-  return TEST_PATTERNS.some((re) => re.test(path26));
+function isTestPath(path27) {
+  return TEST_PATTERNS.some((re) => re.test(path27));
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -4810,7 +4810,7 @@ function parseDiffFiles(raw, opts = {}) {
   return parts.map((part) => {
     let section2 = part;
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path26 = pathOfSection(section2);
+    const path27 = pathOfSection(section2);
     if (!section2.endsWith("\n")) section2 += "\n";
     let added = 0;
     let removed = 0;
@@ -4818,16 +4818,16 @@ function parseDiffFiles(raw, opts = {}) {
       if (line.startsWith("+") && !line.startsWith("+++")) added++;
       else if (line.startsWith("-") && !line.startsWith("---")) removed++;
     }
-    let kind = classifyFileKind(path26, isBinary, section2);
-    if (kind === "source" && opts.readFirstLine && path26 !== "unknown") {
-      kind = classifyFileKind(path26, isBinary, section2, opts.readFirstLine(path26));
+    let kind = classifyFileKind(path27, isBinary, section2);
+    if (kind === "source" && opts.readFirstLine && path27 !== "unknown") {
+      kind = classifyFileKind(path27, isBinary, section2, opts.readFirstLine(path27));
     }
     return {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
       kind,
-      path: path26,
+      path: path27,
       raw: section2,
       removed
     };
@@ -11998,9 +11998,9 @@ async function runRegate(opts) {
   };
 }
 
-// src/modes/review/reseat.ts
-import fs29 from "fs";
-import path24 from "path";
+// src/modes/review/reparse-seat.ts
+import fs30 from "fs";
+import path25 from "path";
 
 // src/modes/review/evidence-manifest.ts
 var EVIDENCE_MANIFEST_SCHEMA_VERSION = 1;
@@ -12039,6 +12039,8 @@ function writeEvidenceManifest(baseDir, runId, manifest) {
 }
 
 // src/modes/review/reseat.ts
+import fs29 from "fs";
+import path24 from "path";
 function splitWorktreePrompt(prompt) {
   const asPacket = {
     baseSha: null,
@@ -12540,6 +12542,156 @@ function rerenderOverview(baseDir, runId, headSha, gateCounts, log) {
   } catch (e) {
     log(`reseat: coverage-overview.md could not be re-rendered (${e.message})`);
   }
+}
+
+// src/modes/review/reparse-seat.ts
+var REPARSE_SEATS = ["claude"];
+function isReparseSeat(v) {
+  return REPARSE_SEATS.includes(v);
+}
+function checkReparse(baseDir, runId, seat) {
+  const existing = readTrailJson(baseDir, runId, `review.${seat}.json`);
+  if (!existing || typeof existing !== "object" || typeof existing.voiceId !== "string") {
+    return {
+      refusal: `run ${runId} has no review.${seat}.json under ${baseDir} \u2014 the ${seat} seat never persisted a review here; re-fire the review`
+    };
+  }
+  if (existing.ok === true) {
+    return {
+      refusal: `seat ${seat} completed in run ${runId} \u2014 nothing to heal (re-running a healthy seat is a new review)`
+    };
+  }
+  const diag = existing.diagnostics;
+  if (diag && typeof diag === "object" && typeof diag.timedOutReason === "string") {
+    return {
+      refusal: `seat ${seat} was cut off on run ${runId} (${diag.timedOutReason}) \u2014 its reply is not a complete review and will not be re-read; re-fire the review`
+    };
+  }
+  const dir = reviewDir(baseDir, runId);
+  let names;
+  try {
+    names = fs30.readdirSync(dir);
+  } catch {
+    names = [];
+  }
+  const partRe = new RegExp(`^${seat}-review\\.c\\d+\\.raw\\.md$`);
+  const parts = names.filter((n) => partRe.test(n));
+  if (parts.length > 0) {
+    return {
+      refusal: `seat ${seat} reviewed run ${runId} in ${parts.length} parts \u2014 re-reading a multi-part reply is not supported yet; re-fire the review`
+    };
+  }
+  const rawPath = path25.join(dir, `${seat}-review.raw.md`);
+  if (!fs30.existsSync(rawPath)) {
+    return {
+      refusal: `seat ${seat} left no reply on run ${runId} (no ${seat}-review.raw.md) \u2014 nothing to re-read; re-fire the review`
+    };
+  }
+  const raw = fs30.readFileSync(rawPath, "utf8");
+  const parsed = parseFindings(raw);
+  if (parsed.parseError) {
+    return {
+      refusal: `seat ${seat}'s persisted reply on run ${runId} still does not parse under this engine (${parsed.parseError}) \u2014 a re-run of this seat is not supported yet; re-fire the review`
+    };
+  }
+  return { existing, findings: parsed.findings, raw, summary: parsed.summary };
+}
+async function runReparseSeat(opts) {
+  const pre = checkReparse(opts.baseDir, opts.runId, opts.seat);
+  if ("refusal" in pre) throw new Error(pre.refusal);
+  const release = acquireReseatLock(opts.baseDir, opts.runId);
+  try {
+    return await reparseUnderLock(opts, pre);
+  } finally {
+    release();
+  }
+}
+async function reparseUnderLock(opts, pre) {
+  const log = opts.log ?? (() => {
+  });
+  const { baseDir, runId, seat } = opts;
+  const { existing, findings } = pre;
+  const previousSummary = typeof existing.summary === "string" ? existing.summary : "";
+  const summary = pre.summary || `Re-read from the persisted reply: ${findings.length} finding(s) (the reply carried no summary)`;
+  const healed = {
+    ...typeof existing.advisor === "string" ? { advisor: existing.advisor } : {},
+    ...existing.diagnostics && typeof existing.diagnostics === "object" ? { diagnostics: existing.diagnostics } : {},
+    findings,
+    ok: true,
+    summary,
+    voiceId: seat
+  };
+  log(
+    scrubControl(
+      `reseat: re-reading ${seat}'s persisted reply on run ${runId} \u2014 previously failed (${previousSummary.slice(0, 120)}); now ${findings.length} finding(s), nothing re-billed`
+    )
+  );
+  persistSeatReview(baseDir, runId, seat, healed, null);
+  try {
+    writeTrailFile(baseDir, runId, `review.${seat}.md`, renderReviewMarkdown(healed));
+  } catch (e) {
+    log(`reseat: review.${seat}.md could not be written (${e.message})`);
+  }
+  try {
+    const trail = readTrailJson(baseDir, runId, CHUNKS_TRAIL_FILE);
+    if (trail && Array.isArray(trail.chunks)) {
+      let touched = false;
+      for (const c of trail.chunks) {
+        const rec = c.seats?.[seat];
+        if (!rec) continue;
+        const { why: _why, ...rest } = rec;
+        void _why;
+        c.seats[seat] = { ...rest, findings: findings.length, state: "reviewed" };
+        touched = true;
+      }
+      if (touched) writeTrailFile(baseDir, runId, CHUNKS_TRAIL_FILE, JSON.stringify(trail, null, 2));
+    }
+  } catch (e) {
+    log(`reseat: ${CHUNKS_TRAIL_FILE} could not be updated (${e.message})`);
+  }
+  const realized = (() => {
+    const m = readTrailJson(baseDir, runId, EVIDENCE_MANIFEST_FILE);
+    return m?.realizedEvidence?.[seat] ?? "packet";
+  })();
+  const stampWritten = foldSynthesis(
+    baseDir,
+    runId,
+    (synth) => ({
+      ...synth,
+      // The synthesis trail keeps the seat's own record beside the stamp (regate's fold never
+      // clobbers it, so the failed copy would otherwise stay there forever).
+      [`${seat}Review`]: healed,
+      reseats: [
+        ...synth.reseats ?? [],
+        {
+          at: (/* @__PURE__ */ new Date()).toISOString(),
+          baseSha: null,
+          evidenceDowngraded: false,
+          fallbackReason: null,
+          outcome: "reviewed",
+          previous: { ok: false, summary: previousSummary },
+          realized,
+          // The one field that tells this heal from a re-run: the reply was never re-spawned.
+          reparsed: true,
+          seat,
+          summary: healed.summary.slice(0, 600)
+        }
+      ]
+    }),
+    log
+  );
+  log(`reseat: ${seat} reviewed \u2014 ${findings.length} finding(s) \xB7 evidence ${realized} \xB7 regating the union\u2026`);
+  const gate = await (opts.regate ?? runRegate)({
+    baseDir,
+    conventionPaths: opts.conventionPaths ?? readConventionPathsFromTrail(baseDir, runId),
+    gateConfig: opts.gateConfig,
+    log,
+    ...opts.premise ? { premise: true } : {},
+    ...opts.gateRun ? { run: opts.gateRun } : {},
+    runId,
+    ...opts.worktree ? { worktree: opts.worktree } : {}
+  });
+  return { gate, ok: gate.ok, review: healed, stampWritten };
 }
 
 // src/plumbing/pin-check.ts
@@ -13681,28 +13833,28 @@ function genRunId() {
 }
 function clearReusedRunTrail(baseDir, trailDir) {
   try {
-    if (fs30.lstatSync(trailDir).isSymbolicLink()) return;
+    if (fs31.lstatSync(trailDir).isSymbolicLink()) return;
   } catch {
     return;
   }
   let realBase;
   let realTarget;
   try {
-    realBase = fs30.realpathSync(baseDir);
-    realTarget = fs30.realpathSync(trailDir);
+    realBase = fs31.realpathSync(baseDir);
+    realTarget = fs31.realpathSync(trailDir);
   } catch {
     return;
   }
-  const rel = path25.relative(realBase, realTarget);
+  const rel = path26.relative(realBase, realTarget);
   if (!rel || escapesRoot(rel)) {
     return;
   }
-  fs30.rmSync(realTarget, { force: true, recursive: true });
+  fs31.rmSync(realTarget, { force: true, recursive: true });
 }
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
   try {
-    const s = fs30.readFileSync(0, "utf8");
+    const s = fs31.readFileSync(0, "utf8");
     return s.trim() ? s : void 0;
   } catch {
     return void 0;
@@ -13748,9 +13900,9 @@ function gitToplevel(cwd) {
 }
 function resolveTrailBase(gitRoot, localRepoTrail) {
   if (gitRoot && localRepoTrail) {
-    return path25.join(gitRoot, ".ensemble-ai", "reviews");
+    return path26.join(gitRoot, ".ensemble-ai", "reviews");
   }
-  return path25.join(os14.tmpdir(), "ensemble-ai", "reviews");
+  return path26.join(os14.tmpdir(), "ensemble-ai", "reviews");
 }
 function ghConventionReader(repoSlug, ref, cwd) {
   const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
@@ -13879,7 +14031,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "diff-file": {
       let text;
       try {
-        text = fs30.readFileSync(String(selection.diffFile), "utf8");
+        text = fs31.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
@@ -14272,7 +14424,7 @@ async function reviewCommand(args, profile = "code") {
     console.log(usage);
     return 0;
   }
-  const cwd = values.cwd ? path25.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path26.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, cmd, cwd);
   if ("code" in source) return source.code;
   const postComment = Boolean(values["post-comment"]);
@@ -14379,7 +14531,7 @@ async function runReviewPipeline(input) {
   const optionalReviewers = resolveOptionalReviewers(values["optional-reviewers"], roster.core, cmd);
   if ("code" in optionalReviewers) return optionalReviewers.code;
   const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-  const out = typeof values.out === "string" ? path25.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+  const out = typeof values.out === "string" ? path26.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
   const trailDir = reviewDir(out, runId);
   const ceiling = positiveCeiling(
     typeof values.ceiling === "string" ? values.ceiling : void 0,
@@ -14412,7 +14564,7 @@ async function runReviewPipeline(input) {
   let intent;
   if (typeof values.intent === "string" && values.intent) {
     try {
-      const text = fs30.readFileSync(values.intent, "utf8").trim();
+      const text = fs31.readFileSync(values.intent, "utf8").trim();
       if (text) {
         intent = text;
         console.error(`\xB7 intent: ${text.length} chars from ${values.intent} \u2014 handed to every seat and the gate as a stated-intent section`);
@@ -14873,7 +15025,7 @@ async function runReviewPipeline(input) {
     const first = result.reviews[0];
     const pinnedReviewerId = first.reviewerId ?? first.reviewer.vendor;
     console.log(
-      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path25.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
+      `  review input (pinned \u2014 what every reviewer saw; read THIS, don't re-derive): ${path26.join(trailDir, `prompt.${pinnedReviewerId}.md`)}`
     );
   }
   if (claudeLayer) {
@@ -15109,19 +15261,19 @@ async function brainstormCommand(args) {
     console.error(BRAINSTORM_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path25.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path26.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path25.resolve(cwd, values.file);
+    const filePath = path26.resolve(cwd, values.file);
     try {
-      const bytes = fs30.statSync(filePath).size;
+      const bytes = fs31.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs30.readFileSync(filePath, "utf8");
+      fileContext = fs31.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${e.message}`
@@ -15132,7 +15284,7 @@ async function brainstormCommand(args) {
   let evidenceInfo;
   if (typeof values["evidence-root"] === "string") {
     try {
-      evidenceInfo = openEvidenceRoot(path25.resolve(cwd, values["evidence-root"]));
+      evidenceInfo = openEvidenceRoot(path26.resolve(cwd, values["evidence-root"]));
     } catch (e) {
       console.error(`ensemble-ai: ${e.message}`);
       return 3;
@@ -15374,19 +15526,19 @@ async function consultCommand(args) {
     console.error(CONSULT_USAGE);
     return 3;
   }
-  const cwd = values.cwd ? path25.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path26.resolve(String(values.cwd)) : process.cwd();
   let fileContext;
   if (typeof values.file === "string") {
-    const filePath = path25.resolve(cwd, values.file);
+    const filePath = path26.resolve(cwd, values.file);
     try {
-      const bytes = fs30.statSync(filePath).size;
+      const bytes = fs31.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs30.readFileSync(filePath, "utf8");
+      fileContext = fs31.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai consult: cannot read --file ${values.file}: ${e.message}`
@@ -15397,7 +15549,7 @@ async function consultCommand(args) {
   let evidenceInfo;
   if (typeof values["evidence-root"] === "string") {
     try {
-      evidenceInfo = openEvidenceRoot(path25.resolve(cwd, values["evidence-root"]));
+      evidenceInfo = openEvidenceRoot(path26.resolve(cwd, values["evidence-root"]));
     } catch (e) {
       console.error(`ensemble-ai: ${e.message}`);
       return 3;
@@ -15640,11 +15792,11 @@ async function receiptCommand(args) {
     console.log(RECEIPT_USAGE);
     return 0;
   }
-  const receiptPathArg = typeof positionals[0] === "string" ? path25.resolve(positionals[0]) : void 0;
+  const receiptPathArg = typeof positionals[0] === "string" ? path26.resolve(positionals[0]) : void 0;
   const readReceiptFile = (p) => {
     let raw;
     try {
-      raw = fs30.readFileSync(p, "utf8");
+      raw = fs31.readFileSync(p, "utf8");
     } catch (e) {
       return { error: `cannot read receipt ${p}: ${e.message}` };
     }
@@ -15685,8 +15837,8 @@ async function receiptCommand(args) {
     console.error(`ensemble-ai receipt ${sub}: choose at most one of --repo / --cwd (both name the repo to verify)`);
     return 3;
   }
-  const repoLocation = typeof values.repo === "string" ? path25.resolve(values.repo) : void 0;
-  const cwd = repoLocation ?? (values.cwd ? path25.resolve(String(values.cwd)) : process.cwd());
+  const repoLocation = typeof values.repo === "string" ? path26.resolve(values.repo) : void 0;
+  const cwd = repoLocation ?? (values.cwd ? path26.resolve(String(values.cwd)) : process.cwd());
   const intendedEvidence = repoLocation ? Object.fromEntries(required.map((id) => [id, "worktree"])) : void 0;
   const acceptDegraded = Boolean(values["accept-degraded"]);
   if (acceptDegraded && !intendedEvidence) {
@@ -15725,7 +15877,7 @@ async function receiptCommand(args) {
     }),
     repo: acquired.repoId
   };
-  const store = values.store ? path25.resolve(String(values.store)) : defaultReceiptStore();
+  const store = values.store ? path26.resolve(String(values.store)) : defaultReceiptStore();
   if (sub === "show") {
     const receipt = readReceipt(store, key);
     if (!receipt) {
@@ -15761,7 +15913,7 @@ async function receiptCommand(args) {
     // with isDiffReviewed so a digest-only drift still reports `stale`.
     readReceipt: receiptPathArg ? (k) => explicit && receiptIdentityMatches(explicit, k) ? explicit : null : (k) => readReceipt(store, k),
     strict: Boolean(values.strict || values["require-artifacts"]),
-    trailDir: typeof values.trail === "string" ? path25.resolve(values.trail) : void 0
+    trailDir: typeof values.trail === "string" ? path26.resolve(values.trail) : void 0
   };
   const state = verifyReceipt({ coverage: acquired.coverage, key, required }, verifyDeps);
   console.log(formatVerify(state, key));
@@ -15809,8 +15961,8 @@ async function reviewersCommand(args) {
     console.log(REVIEWERS_USAGE);
     return 0;
   }
-  const reviewersFile = typeof values["reviewers-file"] === "string" ? path25.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
-  const voicesFile = typeof values["voices-file"] === "string" ? path25.resolve(values["voices-file"]) : VOICES_FILE;
+  const reviewersFile = typeof values["reviewers-file"] === "string" ? path26.resolve(values["reviewers-file"]) : REVIEWERS_FILE;
+  const voicesFile = typeof values["voices-file"] === "string" ? path26.resolve(values["voices-file"]) : VOICES_FILE;
   const warn = (m) => console.error(`\xB7 ${m}`);
   let gateAdvisor;
   const gateSeat = loadGateSeat(voicesFile, {}, warn, (v) => {
@@ -15843,10 +15995,10 @@ async function reviewersCommand(args) {
     offSeats: offSeatsOf(reviewersConfig, enabledIds),
     reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,
-    reviewersFileExists: fs30.existsSync(reviewersFile),
+    reviewersFileExists: fs31.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
     voicesFile,
-    voicesFileExists: fs30.existsSync(voicesFile)
+    voicesFileExists: fs31.existsSync(voicesFile)
   };
   if (values.json) console.log(JSON.stringify(view, null, 2));
   else console.log(renderRegistry(view));
@@ -15957,7 +16109,7 @@ async function diffCommand(args) {
     "--max-chunks"
   );
   if (typeof maxChunks === "object") return maxChunks.code;
-  const cwd = values.cwd ? path25.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path26.resolve(String(values.cwd)) : process.cwd();
   const source = resolveDiffSourceForCommand(values, positionals, "diff", cwd);
   if ("code" in source) return source.code;
   let acquired;
@@ -16062,7 +16214,7 @@ async function pushFenceCommand(args) {
     );
     return 3;
   }
-  const cwd = values.cwd ? path25.resolve(String(values.cwd)) : process.cwd();
+  const cwd = values.cwd ? path26.resolve(String(values.cwd)) : process.cwd();
   const gh = ghRunner(cwd);
   const scope = selection.owner && selection.repo ? ["-R", `${selection.owner}/${selection.repo}`] : [];
   const view = gh([
@@ -16120,7 +16272,7 @@ Exit: 0 = current (or ahead of main); 3 = STALE or DIVERGED; 1 = error. A consum
 gates on the exit code, or parses --json for a softer "N behind" surface.`;
 function resolveSelfRepo(git2) {
   const r = git2(["rev-parse", "--show-toplevel"], {
-    cwd: path25.dirname(fileURLToPath2(import.meta.url))
+    cwd: path26.dirname(fileURLToPath2(import.meta.url))
   });
   return r.ok ? r.text.trim() : null;
 }
@@ -16333,7 +16485,7 @@ what every seat saw \u2014 then re-runs the gate over the union of all persisted
 gate-verdicts.json + claude-synthesis.json in place. No other seat is re-billed.
 
 Usage:
-  ensemble-ai reseat [<pr-url>] --out <dir> --run-id <id> --seat <codex|grok>
+  ensemble-ai reseat [<pr-url>] --out <dir> --run-id <id> --seat <codex|grok|claude>
                      [--repo <path>] [--gate-model <m>] [--gate-effort <e>]
                      [--reviewers-file <p>] [--sandbox <profile>] [--premise]
 
@@ -16341,9 +16493,14 @@ Usage:
                     --repo (the worktree re-materialization fetches pull/<N>/head)
   --out <dir>       the trail base the original run wrote (its <run-id>/ dir lives here)
   --run-id <id>     the original run's id
-  --seat <id>       the FAILED core seat to re-run. A seat that completed is refused \u2014
-                    re-running a healthy seat is a new review. \`claude\` is not supported yet
-                    (the producer runs inside the claude layer; re-fire the review instead)
+  --seat <id>       the FAILED seat to heal. A seat that completed is refused \u2014 re-running a
+                    healthy seat is a new review. codex|grok are RE-RUN against the pinned
+                    packet. \`claude\` is RE-READ, never re-spawned: its persisted reply
+                    (claude-review.raw.md) is parsed again by THIS engine \u2014 the cure for a reply
+                    the parser of the day could not read (a stray bracket) \u2014 then the union is
+                    regated; nothing is billed but the gate. A claude reply that still does not
+                    parse, was cut off, or came in parts is refused (exit 3): the producer has no
+                    pinned prompt on disk, so re-fire the review instead
   --repo <path>     local clone of the PR's repo \u2014 re-materializes the head read-only so the
                     seat (when its sandbox qualifies) and the gate are evidence-bearing.
                     Unavailable/failed \u2192 LOUD fallback: the seat AND the regate of the WHOLE
@@ -16404,9 +16561,10 @@ async function reseatCommand(args) {
     console.error(RESEAT_USAGE);
     return 3;
   }
+  if (isReparseSeat(seatRaw)) return reparseSeatCommand(seatRaw, values, positionals);
   if (!isCoreReviewerId(seatRaw)) {
     console.error(
-      seatRaw === "claude" ? "ensemble-ai reseat: --seat claude is not supported yet \u2014 the producer runs inside the claude layer; re-fire the review instead" : `ensemble-ai reseat: --seat "${seatRaw}" \u2014 expected one of ${CORE_REVIEWER_IDS.join(", ")}`
+      `ensemble-ai reseat: --seat "${seatRaw}" \u2014 expected one of ${CORE_REVIEWER_IDS.join(", ")}, claude`
     );
     return 3;
   }
@@ -16511,6 +16669,87 @@ reseat: ${seat} reviewed, but the gate FAILED \u2014 verdicts remain fail-closed
     session?.reap();
   }
 }
+async function reparseSeatCommand(seat, values, positionals) {
+  const out = values.out.trim();
+  const runId = values["run-id"].trim();
+  const pre = checkReparse(out, runId, seat);
+  if ("refusal" in pre) {
+    console.error(`ensemble-ai reseat: ${pre.refusal}`);
+    return 3;
+  }
+  const headSha = readGatePacketHeadSha(out, runId);
+  if (!headSha) {
+    console.error(
+      `ensemble-ai reseat: run ${runId} has no usable packet.gate.json under ${out} \u2014 nothing to ground the regate against (was this run made by \`review --out\`?)`
+    );
+    return 3;
+  }
+  const gateSeat = loadSeatsOrRefuse(
+    () => loadGateSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values["gate-effort"] === "string" ? values["gate-effort"] : void 0,
+        model: typeof values["gate-model"] === "string" ? values["gate-model"] : void 0,
+        vendor: "anthropic"
+      },
+      (m) => console.error(`\xB7 ${m}`)
+    )
+  );
+  if (!gateSeat) return 3;
+  console.error(
+    `\xB7 ${seat}'s persisted reply parses under this engine: ${pre.findings.length} finding(s) \u2014 re-reading it, no seat is re-run`
+  );
+  let session = null;
+  const repoFlag = typeof values.repo === "string" ? values.repo.trim() : "";
+  if (repoFlag) {
+    const url = positionals[0]?.trim() ?? "";
+    const ref = url ? parsePrUrl(url) : null;
+    if (!ref) {
+      console.error("ensemble-ai reseat: --repo needs the original PR URL as the positional (the head is re-fetched as pull/<N>/head)");
+      return 3;
+    }
+    console.error(`\xB7 re-materializing the PR head as a read-only worktree of ${repoFlag}\u2026`);
+    const made = openWorktree({ baseRef: null, baseSha: null, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
+    if (isPreflightError(made)) {
+      const why = redactUrlCredentials(scrubControl(made.message)).slice(0, 300);
+      console.error(`\xB7 \u26A0 worktree unavailable (${made.kind}: ${why}) \u2014 regating on PACKET evidence (reference-not-found + holistic verification OFF)`);
+    } else {
+      session = made;
+    }
+  }
+  try {
+    const res = await runReparseSeat({
+      baseDir: out,
+      gateConfig: gateSeat.config,
+      log: (m) => console.error(`\xB7 ${m}`),
+      ...values.premise ? { premise: true } : {},
+      runId,
+      seat,
+      ...session ? { worktree: session.dir } : {}
+    });
+    if (!res.stampWritten) {
+      console.error("\xB7 \u26A0 the reseats[] provenance stamp could not be written \u2014 the trail does not record this heal");
+    }
+    console.log(renderGateVerdicts(res.gate.verdicts, { scrub: scrubControl, trailWritten: true }).join("\n"));
+    const simplify = renderPremiseSimplify(res.gate.synthesis.simplify, scrubControl);
+    if (simplify.length) console.log(simplify.join("\n"));
+    console.log(
+      res.ok ? `
+reseat: ${seat} re-read (${res.review.findings.length} finding(s), no seat re-run) \u2014 gate completed over ${res.gate.reviews} voice(s); verdicts updated in ${out}/${runId}/` : `
+reseat: ${seat} re-read, but the gate FAILED \u2014 verdicts remain fail-closed unverified (see stderr for the cause)`
+    );
+    return res.ok ? 0 : 1;
+  } catch (e) {
+    if (e instanceof ReseatLockedError) {
+      console.error(`ensemble-ai reseat: ${e.message}`);
+      return 3;
+    }
+    console.error(`ensemble-ai reseat: failed after the trail was rewritten \u2014 ${e.message}`);
+    return 1;
+  } finally {
+    session?.reap();
+  }
+}
 var PROBE_USAGE = `ensemble-ai probe \u2014 check a backend PR by RUNNING it (the execution prober).
 
 ONE unfenced Anthropic seat gets a disposable worktree of the PR head, forms hypotheses from the
@@ -16589,7 +16828,7 @@ async function probeCommand(rest) {
   let brief = null;
   if (briefPath) {
     try {
-      brief = fs30.readFileSync(path25.resolve(cwd, briefPath), "utf8");
+      brief = fs31.readFileSync(path26.resolve(cwd, briefPath), "utf8");
       console.error(`\xB7 operator brief: ${briefPath} (${brief.length} chars)`);
     } catch (e) {
       if (briefFlag) {
@@ -16671,7 +16910,7 @@ async function probeCommand(rest) {
     }
     const directive = "directive" in directiveRes ? directiveRes.directive : null;
     const runId = typeof values["run-id"] === "string" ? values["run-id"] : genRunId();
-    const out = typeof values.out === "string" ? path25.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
+    const out = typeof values.out === "string" ? path26.resolve(values.out) : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
     const trailDir = reviewDir(out, runId);
     const prompt = renderProbePrompt({
       baseSha: source.prBaseSha,
