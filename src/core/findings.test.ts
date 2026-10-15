@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { escapeRawNewlinesInStrings, extractJsonBlock, parseFindings, stripTrailingCommas } from './findings';
+import {
+  escapeRawNewlinesInStrings,
+  extractJsonBlock,
+  parseFindings,
+  repairBrackets,
+  stripTrailingCommas,
+} from './findings';
 
 const ok = {
   findings: [
@@ -54,6 +60,28 @@ describe('extractJsonBlock', () => {
     const pretty = '{\n  "a": "x\\ny",\n  "b": "q\\"z"\n}';
     expect(escapeRawNewlinesInStrings(pretty)).toBe(pretty);
     expect(extractJsonBlock(pretty + ',')).toEqual({ a: 'x\ny', b: 'q"z' });
+  });
+
+  it('repairs a stray closing brace after a nested object (the `}}},{` reviewer quirk)', () => {
+    const raw = [
+      'I found two low-severity issues.',
+      '```json',
+      '{"summary":"Two lows.","findings":[',
+      '{"title":"First","body":"a","severity":"low","confidence":"medium","evidence":{"file":"src/a.ts","line":54}}},',
+      '{"title":"Second","body":"b","severity":"low","confidence":"high","evidence":{"file":"src/b.ts","line":162}}}]}',
+      '```',
+    ].join('\n');
+    const parsed = parseFindings(raw);
+    expect(parsed.parseError).toBeUndefined();
+    expect(parsed.findings.map((f) => f.evidence.line)).toEqual([54, 162]);
+    expect(parsed.summary).toBe('Two lows.');
+  });
+
+  it('repairBrackets leaves well-formed JSON byte-identical and never touches brackets inside strings', () => {
+    const pretty = '{\n  "a": [1, {"b": "x}}}y]"}],\n  "c": "]["\n}';
+    expect(repairBrackets(pretty)).toBe(pretty);
+    expect(JSON.parse(repairBrackets('{"a":[1,2]]}'))).toEqual({ a: [1, 2] });
+    expect(JSON.parse(repairBrackets('[{"a":1}}]'))).toEqual([{ a: 1 }]);
   });
 
   it('stripTrailingCommas handles escape sequences without flipping string state', () => {
