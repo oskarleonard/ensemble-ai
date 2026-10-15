@@ -64,6 +64,8 @@ export interface VoiceCritiqueResult {
 // One consensus point — a claim the synthesizer judged the voices AGREE on, with
 // the voices that backed it. High-agreement points are the confident answer.
 export interface AgreementPoint {
+  // The synthesizer's plain-language line above the point (core/lead-contract). Optional.
+  lead?: string;
   point: string;
   voices: string[];
 }
@@ -158,6 +160,9 @@ export interface SplitRuling {
   direction: string;
   // The evidence the ruling rests on, as "<voice>: <source>".
   evidenceCited: string[];
+  // The judge's plain-language line for the split: the question in plain words, then how it was
+  // ruled (core/lead-contract). Optional.
+  lead?: string;
   outcome: RulingOutcome;
   splitId: string;
   // What would settle it (unverified): data, an author's answer, a test.

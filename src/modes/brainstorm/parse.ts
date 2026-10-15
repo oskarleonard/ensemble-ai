@@ -1,4 +1,5 @@
 import { extractJsonBlock, oneOf } from '../../core/findings';
+import { capLead } from '../../core/lead-contract';
 
 import {
   type Critique,
@@ -140,6 +141,7 @@ export function parseSynthesis(raw: string): ParsedSynthesis {
     const why = str(r.why);
     if (!title && !why) return;
     const risks = str(r.risks);
+    const lead = capLead(r.lead);
     // rank is assigned from ARRAY ORDER (best-first), never trusted from the model.
     ranked.push({
       contributors: asContributors(r.contributors),
@@ -147,6 +149,7 @@ export function parseSynthesis(raw: string): ParsedSynthesis {
       title: title || `Recommendation ${ranked.length + 1}`,
       why,
       ...(risks ? { risks } : {}),
+      ...(lead ? { lead } : {}),
     });
   });
   return { ranked, summary };

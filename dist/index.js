@@ -7476,6 +7476,19 @@ function scoreHolisticFixture(findings, fixture) {
   return { caught, falseFlags, missed, passed: missed.length === 0 && falseFlags.length === 0 };
 }
 
+// src/core/lead-contract.ts
+var LEAD_MAX = 280;
+var LEAD_FIELD_DOC = `"lead": 1\u20132 sentences, at most ${LEAD_MAX} characters, in plain conversational English a reader of the
+document follows without the code \u2014 no file paths, no identifiers (nothing in snake_case or
+camelCase), no section marks (\xA7), no backticks. Say what the reader hits or what is left open,
+then the fix as "Let's \u2026". Add nothing the point itself does not say.`;
+function capLead(v) {
+  if (typeof v !== "string") return void 0;
+  const t = v.replace(/\s+/g, " ").trim();
+  if (!t) return void 0;
+  return t.length > LEAD_MAX ? `${t.slice(0, LEAD_MAX - 1).trimEnd()}\u2026` : t;
+}
+
 // src/modes/brainstorm/parse.ts
 function str3(v) {
   return typeof v === "string" ? v.trim() : "";
@@ -7567,12 +7580,14 @@ function parseSynthesis(raw) {
     const why = str3(r.why);
     if (!title && !why) return;
     const risks = str3(r.risks);
+    const lead = capLead(r.lead);
     ranked.push({
       contributors: asContributors(r.contributors),
       rank: ranked.length + 1,
       title: title || `Recommendation ${ranked.length + 1}`,
       why,
-      ...risks ? { risks } : {}
+      ...risks ? { risks } : {},
+      ...lead ? { lead } : {}
     });
   });
   return { ranked, summary };
@@ -7691,6 +7706,7 @@ ${JSON_RULE}
   "ranked": [
     {
       "title": "<short>",
+      "lead": "<the plain-language line \u2014 see below>",
       "why": "<why this ranks here>",
       "contributors": ["codex", "grok"],
       "risks": "<the main risk, or omit>"
@@ -7699,6 +7715,7 @@ ${JSON_RULE}
 }
 Rank best-first. Merge duplicates into one entry crediting all contributors. Prefer
 a tight ranked list of the genuinely strong ideas over a long one.
+${LEAD_FIELD_DOC}
 `;
 }
 
@@ -8005,7 +8022,7 @@ ${JSON_RULE2}
 {
   "summary": "<the headline answer in 2-3 sentences>",
   "agreements": [
-    { "point": "<a substantive point the voices agree on>", "voices": ["codex", "grok"] }
+    { "point": "<a substantive point the voices agree on>", "voices": ["codex", "grok"], "lead": "<the plain-language line \u2014 see below>" }
   ],
   "divergences": [
     { "point": "<the question they split on>", "positions": ["codex: X", "grok: Y"] }
@@ -8014,6 +8031,9 @@ ${JSON_RULE2}
 }
 Only list a REAL agreement (genuine concurrence, not a superficial overlap) and a
 REAL divergence (a substantive split, not wording). Empty arrays are fine.
+In the recommendation's numbered list, prefix every item that must be fixed BEFORE the work
+proceeds with "BLOCKER: " \u2014 and nothing else with it; a reader counts the blockers.
+${LEAD_FIELD_DOC}
 `;
 }
 
@@ -8212,12 +8232,16 @@ ${JSON_RULE2}
       "direction": "<settled/converged: the position that stands, and whose \xB7 judgement: the trade-off \xB7 unverified: the unchecked fact>",
       "why": "<the ruling's reason, resting on the evidence>",
       "evidenceCited": ["<voice>: <source>"],
+      "lead": "<the plain-language line: the question in plain words, then how you ruled \u2014 see below>",
       "whatWouldSettle": "<unverified only: the data, test or author's answer that would settle it>",
       "defaultIfUndecided": "<judgement/unverified: the default to take if the human does not decide>"
     }
   ],
   "recommendation": "<verdict sentence(s)\\n\\n1. <action or blocker>\\n2. \u2026\\n\\n<how confident, given what is settled vs still a judgement call>"
 }
+In the recommendation's numbered list, prefix every item that must be fixed BEFORE the work
+proceeds with "BLOCKER: " \u2014 and nothing else with it; a reader counts the blockers.
+${LEAD_FIELD_DOC}
 Cover every split id. Keep the agreements as they are \u2014 they were not in dispute.
 `;
 }
@@ -8307,10 +8331,12 @@ function parseJudgeReply(raw, splitIds) {
       const evidenceCited = strList(r.evidenceCited);
       const whatWouldSettle = str4(r.whatWouldSettle);
       const defaultIfUndecided = str4(r.defaultIfUndecided);
+      const lead = capLead(r.lead);
       rulings.push({
         ...defaultIfUndecided ? { defaultIfUndecided } : {},
         direction,
         evidenceCited,
+        ...lead ? { lead } : {},
         // A "settled" ruling that cites nothing is the taste call the prompt forbids — it is a
         // judgement call for the reader, and the UI says so.
         outcome: outcome === "settled" && evidenceCited.length === 0 ? "judgement" : outcome,
@@ -8399,7 +8425,8 @@ function parseAgreements2(v) {
     const a = ra;
     const point = str5(a.point);
     if (!point) continue;
-    out.push({ point, voices: strList2(a.voices) });
+    const lead = capLead(a.lead);
+    out.push({ point, voices: strList2(a.voices), ...lead ? { lead } : {} });
   }
   return out;
 }

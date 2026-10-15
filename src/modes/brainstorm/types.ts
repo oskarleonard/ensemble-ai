@@ -92,6 +92,9 @@ export interface Critique {
 // the voices whose ideas fed it.
 export interface RankedIdea {
   contributors: string[];
+  // The synthesizer's plain-language line above the point (core/lead-contract). Optional:
+  // absent when the model omitted it; a host derives one from the title then.
+  lead?: string;
   rank: number;
   risks?: string;
   title: string;

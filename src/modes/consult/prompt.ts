@@ -1,4 +1,5 @@
 import type { VoiceAnswerResult, VoiceCritiqueResult } from './types';
+import { LEAD_FIELD_DOC } from '../../core/lead-contract';
 
 // A stateless voice has ONLY this prompt text, so every round embeds exactly what
 // the voice may see and closes with a STRICT one-JSON-block output contract (the
@@ -164,7 +165,7 @@ ${JSON_RULE}
 {
   "summary": "<the headline answer in 2-3 sentences>",
   "agreements": [
-    { "point": "<a substantive point the voices agree on>", "voices": ["codex", "grok"] }
+    { "point": "<a substantive point the voices agree on>", "voices": ["codex", "grok"], "lead": "<the plain-language line — see below>" }
   ],
   "divergences": [
     { "point": "<the question they split on>", "positions": ["codex: X", "grok: Y"] }
@@ -173,5 +174,8 @@ ${JSON_RULE}
 }
 Only list a REAL agreement (genuine concurrence, not a superficial overlap) and a
 REAL divergence (a substantive split, not wording). Empty arrays are fine.
+In the recommendation's numbered list, prefix every item that must be fixed BEFORE the work
+proceeds with "BLOCKER: " — and nothing else with it; a reader counts the blockers.
+${LEAD_FIELD_DOC}
 `;
 }

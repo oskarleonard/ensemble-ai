@@ -1,4 +1,5 @@
 import { extractJsonBlock, oneOf } from '../../core/findings';
+import { capLead } from '../../core/lead-contract';
 
 import {
   type AgreementPoint,
@@ -102,7 +103,8 @@ function parseAgreements(v: unknown): AgreementPoint[] {
     const a = ra as Record<string, unknown>;
     const point = str(a.point);
     if (!point) continue;
-    out.push({ point, voices: strList(a.voices) });
+    const lead = capLead(a.lead);
+    out.push({ point, voices: strList(a.voices), ...(lead ? { lead } : {}) });
   }
   return out;
 }
