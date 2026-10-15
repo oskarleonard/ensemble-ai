@@ -8,9 +8,11 @@ import type { ReviewFinding, SeatDiagnostics } from '../../core/types';
 import type { ResolvedVoiceConfig } from '../brainstorm/types';
 
 import { CHUNKS_TRAIL_FILE, type ChunksTrail } from './chunks';
+import { verdictCounts } from './gate';
+import { readGatePacketHeadSha } from './gate-hunks';
 import { EVIDENCE_MANIFEST_FILE } from './evidence-manifest';
 import { readConventionPathsFromTrail, type RegateOptions, type RegateResult, runRegate } from './regate';
-import { acquireReseatLock, foldSynthesis } from './reseat';
+import { acquireReseatLock, foldSynthesis, rerenderOverview } from './reseat';
 import { persistSeatReview, renderReviewMarkdown } from './self-contained';
 import type { VoiceReview } from './synthesis';
 import { readTrailJson } from './trail-io';
@@ -171,6 +173,7 @@ async function reparseUnderLock(opts: ReparseSeatOptions, pre: ReparseReady): Pr
     log(`reseat: review.${seat}.md could not be written (${(e as Error).message})`);
   }
   // The chunk trail records this seat as failed with the parser's words — make it say what stands.
+  let chunksTouched = false;
   try {
     const trail = readTrailJson<ChunksTrail>(baseDir, runId, CHUNKS_TRAIL_FILE);
     if (trail && Array.isArray(trail.chunks)) {
@@ -184,6 +187,7 @@ async function reparseUnderLock(opts: ReparseSeatOptions, pre: ReparseReady): Pr
         touched = true;
       }
       if (touched) writeTrailFile(baseDir, runId, CHUNKS_TRAIL_FILE, JSON.stringify(trail, null, 2));
+      chunksTouched = touched;
     }
   } catch (e) {
     log(`reseat: ${CHUNKS_TRAIL_FILE} could not be updated (${(e as Error).message})`);
@@ -231,5 +235,11 @@ async function reparseUnderLock(opts: ReparseSeatOptions, pre: ReparseReady): Pr
     runId,
     ...(opts.worktree ? { worktree: opts.worktree } : {}),
   });
+  // The human overview is rendered from the chunk trail — re-render it so it stops saying the
+  // seat failed while chunks.json, review.<seat>.json and the stamp all say reviewed.
+  if (chunksTouched) {
+    const headSha = readGatePacketHeadSha(baseDir, runId);
+    if (headSha) rerenderOverview(baseDir, runId, headSha, gate.ok ? verdictCounts(gate.verdicts) : undefined, log);
+  }
   return { gate, ok: gate.ok, review: healed, stampWritten };
 }

@@ -238,6 +238,10 @@ const WORKTREE_PARENT_PREFIX = 'ensemble-worktree-';
 export interface Worktree {
   dir: string;
   headSha: string;
+  // true ⇔ `pull/N/head` no longer pointed at the pinned head (the branch was rebased or
+  // force-pushed after the review) and the commit was fetched by SHA instead — a heal of the run
+  // (regate, reseat) is still grounded at the head the review actually read.
+  headFetchedBySha: boolean;
   // The base BRANCH tip, fetched beside the head when the caller named the base ref (base drift,
   // gate trail v12): null when no ref was given or the best-effort fetch failed — the head still
   // materializes either way.
@@ -732,6 +736,28 @@ export function materializeWorktree(
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`,
       };
     }
+    // The pinned head may no longer be what pull/N/head points at: a rebase or force-push after
+    // the review leaves the ref on a commit whose history does not contain it. GitHub still serves
+    // such a commit by SHA, so a heal of the run can keep its evidence instead of falling to the
+    // packet (run 2026-10-15-16-22-16 regated on packet evidence for exactly this).
+    let headFetchedBySha = false;
+    const present = deps.git(['rev-parse', '--verify', '--quiet', `${args.headSha}^{commit}`], {
+      cwd: bare,
+      env: INERT_ENV,
+    });
+    if (!present.ok) {
+      const bySha = deps.git(
+        [...INERT_GIT_CONFIG, 'fetch', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head', location.fetchUrl, args.headSha],
+        { cwd: bare, env: fetchEnv(location.repoRoot, bare, deps.git) }
+      );
+      if (!bySha.ok) {
+        return {
+          kind: 'no-such-pr',
+          message: `pull/${args.pr}/head no longer points at ${args.headSha.slice(0, 12)} and ${redactUrlCredentials(location.fetchUrl)} does not serve that commit by SHA: ${redactUrlCredentials(bySha.error.trim())}`,
+        };
+      }
+      headFetchedBySha = true;
+    }
     let baseTip: string | null = null;
     const baseSpec = baseFetchRefspec(args.baseRef);
     if (baseSpec) {
@@ -771,6 +797,7 @@ export function materializeWorktree(
     const made = {
       baseTip,
       dir,
+      headFetchedBySha,
       headSha: args.headSha,
       strippedInstructionFiles: stripAgentInstructions(dir),
     };
@@ -911,6 +938,25 @@ export async function materializeWorktreeAsync(
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`,
       };
     }
+    // Same moved-ref fallback as the sync twin above (fetch the pinned head by SHA).
+    let headFetchedBySha = false;
+    const present = await deps.git(['rev-parse', '--verify', '--quiet', `${args.headSha}^{commit}`], {
+      cwd: bare,
+      env: INERT_ENV,
+    });
+    if (!present.ok) {
+      const bySha = await deps.git(
+        [...INERT_GIT_CONFIG, 'fetch', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head', location.fetchUrl, args.headSha],
+        { cwd: bare, env: await fetchEnvAsync(location.repoRoot, bare, deps.git) }
+      );
+      if (!bySha.ok) {
+        return {
+          kind: 'no-such-pr',
+          message: `pull/${args.pr}/head no longer points at ${args.headSha.slice(0, 12)} and ${redactUrlCredentials(location.fetchUrl)} does not serve that commit by SHA: ${redactUrlCredentials(bySha.error.trim())}`,
+        };
+      }
+      headFetchedBySha = true;
+    }
     let baseTip: string | null = null;
     const baseSpec = baseFetchRefspec(args.baseRef);
     if (baseSpec) {
@@ -943,6 +989,7 @@ export async function materializeWorktreeAsync(
     const made = {
       baseTip,
       dir,
+      headFetchedBySha,
       headSha: args.headSha,
       strippedInstructionFiles: await stripAgentInstructionsAsync(dir),
     };

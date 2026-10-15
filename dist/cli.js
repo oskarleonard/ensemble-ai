@@ -3717,6 +3717,24 @@ function materializeWorktree(args, deps) {
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
+    let headFetchedBySha = false;
+    const present = deps.git(["rev-parse", "--verify", "--quiet", `${args.headSha}^{commit}`], {
+      cwd: bare,
+      env: INERT_ENV
+    });
+    if (!present.ok) {
+      const bySha = deps.git(
+        [...INERT_GIT_CONFIG, "fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", location.fetchUrl, args.headSha],
+        { cwd: bare, env: fetchEnv(location.repoRoot, bare, deps.git) }
+      );
+      if (!bySha.ok) {
+        return {
+          kind: "no-such-pr",
+          message: `pull/${args.pr}/head no longer points at ${args.headSha.slice(0, 12)} and ${redactUrlCredentials(location.fetchUrl)} does not serve that commit by SHA: ${redactUrlCredentials(bySha.error.trim())}`
+        };
+      }
+      headFetchedBySha = true;
+    }
     let baseTip = null;
     const baseSpec = baseFetchRefspec(args.baseRef);
     if (baseSpec) {
@@ -3747,6 +3765,7 @@ function materializeWorktree(args, deps) {
     const made = {
       baseTip,
       dir,
+      headFetchedBySha,
       headSha: args.headSha,
       strippedInstructionFiles: stripAgentInstructions(dir)
     };
@@ -12632,6 +12651,7 @@ async function reparseUnderLock(opts, pre) {
   } catch (e) {
     log(`reseat: review.${seat}.md could not be written (${e.message})`);
   }
+  let chunksTouched = false;
   try {
     const trail = readTrailJson(baseDir, runId, CHUNKS_TRAIL_FILE);
     if (trail && Array.isArray(trail.chunks)) {
@@ -12645,6 +12665,7 @@ async function reparseUnderLock(opts, pre) {
         touched = true;
       }
       if (touched) writeTrailFile(baseDir, runId, CHUNKS_TRAIL_FILE, JSON.stringify(trail, null, 2));
+      chunksTouched = touched;
     }
   } catch (e) {
     log(`reseat: ${CHUNKS_TRAIL_FILE} could not be updated (${e.message})`);
@@ -12691,6 +12712,10 @@ async function reparseUnderLock(opts, pre) {
     runId,
     ...opts.worktree ? { worktree: opts.worktree } : {}
   });
+  if (chunksTouched) {
+    const headSha = readGatePacketHeadSha(baseDir, runId);
+    if (headSha) rerenderOverview(baseDir, runId, headSha, gate.ok ? verdictCounts(gate.verdicts) : void 0, log);
+  }
   return { gate, ok: gate.ok, review: healed, stampWritten };
 }
 
@@ -12791,6 +12816,7 @@ function openWorktree(args, deps = {}) {
     baseSha: args.baseSha,
     baseTip: made.baseTip,
     dir: made.dir,
+    headFetchedBySha: made.headFetchedBySha,
     headSha: made.headSha,
     readableSurface: () => readReadableSurface(made.dir, made.headSha, { git: git2 }).filter(
       (b) => !isStrippedPath(b.path, made.strippedInstructionFiles)
@@ -16447,6 +16473,7 @@ async function regateCommand(args) {
       );
     } else {
       session = made;
+      if (made.headFetchedBySha) console.error(`\xB7 note: pull/${ref.pr}/head has moved since the review \u2014 grounded at the pinned head ${headSha.slice(0, 12)} by SHA`);
     }
   }
   try {
@@ -16611,6 +16638,7 @@ async function reseatCommand(args) {
       console.error(`\xB7 \u26A0 worktree unavailable (${made.kind}: ${why}) \u2014 re-running ${seat} AND regating the whole run on PACKET evidence (reference-not-found + holistic verification OFF)`);
     } else {
       session = made;
+      if (made.headFetchedBySha) console.error(`\xB7 note: pull/${ref.pr}/head has moved since the review \u2014 grounded at the pinned head ${headSha.slice(0, 12)} by SHA`);
       const wrongHead = reseatRefusal(out, runId, seat, session.headSha);
       if (wrongHead) {
         console.error(`ensemble-ai reseat: ${wrongHead}`);
@@ -16715,6 +16743,7 @@ async function reparseSeatCommand(seat, values, positionals) {
       console.error(`\xB7 \u26A0 worktree unavailable (${made.kind}: ${why}) \u2014 regating on PACKET evidence (reference-not-found + holistic verification OFF)`);
     } else {
       session = made;
+      if (made.headFetchedBySha) console.error(`\xB7 note: pull/${ref.pr}/head has moved since the review \u2014 grounded at the pinned head ${headSha.slice(0, 12)} by SHA`);
     }
   }
   try {

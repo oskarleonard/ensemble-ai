@@ -41,6 +41,7 @@ declare function resolveRepoLocation(args: {
 interface Worktree {
     dir: string;
     headSha: string;
+    headFetchedBySha: boolean;
     baseTip: string | null;
     strippedInstructionFiles: string[];
 }

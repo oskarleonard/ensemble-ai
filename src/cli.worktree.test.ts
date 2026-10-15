@@ -73,6 +73,7 @@ function session(): WorktreeSession {
     baseSha: BASE,
     baseTip: null,
     dir: '/tmp/ensemble-worktree-xyz',
+    headFetchedBySha: false,
     headSha: HEAD,
     readableSurface: () => [],
     reap: () => {

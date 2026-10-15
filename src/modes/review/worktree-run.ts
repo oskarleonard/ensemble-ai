@@ -28,6 +28,9 @@ export interface WorktreeSession {
   baseTip: string | null;
   baseSha: string | null;
   dir: string;
+  // true ⇔ pull/N/head had moved off the pinned head and the commit was fetched by SHA (see
+  // worktree.ts Worktree.headFetchedBySha) — a heal grounded at the reviewed head all the same.
+  headFetchedBySha: boolean;
   headSha: string;
   // What the worktree seats could read: the tracked tree at headSha, keyed by blob SHA, MINUS the
   // agent-instruction files the engine stripped. Advisory (evidence-manifest.ts), never hashed into
@@ -93,6 +96,7 @@ export function openWorktree(
     baseSha: args.baseSha,
     baseTip: made.baseTip,
     dir: made.dir,
+    headFetchedBySha: made.headFetchedBySha,
     headSha: made.headSha,
     readableSurface: () =>
       readReadableSurface(made.dir, made.headSha, { git }).filter(
