@@ -158,6 +158,34 @@ function escapeRawNewlinesInStrings(s) {
   }
   return out;
 }
+function repairBrackets(s) {
+  let out = "";
+  let inString = false;
+  const open = [];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      out += ch;
+      if (ch === "\\") {
+        if (i + 1 < s.length) out += s[++i];
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{" || ch === "[") {
+      open.push(ch);
+    } else if (ch === "}" || ch === "]") {
+      const want = ch === "}" ? "{" : "[";
+      if (open[open.length - 1] !== want) continue;
+      open.pop();
+    }
+    out += ch;
+  }
+  return out;
+}
 function extractJsonBlock(raw) {
   const fence = /```(?:json)?\s*([\s\S]*?)```/gi;
   let m;
@@ -183,6 +211,12 @@ function extractJsonBlock(raw) {
   for (const c of candidates) {
     try {
       return JSON.parse(stripTrailingCommas(escapeRawNewlinesInStrings(c)));
+    } catch {
+    }
+  }
+  for (const c of candidates) {
+    try {
+      return JSON.parse(stripTrailingCommas(repairBrackets(escapeRawNewlinesInStrings(c))));
     } catch {
     }
   }
@@ -9047,6 +9081,7 @@ export {
   renderSummaryBody,
   renderSynthesisPrompt,
   renderVerifySandboxProfile,
+  repairBrackets,
   repoIdFromSlug,
   resolveBase,
   resolveBin,

@@ -160,6 +160,41 @@ export function escapeRawNewlinesInStrings(s: string): string {
   return out;
 }
 
+// Drop a CLOSING bracket that does not match the innermost open container (or closes nothing),
+// outside string literals. The recurring shape is one stray `}` after a finding's nested
+// `evidence` object — `"line":54}}},{"title":…` — which strict JSON.parse rejects at the `,`
+// and every earlier pass leaves in place, so a complete review was recorded as "no parseable
+// JSON block" and the whole seat dropped. A matching closer, and everything inside a string,
+// is copied verbatim: well-formed JSON passes through byte-identical. Fourth fallback pass only.
+export function repairBrackets(s: string): string {
+  let out = '';
+  let inString = false;
+  const open: string[] = [];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      out += ch;
+      if (ch === '\\') {
+        if (i + 1 < s.length) out += s[++i];
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{' || ch === '[') {
+      open.push(ch);
+    } else if (ch === '}' || ch === ']') {
+      const want = ch === '}' ? '{' : '[';
+      if (open[open.length - 1] !== want) continue; // stray closer — drop it
+      open.pop();
+    }
+    out += ch;
+  }
+  return out;
+}
+
 export function extractJsonBlock(raw: string): unknown {
   const fence = /```(?:json)?\s*([\s\S]*?)```/gi;
   let m: RegExpExecArray | null;
@@ -191,6 +226,14 @@ export function extractJsonBlock(raw: string): unknown {
   for (const c of candidates) {
     try {
       return JSON.parse(stripTrailingCommas(escapeRawNewlinesInStrings(c)));
+    } catch {
+      // try the next candidate
+    }
+  }
+  // FOURTH pass: a stray closing bracket (the `}}},{` shape), on top of the other two repairs.
+  for (const c of candidates) {
+    try {
+      return JSON.parse(stripTrailingCommas(repairBrackets(escapeRawNewlinesInStrings(c))));
     } catch {
       // try the next candidate
     }
