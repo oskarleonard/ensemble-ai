@@ -124,6 +124,7 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
     expect(normalize(syncOut)).toEqual({
       baseTip: null, // no base ref named ⇒ no second fetch, on both twins
       dir: '<dir>',
+      headFetchedBySha: false, // pull/N/head carried the pinned head ⇒ no fetch by SHA, on both twins
       headSha: HEAD_SHA,
       strippedInstructionFiles: [],
     });
@@ -134,7 +135,7 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
     // The transport reads run UNCONDITIONALLY (auth is needed even with no clone — here the
     // fake /repo has no shared store); nothing they find is ever written into the private repo.
     const flat = syncLog.map((c) => c.args.join(' '));
-    expect(flat).toHaveLength(7);
+    expect(flat).toHaveLength(8);
     expect(flat[0]).toBe('rev-parse --git-common-dir');
     expect(flat[1]).toContain('init');
     expect(flat[1]).toContain('--bare');
@@ -143,15 +144,18 @@ describe('materializeWorktree twins — identical argv + outcome on every branch
     expect(flat[3]).toContain('config --null --get-regexp');
     expect(syncLog[3].cwd.endsWith('/repo')).toBe(true); // the private repo's own view
     expect(flat[4]).toContain('fetch');
-    expect(flat[5]).toContain('worktree add');
-    expect(flat[6]).toBe('rev-parse HEAD');
+    // The pinned-head presence probe (moved pull/N/head ⇒ a second fetch by SHA; here it is present).
+    expect(flat[5]).toBe(`rev-parse --verify --quiet ${HEAD_SHA}^{commit}`);
+    expect(syncLog[5].cwd.endsWith('/repo')).toBe(true);
+    expect(flat[6]).toContain('worktree add');
+    expect(flat[7]).toBe('rev-parse HEAD');
     expect(syncLog[1].lfsSkip).toBe(true); // init
     expect(syncLog[4]).toMatchObject({ lfsSkip: true }); // fetch, in the private repo
     expect(syncLog[4].cwd).toContain('ensemble-worktree-');
     expect(syncLog[4].cwd.endsWith('/repo')).toBe(true);
-    expect(syncLog[5]).toMatchObject({ lfsSkip: true }); // worktree add, in the private repo
-    expect(syncLog[5].cwd.endsWith('/repo')).toBe(true);
-    expect(syncLog[6].cwd).toContain('head'); // HEAD assert, in the worktree
+    expect(syncLog[6]).toMatchObject({ lfsSkip: true }); // worktree add, in the private repo
+    expect(syncLog[6].cwd.endsWith('/repo')).toBe(true);
+    expect(syncLog[7].cwd).toContain('head'); // HEAD assert, in the worktree
   });
 
   it('fetch failure: same error kind, and NEITHER twin reaches worktree add', async () => {

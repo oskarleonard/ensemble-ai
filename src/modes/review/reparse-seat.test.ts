@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { reviewDir } from '../../core/artifacts';
 import type { ResolvedVoiceConfig } from '../brainstorm/types';
 
+import { persistGatePacket } from './gate-hunks';
 import type { RegateOptions, RegateResult } from './regate';
 import { checkReparse, reparseRefusal, runReparseSeat } from './reparse-seat';
 
@@ -56,8 +57,10 @@ function seedRun(opts: { raw?: string | null; review?: Record<string, unknown>; 
         ceilingBytes: 1,
         chunks: [
           {
+            bytes: 1234,
             files: ['src/row.tsx'],
             index: 1,
+            promptChars: 5678,
             label: 'all',
             seats: {
               claude: { effort: 'xhigh', findings: 0, model: 'opus', state: 'failed-reviewer', why: 'output not parseable' },
@@ -71,6 +74,8 @@ function seedRun(opts: { raw?: string | null; review?: Record<string, unknown>; 
       })
     );
   }
+  persistGatePacket(base, runId, { diff: 'diff --git a/src/row.tsx b/src/row.tsx\n', headSha: 'd'.repeat(40) });
+  fs.writeFileSync(path.join(dir, 'coverage-overview.md'), 'claude ✗ failed-reviewer — output not parseable\n');
   fs.writeFileSync(path.join(dir, 'evidence-manifest.json'), JSON.stringify({ realizedEvidence: { claude: 'worktree', codex: 'worktree' } }));
   fs.writeFileSync(path.join(dir, 'claude-synthesis.json'), JSON.stringify({ claudeReview: FAILED_STUB, gateSpawned: true }));
   return { base, dir, runId };
@@ -159,6 +164,12 @@ describe('runReparseSeat — heals the trail without a spawn, then regates the u
     expect(chunks.chunks[0].seats.claude).toMatchObject({ effort: 'xhigh', findings: 2, state: 'reviewed' });
     expect(chunks.chunks[0].seats.claude.why).toBeUndefined();
     expect(chunks.chunks[0].seats.codex).toEqual({ findings: 0, state: 'reviewed' });
+    // Every trail write landed (a best-effort write that failed says so on the log).
+    expect(log.filter((l) => /could not/.test(l))).toEqual([]);
+    // The overview rendered from the chunk trail no longer says the seat failed.
+    const overview = fs.readFileSync(path.join(dir, 'coverage-overview.md'), 'utf8');
+    expect(overview).not.toContain('failed-reviewer');
+    expect(overview).not.toContain('output not parseable');
 
     const synth = JSON.parse(fs.readFileSync(path.join(dir, 'claude-synthesis.json'), 'utf8'));
     expect(synth.gateSpawned).toBe(true);

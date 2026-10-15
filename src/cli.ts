@@ -3944,6 +3944,7 @@ async function regateCommand(args: string[]): Promise<number> {
       );
     } else {
       session = made;
+      if (made.headFetchedBySha) console.error(`· note: pull/${ref.pr}/head has moved since the review — grounded at the pinned head ${headSha.slice(0, 12)} by SHA`);
     }
   }
 
@@ -4145,6 +4146,7 @@ async function reseatCommand(args: string[]): Promise<number> {
       console.error(`· ⚠ worktree unavailable (${made.kind}: ${why}) — re-running ${seat} AND regating the whole run on PACKET evidence (reference-not-found + holistic verification OFF)`);
     } else {
       session = made;
+      if (made.headFetchedBySha) console.error(`· note: pull/${ref.pr}/head has moved since the review — grounded at the pinned head ${headSha.slice(0, 12)} by SHA`);
       // The module refuses a tree at another commit; refuse it HERE too, before the seat is billed.
       const wrongHead = reseatRefusal(out, runId, seat, session.headSha);
       if (wrongHead) {
@@ -4276,6 +4278,7 @@ async function reparseSeatCommand(
       console.error(`· ⚠ worktree unavailable (${made.kind}: ${why}) — regating on PACKET evidence (reference-not-found + holistic verification OFF)`);
     } else {
       session = made;
+      if (made.headFetchedBySha) console.error(`· note: pull/${ref.pr}/head has moved since the review — grounded at the pinned head ${headSha.slice(0, 12)} by SHA`);
     }
   }
 

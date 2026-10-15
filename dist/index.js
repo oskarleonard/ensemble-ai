@@ -4224,6 +4224,24 @@ function materializeWorktree(args, deps) {
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
+    let headFetchedBySha = false;
+    const present = deps.git(["rev-parse", "--verify", "--quiet", `${args.headSha}^{commit}`], {
+      cwd: bare,
+      env: INERT_ENV
+    });
+    if (!present.ok) {
+      const bySha = deps.git(
+        [...INERT_GIT_CONFIG, "fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", location.fetchUrl, args.headSha],
+        { cwd: bare, env: fetchEnv(location.repoRoot, bare, deps.git) }
+      );
+      if (!bySha.ok) {
+        return {
+          kind: "no-such-pr",
+          message: `pull/${args.pr}/head no longer points at ${args.headSha.slice(0, 12)} and ${redactUrlCredentials(location.fetchUrl)} does not serve that commit by SHA: ${redactUrlCredentials(bySha.error.trim())}`
+        };
+      }
+      headFetchedBySha = true;
+    }
     let baseTip = null;
     const baseSpec = baseFetchRefspec(args.baseRef);
     if (baseSpec) {
@@ -4254,6 +4272,7 @@ function materializeWorktree(args, deps) {
     const made = {
       baseTip,
       dir,
+      headFetchedBySha,
       headSha: args.headSha,
       strippedInstructionFiles: stripAgentInstructions(dir)
     };
@@ -4337,6 +4356,24 @@ async function materializeWorktreeAsync(args, deps) {
         message: `fetch pull/${args.pr}/head from ${redactUrlCredentials(location.fetchUrl)} failed: ${redactUrlCredentials(fetched.error.trim())}`
       };
     }
+    let headFetchedBySha = false;
+    const present = await deps.git(["rev-parse", "--verify", "--quiet", `${args.headSha}^{commit}`], {
+      cwd: bare,
+      env: INERT_ENV
+    });
+    if (!present.ok) {
+      const bySha = await deps.git(
+        [...INERT_GIT_CONFIG, "fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", location.fetchUrl, args.headSha],
+        { cwd: bare, env: await fetchEnvAsync(location.repoRoot, bare, deps.git) }
+      );
+      if (!bySha.ok) {
+        return {
+          kind: "no-such-pr",
+          message: `pull/${args.pr}/head no longer points at ${args.headSha.slice(0, 12)} and ${redactUrlCredentials(location.fetchUrl)} does not serve that commit by SHA: ${redactUrlCredentials(bySha.error.trim())}`
+        };
+      }
+      headFetchedBySha = true;
+    }
     let baseTip = null;
     const baseSpec = baseFetchRefspec(args.baseRef);
     if (baseSpec) {
@@ -4367,6 +4404,7 @@ async function materializeWorktreeAsync(args, deps) {
     const made = {
       baseTip,
       dir,
+      headFetchedBySha,
       headSha: args.headSha,
       strippedInstructionFiles: await stripAgentInstructionsAsync(dir)
     };

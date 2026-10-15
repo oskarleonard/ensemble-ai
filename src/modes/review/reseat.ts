@@ -901,7 +901,7 @@ function recordHealedParts(baseDir: string, runId: string, seat: CoreReviewerId,
 }
 
 // Re-render coverage-overview.md from the (now updated) chunk trail with the regate's counts.
-function rerenderOverview(baseDir: string, runId: string, headSha: string, gateCounts: Record<string, number> | undefined, log: (m: string) => void): void {
+export function rerenderOverview(baseDir: string, runId: string, headSha: string, gateCounts: Record<string, number> | undefined, log: (m: string) => void): void {
   try {
     const trail = readTrailJson<ChunksTrail>(baseDir, runId, CHUNKS_TRAIL_FILE);
     if (!trail || !Array.isArray(trail.chunks)) return;

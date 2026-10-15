@@ -248,6 +248,48 @@ describe('materialization hardening — untrusted content is checked out INERT i
     expect(baseFetchRefspec('release/1.2')).toBe('+refs/heads/release/1.2:refs/ensemble/base');
   });
 
+  it('fetches the pinned head by SHA when pull/N/head no longer carries it (rebased after the review)', () => {
+    const calls: string[][] = [];
+    const git: GitRun = ((args: string[]) => {
+      calls.push(args);
+      if (args[0] === 'rev-parse' && args[1] === '--git-common-dir') return ok('/repo/.git');
+      // The pull fetch landed, but the pinned head is not in what it brought.
+      if (args[0] === 'rev-parse' && args[1] === '--verify') return err('fatal: Needed a single revision');
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(headSha);
+      return ok('');
+    }) as GitRun;
+    const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git });
+    if (isPreflightError(res)) throw new Error(res.message);
+    expect(res.headFetchedBySha).toBe(true);
+    const fetches = calls.filter((c) => c.includes('fetch'));
+    expect(fetches).toHaveLength(2);
+    expect(fetches[0]).toContain('pull/7/head');
+    expect(fetches[1]).toContain(headSha);
+    expect(fetches[1]).toContain('https://github.com/o/r.git');
+    reapWorktree(res.dir);
+  });
+
+  it('a pinned head the remote will not serve by SHA is `no-such-pr`, named as a moved ref', () => {
+    const git: GitRun = ((args: string[]) => {
+      if (args[0] === 'rev-parse' && args[1] === '--git-common-dir') return ok('/repo/.git');
+      if (args[0] === 'rev-parse' && args[1] === '--verify') return err('fatal: Needed a single revision');
+      if (args.includes('fetch') && args.includes(headSha)) return err('fatal: remote error: upload-pack: not our ref');
+      return ok('');
+    }) as GitRun;
+    const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git });
+    expect(isPreflightError(res) && res.kind).toBe('no-such-pr');
+    expect(isPreflightError(res) && res.message).toMatch(/no longer points at aaaaaaaaaaaa .* not our ref/);
+  });
+
+  it('does not fetch by SHA when pull/N/head already carries the pinned head', () => {
+    const { calls, git } = harness(headSha);
+    const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git });
+    if (isPreflightError(res)) throw new Error(res.message);
+    expect(res.headFetchedBySha).toBe(false);
+    expect(calls.filter((c) => c.includes('fetch'))).toHaveLength(1);
+    reapWorktree(res.dir);
+  });
+
   it('creates the worktree from a PRIVATE bare repo (init --bare), never the shared checkout', () => {
     const { calls, git } = harness(headSha);
     const res = materializeWorktree({ headSha, location, pr: 7, worktreeRoot: '/tmp' }, { git });
@@ -512,6 +554,32 @@ describe('materializeWorktree · REAL git end-to-end (hermetic file:// origin)',
       expect(fs.existsSync(made.dir)).toBe(false);
       expect(fs.existsSync(parent)).toBe(false); // the private repo (a sibling) went with it
       reapWorktree(made.dir); // idempotent
+    } finally {
+      fs.rmSync(base, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  it('materializes a pinned head that pull/N/head has moved OFF, by SHA (real git, force-pushed origin)', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-moved-'));
+    try {
+      const { headSha, origin } = makeOrigin(base);
+      // The author rewrites the branch after the review: pull/7/head now names a commit whose history
+      // does not contain the reviewed head. The old commit is unreferenced but still in the store —
+      // as on GitHub, where it stays fetchable by SHA.
+      fs.writeFileSync(path.join(origin, 'src.ts'), 'export const x = 99;\n');
+      g(origin, 'add', '.');
+      g(origin, 'commit', '-q', '--amend', '-m', 'rewritten');
+      const moved = g(origin, 'rev-parse', 'HEAD');
+      expect(moved).not.toBe(headSha);
+      g(origin, 'update-ref', 'refs/pull/7/head', moved);
+      g(origin, 'config', 'uploadpack.allowAnySHA1InWant', 'true');
+      const consumer = makeConsumer(base);
+      const made = materialize(base, consumer, headSha, origin);
+      if (isPreflightError(made)) throw new Error(`materialization failed: ${made.message}`);
+      expect(made.headSha).toBe(headSha);
+      expect(made.headFetchedBySha).toBe(true);
+      expect(fs.readFileSync(path.join(made.dir, 'src.ts'), 'utf8')).toContain('x = 0');
+      reapWorktree(made.dir);
     } finally {
       fs.rmSync(base, { force: true, recursive: true });
     }
