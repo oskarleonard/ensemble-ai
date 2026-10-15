@@ -231,11 +231,14 @@ export function extractJsonBlock(raw: string): unknown {
     }
   }
   // FOURTH pass: a stray closing bracket (the `}}},{` shape), on top of the other two repairs.
-  for (const c of candidates) {
+  // FENCED candidate only: over the widest `{…}` span of a prose reply a dropped bracket can
+  // stitch unrelated text into a shape that parses, and that is where a false review would come
+  // from. Inside a fence the model meant JSON, so a repaired parse is the reply it meant.
+  if (fenced) {
     try {
-      return JSON.parse(stripTrailingCommas(repairBrackets(escapeRawNewlinesInStrings(c))));
+      return JSON.parse(stripTrailingCommas(repairBrackets(escapeRawNewlinesInStrings(fenced))));
     } catch {
-      // try the next candidate
+      // fall through
     }
   }
   return null;
