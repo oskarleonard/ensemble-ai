@@ -23,7 +23,7 @@ function makeExport(name: string): string {
 describe('parseCompanionFlags', () => {
   it('accepts <name>=<absolute existing dir>, refuses the rest', () => {
     const d = makeExport('a');
-    expect(parseCompanionFlags([`lisk-infra=${d}`])).toEqual([{ name: 'lisk-infra', dir: fs.realpathSync(d) }]);
+    expect(parseCompanionFlags([`acme-infra=${d}`])).toEqual([{ name: 'acme-infra', dir: fs.realpathSync(d) }]);
     expect(() => parseCompanionFlags(['nodir'])).toThrow(/<name>=<dir>/);
     expect(() => parseCompanionFlags(['Bad Name=/tmp'])).toThrow(/must match/);
     expect(() => parseCompanionFlags([`x=relative/dir`])).toThrow(/absolute/);
@@ -36,15 +36,15 @@ describe('installCompanions', () => {
   it('copies under .companions/<name>, strips instruction files, drops symlinks, sets the clause', () => {
     const wt = fs.mkdtempSync(path.join(tmp, 'worktree-'));
     const d = makeExport('b');
-    const [c] = installCompanions(wt, [{ name: 'lisk-infra', dir: d }]);
-    expect(c.installedAt).toBe(path.join(wt, '.companions', 'lisk-infra'));
+    const [c] = installCompanions(wt, [{ name: 'acme-infra', dir: d }]);
+    expect(c.installedAt).toBe(path.join(wt, '.companions', 'acme-infra'));
     expect(fs.existsSync(path.join(c.installedAt, 'terraform', 'main.tf'))).toBe(true);
     expect(fs.existsSync(path.join(c.installedAt, 'CLAUDE.md'))).toBe(false);
     expect(fs.existsSync(path.join(c.installedAt, 'AGENTS.md'))).toBe(false);
     expect(fs.existsSync(path.join(c.installedAt, 'leak'))).toBe(false);
     expect(c.files).toBe(1);
     expect(companionsClause()).toContain('`.companions/<name>/`');
-    expect(companionsClause()).toContain('`lisk-infra`');
+    expect(companionsClause()).toContain('`acme-infra`');
   });
   it('no companions → no clause', () => {
     expect(installCompanions(tmp, [])).toEqual([]);

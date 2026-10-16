@@ -9,20 +9,20 @@ import {
   resolveGitleaksExemptions,
 } from './gitleaks-allowlist';
 
-// The shape of lisk-app's backend/.gitleaks.toml at 16364a8a: comments inside the
+// The shape of a real monorepo's backend/.gitleaks.toml: comments inside the
 // arrays (with quotes in them), regexes carrying `]`, `#` and quotes, a `regexes`
 // array BEFORE `paths`, and a per-rule section that must be ignored.
-const LISK_LIKE = `
-title = "lisk-backend"
+const REAL_LIKE = `
+title = "acme-backend"
 
 [extend]
 useDefault = true
 disabledRules = ["generic-api-key"]
 
 [[rules]]
-id = "lisk-secret-env-assignment"
-regex = '''(?i)(lisk_[a-z0-9_]*(secret|token))\\s*[:=]\\s*['"]?([^\\s'"#]{8,})['"]?'''
-keywords = ["lisk_"]
+id = "acme-secret-env-assignment"
+regex = '''(?i)(acme_[a-z0-9_]*(secret|token))\\s*[:=]\\s*['"]?([^\\s'"#]{8,})['"]?'''
+keywords = ["acme_"]
 
 [rules.allowlist]
 paths = [ '''(^|/)per-rule-only/''' ]
@@ -66,7 +66,7 @@ describe('readTomlStringArray', () => {
 
 describe('parseGitleaksAllowlistPaths', () => {
   it('compiles the GLOBAL allowlist paths and ignores per-rule allowlists and regexes', () => {
-    const { invalid, patterns } = parseGitleaksAllowlistPaths(LISK_LIKE);
+    const { invalid, patterns } = parseGitleaksAllowlistPaths(REAL_LIKE);
     expect(invalid).toEqual([]);
     expect(patterns).toHaveLength(7);
     expect(patterns.some((re) => re.test('scripts/gitleaks-selftest.sh'))).toBe(true);
@@ -133,8 +133,8 @@ describe('resolveGitleaksExemptions', () => {
     };
   }
 
-  it('exempts lisk-app’s self-test through backend/.gitleaks.toml, reading each config once', async () => {
-    const reader = readerOf({ 'backend/.gitleaks.toml': LISK_LIKE });
+  it('exempts a monorepo’s self-test through backend/.gitleaks.toml, reading each config once', async () => {
+    const reader = readerOf({ 'backend/.gitleaks.toml': REAL_LIKE });
     const ex = await resolveGitleaksExemptions(reader, [
       'backend/scripts/gitleaks-selftest.sh',
       'backend/pkg/handler/x.go',

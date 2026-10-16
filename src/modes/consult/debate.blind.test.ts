@@ -30,7 +30,7 @@ describe('the blind judge', () => {
   it('leaves the article, initials and identifiers alone', () => {
     const keep = [
       'A separate portfolio-send guard runs on save. A Bridge USDC-on-Ethereum method becomes a refund path.',
-      'Plan B is the manual procedure; Appendix C lists the hosts; see §3.4/§5.2 and PLAT-757.',
+      'Plan B is the manual procedure; Appendix C lists the hosts; see §3.4/§5.2 and ACME-757.',
       'A zero-row database query alone does not prove coverage. A later replay must not duplicate it.',
     ];
     for (const t of keep) expect(deanonymizeJudgeText(t, alias)).toBe(t);

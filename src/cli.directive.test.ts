@@ -183,10 +183,10 @@ describe('--intent <file> threads tracker text into the mode and pins it to the 
   it('reads the file, passes it as `intent`, and writes intent.md beside the packet', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-intent-'));
     const file = path.join(dir, 'ticket.md');
-    fs.writeFileSync(file, '## ORG-1 — keep the 403 declarations\n\nA suspended member still gets 403.\n');
+    fs.writeFileSync(file, '## ACME-1 — keep the 403 declarations\n\nA suspended member still gets 403.\n');
     expect(await main(['review', '--pr', '7', '--intent', file, '--out', dir, '--run-id', 'r1'])).toBe(0);
-    expect(mockRun.mock.calls[0]?.[0].intent).toBe('## ORG-1 — keep the 403 declarations\n\nA suspended member still gets 403.');
-    expect(fs.readFileSync(path.join(dir, 'r1', 'intent.md'), 'utf8')).toBe('## ORG-1 — keep the 403 declarations\n\nA suspended member still gets 403.');
+    expect(mockRun.mock.calls[0]?.[0].intent).toBe('## ACME-1 — keep the 403 declarations\n\nA suspended member still gets 403.');
+    expect(fs.readFileSync(path.join(dir, 'r1', 'intent.md'), 'utf8')).toBe('## ACME-1 — keep the 403 declarations\n\nA suspended member still gets 403.');
     expect(errorLines().some((l) => l.includes('intent:') && l.includes('handed to every seat'))).toBe(true);
     fs.rmSync(dir, { force: true, recursive: true });
   });

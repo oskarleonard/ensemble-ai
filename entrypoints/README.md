@@ -78,7 +78,7 @@ The gate can always be bypassed, so it can never wedge PR creation:
 
 The gate is **review-only** and **purely local** — it runs the local verifier and
 reads a local receipt store; it transmits nothing. That makes it safe to install in
-the work config too, so it reaches `_work`/Lisk diffs (per the ratified
+the work config too, so it reaches work-repo diffs (per the ratified
 codex-grok-work-code-review-policy — personal Codex/Grok tooling may REVIEW work
 code, review-only, nothing leaves the machine):
 
