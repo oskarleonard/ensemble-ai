@@ -5561,6 +5561,14 @@ json block, in this schema:
 ${SCHEMA_BLOCK}`;
 }
 
+// src/modes/review/product-docs.ts
+var NUMBERING = String.raw`(?:\d+(?:\.\d+)*\.?\s+)?`;
+var NON_NORMATIVE_PREFIX_RE = new RegExp(
+  `^${NUMBERING}(?:non[\\s-]?goals?|out[\\s-]of[\\s-]scope|open[\\s-]questions?|alternatives?\\s+(?:considered|explored|evaluated|rejected)|rejected\\s+(?:alternatives?|options?|approaches?|designs?|ideas?))\\b`,
+  "i"
+);
+var NON_NORMATIVE_WHOLE_RE = new RegExp(`^${NUMBERING}(?:alternatives?|drafts?|deprecated|superseded)\\s*:?$`, "i");
+
 // src/modes/review/product.ts
 var PRODUCT_SEAT_ID = "product";
 var PRODUCT_SEVERITY_CAP = "medium";

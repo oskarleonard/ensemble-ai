@@ -8131,7 +8131,7 @@ function indexProductDocs(text) {
   return { lines, sources };
 }
 var BR_RE = /<br\s*\/?>/gi;
-var TAG_RE = /<[^>]*>/g;
+var TAG_RE = /<\/?[A-Za-z][\w:-]*(?:\s[^<>]*)?\/?>/g;
 var ENTITY_RE = /&(amp|lt|gt|quot|#39|nbsp);/g;
 var ENTITIES = { "#39": "'", amp: "&", gt: ">", lt: "<", nbsp: " ", quot: '"' };
 var IMAGE_RE = /!\[[^\]]*\]\([^)]*\)/g;
@@ -8210,9 +8210,14 @@ function docHeadingPath(index, source, span) {
   }
   return { all: [...all], atStart };
 }
-var NON_NORMATIVE_RE = /non[\s-]?goals?|out[\s-]of[\s-]scope|alternative|rejected|superseded|deprecated|draft|open[\s-]questions?/i;
+var NUMBERING = String.raw`(?:\d+(?:\.\d+)*\.?\s+)?`;
+var NON_NORMATIVE_PREFIX_RE = new RegExp(
+  `^${NUMBERING}(?:non[\\s-]?goals?|out[\\s-]of[\\s-]scope|open[\\s-]questions?|alternatives?\\s+(?:considered|explored|evaluated|rejected)|rejected\\s+(?:alternatives?|options?|approaches?|designs?|ideas?))\\b`,
+  "i"
+);
+var NON_NORMATIVE_WHOLE_RE = new RegExp(`^${NUMBERING}(?:alternatives?|drafts?|deprecated|superseded)\\s*:?$`, "i");
 function nonNormativeHeading(path28) {
-  return path28.find((h) => NON_NORMATIVE_RE.test(h)) ?? null;
+  return path28.find((h) => NON_NORMATIVE_PREFIX_RE.test(h) || NON_NORMATIVE_WHOLE_RE.test(h)) ?? null;
 }
 var DOC_CONTEXT_RADIUS = 8;
 var CONTEXT_LINE_CAP = 500;

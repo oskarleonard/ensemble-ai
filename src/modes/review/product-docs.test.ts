@@ -11,6 +11,7 @@ import {
   nonNormativeHeading,
   normalizeDocLine,
   renderDocLine,
+  visibleDocText,
 } from './product-docs';
 import { PRODUCT_DOCS } from './product-fixture';
 
@@ -139,6 +140,30 @@ describe('docHeadingPath + nonNormativeHeading — where a quote sits decides wh
     (h) => expect(nonNormativeHeading([h])).toBe(h)
   );
   it('a heading like "Goals" or "Rules" is not', () => expect(nonNormativeHeading(['Goals', 'Rules'])).toBeNull());
+
+  it.each(['Non-goals for v1', 'Open questions (resolved)', '7.2 Out of scope', 'Alternatives considered and rejected', 'Alternatives:'])(
+    '%s still reads as its section',
+    (h) => expect(nonNormativeHeading([h])).toBe(h)
+  );
+
+  // An invoicing / payments design uses these words as DOMAIN language — the rules under them are in force.
+  it.each(['Draft invoices', 'Rejected payments', 'Alternative payment methods', 'Deprecated fields and their replacements', 'Superseded bills'])(
+    '%s is domain language, not a non-normative section',
+    (h) => expect(nonNormativeHeading([h])).toBeNull()
+  );
+});
+
+describe('visibleDocText — a TAG is a tag name, never any <…>', () => {
+  it('prose with < and > keeps every word, so a quote that differs between them cannot match', () => {
+    expect(visibleDocText('Refund when amount < 5 and fee > 3.')).toBe('Refund when amount < 5 and fee > 3.');
+    expect(visibleDocText('Limits: 1 <= n >= 0')).toBe('Limits: 1 <= n >= 0');
+    expect(normalizeDocLine('Refund when amount < 5 and fee > 3.')).not.toBe(normalizeDocLine('Refund when amount < 9 and fee > 3.'));
+  });
+  it('real tags still go: span with attributes, mention, empty-block, closing tags', () => {
+    expect(visibleDocText('<span discussion-urls="discussion://a/b">A rule</span> <mention-user url="user://x"/><empty-block/>')).toBe(
+      'A rule '
+    );
+  });
 });
 
 describe('docContext — the quote with ±8 lines of its own section, never the whole file', () => {

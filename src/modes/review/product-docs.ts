@@ -79,7 +79,11 @@ export function indexProductDocs(text: string): ProductDocsIndex {
 // character. A faithful copy of the raw line folds to the same text, so it still matches too.
 
 const BR_RE = /<br\s*\/?>/gi;
-const TAG_RE = /<[^>]*>/g;
+// A TAG is `<` straight followed by a tag name (or `/name`), attributes free of `<` and `>`. Never
+// any `<…>`: "amount < 5 and fee > 3" is prose, and erasing the span between the two signs would let
+// a quote with different numbers in it match the real line — a false VERIFY, the one failure a fold
+// may not cause.
+const TAG_RE = /<\/?[A-Za-z][\w:-]*(?:\s[^<>]*)?\/?>/g;
 const ENTITY_RE = /&(amp|lt|gt|quot|#39|nbsp);/g;
 const ENTITIES: Record<string, string> = { '#39': "'", amp: '&', gt: '>', lt: '<', nbsp: ' ', quot: '"' };
 const IMAGE_RE = /!\[[^\]]*\]\([^)]*\)/g;
@@ -219,10 +223,22 @@ export function docHeadingPath(index: ProductDocsIndex, source: ProductSource, s
 
 // Headings under which a sentence is not a rule in force. A superset of the reviewed list (it also
 // folds "out-of-scope", "non goals", "open questions"): a wider net here only ever DOWNGRADES.
-const NON_NORMATIVE_RE = /non[\s-]?goals?|out[\s-]of[\s-]scope|alternative|rejected|superseded|deprecated|draft|open[\s-]questions?/i;
+//
+// ANCHORED to the heading's start (after any "7.2" numbering the fold left): a heading that IS such a
+// section, never one that uses the word as domain language — an invoicing or payments design has
+// "Draft invoices", "Rejected payments" and "Alternative payment methods", and those rules ARE in
+// force. "Non-goals for v1" / "Open questions (resolved)" still read as their section; the bare words
+// that double as domain terms (alternative(s), draft(s), deprecated, superseded) count only as the
+// whole heading. A miss here costs nothing: the gate still reads the heading path and judges it.
+const NUMBERING = String.raw`(?:\d+(?:\.\d+)*\.?\s+)?`;
+const NON_NORMATIVE_PREFIX_RE = new RegExp(
+  `^${NUMBERING}(?:non[\\s-]?goals?|out[\\s-]of[\\s-]scope|open[\\s-]questions?|alternatives?\\s+(?:considered|explored|evaluated|rejected)|rejected\\s+(?:alternatives?|options?|approaches?|designs?|ideas?))\\b`,
+  'i'
+);
+const NON_NORMATIVE_WHOLE_RE = new RegExp(`^${NUMBERING}(?:alternatives?|drafts?|deprecated|superseded)\\s*:?$`, 'i');
 
 export function nonNormativeHeading(path: readonly string[]): string | null {
-  return path.find((h) => NON_NORMATIVE_RE.test(h)) ?? null;
+  return path.find((h) => NON_NORMATIVE_PREFIX_RE.test(h) || NON_NORMATIVE_WHOLE_RE.test(h)) ?? null;
 }
 
 // ── What the gate is shown for one finding ────────────────────────────────────────────
