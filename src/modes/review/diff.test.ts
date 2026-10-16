@@ -329,8 +329,8 @@ index 111..222 100644
   });
 
   it('`-generated.json` is a generator name shape too', () => {
-    expect(classifyFileKind('web/apps/web/api-specs/lisk-backend-generated.json', false)).toBe('generated');
-    expect(classifyFileKind('web/apps/web/api-specs/lisk-backend-upcoming.json', false)).toBe('source');
+    expect(classifyFileKind('web/apps/web/api-specs/acme-backend-generated.json', false)).toBe('generated');
+    expect(classifyFileKind('web/apps/web/api-specs/acme-backend-upcoming.json', false)).toBe('source');
   });
 });
 

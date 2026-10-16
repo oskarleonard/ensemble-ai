@@ -5,7 +5,7 @@ import { STRIPPED_INSTRUCTION_PATHS } from './worktree';
 
 // COMPANION REPOS for a worktree review (`--companion <name>=<dir>`, repeatable — hugin spec
 // doc-review-evidence §8, 2026-10-09). A PR's other half often lives in a sibling repo (a
-// lisk-app backend change whose deployment, subgraph config and env wiring live in lisk-infra).
+// monorepo backend change whose deployment, subgraph config and env wiring live in an infra repo).
 // The caller exports each companion at a pinned commit (no .git, instruction files already
 // stripped) and the engine places it INSIDE the worktree under `.companions/<name>/` after the
 // worktree is materialized and before any seat spawns — so every fenced seat reaches it through
