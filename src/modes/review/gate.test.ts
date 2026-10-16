@@ -311,8 +311,8 @@ describe('reconcileGateVerdicts — postable text (A+)', () => {
     expect(u).toMatchObject({ effectiveVerdict: 'unverified', postableBody: null, postableStatus: 'not-postable' });
   });
 
-  it('the durable trail schema is bumped to v12 (base drift; scope was v11, verifiedKernel v10, premise v9, duplicateOf/duplicates v8, verifyRequested v7, settlement v6, postable/placement/anchorSide/tldr v2–v5)', () => {
-    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(12);
+  it('the durable trail schema is bumped to v13 (product docRef/docVerified; base drift was v12, scope v11, verifiedKernel v10, premise v9, duplicateOf/duplicates v8, verifyRequested v7, settlement v6, postable/placement/anchorSide/tldr v2–v5)', () => {
+    expect(GATE_TRAIL_SCHEMA_VERSION).toBe(13);
   });
 
   describe('duplicateOf → threaded duplicate echoes (trail v8)', () => {

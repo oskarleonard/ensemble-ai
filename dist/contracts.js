@@ -49,6 +49,7 @@ function severityAtLeast(severity, floor) {
   return s >= 0 && f >= 0 && s <= f;
 }
 var CONFIDENCES = ["high", "medium", "low"];
+var DOC_CLAIM_CLASSES = ["rule-broken", "decision-reversed", "promise-undelivered"];
 var TERMINAL_STATES = ["reviewed", "failed-reviewer"];
 
 // src/core/findings.ts
@@ -93,6 +94,22 @@ function asEvidence(v) {
     file: typeof e.file === "string" && e.file.trim() ? e.file.trim() : void 0,
     line: typeof e.line === "number" && Number.isInteger(e.line) && e.line > 0 ? e.line : void 0
   };
+}
+var DOC_KEY_CAP = 200;
+var DOC_QUOTE_CAP = 8e3;
+function asDocClaimClass(v) {
+  if (typeof v !== "string") return void 0;
+  const k = v.trim().toLowerCase().replace(/[\s_]+/g, "-");
+  return DOC_CLAIM_CLASSES.includes(k) ? k : void 0;
+}
+function parseDocRef(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return void 0;
+  const d = v;
+  const key = typeof d.key === "string" ? d.key.trim() : "";
+  const quote = typeof d.quote === "string" ? d.quote : "";
+  if (!key || key.length > DOC_KEY_CAP || !quote.trim()) return void 0;
+  const cls = asDocClaimClass(d.class);
+  return { ...cls ? { class: cls } : {}, key, quote: quote.length > DOC_QUOTE_CAP ? quote.slice(0, DOC_QUOTE_CAP) : quote };
 }
 function stripTrailingCommas(s) {
   let out = "";
@@ -241,9 +258,11 @@ function parseFindings(raw) {
     const f = rf;
     const evidence = asEvidence(f.evidence);
     const uncited = !evidence.file;
+    const docRef = parseDocRef(f.docRef);
     findings.push({
       body: typeof f.body === "string" ? f.body : "",
       confidence: uncited ? "low" : asConfidence(f.confidence),
+      ...docRef ? { docRef } : {},
       evidence,
       id: `f${i + 1}`,
       severity: asSeverity(f.severity),
@@ -604,6 +623,7 @@ export {
   CORE_REVIEWER_IDS,
   DIFF_SECTION_TITLE,
   DIFF_USEFUL_FLOOR,
+  DOC_CLAIM_CLASSES,
   FINDINGS_INSTRUCTIONS,
   PACKET_BUDGETS,
   REVIEWER_IDS,
@@ -622,6 +642,7 @@ export {
   isReviewerId,
   isSeatAdvisor,
   oneOf,
+  parseDocRef,
   parseFindings,
   parseReviewerIds,
   parseSeatAdvisor,

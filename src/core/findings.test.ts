@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   escapeRawNewlinesInStrings,
   extractJsonBlock,
+  parseDocRef,
   parseFindings,
   repairBrackets,
   stripTrailingCommas,
@@ -181,5 +182,44 @@ describe('parseFindings', () => {
       expect(r.parseError).toBeDefined();
       expect(r.findings).toEqual([]);
     }
+  });
+});
+
+// The product seat's DOC half rides the ONE parser (symmetry): kept when well-formed, dropped
+// otherwise, and never grown onto a finding that did not send one.
+describe('parseFindings — docRef (the product seat)', () => {
+  const one = (extra: object) =>
+    parseFindings(JSON.stringify({ findings: [{ body: 'b', confidence: 'high', evidence: { file: 'a.go', line: 1 }, severity: 'medium', title: 't', ...extra }], summary: 's' })).findings[0];
+
+  it('keeps a well-formed ref, folding the class spelling', () => {
+    expect(one({ docRef: { class: 'RULE BROKEN', key: ' ACME-12 ', quote: 'A suspended member still gets 403.' } }).docRef).toEqual({
+      class: 'rule-broken',
+      key: 'ACME-12',
+      quote: 'A suspended member still gets 403.',
+    });
+    expect(one({ docRef: { class: 'promise_undelivered', key: 'k', quote: 'q' } }).docRef?.class).toBe('promise-undelivered');
+  });
+
+  it('drops an unknown class but keeps the ref (the host then applies its strictest check)', () => {
+    expect(one({ docRef: { class: 'scope-exceeded', key: 'k', quote: 'q' } }).docRef).toEqual({ key: 'k', quote: 'q' });
+  });
+
+  it.each([
+    ['no key', { quote: 'q' }],
+    ['a blank quote', { key: 'k', quote: '   ' }],
+    ['a non-string key', { key: 7, quote: 'q' }],
+    ['an over-long key', { key: 'k'.repeat(201), quote: 'q' }],
+    ['an array', ['k', 'q']],
+  ])('drops a malformed ref: %s', (_, docRef) => {
+    expect('docRef' in one({ docRef })).toBe(false);
+  });
+
+  it('never adds the key to a finding that sent none', () => {
+    expect('docRef' in one({})).toBe(false);
+  });
+
+  it('bounds a hostile quote (a cut quote can no longer verify — fail closed)', () => {
+    expect(one({ docRef: { key: 'k', quote: 'x'.repeat(9000) } }).docRef?.quote).toHaveLength(8000);
+    expect(parseDocRef({ key: 'k', quote: 'q' })).toEqual({ key: 'k', quote: 'q' });
   });
 });

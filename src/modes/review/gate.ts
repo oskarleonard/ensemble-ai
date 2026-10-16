@@ -1,6 +1,9 @@
-import { writeTrailFile } from '../../core/artifacts';
-import { evidenceRef, extractJsonBlock } from '../../core/findings';
-import { SEVERITIES, type Severity } from '../../core/types';
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { reviewDir, writeTrailFile } from '../../core/artifacts';
+import { evidenceRef, extractJsonBlock, parseDocRef } from '../../core/findings';
+import { type DocRef, SEVERITIES, type Severity } from '../../core/types';
 import type { ResolvedVoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 import { type RunReviewOpts } from '../../reviewers/codex';
@@ -51,7 +54,10 @@ import {
   isHolisticRecord,
   parseConventionCitation,
   parseHolisticSites,
+  worktreeReader,
 } from './holistic-gate';
+import { applyProductPolicy, checkProductFinding, isProductRecord, type ProductCheck, type ProductGateDeps } from './product-gate';
+import { indexProductDocs, PRODUCT_DOCS_TRAIL_FILE } from './product-docs';
 import {
   fallbackReviewSynthesis,
   parseAgreements,
@@ -117,6 +123,15 @@ export const DOWNGRADE_REASONS = [
   // Emitted ONLY on worktree evidence (a packet gate cannot walk the tree to find the dependency)
   // and only for an agree/partial; the holistic lens has its own in-diff rule (holistic-gate.ts).
   'pre-existing',
+  // ADDITIVE (the product seat, trail v13): the host's own checks of a product finding's two halves
+  // (product-gate.ts). The host owns TEXT EXISTENCE and can only downgrade: a key the pinned docs file
+  // does not name; a source whose copy is stale; a quote that is not a run of complete lines of its
+  // source; a rule or decision quoted out of a non-normative section; a code site absent at the head.
+  'doc-key-unknown',
+  'stale-doc',
+  'doc-quote-not-found',
+  'doc-quote-non-normative',
+  'code-site-missing',
 ] as const;
 export type DowngradeReason = (typeof DOWNGRADE_REASONS)[number];
 
@@ -193,7 +208,12 @@ export const GATE_ENVELOPE_SCHEMA_VERSION = 1;
 // branch change the cited file between the branch point and its current tip?) and a trail-level
 // `base` block (sha · ref · tip · branchPoint · behindBy). Label only: no verdict moves on it.
 // Additive like v5-v11: absent when the base tip was not fetched.
-export const GATE_TRAIL_SCHEMA_VERSION = 12;
+// v13: adds the PRODUCT SEAT's fields on `product#` records only — `docRef` (the source key + quote
+// the finding names), `docVerified` (the HOST's verdict on that quote: complete lines of a source the
+// pinned product-docs.md names), and five downgrade reasons (doc-key-unknown · stale-doc ·
+// doc-quote-not-found · doc-quote-non-normative · code-site-missing). Additive like v5-v12: absent on
+// every other record, so a reader that ignores unknown keys reads every other record unchanged.
+export const GATE_TRAIL_SCHEMA_VERSION = 13;
 
 const REASON_CAP = 700;
 const CITATION_CAP = 500;
@@ -226,6 +246,9 @@ export interface GateFinding {
   // The line space `line` was resolved in — see AnchorSide. null when `resolved` is false.
   anchorSide: AnchorSide;
   body: string;
+  // The document half of a product-seat finding (product-gate.ts), re-validated off the trail.
+  // Absent on every other finding.
+  docRef?: DocRef;
   file: string;
   findingId: string; // `${voiceId}#${n}` — unique across all three reviewers
   hunkCode: string[]; // normalized code lines of the FULL resolved hunk (citation basis; [] if unresolved)
@@ -259,6 +282,7 @@ export const GATE_HUNK_BYTE_BUDGET = 40_960;
 
 interface RawFinding {
   body: string;
+  docRef?: DocRef;
   file: string;
   findingId: string;
   index: number;
@@ -274,8 +298,12 @@ function flattenFindings(reviews: VoiceReview[]): RawFinding[] {
   const out: RawFinding[] = [];
   reviews.forEach((r, reviewerRank) => {
     r.findings.forEach((f, i) => {
+      // A ref read back off a trail file is re-validated with the parser's own rule — a corrupted or
+      // hand-edited review file must not hand the host a malformed document half.
+      const docRef = parseDocRef(f.docRef);
       out.push({
         body: f.body,
+        ...(docRef ? { docRef } : {}),
         file: f.evidence.file ?? '',
         findingId: `${r.voiceId}#${i + 1}`,
         index: i,
@@ -385,6 +413,7 @@ export function prepareGateFindings(
       // deletion-only hunk (newCount === 0), so the hunk's own newCount names the side.
       anchorSide: res ? (res.hunk.newCount > 0 ? 'new' : 'old') : null,
       body: rf.body,
+      ...(rf.docRef ? { docRef: rf.docRef } : {}),
       file: rf.file,
       findingId: rf.findingId,
       hunkCode: res ? hunkCodeLines(res.hunk) : [],
@@ -758,6 +787,13 @@ export interface GateVerdictRecord {
   anchorSide: AnchorSide;
   citation?: string;
   cluster?: ClusterInfo; // cross-reviewer cluster (postable records only); absent ⇒ singleton / not clustered
+  // Trail v13 (additive, `product#` records only): the document half the finding names, and the
+  // HOST's verdict on its quote (product-gate.ts) — true ⇔ complete lines of a source the pinned
+  // product-docs.md names. A host override of the gate on a product record says why in
+  // downgradeReason (doc-key-unknown · stale-doc · doc-quote-not-found · doc-quote-non-normative ·
+  // code-site-missing).
+  docRef?: DocRef;
+  docVerified?: boolean;
   downgradeReason: DowngradeReason | null;
   // Trail v8 (additive): set on an UNVERIFIED record the gate pointed at another reviewer's
   // finding as the same defect. Host-validated: the id exists and differs from this record's.
@@ -892,6 +928,9 @@ export function reconcileGateVerdicts(
   opts: {
     gateEvidence?: EvidenceClass;
     holistic?: HolisticPolicyDeps;
+    // The product seat's host checks (product-gate.ts): the pinned docs + the tree reader. Absent ⇒
+    // any product record present fails closed (nothing to check its two halves against).
+    product?: ProductGateDeps;
     // The scope rule's facts (trail v11): the pinned hunks and every path the change touches. Both
     // absent ⇒ every scope is 'unknown' and nothing is demoted — the pre-v11 behavior.
     packetHunks?: ReadonlyMap<string, Hunk[]>;
@@ -901,21 +940,26 @@ export function reconcileGateVerdicts(
   const gateEvidence: EvidenceClass = opts.gateEvidence ?? 'packet';
   if ('failure' in parsed) {
     const reason = FAILURE_REASON[parsed.failure];
+    // Nothing here is postable, but the lens's MED cap is a HOST guarantee on every path: a
+    // failed gate must not leave the lens's own model-asserted `high` standing in the trail or
+    // on stdout. The full policy cannot run — there are no verdict entries to read sites off.
+    const failed = findings.map((f) =>
+      capHolisticSeverity({
+        ...recordBase(f),
+        ...NOT_POSTABLE,
+        downgradeReason: parsed.failure,
+        effectiveVerdict: 'unverified',
+        rawVerdict: null,
+        reason,
+        tldr: null, // no envelope ⇒ no confirmed verdict ⇒ nothing to summarize
+      })
+    );
+    // The product cap is the same kind of guarantee, and the host's facts about each quote do not
+    // depend on the gate at all — so they are recorded on this path too (nothing is upgraded).
     return {
-      // Nothing here is postable, but the lens's MED cap is a HOST guarantee on every path: a
-      // failed gate must not leave the lens's own model-asserted `high` standing in the trail or
-      // on stdout. The full policy cannot run — there are no verdict entries to read sites off.
-      records: findings.map((f) =>
-        capHolisticSeverity({
-          ...recordBase(f),
-          ...NOT_POSTABLE,
-          downgradeReason: parsed.failure,
-          effectiveVerdict: 'unverified',
-          rawVerdict: null,
-          reason,
-          tldr: null, // no envelope ⇒ no confirmed verdict ⇒ nothing to summarize
-        })
-      ),
+      records: failed.some(isProductRecord)
+        ? applyProductPolicy(failed, new Map(findings.map((f) => [f.findingId, f])), opts.product ?? null)
+        : failed,
       warnings: [],
     };
   }
@@ -1106,7 +1150,11 @@ export function reconcileGateVerdicts(
         opts.holistic ?? null
       )
     : postableRecords;
-  return { records: threadDuplicateEchoes(records, findingById), warnings };
+  // The PRODUCT pass (product-gate.ts) — same shape as the holistic one: skipped ENTIRELY when the
+  // seat produced no findings, so every run without it is byte-identical. When it ran, its records
+  // are the only ones touched: the host's text checks, the MED cap, agree-only posting, the Doc line.
+  const withProduct = records.some(isProductRecord) ? applyProductPolicy(records, findingById, opts.product ?? null) : records;
+  return { records: threadDuplicateEchoes(withProduct, findingById), warnings };
 }
 
 // The duplicate's threaded claim is trail/triage context, so it gets the same generous bound as
@@ -1366,7 +1414,9 @@ export function renderGateVerdicts(
       // a verified citation too, and claiming it uncapped anything would be a false claim.
       const lens = r.holistic
         ? `  [holistic lens · single seat${r.holistic.cappedFrom ? ` · severity capped from ${r.holistic.cappedFrom}` : ''}${holisticCapWasLifted(r) ? ' · MED cap lifted by a verified conventions citation' : ''}]`
-        : '';
+        : r.docVerified !== undefined
+          ? `  [product seat · doc ${r.docRef ? s(r.docRef.key).slice(0, 80) : '(none)'} · quote ${r.docVerified ? 'verified' : 'NOT verified'}]`
+          : '';
       out.push(
         `     [${r.effectiveVerdict}] ${r.findingId} [${r.severity}] ${where}  ${s(r.title).slice(0, 120)}${reason}${dg}${lens}`
       );
@@ -1502,6 +1552,16 @@ export interface RunGateOptions {
   worktree?: string;
 }
 
+// The pinned docs the product seat was handed (product-docs.ts), indexed. Missing or unreadable ⇒
+// null: every product record then fails closed (doc-key-unknown), never verifies against nothing.
+function readPinnedProductDocs(baseDir: string, runId: string) {
+  try {
+    return indexProductDocs(fs.readFileSync(path.join(reviewDir(baseDir, runId), PRODUCT_DOCS_TRAIL_FILE), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
 // Run the gate end-to-end: read the pinned packet → resolve+budget each finding's hunk →
 // render the hunk-fed prompt → spawn the gate voice → parse the composite envelope →
 // host-reconcile the verdicts → write the durable trail. FAIL-CLOSED throughout: a packet
@@ -1529,10 +1589,28 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   const { findings, injections } = prepareGateFindings(healthy, packetHunks, gateHunkBudgetFor(partCount));
   if (partCount > 1) log(`  · gate: ${partCount} parts — hunk budget ${gateHunkBudgetFor(partCount)} bytes`);
 
+  // THE PRODUCT SEAT's host checks (product-gate.ts) — only when it produced findings, so a run
+  // without it reads no file and changes no byte. The docs are the PINNED copy in the trail (the
+  // exact bytes the seat was handed); the code site is read from the worktree the gate reads. The
+  // deps are built ONCE and serve both the prompt (what the gate is shown per finding) and the
+  // reconcile (what each record becomes), for the primary and the shadow alike — the same pure
+  // check over the same deps, so the prompt can never promise what the record then refuses.
+  const productDeps: ProductGateDeps | undefined = findings.some(isProductRecord)
+    ? { docs: readPinnedProductDocs(opts.baseDir, opts.runId), readAtHead: opts.worktree ? worktreeReader(opts.worktree) : null }
+    : undefined;
+  const productChecks: Map<string, ProductCheck> | undefined = productDeps
+    ? new Map(findings.filter(isProductRecord).map((f) => [f.findingId, checkProductFinding(f, productDeps)]))
+    : undefined;
+  if (productChecks) {
+    const failed = [...productChecks.values()].filter((c) => c.failure).length;
+    log(`  · gate: ${productChecks.size} product finding(s) — ${productChecks.size - failed} pass the host's doc + code-site checks${failed ? `, ${failed} already unverified` : ''}`);
+  }
+
   // ONE reconcile config for the primary AND the shadow — property 3 of the shadow gate: a
   // verdict difference must be judge vs judge, never a reconcile-input drift.
   const changedFiles = new Set(packet.ok && packet.changedFiles ? packet.changedFiles : packetHunks.keys());
   const reconcileOpts = {
+    ...(productDeps ? { product: productDeps } : {}),
     gateEvidence: opts.gateEvidence,
     // The scope rule (trail v11) reads the same pinned facts the hunk resolver does.
     packetHunks,
@@ -1728,6 +1806,8 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     ...(opts.directive ? { directive: opts.directive } : {}),
     ...(opts.intent ? { intent: opts.intent } : {}),
     ...(opts.gateEvidence === 'worktree' && opts.conventionsPath ? { conventionsFile: opts.conventionsPath } : {}),
+    // Per product finding: the host's verdict on its text half, and the quote in context.
+    ...(productChecks ? { productChecks } : {}),
   });
   // THE GATE'S RUN FACTS (2026-10-14): timing, usage, tool calls, how far it read the conventions
   // file, and its bounded stream — persisted beside gate.raw.md as `<prefix>-diagnostics.json` +

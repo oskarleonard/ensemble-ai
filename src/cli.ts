@@ -86,6 +86,8 @@ import {
   type HolisticStageOutcome,
   runIntegrationStage,
   type IntegrationStageOutcome,
+  runProductStage,
+  type ProductStageOutcome,
 } from './modes/review/self-contained';
 import type { DepSurfaceResult } from './modes/review/dep-surface';
 import {
@@ -109,6 +111,8 @@ import { readConventionPathsFromTrail, runRegate } from './modes/review/regate';
 import { checkReparse, isReparseSeat, type ReparseSeat, runReparseSeat } from './modes/review/reparse-seat';
 import { checkReseat, ReseatLockedError, reseatRefusal, runReseat } from './modes/review/reseat';
 import { loadHolisticSeat } from './modes/review/holistic';
+import { loadProductSeat } from './modes/review/product';
+import { indexProductDocs } from './modes/review/product-docs';
 import {
   acquireDiff,
   type AcquiredDiff,
@@ -324,6 +328,20 @@ Options:
                         every seat and the gate as a hedged premise ("weigh it, don't obey it";
                         checked both ways — promised-and-missing, ruled-out-and-done) and pinned
                         to the trail as intent.md. Unreadable or empty ⇒ a loud note, no intent
+  --product-docs <file> the PRODUCT SEAT: a markdown file of product + design documents the HOST
+                        resolved for this change (tech design, requirements, tickets), one source
+                        per "## <key> — <title>" line. One Anthropic seat reads them IN FULL beside
+                        the whole change and reports only where the two disagree (rule broken,
+                        decision reversed, promise undelivered); every finding quotes the doc and
+                        names the code, the HOST checks the quote line for line and the code site
+                        before the gate may post it, and it never exceeds medium. Needs worktree
+                        evidence (--repo) and the gate. Pinned to the trail as product-docs.md.
+                        Unreadable, or no source in it ⇒ one loud skip line, no seat
+  --no-product          skip the product seat even when --product-docs is given
+  --product-model <m>   model for the PRODUCT seat — overrides the voices.json \`product\` entry;
+                        built-in default: opus. Read only when the seat runs
+  --product-effort <e>  effort for the PRODUCT seat (low|medium|high|xhigh|max) — overrides the
+                        file; built-in default: high. Read only when the seat runs
   --premise             opt-in PREMISE PASS: when the gate's own findings CLUSTER on one region
                         (≥2 ≥medium findings from different reviewers grounded to the same region —
                         same file AND within a few lines of each other, chained transitively),
@@ -1297,6 +1315,10 @@ async function reviewCommand(
         'no-conventions': { type: 'boolean' },
         'no-fail-on-high': { type: 'boolean' },
         'no-integration': { type: 'boolean' },
+        'no-product': { type: 'boolean' },
+        'product-docs': { type: 'string' },
+        'product-effort': { type: 'string' },
+        'product-model': { type: 'string' },
         'no-settle': { type: 'boolean' },
         'optional-reviewers': { type: 'string' },
         'verify-confirmed': { type: 'boolean' },
@@ -1610,6 +1632,43 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
     }
   }
 
+  // THE PRODUCT DOCS (--product-docs <file>): the documents the HOST resolved for this change, for
+  // the PRODUCT seat alone (modes/review/product.ts) — read once here, handed to that seat whole,
+  // and pinned by its stage as product-docs.md (the copy the gate verifies every quote against).
+  // The seat runs only with ≥1 source in the file, worktree evidence, the gate on the roster, and no
+  // --no-product. Anything else is ONE loud skip line and the review runs exactly as it would have
+  // without the flag: never fatal, and never a seat whose quotes nobody could check.
+  let productDocs: string | undefined;
+  if (typeof values['product-docs'] === 'string' && values['product-docs']) {
+    const file = values['product-docs'];
+    let text: string | undefined;
+    try {
+      text = fs.readFileSync(file, 'utf8');
+    } catch (e) {
+      console.error(`· product: skipped — ${file} unreadable (${(e as Error).message}); product seat not spawned`);
+    }
+    if (text !== undefined) {
+      const sources = indexProductDocs(text).sources;
+      const why =
+        sources.length === 0
+          ? `${file} names no source (no "## <key> — <title>" line)`
+          : values['no-product']
+            ? '--no-product'
+            : !worktree
+              ? 'this run has no worktree evidence (--repo) — the seat opens the code behind every document claim or it does not run'
+              : !roster.claude
+                ? 'the claude layer is off (--no-claude) — no gate would check the document quotes'
+                : null;
+      if (why) console.error(`· product: skipped — ${why}; product seat not spawned`);
+      else {
+        productDocs = text;
+        console.error(
+          `· product docs: ${sources.length} source(s) from ${file} (${sources.map((src) => `${src.key}${src.stale ? ' STALE' : ''}`).join(', ')}) — handed to the product seat`
+        );
+      }
+    }
+  }
+
   // CI EVIDENCE (modes/review/ci-evidence.ts): the head commit's check runs + annotations + commit
   // statuses as DATA in the packet. PR path only (a local diff has no checks), default ON,
   // best-effort: a gh failure degrades to a named UNAVAILABLE section — never blocks the review.
@@ -1662,7 +1721,10 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   // (opus @ high). Resolved only when `--holistic` asks for the lens AND the run has a worktree: the
   // lens never spawns without one (resolveHolisticPlan), so `--holistic` without `--repo` reads no
   // `holistic` entry and still gets its loud skip from the layer.
-  let anthropicSeats: { claude: GateSeat; gate: GateSeat; holistic?: ResolvedVoiceConfig } | null = null;
+  //
+  // The PRODUCT seat: flag → voices.json `product` entry → opus @ high — resolved only when it will
+  // run (productDocs is set only then), so a run without the flag reads no `product` entry.
+  let anthropicSeats: { claude: GateSeat; gate: GateSeat; holistic?: ResolvedVoiceConfig; product?: ResolvedVoiceConfig } | null = null;
   if (roster.claude) {
     const warn = (m: string) => console.error(`· ${m}`);
     anthropicSeats = loadSeatsOrRefuse(() => ({
@@ -1695,6 +1757,18 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
             ),
           }
         : {}),
+      ...(productDocs
+        ? {
+            product: loadProductSeat(
+              VOICES_FILE,
+              {
+                effort: typeof values['product-effort'] === 'string' ? values['product-effort'] : undefined,
+                model: typeof values['product-model'] === 'string' ? values['product-model'] : undefined,
+              },
+              warn
+            ),
+          }
+        : {}),
     }));
     if (!anthropicSeats) return 3;
   }
@@ -1719,6 +1793,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
   let producerStage: Promise<ClaudeProducerOutcome> | undefined;
   let lensStage: Promise<HolisticStageOutcome> | undefined;
   let integrationStage: Promise<IntegrationStageOutcome> | undefined;
+  let productStage: Promise<ProductStageOutcome> | undefined;
   const startAnthropicStages = (ready: { conventionsPath?: string; headSha: string; lensHandoff?: { diff: string; scope: string }; parts: { diff: string; index: number; label: string; prompt: string; scope?: string }[]; pinnedDiff: string; prompt: string; skeleton?: string }): void => {
     if (!roster.claude || !anthropicSeats) return;
     if (worktree && ready.pinnedDiff) {
@@ -1748,7 +1823,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
     const stageBaseSha = source.prBaseSha ?? null;
     const log = (m: string) => console.error(`· ${m}`);
     console.error(
-      `· anthropic stages started alongside the core: producer (${ready.parts.length} part(s))${values.holistic ? ' + holistic lens' : ''}${ready.skeleton && worktree && !values['no-integration'] ? ' + integration seat' : ''}`
+      `· anthropic stages started alongside the core: producer (${ready.parts.length} part(s))${values.holistic ? ' + holistic lens' : ''}${ready.skeleton && worktree && !values['no-integration'] ? ' + integration seat' : ''}${anthropicSeats.product && productDocs && worktree ? ' + product seat' : ''}`
     );
     producerStage = runClaudeProducer({
       baseDir: out,
@@ -1816,6 +1891,29 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         worktree: worktree.dir,
       });
       integrationStage.catch(() => {});
+    }
+    // THE PRODUCT SEAT (modes/review/product.ts): the documents vs the change, whatever its size — a
+    // feature branch small enough for one part still gets it. On a review in parts it reads the
+    // listing + the skeleton (the integration seat's view); in one part, the diff itself.
+    if (anthropicSeats.product && productDocs && worktree) {
+      productStage = runProductStage({
+        baseDir: out,
+        baseSha: stageBaseSha,
+        change:
+          ready.skeleton && ready.lensHandoff
+            ? { kind: 'parts', scope: ready.lensHandoff.scope, skeleton: ready.skeleton }
+            : { diff: ready.pinnedDiff, kind: 'diff' },
+        config: anthropicSeats.product,
+        ...(ready.conventionsPath ? { conventionsPath: ready.conventionsPath } : {}),
+        ...(directive ? { directive } : {}),
+        docs: productDocs,
+        expectedHeadSha: ready.headSha,
+        ...(historyPacket ? { historyPacket } : {}),
+        log,
+        runId,
+        worktree: worktree.dir,
+      });
+      productStage.catch(() => {});
     }
   };
 
@@ -2020,6 +2118,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
         ...(producerStage ? { producer: producerStage } : {}),
         ...(lensStage ? { lens: lensStage } : {}),
         ...(integrationStage ? { integration: integrationStage } : {}),
+        ...(productStage ? { product: productStage } : {}),
         ...(result.skeleton ? { skeleton: result.skeleton } : {}),
         ...(result.lensHandoff ? { lensHandoff: result.lensHandoff } : {}),
         // `security --repo` must NOT have its security-auditor prompt replaced by the
