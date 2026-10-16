@@ -37,11 +37,12 @@ import {
 // off. Bash/Read/Write/Edit stay: they are the whole point. No home-read deny and no neutral cwd —
 // see the operator-decision block above. The seat's advisor rides `--settings` (claudeAdvisorArgs)
 // and its "off" the spawn env (claudeAdvisorEnv), like every other claude seat.
-// `--disallowedTools` is variadic, so it goes LAST.
-export function buildClaudeExecArgs(prompt: string, config?: VoiceConfig): string[] {
+// `--disallowedTools` is variadic, so it goes LAST. The PROMPT is not an arg: it rides stdin
+// (runClaudeExecVoice), because an exec seat's prompt carries a whole diff and argv is capped
+// (incident 2026-10-16: spawn E2BIG). `-p` with no positional prompt reads it from stdin.
+export function buildClaudeExecArgs(config?: VoiceConfig): string[] {
   const args = [
     '-p',
-    prompt,
     '--output-format',
     'stream-json',
     '--verbose',
@@ -81,7 +82,7 @@ export async function runClaudeExecVoice(
   const retryDelaysMs = seams.retryDelaysMs ?? TRANSIENT_RETRY_DELAYS_MS;
   const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
   const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
-  const args = buildClaudeExecArgs(prompt, config);
+  const args = buildClaudeExecArgs(config);
   const env = claudeAdvisorEnv(config);
   let retried = 0;
   for (;;) {
@@ -95,6 +96,7 @@ export async function runClaudeExecVoice(
       inactivityTimeoutMs,
       onSpawn: opts.onSpawn,
       stderrLimit: 2000,
+      stdin: prompt,
       timeoutMs: opts.timeoutMs,
     });
     const elapsedMs = Date.now() - startedAt;

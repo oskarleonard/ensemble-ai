@@ -137,6 +137,32 @@ describe('runReviewerExec — env', () => {
   });
 });
 
+// A prompt too big for argv rides stdin (incident 2026-10-16: spawn E2BIG on a 1.9 MB `-p` prompt).
+describe('runReviewerExec — stdin', () => {
+  it('hands the child the whole payload, past the argv cap, then closes the pipe', async () => {
+    const res = await runReviewerExec({
+      args: ['-c', 'wc -c | tr -d " "'],
+      bin: '/bin/sh',
+      capture: 'stdout',
+      stderrLimit: 500,
+      stdin: 'x'.repeat(2_000_000),
+      timeoutMs: 20_000,
+    });
+    expect(res.raw).toBe('2000000');
+  });
+
+  it('without `stdin` the child reads EOF at once — never a hang', async () => {
+    const res = await runReviewerExec({
+      args: ['-c', 'cat; echo done'],
+      bin: '/bin/sh',
+      capture: 'stdout',
+      stderrLimit: 500,
+      timeoutMs: 20_000,
+    });
+    expect(res.raw).toBe('done');
+  });
+});
+
 // The run's own facts beside its reply: the exit code it reported, and a spawn that never started.
 describe('runReviewerExec — exit code and spawn error', () => {
   it('reports the exit code', async () => {

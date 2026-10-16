@@ -38,6 +38,7 @@ import { composeEvidenceContext, type EvidenceRootInfo, openEvidenceRoot } from 
 import { type Companion, getCompanionNames, installCompanions, parseCompanionFlags } from './modes/review/companions';
 import { judgeConfig, listVoices, loadJudge, loadVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
+  PROBE_INLINE_DIFF_LIMIT,
   probeSeatLabel,
   probeSeatRecord,
   renderProbePrompt,
@@ -4507,10 +4508,19 @@ async function probeCommand(rest: string[]): Promise<number> {
         : resolveTrailBase(gitToplevel(cwd), source.localRepoTrail ?? false);
     const trailDir = reviewDir(out, runId);
 
+    // A diff too big to paste goes to a trail file the prober reads instead (incident 2026-10-16).
+    const diffFile =
+      acquired.diff.length > PROBE_INLINE_DIFF_LIMIT
+        ? writeTrailFile(out, runId, 'probe-diff.patch', acquired.diff)
+        : null;
+    if (diffFile) {
+      console.error(`· probe: the diff is ${acquired.diff.length} chars — handed to the prober as ${diffFile}, not pasted`);
+    }
     const prompt = renderProbePrompt({
       baseSha: source.prBaseSha,
       brief,
       diff: acquired.diff,
+      diffFile,
       directive,
       headSha: acquired.headSha,
       worktree: worktree.dir,

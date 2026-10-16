@@ -207,6 +207,13 @@ interface ReviewerExecOpts {
     inactivityTimeoutMs?: number;
     /** Cap the retained stderr tail (a noise channel) at this many chars. */
     stderrLimit: number;
+    /**
+     * Text written to the child's stdin, which is then closed. Absent ⇒ stdin stays 'ignore'
+     * (see the contract below). For a prompt too big for argv: the OS caps the whole argv+env (1 MB
+     * on macOS) and the spawn dies E2BIG before the seat starts (incident 2026-10-16: a 1.9 MB
+     * diff inlined into the prober's `-p` prompt). stdin has no such cap.
+     */
+    stdin?: string;
     /** Cap the retained stream tail (see `streamStdout`) at this many chars. */
     streamLimit?: number;
     /**

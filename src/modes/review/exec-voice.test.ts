@@ -9,10 +9,12 @@ import { buildClaudeExecArgs, runClaudeExecVoice } from './exec-voice';
 const CFG: VoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
 
 describe('the exec-voice argv — unfenced where the review seats are fenced, and that is the point', () => {
-  const args = buildClaudeExecArgs('PROMPT', CFG);
+  const args = buildClaudeExecArgs(CFG);
 
   it('runs headless bypassPermissions stream-json (probed 2026-08-10: Bash executes)', () => {
-    expect(args.slice(0, 2)).toEqual(['-p', 'PROMPT']);
+    // `-p` with no positional prompt: the prompt rides stdin (incident 2026-10-16: argv E2BIG).
+    expect(args[0]).toBe('-p');
+    expect(args[1]).toBe('--output-format');
     for (const flag of ['--output-format', 'stream-json', '--permission-mode', 'bypassPermissions', '--strict-mcp-config']) {
       expect(args).toContain(flag);
     }
@@ -31,7 +33,7 @@ describe('the exec-voice argv — unfenced where the review seats are fenced, an
     expect(args).toContain('opus');
     expect(args).toContain('--effort');
     expect(args).toContain('max');
-    const bare = buildClaudeExecArgs('P', { ...CFG, effort: 'default', model: 'default' });
+    const bare = buildClaudeExecArgs({ ...CFG, effort: 'default', model: 'default' });
     expect(bare).not.toContain('--model');
     expect(bare).not.toContain('--effort');
   });
@@ -39,10 +41,10 @@ describe('the exec-voice argv — unfenced where the review seats are fenced, an
 
 describe('the exec-voice argv — the advisor rides --settings like every claude seat', () => {
   it('absent / "off" → no --settings; a model id → advisorModel, before the variadic --disallowedTools', () => {
-    expect(buildClaudeExecArgs('PROMPT', CFG)).not.toContain('--settings');
+    expect(buildClaudeExecArgs(CFG)).not.toContain('--settings');
     // "off" is the env kill switch (claudeAdvisorEnv) — no settings value disables the advisor.
-    expect(buildClaudeExecArgs('PROMPT', { ...CFG, advisor: 'off' })).toEqual(buildClaudeExecArgs('PROMPT', CFG));
-    const args = buildClaudeExecArgs('PROMPT', { ...CFG, advisor: 'claude-fable-5-1' });
+    expect(buildClaudeExecArgs({ ...CFG, advisor: 'off' })).toEqual(buildClaudeExecArgs(CFG));
+    const args = buildClaudeExecArgs({ ...CFG, advisor: 'claude-fable-5-1' });
     const at = args.indexOf('--settings');
     expect(JSON.parse(args[at + 1])).toEqual({ advisorModel: 'claude-fable-5-1' });
     expect(at).toBeLessThan(args.indexOf('--disallowedTools'));
@@ -77,5 +79,17 @@ describe('runClaudeExecVoice — the advisor "off" reaches the spawned claude as
   it('a pinned model or an absent advisor → the variable is never set', async () => {
     expect((await envOf({ ...CFG, advisor: 'claude-fable-5-1' }))?.CLAUDE_CODE_DISABLE_ADVISOR_TOOL).toBeUndefined();
     expect((await envOf(CFG))?.CLAUDE_CODE_DISABLE_ADVISOR_TOOL).toBeUndefined();
+  });
+
+  it('the prompt reaches the spawned claude on stdin, never in argv (incident 2026-10-16: E2BIG)', async () => {
+    const calls: ReviewerExecOpts[] = [];
+    const exec: ReviewerExec = (req) => {
+      calls.push(req);
+      return Promise.resolve({ raw: 'DONE', stderrTail: '', timedOut: false });
+    };
+    const prompt = `PROMPT ${'d'.repeat(2_000_000)}`;
+    await runClaudeExecVoice(prompt, CFG, { timeoutMs: 1_000, worktree: '/tmp/worktree' }, { exec });
+    expect(calls[0].stdin).toBe(prompt);
+    expect(calls[0].args.some((a) => a.includes('PROMPT'))).toBe(false);
   });
 });
