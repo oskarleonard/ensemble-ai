@@ -1835,8 +1835,13 @@ function runReviewerExec(opts) {
       ...opts.env ? { env: { ...process.env, ...opts.env } } : {},
       // stdout is piped when we read the reply from it (grok) or stream it for
       // liveness (codex `--json`); an outfile-only seat keeps it 'ignore'.
-      stdio: ["ignore", pipeStdout ? "pipe" : "ignore", "pipe"]
+      stdio: [opts.stdin === void 0 ? "ignore" : "pipe", pipeStdout ? "pipe" : "ignore", "pipe"]
     });
+    if (opts.stdin !== void 0) {
+      child.stdin?.on("error", () => {
+      });
+      child.stdin?.end(opts.stdin);
+    }
     const killer = makeEscalatingKill(
       { kill: (sig) => killTree(child, sig) },
       KILL_GRACE_MS

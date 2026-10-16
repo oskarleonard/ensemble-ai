@@ -132,6 +132,13 @@ export interface ReviewerExecOpts {
   inactivityTimeoutMs?: number;
   /** Cap the retained stderr tail (a noise channel) at this many chars. */
   stderrLimit: number;
+  /**
+   * Text written to the child's stdin, which is then closed. Absent ⇒ stdin stays 'ignore'
+   * (see the contract below). For a prompt too big for argv: the OS caps the whole argv+env (1 MB
+   * on macOS) and the spawn dies E2BIG before the seat starts (incident 2026-10-16: a 1.9 MB
+   * diff inlined into the prober's `-p` prompt). stdin has no such cap.
+   */
+  stdin?: string;
   /** Cap the retained stream tail (see `streamStdout`) at this many chars. */
   streamLimit?: number;
   /**
@@ -203,7 +210,8 @@ export interface ReviewerExecResult {
 //   orphan can hold open forever; plus an absolute backstop, so even if NEITHER
 //   event fires the promise still resolves (lived: a 40-min 0%-CPU wedge).
 // - stdin is 'ignore' (CLOSED): a piped-but-empty stdin makes codex append a
-//   <stdin> block to the prompt.
+//   <stdin> block to the prompt. Only a caller that passes `stdin` gets a pipe,
+//   written in full and closed at once.
 // - the reply comes from the -o file (codex) OR accumulated stdout (grok); for
 //   codex stdout is empty and the exit code LIES ("at capacity" exits 0 with no
 //   file), so success = a non-empty reply, never the exit code.
@@ -228,8 +236,14 @@ export function runReviewerExec(
       ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
       // stdout is piped when we read the reply from it (grok) or stream it for
       // liveness (codex `--json`); an outfile-only seat keeps it 'ignore'.
-      stdio: ['ignore', pipeStdout ? 'pipe' : 'ignore', 'pipe'],
+      stdio: [opts.stdin === undefined ? 'ignore' : 'pipe', pipeStdout ? 'pipe' : 'ignore', 'pipe'],
     });
+    if (opts.stdin !== undefined) {
+      // A child that exits before reading it all (a spawn failure, a fast crash) breaks the pipe;
+      // that EPIPE is the child's story, told by its exit — never a crash of this process.
+      child.stdin?.on('error', () => {});
+      child.stdin?.end(opts.stdin);
+    }
     const killer = makeEscalatingKill(
       { kill: (sig) => killTree(child, sig) },
       KILL_GRACE_MS
