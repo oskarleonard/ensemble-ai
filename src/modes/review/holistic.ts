@@ -83,29 +83,51 @@ export function resolveHolisticSeat(
   warn: (m: string) => void = () => {},
   parseAdvisor: typeof parseSeatAdvisor = parseSeatAdvisor
 ): ResolvedVoiceConfig {
+  return resolveVoicesSeat(HOLISTIC_SEAT_SPEC, raw, flags, warn, parseAdvisor);
+}
+
+// One single-purpose Anthropic seat that resolves from its OWN voices.json entry (the lens, the
+// product seat): which entry, how its messages name it, and its built-in default. The chain and
+// every rule above are shared, so a second such seat cannot drift from the first.
+export interface VoicesSeatSpec {
+  defaults: { readonly effort: string; readonly model: string };
+  // The voices.json key, also the seat's name in messages and in its `--<name>-effort` flag.
+  name: string;
+  // How the `cmd`-is-ignored warning names the seat ("the lens").
+  role: string;
+}
+
+const HOLISTIC_SEAT_SPEC: VoicesSeatSpec = { defaults: HOLISTIC_DEFAULTS, name: 'holistic', role: 'the lens' };
+
+export function resolveVoicesSeat(
+  spec: VoicesSeatSpec,
+  raw: unknown,
+  flags: HolisticSeatFlags = {},
+  warn: (m: string) => void = () => {},
+  parseAdvisor: typeof parseSeatAdvisor = parseSeatAdvisor
+): ResolvedVoiceConfig {
+  const { name } = spec;
   const root = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
-  const entry =
-    root.holistic && typeof root.holistic === 'object' && !Array.isArray(root.holistic)
-      ? (root.holistic as Record<string, unknown>)
-      : null;
-  if (root.holistic !== undefined && !entry) {
-    warn('holistic seat: expected an object like {"model":"…","effort":"…"} — using the built-in default');
+  const value = root[name];
+  const entry = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+  if (value !== undefined && !entry) {
+    warn(`${name} seat: expected an object like {"model":"…","effort":"…"} — using the built-in default`);
   }
   if (entry && 'cmd' in entry) {
-    warn('holistic seat: `cmd` is ignored — the lens is always a `claude -p` spawn (read-only plan mode + write-tool deny-list); remove it');
+    warn(`${name} seat: \`cmd\` is ignored — ${spec.role} is always a \`claude -p\` spawn (read-only plan mode + write-tool deny-list); remove it`);
   }
 
-  const model = nonEmptyStr(flags.model) || (entry && nonEmptyStr(entry.model)) || HOLISTIC_DEFAULTS.model;
-  const advisor = entry ? parseAdvisor(entry.advisor, 'voices.json holistic') : undefined;
+  const model = nonEmptyStr(flags.model) || (entry && nonEmptyStr(entry.model)) || spec.defaults.model;
+  const advisor = entry ? parseAdvisor(entry.advisor, `voices.json ${name}`) : undefined;
 
   // Effort: a flag outside the whitelist is ignored + warned (flag/file symmetry — never resolve
   // a value the spawn would drop), then the chain continues at the file link.
   const flagEffort = nonEmptyStr(flags.effort);
   if (flagEffort && !CLAUDE_EFFORTS.has(flagEffort))
     warn(
-      `holistic seat: --holistic-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — ignored`
+      `${name} seat: --${name}-effort "${flagEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — ignored`
     );
-  let effort: string = HOLISTIC_DEFAULTS.effort;
+  let effort: string = spec.defaults.effort;
   if (flagEffort && CLAUDE_EFFORTS.has(flagEffort)) {
     effort = flagEffort;
   } else {
@@ -114,7 +136,7 @@ export function resolveHolisticSeat(
       if (CLAUDE_EFFORTS.has(rawEffort)) effort = rawEffort;
       else
         warn(
-          `holistic seat: \`effort\` "${rawEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — using the built-in default "${HOLISTIC_DEFAULTS.effort}"`
+          `${name} seat: \`effort\` "${rawEffort}" is not a known effort (${[...CLAUDE_EFFORTS].join('|')}) — using the built-in default "${spec.defaults.effort}"`
         );
     }
   }
@@ -130,15 +152,25 @@ export function loadHolisticSeat(
   warn: (m: string) => void = () => {},
   parseAdvisor: typeof parseSeatAdvisor = parseSeatAdvisor
 ): ResolvedVoiceConfig {
+  return loadVoicesSeat(HOLISTIC_SEAT_SPEC, file, flags, warn, parseAdvisor);
+}
+
+export function loadVoicesSeat(
+  spec: VoicesSeatSpec,
+  file: string = VOICES_FILE,
+  flags: HolisticSeatFlags = {},
+  warn: (m: string) => void = () => {},
+  parseAdvisor: typeof parseSeatAdvisor = parseSeatAdvisor
+): ResolvedVoiceConfig {
   let raw: unknown = {};
   try {
     raw = JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT')
-      warn(`holistic seat: could not read \`${file}\` (${(e as Error).message.split('\n')[0]}) — using the built-in default`);
+      warn(`${spec.name} seat: could not read \`${file}\` (${(e as Error).message.split('\n')[0]}) — using the built-in default`);
     raw = {};
   }
-  return resolveHolisticSeat(raw, flags, warn, parseAdvisor);
+  return resolveVoicesSeat(spec, raw, flags, warn, parseAdvisor);
 }
 
 // ── Run plan (default off · worktree or nothing) ──────────────────────────────────────

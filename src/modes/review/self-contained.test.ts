@@ -25,7 +25,9 @@ import {
   runClaudeProducer,
   runHolisticStage,
   runIntegrationStage,
+  runProductStage,
 } from './self-contained';
+import { PRODUCT_DOCS } from './product-fixture';
 
 const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'default', id: 'claude', model: 'default', vendor: 'anthropic' };
 const HEAD = 'HEADSHA1';
@@ -1099,5 +1101,125 @@ describe('runIntegrationStage — one seat over the skeleton, its review reaches
     expect(res.integrationReview).toBeNull();
     expect(res.integrationSkipped).toContain('NO worktree evidence');
     fs.rmSync(base, { force: true, recursive: true });
+  });
+});
+
+describe('runProductStage — the documents vs the change, its quotes verified at the gate', () => {
+  const STATUS = '2. Suspend writes the status “suspended” to the member record.';
+  const PRODUCT_REVIEW = JSON.stringify({
+    findings: [
+      {
+        body: 'suspend writes deactivated at src/x.ts:3, the ticket says suspended',
+        confidence: 'high',
+        docRef: { class: 'rule-broken', key: 'ACME-12', quote: STATUS },
+        evidence: { file: 'src/x.ts', line: 3 },
+        severity: 'high',
+        title: 'suspend writes the wrong status',
+      },
+    ],
+    summary: 'checked ACME-12 and the billing TDD',
+  });
+  const GATE_WITH_PRODUCT = JSON.stringify({
+    schemaVersion: 1,
+    synthesis: { agreements: [], bottomLine: 'fix then merge', disagreements: [] },
+    verdicts: [
+      { findingId: 'codex#1', reason: 'confirmed', verdict: 'agree' },
+      { findingId: 'product#1', reason: 'the code writes deactivated', tldr: 'Suspended members are not suspended.', verdict: 'agree' },
+    ],
+  });
+  function worktree(): string {
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-sc-wt-'));
+    fs.mkdirSync(path.join(wt, 'src'));
+    fs.writeFileSync(path.join(wt, 'src', 'x.ts'), 'export function x() {\n  const a = compute();\n  const veryUniqueGroundingLineHere = a.value.length;\n  return a;\n}\n');
+    return wt;
+  }
+
+  it('pins the docs, persists review + stream (capped at medium), and the gate verifies the quote and posts the Doc line', async () => {
+    const base = tmpTrail();
+    const runId = 'product';
+    seedCoreTrail(base, runId, [stored('codex')]);
+    const wt = worktree();
+    const prompts: string[] = [];
+    let gatePrompt = '';
+    const run = async (prompt: string): Promise<VoiceRunResult> => {
+      if (prompt.includes('VERIFIED GATE')) {
+        gatePrompt = prompt;
+        return okRun(GATE_WITH_PRODUCT);
+      }
+      prompts.push(prompt);
+      return { ...okRun(PRODUCT_REVIEW), stream: '{"type":"system","subtype":"init"}' };
+    };
+    const logs: string[] = [];
+    const product = runProductStage({
+      baseDir: base, baseSha: 'b'.repeat(40), change: { diff: GATE_DIFF, kind: 'diff' }, config: { ...CFG, effort: 'high', model: 'opus' },
+      docs: PRODUCT_DOCS, expectedHeadSha: HEAD, log: (m) => void logs.push(m), run, runId, worktree: wt,
+    });
+    const res = await runClaudeReviewLayer({
+      baseDir: base, claudeConfig: CFG, coreReviews: [stored('codex')], expectedHeadSha: HEAD, includeClaudeReviewer: false,
+      product, reviewPrompt: 'P', run, runId, worktree: wt,
+    });
+    const dir = reviewDir(base, runId);
+    // the seat: one spawn, the docs whole, the trail files the dashboard reads
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('PRODUCT seat');
+    expect(prompts[0]).toContain(PRODUCT_DOCS);
+    expect(fs.readFileSync(path.join(dir, 'product-docs.md'), 'utf8')).toBe(PRODUCT_DOCS);
+    expect(fs.readFileSync(path.join(dir, 'product-stream.jsonl'), 'utf8')).toBe('{"type":"system","subtype":"init"}');
+    const persisted = JSON.parse(fs.readFileSync(path.join(dir, 'review.product.json'), 'utf8'));
+    expect(persisted.findings[0]).toMatchObject({ docRef: { class: 'rule-broken', key: 'ACME-12', quote: STATUS }, severity: 'medium' });
+    expect(typeof persisted.diagnostics.elapsedMs).toBe('number');
+    expect(res.productReview?.findings[0].severity).toBe('medium');
+    expect(logs).toContain('product seat (anthropic/opus @ high) reading the docs + the whole change…');
+    expect(logs.some((l) => l.startsWith('product: reviewed — 1 finding(s) · '))).toBe(true);
+    // the gate: shown the quote in context, never the whole file
+    expect(gatePrompt).toContain('<<<DOC product#1');
+    expect(gatePrompt).toContain('Product-seat findings');
+    expect(gatePrompt).not.toContain('Invoices are always issued');
+    // the record: verified, capped, the Doc line appended to the posted body
+    const rec = res.gateVerdicts.find((v) => v.findingId === 'product#1');
+    expect(rec).toMatchObject({ docRef: { key: 'ACME-12', quote: STATUS }, docVerified: true, downgradeReason: null, effectiveVerdict: 'agree', postableStatus: 'postable', severity: 'medium' });
+    expect(rec?.postableBody?.endsWith('\n\n**Doc:** ACME-12 — "2. Suspend writes the status “suspended” to the member record."')).toBe(true);
+    const trail = JSON.parse(fs.readFileSync(path.join(dir, 'gate-verdicts.json'), 'utf8'));
+    expect(trail.schemaVersion).toBe(13);
+    expect(trail.verdicts.find((v: { findingId: string }) => v.findingId === 'product#1').docVerified).toBe(true);
+    expect(renderClaudeLayer(res).join('\n')).toContain('product seat — read the change against the product docs');
+    fs.rmSync(base, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  it('refuses without a worktree, a base SHA, or a source — loudly, with no spawn and no pin', async () => {
+    const base = tmpTrail();
+    let spawned = 0;
+    const run = async (): Promise<VoiceRunResult> => {
+      spawned++;
+      return okRun('{}');
+    };
+    const wt = worktree();
+    const common = { baseDir: base, change: { diff: GATE_DIFF, kind: 'diff' as const }, config: CFG, expectedHeadSha: HEAD, run };
+    const noWt = await runProductStage({ ...common, baseSha: 'b'.repeat(40), docs: PRODUCT_DOCS, runId: 'p1' });
+    expect(noWt).toMatchObject({ productReview: null });
+    expect(noWt.productSkipped).toContain('NO worktree evidence');
+    expect((await runProductStage({ ...common, baseSha: null, docs: PRODUCT_DOCS, runId: 'p2', worktree: wt })).productSkipped).toContain('no base SHA');
+    const logs: string[] = [];
+    const none = await runProductStage({ ...common, baseSha: 'b'.repeat(40), docs: '# product docs: none — no ticket\n', log: (m) => void logs.push(m), runId: 'p3', worktree: wt });
+    expect(none.productSkipped).toContain('name no source');
+    expect(logs[0]).toMatch(/^product: skipped — the docs name no source/);
+    expect(spawned).toBe(0);
+    for (const id of ['p1', 'p2', 'p3']) expect(fs.existsSync(path.join(reviewDir(base, id), 'product-docs.md'))).toBe(false);
+    fs.rmSync(base, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
+
+  it('a seat that throws or returns junk is persisted ok:false — the gate simply has no product voice', async () => {
+    const base = tmpTrail();
+    const wt = worktree();
+    const common = { baseDir: base, baseSha: 'b'.repeat(40), change: { diff: GATE_DIFF, kind: 'diff' as const }, config: CFG, docs: PRODUCT_DOCS, expectedHeadSha: HEAD, worktree: wt };
+    const threw = await runProductStage({ ...common, run: async () => { throw new Error('claude not installed'); }, runId: 'p4' });
+    expect(threw.productReview).toMatchObject({ findings: [], ok: false, voiceId: 'product' });
+    expect(JSON.parse(fs.readFileSync(path.join(reviewDir(base, 'p4'), 'review.product.json'), 'utf8')).ok).toBe(false);
+    const junk = await runProductStage({ ...common, run: async () => okRun('no json here'), runId: 'p5' });
+    expect(junk.productReview?.summary).toContain('not parseable');
+    fs.rmSync(base, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
   });
 });

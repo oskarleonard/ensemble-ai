@@ -2,6 +2,7 @@ import { SEVERITIES } from '../../core/types';
 
 import type { GateVerdictRecord } from './gate';
 import { isHolisticRecord } from './holistic-gate';
+import { isProductRecord } from './product-gate';
 
 // ── Cross-reviewer dedup by SELECTION (A+) ─────────────────────────────────────────────
 //
@@ -120,7 +121,9 @@ export function clusterPostable(records: GateVerdictRecord[]): GateVerdictRecord
   // never receive a corroboration count, and it must never inflate another cluster's — "flagged by
   // 2 of 4" would be a lie assembled from a diff-local reviewer and a whole-tree lens that agreed
   // by coincidence of proximity. Its findings post on their own single-seat provenance or not at all.
-  const postable = records.filter((r) => r.postableStatus === 'postable' && !isHolisticRecord(r));
+  // The PRODUCT seat likewise: one seat reading the documents, and electing a code reviewer's record
+  // over it would drop the one line that names the document — the reason the seat exists.
+  const postable = records.filter((r) => r.postableStatus === 'postable' && !isHolisticRecord(r) && !isProductRecord(r));
   const tok = new Map(postable.map((r) => [r.findingId, tokens(r)]));
 
   // Cluster the postable set: two findings link when they are proximate AND text-similar (the

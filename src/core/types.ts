@@ -203,6 +203,21 @@ export interface Evidence {
   line?: number;
 }
 
+// The three claims a document-grounded finding may make (the product seat, modes/review/product.ts).
+// "The docs never asked for it" is deliberately NOT one of them: absence from a document cannot
+// carry a quote, and an unquotable claim is exactly what the host refuses to post.
+export const DOC_CLAIM_CLASSES = ['rule-broken', 'decision-reversed', 'promise-undelivered'] as const;
+export type DocClaimClass = (typeof DOC_CLAIM_CLASSES)[number];
+
+// The DOC half of a finding that says "the document says X, the change does Y": which source it
+// quotes (`key`, as the host's docs file names it) and the complete line(s) it quotes. Model-written
+// and UNTRUSTED until the host has located the quote in its own pinned copy (product-gate.ts).
+export interface DocRef {
+  class?: DocClaimClass;
+  key: string;
+  quote: string;
+}
+
 // One reviewer finding — a TYPED contract. `id` is assigned at parse time (f1,
 // f2, …) so dispositions can reference it stably across the artifact boundary.
 export interface ReviewFinding {
@@ -212,6 +227,9 @@ export interface ReviewFinding {
   // it; nothing in the gate keys off it.
   chunk?: number;
   confidence: Confidence;
+  // The document a finding quotes (the product seat). Absent on every other finding — the parser
+  // keeps it only when it is well-formed, so a code reviewer's finding never grows the key.
+  docRef?: DocRef;
   evidence: Evidence;
   id: string;
   severity: Severity;

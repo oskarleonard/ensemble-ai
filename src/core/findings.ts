@@ -1,6 +1,9 @@
 import {
   type Confidence,
   CONFIDENCES,
+  DOC_CLAIM_CLASSES,
+  type DocClaimClass,
+  type DocRef,
   type Evidence,
   type ReviewFinding,
   SEVERITIES,
@@ -83,6 +86,33 @@ function asEvidence(v: unknown): Evidence {
         ? e.line
         : undefined,
   };
+}
+
+// A source key is a path or a ticket key — short. A quote is one or more complete document lines,
+// and a document paragraph is one line, so the bound is generous: it exists only against hostile
+// input. A quote cut by it can no longer match line-for-line, so the host refuses it (fail closed).
+const DOC_KEY_CAP = 200;
+const DOC_QUOTE_CAP = 8000;
+
+// "RULE BROKEN", "rule_broken" and "rule-broken" all name one class; anything else is no class at
+// all (the host then applies the strictest check, product-gate.ts).
+function asDocClaimClass(v: unknown): DocClaimClass | undefined {
+  if (typeof v !== 'string') return undefined;
+  const k = v.trim().toLowerCase().replace(/[\s_]+/g, '-');
+  return (DOC_CLAIM_CLASSES as readonly string[]).includes(k) ? (k as DocClaimClass) : undefined;
+}
+
+// The doc half of a finding (types.ts DocRef). Well-formed or absent: a missing/blank key or quote
+// drops the whole ref, which the host reads as "names no source" — never as a ref it may trust.
+// Exported so a ref read back off a trail file is re-validated with the SAME rule (gate.ts).
+export function parseDocRef(v: unknown): DocRef | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const d = v as Record<string, unknown>;
+  const key = typeof d.key === 'string' ? d.key.trim() : '';
+  const quote = typeof d.quote === 'string' ? d.quote : '';
+  if (!key || key.length > DOC_KEY_CAP || !quote.trim()) return undefined;
+  const cls = asDocClaimClass(d.class);
+  return { ...(cls ? { class: cls } : {}), key, quote: quote.length > DOC_QUOTE_CAP ? quote.slice(0, DOC_QUOTE_CAP) : quote };
 }
 
 // Pull the JSON object out of a reply that may wrap it in a ```json fence and/or
@@ -278,9 +308,11 @@ export function parseFindings(raw: string): ParsedReview {
     const f = rf as Record<string, unknown>;
     const evidence = asEvidence(f.evidence);
     const uncited = !evidence.file;
+    const docRef = parseDocRef(f.docRef);
     findings.push({
       body: typeof f.body === 'string' ? f.body : '',
       confidence: uncited ? 'low' : asConfidence(f.confidence),
+      ...(docRef ? { docRef } : {}),
       evidence,
       id: `f${i + 1}`,
       severity: asSeverity(f.severity),

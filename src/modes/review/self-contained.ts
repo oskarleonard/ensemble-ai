@@ -51,6 +51,8 @@ import {
 } from './holistic';
 import { worktreeReader, conventionsAwareReader, CONVENTIONS_IN_TREE_REL } from './holistic-gate';
 import { INTEGRATION_SEAT_ID, renderIntegrationPrompt } from './integration';
+import { capProductFinding, PRODUCT_SEAT_ID, type ProductChange, renderProductPrompt } from './product';
+import { indexProductDocs, PRODUCT_DOCS_TRAIL_FILE } from './product-docs';
 import { type HistoryPacket, historyPacketHasData } from './history-packet';
 import type { ReviewProfile } from './profile';
 import { type ReviewSynthesis, type VoiceReview } from './synthesis';
@@ -179,6 +181,9 @@ export function loadVoiceReviewsFromTrail(
   // The integration seat (a review in parts) sits after the reviewers and before the lens.
   const integration = reviewJsonFromTrail(baseDir, runId, `review.${INTEGRATION_SEAT_ID}.json`);
   if (integration) out.push(integration);
+  // The product seat (the docs vs the change) beside it — absent unless the run handed docs over.
+  const product = reviewJsonFromTrail(baseDir, runId, `review.${PRODUCT_SEAT_ID}.json`);
+  if (product) out.push(product);
   // The lens is LAST so its findingIds sort after the reviewers' in the gate prompt. Absent
   // whenever the lens did not run (the default) — no file, no voice, no findings.
   const holistic = reviewJsonFromTrail(baseDir, runId, `review.${HOLISTIC_SEAT_ID}.json`);
@@ -400,6 +405,9 @@ export interface ClaudeLayerOptions {
   // layer only awaits it (it never starts it: the seat needs the skeleton, which is the caller's)
   // so its review is on disk before the gate reads the voices.
   integration?: Promise<IntegrationStageOutcome>;
+  // The PRODUCT seat (./product), pre-started by the caller when the run handed product docs over.
+  // Awaited like the integration seat, so its review is on disk before the gate reads the voices.
+  product?: Promise<ProductStageOutcome>;
   // The whole-change skeleton (skeleton.ts) for the lens on a review in parts.
   skeleton?: string;
   // The head SHA the reviewers saw — the gate reads the pinned packet keyed by it, and a
@@ -469,6 +477,10 @@ export interface ClaudeLayerResult {
   integrationReview?: VoiceReview | null;
   // Why the integration seat did not run when it was asked for.
   integrationSkipped?: string | null;
+  // The product seat's review (./product). Absent when it did not run.
+  productReview?: VoiceReview | null;
+  // Why the product seat did not run when docs were handed over for it.
+  productSkipped?: string | null;
   // Why the lens did NOT run, when it was requested. Null/absent ⇒ it ran, or was never requested.
   holisticSkipped?: string | null;
   // The model that ACTUALLY ran the claude voice (e.g. `opus`, `sonnet`) — rendered in the
@@ -913,6 +925,126 @@ export async function runIntegrationStage(opts: IntegrationStageOptions): Promis
   return { integrationReview: review, integrationSkipped: null };
 }
 
+// ── The product stage (the documents vs the change) ─────────────────────────────────
+//
+// One Anthropic seat over the product docs IN FULL + the whole change + the tree, reporting only
+// where the two disagree (./product). Started by the caller with the packet; it pins the docs it is
+// handed to the trail BEFORE it spawns — the gate verifies every quote against that copy, so a seat
+// whose docs could not be pinned is a seat nobody could check, and it does not run.
+
+export interface ProductStageOptions {
+  baseDir: string;
+  baseSha: string | null;
+  // The diff on a single-part review; the listing + skeleton on a review in parts.
+  change: ProductChange;
+  config: ResolvedVoiceConfig;
+  conventionsPath?: string;
+  directive?: string;
+  // The docs file, verbatim (product-docs.ts) — pinned as product-docs.md, handed to the seat whole.
+  docs: string;
+  expectedHeadSha: string;
+  historyPacket?: HistoryPacket;
+  log?: (m: string) => void;
+  run?: ClaudeRunner;
+  runId: string;
+  timeoutMs?: number;
+  worktree?: string;
+}
+
+export interface ProductStageOutcome {
+  productReview: VoiceReview | null;
+  productSkipped: string | null;
+}
+
+// The docs are large and the seat opens files behind every claim: the integration seat's backstop.
+export const PRODUCT_WORKTREE_TIMEOUT_MS = 3_600_000; // 60 min runaway backstop
+
+// Its log lines carry no inner bullet: through the CLI's `· ` they read exactly as the run-log
+// contract pins them (`· product seat (…) reading…`, `· product: reviewed — …`, `· product: skipped — …`).
+export async function runProductStage(opts: ProductStageOptions): Promise<ProductStageOutcome> {
+  const log = opts.log ?? (() => {});
+  const run: ClaudeRunner = opts.run ?? runClaudeReviewVoice;
+  const skip = (why: string): ProductStageOutcome => {
+    log(`product: skipped — ${why}`);
+    return { productReview: null, productSkipped: why };
+  };
+  if (!opts.worktree)
+    return skip('this run has NO worktree evidence — the seat opens the code behind every document claim or it does not run. No seat spawned, no findings added.');
+  if (!opts.baseSha) return skip('this run resolved no base SHA — the seat cannot name the range. No seat spawned, no findings added.');
+  const sources = indexProductDocs(opts.docs).sources;
+  if (sources.length === 0)
+    return skip('the docs name no source (no "## <key> — <title>" line) — there is nothing to quote. No seat spawned, no findings added.');
+  try {
+    writeTrailFile(opts.baseDir, opts.runId, PRODUCT_DOCS_TRAIL_FILE, opts.docs);
+  } catch (e) {
+    return skip(`could not pin ${PRODUCT_DOCS_TRAIL_FILE} to the trail (${(e as Error).message}) — the gate could verify no quote against it. No seat spawned.`);
+  }
+  log(`product seat (anthropic/${opts.config.model} @ ${opts.config.effort}) reading the docs + the whole change…`);
+  const prompt = renderProductPrompt({
+    baseSha: opts.baseSha,
+    change: opts.change,
+    ...(opts.conventionsPath ? { conventionsPath: opts.conventionsPath } : {}),
+    ...(opts.directive ? { directive: opts.directive } : {}),
+    docs: opts.docs,
+    headSha: opts.expectedHeadSha,
+    history: historyPacketHasData(opts.historyPacket),
+    worktree: opts.worktree,
+  });
+  const fail = (summary: string, raw: string | null, diagnostics?: SeatDiagnostics, stream?: string | null): ProductStageOutcome => {
+    const review: VoiceReview = { ...(diagnostics ? { diagnostics } : {}), findings: [], ok: false, summary, voiceId: PRODUCT_SEAT_ID };
+    try {
+      persistSeatReview(opts.baseDir, opts.runId, PRODUCT_SEAT_ID, review, raw, stream);
+    } catch {
+      /* a failed seat with no trail entry reads as absent — the gate simply has no voice */
+    }
+    return { productReview: review, productSkipped: null };
+  };
+  let res: VoiceRunResult;
+  const startedAt = Date.now();
+  try {
+    res = await run(prompt, opts.config, {
+      ...(opts.historyPacket ? { historyPacket: opts.historyPacket.files } : {}),
+      timeoutMs: opts.timeoutMs ?? PRODUCT_WORKTREE_TIMEOUT_MS,
+      worktree: opts.worktree,
+    });
+  } catch (e) {
+    log(`product: failed to run — ${(e as Error).message}`);
+    return fail(`the product seat did not run: ${(e as Error).message}`, null);
+  }
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+  const stream = res.stream ?? null;
+  if (!res.raw || res.timedOut) {
+    const why = res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output');
+    log(`product: ${why}`);
+    return fail(`the product seat ${why}`, res.raw ?? null, diagnostics, stream);
+  }
+  const parsed = parseFindings(res.raw);
+  if (parsed.parseError) {
+    log(`product: ${parsed.parseError}`);
+    return fail(`output not parseable (${parsed.parseError})`, res.raw, diagnostics, stream);
+  }
+  // The MED cap at the source: the trail, stdout and every consumer show the severity the host acts
+  // on. The model's own word stays in product-review.raw.md.
+  let review: VoiceReview = withSeatAdvisor(
+    { diagnostics, findings: parsed.findings.map(capProductFinding), ok: true, summary: parsed.summary, voiceId: PRODUCT_SEAT_ID },
+    opts.config
+  );
+  try {
+    persistSeatReview(opts.baseDir, opts.runId, PRODUCT_SEAT_ID, review, res.raw, stream);
+  } catch (e) {
+    const why = (e as Error).message;
+    log(`product: trail persist FAILED (${why}) — the seat's findings are dropped from this run`);
+    review = { ...review, findings: [], ok: false, summary: `the product seat ran but FAILED to persist to the trail (${why})` };
+  }
+  try {
+    writeTrailFile(opts.baseDir, opts.runId, `review.${PRODUCT_SEAT_ID}.md`, renderReviewMarkdown(review));
+  } catch (e) {
+    log(`product: trail write review.${PRODUCT_SEAT_ID}.md failed (${(e as Error).message}) — continuing`);
+  }
+  log(`product: reviewed — ${review.findings.length} finding(s) · ${describeRun(diagnostics)}`);
+  return { productReview: review, productSkipped: null };
+}
+
 // Run the cold Opus reviewer (when in the roster) over the SAME prompt + persist it, write
 // every reviewer's rendered review.<id>.md, then synthesize over the reviews LOADED from the
 // trail files. An Opus reviewer failure degrades to an ok:false voice (synthesis still runs
@@ -953,6 +1085,9 @@ export async function runClaudeReviewLayer(
   // The integration seat's review must be on disk before the gate loads the voices.
   const integrationOutcome = opts.integration ? await opts.integration : null;
   const integrationReview = integrationOutcome?.integrationReview ?? null;
+  // So must the product seat's — and its pinned docs, which the gate verifies every quote against.
+  const productOutcome = opts.product ? await opts.product : null;
+  const productReview = productOutcome?.productReview ?? null;
 
   // Run the GATE over the reviews READ BACK from the trail files (the literal "reads the
   // three review files") — grounding each finding against the pinned packet hunks, tagging
@@ -1053,6 +1188,8 @@ export async function runClaudeReviewLayer(
     gateSpawned: gate.gateSpawned,
     ...(integrationReview !== null ? { integrationReview } : {}),
     ...(integrationOutcome?.integrationSkipped ? { integrationSkipped: integrationOutcome.integrationSkipped } : {}),
+    ...(productReview !== null ? { productReview } : {}),
+    ...(productOutcome?.productSkipped ? { productSkipped: productOutcome.productSkipped } : {}),
     gateTrailWritten: gate.gateTrailWritten,
     gateVerdicts,
     holisticReview,
@@ -1118,6 +1255,19 @@ export function renderClaudeLayer(result: ClaudeLayerResult): string[] {
   } else if (result.integrationSkipped) {
     out.push('');
     out.push(`  ── integration seat — skipped: ${scrub(result.integrationSkipped)} ──`);
+  }
+  // The product seat gets its own block too: ONE seat reading the documents, MED-capped, and every
+  // finding stands or falls on the host's check of the quote it names.
+  const pr = result.productReview;
+  if (pr) {
+    out.push('');
+    out.push(`  ── product seat — ${pr.ok ? 'read the change against the product docs' : 'failed'} (ONE seat · rule broken, decision reversed, promise undelivered · MED-capped · each quote host-checked) ──`);
+    if (!pr.ok) out.push(`     ${scrub(pr.summary)}`);
+    else if (pr.findings.length === 0) out.push('     no findings — the documents it checked are in its summary; a clean pass is not a sign-off');
+    for (const f of pr.findings) out.push(`     − [${f.severity}] ${scrub(evidenceRef(f.evidence.file, f.evidence.line))}  ${scrub(f.title)}${f.docRef ? `  (doc ${scrub(f.docRef.key)})` : ''}`);
+  } else if (result.productSkipped) {
+    out.push('');
+    out.push(`  ── product seat — skipped: ${scrub(result.productSkipped)} ──`);
   }
   const hr = result.holisticReview;
   if (hr) {
