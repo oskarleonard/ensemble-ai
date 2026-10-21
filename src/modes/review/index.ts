@@ -418,6 +418,9 @@ export async function runReviewMode(
   for (const s of secretScan.inlineSecretsOmitted) {
     log(`secret-scan: ${s.path} (${s.label}) — in an OMITTED file, not transmitted; not blocking`);
   }
+  for (const p of secretScan.sensitivePathsTracked) {
+    log(`secret-scan: ${p.path} (${p.label}) — already at the base under this path, not a surface this change stages; not blocking`);
+  }
 
   // Gather the repo's convention web (root + touched packages + the linked/swept md)
   // through the injected reader — the SAME pure gatherer the dashboard calls. Feeds

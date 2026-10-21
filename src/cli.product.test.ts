@@ -73,7 +73,7 @@ const engineResult = (): ReviewModeResult =>
         terminalState: 'reviewed',
       },
     ],
-    secretScan: { blocked: false, inlineSecrets: [], inlineSecretsAllowlisted: [], inlineSecretsOmitted: [], overridden: false, sensitivePaths: [] },
+    secretScan: { blocked: false, inlineSecrets: [], inlineSecretsAllowlisted: [], inlineSecretsOmitted: [], overridden: false, sensitivePaths: [], sensitivePathsTracked: [] },
   }) as unknown as ReviewModeResult;
 
 const session = (): WorktreeSession => ({

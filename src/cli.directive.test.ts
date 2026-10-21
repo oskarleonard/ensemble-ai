@@ -60,7 +60,7 @@ const engineResult = (): ReviewModeResult =>
       inlineSecretsAllowlisted: [],
       inlineSecretsOmitted: [],
       overridden: false,
-      sensitivePaths: [],
+      sensitivePaths: [], sensitivePathsTracked: [],
     },
   }) as unknown as ReviewModeResult;
 

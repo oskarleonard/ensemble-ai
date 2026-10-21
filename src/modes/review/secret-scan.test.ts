@@ -14,11 +14,23 @@ ${addedLines.map((l) => `+${l}`).join('\n')}
 `;
 }
 
+// The same, as a file the change ADDS (`--- /dev/null`): the shape the PATH rule is about.
+function newFileDiffFor(path: string, addedLines: string[]): string {
+  return `diff --git a/${path} b/${path}
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/${path}
+@@ -0,0 +1,${addedLines.length} @@
+${addedLines.map((l) => `+${l}`).join('\n')}
+`;
+}
+
 const CLEAN = diffFor('src/a.ts', ['const a = 1;', 'export { a };']);
 
 describe('scanDiffForSecrets — sensitive paths', () => {
-  it('default-REJECTS a diff that touches a sensitive path (.env)', () => {
-    const files = parseDiffFiles(diffFor('.env', ['API_KEY=abc']));
+  it('default-REJECTS a diff that ADDS a sensitive path (.env)', () => {
+    const files = parseDiffFiles(newFileDiffFor('.env', ['API_KEY=abc']));
     const r = scanDiffForSecrets(files);
     expect(r.sensitivePaths.map((p) => p.label)).toContain('dotenv');
     expect(r.blocked).toBe(true);
@@ -26,7 +38,7 @@ describe('scanDiffForSecrets — sensitive paths', () => {
   });
 
   it('--allow-sensitive overrides the block but STILL records the path', () => {
-    const files = parseDiffFiles(diffFor('config/.env.production', ['X=1']));
+    const files = parseDiffFiles(newFileDiffFor('config/.env.production', ['X=1']));
     const r = scanDiffForSecrets(files, { allowSensitive: true });
     expect(r.sensitivePaths).toHaveLength(1);
     expect(r.blocked).toBe(false);
@@ -48,7 +60,7 @@ describe('scanDiffForSecrets — sensitive paths', () => {
 
   it('still blocks real dotenv files next to the exempt template shapes', () => {
     for (const path of ['.env', '.env.production', 'apps/admin/.env.local', '.env.template.bak']) {
-      const r = scanDiffForSecrets(parseDiffFiles(diffFor(path, ['X=1'])));
+      const r = scanDiffForSecrets(parseDiffFiles(newFileDiffFor(path, ['X=1'])));
       expect(r.sensitivePaths.map((p) => p.label), path).toContain('dotenv');
       expect(r.blocked, path).toBe(true);
     }
@@ -58,7 +70,7 @@ describe('scanDiffForSecrets — sensitive paths', () => {
     // Regression guard for the first draft's `(\.[^/]+)*` (exponential: ~1 s at 28 segments).
     const hostile = '.env' + '.a'.repeat(60) + '!';
     const t0 = Date.now();
-    const r = scanDiffForSecrets(parseDiffFiles(diffFor(hostile, ['X=1'])));
+    const r = scanDiffForSecrets(parseDiffFiles(newFileDiffFor(hostile, ['X=1'])));
     expect(Date.now() - t0).toBeLessThan(200);
     expect(r.sensitivePaths.map((p) => p.label)).toContain('dotenv'); // not a template → still blocked
   });
@@ -79,7 +91,7 @@ describe('scanDiffForSecrets — sensitive paths', () => {
       ['.netrc', 'netrc'],
       ['project/.npmrc', 'npmrc'],
     ] as const) {
-      const r = scanDiffForSecrets(parseDiffFiles(diffFor(path, ['x'])));
+      const r = scanDiffForSecrets(parseDiffFiles(newFileDiffFor(path, ['x'])));
       expect(r.sensitivePaths.map((p) => p.label)).toContain(label);
     }
   });
@@ -157,8 +169,8 @@ describe('scanDiffForSecrets — the coverage cut bounds the inline block', () =
     expect(r.inlineSecretsOmitted).toHaveLength(0);
   });
 
-  it('the PATH rule ignores the cut — an omitted .env still blocks', () => {
-    const files = parseDiffFiles(diffFor('.env', ['API_KEY=abc']) + CLEAN);
+  it('the PATH rule ignores the cut — an omitted, ADDED .env still blocks', () => {
+    const files = parseDiffFiles(newFileDiffFor('.env', ['API_KEY=abc']) + CLEAN);
     const r = scanDiffForSecrets(files, { coveredPaths: new Set(['src/a.ts']) });
     expect(r.blocked).toBe(true);
     expect(r.sensitivePaths.map((p) => p.label)).toContain('dotenv');
@@ -189,6 +201,82 @@ describe('scanDiffForSecrets — the repo gitleaks allowlist exempts a transmitt
     const r = scanDiffForSecrets(parseDiffFiles(twoFiles), { allowlistedPaths: new Set([selftest]), coveredPaths: new Set(['src/a.ts']) });
     expect(r.inlineSecretsOmitted).toHaveLength(1);
     expect(r.inlineSecretsAllowlisted).toHaveLength(0);
+  });
+});
+
+describe('scanDiffForSecrets — a sensitive path already at the base is named, not blocking', () => {
+  // Run 2026-10-21-20-26-33-e36a86f6: one blank line appended to a committed end-to-end
+  // env file (mock mode + localhost URLs) vetoed a 90-file review on the filename alone.
+  const E2E = 'apps/site/.env.e2e';
+
+  it('an EDIT to a committed dotenv file is recorded under sensitivePathsTracked and does not block', () => {
+    const r = scanDiffForSecrets(parseDiffFiles(diffFor(E2E, ['E2E_PORT=3000', ''])));
+    expect(r.sensitivePathsTracked).toEqual([{ label: 'dotenv', path: E2E }]);
+    expect(r.sensitivePaths).toHaveLength(0);
+    expect(r.blocked).toBe(false);
+    expect(r.overridden).toBe(false);
+  });
+
+  it('a DELETION of a committed sensitive file is at-base too (it was staged long ago)', () => {
+    const deletion = `diff --git a/certs/dev.pem b/certs/dev.pem
+deleted file mode 100644
+index 1111111..0000000
+--- a/certs/dev.pem
++++ /dev/null
+@@ -1 +0,0 @@
+-not a key, just a placeholder
+`;
+    const r = scanDiffForSecrets(parseDiffFiles(deletion));
+    expect(r.sensitivePathsTracked).toEqual([{ label: 'pem', path: 'certs/dev.pem' }]);
+    expect(r.blocked).toBe(false);
+  });
+
+  it('a rename INTO a sensitive path is still a surface the change stages — blocks', () => {
+    const rename = `diff --git a/config/settings.txt b/config/.env
+similarity index 50%
+rename from config/settings.txt
+rename to config/.env
+index 1111111..2222222 100644
+--- a/config/settings.txt
++++ b/config/.env
+@@ -1 +1,2 @@
+ X=1
++Y=2
+`;
+    const r = scanDiffForSecrets(parseDiffFiles(rename));
+    expect(r.sensitivePaths).toEqual([{ label: 'dotenv', path: 'config/.env' }]);
+    expect(r.sensitivePathsTracked).toHaveLength(0);
+    expect(r.blocked).toBe(true);
+  });
+
+  it('the inline scan still reads a tracked file — a real credential edited in blocks', () => {
+    const r = scanDiffForSecrets(parseDiffFiles(diffFor(E2E, ['AWS_KEY=AKIAIOSFODNN7EXAMPLE'])));
+    expect(r.sensitivePathsTracked).toEqual([{ label: 'dotenv', path: E2E }]);
+    expect(r.inlineSecrets.map((s) => s.label)).toContain('aws-access-key');
+    expect(r.blocked).toBe(true);
+  });
+
+  it('a removed CONTENT line shaped like a header does not make an added file at-base', () => {
+    const forged = `diff --git a/.env b/.env
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/.env
+@@ -0,0 +1,2 @@
++X=1
+--- a/.env
+`;
+    const r = scanDiffForSecrets(parseDiffFiles(forged));
+    expect(r.sensitivePaths).toEqual([{ label: 'dotenv', path: '.env' }]);
+    expect(r.sensitivePathsTracked).toHaveLength(0);
+    expect(r.blocked).toBe(true);
+  });
+
+  it('a tracked path next to an ADDED one: the added one still blocks, both are named', () => {
+    const r = scanDiffForSecrets(parseDiffFiles(diffFor(E2E, ['X=1']) + newFileDiffFor('.env', ['Y=2'])));
+    expect(r.sensitivePathsTracked.map((p) => p.path)).toEqual([E2E]);
+    expect(r.sensitivePaths.map((p) => p.path)).toEqual(['.env']);
+    expect(r.blocked).toBe(true);
   });
 });
 
