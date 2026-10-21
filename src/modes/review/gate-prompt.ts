@@ -232,7 +232,9 @@ const productClause = `
   the code open at the finding's evidence site: (1) does that code really do otherwise than the
   quoted text says, read in its context? (2) is the text NORMATIVE for this change — a rule, a
   decision, or an acceptance criterion in force, not an example, an option weighed, a non-goal, or a
-  question still open? (3) is it THIS PR's — does the change do it, or reach the code that does?
+  question still open? Where the requirements (a source titled \`prd\`) and the tech design (\`tdd\`)
+  disagree, the requirements are in force: a tech-design decision the change departs from while the
+  requirements back it is NOT a defect. (3) is it THIS PR's — does the change do it, or reach the code that does?
   All three ⇒ "agree". Otherwise "unverified" with the reason, or "false" under the usual citation
   rule. A product finding posts ONLY on "agree" (a "partial" stays in the trail), with one
   host-written line quoting the document; its severity is capped at "${PRODUCT_SEVERITY_CAP}" by the host whatever you

@@ -162,6 +162,15 @@ ${args.docs}
    PR does NOT claim it, this is inventory, not accusation: report it with "confidence": "low" and say
    "not claimed by this PR" in the body.
 
+When the REQUIREMENTS (a source whose title is marked \`prd\`) and the TECH DESIGN (marked \`tdd\`)
+disagree, the requirements win: the tech design is how the team planned to build what the
+requirements ask for, and a plan can drift. So a change that follows the tech design where the tech
+design contradicts the requirements is a finding against the REQUIREMENTS — quote the requirement
+line (its key, class rule-broken or promise-undelivered) and say in the body that the change follows
+the tech design (its key and the conflicting line) but the requirements say otherwise. And a change
+that departs from the tech design while the requirements back it is NOT a finding: the plan was
+wrong, not the code.
+
 Never report style, a bug visible inside one hunk (the code reviewers own those), a reinvented
 pattern, a seam between parts, or something the documents merely do not mention: absence from a
 document is not a finding, because no quote can carry it. Read a sentence in its place — a line under

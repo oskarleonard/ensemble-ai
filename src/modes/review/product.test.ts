@@ -49,6 +49,13 @@ describe('renderProductPrompt — the documents vs the change', () => {
     expect(p).toContain('"not claimed by this PR"');
   });
 
+  // Operator ruling 2026-10-21: the tech design is a plan and can drift — the requirements are the authority.
+  it('the requirements outrank the tech design, both ways', () => {
+    expect(p).toContain('the requirements win');
+    expect(p).toContain('a finding against the REQUIREMENTS');
+    expect(p).toMatch(/departs from the tech design while the\s+requirements back it is NOT a finding/);
+  });
+
   it('demands both halves: complete lines copied exactly, a listed key, a code site at the head', () => {
     expect(p).toContain('## Every finding names BOTH halves');
     expect(p).toContain('COMPLETE lines copied EXACTLY');
