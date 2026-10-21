@@ -109,6 +109,11 @@ export interface SecretScanResult {
   // The caller's explicit acknowledgement (recorded for the manifest).
   overridden: boolean;
   sensitivePaths: SensitivePathHit[];
+  // Sensitive-path hits on files that already existed at the diff's BASE under the
+  // same path (edited or deleted, not added or renamed-into). Committed before this
+  // change, so not a surface the change stages: named, never blocking. Their
+  // transmitted lines still go through the inline scan.
+  sensitivePathsTracked: SensitivePathHit[];
 }
 
 // Every CONTENT line of the diff section actually transmitted to the reviewer:
@@ -127,11 +132,35 @@ function payloadLines(section: string): string[] {
     .map((l) => l.slice(1));
 }
 
+// Whether the file already existed at the diff's BASE under this same path: its
+// section HEADER carries a `--- a/<path>` line (an edit or a deletion). An added file
+// has `--- /dev/null` there, and a rename names the OLD path, so a rename INTO a
+// sensitive path still counts as staging one. Only the lines before the first hunk
+// are read, so a removed content line can never pose as the header. A binary
+// section has no `---` line at all and so never counts as at-base (it blocks — the
+// safe direction). Git appends a tab after a path containing a space, hence the
+// trim (the parser trims the `+++ b/` path the same way).
+function existedAtBase(f: FileDiff): boolean {
+  for (const l of f.raw.split('\n')) {
+    if (l.startsWith('@@')) break;
+    if (l.startsWith('--- a/') && l.slice(6).trim() === f.path) return true;
+  }
+  return false;
+}
+
 // Scan the parsed file diffs for sensitive paths + inline secrets. PURE.
 //
-// The PATH rule runs over EVERY file: a `.env` / `.pem` staged in the change is a
-// signal about the change itself, whether or not its bytes ship. The INLINE scan
-// is a leak check on the PAYLOAD, so with `coveredPaths` given it blocks only on
+// The PATH rule runs over EVERY file, whether or not its bytes ship — but it is
+// about a secret SURFACE entering the change: a `.env` / `.pem` the change ADDS
+// (or renames into) is the signal. A file that already existed at the base under
+// the same path was committed before this change; editing or deleting it is not
+// that event, so it is named under `sensitivePathsTracked` and does not block —
+// its transmitted lines still go through the inline scan. Born of run
+// 2026-10-21-20-26-33-e36a86f6: a 90-file PR appended one blank line to a committed
+// end-to-end env file (mock mode, localhost URLs) and the whole review died on the
+// filename. `--allow-sensitive` remains the override for a path the change adds.
+//
+// The INLINE scan is a leak check on the PAYLOAD, so with `coveredPaths` given it blocks only on
 // files the coverage cut actually transmits; a hit in an omitted file is recorded
 // under `inlineSecretsOmitted` instead. Born of run 2026-10-10-14-18-10-a3163f6e:
 // a 411-file PR touched the repo's gitleaks SELF-TEST (planted fake `AKIA…`), the
@@ -150,13 +179,15 @@ export function scanDiffForSecrets(
   } = {}
 ): SecretScanResult {
   const sensitivePaths: SensitivePathHit[] = [];
+  const sensitivePathsTracked: SensitivePathHit[] = [];
   const inlineSecrets: InlineSecretHit[] = [];
   const inlineSecretsOmitted: InlineSecretHit[] = [];
   const inlineSecretsAllowlisted: InlineSecretHit[] = [];
   for (const f of files) {
+    const atBase = existedAtBase(f);
     for (const { label, re } of SENSITIVE_PATH_PATTERNS) {
       if (label === 'dotenv' && DOTENV_TEMPLATE_RE.test(f.path)) continue;
-      if (re.test(f.path)) sensitivePaths.push({ label, path: f.path });
+      if (re.test(f.path)) (atBase ? sensitivePathsTracked : sensitivePaths).push({ label, path: f.path });
     }
     if (f.isBinary) continue;
     const transmitted = opts.coveredPaths ? opts.coveredPaths.has(f.path) : true;
@@ -176,5 +207,6 @@ export function scanDiffForSecrets(
     inlineSecretsOmitted,
     overridden,
     sensitivePaths,
+    sensitivePathsTracked,
   };
 }
