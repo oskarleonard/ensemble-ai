@@ -162,6 +162,14 @@ ${args.docs}
    PR does NOT claim it, this is inventory, not accusation: report it with "confidence": "low" and say
    "not claimed by this PR" in the body.
 
+A requirement the code already missed before this PR, and that the change leaves as it was, is a
+PROMISE UNDELIVERED — not a RULE BROKEN, which is for what the change itself does. Code older than the
+PR does not excuse it: the PR that claims a requirement owes it, whoever wrote the line. Say in the
+body that the code predates the PR, and why the PR claims the requirement (it merges the whole
+feature, or its description or ticket names it). As the code site, cite the line at the head where the
+requirement is not met — in a file this PR changes whenever the flow runs through one: a site in a
+file the change does not touch stays in the run for the owner and is not posted.
+
 When the REQUIREMENTS (a source whose title is marked \`prd\`) and the TECH DESIGN (marked \`tdd\`)
 disagree, the requirements win: the tech design is how the team planned to build what the
 requirements ask for, and a plan can drift. So a change that follows the tech design where the tech

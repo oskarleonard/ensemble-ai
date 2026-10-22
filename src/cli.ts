@@ -3934,8 +3934,10 @@ Usage:
   ensemble-ai regate [<pr-url>] --out <dir> --run-id <id> [--repo <path>]
                      [--gate-model <m>] [--gate-effort <e>] [--premise]
 
-  <pr-url>          the SAME GitHub PR URL the original review took — required only with
-                    --repo (the worktree re-materialization fetches pull/<N>/head)
+  <pr-url>          the SAME GitHub PR URL the original review took — the gate re-reads the
+                    PR's title + description from it (the stated intent the review's gate judged
+                    with; unavailable ⇒ a loud note, no clause). Required with --repo (the worktree
+                    re-materialization fetches pull/<N>/head)
   --out <dir>       the trail base the original run wrote (its <run-id>/ dir lives here)
   --run-id <id>     the original run's id
   --repo <path>     local clone of the PR's repo — re-materializes the head read-only so
@@ -4026,13 +4028,15 @@ async function regateCommand(args: string[]): Promise<number> {
   );
   if (!gateSeat) return 3;
 
+  // The PR URL: optional, unless --repo needs it to re-fetch the head.
+  const prUrl = positionals[0]?.trim() ?? '';
+  const ref = prUrl ? parsePrUrl(prUrl) : null;
+
   // Worktree evidence is opt-in and best-effort: a refused/failed materialization
   // degrades LOUDLY to packet grounding — a regate is never lost to a worktree problem.
   let session: WorktreeSession | null = null;
   const repoFlag = typeof values.repo === 'string' ? values.repo.trim() : '';
   if (repoFlag) {
-    const url = positionals[0]?.trim() ?? '';
-    const ref = url ? parsePrUrl(url) : null;
     if (!ref) {
       console.error(
         'ensemble-ai regate: --repo needs the original PR URL as the positional (the head is re-fetched as pull/<N>/head)'
@@ -4058,10 +4062,21 @@ async function regateCommand(args: string[]): Promise<number> {
     }
   }
 
+  // The stated intent the review's gate judged with — the PR's own title + body, re-fetched (the
+  // trail does not pin it). Best-effort and LOUD, exactly the review's posture: without it the
+  // gate judges the findings without the author's intent, the pre-parity regate.
+  let directive: string | undefined;
+  if (ref) {
+    const fetched = fetchPrDirective({ pr: ref.pr, repoSlug: `${ref.owner}/${ref.repo}` }, process.cwd());
+    if ('directive' in fetched) directive = fetched.directive;
+    else console.error(`· directive: PR #${ref.pr} description unavailable (${fetched.error}) — regating WITHOUT the author's stated intent`);
+  }
+
   try {
     const res = await runRegate({
       baseDir: out,
       conventionPaths: readConventionPathsFromTrail(out, runId),
+      ...(directive ? { directive } : {}),
       gateConfig: gateSeat.config,
       log: (m) => console.error(`· ${m}`),
       ...(values.premise ? { premise: true } : {}),

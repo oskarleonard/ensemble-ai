@@ -317,15 +317,24 @@ function payloadLines(section2) {
     (l) => l.startsWith("+") && !l.startsWith("+++") || l.startsWith("-") && !l.startsWith("---") || l.startsWith(" ")
   ).map((l) => l.slice(1));
 }
+function existedAtBase(f) {
+  for (const l of f.raw.split("\n")) {
+    if (l.startsWith("@@")) break;
+    if (l.startsWith("--- a/") && l.slice(6).trim() === f.path) return true;
+  }
+  return false;
+}
 function scanDiffForSecrets(files, opts = {}) {
   const sensitivePaths = [];
+  const sensitivePathsTracked = [];
   const inlineSecrets = [];
   const inlineSecretsOmitted = [];
   const inlineSecretsAllowlisted = [];
   for (const f of files) {
+    const atBase = existedAtBase(f);
     for (const { label: label2, re } of SENSITIVE_PATH_PATTERNS) {
       if (label2 === "dotenv" && DOTENV_TEMPLATE_RE.test(f.path)) continue;
-      if (re.test(f.path)) sensitivePaths.push({ label: label2, path: f.path });
+      if (re.test(f.path)) (atBase ? sensitivePathsTracked : sensitivePaths).push({ label: label2, path: f.path });
     }
     if (f.isBinary) continue;
     const transmitted = opts.coveredPaths ? opts.coveredPaths.has(f.path) : true;
@@ -344,7 +353,8 @@ function scanDiffForSecrets(files, opts = {}) {
     inlineSecretsAllowlisted,
     inlineSecretsOmitted,
     overridden,
-    sensitivePaths
+    sensitivePaths,
+    sensitivePathsTracked
   };
 }
 
@@ -6070,7 +6080,14 @@ var productClause = `
   decision, or an acceptance criterion in force, not an example, an option weighed, a non-goal, or a
   question still open? Where the requirements (a source titled \`prd\`) and the tech design (\`tdd\`)
   disagree, the requirements are in force: a tech-design decision the change departs from while the
-  requirements back it is NOT a defect. (3) is it THIS PR's \u2014 does the change do it, or reach the code that does?
+  requirements back it is NOT a defect. (3) is it THIS PR's \u2014 does the change do it, reach the code
+  that does, or leave undone a requirement the PR claims to deliver? A PR claims a requirement when
+  its stated intent names the feature, the ticket, or the requirement, or when it merges the whole
+  feature the documents describe. Code older than the PR does NOT make a claimed requirement
+  pre-existing: never answer "pre-existing:" for a product finding only because the base already had
+  that code \u2014 for a requirement the PR claims, a stated-intent item the diff does not do is a finding
+  against this PR, not a mere conformance note. A requirement the PR does not claim (the finding says
+  "not claimed by this PR") is inventory: send "unverified".
   All three \u21D2 "agree". Otherwise "unverified" with the reason, or "false" under the usual citation
   rule. A product finding posts ONLY on "agree" (a "partial" stays in the trail), with one
   host-written line quoting the document; its severity is capped at "${PRODUCT_SEVERITY_CAP}" by the host whatever you
@@ -6863,6 +6880,9 @@ async function runReviewMode(opts) {
   }
   for (const s of secretScan.inlineSecretsOmitted) {
     log(`secret-scan: ${s.path} (${s.label}) \u2014 in an OMITTED file, not transmitted; not blocking`);
+  }
+  for (const p of secretScan.sensitivePathsTracked) {
+    log(`secret-scan: ${p.path} (${p.label}) \u2014 already at the base under this path, not a surface this change stages; not blocking`);
   }
   let agentsMd = opts.agentsMd;
   let conventionManifest;
