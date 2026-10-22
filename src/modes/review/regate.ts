@@ -43,6 +43,10 @@ export interface RegateOptions {
   // gate prompt + synthesis are byte-identical to a plain regate. Threaded so a --premise run whose
   // gate died can be HEALED with the same behavior it was launched with (codex#f1 · claude#f1).
   premise?: boolean;
+  // The PR's own title + body, re-fetched by the CLI from the PR URL: the gate judges with the same
+  // stated intent the review's gate had (a product finding's "does this PR claim it" rests on it).
+  // Absent ⇒ no stated-intent clause, the pre-parity regate.
+  directive?: string;
   // Injected for tests; the default is the real capability-fenced claude spawn.
   run?: typeof runClaudeReviewVoice;
   runId: string;
@@ -109,6 +113,7 @@ export async function runRegate(opts: RegateOptions): Promise<RegateResult> {
   const gate = await runGate({
     baseDir: opts.baseDir,
     config: opts.gateConfig,
+    ...(opts.directive ? { directive: opts.directive } : {}),
     expectedHeadSha: headSha,
     ...(priorDrift?.base ? { priorDrift } : {}),
     ...(opts.worktree

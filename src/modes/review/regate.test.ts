@@ -134,6 +134,17 @@ describe('runRegate — heal a dead gate from the persisted trail, no reviewer r
     expect(on[0]).toContain('Premise pass'); // --premise threaded through ⇒ the clause is appended
   });
 
+  it("threads the PR's own title + body into the gate — the stated intent the review's gate judged with", async () => {
+    const { base, runId } = seedRun();
+    const seen: string[] = [];
+    await runRegate({ baseDir: base, directive: 'Feature: acme billing\n\nShips the whole billing feature.', gateConfig: CFG, run: async (p) => (seen.push(p), okRun(GATE)), runId });
+    expect(seen[0]).toContain("## The author's stated intent (PR title + description)");
+    expect(seen[0]).toContain('Ships the whole billing feature.');
+    const bare: string[] = [];
+    await runRegate({ baseDir: base, gateConfig: CFG, run: async (p) => (bare.push(p), okRun(GATE)), runId });
+    expect(bare[0]).not.toContain("## The author's stated intent");
+  });
+
   it('a gate that times out AGAIN stays fail-closed and reports ok:false', async () => {
     const { base, runId } = seedRun();
     const res = await runRegate({

@@ -1073,6 +1073,7 @@ interface SecretScanResult {
     inlineSecretsAllowlisted: InlineSecretHit[];
     overridden: boolean;
     sensitivePaths: SensitivePathHit[];
+    sensitivePathsTracked: SensitivePathHit[];
 }
 declare function scanDiffForSecrets(files: FileDiff[], opts?: {
     allowSensitive?: boolean;

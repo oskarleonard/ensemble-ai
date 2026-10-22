@@ -234,7 +234,14 @@ const productClause = `
   decision, or an acceptance criterion in force, not an example, an option weighed, a non-goal, or a
   question still open? Where the requirements (a source titled \`prd\`) and the tech design (\`tdd\`)
   disagree, the requirements are in force: a tech-design decision the change departs from while the
-  requirements back it is NOT a defect. (3) is it THIS PR's — does the change do it, or reach the code that does?
+  requirements back it is NOT a defect. (3) is it THIS PR's — does the change do it, reach the code
+  that does, or leave undone a requirement the PR claims to deliver? A PR claims a requirement when
+  its stated intent names the feature, the ticket, or the requirement, or when it merges the whole
+  feature the documents describe. Code older than the PR does NOT make a claimed requirement
+  pre-existing: never answer "pre-existing:" for a product finding only because the base already had
+  that code — for a requirement the PR claims, a stated-intent item the diff does not do is a finding
+  against this PR, not a mere conformance note. A requirement the PR does not claim (the finding says
+  "not claimed by this PR") is inventory: send "unverified".
   All three ⇒ "agree". Otherwise "unverified" with the reason, or "false" under the usual citation
   rule. A product finding posts ONLY on "agree" (a "partial" stays in the trail), with one
   host-written line quoting the document; its severity is capped at "${PRODUCT_SEVERITY_CAP}" by the host whatever you

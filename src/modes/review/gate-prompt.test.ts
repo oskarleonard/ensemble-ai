@@ -516,6 +516,10 @@ describe('renderGatePrompt — the product clause + per-finding DOC block', () =
     expect(p).toContain('Do NOT judge whether the quote is verbatim');
     expect(p).toContain('NORMATIVE for this change');
     expect(p).toContain('is it THIS PR\'s');
+    // A requirement the PR claims is its own, however old the code (operator ruling 2026-10-22).
+    expect(p).toContain('leave undone a requirement the PR claims to deliver');
+    expect(p).toMatch(/Code older than the PR does NOT make a claimed requirement\s+pre-existing/);
+    expect(p).toMatch(/the finding says\s+"not claimed by this PR"\) is inventory: send "unverified"/);
     expect(p).toContain('posts ONLY on "agree"');
     expect(p).toContain('capped at "medium"');
   });

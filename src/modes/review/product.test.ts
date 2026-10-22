@@ -56,6 +56,14 @@ describe('renderProductPrompt — the documents vs the change', () => {
     expect(p).toMatch(/departs from the tech design while the\s+requirements back it is NOT a finding/);
   });
 
+  // Operator ruling 2026-10-22: a requirement the base already missed is still the feature's to deliver.
+  it('a requirement the base already missed is an undelivered promise, owed by the PR that claims it', () => {
+    expect(p).toMatch(/the change leaves as it was, is a\s+PROMISE UNDELIVERED — not a RULE BROKEN/);
+    expect(p).toMatch(/Code older than the\s+PR does not excuse it/);
+    expect(p).toMatch(/why the PR claims the requirement/);
+    expect(p).toMatch(/stays in the run for the owner and is not posted/);
+  });
+
   it('demands both halves: complete lines copied exactly, a listed key, a code site at the head', () => {
     expect(p).toContain('## Every finding names BOTH halves');
     expect(p).toContain('COMPLETE lines copied EXACTLY');

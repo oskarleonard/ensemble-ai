@@ -4497,15 +4497,24 @@ function payloadLines(section2) {
     (l) => l.startsWith("+") && !l.startsWith("+++") || l.startsWith("-") && !l.startsWith("---") || l.startsWith(" ")
   ).map((l) => l.slice(1));
 }
+function existedAtBase(f) {
+  for (const l of f.raw.split("\n")) {
+    if (l.startsWith("@@")) break;
+    if (l.startsWith("--- a/") && l.slice(6).trim() === f.path) return true;
+  }
+  return false;
+}
 function scanDiffForSecrets(files, opts = {}) {
   const sensitivePaths = [];
+  const sensitivePathsTracked = [];
   const inlineSecrets = [];
   const inlineSecretsOmitted = [];
   const inlineSecretsAllowlisted = [];
   for (const f of files) {
+    const atBase = existedAtBase(f);
     for (const { label: label2, re } of SENSITIVE_PATH_PATTERNS) {
       if (label2 === "dotenv" && DOTENV_TEMPLATE_RE.test(f.path)) continue;
-      if (re.test(f.path)) sensitivePaths.push({ label: label2, path: f.path });
+      if (re.test(f.path)) (atBase ? sensitivePathsTracked : sensitivePaths).push({ label: label2, path: f.path });
     }
     if (f.isBinary) continue;
     const transmitted = opts.coveredPaths ? opts.coveredPaths.has(f.path) : true;
@@ -4524,7 +4533,8 @@ function scanDiffForSecrets(files, opts = {}) {
     inlineSecretsAllowlisted,
     inlineSecretsOmitted,
     overridden,
-    sensitivePaths
+    sensitivePaths,
+    sensitivePathsTracked
   };
 }
 
@@ -8330,6 +8340,14 @@ ${args.docs}
    PR does NOT claim it, this is inventory, not accusation: report it with "confidence": "low" and say
    "not claimed by this PR" in the body.
 
+A requirement the code already missed before this PR, and that the change leaves as it was, is a
+PROMISE UNDELIVERED \u2014 not a RULE BROKEN, which is for what the change itself does. Code older than the
+PR does not excuse it: the PR that claims a requirement owes it, whoever wrote the line. Say in the
+body that the code predates the PR, and why the PR claims the requirement (it merges the whole
+feature, or its description or ticket names it). As the code site, cite the line at the head where the
+requirement is not met \u2014 in a file this PR changes whenever the flow runs through one: a site in a
+file the change does not touch stays in the run for the owner and is not posted.
+
 When the REQUIREMENTS (a source whose title is marked \`prd\`) and the TECH DESIGN (marked \`tdd\`)
 disagree, the requirements win: the tech design is how the team planned to build what the
 requirements ask for, and a plan can drift. So a change that follows the tech design where the tech
@@ -9798,7 +9816,14 @@ var productClause = `
   decision, or an acceptance criterion in force, not an example, an option weighed, a non-goal, or a
   question still open? Where the requirements (a source titled \`prd\`) and the tech design (\`tdd\`)
   disagree, the requirements are in force: a tech-design decision the change departs from while the
-  requirements back it is NOT a defect. (3) is it THIS PR's \u2014 does the change do it, or reach the code that does?
+  requirements back it is NOT a defect. (3) is it THIS PR's \u2014 does the change do it, reach the code
+  that does, or leave undone a requirement the PR claims to deliver? A PR claims a requirement when
+  its stated intent names the feature, the ticket, or the requirement, or when it merges the whole
+  feature the documents describe. Code older than the PR does NOT make a claimed requirement
+  pre-existing: never answer "pre-existing:" for a product finding only because the base already had
+  that code \u2014 for a requirement the PR claims, a stated-intent item the diff does not do is a finding
+  against this PR, not a mere conformance note. A requirement the PR does not claim (the finding says
+  "not claimed by this PR") is inventory: send "unverified".
   All three \u21D2 "agree". Otherwise "unverified" with the reason, or "false" under the usual citation
   rule. A product finding posts ONLY on "agree" (a "partial" stays in the trail), with one
   host-written line quoting the document; its severity is capped at "${PRODUCT_SEVERITY_CAP}" by the host whatever you
@@ -11952,6 +11977,9 @@ async function runReviewMode(opts) {
   for (const s of secretScan.inlineSecretsOmitted) {
     log(`secret-scan: ${s.path} (${s.label}) \u2014 in an OMITTED file, not transmitted; not blocking`);
   }
+  for (const p of secretScan.sensitivePathsTracked) {
+    log(`secret-scan: ${p.path} (${p.label}) \u2014 already at the base under this path, not a surface this change stages; not blocking`);
+  }
   let agentsMd = opts.agentsMd;
   let conventionManifest;
   if (!opts.noConventions && opts.conventionReader) {
@@ -12525,6 +12553,7 @@ async function runRegate(opts) {
   const gate = await runGate({
     baseDir: opts.baseDir,
     config: opts.gateConfig,
+    ...opts.directive ? { directive: opts.directive } : {},
     expectedHeadSha: headSha,
     ...priorDrift?.base ? { priorDrift } : {},
     ...opts.worktree ? {
@@ -14753,12 +14782,14 @@ function printSummary(result, profile) {
     out.push(...renderConventionManifest(result.conventionManifest));
   }
   const ss = result.secretScan;
-  if (ss.sensitivePaths.length || ss.inlineSecrets.length || ss.inlineSecretsOmitted.length || ss.inlineSecretsAllowlisted.length) {
+  if (ss.sensitivePaths.length || ss.sensitivePathsTracked.length || ss.inlineSecrets.length || ss.inlineSecretsOmitted.length || ss.inlineSecretsAllowlisted.length) {
     const omitted = ss.inlineSecretsOmitted.length ? ` \xB7 ${ss.inlineSecretsOmitted.length} inline in omitted file(s), not transmitted` : "";
     const allowlisted = ss.inlineSecretsAllowlisted.length ? ` \xB7 ${ss.inlineSecretsAllowlisted.length} inline allowlisted by the repo's .gitleaks.toml` : "";
+    const tracked = ss.sensitivePathsTracked.length ? ` \xB7 ${ss.sensitivePathsTracked.length} sensitive path(s) already at the base, not blocking` : "";
     out.push(
-      `  secrets: ${ss.sensitivePaths.length} sensitive path(s), ${ss.inlineSecrets.length} inline${ss.overridden ? " (overridden)" : ""}${omitted}${allowlisted}`
+      `  secrets: ${ss.sensitivePaths.length} sensitive path(s), ${ss.inlineSecrets.length} inline${ss.overridden ? " (overridden)" : ""}${omitted}${allowlisted}${tracked}`
     );
+    for (const p of ss.sensitivePathsTracked) out.push(`             at-base path: ${p.path} (${p.label})`);
     for (const s of ss.inlineSecretsOmitted) out.push(`             omitted-file hit: ${s.path} (${s.label})`);
     for (const s of ss.inlineSecretsAllowlisted) out.push(`             allowlisted hit: ${s.path} (${s.label})`);
   }
@@ -16998,8 +17029,10 @@ Usage:
   ensemble-ai regate [<pr-url>] --out <dir> --run-id <id> [--repo <path>]
                      [--gate-model <m>] [--gate-effort <e>] [--premise]
 
-  <pr-url>          the SAME GitHub PR URL the original review took \u2014 required only with
-                    --repo (the worktree re-materialization fetches pull/<N>/head)
+  <pr-url>          the SAME GitHub PR URL the original review took \u2014 the gate re-reads the
+                    PR's title + description from it (the stated intent the review's gate judged
+                    with; unavailable \u21D2 a loud note, no clause). Required with --repo (the worktree
+                    re-materialization fetches pull/<N>/head)
   --out <dir>       the trail base the original run wrote (its <run-id>/ dir lives here)
   --run-id <id>     the original run's id
   --repo <path>     local clone of the PR's repo \u2014 re-materializes the head read-only so
@@ -17075,11 +17108,11 @@ async function regateCommand(args) {
     )
   );
   if (!gateSeat) return 3;
+  const prUrl = positionals[0]?.trim() ?? "";
+  const ref = prUrl ? parsePrUrl(prUrl) : null;
   let session = null;
   const repoFlag = typeof values.repo === "string" ? values.repo.trim() : "";
   if (repoFlag) {
-    const url = positionals[0]?.trim() ?? "";
-    const ref = url ? parsePrUrl(url) : null;
     if (!ref) {
       console.error(
         "ensemble-ai regate: --repo needs the original PR URL as the positional (the head is re-fetched as pull/<N>/head)"
@@ -17105,10 +17138,17 @@ async function regateCommand(args) {
       if (made.headFetchedBySha) console.error(`\xB7 note: pull/${ref.pr}/head has moved since the review \u2014 grounded at the pinned head ${headSha.slice(0, 12)} by SHA`);
     }
   }
+  let directive;
+  if (ref) {
+    const fetched = fetchPrDirective({ pr: ref.pr, repoSlug: `${ref.owner}/${ref.repo}` }, process.cwd());
+    if ("directive" in fetched) directive = fetched.directive;
+    else console.error(`\xB7 directive: PR #${ref.pr} description unavailable (${fetched.error}) \u2014 regating WITHOUT the author's stated intent`);
+  }
   try {
     const res = await runRegate({
       baseDir: out,
       conventionPaths: readConventionPathsFromTrail(out, runId),
+      ...directive ? { directive } : {},
       gateConfig: gateSeat.config,
       log: (m) => console.error(`\xB7 ${m}`),
       ...values.premise ? { premise: true } : {},
