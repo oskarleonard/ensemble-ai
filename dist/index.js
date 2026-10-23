@@ -5359,7 +5359,7 @@ function seatDiagnostics(result, timing, opts = {}) {
 function persistAttempt(args, prompt, result, timing) {
   const parsed = result.raw ? parseFindings(result.raw) : null;
   const terminalState = attemptTerminalState(result, parsed);
-  const summary = result.timedOut ? timedOutSummary(result, timing) : parsed?.summary || result.failWhy || `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || "no output"}`;
+  const summary = result.timedOut ? timedOutSummary(result, timing) : parsed?.summary || result.failWhy || `The ${args.reviewer.id} reviewer produced no parseable findings: ${attemptFailureWhy(result)}`;
   return persistReview(args.out, {
     ...args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {},
     diagnostics: seatDiagnostics(result, timing, { conventionsFile: args.conventionsFile }),
@@ -5423,7 +5423,7 @@ async function runCoreSeat(args) {
   if (!packetRetryAfterWorktree(first, args.retryOnPacket)) {
     return { egressDenials, fallbackReason: null, realized: "worktree", review };
   }
-  const why = first.failWhy ?? (first.stderrTail.trim().slice(0, 300) || "no output");
+  const why = attemptFailureWhy(first);
   const reason = `${reviewer.id}: the worktree seat produced no usable review under its \`${args.qualification.profile.id}\` sandbox (${why}) \u2014 FELL BACK to the diff-only packet. This seat reviewed less than it would have in-project.`;
   log(`  \xB7 \u26A0 ${reason}`);
   const { result: second, timing: secondTiming } = await adapterOnce(
@@ -5440,6 +5440,14 @@ async function runCoreSeat(args) {
     realized: "packet",
     review: persistAttempt(args, args.packetPrompt, second, secondTiming)
   };
+}
+var CODEX_STDIN_BANNER = "Reading additional input from stdin...";
+function attemptFailureWhy(first) {
+  const named = first.failWhy?.trim();
+  if (named) return named.slice(0, 300);
+  const tail = first.stderrTail.split("\n").filter((line) => line.trim() !== CODEX_STDIN_BANNER).join("\n").trim();
+  if (tail) return tail.slice(0, 300);
+  return first.raw ? "the reply did not parse as a review" : "no output";
 }
 function isSettledApiFailure(first) {
   return first.failKind === "transient-api" || first.failKind === "usage-limit";
@@ -8965,6 +8973,7 @@ export {
   CLAUDE_WEB_TOOLS,
   CODEX_INACTIVITY_TIMEOUT_MS,
   CODEX_SANDBOX_PROFILE,
+  CODEX_STDIN_BANNER,
   COLD_PEER_ROLE,
   CONFIDENCES,
   CONVENTIONS_INLINE_MAX,
@@ -9061,6 +9070,7 @@ export {
   asRecord2 as asRecord,
   assembleCodePacket,
   assertRosterAdvisors,
+  attemptFailureWhy,
   baseFetchRefspec,
   boundedStreamTail,
   buildClaudeEvidenceArgs,

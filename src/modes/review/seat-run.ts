@@ -155,7 +155,7 @@ function persistAttempt(
     ? timedOutSummary(result, timing)
     : parsed?.summary ||
       result.failWhy ||
-      `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || 'no output'}`;
+      `The ${args.reviewer.id} reviewer produced no parseable findings: ${attemptFailureWhy(result)}`;
   return persistReview(args.out, {
     ...(args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {}),
     diagnostics: seatDiagnostics(result, timing, { conventionsFile: args.conventionsFile }),
@@ -241,7 +241,7 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   // real review run, and it produced nothing usable. Fall back to the packet, LOUDLY — this seat
   // now runs BELOW the ratified acceptance bar (packet < the manual whole-repo baseline), which is
   // Oskar's ratification call to accept, never a silent downgrade.
-  const why = first.failWhy ?? (first.stderrTail.trim().slice(0, 300) || 'no output');
+  const why = attemptFailureWhy(first);
   const reason = `${reviewer.id}: the worktree seat produced no usable review under its \`${args.qualification.profile.id}\` sandbox (${why}) — FELL BACK to the diff-only packet. This seat reviewed less than it would have in-project.`;
   log(`  · ⚠ ${reason}`);
   const { result: second, timing: secondTiming } = await adapterOnce(
@@ -258,6 +258,29 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
     realized: 'packet',
     review: persistAttempt(args, args.packetPrompt, second, secondTiming),
   };
+}
+
+// codex `exec --json` writes only this banner to stderr — the reply and any death ride the -o file
+// and the `--json` stream (see codexStreamFailure) — so as a CAUSE it says nothing.
+export const CODEX_STDIN_BANNER = 'Reading additional input from stdin...';
+
+// WHY a failed attempt produced no usable review — the ONE derivation the packet-fallback reason
+// (runCoreSeat), the failed seat's summary (persistAttempt) and a consumer composing its own seats
+// (the Munin dashboard) all read: a non-blank failWhy; else the stderr tail without codex's stdin
+// banner; else the reply itself named — 'the reply did not parse as a review' when one came back,
+// 'no output' when none did. Capped at 300.
+export function attemptFailureWhy(
+  first: Pick<CodexReviewResult, 'failWhy' | 'raw' | 'stderrTail'>
+): string {
+  const named = first.failWhy?.trim();
+  if (named) return named.slice(0, 300);
+  const tail = first.stderrTail
+    .split('\n')
+    .filter((line) => line.trim() !== CODEX_STDIN_BANNER)
+    .join('\n')
+    .trim();
+  if (tail) return tail.slice(0, 300);
+  return first.raw ? 'the reply did not parse as a review' : 'no output';
 }
 
 // After a failed WORKTREE attempt: a failure the adapter already SETTLED — an API-named death (a
