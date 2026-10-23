@@ -3278,6 +3278,7 @@ async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
       if (transient) {
         const errorLine = (stream?.found ? stream.text ?? "" : raw ?? "").trim();
         return {
+          failKind: "transient-api",
           failWhy: `persistent transient API error after ${retried + 1} attempts`,
           ok: false,
           raw: null,
@@ -3288,6 +3289,7 @@ async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
       const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
       if (!timedOut && limitText) {
         return {
+          failKind: "usage-limit",
           failWhy: `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${limitText.slice(0, 160)}`,
           ok: false,
           raw: null,
@@ -4608,6 +4610,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       if (transient) {
         const errorLine = (stream?.found ? stream.text ?? "" : raw ?? "").trim();
         return {
+          failKind: "transient-api",
           failWhy: `persistent transient API error after ${retried + 1} attempts`,
           ok: false,
           raw: null,
@@ -4618,6 +4621,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
       if (!timedOut && limitText) {
         return {
+          failKind: "usage-limit",
           failWhy: `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${limitText.slice(0, 160)}`,
           ok: false,
           raw: null,
@@ -5349,7 +5353,7 @@ function seatDiagnostics(result, timing, opts = {}) {
 }
 function persistAttempt(args, prompt, result, timing) {
   const parsed = result.raw ? parseFindings(result.raw) : null;
-  const terminalState = parsed && !parsed.parseError && !result.timedOut ? "reviewed" : "failed-reviewer";
+  const terminalState = attemptTerminalState(result, parsed);
   const summary = result.timedOut ? timedOutSummary(result, timing) : parsed?.summary || result.failWhy || `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || "no output"}`;
   return persistReview(args.out, {
     ...args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {},
@@ -5435,14 +5439,17 @@ async function runCoreSeat(args) {
 function isSettledApiFailure(first) {
   return first.failKind === "transient-api" || first.failKind === "usage-limit";
 }
-function packetRetryAfterWorktree(first, retryOnPacket) {
-  return retryOnPacket && !first.timedOut && !isSettledApiFailure(first);
+function attemptTerminalState(result, parsed = result.raw ? parseFindings(result.raw) : null) {
+  return parsed && !parsed.parseError && !result.timedOut ? "reviewed" : "failed-reviewer";
 }
-var RETRIES_ON_PACKET = {
+function packetRetryAfterWorktree(first, retryOnPacket) {
+  return retryOnPacket && attemptTerminalState(first) === "failed-reviewer" && !first.timedOut && !isSettledApiFailure(first);
+}
+var RETRIES_ON_PACKET = Object.freeze({
   claude: false,
   codex: true,
   grok: false
-};
+});
 
 // src/modes/review/self-contained.ts
 import path18 from "path";

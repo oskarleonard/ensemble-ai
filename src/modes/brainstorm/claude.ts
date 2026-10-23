@@ -181,6 +181,7 @@ export async function runClaudeVoice(
     if (transient) {
       const errorLine = (stream?.found ? (stream.text ?? '') : (raw ?? '')).trim();
       return {
+        failKind: 'transient-api',
         failWhy: `persistent transient API error after ${retried + 1} attempts`,
         ok: false,
         raw: null,
@@ -191,6 +192,7 @@ export async function runClaudeVoice(
     const limitText = typeof text === 'string' && isUsageLimitReply(text) ? text.trim() : null;
     if (!timedOut && limitText) {
       return {
+        failKind: 'usage-limit',
         failWhy: `${USAGE_LIMIT_FAIL_PREFIX} — ${limitText.slice(0, 160)}`,
         ok: false,
         raw: null,

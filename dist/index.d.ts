@@ -1051,8 +1051,8 @@ declare function hasDepSurface(r: DepSurfaceResult): boolean;
 
 type ReviewAdapter = (prompt: string, config: ReviewerConfig, opts?: RunReviewOpts) => Promise<CodexReviewResult>;
 declare function isSettledApiFailure(first: Pick<CodexReviewResult, 'failKind'>): boolean;
-declare function packetRetryAfterWorktree(first: Pick<CodexReviewResult, 'failKind' | 'timedOut'>, retryOnPacket: boolean): boolean;
-declare const RETRIES_ON_PACKET: Record<ReviewerId, boolean>;
+declare function packetRetryAfterWorktree(first: Pick<CodexReviewResult, 'failKind' | 'raw' | 'timedOut'>, retryOnPacket: boolean): boolean;
+declare const RETRIES_ON_PACKET: Readonly<Record<ReviewerId, boolean>>;
 
 interface TextSecretHit {
     label: string;

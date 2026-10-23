@@ -263,6 +263,7 @@ export async function runClaudeReviewVoice(
         // for a reply; the error itself is preserved on stderrTail for the trail.
         const errorLine = (stream?.found ? (stream.text ?? '') : (raw ?? '')).trim();
         return {
+          failKind: 'transient-api',
           failWhy: `persistent transient API error after ${retried + 1} attempts`,
           ok: false,
           raw: null,
@@ -275,6 +276,7 @@ export async function runClaudeReviewVoice(
         // The operator's own subscription window is exhausted. Fail loud and named —
         // the reply carries the reset time, which is exactly what the operator needs.
         return {
+          failKind: 'usage-limit',
           failWhy: `${USAGE_LIMIT_FAIL_PREFIX} — ${limitText.slice(0, 160)}`,
           ok: false,
           raw: null,
