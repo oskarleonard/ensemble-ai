@@ -260,9 +260,10 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   };
 }
 
-// After a failed WORKTREE attempt: a failure the adapter already SETTLED — an API-named death it
-// retried on this evidence (a 429 / 5xx out of retries) or the operator's usage limit. Neither
-// says anything about the sandbox, so no packet re-run can cure it. Read off the typed fact
+// After a failed WORKTREE attempt: a failure the adapter already SETTLED — an API-named death (a
+// 429 / 5xx / overloaded: retried in place while it arrives inside the fast-fail window, named the
+// same when it arrives later, unretried) or the operator's usage limit. Neither says anything about
+// the sandbox, so no packet re-run can cure it. Read off the typed fact
 // (`failKind`), which codex's toCodexResult and the Claude runners set alike: from the death
 // itself, never from whether the attempt was fast enough to retry. grok's adapter sets no failKind
 // yet, so a grok death never reads as settled (moot for the CLI — RETRIES_ON_PACKET.grok is false).

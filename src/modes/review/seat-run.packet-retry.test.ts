@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as engine from '../../index';
 import type { ReviewerConfig } from '../../core/types';
@@ -13,6 +13,10 @@ import { isSettledApiFailure, packetRetryAfterWorktree, RETRIES_ON_PACKET } from
 // consumer that composes its own seats (munin-dashboard#315): one rule, no host mirror.
 describe('packetRetryAfterWorktree', () => {
   const failed = { raw: null, timedOut: false };
+  // The Claude runners resolve their binary even with an injected exec; pin it the way the other
+  // Claude tests do, so the suite never shells out to `/bin/zsh -ic whence` (absent on CI's Linux).
+  beforeEach(() => vi.stubEnv('CLAUDE_BIN', '/bin/echo'));
+  afterEach(() => vi.unstubAllEnvs());
 
   it('re-runs only a seat whose sandbox is the unproven mechanism (codex), after a plain failure', () => {
     expect(packetRetryAfterWorktree(failed, RETRIES_ON_PACKET.codex)).toBe(true);
