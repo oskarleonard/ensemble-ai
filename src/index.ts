@@ -60,6 +60,10 @@ export * from './modes/review/ci-evidence';
 export * from './modes/review/evidence';
 export * from './modes/review/evidence-manifest';
 export * from './modes/review/worktree';
+// Seat telemetry off each seat's own stream — tokens, tool calls, turns, the THIN read-depth flag,
+// and the three-valued conventions-read fact. Exported so a consumer that composes its own seats
+// (the Munin dashboard) records the SAME facts the review mode does. One engine, no drift.
+export * from './modes/review/seat-usage';
 // The consumer-runner contract (GitRunAsync): scrub git's repository-selecting env from the
 // INHERITED env before applying a command's own env. Exported so a consumer reuses the engine's
 // list instead of mirroring it (munin-dashboard#227 had to copy it).
