@@ -7682,11 +7682,9 @@ async function runCoreSeat(args) {
   if (review.terminalState === "reviewed") {
     return { egressDenials, fallbackReason: null, realized: "worktree", review };
   }
-  if (first.failKind === "transient-api" || first.failKind === "usage-limit") {
+  if (isSettledApiFailure(first))
     log(`  \xB7 \u26A0 ${reviewer.id}: ${first.failWhy ?? first.failKind} \u2014 not a sandbox failure, so no packet re-run; the seat stands failed`);
-    return { egressDenials, fallbackReason: null, realized: "worktree", review };
-  }
-  if (first.timedOut || !args.retryOnPacket) {
+  if (!packetRetryAfterWorktree(first, args.retryOnPacket)) {
     return { egressDenials, fallbackReason: null, realized: "worktree", review };
   }
   const why = first.failWhy ?? (first.stderrTail.trim().slice(0, 300) || "no output");
@@ -7706,6 +7704,12 @@ async function runCoreSeat(args) {
     realized: "packet",
     review: persistAttempt(args, args.packetPrompt, second, secondTiming)
   };
+}
+function isSettledApiFailure(first) {
+  return first.failKind === "transient-api" || first.failKind === "usage-limit";
+}
+function packetRetryAfterWorktree(first, retryOnPacket) {
+  return retryOnPacket && !first.timedOut && !isSettledApiFailure(first);
 }
 var RETRIES_ON_PACKET = {
   claude: false,

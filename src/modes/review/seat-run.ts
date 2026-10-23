@@ -233,11 +233,9 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   // retried, or the operator's usage limit, says nothing about the sandbox — the packet re-run met
   // the same 429 five seconds later. The seat stands failed with the real cause on it; the
   // dashboard's reseat heals it once the limit clears.
-  if (first.failKind === 'transient-api' || first.failKind === 'usage-limit') {
+  if (isSettledApiFailure(first))
     log(`  · ⚠ ${reviewer.id}: ${first.failWhy ?? first.failKind} — not a sandbox failure, so no packet re-run; the seat stands failed`);
-    return { egressDenials, fallbackReason: null, realized: 'worktree', review };
-  }
-  if (first.timedOut || !args.retryOnPacket) {
+  if (!packetRetryAfterWorktree(first, args.retryOnPacket)) {
     return { egressDenials, fallbackReason: null, realized: 'worktree', review };
   }
   // PROVEN BREAKAGE (§9 grok-f2, spec §2's codex branch): the wrapper's viability check IS this
@@ -261,6 +259,24 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
     realized: 'packet',
     review: persistAttempt(args, args.packetPrompt, second, secondTiming),
   };
+}
+
+// After a failed WORKTREE attempt: a failure the adapter already SETTLED — an API-named death it
+// retried on this evidence (a 429 / 5xx out of retries) or the operator's usage limit. Neither
+// says anything about the sandbox, so no packet re-run can cure it.
+export function isSettledApiFailure(first: Pick<CodexReviewResult, 'failKind'>): boolean {
+  return first.failKind === 'transient-api' || first.failKind === 'usage-limit';
+}
+
+// THE one rule for "a failed worktree attempt re-runs on the diff-only packet" — runCoreSeat's own
+// decision, exported so a consumer that composes its own seats (the Munin dashboard) applies the
+// same one: never after a timeout (a second full budget to learn nothing), never after a settled
+// API failure, and only for a seat whose sandbox is the unproven mechanism (RETRIES_ON_PACKET).
+export function packetRetryAfterWorktree(
+  first: Pick<CodexReviewResult, 'failKind' | 'timedOut'>,
+  retryOnPacket: boolean
+): boolean {
+  return retryOnPacket && !first.timedOut && !isSettledApiFailure(first);
 }
 
 // Only the codex seat re-runs on the packet after a failed worktree attempt: its wrapper is the
