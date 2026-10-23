@@ -67,6 +67,8 @@ export * from './modes/review/seat-usage';
 // The packet-retry rule after a failed worktree attempt (runCoreSeat's own decision) and the
 // per-seat table it reads — so a consumer composing its own seats retries exactly when the CLI does.
 export {
+  attemptFailureWhy,
+  CODEX_STDIN_BANNER,
   isSettledApiFailure,
   packetRetryAfterWorktree,
   RETRIES_ON_PACKET,

@@ -253,6 +253,13 @@ function refuseWorktree(message: string): Promise<CodexReviewResult> {
 
 export type CodexFailKind = 'stalled' | 'transient-api' | 'usage-limit' | 'api-error';
 
+// The context line runCodexReview prepends to stderr when an attempt recovered from a transient API
+// error and then failed for another reason — context, never a cause (seat-run attemptFailureWhy).
+export function codexRetryNote(retried: number): string {
+  return `retried ${retried}× after a transient API error`;
+}
+export const CODEX_RETRY_NOTE_RE = /^retried \d+× after a transient API error$/;
+
 // THE STREAM NAMES THE DEATH (run 2026-10-14-11-08-56-90dbf6a6): a codex seat that dies on the
 // API writes NOTHING to the -o file and only its stdin banner to stderr — the one channel that
 // carries the cause is the `--json` stream's terminal `turn.failed` event ("exceeded retry limit,
@@ -491,7 +498,7 @@ export async function runCodexReview(
       continue;
     }
     if (retried === 0) return withDenials;
-    const note = `retried ${retried}× after a transient API error`;
+    const note = codexRetryNote(retried);
     if (transient) {
       return { ...withDenials, failWhy: `${res.failWhy ?? 'codex API error'} (after ${retried + 1} attempts)` };
     }
