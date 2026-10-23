@@ -2045,6 +2045,10 @@ function worktreeReplyFile() {
 function refuseWorktree(message) {
   return Promise.resolve({ ok: false, raw: null, stderrTail: message, timedOut: false });
 }
+function codexRetryNote(retried) {
+  return `retried ${retried}\xD7 after a transient API error`;
+}
+var CODEX_RETRY_NOTE_RE = /^retried \d+× after a transient API error$/;
 function codexStreamFailure(stream) {
   if (!stream) return null;
   const lines = stream.split("\n");
@@ -2189,7 +2193,7 @@ async function runCodexReview(prompt, config, opts = {}, seams = {}) {
       continue;
     }
     if (retried === 0) return withDenials;
-    const note = `retried ${retried}\xD7 after a transient API error`;
+    const note = codexRetryNote(retried);
     if (transient) {
       return { ...withDenials, failWhy: `${res.failWhy ?? "codex API error"} (after ${retried + 1} attempts)` };
     }
@@ -7635,7 +7639,7 @@ function seatDiagnostics(result, timing, opts = {}) {
 function persistAttempt(args, prompt, result, timing) {
   const parsed = result.raw ? parseFindings(result.raw) : null;
   const terminalState = attemptTerminalState(result, parsed);
-  const summary = result.timedOut ? timedOutSummary(result, timing) : parsed?.summary || result.failWhy || `The ${args.reviewer.id} reviewer produced no parseable findings: ${attemptFailureWhy(result)}`;
+  const summary = result.timedOut ? timedOutSummary(result, timing) : terminalState === "reviewed" ? parsed?.summary ?? "" : `The ${args.reviewer.id} reviewer produced no parseable findings: ${attemptFailureWhy(result)}`;
   return persistReview(args.out, {
     ...args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {},
     diagnostics: seatDiagnostics(result, timing, { conventionsFile: args.conventionsFile }),
@@ -7721,7 +7725,7 @@ var CODEX_STDIN_BANNER = "Reading additional input from stdin...";
 function attemptFailureWhy(first) {
   const named = first.failWhy?.trim();
   if (named) return named.slice(0, 300);
-  const tail = first.stderrTail.split("\n").filter((line) => line.trim() !== CODEX_STDIN_BANNER).join("\n").trim();
+  const tail = first.stderrTail.split("\n").filter((line) => line.trim() !== CODEX_STDIN_BANNER && !CODEX_RETRY_NOTE_RE.test(line.trim())).join("\n").trim();
   if (tail) return tail.slice(0, 300);
   return first.raw ? "the reply did not parse as a review" : "no output";
 }

@@ -9,7 +9,7 @@ import type {
   TerminalState,
 } from '../../core/types';
 import type { EgressDenial } from '../../core/egress-proxy';
-import type { CodexReviewResult, RunReviewOpts } from '../../reviewers/codex';
+import { CODEX_RETRY_NOTE_RE, type CodexReviewResult, type RunReviewOpts } from '../../reviewers/codex';
 
 import type { EvidenceClass } from './evidence';
 import type { SeatQualification } from './seat-evidence';
@@ -149,13 +149,15 @@ function persistAttempt(
 ): StoredReview {
   const parsed = result.raw ? parseFindings(result.raw) : null;
   const terminalState = attemptTerminalState(result, parsed);
-  // A seat that produced NOTHING says why (its stderr tail) — under a sandbox wrapper that is the
-  // difference between "the model had nothing to say" and "the profile killed the process".
+  // A REVIEWED seat keeps its own summary — even an empty one: a valid review without a summary is
+  // not a parse failure. A FAILED seat says why, through the one derivation (attemptFailureWhy) —
+  // under a sandbox wrapper that is the difference between "the model had nothing to say" and
+  // "the profile killed the process".
   const summary = result.timedOut
     ? timedOutSummary(result, timing)
-    : parsed?.summary ||
-      result.failWhy ||
-      `The ${args.reviewer.id} reviewer produced no parseable findings: ${attemptFailureWhy(result)}`;
+    : terminalState === 'reviewed'
+      ? (parsed?.summary ?? '')
+      : `The ${args.reviewer.id} reviewer produced no parseable findings: ${attemptFailureWhy(result)}`;
   return persistReview(args.out, {
     ...(args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {}),
     diagnostics: seatDiagnostics(result, timing, { conventionsFile: args.conventionsFile }),
@@ -267,8 +269,8 @@ export const CODEX_STDIN_BANNER = 'Reading additional input from stdin...';
 // WHY a failed attempt produced no usable review — the ONE derivation the packet-fallback reason
 // (runCoreSeat), the failed seat's summary (persistAttempt) and a consumer composing its own seats
 // (the Munin dashboard) all read: a non-blank failWhy; else the stderr tail without codex's stdin
-// banner; else the reply itself named — 'the reply did not parse as a review' when one came back,
-// 'no output' when none did. Capped at 300.
+// banner and its retry note (context, never a cause); else the reply itself named — 'the reply did
+// not parse as a review' when one came back, 'no output' when none did. Capped at 300.
 export function attemptFailureWhy(
   first: Pick<CodexReviewResult, 'failWhy' | 'raw' | 'stderrTail'>
 ): string {
@@ -276,7 +278,7 @@ export function attemptFailureWhy(
   if (named) return named.slice(0, 300);
   const tail = first.stderrTail
     .split('\n')
-    .filter((line) => line.trim() !== CODEX_STDIN_BANNER)
+    .filter((line) => line.trim() !== CODEX_STDIN_BANNER && !CODEX_RETRY_NOTE_RE.test(line.trim()))
     .join('\n')
     .trim();
   if (tail) return tail.slice(0, 300);
