@@ -1350,6 +1350,9 @@ function isUsageLimitReply(raw) {
 function isRetryableApiStatus(status) {
   return status === 429 || typeof status === "number" && status >= 500 && status <= 599;
 }
+function errorResultFailKind(result) {
+  return isRetryableApiStatus(result.apiErrorStatus) || isTransientApiErrorReply(result.text ?? "") ? "transient-api" : "api-error";
+}
 var USAGE_LIMIT_FAIL_PREFIX = "operator usage limit reached";
 function isUsageLimitFailure(failWhy) {
   return failWhy?.startsWith(USAGE_LIMIT_FAIL_PREFIX) ?? false;
@@ -2744,7 +2747,7 @@ async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
       const stream = typeof raw === "string" ? extractStreamResult(raw) : null;
       const text = stream?.found ? stream.text : raw;
       const activity = streamActivityTail(raw);
-      const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
+      const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && errorResultFailKind(stream) === "transient-api" : isTransientApiErrorReply(raw));
       if (transient && retried < retryDelaysMs.length) {
         await sleep2(retryDelaysMs[retried]);
         retried += 1;
@@ -2775,6 +2778,7 @@ async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
       if (!timedOut && stream?.found && stream.isError) {
         const status = stream.apiErrorStatus;
         return {
+          failKind: errorResultFailKind(stream),
           failWhy: `the voice returned an error result${status ? ` (API status ${status})` : ""}`,
           ok: false,
           raw: null,
@@ -5542,7 +5546,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       const elapsedMs = Date.now() - startedAt;
       const stream = typeof raw === "string" ? extractStreamResult(raw) : null;
       const text = stream?.found ? stream.text : raw;
-      const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
+      const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && errorResultFailKind(stream) === "transient-api" : isTransientApiErrorReply(raw));
       if (transient && retried < retryDelaysMs.length) {
         await sleep3(retryDelaysMs[retried]);
         retried += 1;
@@ -5573,6 +5577,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       if (!timedOut && stream?.found && stream.isError) {
         const status = stream.apiErrorStatus;
         return {
+          failKind: errorResultFailKind(stream),
           failWhy: `reviewer returned an error result${status ? ` (API status ${status})` : ""}`,
           ok: false,
           raw: null,
@@ -5672,7 +5677,7 @@ async function runClaudeExecVoice(prompt, config, opts, seams = {}) {
     const elapsedMs = Date.now() - startedAt;
     const stream = typeof raw === "string" ? extractStreamResult(raw) : null;
     const text = stream?.found ? stream.text : raw;
-    const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
+    const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && errorResultFailKind(stream) === "transient-api" : isTransientApiErrorReply(raw));
     if (transient && retried < retryDelaysMs.length) {
       await sleep4(retryDelaysMs[retried]);
       retried += 1;
@@ -5703,6 +5708,7 @@ async function runClaudeExecVoice(prompt, config, opts, seams = {}) {
     if (!timedOut && stream?.found && stream.isError) {
       const status = stream.apiErrorStatus;
       return {
+        failKind: errorResultFailKind(stream),
         failWhy: `exec seat returned an error result${status ? ` (API status ${status})` : ""}`,
         ok: false,
         raw: null,

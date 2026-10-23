@@ -1,8 +1,8 @@
 import {
   CLAUDE_EFFORTS,
   CLAUDE_INACTIVITY_TIMEOUT_MS,
+  errorResultFailKind,
   extractStreamResult,
-  isRetryableApiStatus,
   isTransientApiErrorReply,
   isUsageLimitReply,
   streamActivityTail,
@@ -170,8 +170,7 @@ export async function runClaudeVoice(
       typeof raw === 'string' &&
       elapsedMs < fastFailMs &&
       (stream?.found
-        ? stream.isError &&
-          (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? ''))
+        ? stream.isError && errorResultFailKind(stream) === 'transient-api'
         : isTransientApiErrorReply(raw));
     if (transient && retried < retryDelaysMs.length) {
       await sleep(retryDelaysMs[retried]);
@@ -203,6 +202,7 @@ export async function runClaudeVoice(
     if (!timedOut && stream?.found && stream.isError) {
       const status = stream.apiErrorStatus;
       return {
+        failKind: errorResultFailKind(stream),
         failWhy: `the voice returned an error result${status ? ` (API status ${status})` : ''}`,
         ok: false,
         raw: null,

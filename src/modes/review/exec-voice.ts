@@ -1,3 +1,4 @@
+import { errorResultFailKind } from '../../core/claude-stream';
 import { runReviewerExec } from '../../core/spawn';
 import { claudeAdvisorArgs, claudeAdvisorEnv, resolveClaudeBin } from '../brainstorm/claude';
 import type { VoiceConfig } from '../brainstorm/types';
@@ -7,7 +8,6 @@ import {
   CLAUDE_EFFORTS,
   CLAUDE_INACTIVITY_TIMEOUT_MS,
   extractStreamResult,
-  isRetryableApiStatus,
   isTransientApiErrorReply,
   isUsageLimitReply,
   TRANSIENT_FAST_FAIL_MS,
@@ -107,8 +107,7 @@ export async function runClaudeExecVoice(
       typeof raw === 'string' &&
       elapsedMs < fastFailMs &&
       (stream?.found
-        ? stream.isError &&
-          (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? ''))
+        ? stream.isError && errorResultFailKind(stream) === 'transient-api'
         : isTransientApiErrorReply(raw));
     if (transient && retried < retryDelaysMs.length) {
       await sleep(retryDelaysMs[retried]);
@@ -140,6 +139,7 @@ export async function runClaudeExecVoice(
     if (!timedOut && stream?.found && stream.isError) {
       const status = stream.apiErrorStatus;
       return {
+        failKind: errorResultFailKind(stream),
         failWhy: `exec seat returned an error result${status ? ` (API status ${status})` : ''}`,
         ok: false,
         raw: null,

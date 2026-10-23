@@ -2,8 +2,11 @@ import { describe, expect, it } from 'vitest';
 
 import * as engine from '../../index';
 import type { ReviewerConfig } from '../../core/types';
+import { toCodexResult } from '../../reviewers/codex';
+import { runClaudeVoice } from '../brainstorm/claude';
 
 import { type ReviewerExec, runClaudeReviewVoice } from './claude';
+import { runClaudeExecVoice } from './exec-voice';
 import { isSettledApiFailure, packetRetryAfterWorktree, RETRIES_ON_PACKET } from './seat-run';
 
 // The packet-retry rule runCoreSeat applies after a failed worktree attempt, exported for a
@@ -56,6 +59,44 @@ describe('packetRetryAfterWorktree', () => {
     for (const settled of [transient, limit]) {
       expect(isSettledApiFailure(settled)).toBe(true);
       expect(packetRetryAfterWorktree(settled, true)).toBe(false);
+    }
+  });
+
+  it('gives codex and every Claude runner the SAME answer on the same API death, however late it came', async () => {
+    const CFG: ReviewerConfig = { cmd: 'claude', effort: 'high', id: 'claude', model: 'm', vendor: 'anthropic' };
+    const errorResult = (status: number, text: string) =>
+      JSON.stringify({ api_error_status: status, is_error: true, result: text, type: 'result' });
+    // fastFailMs 0: every death arrives AFTER the fast-fail window, so no runner retries it — the
+    // error-result branch alone names it (a 529 after a slow start, the case codex names untimed).
+    const claudeRunners = (raw: string) => {
+      const exec = () => Promise.resolve({ raw, stderrTail: '', timedOut: false });
+      const seams = { exec, fastFailMs: 0, retryDelaysMs: [] };
+      return Promise.all([
+        runClaudeReviewVoice('p', CFG, {}, seams),
+        runClaudeVoice('p', CFG, {}, seams),
+        runClaudeExecVoice('p', CFG, { timeoutMs: 1000, worktree: '/nonexistent' }, seams),
+      ]);
+    };
+    const codexDeath = (message: string) =>
+      toCodexResult({ raw: null, stderrTail: '', streamTail: JSON.stringify({ error: { message }, type: 'turn.failed' }), timedOut: false });
+
+    const overloaded = await claudeRunners(errorResult(529, 'API Error: 529 Overloaded'));
+    const codexOverloaded = codexDeath('exceeded retry limit, last status: 529 Overloaded');
+    expect(isSettledApiFailure(codexOverloaded)).toBe(true);
+    for (const seat of overloaded) {
+      expect(seat.failKind).toBe('transient-api');
+      expect(isSettledApiFailure(seat)).toBe(isSettledApiFailure(codexOverloaded));
+      expect(packetRetryAfterWorktree(seat, true)).toBe(false);
+    }
+
+    // A permanent error (auth) is not settled on either side: it may be the sandbox's doing.
+    const auth = await claudeRunners(errorResult(401, 'Invalid API key'));
+    const codexAuth = codexDeath('unexpected status 401 Unauthorized');
+    expect(codexAuth.failKind).toBe('api-error');
+    for (const seat of auth) {
+      expect(seat.failKind).toBe('api-error');
+      expect(isSettledApiFailure(seat)).toBe(false);
+      expect(packetRetryAfterWorktree(seat, true)).toBe(true);
     }
   });
 
