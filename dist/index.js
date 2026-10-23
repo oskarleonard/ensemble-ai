@@ -2001,6 +2001,9 @@ function isUsageLimitReply(raw) {
 function isRetryableApiStatus(status) {
   return status === 429 || typeof status === "number" && status >= 500 && status <= 599;
 }
+function errorResultFailKind(result) {
+  return isRetryableApiStatus(result.apiErrorStatus) || isTransientApiErrorReply(result.text ?? "") ? "transient-api" : "api-error";
+}
 var USAGE_LIMIT_FAIL_PREFIX = "operator usage limit reached";
 function isUsageLimitFailure(failWhy) {
   return failWhy?.startsWith(USAGE_LIMIT_FAIL_PREFIX) ?? false;
@@ -3269,7 +3272,7 @@ async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
       const stream = typeof raw === "string" ? extractStreamResult(raw) : null;
       const text = stream?.found ? stream.text : raw;
       const activity = streamActivityTail(raw);
-      const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
+      const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && errorResultFailKind(stream) === "transient-api" : isTransientApiErrorReply(raw));
       if (transient && retried < retryDelaysMs.length) {
         await sleep2(retryDelaysMs[retried]);
         retried += 1;
@@ -3278,6 +3281,7 @@ async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
       if (transient) {
         const errorLine = (stream?.found ? stream.text ?? "" : raw ?? "").trim();
         return {
+          failKind: "transient-api",
           failWhy: `persistent transient API error after ${retried + 1} attempts`,
           ok: false,
           raw: null,
@@ -3288,6 +3292,7 @@ async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
       const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
       if (!timedOut && limitText) {
         return {
+          failKind: "usage-limit",
           failWhy: `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${limitText.slice(0, 160)}`,
           ok: false,
           raw: null,
@@ -3298,6 +3303,7 @@ async function runClaudeVoice(prompt, config, opts = {}, seams = {}) {
       if (!timedOut && stream?.found && stream.isError) {
         const status = stream.apiErrorStatus;
         return {
+          failKind: errorResultFailKind(stream),
           failWhy: `the voice returned an error result${status ? ` (API status ${status})` : ""}`,
           ok: false,
           raw: null,
@@ -4599,7 +4605,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       const elapsedMs = Date.now() - startedAt;
       const stream = typeof raw === "string" ? extractStreamResult(raw) : null;
       const text = stream?.found ? stream.text : raw;
-      const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && (isRetryableApiStatus(stream.apiErrorStatus) || isTransientApiErrorReply(stream.text ?? "")) : isTransientApiErrorReply(raw));
+      const transient = !timedOut && typeof raw === "string" && elapsedMs < fastFailMs && (stream?.found ? stream.isError && errorResultFailKind(stream) === "transient-api" : isTransientApiErrorReply(raw));
       if (transient && retried < retryDelaysMs.length) {
         await sleep3(retryDelaysMs[retried]);
         retried += 1;
@@ -4608,6 +4614,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       if (transient) {
         const errorLine = (stream?.found ? stream.text ?? "" : raw ?? "").trim();
         return {
+          failKind: "transient-api",
           failWhy: `persistent transient API error after ${retried + 1} attempts`,
           ok: false,
           raw: null,
@@ -4618,6 +4625,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       const limitText = typeof text === "string" && isUsageLimitReply(text) ? text.trim() : null;
       if (!timedOut && limitText) {
         return {
+          failKind: "usage-limit",
           failWhy: `${USAGE_LIMIT_FAIL_PREFIX} \u2014 ${limitText.slice(0, 160)}`,
           ok: false,
           raw: null,
@@ -4628,6 +4636,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
       if (!timedOut && stream?.found && stream.isError) {
         const status = stream.apiErrorStatus;
         return {
+          failKind: errorResultFailKind(stream),
           failWhy: `reviewer returned an error result${status ? ` (API status ${status})` : ""}`,
           ok: false,
           raw: null,
@@ -5349,7 +5358,7 @@ function seatDiagnostics(result, timing, opts = {}) {
 }
 function persistAttempt(args, prompt, result, timing) {
   const parsed = result.raw ? parseFindings(result.raw) : null;
-  const terminalState = parsed && !parsed.parseError && !result.timedOut ? "reviewed" : "failed-reviewer";
+  const terminalState = attemptTerminalState(result, parsed);
   const summary = result.timedOut ? timedOutSummary(result, timing) : parsed?.summary || result.failWhy || `The ${args.reviewer.id} reviewer produced no parseable findings: ${result.stderrTail.trim().slice(0, 300) || "no output"}`;
   return persistReview(args.out, {
     ...args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {},
@@ -5409,11 +5418,9 @@ async function runCoreSeat(args) {
   if (review.terminalState === "reviewed") {
     return { egressDenials, fallbackReason: null, realized: "worktree", review };
   }
-  if (first.failKind === "transient-api" || first.failKind === "usage-limit") {
+  if (isSettledApiFailure(first))
     log(`  \xB7 \u26A0 ${reviewer.id}: ${first.failWhy ?? first.failKind} \u2014 not a sandbox failure, so no packet re-run; the seat stands failed`);
-    return { egressDenials, fallbackReason: null, realized: "worktree", review };
-  }
-  if (first.timedOut || !args.retryOnPacket) {
+  if (!packetRetryAfterWorktree(first, args.retryOnPacket)) {
     return { egressDenials, fallbackReason: null, realized: "worktree", review };
   }
   const why = first.failWhy ?? (first.stderrTail.trim().slice(0, 300) || "no output");
@@ -5434,11 +5441,20 @@ async function runCoreSeat(args) {
     review: persistAttempt(args, args.packetPrompt, second, secondTiming)
   };
 }
-var RETRIES_ON_PACKET = {
+function isSettledApiFailure(first) {
+  return first.failKind === "transient-api" || first.failKind === "usage-limit";
+}
+function attemptTerminalState(result, parsed = result.raw ? parseFindings(result.raw) : null) {
+  return parsed && !parsed.parseError && !result.timedOut ? "reviewed" : "failed-reviewer";
+}
+function packetRetryAfterWorktree(first, retryOnPacket) {
+  return retryOnPacket && attemptTerminalState(first) === "failed-reviewer" && !first.timedOut && !isSettledApiFailure(first);
+}
+var RETRIES_ON_PACKET = Object.freeze({
   claude: false,
   codex: true,
   grok: false
-};
+});
 
 // src/modes/review/self-contained.ts
 import path18 from "path";
@@ -9008,6 +9024,7 @@ export {
   QUALIFY_PROBE_PORT,
   QUALITY_LENS,
   REPO_LOCATION_ENV,
+  RETRIES_ON_PACKET,
   REVIEWERS_FILE,
   REVIEWER_DEFAULTS,
   REVIEWER_IDS,
@@ -9136,6 +9153,7 @@ export {
   isReviewProfile,
   isReviewerId,
   isSeatAdvisor,
+  isSettledApiFailure,
   isStrippedPath,
   isTestPath,
   isTransientApiErrorReply,
@@ -9168,6 +9186,7 @@ export {
   missingConfig,
   omittedLine,
   oneOf,
+  packetRetryAfterWorktree,
   parseConventionCitation,
   parseCritique,
   parseDiffFiles,

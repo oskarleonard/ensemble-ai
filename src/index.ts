@@ -64,6 +64,13 @@ export * from './modes/review/worktree';
 // and the three-valued conventions-read fact. Exported so a consumer that composes its own seats
 // (the Munin dashboard) records the SAME facts the review mode does. One engine, no drift.
 export * from './modes/review/seat-usage';
+// The packet-retry rule after a failed worktree attempt (runCoreSeat's own decision) and the
+// per-seat table it reads — so a consumer composing its own seats retries exactly when the CLI does.
+export {
+  isSettledApiFailure,
+  packetRetryAfterWorktree,
+  RETRIES_ON_PACKET,
+} from './modes/review/seat-run';
 // The consumer-runner contract (GitRunAsync): scrub git's repository-selecting env from the
 // INHERITED env before applying a command's own env. Exported so a consumer reuses the engine's
 // list instead of mirroring it (munin-dashboard#227 had to copy it).

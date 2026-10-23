@@ -1,5 +1,5 @@
 import { persistReview } from '../../core/artifacts';
-import { parseFindings } from '../../core/findings';
+import { type ParsedReview, parseFindings } from '../../core/findings';
 import type { assembleCodePacket } from '../../core/packet';
 import type {
   ReviewerConfig,
@@ -148,8 +148,7 @@ function persistAttempt(
   timing: SeatTiming
 ): StoredReview {
   const parsed = result.raw ? parseFindings(result.raw) : null;
-  const terminalState: TerminalState =
-    parsed && !parsed.parseError && !result.timedOut ? 'reviewed' : 'failed-reviewer';
+  const terminalState = attemptTerminalState(result, parsed);
   // A seat that produced NOTHING says why (its stderr tail) — under a sandbox wrapper that is the
   // difference between "the model had nothing to say" and "the profile killed the process".
   const summary = result.timedOut
@@ -233,11 +232,9 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   // retried, or the operator's usage limit, says nothing about the sandbox — the packet re-run met
   // the same 429 five seconds later. The seat stands failed with the real cause on it; the
   // dashboard's reseat heals it once the limit clears.
-  if (first.failKind === 'transient-api' || first.failKind === 'usage-limit') {
+  if (isSettledApiFailure(first))
     log(`  · ⚠ ${reviewer.id}: ${first.failWhy ?? first.failKind} — not a sandbox failure, so no packet re-run; the seat stands failed`);
-    return { egressDenials, fallbackReason: null, realized: 'worktree', review };
-  }
-  if (first.timedOut || !args.retryOnPacket) {
+  if (!packetRetryAfterWorktree(first, args.retryOnPacket)) {
     return { egressDenials, fallbackReason: null, realized: 'worktree', review };
   }
   // PROVEN BREAKAGE (§9 grok-f2, spec §2's codex branch): the wrapper's viability check IS this
@@ -263,6 +260,44 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   };
 }
 
+// After a failed WORKTREE attempt: a failure the adapter already SETTLED — an API-named death (a
+// 429 / 5xx / overloaded: retried in place while it arrives inside the fast-fail window, named the
+// same when it arrives later, unretried) or the operator's usage limit. Neither says anything about
+// the sandbox, so no packet re-run can cure it. Read off the typed fact
+// (`failKind`), which codex's toCodexResult and the Claude runners set alike: from the death
+// itself, never from whether the attempt was fast enough to retry. grok's adapter sets no failKind
+// yet, so a grok death never reads as settled (moot for the CLI — RETRIES_ON_PACKET.grok is false).
+export function isSettledApiFailure(first: Pick<CodexReviewResult, 'failKind'>): boolean {
+  return first.failKind === 'transient-api' || first.failKind === 'usage-limit';
+}
+
+// ONE attempt's terminal state: a review only when its reply parsed and the seat did not time out
+// (a cut-off review is not trusted even if it partly parsed). `ok` is NOT this — codex returns ok
+// with a reply that does not parse — so the retry rule below asks this, never `ok`.
+function attemptTerminalState(
+  result: Pick<CodexReviewResult, 'raw' | 'timedOut'>,
+  parsed: ParsedReview | null = result.raw ? parseFindings(result.raw) : null
+): TerminalState {
+  return parsed && !parsed.parseError && !result.timedOut ? 'reviewed' : 'failed-reviewer';
+}
+
+// THE one rule for "a worktree attempt re-runs on the diff-only packet" — runCoreSeat's own
+// decision, whole, exported so a consumer that composes its own seats (the Munin dashboard) applies
+// the same one: only after a FAILED attempt (the terminal state persistAttempt records), never
+// after a timeout (a second full budget to learn nothing), never after a settled API failure, and
+// only for a seat whose sandbox is the unproven mechanism (RETRIES_ON_PACKET).
+export function packetRetryAfterWorktree(
+  first: Pick<CodexReviewResult, 'failKind' | 'raw' | 'timedOut'>,
+  retryOnPacket: boolean
+): boolean {
+  return (
+    retryOnPacket &&
+    attemptTerminalState(first) === 'failed-reviewer' &&
+    !first.timedOut &&
+    !isSettledApiFailure(first)
+  );
+}
+
 // Only the codex seat re-runs on the packet after a failed worktree attempt: its wrapper is the
 // unproven mechanism this phase introduces (spec Open questions — "fail closed to packet per seat
 // only on PROVEN breakage"), and a real review under it is the proof the spec asks for. grok's
@@ -271,8 +306,10 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
 // evidence gain.
 // claude: like grok, its fence (the capability fence) is a proven mechanism, not the
 // unproven wrapper this retry exists to prove — a claude failure is a reviewer failure.
-export const RETRIES_ON_PACKET: Record<ReviewerId, boolean> = {
+// Frozen: the engine's own runs read this table, so a consumer that imports it reads the policy and
+// can never rewrite it for the process.
+export const RETRIES_ON_PACKET: Readonly<Record<ReviewerId, boolean>> = Object.freeze({
   claude: false,
   codex: true,
   grok: false,
-};
+});

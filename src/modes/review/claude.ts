@@ -8,8 +8,8 @@ import { isUnder, makeOwnerOnlyTempDir } from '../../core/artifacts';
 import {
   CLAUDE_EFFORTS,
   CLAUDE_INACTIVITY_TIMEOUT_MS,
+  errorResultFailKind,
   extractStreamResult,
-  isRetryableApiStatus,
   isTransientApiErrorReply,
   isUsageLimitReply,
   TRANSIENT_FAST_FAIL_MS,
@@ -246,9 +246,7 @@ export async function runClaudeReviewVoice(
         typeof raw === 'string' &&
         elapsedMs < fastFailMs &&
         (stream?.found
-          ? stream.isError &&
-            (isRetryableApiStatus(stream.apiErrorStatus) ||
-              isTransientApiErrorReply(stream.text ?? ''))
+          ? stream.isError && errorResultFailKind(stream) === 'transient-api'
           : isTransientApiErrorReply(raw));
       if (transient && retried < retryDelaysMs.length) {
         await sleep(retryDelaysMs[retried]);
@@ -263,6 +261,7 @@ export async function runClaudeReviewVoice(
         // for a reply; the error itself is preserved on stderrTail for the trail.
         const errorLine = (stream?.found ? (stream.text ?? '') : (raw ?? '')).trim();
         return {
+          failKind: 'transient-api',
           failWhy: `persistent transient API error after ${retried + 1} attempts`,
           ok: false,
           raw: null,
@@ -275,6 +274,7 @@ export async function runClaudeReviewVoice(
         // The operator's own subscription window is exhausted. Fail loud and named —
         // the reply carries the reset time, which is exactly what the operator needs.
         return {
+          failKind: 'usage-limit',
           failWhy: `${USAGE_LIMIT_FAIL_PREFIX} — ${limitText.slice(0, 160)}`,
           ok: false,
           raw: null,
@@ -289,6 +289,7 @@ export async function runClaudeReviewVoice(
         // "no parseable JSON" downstream.
         const status = stream.apiErrorStatus;
         return {
+          failKind: errorResultFailKind(stream),
           failWhy: `reviewer returned an error result${status ? ` (API status ${status})` : ''}`,
           ok: false,
           raw: null,

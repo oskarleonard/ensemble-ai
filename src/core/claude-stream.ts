@@ -40,6 +40,16 @@ export function isRetryableApiStatus(status: number | null): boolean {
   return status === 429 || (typeof status === 'number' && status >= 500 && status <= 599);
 }
 
+// WHAT a completed error result is, apart from whether to retry it: a retryable status or a short
+// API-error reply is a transient API death, anything else (auth, a permanent 4xx) a plain API
+// error. The fast-fail window decides only whether the seat re-spawns — a 529 after a slow start
+// is the same death as one on arrival, and codex's toCodexResult names it with no time gate too.
+export function errorResultFailKind(result: Pick<StreamResultEvent, 'apiErrorStatus' | 'text'>): 'api-error' | 'transient-api' {
+  return isRetryableApiStatus(result.apiErrorStatus) || isTransientApiErrorReply(result.text ?? '')
+    ? 'transient-api'
+    : 'api-error';
+}
+
 // The one seat failure a re-spawn can never fix: the operator's own subscription window is
 // closed until the reset time the reply carries. Callers that retry an empty seat check this
 // so they burn nothing against a window that is already spent.
