@@ -1053,7 +1053,7 @@ declare function hasDepSurface(r: DepSurfaceResult): boolean;
 
 type ReviewAdapter = (prompt: string, config: ReviewerConfig, opts?: RunReviewOpts) => Promise<CodexReviewResult>;
 declare const CODEX_STDIN_BANNER = "Reading additional input from stdin...";
-declare function attemptFailureWhy(first: Pick<CodexReviewResult, 'failWhy' | 'raw' | 'stderrTail'>): string;
+declare function attemptFailureWhy(first: Pick<CodexReviewResult, 'failWhy' | 'raw' | 'stderrTail'> & Partial<Pick<CodexReviewResult, 'timedOut' | 'timedOutReason'>>, elapsedMs?: number): string;
 declare function isSettledApiFailure(first: Pick<CodexReviewResult, 'failKind'>): boolean;
 declare function packetRetryAfterWorktree(first: Pick<CodexReviewResult, 'failKind' | 'raw' | 'timedOut'>, retryOnPacket: boolean): boolean;
 declare const RETRIES_ON_PACKET: Readonly<Record<ReviewerId, boolean>>;

@@ -31,6 +31,20 @@ describe('attemptFailureWhy', () => {
     expect(attemptFailureWhy({ raw: null, stderrTail: 'y'.repeat(900) })).toHaveLength(300);
   });
 
+  it('names the watchdog for a timed-out attempt that named none — never "no output" (#143 round 2)', () => {
+    // codex's absolute backstop: no failWhy, no reply, only the banner on stderr.
+    expect(
+      attemptFailureWhy({ raw: null, stderrTail: CODEX_STDIN_BANNER, timedOut: true, timedOutReason: 'absolute' }, 12 * 60_000)
+    ).toBe('The reviewer timed out before completing (the absolute backstop cut it after 12 min) — its output is incomplete and not trusted.');
+    expect(attemptFailureWhy({ raw: null, stderrTail: '', timedOut: true, timedOutReason: 'absolute' })).toContain(
+      '(the absolute backstop cut it)'
+    );
+    expect(attemptFailureWhy({ failWhy: '   ', raw: 'partial', stderrTail: 'x', timedOut: true, timedOutReason: 'inactivity' })).toContain(
+      'the liveness watchdog cut it on a silent seat'
+    );
+    expect(attemptFailureWhy({ failWhy: 'z'.repeat(900), raw: null, stderrTail: '', timedOut: true })).toHaveLength(300);
+  });
+
   it('is reachable through the library entry', () => {
     expect(engine.attemptFailureWhy).toBe(attemptFailureWhy);
     expect(engine.CODEX_STDIN_BANNER).toBe('Reading additional input from stdin...');

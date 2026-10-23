@@ -94,23 +94,6 @@ async function adapterOnce(
   }
 }
 
-// A timeout summary names WHICH watchdog fired and how long the seat ran: the absolute backstop
-// means it was still producing when cut (give it budget), the liveness one means it went silent
-// (it wedged). Run 2026-08-26-10-45-52 left only "timed out" behind, and the difference had to be
-// reconstructed from artifact mtimes. The adapter's own wording wins when it has one.
-function timedOutSummary(result: CodexReviewResult, timing: SeatTiming): string {
-  if (result.failWhy) return result.failWhy;
-  const minutes = Math.round((timing.endedAt - timing.startedAt) / 60_000);
-  const watchdog =
-    result.timedOutReason === 'inactivity'
-      ? // Elapsed is NOT the silence: a seat can work for 30 min and then go quiet for 15. Only the
-        // adapter knows its own silence budget, so it states the figure in `failWhy` (returned
-        // above); this generic wording is the fallback for a seat that named none.
-        'the liveness watchdog cut it on a silent seat'
-      : `the absolute backstop cut it after ${minutes} min`;
-  return `The reviewer timed out before completing (${watchdog}) — its output is incomplete and not trusted.`;
-}
-
 // The seat's run FACTS for the trail, written for every attempt. The stderr tail is the noise
 // channel bounded by the adapter (2000 chars) — kept here rather than dropped, because on a
 // timeout it is the only text the seat left behind. Pre-flight warnings ride their own field, so
@@ -152,9 +135,10 @@ function persistAttempt(
   // A REVIEWED seat keeps its own summary — even an empty one: a valid review without a summary is
   // not a parse failure. A FAILED seat says why, through the one derivation (attemptFailureWhy) —
   // under a sandbox wrapper that is the difference between "the model had nothing to say" and
-  // "the profile killed the process".
+  // "the profile killed the process". A timed-out seat's why is its whole summary (it names the
+  // watchdog); any other failure is framed as the reply that never parsed.
   const summary = result.timedOut
-    ? timedOutSummary(result, timing)
+    ? attemptFailureWhy(result, timing.endedAt - timing.startedAt)
     : terminalState === 'reviewed'
       ? (parsed?.summary ?? '')
       : `The ${args.reviewer.id} reviewer produced no parseable findings: ${attemptFailureWhy(result)}`;
@@ -235,7 +219,7 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   // the same 429 five seconds later. The seat stands failed with the real cause on it; the
   // dashboard's reseat heals it once the limit clears.
   if (isSettledApiFailure(first))
-    log(`  · ⚠ ${reviewer.id}: ${first.failWhy ?? first.failKind} — not a sandbox failure, so no packet re-run; the seat stands failed`);
+    log(`  · ⚠ ${reviewer.id}: ${attemptFailureWhy(first)} — not a sandbox failure, so no packet re-run; the seat stands failed`);
   if (!packetRetryAfterWorktree(first, args.retryOnPacket)) {
     return { egressDenials, fallbackReason: null, realized: 'worktree', review };
   }
@@ -267,15 +251,29 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
 export const CODEX_STDIN_BANNER = 'Reading additional input from stdin...';
 
 // WHY a failed attempt produced no usable review — the ONE derivation the packet-fallback reason
-// (runCoreSeat), the failed seat's summary (persistAttempt) and a consumer composing its own seats
-// (the Munin dashboard) all read: a non-blank failWhy; else the stderr tail without codex's stdin
-// banner and its retry note (context, never a cause); else the reply itself named — 'the reply did
-// not parse as a review' when one came back, 'no output' when none did. Capped at 300.
+// and the settled-failure log (runCoreSeat), the failed seat's summary (persistAttempt) and a
+// consumer composing its own seats (the Munin dashboard) all read: a non-blank failWhy; else, for a
+// timed-out attempt, WHICH watchdog cut it; else the stderr tail without codex's stdin banner and
+// its retry note (context, never a cause); else the reply itself named — 'the reply did not parse
+// as a review' when one came back, 'no output' when none did. Capped at 300.
+// The watchdog matters (run 2026-08-26-10-45-52 left only "timed out" behind): the absolute
+// backstop means the seat was still producing when cut (give it budget), the liveness one that it
+// went silent (it wedged). Elapsed is NOT the silence — only the adapter knows its silence budget,
+// so it names that figure in failWhy; `elapsedMs` (how long the attempt ran) dates the backstop.
 export function attemptFailureWhy(
-  first: Pick<CodexReviewResult, 'failWhy' | 'raw' | 'stderrTail'>
+  first: Pick<CodexReviewResult, 'failWhy' | 'raw' | 'stderrTail'> &
+    Partial<Pick<CodexReviewResult, 'timedOut' | 'timedOutReason'>>,
+  elapsedMs?: number
 ): string {
   const named = first.failWhy?.trim();
   if (named) return named.slice(0, 300);
+  if (first.timedOut) {
+    const watchdog =
+      first.timedOutReason === 'inactivity'
+        ? 'the liveness watchdog cut it on a silent seat'
+        : `the absolute backstop cut it${elapsedMs === undefined ? '' : ` after ${Math.round(elapsedMs / 60_000)} min`}`;
+    return `The reviewer timed out before completing (${watchdog}) — its output is incomplete and not trusted.`;
+  }
   const tail = first.stderrTail
     .split('\n')
     .filter((line) => line.trim() !== CODEX_STDIN_BANNER && !CODEX_RETRY_NOTE_RE.test(line.trim()))

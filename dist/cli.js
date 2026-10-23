@@ -7610,17 +7610,6 @@ async function adapterOnce(adapter, prompt, reviewer, opts) {
     };
   }
 }
-function timedOutSummary(result, timing) {
-  if (result.failWhy) return result.failWhy;
-  const minutes = Math.round((timing.endedAt - timing.startedAt) / 6e4);
-  const watchdog = result.timedOutReason === "inactivity" ? (
-    // Elapsed is NOT the silence: a seat can work for 30 min and then go quiet for 15. Only the
-    // adapter knows its own silence budget, so it states the figure in `failWhy` (returned
-    // above); this generic wording is the fallback for a seat that named none.
-    "the liveness watchdog cut it on a silent seat"
-  ) : `the absolute backstop cut it after ${minutes} min`;
-  return `The reviewer timed out before completing (${watchdog}) \u2014 its output is incomplete and not trusted.`;
-}
 function seatDiagnostics(result, timing, opts = {}) {
   const usage = parseSeatUsage(result.stream);
   const conventions = opts.conventionsFile ? conventionsReadOf(result.stream, readConventionsLayout(opts.conventionsFile)) : void 0;
@@ -7639,7 +7628,7 @@ function seatDiagnostics(result, timing, opts = {}) {
 function persistAttempt(args, prompt, result, timing) {
   const parsed = result.raw ? parseFindings(result.raw) : null;
   const terminalState = attemptTerminalState(result, parsed);
-  const summary = result.timedOut ? timedOutSummary(result, timing) : terminalState === "reviewed" ? parsed?.summary ?? "" : `The ${args.reviewer.id} reviewer produced no parseable findings: ${attemptFailureWhy(result)}`;
+  const summary = result.timedOut ? attemptFailureWhy(result, timing.endedAt - timing.startedAt) : terminalState === "reviewed" ? parsed?.summary ?? "" : `The ${args.reviewer.id} reviewer produced no parseable findings: ${attemptFailureWhy(result)}`;
   return persistReview(args.out, {
     ...args.artifactSuffix ? { artifactSuffix: args.artifactSuffix } : {},
     diagnostics: seatDiagnostics(result, timing, { conventionsFile: args.conventionsFile }),
@@ -7699,7 +7688,7 @@ async function runCoreSeat(args) {
     return { egressDenials, fallbackReason: null, realized: "worktree", review };
   }
   if (isSettledApiFailure(first))
-    log(`  \xB7 \u26A0 ${reviewer.id}: ${first.failWhy ?? first.failKind} \u2014 not a sandbox failure, so no packet re-run; the seat stands failed`);
+    log(`  \xB7 \u26A0 ${reviewer.id}: ${attemptFailureWhy(first)} \u2014 not a sandbox failure, so no packet re-run; the seat stands failed`);
   if (!packetRetryAfterWorktree(first, args.retryOnPacket)) {
     return { egressDenials, fallbackReason: null, realized: "worktree", review };
   }
@@ -7722,9 +7711,13 @@ async function runCoreSeat(args) {
   };
 }
 var CODEX_STDIN_BANNER = "Reading additional input from stdin...";
-function attemptFailureWhy(first) {
+function attemptFailureWhy(first, elapsedMs) {
   const named = first.failWhy?.trim();
   if (named) return named.slice(0, 300);
+  if (first.timedOut) {
+    const watchdog = first.timedOutReason === "inactivity" ? "the liveness watchdog cut it on a silent seat" : `the absolute backstop cut it${elapsedMs === void 0 ? "" : ` after ${Math.round(elapsedMs / 6e4)} min`}`;
+    return `The reviewer timed out before completing (${watchdog}) \u2014 its output is incomplete and not trusted.`;
+  }
   const tail = first.stderrTail.split("\n").filter((line) => line.trim() !== CODEX_STDIN_BANNER && !CODEX_RETRY_NOTE_RE.test(line.trim())).join("\n").trim();
   if (tail) return tail.slice(0, 300);
   return first.raw ? "the reply did not parse as a review" : "no output";
