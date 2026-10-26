@@ -290,7 +290,15 @@ export function readConventionsLayout(file: string): { indexEndLine: number; spa
     path: h.path,
     startLine: h.line + 1,
   }));
-  return { indexEndLine: Math.max(0, headers[0].line - 3), spans };
+  // The index ends at the last NON-BLANK line before the first header. Not `line − 3`: that
+  // assumed two blank lines between them, which holds for a body that starts with `\n\n` but
+  // not for the file runReviewMode writes — gatherConventions strips its leading newlines, so
+  // the first header sits right under the index and `line − 3` landed two rows early. The
+  // writer's own `conventionsIndex(...).indexEndLine` is the reference value; this must equal it
+  // on real gathered output (conventions-index.test.ts), whichever layout the host wrote.
+  let indexEndLine = headers[0].line - 1;
+  while (indexEndLine > 0 && lines[indexEndLine - 1].trim() === '') indexEndLine--;
+  return { indexEndLine, spans };
 }
 
 // The tier a reference confers on its target, given the referring file's tier: an

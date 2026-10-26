@@ -231,6 +231,19 @@ describe('runClaudeReviewVoice — stream-json integration', () => {
     JSON.stringify({ is_error: false, result: 'FINAL REVIEW TEXT', subtype: 'success', type: 'result' }),
   ].join('\n');
 
+  it('a transcript over the bound keeps its HEAD (init) beside the tail with a cut marker', async () => {
+    const [init, final] = GOOD_STREAM.split('\n');
+    const filler = Array.from({ length: 90_000 }, (_, i) => JSON.stringify({ message: { content: [{ text: `t${i} ${'x'.repeat(60)}`, type: 'text' }] }, type: 'assistant' })).join('\n');
+    const exec: ReviewerExec = () => Promise.resolve({ raw: `${init}\n${filler}\n${final}`, stderrTail: '', timedOut: false });
+    const res = await runClaudeReviewVoice('p', CFG(), {}, { exec, retryDelaysMs: [0, 0] });
+    expect(res.ok).toBe(true);
+    expect(res.raw).toBe('FINAL REVIEW TEXT');
+    expect(res.stream?.startsWith(init)).toBe(true);
+    expect(res.stream).toContain('"type":"ensemble.stream_cut"');
+    expect(res.stream?.endsWith(final)).toBe(true);
+    expect(res.stream!.length).toBeLessThan(8_000_000 + 70_000);
+  });
+
   it('returns the result event text as raw, not the stream transcript', async () => {
     const exec: ReviewerExec = () => Promise.resolve({ raw: GOOD_STREAM, stderrTail: '', timedOut: false });
     const res = await runClaudeReviewVoice('p', CFG(), {}, { exec, retryDelaysMs: [0, 0] });

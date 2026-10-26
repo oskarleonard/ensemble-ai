@@ -241,6 +241,7 @@ export function conventionsReadOf(
 ): ConventionsRead | undefined {
   if (!stream) return undefined;
   let first: string | null = null;
+  let sawCut = false;
   const ranges: LineRange[] = [];
   // claude-shaped: a Read/Grep is recorded by tool_use id so an errored tool_result can drop it.
   const pending = new Map<string, LineRange>();
@@ -255,6 +256,7 @@ export function conventionsReadOf(
     if (!e || typeof e !== 'object') continue;
     const ev = e as Record<string, unknown>;
     if (first === null) first = streamHeadKind(ev);
+    if (ev.type === STREAM_CUT_EVENT) sawCut = true;
     if ((ev.type === 'item.started' || ev.type === 'item.completed') && ev.item && typeof ev.item === 'object') {
       const it = ev.item as Record<string, unknown>;
       if (it.type === 'command_execution' && typeof it.command === 'string' && ev.type === 'item.started') ranges.push(...codexRanges(it.command, needle));
@@ -299,12 +301,14 @@ export function conventionsReadOf(
   }
   ranges.push(...pending.values());
   if (first === null) return undefined;
-  // A truncated stream can still PROVE a read (the call survived); it can never prove "unread".
-  const headIntact = first === 'init';
-  if (ranges.length === 0) return headIntact ? { docsRead: [], state: 'unread' } : undefined;
+  // A truncated stream — head gone, or a cut marker between head and tail — can still PROVE a
+  // read (the call survived); it can never prove "unread" or "index-only", because the call that
+  // reached a doc may be in the part that was dropped. Those two need the WHOLE stream.
+  const whole = first === 'init' && !sawCut;
+  if (ranges.length === 0) return whole ? { docsRead: [], state: 'unread' } : undefined;
   if (!layout) return { docsRead: [], state: 'read' };
   const beyondIndex = ranges.some((r) => r.grep || r.end > layout.indexEndLine);
-  if (!beyondIndex) return { docsRead: [], state: 'index-only' };
+  if (!beyondIndex) return whole ? { docsRead: [], state: 'index-only' } : undefined;
   const docsRead = layout.spans
     .filter((sp) => ranges.some((r) => !r.grep && r.start <= sp.endLine && r.end >= sp.startLine))
     .map((sp) => sp.path);

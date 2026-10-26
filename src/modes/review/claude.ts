@@ -18,7 +18,7 @@ import {
   USAGE_LIMIT_FAIL_PREFIX,
 } from '../../core/claude-stream';
 import { CLAUDE_REVIEW_DENIED_TOOLS, homeReadDenyRules } from '../../core/claude-fence';
-import { boundedStreamTail, runReviewerExec } from '../../core/spawn';
+import { boundedStreamHeadTail, runReviewerExec } from '../../core/spawn';
 import { type RunReviewOpts, REVIEW_TIMEOUT_MS } from '../../reviewers/codex';
 
 import type { SandboxProfileRef } from './evidence';
@@ -180,9 +180,10 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 // The stream-json transcript persisted as `<seat>-stream.jsonl`, with tool-result payloads
 // stripped (core/claude-stream stripStreamPayloads) — ~40% of the raw bytes, every event and
 // every tool call kept. This bound is a SAFETY net on the stripped copy, not a budget: a 14-min
-// 91-turn part (run d5a1f648) is ~400 KB stripped, and a cut here loses the head that the
-// read-depth telemetry needs (the first 1 MB cap did exactly that; the head is where init and
-// the early tool calls are).
+// 91-turn part (run d5a1f648) is ~400 KB stripped. When the bound does cut, it keeps the HEAD
+// beside the tail with a cut marker (core/spawn boundedStreamHeadTail): the head is where init,
+// the early tool calls and the step-0 conventions read are, and the first 1 MB tail-only cap
+// lost exactly those.
 const CLAUDE_STREAM_TAIL_LIMIT = 8_000_000;
 
 export async function runClaudeReviewVoice(
@@ -306,7 +307,7 @@ export async function runClaudeReviewVoice(
           ok: false,
           raw: null,
           stderrTail,
-          ...(typeof raw === 'string' && raw ? { stream: boundedStreamTail(stripStreamPayloads(raw), CLAUDE_STREAM_TAIL_LIMIT) } : {}),
+          ...(typeof raw === 'string' && raw ? { stream: boundedStreamHeadTail(stripStreamPayloads(raw), CLAUDE_STREAM_TAIL_LIMIT) } : {}),
           timedOut: true,
         };
       }
@@ -318,7 +319,7 @@ export async function runClaudeReviewVoice(
         stderrTail: retryNote ? `${retryNote}${stderrTail ?? ''}` : stderrTail,
         // The stream-json transcript the reply was extracted from — tokens, turns and tool calls
         // for the read-depth telemetry (seat-usage.ts), persisted beside the reply like codex's.
-        ...(typeof raw === 'string' && raw ? { stream: boundedStreamTail(stripStreamPayloads(raw), CLAUDE_STREAM_TAIL_LIMIT) } : {}),
+        ...(typeof raw === 'string' && raw ? { stream: boundedStreamHeadTail(stripStreamPayloads(raw), CLAUDE_STREAM_TAIL_LIMIT) } : {}),
         timedOut,
       };
     }

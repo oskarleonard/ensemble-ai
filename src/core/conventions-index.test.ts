@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import { conventionsIndex, readConventionsLayout, type ConventionManifest } from './conventions';
+import { conventionsIndex, gatherConventions, memoryConventionReader, readConventionsLayout, type ConventionManifest } from './conventions';
 
 const body = ['', '', '===== CLAUDE.md =====', 'root rule', '', '', '===== backend/.claude/rules/testing.md =====', 'test rule', 'second', '', '', '===== backend/docs/architecture.md =====', 'arch page', '', '', '===== web/CLAUDE.md =====', 'web rule'].join('\n');
 const manifest: ConventionManifest = {
@@ -52,6 +52,30 @@ describe('conventionsIndex — the block at the top of the in-tree conventions f
     expect(back?.indexEndLine).toBe(index.indexEndLine);
     expect(back?.spans).toEqual(index.spans);
     expect(readConventionsLayout(path.join(dir, 'missing.md'))).toBeNull();
+    fs.rmSync(dir, { force: true, recursive: true });
+  });
+  it('the read-back agrees with the writer on REAL gathered output, where the first header sits right under the index', async () => {
+    // gatherConventions strips its leading newlines, so unlike the fixture above the body starts
+    // with its first header: `line − 3` put the index end two rows early here (Munin, engine ask
+    // 2026-10-24) and a read of the index's last two rows scored as `read` with no docs.
+    const gathered = await gatherConventions(
+      memoryConventionReader({
+        'CLAUDE.md': 'root rule, see docs/arch.md',
+        'backend/CLAUDE.md': 'backend rule',
+        'docs/arch.md': 'arch page',
+      }),
+      ['backend/pkg/x.go']
+    );
+    expect(gathered.text.startsWith('=====')).toBe(true);
+    const idx = conventionsIndex(gathered.text, gathered.manifest, ['backend/pkg/x.go']);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'conv-layout-real-'));
+    const file = path.join(dir, 'CONVENTIONS.md');
+    fs.writeFileSync(file, idx.text + gathered.text);
+    const final = fs.readFileSync(file, 'utf8').split('\n');
+    expect(final[idx.indexEndLine]).toMatch(/^===== /); // no blank line between index and body
+    const back = readConventionsLayout(file);
+    expect(back?.indexEndLine).toBe(idx.indexEndLine);
+    expect(back?.spans).toEqual(idx.spans);
     fs.rmSync(dir, { force: true, recursive: true });
   });
   it('a change at the root has nothing below the root to read in full besides the root rules', () => {
