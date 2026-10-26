@@ -78,7 +78,15 @@ describe('conventionsReadOf — how far a seat read into the conventions file (n
   const init = JSON.stringify({ subtype: 'init', type: 'system' });
   const layout = { indexEndLine: 33, spans: [{ endLine: 80, path: 'CLAUDE.md', startLine: 36 }, { endLine: 900, path: 'backend/CLAUDE.md', startLine: 83 }] };
   const F = '/wt/.ensemble-conventions/CONVENTIONS.md';
-  const codex = (...cmds: string[]) => [JSON.stringify({ type: 'thread.started' }), ...cmds.map((command) => JSON.stringify({ item: { command, type: 'command_execution' }, type: 'item.started' }))].join('\n');
+  // A codex command is two events: started, then completed with the exit code. `ran` is the
+  // default; `exit` overrides it; `null` leaves the command never completed (seat reclaimed).
+  const cmd = (command: string, i: number, exit: number | null = 0): string[] => {
+    const id = `item_${i}`;
+    const started = JSON.stringify({ item: { command, id, type: 'command_execution' }, type: 'item.started' });
+    if (exit === null) return [started];
+    return [started, JSON.stringify({ item: { aggregated_output: 'x', command, exit_code: exit, id, status: exit === 0 ? 'completed' : 'failed', type: 'command_execution' }, type: 'item.completed' })];
+  };
+  const codex = (...cmds: string[]) => [JSON.stringify({ type: 'thread.started' }), ...cmds.flatMap((c, i) => cmd(c, i))].join('\n');
   const claude = (...events: string[]) => [init, ...events].join('\n');
   const read = (id: string, input: Record<string, unknown>) => JSON.stringify({ message: { content: [{ id, input, name: 'Read', type: 'tool_use' }] }, type: 'assistant' });
   const result = (id: string, isError: boolean) => JSON.stringify({ message: { content: [{ content: isError ? 'File content (344.4KB) exceeds maximum allowed size' : 'ok', is_error: isError, tool_use_id: id, type: 'tool_result' }] }, type: 'user' });
@@ -88,6 +96,20 @@ describe('conventionsReadOf — how far a seat read into the conventions file (n
     expect(conventionsReadOf(codex("/bin/zsh -lc \"sed -n '1,180p' .ensemble-conventions/CONVENTIONS.md\"", "/bin/zsh -lc \"sed -n '570,1084p' .ensemble-conventions/CONVENTIONS.md\""), layout)).toEqual({ docsRead: ['CLAUDE.md', 'backend/CLAUDE.md'], state: 'read' });
     expect(conventionsReadOf(codex("/bin/zsh -lc 'cat .ensemble-conventions/CONVENTIONS.md'"), layout)).toEqual({ docsRead: ['CLAUDE.md', 'backend/CLAUDE.md'], state: 'read' });
     expect(conventionsReadOf(codex("/bin/zsh -lc 'rg -n \"bun\" .ensemble-conventions/CONVENTIONS.md'"), layout)).toEqual({ docsRead: [], state: 'read' });
+  });
+  it('codex: a read counts only when its item.completed says it RAN — a failed command read nothing, a never-completed one is attempted and bars "unread"', () => {
+    const start = JSON.stringify({ type: 'thread.started' });
+    const sed80 = "/bin/zsh -lc \"sed -n '1,80p' .ensemble-conventions/CONVENTIONS.md\"";
+    // failed (exit 1): dropped — with nothing else on the file the whole stream says unread
+    expect(conventionsReadOf([start, ...cmd(sed80, 1, 1)].join('\n'), layout)).toEqual({ docsRead: [], state: 'unread' });
+    // never completed: attempted — proves nothing, and the stream can no longer claim unread or index-only
+    expect(conventionsReadOf([start, ...cmd(sed80, 1, null)].join('\n'), layout)).toBeUndefined();
+    expect(conventionsReadOf([start, ...cmd("sed -n '1,30p' .ensemble-conventions/CONVENTIONS.md", 1), ...cmd(sed80, 2, null)].join('\n'), layout)).toBeUndefined();
+    // a proven read beside an attempted one is still a read (the proof survived)
+    expect(conventionsReadOf([start, ...cmd(sed80, 1), ...cmd("cat .ensemble-conventions/CONVENTIONS.md", 2, null)].join('\n'), layout)).toEqual({ docsRead: ['CLAUDE.md'], state: 'read' });
+    // a completed event whose started twin fell in a cut still proves the read
+    const cut = JSON.stringify({ droppedChars: 9000, type: 'ensemble.stream_cut' });
+    expect(conventionsReadOf([start, cut, cmd(sed80, 1)[1]].join('\n'), layout)).toEqual({ docsRead: ['CLAUDE.md'], state: 'read' });
   });
   it('claude-shaped: a bare Read that ERRORED on size is dropped; 80 lines reaches the root rules; a Grep of the file is a read', () => {
     expect(conventionsReadOf(claude(read('t1', { file_path: F }), result('t1', true)), layout)).toEqual({ docsRead: [], state: 'unread' });

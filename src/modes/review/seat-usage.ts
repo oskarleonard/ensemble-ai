@@ -245,6 +245,15 @@ export function conventionsReadOf(
   const ranges: LineRange[] = [];
   // claude-shaped: a Read/Grep is recorded by tool_use id so an errored tool_result can drop it.
   const pending = new Map<string, LineRange>();
+  // codex: a command is recorded at `item.started` and COUNTS only when its `item.completed`
+  // says it ran (`status: completed`, exit 0) — a command that failed read nothing, and one that
+  // never returned (the seat was reclaimed mid-command) is ATTEMPTED: it proves no read, and it
+  // bars the "unread"/"index-only" claims the same way a cut does (Munin, engine ask 3,
+  // 2026-10-23: the started-only count overstated codex's read tally). Codex-only on purpose:
+  // grok's claude-shaped stream carries a `tool_result` for a fraction of its `tool_use`s (run
+  // d3da5a17: 14 of 64), so a claude-shaped Read without a result stays counted, as before.
+  const codexPending = new Map<string, LineRange[]>();
+  let codexUnkeyed = 0;
   for (const line of stream.split('\n')) {
     if (!line.trim()) continue;
     let e: unknown;
@@ -259,7 +268,23 @@ export function conventionsReadOf(
     if (ev.type === STREAM_CUT_EVENT) sawCut = true;
     if ((ev.type === 'item.started' || ev.type === 'item.completed') && ev.item && typeof ev.item === 'object') {
       const it = ev.item as Record<string, unknown>;
-      if (it.type === 'command_execution' && typeof it.command === 'string' && ev.type === 'item.started') ranges.push(...codexRanges(it.command, needle));
+      if (it.type !== 'command_execution') continue;
+      const id = typeof it.id === 'string' ? it.id : null;
+      if (ev.type === 'item.started') {
+        const rs = typeof it.command === 'string' ? codexRanges(it.command, needle) : [];
+        if (rs.length === 0) continue;
+        if (id === null) codexUnkeyed++;
+        else codexPending.set(id, rs);
+        continue;
+      }
+      // item.completed: the command either ran (exit 0, status completed) or it did not.
+      const rs = id !== null ? codexPending.get(id) : undefined;
+      if (id !== null) codexPending.delete(id);
+      const ran = it.status === 'completed' && (it.exit_code === undefined || it.exit_code === 0);
+      if (rs && ran) ranges.push(...rs);
+      // A completed event with no started twin in the stream (the start fell in a cut) still
+      // proves the read when it ran — the command text is on the completed item too.
+      if (!rs && ran && typeof it.command === 'string') ranges.push(...codexRanges(it.command, needle));
       continue;
     }
     if (ev.type === 'assistant' && ev.message && typeof ev.message === 'object') {
@@ -304,7 +329,8 @@ export function conventionsReadOf(
   // A truncated stream — head gone, or a cut marker between head and tail — can still PROVE a
   // read (the call survived); it can never prove "unread" or "index-only", because the call that
   // reached a doc may be in the part that was dropped. Those two need the WHOLE stream.
-  const whole = first === 'init' && !sawCut;
+  const attempted = codexPending.size > 0 || codexUnkeyed > 0;
+  const whole = first === 'init' && !sawCut && !attempted;
   if (ranges.length === 0) return whole ? { docsRead: [], state: 'unread' } : undefined;
   if (!layout) return { docsRead: [], state: 'read' };
   const beyondIndex = ranges.some((r) => r.grep || r.end > layout.indexEndLine);
