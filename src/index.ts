@@ -64,6 +64,10 @@ export * from './modes/review/worktree';
 // and the three-valued conventions-read fact. Exported so a consumer that composes its own seats
 // (the Munin dashboard) records the SAME facts the review mode does. One engine, no drift.
 export * from './modes/review/seat-usage';
+// The in-tree conventions handover as a sandbox-boundary write: head tracks nothing at the path,
+// nothing sits there, non-recursive mkdir, O_CREAT|O_EXCL|O_NOFOLLOW, cleanup on failure. Exported
+// so a consumer that writes the same file into its own worktree takes the engine's fences.
+export { gitRootEntriesAtHead, writeConventionsInTree, writeExclusive } from './modes/review/conventions-write';
 // The packet-retry rule after a failed worktree attempt (runCoreSeat's own decision) and the
 // per-seat table it reads — so a consumer composing its own seats retries exactly when the CLI does.
 export {

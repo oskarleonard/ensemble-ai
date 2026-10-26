@@ -5,6 +5,7 @@ import { escapesRoot } from '../../core/artifacts';
 import { SEVERITIES, type Severity } from '../../core/types';
 
 import type { DowngradeReason, GateVerdictRecord } from './gate';
+import { CONVENTIONS_IN_TREE_DIR, CONVENTIONS_IN_TREE_FILE } from './conventions-write';
 import { HOLISTIC_SEAT_ID, HOLISTIC_SEVERITY_CAP } from './holistic';
 
 // THE HOLISTIC GATE POLICY — every guardrail spec §4 states, as CODE the host runs, never as a
@@ -38,9 +39,10 @@ const HOLISTIC_LINE_SLACK = 2;
 const MAX_QUOTE_CHARS = 2000;
 const MAX_FILE_BYTES = 1_048_576;
 const MAX_FILE_LINES = 20_000;
-// The engine-written conventions file inside the worktree (modes/review CONVENTIONS_IN_TREE_*),
-// repo-relative. Spelled here too so the gate never imports the mode; index.test pins the two.
-export const CONVENTIONS_IN_TREE_REL = '.ensemble-conventions/CONVENTIONS.md';
+// The engine-written conventions file inside the worktree, repo-relative — derived from the
+// writer's own constants (conventions-write.ts, not the mode's index) so the gate and the writer
+// can never spell the path differently. Munin's review of #145 found the duplicate literal.
+export const CONVENTIONS_IN_TREE_REL = `${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}`;
 const CONVENTIONS_IN_TREE_REL_LC = CONVENTIONS_IN_TREE_REL.toLowerCase();
 const isInTreeConventions = (rel: string): boolean =>
   rel === CONVENTIONS_IN_TREE_REL_LC || rel.endsWith(`/${CONVENTIONS_IN_TREE_REL_LC}`);
@@ -171,10 +173,19 @@ export function worktreeReader(worktreeDir: string): SiteReader {
 // served from its `===== <path> =====` section of the in-tree file, line-for-line (the section
 // begins at the doc's line 1). The worktree is still tried first, so an unstripped doc (a docs/
 // page) reads from the tree exactly as before.
+//
+// `conventionsFile` is THE FILE THE ENGINE WROTE (the writer's result), or null when it wrote
+// none — never a path derived from the worktree. Munin's review of #145 (all three vendors):
+// the gate used to derive `<worktree>/.ensemble-conventions/CONVENTIONS.md` itself, so once the
+// writer refuses the route (the PR committed something at that path) the gate read the PR's OWN
+// bytes — or a symlink's target outside the tree — as the trusted rules that lift the holistic
+// MED cap. `whole()` now also refuses a symlink (lstat), a non-regular file, and, given `root`,
+// a realpath outside the worktree: the same containment `worktreeReader` has.
 export function conventionsAwareReader(
   base: SiteReader,
   conventionsFile: string | null,
-  gathered: readonly string[] = []
+  gathered: readonly string[] = [],
+  root?: string
 ): SiteReader {
   let cached: string[] | null | undefined;
   const whole = (): string[] | null => {
@@ -182,8 +193,14 @@ export function conventionsAwareReader(
     cached = null;
     if (conventionsFile) {
       try {
-        const st = fs.statSync(conventionsFile);
-        if (st.isFile() && st.size <= MAX_FILE_BYTES) cached = fs.readFileSync(conventionsFile, 'utf8').split(/\r?\n/).slice(0, MAX_FILE_LINES);
+        const st = fs.lstatSync(conventionsFile);
+        if (!st.isFile() || st.size > MAX_FILE_BYTES) return cached; // a symlink, a dir, a device, or too big
+        const real = fs.realpathSync(conventionsFile);
+        if (root !== undefined) {
+          const rel = path.relative(fs.realpathSync(path.resolve(root)), real);
+          if (rel === '' || escapesRoot(rel)) return cached;
+        }
+        cached = fs.readFileSync(real, 'utf8').split(/\r?\n/).slice(0, MAX_FILE_LINES);
       } catch {
         cached = null;
       }

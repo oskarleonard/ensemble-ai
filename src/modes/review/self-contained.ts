@@ -1,4 +1,3 @@
-import path from 'node:path';
 // The SELF-CONTAINED review layer: after the cross-vendor CORE (codex+grok) reviews the
 // pinned packet, add a THIRD blind peer reviewer — a COLD headless `claude -p` (Opus) —
 // on the SAME packet, then a separate `claude -p` GATE pass that reads all three
@@ -49,7 +48,7 @@ import {
   resolveHolisticPlan,
   runHolisticLens,
 } from './holistic';
-import { worktreeReader, conventionsAwareReader, CONVENTIONS_IN_TREE_REL } from './holistic-gate';
+import { worktreeReader, conventionsAwareReader } from './holistic-gate';
 import { INTEGRATION_SEAT_ID, renderIntegrationPrompt } from './integration';
 import { capProductFinding, PRODUCT_SEAT_ID, type ProductChange, renderProductPrompt } from './product';
 import { indexProductDocs, PRODUCT_DOCS_TRAIL_FILE } from './product-docs';
@@ -1115,7 +1114,9 @@ export async function runClaudeReviewLayer(
           gateEvidence: 'worktree' as const,
           holistic: {
             conventionPaths: opts.conventionPaths,
-            readAtHead: conventionsAwareReader(worktreeReader(opts.worktree), path.join(opts.worktree, CONVENTIONS_IN_TREE_REL), opts.conventionPaths ?? []),
+            // The file the ENGINE wrote (or none) — never a path derived from the worktree, which
+            // would hand the gate the PR's own bytes when the writer refused (Munin, #145 review).
+            readAtHead: conventionsAwareReader(worktreeReader(opts.worktree), opts.conventionsPath ?? null, opts.conventionPaths ?? [], opts.worktree),
           },
         }
       : {}),

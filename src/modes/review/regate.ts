@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { reviewDir, writeTrailFile } from '../../core/artifacts';
+import { escapesRoot, reviewDir, writeTrailFile } from '../../core/artifacts';
 import type { ResolvedVoiceConfig } from '../brainstorm/types';
 
 import { runClaudeReviewVoice } from './claude';
@@ -9,7 +9,7 @@ import { type GateVerdictRecord, runGate,
   type GateBaseTrail,
 } from './gate';
 import { readGatePacketHeadSha } from './gate-hunks';
-import { worktreeReader, conventionsAwareReader, CONVENTIONS_IN_TREE_REL } from './holistic-gate';
+import { worktreeReader, conventionsAwareReader } from './holistic-gate';
 import { readTrailJson } from './trail-io';
 import {
   GATE_WORKTREE_TIMEOUT_MS,
@@ -87,6 +87,24 @@ export function readConventionPathsFromTrail(
   }
 }
 
+// The conventions file the REVIEW wrote, from the trail's manifest (`inTree.file`), but only when
+// it lies inside the worktree THIS regate materialized — a regate's worktree is a fresh checkout,
+// so the review-time path (a reaped temp dir) is normally gone and the answer is null. Null means
+// the gate verifies gathered-doc citations from the tree only; it never means "read whatever the
+// PR left at that path" (Munin, #145 review).
+export function readConventionsFileFromTrail(baseDir: string, runId: string, worktree: string): string | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(reviewDir(baseDir, runId), 'conventions.json'), 'utf8')) as { inTree?: { file?: unknown } };
+    const file = raw.inTree?.file;
+    if (typeof file !== 'string' || !path.isAbsolute(file)) return null;
+    const rel = path.relative(path.resolve(worktree), path.resolve(file));
+    if (rel === '' || escapesRoot(rel)) return null;
+    return file;
+  } catch {
+    return null;
+  }
+}
+
 export async function runRegate(opts: RegateOptions): Promise<RegateResult> {
   const log = opts.log ?? (() => {});
   const headSha = readGatePacketHeadSha(opts.baseDir, opts.runId);
@@ -110,6 +128,8 @@ export async function runRegate(opts: RegateOptions): Promise<RegateResult> {
   // Base drift (trail v12): a regate carries the REVIEW-TIME facts forward (the head is unchanged,
   // the base is not) — read before runGate overwrites the trail.
   const priorDrift = readTrailJson<{ base?: GateBaseTrail | null; verdicts?: GateVerdictRecord[] }>(opts.baseDir, opts.runId, 'gate-verdicts.json');
+  const conventionsFile = opts.worktree ? readConventionsFileFromTrail(opts.baseDir, opts.runId, opts.worktree) : null;
+  if (opts.worktree && !conventionsFile) log('regate: no engine-written conventions file in this worktree — gathered-doc citations verify from the tree only');
   const gate = await runGate({
     baseDir: opts.baseDir,
     config: opts.gateConfig,
@@ -121,7 +141,7 @@ export async function runRegate(opts: RegateOptions): Promise<RegateResult> {
           gateEvidence: 'worktree' as const,
           holistic: {
             conventionPaths: opts.conventionPaths,
-            readAtHead: conventionsAwareReader(worktreeReader(opts.worktree), path.join(opts.worktree, CONVENTIONS_IN_TREE_REL), opts.conventionPaths ?? []),
+            readAtHead: conventionsAwareReader(worktreeReader(opts.worktree), conventionsFile, opts.conventionPaths ?? [], opts.worktree),
           },
         }
       : {}),

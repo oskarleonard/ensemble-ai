@@ -3388,8 +3388,8 @@ import nodePath from "path";
 
 // src/modes/review/chunks.ts
 var DEFAULT_MAX_CHUNKS = 8;
-function areaAt(path24, depth) {
-  const parts = path24.split("/");
+function areaAt(path23, depth) {
+  const parts = path23.split("/");
   const dirs = parts.slice(0, -1);
   if (dirs.length === 0) return ".";
   return dirs.slice(0, depth).join("/");
@@ -3570,6 +3570,37 @@ function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
   const bin = path11.basename(cmd.split(/\s+/)[0]);
   return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
 }
+function effectiveSshCommand(cwd, cache) {
+  const key = cwd ?? "";
+  if (cache.has(key)) return cache.get(key);
+  let value = process.env.GIT_SSH_COMMAND?.trim() || void 0;
+  if (!value) {
+    try {
+      value = execFileSync3("git", ["config", "--get", "core.sshCommand"], {
+        cwd,
+        encoding: "utf8",
+        env: scrubRepoEnv(process.env),
+        // the cwd repo's config — never GIT_DIR's
+        stdio: ["ignore", "pipe", "ignore"]
+      }).trim() || void 0;
+    } catch {
+      value = void 0;
+    }
+  }
+  cache.set(key, value);
+  return value;
+}
+function nonInteractiveEnv(configuredSsh) {
+  const ssh = nonInteractiveSshCommand(configuredSsh);
+  return {
+    GIT_ASKPASS: "",
+    GIT_TERMINAL_PROMPT: "0",
+    SSH_ASKPASS: "",
+    // Absent ⇒ git resolves ssh itself, from the user's own GIT_SSH_COMMAND or core.sshCommand.
+    ...ssh ? { GIT_SSH_COMMAND: ssh } : {}
+  };
+}
+var GIT_TIMEOUT_MS = 6e5;
 var GIT_MAX_BUFFER = 64 * 1024 * 1024;
 var REPO_LOCATION_ENV = [
   "GIT_DIR",
@@ -3609,6 +3640,34 @@ function scrubRepoEnv(env) {
   for (const key of REPO_LOCATION_ENV) delete out[key];
   for (const key of Object.keys(out)) if (CONFIG_INJECTION_ENV_RE.test(key)) delete out[key];
   return out;
+}
+function execGit() {
+  const sshByCwd = /* @__PURE__ */ new Map();
+  return (args, opts) => {
+    try {
+      const text = execFileSync3("git", args, {
+        cwd: opts?.cwd,
+        // Read `process.env` LIVE each spawn (a later `HTTPS_PROXY`/`GIT_SSH_COMMAND` must be seen),
+        // but scrub the repo-selectors in place so the env is cloned once, not twice.
+        encoding: "utf8",
+        env: Object.assign(scrubRepoEnv(process.env), nonInteractiveEnv(effectiveSshCommand(opts?.cwd, sshByCwd)), opts?.env ?? {}),
+        maxBuffer: GIT_MAX_BUFFER,
+        // Capture git's stderr into `err.stderr` (below) WITHOUT mirroring it onto our own stderr:
+        // execFileSync's default leaves stderr inherited, so it ALSO prints the child's stderr
+        // verbatim — a `https://<token>@host` remote git quotes back on a failed fetch would reach
+        // the operator's terminal + run log unredacted, defeating the message-level redaction in
+        // worktree.ts (cross-vendor review of the lock removal, claude-f2). stdin stays closed so a
+        // git command can never sit on an interactive read.
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: GIT_TIMEOUT_MS
+      });
+      return { ok: true, text };
+    } catch (e) {
+      const err = e;
+      const stderr = err.stderr ? String(err.stderr).trim() : "";
+      return { error: stderr || err.message || "git failed", ok: false };
+    }
+  };
 }
 
 // src/modes/review/diff.ts
@@ -3658,9 +3717,9 @@ function hasGeneratedHeader(section2) {
 function hasGeneratedFirstLine(line) {
   return typeof line === "string" && GENERATED_FIRST_LINE.test(line);
 }
-function classifyFileKind(path24, isBinary, section2 = "", firstLine2) {
+function classifyFileKind(path23, isBinary, section2 = "", firstLine2) {
   if (isBinary) return "binary";
-  if (GENERATED_PATTERNS.some((re) => re.test(path24))) return "generated";
+  if (GENERATED_PATTERNS.some((re) => re.test(path23))) return "generated";
   if (section2 && hasGeneratedHeader(section2)) return "generated";
   return hasGeneratedFirstLine(firstLine2) ? "generated" : "source";
 }
@@ -3702,8 +3761,8 @@ var TEST_PATTERNS = [
   /Tests?\.(java|kt|swift|cs|scala)$/,
   /\.bats$/
 ];
-function isTestPath(path24) {
-  return TEST_PATTERNS.some((re) => re.test(path24));
+function isTestPath(path23) {
+  return TEST_PATTERNS.some((re) => re.test(path23));
 }
 function pathOfSection(section2) {
   const plus = section2.match(/^\+\+\+ b\/(.+)$/m);
@@ -3722,7 +3781,7 @@ function parseDiffFiles(raw, opts = {}) {
   return parts.map((part) => {
     let section2 = part;
     const isBinary = /^Binary files .* differ$/m.test(section2) || /^GIT binary patch$/m.test(section2);
-    const path24 = pathOfSection(section2);
+    const path23 = pathOfSection(section2);
     if (!section2.endsWith("\n")) section2 += "\n";
     let added = 0;
     let removed = 0;
@@ -3730,16 +3789,16 @@ function parseDiffFiles(raw, opts = {}) {
       if (line.startsWith("+") && !line.startsWith("+++")) added++;
       else if (line.startsWith("-") && !line.startsWith("---")) removed++;
     }
-    let kind = classifyFileKind(path24, isBinary, section2);
-    if (kind === "source" && opts.readFirstLine && path24 !== "unknown") {
-      kind = classifyFileKind(path24, isBinary, section2, opts.readFirstLine(path24));
+    let kind = classifyFileKind(path23, isBinary, section2);
+    if (kind === "source" && opts.readFirstLine && path23 !== "unknown") {
+      kind = classifyFileKind(path23, isBinary, section2, opts.readFirstLine(path23));
     }
     return {
       added,
       bytes: Buffer.byteLength(section2, "utf8"),
       isBinary,
       kind,
-      path: path24,
+      path: path23,
       raw: section2,
       removed
     };
@@ -4718,10 +4777,6 @@ var REVIEW_ADAPTERS = {
   grok: runGrokReview
 };
 
-// src/modes/review/index.ts
-import fs25 from "fs";
-import path22 from "path";
-
 // src/core/sanitize.ts
 function scrubControl(s) {
   return s.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
@@ -4795,6 +4850,59 @@ ${raw}`;
     realized,
     review
   };
+}
+
+// src/modes/review/conventions-write.ts
+import fs20 from "fs";
+import path17 from "path";
+var CONVENTIONS_IN_TREE_DIR = ".ensemble-conventions";
+var CONVENTIONS_IN_TREE_FILE = "CONVENTIONS.md";
+var IGNORE_ALL = "*\n";
+function gitRootEntriesAtHead(worktreeDir, headSha) {
+  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(headSha)) return null;
+  const res = execGit()(["ls-tree", "--name-only", headSha], { cwd: worktreeDir });
+  if (!res.ok) return null;
+  return res.text.split("\n").filter((l) => l !== "");
+}
+function writeExclusive(file, body, mode = 384) {
+  const flags = fs20.constants.O_WRONLY | fs20.constants.O_CREAT | fs20.constants.O_EXCL | (fs20.constants.O_NOFOLLOW ?? 0);
+  const fd = fs20.openSync(file, flags, mode);
+  try {
+    fs20.writeFileSync(fd, body);
+  } finally {
+    fs20.closeSync(fd);
+  }
+}
+function writeConventionsInTree(worktreeDir, headSha, body, seams = {}) {
+  const rootEntries = seams.rootEntriesAtHead ?? gitRootEntriesAtHead;
+  const exclusive = seams.writeExclusive ?? writeExclusive;
+  const dir = path17.join(worktreeDir, CONVENTIONS_IN_TREE_DIR);
+  const file = path17.join(dir, CONVENTIONS_IN_TREE_FILE);
+  const tracked = rootEntries(worktreeDir, headSha)?.find((n) => n.toLowerCase() === CONVENTIONS_IN_TREE_DIR.toLowerCase());
+  if (tracked !== void 0) return { ok: false, why: `the PR head tracks \`${tracked}\` \u2014 the engine never writes over the author's path` };
+  try {
+    const st = fs20.lstatSync(dir);
+    const kind = st.isSymbolicLink() ? "a symlink" : st.isDirectory() ? "a directory" : "a file";
+    return { ok: false, why: `${kind} already sits at ${CONVENTIONS_IN_TREE_DIR} in the checkout` };
+  } catch (e) {
+    if (e.code !== "ENOENT") return { ok: false, why: `could not inspect ${CONVENTIONS_IN_TREE_DIR}: ${e.message}` };
+  }
+  try {
+    fs20.mkdirSync(dir, { mode: 448 });
+  } catch (e) {
+    return { ok: false, why: `could not create ${CONVENTIONS_IN_TREE_DIR}: ${e.message}` };
+  }
+  try {
+    exclusive(file, body);
+    exclusive(path17.join(dir, ".gitignore"), IGNORE_ALL);
+    return { file, ok: true };
+  } catch (e) {
+    try {
+      fs20.rmSync(dir, { force: true, recursive: true });
+    } catch {
+    }
+    return { ok: false, why: `could not write ${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}: ${e.message}` };
+  }
 }
 
 // src/modes/review/dep-surface.ts
@@ -4891,7 +4999,7 @@ function hasDepSurface(r) {
 }
 
 // src/modes/review/receipt.ts
-import fs24 from "fs";
+import fs25 from "fs";
 import os12 from "os";
 import path21 from "path";
 
@@ -4979,20 +5087,20 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/gate.ts
-import fs23 from "fs";
+import fs24 from "fs";
 import path20 from "path";
 
 // src/modes/review/holistic-gate.ts
-import fs22 from "fs";
+import fs23 from "fs";
 import path19 from "path";
 
 // src/modes/review/holistic.ts
-import fs21 from "fs";
+import fs22 from "fs";
 
 // src/modes/brainstorm/voices.ts
-import fs20 from "fs";
+import fs21 from "fs";
 import os11 from "os";
-import path17 from "path";
+import path18 from "path";
 
 // src/modes/brainstorm/types.ts
 var VOICE_IDS = ["codex", "grok", "claude"];
@@ -5060,7 +5168,7 @@ var VOICE_ADAPTERS = {
   codex: (p, c, o) => runCodexReview(p, toReviewerConfig(c), { ...o, ...c.web ? { web: true } : {} }),
   grok: (p, c, o) => runGrokReview(p, toReviewerConfig(c), { ...o, ...c.web ? { web: true } : {} })
 };
-var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path17.join(os11.homedir(), ".ensemble-ai", "voices.json");
+var VOICES_FILE = process.env.ENSEMBLE_VOICES_FILE || path18.join(os11.homedir(), ".ensemble-ai", "voices.json");
 function str2(v, fallback) {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
@@ -5099,7 +5207,7 @@ function parseJudge(raw) {
 }
 function loadJudge(file = VOICES_FILE) {
   try {
-    return parseJudge(JSON.parse(fs20.readFileSync(file, "utf8")));
+    return parseJudge(JSON.parse(fs21.readFileSync(file, "utf8")));
   } catch {
     return {};
   }
@@ -5110,7 +5218,7 @@ function judgeConfig(spec, voiceId, configs) {
 }
 function loadVoices(file = VOICES_FILE) {
   try {
-    return parseVoices(JSON.parse(fs20.readFileSync(file, "utf8")));
+    return parseVoices(JSON.parse(fs21.readFileSync(file, "utf8")));
   } catch {
     return { ...VOICE_DEFAULTS };
   }
@@ -5472,9 +5580,6 @@ var RETRIES_ON_PACKET = Object.freeze({
   grok: false
 });
 
-// src/modes/review/self-contained.ts
-import path18 from "path";
-
 // src/modes/review/code-review-seat.ts
 var COLD_PEER_ROLE = "You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.";
 function conventionsStep(file) {
@@ -5677,7 +5782,7 @@ function loadVoicesSeat(spec, file = VOICES_FILE, flags = {}, warn = () => {
 }, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
-    raw = JSON.parse(fs21.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs22.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`${spec.name} seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -5823,7 +5928,7 @@ var HOLISTIC_LINE_SLACK = 2;
 var MAX_QUOTE_CHARS = 2e3;
 var MAX_FILE_BYTES = 1048576;
 var MAX_FILE_LINES = 2e4;
-var CONVENTIONS_IN_TREE_REL = ".ensemble-conventions/CONVENTIONS.md";
+var CONVENTIONS_IN_TREE_REL = `${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}`;
 var CONVENTIONS_IN_TREE_REL_LC = CONVENTIONS_IN_TREE_REL.toLowerCase();
 var isInTreeConventions = (rel) => rel === CONVENTIONS_IN_TREE_REL_LC || rel.endsWith(`/${CONVENTIONS_IN_TREE_REL_LC}`);
 var HOLISTIC_SITE_ROLES = ["diff", "pattern"];
@@ -5861,7 +5966,7 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs22.realpathSync(path19.resolve(worktreeDir));
+    root = fs23.realpathSync(path19.resolve(worktreeDir));
   } catch {
     return () => null;
   }
@@ -5874,25 +5979,31 @@ function worktreeReader(worktreeDir) {
       if (!file || file.includes("\0") || path19.isAbsolute(file)) return null;
       const target = path19.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs22.realpathSync(target);
+      const real = fs23.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs22.statSync(real);
+      const st = fs23.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs22.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs23.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
   };
 }
-function conventionsAwareReader(base, conventionsFile, gathered = []) {
+function conventionsAwareReader(base, conventionsFile, gathered = [], root) {
   let cached;
   const whole = () => {
     if (cached !== void 0) return cached;
     cached = null;
     if (conventionsFile) {
       try {
-        const st = fs22.statSync(conventionsFile);
-        if (st.isFile() && st.size <= MAX_FILE_BYTES) cached = fs22.readFileSync(conventionsFile, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+        const st = fs23.lstatSync(conventionsFile);
+        if (!st.isFile() || st.size > MAX_FILE_BYTES) return cached;
+        const real = fs23.realpathSync(conventionsFile);
+        if (root !== void 0) {
+          const rel = path19.relative(fs23.realpathSync(path19.resolve(root)), real);
+          if (rel === "" || escapesRoot(rel)) return cached;
+        }
+        cached = fs23.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
       } catch {
         cached = null;
       }
@@ -6178,11 +6289,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs24.mkdirSync(path21.dirname(file), { recursive: true, mode: 448 });
+  fs25.mkdirSync(path21.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs24.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs24.chmodSync(tmp, 384);
-  fs24.renameSync(tmp, file);
+  fs25.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs25.chmodSync(tmp, 384);
+  fs25.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -6264,7 +6375,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs24.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs25.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -6814,8 +6925,6 @@ async function resolveGitleaksExemptions(reader, paths) {
 
 // src/modes/review/index.ts
 var SKELETON_TRAIL_FILE = "skeleton.md";
-var CONVENTIONS_IN_TREE_DIR = ".ensemble-conventions";
-var CONVENTIONS_IN_TREE_FILE = "CONVENTIONS.md";
 var CONVENTIONS_INLINE_MAX = 32e3;
 function conventionsPointer(file, chars, files) {
   return `The repository's conventions (${files !== void 0 ? `${files} file(s), ` : ""}${chars.toLocaleString("en-US")} chars, gathered at the PR BASE \u2014 the rules this change is judged against, not the PR's own edits to them) are NOT inlined here. They are at:
@@ -6943,12 +7052,17 @@ async function runReviewMode(opts) {
   const everySeatReadsTree = Boolean(wt) && reviewers.every((id) => quals[id]?.qualified);
   let conventionsPath;
   if (wt && everySeatReadsTree && agentsMd && agentsMd.length > CONVENTIONS_INLINE_MAX) {
+    let index = null;
     try {
-      const dir = path22.join(wt.dir, CONVENTIONS_IN_TREE_DIR);
-      fs25.mkdirSync(dir, { recursive: true });
-      const file = path22.join(dir, CONVENTIONS_IN_TREE_FILE);
-      const index = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) : null;
-      fs25.writeFileSync(file, index ? index.text + agentsMd : agentsMd, { mode: 384 });
+      index = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) : null;
+    } catch (e) {
+      log(`Conventions: index not built (${e.message}) \u2014 the file carries the docs without an index`);
+    }
+    const written = writeConventionsInTree(wt.dir, wt.headSha, index ? index.text + agentsMd : agentsMd);
+    if (!written.ok) {
+      log(`Conventions: not written into the worktree (${written.why}) \u2014 inlined in the packet instead`);
+    } else {
+      const { file } = written;
       if (conventionManifest && index) {
         conventionManifest.inTree = { file, indexEndLine: index.indexEndLine, jumpTo: index.jumpTo, readInFull: index.readInFull, spans: index.spans };
       }
@@ -6956,9 +7070,6 @@ async function runReviewMode(opts) {
       const files = conventionManifest ? conventionManifest.files.filter((f) => f.included).length : void 0;
       agentsMd = conventionsPointer(file, agentsMd.length, files);
       log(`Conventions: handed to the seats as a file in the worktree (${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}) instead of inline \u2014 every seat reads the tree, and the packet no longer repeats them per part`);
-    } catch (e) {
-      log(`Conventions: could not be written into the worktree (${e.message}) \u2014 inlined in the packet instead`);
-      conventionsPath = void 0;
     }
   }
   const ci = resolveCiEvidence(opts.ciEvidence, opts.ciEvidenceUnavailable);
@@ -7593,7 +7704,7 @@ function stageReview(payload, target, deps) {
 
 // src/modes/review/holistic-fixture.ts
 import fs26 from "fs";
-import path23 from "path";
+import path22 from "path";
 function anchor(v, where) {
   const e = v ?? {};
   if (typeof e.file !== "string" || typeof e.line !== "number" || typeof e.symbol !== "string")
@@ -7601,7 +7712,7 @@ function anchor(v, where) {
   return { file: e.file, line: e.line, symbol: e.symbol };
 }
 function loadHolisticFixture(dir) {
-  const raw = JSON.parse(fs26.readFileSync(path23.join(dir, "expectations.json"), "utf8"));
+  const raw = JSON.parse(fs26.readFileSync(path22.join(dir, "expectations.json"), "utf8"));
   const positives = Array.isArray(raw.plantedPositives) ? raw.plantedPositives : [];
   const misses = Array.isArray(raw.nearMisses) ? raw.nearMisses : [];
   if (positives.length === 0 || misses.length === 0)
@@ -7634,7 +7745,7 @@ function verifyFixtureAnchors(dir, fixture) {
   const check = (a, label2) => {
     let lines;
     try {
-      lines = fs26.readFileSync(path23.join(dir, a.file), "utf8").split(/\r?\n/);
+      lines = fs26.readFileSync(path22.join(dir, a.file), "utf8").split(/\r?\n/);
     } catch {
       broken.push(`${label2}: ${a.file} is unreadable`);
       return;
@@ -9148,6 +9259,7 @@ export {
   gatherConventions,
   gitConventionReader,
   gitHasCommit,
+  gitRootEntriesAtHead,
   grokAllowedTools,
   grokLoginWarningLine,
   grokToolFence,
@@ -9324,7 +9436,9 @@ export {
   worktreeReader,
   wrapWithSandbox,
   writeCodexSandboxProfile,
+  writeConventionsInTree,
   writeEvidenceManifest,
+  writeExclusive,
   writeReceipt,
   writeTrailFile
 };
