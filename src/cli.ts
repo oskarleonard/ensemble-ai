@@ -35,7 +35,7 @@ import {
 } from './core/types';
 import { runBrainstormMode } from './modes/brainstorm';
 import { composeEvidenceContext, type EvidenceRootInfo, openEvidenceRoot } from './modes/evidence';
-import { type Companion, getCompanionNames, installCompanions, parseCompanionFlags } from './modes/review/companions';
+import { type Companion, CompanionsRefusedError, getCompanionNames, installCompanions, parseCompanionFlags } from './modes/review/companions';
 import { judgeConfig, listVoices, loadJudge, loadVoices, VOICES_FILE } from './modes/brainstorm/voices';
 import {
   PROBE_INLINE_DIFF_LIMIT,
@@ -1473,9 +1473,11 @@ async function reviewCommand(
         for (const c of installed)
           console.error(`· companion ${c.name}: ${c.files} file(s) under .companions/${c.name}/${c.strippedInstructionFiles.length ? ` (${c.strippedInstructionFiles.length} instruction file(s) stripped)` : ''}`);
       } catch (e) {
-        // A refused install (the PR committed something at `.companions`) is LOUD and not fatal:
-        // the seats review without companion context and the clause stays empty.
-        console.error(`· companions: ${(e as Error).message} — the review runs without companion context`);
+        // ONLY a refused install (the PR committed something at `.companions`) is downgraded — LOUD
+        // and not fatal: the seats review without companion context and the clause stays empty. A
+        // missing/unreadable companion or an IO failure still fails the command, as it always did.
+        if (!(e instanceof CompanionsRefusedError)) throw e;
+        console.error(`· companions: ${e.message} — the review runs without companion context`);
       }
     }
   }

@@ -3940,13 +3940,23 @@ function parseCompanionFlags(values) {
   return out;
 }
 var STRIPPED_BASENAMES = new Set(STRIPPED_INSTRUCTION_PATHS.map((p) => path15.basename(p)));
+var CompanionsRefusedError = class extends Error {
+  why;
+  constructor(why) {
+    super(`companions not installed: ${why}`);
+    this.name = "CompanionsRefusedError";
+    this.why = why;
+  }
+};
 function installCompanions(worktreeDir, companions, headSha = "", rootEntriesAtHead) {
   const installed = [];
+  setCompanionNames([]);
   if (companions.length === 0) return installed;
   const claim = claimEngineDir(worktreeDir, headSha, COMPANIONS_DIR, ...rootEntriesAtHead ? [rootEntriesAtHead] : []);
-  if (!claim.ok) throw new Error(`companions not installed: ${claim.why}`);
+  if (!claim.ok) throw new CompanionsRefusedError(claim.why);
   const base = claim.dir;
   try {
+    writeExclusive(path15.join(base, ".gitignore"), "*\n");
     for (const c of companions) {
       const dest = path15.join(base, c.name);
       fs17.mkdirSync(dest, { mode: 448 });
@@ -15291,6 +15301,7 @@ async function reviewCommand(args, profile = "code") {
         for (const c of installed)
           console.error(`\xB7 companion ${c.name}: ${c.files} file(s) under .companions/${c.name}/${c.strippedInstructionFiles.length ? ` (${c.strippedInstructionFiles.length} instruction file(s) stripped)` : ""}`);
       } catch (e) {
+        if (!(e instanceof CompanionsRefusedError)) throw e;
         console.error(`\xB7 companions: ${e.message} \u2014 the review runs without companion context`);
       }
     }
