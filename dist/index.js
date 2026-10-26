@@ -1130,7 +1130,9 @@ function readConventionsLayout(file) {
     path: h.path,
     startLine: h.line + 1
   }));
-  return { indexEndLine: Math.max(0, headers[0].line - 3), spans };
+  let indexEndLine = headers[0].line - 1;
+  while (indexEndLine > 0 && lines[indexEndLine - 1].trim() === "") indexEndLine--;
+  return { indexEndLine, spans };
 }
 function tierOfRef(parent, kind) {
   if (kind === "include") return parent;
@@ -1850,6 +1852,11 @@ ${tail}`;
 function boundedStreamTail(tail, limit) {
   if (tail.length <= limit) return tail;
   return tail.slice(-limit).replace(/^[^\n]*\n/, "");
+}
+function boundedStreamHeadTail(raw, limit) {
+  if (raw.length <= limit) return raw;
+  const headLimit = Math.min(STREAM_HEAD_LIMIT, limit);
+  return joinStreamHeadTail(raw.slice(0, headLimit), boundedStreamTail(raw, limit), raw.length, headLimit);
 }
 function runReviewerExec(opts) {
   const { bin, args, outFile, timeoutMs, stderrLimit, onSpawn } = opts;
@@ -3132,7 +3139,7 @@ async function runGrokReview(prompt, config, opts = {}) {
         ok: false,
         raw: null,
         stderrTail: verdict.why,
-        ...raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
+        ...raw ? { stream: boundedStreamHeadTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
         timedOut,
         ...timedOutReason ? { timedOutReason } : {}
       };
@@ -3154,9 +3161,11 @@ async function runGrokReview(prompt, config, opts = {}) {
       ...preflight,
       raw: text,
       stderrTail,
-      // The bounded NDJSON tail: a reclaimed seat leaves a record of what it was doing, not just
-      // "it timed out". Cut on a line boundary — the trail persists it as .jsonl.
-      ...raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
+      // The bounded NDJSON stream — its HEAD (init, the step-0 conventions read) + a cut marker +
+      // the tail, so a reclaimed seat leaves a record of what it was doing AND the read-depth
+      // telemetry keeps its head (a bare tail left grok head-lost on every long seat). Cut on
+      // line boundaries — the trail persists it as .jsonl.
+      ...raw ? { stream: boundedStreamHeadTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
       timedOut,
       ...timedOutReason ? { timedOutReason } : {}
     };
@@ -4654,7 +4663,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
           ok: false,
           raw: null,
           stderrTail,
-          ...typeof raw === "string" && raw ? { stream: boundedStreamTail(stripStreamPayloads(raw), CLAUDE_STREAM_TAIL_LIMIT) } : {},
+          ...typeof raw === "string" && raw ? { stream: boundedStreamHeadTail(stripStreamPayloads(raw), CLAUDE_STREAM_TAIL_LIMIT) } : {},
           timedOut: true
         };
       }
@@ -4666,7 +4675,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
         stderrTail: retryNote ? `${retryNote}${stderrTail ?? ""}` : stderrTail,
         // The stream-json transcript the reply was extracted from — tokens, turns and tool calls
         // for the read-depth telemetry (seat-usage.ts), persisted beside the reply like codex's.
-        ...typeof raw === "string" && raw ? { stream: boundedStreamTail(stripStreamPayloads(raw), CLAUDE_STREAM_TAIL_LIMIT) } : {},
+        ...typeof raw === "string" && raw ? { stream: boundedStreamHeadTail(stripStreamPayloads(raw), CLAUDE_STREAM_TAIL_LIMIT) } : {},
         timedOut
       };
     }
@@ -5255,6 +5264,7 @@ function codexRanges(command, needle) {
 function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
   if (!stream) return void 0;
   let first = null;
+  let sawCut = false;
   const ranges = [];
   const pending = /* @__PURE__ */ new Map();
   for (const line of stream.split("\n")) {
@@ -5268,6 +5278,7 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
     if (!e || typeof e !== "object") continue;
     const ev = e;
     if (first === null) first = streamHeadKind(ev);
+    if (ev.type === STREAM_CUT_EVENT) sawCut = true;
     if ((ev.type === "item.started" || ev.type === "item.completed") && ev.item && typeof ev.item === "object") {
       const it = ev.item;
       if (it.type === "command_execution" && typeof it.command === "string" && ev.type === "item.started") ranges.push(...codexRanges(it.command, needle));
@@ -5312,11 +5323,11 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
   }
   ranges.push(...pending.values());
   if (first === null) return void 0;
-  const headIntact = first === "init";
-  if (ranges.length === 0) return headIntact ? { docsRead: [], state: "unread" } : void 0;
+  const whole = first === "init" && !sawCut;
+  if (ranges.length === 0) return whole ? { docsRead: [], state: "unread" } : void 0;
   if (!layout) return { docsRead: [], state: "read" };
   const beyondIndex = ranges.some((r) => r.grep || r.end > layout.indexEndLine);
-  if (!beyondIndex) return { docsRead: [], state: "index-only" };
+  if (!beyondIndex) return whole ? { docsRead: [], state: "index-only" } : void 0;
   const docsRead = layout.spans.filter((sp) => ranges.some((r) => !r.grep && r.start <= sp.endLine && r.end >= sp.startLine)).map((sp) => sp.path);
   return { docsRead, state: "read" };
 }
@@ -9070,6 +9081,7 @@ export {
   assertRosterAdvisors,
   attemptFailureWhy,
   baseFetchRefspec,
+  boundedStreamHeadTail,
   boundedStreamTail,
   buildClaudeEvidenceArgs,
   buildClaudeReviewArgs,

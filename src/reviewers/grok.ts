@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { resolveBin } from '../core/bin';
 import { type EgressProxy, proxyEnv } from '../core/egress-proxy';
-import { boundedStreamTail, runReviewerExec } from '../core/spawn';
+import { boundedStreamHeadTail, runReviewerExec } from '../core/spawn';
 import type { ReviewerConfig } from '../core/types';
 import type { SandboxProfileRef } from '../modes/review/evidence';
 
@@ -638,7 +638,7 @@ export async function runGrokReview(
         ok: false,
         raw: null,
         stderrTail: verdict.why,
-        ...(raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {}),
+        ...(raw ? { stream: boundedStreamHeadTail(raw, GROK_STREAM_TAIL_LIMIT) } : {}),
         timedOut,
         ...(timedOutReason ? { timedOutReason } : {}),
       };
@@ -669,9 +669,11 @@ export async function runGrokReview(
       ...preflight,
       raw: text,
       stderrTail,
-      // The bounded NDJSON tail: a reclaimed seat leaves a record of what it was doing, not just
-      // "it timed out". Cut on a line boundary — the trail persists it as .jsonl.
-      ...(raw ? { stream: boundedStreamTail(raw, GROK_STREAM_TAIL_LIMIT) } : {}),
+      // The bounded NDJSON stream — its HEAD (init, the step-0 conventions read) + a cut marker +
+      // the tail, so a reclaimed seat leaves a record of what it was doing AND the read-depth
+      // telemetry keeps its head (a bare tail left grok head-lost on every long seat). Cut on
+      // line boundaries — the trail persists it as .jsonl.
+      ...(raw ? { stream: boundedStreamHeadTail(raw, GROK_STREAM_TAIL_LIMIT) } : {}),
       timedOut,
       ...(timedOutReason ? { timedOutReason } : {}),
     };

@@ -100,6 +100,13 @@ describe('conventionsReadOf — how far a seat read into the conventions file (n
     expect(conventionsReadOf(claude(read('t1', { file_path: '/wt/src/x.ts' })), layout)).toEqual({ docsRead: [], state: 'unread' });
     expect(conventionsReadOf(claude(JSON.stringify({ message: { content: [{ content: `see ${F}`, tool_use_id: 'x', type: 'tool_result' }] }, type: 'user' })), layout)).toEqual({ docsRead: [], state: 'unread' });
   });
+  it('a CUT stream (head + marker + tail) can prove a read, never an unread or an index-only — the call may be in the gap', () => {
+    const cut = JSON.stringify({ droppedChars: 50_000, type: 'ensemble.stream_cut' });
+    expect(conventionsReadOf(claude(cut, read('t1', { file_path: '/wt/src/x.ts' })), layout)).toBeUndefined();
+    expect(conventionsReadOf(claude(cut, read('t1', { file_path: F, limit: 30 }), result('t1', false)), layout)).toBeUndefined();
+    expect(conventionsReadOf(claude(cut, read('t1', { file_path: F, limit: 80 }), result('t1', false)), layout)).toEqual({ docsRead: ['CLAUDE.md'], state: 'read' });
+    expect(conventionsReadOf([JSON.stringify({ type: 'thread.started' }), cut, JSON.stringify({ item: { command: "sed -n '1,30p' .ensemble-conventions/CONVENTIONS.md", type: 'command_execution' }, type: 'item.started' })].join('\n'), layout)).toBeUndefined();
+  });
   it('no layout (file unreadable after the fact) ⇒ read vs unread only; a headless stream cannot say no', () => {
     expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 30 })), null)).toEqual({ docsRead: [], state: 'read' });
     expect(conventionsReadOf(read('t1', { file_path: '/wt/src/x.ts' }), layout)).toBeUndefined();

@@ -493,6 +493,21 @@ describe('runGrokReview (stdout capture)', () => {
     expect(result.failWhy).toMatch(/tool fence — .*did not announce its tools/);
   });
 
+  it('a stream over the bound keeps its HEAD (init) beside the tail with a cut marker — the read-depth telemetry needs the first events', async () => {
+    const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
+    const [init, ...rest] = grokStream('REVIEW BODY').split('\n');
+    const filler = Array.from({ length: 12_000 }, (_, i) => JSON.stringify({ event: { delta: { text: `t${i} ${'x'.repeat(80)}`, type: 'text_delta' }, type: 'content_block_delta' }, type: 'stream_event' })).join('\n');
+    child?.stdout.emit('data', Buffer.from(`${init}\n${filler}\n${rest.join('\n')}`));
+    child?.emit('close');
+    const result = await p;
+    expect(result.ok).toBe(true);
+    expect(result.stream?.startsWith(init)).toBe(true);
+    expect(result.stream).toContain('"type":"ensemble.stream_cut"');
+    expect(result.stream).toContain('"subtype":"success"');
+    expect(result.stream!.length).toBeLessThan(1_000_000 + 70_000);
+  });
+
   it('returns a bounded NDJSON tail so a seat leaves a record of what it was doing', async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
     await untilSpawned();

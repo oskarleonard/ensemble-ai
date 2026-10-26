@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { killTree, makeEscalatingKill, runReviewerExec } from './spawn';
+import { boundedStreamHeadTail, killTree, makeEscalatingKill, runReviewerExec, STREAM_CUT_EVENT } from './spawn';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -264,5 +264,28 @@ describe('runReviewerExec — stream liveness beside an outfile reply', () => {
     expect(res.streamTail?.startsWith('event-1-')).toBe(true);
     expect(res.streamTail).toContain('"type":"ensemble.stream_cut"');
     expect(res.streamTail).toContain('event-200');
+  });
+});
+
+describe('boundedStreamHeadTail — a whole stream bounded as head + cut marker + tail', () => {
+  const lines = Array.from({ length: 4000 }, (_, i) => JSON.stringify({ i, pad: 'x'.repeat(80), type: i === 0 ? 'system' : 'stream_event' }));
+  const raw = lines.join('\n');
+
+  it('returns a stream under the limit unchanged', () => {
+    expect(boundedStreamHeadTail(raw, raw.length)).toBe(raw);
+    expect(boundedStreamHeadTail(raw, raw.length + 1)).toBe(raw);
+  });
+  it('keeps the first lines, names the gap, and ends with the last lines — every piece on a line boundary', () => {
+    const out = boundedStreamHeadTail(raw, 100_000);
+    const outLines = out.split('\n');
+    expect(outLines[0]).toBe(lines[0]); // the head survives: init is the first event
+    expect(outLines[outLines.length - 1]).toBe(lines[lines.length - 1]);
+    const cut = outLines.find((l) => l.includes(STREAM_CUT_EVENT));
+    expect(cut).toBeDefined();
+    const marker = JSON.parse(cut!) as { droppedChars: number; type: string };
+    expect(marker.type).toBe(STREAM_CUT_EVENT);
+    // What was kept + what the marker says was dropped is the whole stream.
+    expect(out.length - cut!.length - 1 + marker.droppedChars).toBe(raw.length);
+    for (const l of outLines) expect(() => JSON.parse(l)).not.toThrow();
   });
 });

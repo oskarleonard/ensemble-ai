@@ -185,6 +185,16 @@ export function boundedStreamTail(tail: string, limit: number): string {
   return tail.slice(-limit).replace(/^[^\n]*\n/, '');
 }
 
+// The same head + cut marker + tail for a stream the caller holds WHOLE (`capture: 'stdout'` —
+// grok, claude): a bare tail dropped the init event and the step-0 read of the conventions file,
+// so every long grok seat came out `streamTruncated` with no conventions fact (every Hugin run
+// 2026-10-22 → 10-26). Whole-stream input, same `limit` the tail already used.
+export function boundedStreamHeadTail(raw: string, limit: number): string {
+  if (raw.length <= limit) return raw;
+  const headLimit = Math.min(STREAM_HEAD_LIMIT, limit);
+  return joinStreamHeadTail(raw.slice(0, headLimit), boundedStreamTail(raw, limit), raw.length, headLimit);
+}
+
 export interface ReviewerExecResult {
   /** The child's `'error'` event, when one fired — most often a binary that could not be spawned (ENOENT, EACCES). */
   error?: Error;
