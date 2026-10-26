@@ -691,7 +691,7 @@ declare function parseHolisticSites(v: unknown): HolisticSite[] | undefined;
 declare function parseConventionCitation(v: unknown): ConventionCitation | undefined;
 type SiteReader = (file: string) => string[] | null;
 declare function worktreeReader(worktreeDir: string): SiteReader;
-declare function conventionsAwareReader(base: SiteReader, conventionsFile: string | null, gathered?: readonly string[]): SiteReader;
+declare function conventionsAwareReader(base: SiteReader, conventionsFile: string | null, gathered?: readonly string[], root?: string): SiteReader;
 declare function findQuoteSpans(lines: string[], quote: string): {
     end: number;
     start: number;

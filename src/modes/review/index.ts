@@ -468,7 +468,14 @@ export async function runReviewMode(
   if (wt && everySeatReadsTree && agentsMd && agentsMd.length > CONVENTIONS_INLINE_MAX) {
     // The index first (core/conventions conventionsIndex): nearest docs, root rules, a line per
     // doc — so a seat reads the right sections instead of grepping for the separators.
-    const index = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) : null;
+    let index: ReturnType<typeof conventionsIndex> | null = null;
+    try {
+      index = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) : null;
+    } catch (e) {
+      // A broken index never aborts the run: the file is written without one (the seat greps
+      // the separators), exactly as before this block left the old try (Munin, #145 review f2).
+      log(`Conventions: index not built (${(e as Error).message}) — the file carries the docs without an index`);
+    }
     // A sandbox-boundary write into the PR's own tree: refused (and inlined instead) when the head
     // tracks the path or anything sits there, never through a symlink — conventions-write.ts.
     const written = writeConventionsInTree(wt.dir, wt.headSha, index ? index.text + agentsMd : agentsMd);

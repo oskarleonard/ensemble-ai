@@ -10,7 +10,7 @@ import type { ResolvedVoiceConfig, VoiceConfig } from '../brainstorm/types';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { persistGatePacket, readGatePacketHeadSha } from './gate-hunks';
-import { readConventionPathsFromTrail, runRegate } from './regate';
+import { readConventionPathsFromTrail, readConventionsFileFromTrail, runRegate } from './regate';
 import { GATE_WORKTREE_TIMEOUT_MS, persistSeatReview } from './self-contained';
 
 const CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
@@ -196,6 +196,28 @@ describe('trail readers regate leans on', () => {
     expect(readGatePacketHeadSha(base, 'missing')).toBeNull();
   });
 
+  it('readConventionsFileFromTrail hands back the review-time file only when it lies INSIDE this regate\'s worktree — else null, never a derived path', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'regate-convfile-'));
+    const runId = 'r-convfile';
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'regate-wt-'));
+    expect(readConventionsFileFromTrail(base, runId, wt)).toBeNull(); // no manifest
+    fs.mkdirSync(reviewDir(base, runId), { recursive: true });
+    const manifest = path.join(reviewDir(base, runId), 'conventions.json');
+    // the usual case: the review's worktree was a different, since-reaped temp dir
+    fs.writeFileSync(manifest, JSON.stringify({ files: [], inTree: { file: '/var/folders/x/ensemble-worktree-gone/head/.ensemble-conventions/CONVENTIONS.md' } }));
+    expect(readConventionsFileFromTrail(base, runId, wt)).toBeNull();
+    // inside this worktree ⇒ handed back as recorded
+    const inside = path.join(wt, '.ensemble-conventions', 'CONVENTIONS.md');
+    fs.writeFileSync(manifest, JSON.stringify({ files: [], inTree: { file: inside } }));
+    expect(readConventionsFileFromTrail(base, runId, wt)).toBe(inside);
+    // a relative or escaping path is never trusted
+    fs.writeFileSync(manifest, JSON.stringify({ files: [], inTree: { file: path.join(wt, '..', 'elsewhere', 'CONVENTIONS.md') } }));
+    expect(readConventionsFileFromTrail(base, runId, wt)).toBeNull();
+    fs.writeFileSync(manifest, JSON.stringify({ files: [], inTree: { file: '.ensemble-conventions/CONVENTIONS.md' } }));
+    expect(readConventionsFileFromTrail(base, runId, wt)).toBeNull();
+    fs.rmSync(base, { force: true, recursive: true });
+    fs.rmSync(wt, { force: true, recursive: true });
+  });
   it('readConventionPathsFromTrail filters to included paths, undefined when absent', () => {
     const { base, runId } = seedRun();
     expect(readConventionPathsFromTrail(base, runId)).toBeUndefined();
