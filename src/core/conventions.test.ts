@@ -4,15 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import {
-  type ConventionReader,
-  extractDirRefs,
-  extractRefs,
-  fsConventionReader,
-  gatherConventions,
-  memoryConventionReader,
-  resolveInRepo,
-} from './conventions';
+import { extractDirRefs, extractRefs, fsConventionReader, gatherConventions, memoryConventionReader, repoConventionsConfig, resolveInRepo, type ConventionManifest, type ConventionReader } from './conventions';
 
 const included = (m: { files: { path: string; included: boolean }[] }): string[] =>
   m.files.filter((f) => f.included).map((f) => f.path);
@@ -584,5 +576,31 @@ describe('fs reader · the read buffer is sized to the file, not the cap', () =>
     } finally {
       fs.rmSync(dir, { force: true, recursive: true });
     }
+  });
+});
+
+// The repo's own `.ensemble-ai.json` `conventions:[]` — read by the gatherer at the reader's ref.
+describe('repo conventions config · `.ensemble-ai.json` lifts the listed docs to MANDATORY', () => {
+  const tierOf = (manifest: ConventionManifest, p: string) => manifest.files.find((f) => f.path === p);
+
+  it('a listed doc nobody links is gathered at tier 0; a path outside the repo is ignored; `--conventions` stays additive', async () => {
+    const reader = memoryConventionReader({
+      '.ensemble-ai.json': JSON.stringify({ conventions: ['docs/style.md', '../outside.md', 42] }),
+      'CLAUDE.md': '# rules\n',
+      'docs/style.md': 'style rules nobody links',
+      'docs/extra.md': 'named by the caller',
+    });
+    expect(await repoConventionsConfig(reader)).toEqual(['docs/style.md', '../outside.md']);
+    const { manifest } = await gatherConventions(reader, ['src/x.ts'], { conventions: ['docs/extra.md'] });
+    expect(tierOf(manifest, 'docs/style.md')).toMatchObject({ included: true, tier: 0 });
+    expect(tierOf(manifest, 'docs/extra.md')).toMatchObject({ included: true, tier: 0 });
+    expect(manifest.files.some((f) => f.path.includes('outside'))).toBe(false);
+  });
+  it('no file, malformed JSON, or a non-list field ⇒ nothing added, nothing thrown', async () => {
+    expect(await repoConventionsConfig(memoryConventionReader({ 'CLAUDE.md': 'x' }))).toEqual([]);
+    expect(await repoConventionsConfig(memoryConventionReader({ '.ensemble-ai.json': '{ not json' }))).toEqual([]);
+    expect(await repoConventionsConfig(memoryConventionReader({ '.ensemble-ai.json': '{"conventions":"docs/style.md"}' }))).toEqual([]);
+    const { manifest } = await gatherConventions(memoryConventionReader({ '.ensemble-ai.json': '{ not json', 'CLAUDE.md': '# rules\n' }), ['src/x.ts']);
+    expect(tierOf(manifest, 'CLAUDE.md')).toMatchObject({ included: true, tier: 0 });
   });
 });

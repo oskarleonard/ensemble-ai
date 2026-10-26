@@ -31,9 +31,35 @@ export interface GatherConfig {
   capBytes?: number;
   // Hard ceiling on distinct files visited — terminates any import cycle / runaway.
   maxFiles?: number;
-  // Explicit extra entry paths (`.ensemble-ai.json` `conventions:[]` / `--conventions`)
-  // — a belt for non-standard layouts. Additive to the auto-detected set.
+  // Explicit extra entry paths from the CALLER (`--conventions`) — a belt for non-standard
+  // layouts. Additive to the auto-detected set AND to the repo's own list: the gatherer reads
+  // `.ensemble-ai.json` `conventions:[]` itself, through the same reader (so at the same ref).
   conventions?: string[];
+}
+
+// The repo's own opt-in: `{ "conventions": ["docs/style.md", …] }` at its root, read at the ref
+// the reader serves (a review's PR BASE). Documented on GatherConfig since the first gather and
+// read by nothing until Munin's engine ask 4 (2026-10-23) — a consumer that wanted it had to
+// read the file itself and pass it as `conventions`, so two hosts could disagree on one repo's
+// list. Bounded read: a config over the bound parses as nothing, never as a partial list.
+export const REPO_CONVENTIONS_CONFIG = '.ensemble-ai.json';
+const REPO_CONVENTIONS_CONFIG_MAX_BYTES = 64_000;
+
+export async function repoConventionsConfig(reader: ConventionReader, maxBytes = REPO_CONVENTIONS_CONFIG_MAX_BYTES): Promise<string[]> {
+  let text: string | null;
+  try {
+    text = await reader.read(REPO_CONVENTIONS_CONFIG, Math.min(maxBytes, REPO_CONVENTIONS_CONFIG_MAX_BYTES));
+  } catch {
+    return [];
+  }
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    const list = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>).conventions : undefined;
+    return Array.isArray(list) ? list.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
 }
 
 // How strongly the repo asked for a file to be read — the budget is filled tier by tier.
@@ -349,7 +375,8 @@ export async function gatherConventions(
   const queue: string[] = [];
   // Explicitly configured paths are the one way to lift a README above SWEPT.
   const explicit = new Set<string>();
-  for (const c of config.conventions ?? []) {
+  // The config read is bounded like every other read: never past the gather cap.
+  for (const c of [...(config.conventions ?? []), ...(await repoConventionsConfig(reader, capBytes))]) {
     const rel = resolveInRepo('', c);
     if (rel) explicit.add(rel);
   }
