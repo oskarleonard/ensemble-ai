@@ -188,6 +188,15 @@ export interface RunReviewOpts {
   historyPacket?: readonly HistoryPacketFile[];
   // Receives the kill handle so a caller (a future cancel) can abort the child.
   onSpawn?: (kill: () => void) => void;
+  // THE FULL STREAM (Munin, engine ask 2, 2026-10-23). The result's `stream` is a BOUNDED head +
+  // cut marker + tail (core/spawn), so a read fact derived from it is a floor on a long seat. A
+  // caller that wants the whole stream — the Munin dashboard writing `<seat>-stream.jsonl` for its
+  // own telemetry — gets every stdout chunk of the vendor process here, in order, as it arrives,
+  // and keeps it where it likes (a file, never the heap). Honored by all three seats. Across a
+  // transient-error retry the chunks of every attempt arrive on the same sink, in order; a
+  // consumer that wants one attempt per file splits on the init event. Nothing else changes:
+  // the bounded `stream` on the result is still produced.
+  onStream?: (chunk: string) => void;
   timeoutMs?: number;
   // WORKTREE EVIDENCE (§2): the detached, read-only worktree of the PR head this seat runs in.
   // BORROWED, never owned — one worktree is materialized per run and shared by every seat, so a
@@ -412,6 +421,7 @@ async function runCodexWorktreeReview(
       env: proxyEnv(proxy.url),
       inactivityTimeoutMs: CODEX_INACTIVITY_TIMEOUT_MS,
       onSpawn: opts.onSpawn,
+      ...(opts.onStream ? { onStdout: opts.onStream } : {}),
       outFile: reply.file,
       stderrLimit: 2000,
       streamStdout: true,
@@ -461,6 +471,7 @@ function runCodexAttempt(prompt: string, config: ReviewerConfig, opts: RunReview
     stderrLimit: 2000,
     streamStdout: true,
     onSpawn: opts.onSpawn,
+    ...(opts.onStream ? { onStdout: opts.onStream } : {}),
   }).then(toCodexResult);
 }
 

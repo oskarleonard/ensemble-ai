@@ -508,6 +508,19 @@ describe('runGrokReview (stdout capture)', () => {
     expect(result.stream!.length).toBeLessThan(1_000_000 + 70_000);
   });
 
+  it('onStream receives every stdout chunk, in order — the full stream for a caller that keeps it (engine ask 2)', async () => {
+    const chunks: string[] = [];
+    const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' }, { onStream: (c) => chunks.push(c) });
+    await untilSpawned();
+    const [a, b] = [grokStream('REVIEW BODY').slice(0, 40), grokStream('REVIEW BODY').slice(40)];
+    child?.stdout.emit('data', Buffer.from(a));
+    child?.stdout.emit('data', Buffer.from(b));
+    child?.emit('close');
+    const result = await p;
+    expect(result.ok).toBe(true);
+    expect(chunks).toEqual([a, b]);
+  });
+
   it('returns a bounded NDJSON tail so a seat leaves a record of what it was doing', async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
     await untilSpawned();

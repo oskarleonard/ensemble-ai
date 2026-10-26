@@ -244,6 +244,23 @@ describe('runClaudeReviewVoice — stream-json integration', () => {
     expect(res.stream!.length).toBeLessThan(8_000_000 + 70_000);
   });
 
+  it('hands the caller\'s onStream sink to the runner as its stdout tap (engine ask 2)', async () => {
+    const reqs: ReviewerExecOpts[] = [];
+    const exec: ReviewerExec = (req) => {
+      reqs.push(req);
+      return Promise.resolve({ raw: GOOD_STREAM, stderrTail: '', timedOut: false });
+    };
+    const sink = (_c: string): void => {};
+    await runClaudeReviewVoice('p', CFG(), { onStream: sink }, { exec, retryDelaysMs: [0, 0] });
+    expect(reqs[0].onStdout).toBe(sink);
+    const bare: ReviewerExec = (req) => {
+      reqs.push(req);
+      return Promise.resolve({ raw: GOOD_STREAM, stderrTail: '', timedOut: false });
+    };
+    await runClaudeReviewVoice('p', CFG(), {}, { exec: bare, retryDelaysMs: [0, 0] });
+    expect(reqs[1].onStdout).toBeUndefined();
+  });
+
   it('returns the result event text as raw, not the stream transcript', async () => {
     const exec: ReviewerExec = () => Promise.resolve({ raw: GOOD_STREAM, stderrTail: '', timedOut: false });
     const res = await runClaudeReviewVoice('p', CFG(), {}, { exec, retryDelaysMs: [0, 0] });

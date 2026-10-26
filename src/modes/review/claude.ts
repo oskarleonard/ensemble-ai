@@ -233,6 +233,7 @@ export async function runClaudeReviewVoice(
         env,
         inactivityTimeoutMs,
         onSpawn: opts.onSpawn,
+        ...(opts.onStream ? { onStdout: opts.onStream } : {}),
         stderrLimit: 2000,
         timeoutMs,
       });

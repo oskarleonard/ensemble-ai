@@ -270,6 +270,7 @@ declare function buildCodexReviewArgs(config: ReviewerConfig, outFile: string, p
 interface RunReviewOpts {
     historyPacket?: readonly HistoryPacketFile[];
     onSpawn?: (kill: () => void) => void;
+    onStream?: (chunk: string) => void;
     timeoutMs?: number;
     evidenceRoot?: string;
     worktree?: string;
