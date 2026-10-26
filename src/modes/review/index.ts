@@ -1,5 +1,3 @@
-import fs from 'node:fs';
-import path from 'node:path';
 
 import { writeTrailFile } from '../../core/artifacts';
 import {
@@ -27,6 +25,7 @@ import {
 import { REVIEW_ADAPTERS } from '../../reviewers/registry';
 
 import { type ChunkSeatRun, mergeChunkSeatRuns } from './chunk-merge';
+import { CONVENTIONS_IN_TREE_DIR, CONVENTIONS_IN_TREE_FILE, writeConventionsInTree } from './conventions-write';
 import {
   CHUNKS_TRAIL_FILE,
   CHUNKS_TRAIL_SCHEMA_VERSION,
@@ -262,12 +261,12 @@ export interface ReviewPart {
   scope?: string;
 }
 
-// Where the gathered conventions land inside the worktree when they are handed over by path
-// (see runReviewMode): a dotted, engine-owned dir beside `.companions/`, never a path the PR
-// could have committed, and never one of the stripped agent-instruction names.
 export const SKELETON_TRAIL_FILE = 'skeleton.md';
-export const CONVENTIONS_IN_TREE_DIR = '.ensemble-conventions';
-export const CONVENTIONS_IN_TREE_FILE = 'CONVENTIONS.md';
+// Where the gathered conventions land inside the worktree when they are handed over by path
+// (see runReviewMode): a dotted, engine-owned dir beside `.companions/`. A PR CAN commit that
+// path (as a symlink, even), so the write refuses the route when anything sits there — see
+// conventions-write.ts. The names live there; re-exported here unchanged.
+export { CONVENTIONS_IN_TREE_DIR, CONVENTIONS_IN_TREE_FILE } from './conventions-write';
 // Below this many chars the conventions ride inline regardless — a pointer costs a read.
 export const CONVENTIONS_INLINE_MAX = 32_000;
 
@@ -467,14 +466,16 @@ export async function runReviewMode(
   // before, so a packet seat is never asked to read a file it cannot reach.
   let conventionsPath: string | undefined;
   if (wt && everySeatReadsTree && agentsMd && agentsMd.length > CONVENTIONS_INLINE_MAX) {
-    try {
-      const dir = path.join(wt.dir, CONVENTIONS_IN_TREE_DIR);
-      fs.mkdirSync(dir, { recursive: true });
-      const file = path.join(dir, CONVENTIONS_IN_TREE_FILE);
-      // The index first (core/conventions conventionsIndex): nearest docs, root rules, a line per
-      // doc — so a seat reads the right sections instead of grepping for the separators.
-      const index = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) : null;
-      fs.writeFileSync(file, index ? index.text + agentsMd : agentsMd, { mode: 0o600 });
+    // The index first (core/conventions conventionsIndex): nearest docs, root rules, a line per
+    // doc — so a seat reads the right sections instead of grepping for the separators.
+    const index = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) : null;
+    // A sandbox-boundary write into the PR's own tree: refused (and inlined instead) when the head
+    // tracks the path or anything sits there, never through a symlink — conventions-write.ts.
+    const written = writeConventionsInTree(wt.dir, wt.headSha, index ? index.text + agentsMd : agentsMd);
+    if (!written.ok) {
+      log(`Conventions: not written into the worktree (${written.why}) — inlined in the packet instead`);
+    } else {
+      const { file } = written;
       if (conventionManifest && index) {
         conventionManifest.inTree = { file, indexEndLine: index.indexEndLine, jumpTo: index.jumpTo, readInFull: index.readInFull, spans: index.spans };
       }
@@ -482,9 +483,6 @@ export async function runReviewMode(
       const files = conventionManifest ? conventionManifest.files.filter((f) => f.included).length : undefined;
       agentsMd = conventionsPointer(file, agentsMd.length, files);
       log(`Conventions: handed to the seats as a file in the worktree (${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}) instead of inline — every seat reads the tree, and the packet no longer repeats them per part`);
-    } catch (e) {
-      log(`Conventions: could not be written into the worktree (${(e as Error).message}) — inlined in the packet instead`);
-      conventionsPath = undefined;
     }
   }
 

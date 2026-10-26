@@ -6967,10 +6967,6 @@ function isImplemented(mode) {
   return IMPLEMENTED_MODES.includes(mode);
 }
 
-// src/modes/review/index.ts
-import fs27 from "fs";
-import path23 from "path";
-
 // src/modes/review/profile.ts
 var SECURITY_OBJECTIVE = "Adversarial cross-vendor SECURITY audit of a code diff \u2014 hunt for exploitable vulnerabilities a same-vendor author might miss: injection, XSS, broken authn/authz, secret leakage, supply-chain risk, unsafe deserialization/eval, SSRF, path traversal, and crypto misuse.";
 var SECURITY_CLASSES = [
@@ -7213,6 +7209,59 @@ ${raw}`;
   };
 }
 
+// src/modes/review/conventions-write.ts
+import fs23 from "fs";
+import path19 from "path";
+var CONVENTIONS_IN_TREE_DIR = ".ensemble-conventions";
+var CONVENTIONS_IN_TREE_FILE = "CONVENTIONS.md";
+var IGNORE_ALL = "*\n";
+function gitRootEntriesAtHead(worktreeDir, headSha) {
+  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(headSha)) return null;
+  const res = execGit()(["ls-tree", "--name-only", headSha], { cwd: worktreeDir });
+  if (!res.ok) return null;
+  return res.text.split("\n").filter((l) => l !== "");
+}
+function writeExclusive(file, body, mode = 384) {
+  const flags = fs23.constants.O_WRONLY | fs23.constants.O_CREAT | fs23.constants.O_EXCL | (fs23.constants.O_NOFOLLOW ?? 0);
+  const fd = fs23.openSync(file, flags, mode);
+  try {
+    fs23.writeFileSync(fd, body);
+  } finally {
+    fs23.closeSync(fd);
+  }
+}
+function writeConventionsInTree(worktreeDir, headSha, body, seams = {}) {
+  const rootEntries = seams.rootEntriesAtHead ?? gitRootEntriesAtHead;
+  const exclusive = seams.writeExclusive ?? writeExclusive;
+  const dir = path19.join(worktreeDir, CONVENTIONS_IN_TREE_DIR);
+  const file = path19.join(dir, CONVENTIONS_IN_TREE_FILE);
+  const tracked = rootEntries(worktreeDir, headSha)?.find((n) => n.toLowerCase() === CONVENTIONS_IN_TREE_DIR.toLowerCase());
+  if (tracked !== void 0) return { ok: false, why: `the PR head tracks \`${tracked}\` \u2014 the engine never writes over the author's path` };
+  try {
+    const st = fs23.lstatSync(dir);
+    const kind = st.isSymbolicLink() ? "a symlink" : st.isDirectory() ? "a directory" : "a file";
+    return { ok: false, why: `${kind} already sits at ${CONVENTIONS_IN_TREE_DIR} in the checkout` };
+  } catch (e) {
+    if (e.code !== "ENOENT") return { ok: false, why: `could not inspect ${CONVENTIONS_IN_TREE_DIR}: ${e.message}` };
+  }
+  try {
+    fs23.mkdirSync(dir, { mode: 448 });
+  } catch (e) {
+    return { ok: false, why: `could not create ${CONVENTIONS_IN_TREE_DIR}: ${e.message}` };
+  }
+  try {
+    exclusive(file, body);
+    exclusive(path19.join(dir, ".gitignore"), IGNORE_ALL);
+    return { file, ok: true };
+  } catch (e) {
+    try {
+      fs23.rmSync(dir, { force: true, recursive: true });
+    } catch {
+    }
+    return { ok: false, why: `could not write ${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}: ${e.message}` };
+  }
+}
+
 // src/modes/review/dep-surface.ts
 var MANIFEST_PATTERNS = [
   { label: "npm", re: /(^|\/)package\.json$/ },
@@ -7304,9 +7353,9 @@ function scanDependencySurface(files) {
 }
 
 // src/modes/review/receipt.ts
-import fs26 from "fs";
+import fs27 from "fs";
 import os13 from "os";
-import path22 from "path";
+import path23 from "path";
 
 // src/modes/review/evidence.ts
 var EVIDENCE_CLASSES = ["packet", "worktree"];
@@ -7389,15 +7438,15 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/gate.ts
+import fs26 from "fs";
+import path22 from "path";
+
+// src/modes/review/holistic-gate.ts
 import fs25 from "fs";
 import path21 from "path";
 
-// src/modes/review/holistic-gate.ts
-import fs24 from "fs";
-import path20 from "path";
-
 // src/modes/review/holistic.ts
-import fs23 from "fs";
+import fs24 from "fs";
 
 // src/modes/review/seat-usage.ts
 function num(v) {
@@ -7749,7 +7798,7 @@ var RETRIES_ON_PACKET = Object.freeze({
 });
 
 // src/modes/review/self-contained.ts
-import path19 from "path";
+import path20 from "path";
 
 // src/modes/review/code-review-seat.ts
 var COLD_PEER_ROLE = "You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.";
@@ -8942,7 +8991,7 @@ async function runClaudeReviewLayer(opts) {
       gateEvidence: "worktree",
       holistic: {
         conventionPaths: opts.conventionPaths,
-        readAtHead: conventionsAwareReader(worktreeReader(opts.worktree), path19.join(opts.worktree, CONVENTIONS_IN_TREE_REL), opts.conventionPaths ?? [])
+        readAtHead: conventionsAwareReader(worktreeReader(opts.worktree), path20.join(opts.worktree, CONVENTIONS_IN_TREE_REL), opts.conventionPaths ?? [])
       }
     } : {},
     log,
@@ -9161,7 +9210,7 @@ function loadVoicesSeat(spec, file = VOICES_FILE, flags = {}, warn = () => {
 }, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
-    raw = JSON.parse(fs23.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs24.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`${spec.name} seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -9345,24 +9394,24 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs24.realpathSync(path20.resolve(worktreeDir));
+    root = fs25.realpathSync(path21.resolve(worktreeDir));
   } catch {
     return () => null;
   }
   const inside = (p) => {
-    const rel = path20.relative(root, p);
+    const rel = path21.relative(root, p);
     return rel !== "" && !escapesRoot(rel);
   };
   return (file) => {
     try {
-      if (!file || file.includes("\0") || path20.isAbsolute(file)) return null;
-      const target = path20.resolve(root, file);
+      if (!file || file.includes("\0") || path21.isAbsolute(file)) return null;
+      const target = path21.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs24.realpathSync(target);
+      const real = fs25.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs24.statSync(real);
+      const st = fs25.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs24.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs25.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
@@ -9375,8 +9424,8 @@ function conventionsAwareReader(base, conventionsFile, gathered = []) {
     cached = null;
     if (conventionsFile) {
       try {
-        const st = fs24.statSync(conventionsFile);
-        if (st.isFile() && st.size <= MAX_FILE_BYTES) cached = fs24.readFileSync(conventionsFile, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+        const st = fs25.statSync(conventionsFile);
+        if (st.isFile() && st.size <= MAX_FILE_BYTES) cached = fs25.readFileSync(conventionsFile, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
       } catch {
         cached = null;
       }
@@ -10934,7 +10983,7 @@ function renderGateVerdicts(records, opts) {
 var SHADOW_GATE_SCHEMA_VERSION = 1;
 function readPinnedProductDocs(baseDir, runId) {
   try {
-    return indexProductDocs(fs25.readFileSync(path21.join(reviewDir(baseDir, runId), PRODUCT_DOCS_TRAIL_FILE), "utf8"));
+    return indexProductDocs(fs26.readFileSync(path22.join(reviewDir(baseDir, runId), PRODUCT_DOCS_TRAIL_FILE), "utf8"));
   } catch {
     return null;
   }
@@ -11240,10 +11289,10 @@ function slug(s) {
   return sanitizePathSegment(s ?? "unknown").slice(0, 80) || "x";
 }
 function defaultReceiptStore() {
-  return process.env.ENSEMBLE_RECEIPTS_DIR || path22.join(os13.homedir(), ".ensemble-ai", "receipts");
+  return process.env.ENSEMBLE_RECEIPTS_DIR || path23.join(os13.homedir(), ".ensemble-ai", "receipts");
 }
 function receiptPath(storeDir, key) {
-  return path22.join(
+  return path23.join(
     storeDir,
     slug(key.repo),
     slug(key.headSha),
@@ -11264,11 +11313,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs26.mkdirSync(path22.dirname(file), { recursive: true, mode: 448 });
+  fs27.mkdirSync(path23.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs26.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs26.chmodSync(tmp, 384);
-  fs26.renameSync(tmp, file);
+  fs27.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs27.chmodSync(tmp, 384);
+  fs27.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -11350,7 +11399,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs26.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs27.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -11913,8 +11962,6 @@ async function resolveGitleaksExemptions(reader, paths) {
 
 // src/modes/review/index.ts
 var SKELETON_TRAIL_FILE = "skeleton.md";
-var CONVENTIONS_IN_TREE_DIR = ".ensemble-conventions";
-var CONVENTIONS_IN_TREE_FILE = "CONVENTIONS.md";
 var CONVENTIONS_INLINE_MAX = 32e3;
 function conventionsPointer(file, chars, files) {
   return `The repository's conventions (${files !== void 0 ? `${files} file(s), ` : ""}${chars.toLocaleString("en-US")} chars, gathered at the PR BASE \u2014 the rules this change is judged against, not the PR's own edits to them) are NOT inlined here. They are at:
@@ -12042,12 +12089,12 @@ async function runReviewMode(opts) {
   const everySeatReadsTree = Boolean(wt) && reviewers.every((id) => quals[id]?.qualified);
   let conventionsPath;
   if (wt && everySeatReadsTree && agentsMd && agentsMd.length > CONVENTIONS_INLINE_MAX) {
-    try {
-      const dir = path23.join(wt.dir, CONVENTIONS_IN_TREE_DIR);
-      fs27.mkdirSync(dir, { recursive: true });
-      const file = path23.join(dir, CONVENTIONS_IN_TREE_FILE);
-      const index = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) : null;
-      fs27.writeFileSync(file, index ? index.text + agentsMd : agentsMd, { mode: 384 });
+    const index = conventionManifest ? conventionsIndex(agentsMd, conventionManifest, acquired.files.map((f) => f.path)) : null;
+    const written = writeConventionsInTree(wt.dir, wt.headSha, index ? index.text + agentsMd : agentsMd);
+    if (!written.ok) {
+      log(`Conventions: not written into the worktree (${written.why}) \u2014 inlined in the packet instead`);
+    } else {
+      const { file } = written;
       if (conventionManifest && index) {
         conventionManifest.inTree = { file, indexEndLine: index.indexEndLine, jumpTo: index.jumpTo, readInFull: index.readInFull, spans: index.spans };
       }
@@ -12055,9 +12102,6 @@ async function runReviewMode(opts) {
       const files = conventionManifest ? conventionManifest.files.filter((f) => f.included).length : void 0;
       agentsMd = conventionsPointer(file, agentsMd.length, files);
       log(`Conventions: handed to the seats as a file in the worktree (${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}) instead of inline \u2014 every seat reads the tree, and the packet no longer repeats them per part`);
-    } catch (e) {
-      log(`Conventions: could not be written into the worktree (${e.message}) \u2014 inlined in the packet instead`);
-      conventionsPath = void 0;
     }
   }
   const ci = resolveCiEvidence(opts.ciEvidence, opts.ciEvidenceUnavailable);
