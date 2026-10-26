@@ -438,6 +438,24 @@ describe('toCodexResult — a spawn result folds the named failure in', () => {
   });
 });
 
+describe('runCodexReview — onStream hands the caller every stdout chunk (engine ask 2)', () => {
+  it('a packet-mode seat forwards the --json stream chunks, in order, beside the bounded tail it already keeps', async () => {
+    const chunks: string[] = [];
+    const p = runCodexReview('PROMPT', CONFIG, { onStream: (c) => chunks.push(c), timeoutMs: 10_000 });
+    const a = JSON.stringify({ type: 'thread.started', thread_id: 't' }) + '\n';
+    const b = JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }) + '\n';
+    child?.stdout.emit('data', Buffer.from(a));
+    child?.stdout.emit('data', Buffer.from(b));
+    const outFile = lastArgs[lastArgs.indexOf('-o') + 1];
+    fs.writeFileSync(outFile, 'CODEX REVIEW BODY');
+    child?.emit('close');
+    const result = await p;
+    expect(result.ok).toBe(true);
+    expect(chunks).toEqual([a, b]);
+    expect(result.stream).toBe(a + b);
+  });
+});
+
 describe('runCodexReview — a fast-failed transient 429 is retried on the SAME evidence', () => {
   const seams = { fastFailMs: 120_000, retryDelaysMs: [0, 0], sleep: async () => {} };
   const spawns = () => vi.mocked(spawn).mock.calls.length;

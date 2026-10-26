@@ -2150,6 +2150,7 @@ async function runCodexWorktreeReview(prompt, config, worktree, opts) {
       env: proxyEnv(proxy.url),
       inactivityTimeoutMs: CODEX_INACTIVITY_TIMEOUT_MS,
       onSpawn: opts.onSpawn,
+      ...opts.onStream ? { onStdout: opts.onStream } : {},
       outFile: reply.file,
       stderrLimit: 2e3,
       streamStdout: true,
@@ -2178,7 +2179,8 @@ function runCodexAttempt(prompt, config, opts) {
     timeoutMs,
     stderrLimit: 2e3,
     streamStdout: true,
-    onSpawn: opts.onSpawn
+    onSpawn: opts.onSpawn,
+    ...opts.onStream ? { onStdout: opts.onStream } : {}
   }).then(toCodexResult);
 }
 async function runCodexReview(prompt, config, opts = {}, seams = {}) {
@@ -2578,6 +2580,7 @@ async function runGrokReview(prompt, config, opts = {}) {
     let fence = null;
     let firstLine4 = "";
     const onStdout = (chunk) => {
+      opts.onStream?.(chunk);
       if (fence) return;
       firstLine4 += chunk;
       const nl = firstLine4.indexOf("\n");
@@ -5553,6 +5556,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
         env,
         inactivityTimeoutMs,
         onSpawn: opts.onSpawn,
+        ...opts.onStream ? { onStdout: opts.onStream } : {},
         stderrLimit: 2e3,
         timeoutMs
       });

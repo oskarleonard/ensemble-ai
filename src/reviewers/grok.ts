@@ -597,6 +597,7 @@ export async function runGrokReview(
     let fence: GrokToolFence | null = null;
     let firstLine = '';
     const onStdout = (chunk: string): void => {
+      opts.onStream?.(chunk); // the caller's full-stream sink sees every chunk, fenced or not
       if (fence) return;
       firstLine += chunk;
       const nl = firstLine.indexOf('\n');
