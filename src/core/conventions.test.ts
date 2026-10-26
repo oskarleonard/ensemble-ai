@@ -4,7 +4,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { extractDirRefs, extractRefs, fsConventionReader, gatherConventions, memoryConventionReader, repoConventionsConfig, resolveInRepo, type ConventionManifest, type ConventionReader } from './conventions';
+import {
+  type ConventionManifest,
+  type ConventionReader,
+  extractDirRefs,
+  extractRefs,
+  fsConventionReader,
+  gatherConventions,
+  memoryConventionReader,
+  REPO_CONVENTIONS_CONFIG_MAX_BYTES,
+  repoConventionsConfig,
+  resolveInRepo,
+} from './conventions';
 
 const included = (m: { files: { path: string; included: boolean }[] }): string[] =>
   m.files.filter((f) => f.included).map((f) => f.path);
@@ -242,7 +253,9 @@ describe('C · byte-cap bounds the READ (never slurp a huge file to trim it)', (
     const seen: (number | undefined)[] = [];
     const spy = {
       read: (rel: string, maxBytes?: number) => {
-        seen.push(maxBytes);
+        // `.ensemble-ai.json` has its own fixed bound (REPO_CONVENTIONS_CONFIG_MAX_BYTES + 1),
+        // not the gather cap: it is a path list, not gathered text. Every DOC read is cap-bound.
+        if (rel !== '.ensemble-ai.json') seen.push(maxBytes);
         return reader.read(rel, maxBytes);
       },
       list: reader.list,
@@ -283,7 +296,7 @@ describe('read-truncation honesty (MED conventions.ts:189)', () => {
     const asks: Array<number | undefined> = [];
     const reader: ConventionReader = {
       async read(rel, maxBytes) {
-        asks.push(maxBytes);
+        if (rel !== '.ensemble-ai.json') asks.push(maxBytes); // the config has its own fixed bound
         if (rel !== 'AGENTS.md') return null;
         // Honor the bound like a real reader (return at most maxBytes bytes).
         return maxBytes === undefined ? big : big.slice(0, maxBytes);
@@ -590,17 +603,41 @@ describe('repo conventions config · `.ensemble-ai.json` lifts the listed docs t
       'docs/style.md': 'style rules nobody links',
       'docs/extra.md': 'named by the caller',
     });
-    expect(await repoConventionsConfig(reader)).toEqual(['docs/style.md', '../outside.md']);
+    expect(await repoConventionsConfig(reader)).toEqual({ conventions: ['docs/style.md', '../outside.md'], path: '.ensemble-ai.json', state: 'read' });
     const { manifest } = await gatherConventions(reader, ['src/x.ts'], { conventions: ['docs/extra.md'] });
     expect(tierOf(manifest, 'docs/style.md')).toMatchObject({ included: true, tier: 0 });
     expect(tierOf(manifest, 'docs/extra.md')).toMatchObject({ included: true, tier: 0 });
     expect(manifest.files.some((f) => f.path.includes('outside'))).toBe(false);
+    expect(manifest.repoConfig).toEqual({ conventions: ['docs/style.md', '../outside.md'], path: '.ensemble-ai.json', state: 'read' });
   });
-  it('no file, malformed JSON, or a non-list field ⇒ nothing added, nothing thrown', async () => {
-    expect(await repoConventionsConfig(memoryConventionReader({ 'CLAUDE.md': 'x' }))).toEqual([]);
-    expect(await repoConventionsConfig(memoryConventionReader({ '.ensemble-ai.json': '{ not json' }))).toEqual([]);
-    expect(await repoConventionsConfig(memoryConventionReader({ '.ensemble-ai.json': '{"conventions":"docs/style.md"}' }))).toEqual([]);
-    const { manifest } = await gatherConventions(memoryConventionReader({ '.ensemble-ai.json': '{ not json', 'CLAUDE.md': '# rules\n' }), ['src/x.ts']);
+  it('no file, malformed JSON, or a non-list field ⇒ nothing added, nothing thrown — and the manifest NAMES why', async () => {
+    const P = '.ensemble-ai.json';
+    expect(await repoConventionsConfig(memoryConventionReader({ 'CLAUDE.md': 'x' }))).toEqual({ conventions: [], path: P, state: 'absent' });
+    expect(await repoConventionsConfig(memoryConventionReader({ [P]: '{ not json' }))).toEqual({ conventions: [], path: P, state: 'invalid' });
+    expect(await repoConventionsConfig(memoryConventionReader({ [P]: '{"conventions":"docs/style.md"}' }))).toEqual({ conventions: [], path: P, state: 'invalid' });
+    const throwing: ConventionReader = { list: async () => [], read: async () => { throw new Error('boom'); } };
+    expect(await repoConventionsConfig(throwing)).toEqual({ conventions: [], path: P, state: 'invalid' });
+    const { manifest } = await gatherConventions(memoryConventionReader({ [P]: '{ not json', 'CLAUDE.md': '# rules\n' }), ['src/x.ts']);
     expect(tierOf(manifest, 'CLAUDE.md')).toMatchObject({ included: true, tier: 0 });
+    expect(manifest.repoConfig?.state).toBe('invalid');
+  });
+  it('a config over the fixed bound is read as NOTHING, never as a partial list — whatever the gather cap is', async () => {
+    const P = '.ensemble-ai.json';
+    const many = Array.from({ length: 4000 }, (_, i) => `docs/rule-${i}.md`); // ~70 KB of valid JSON
+    const big = JSON.stringify({ conventions: many });
+    expect(Buffer.byteLength(big, 'utf8')).toBeGreaterThan(REPO_CONVENTIONS_CONFIG_MAX_BYTES);
+    const asked: (number | undefined)[] = [];
+    const inner = memoryConventionReader({ [P]: big, 'CLAUDE.md': '# rules\n', 'docs/rule-1.md': 'r1' });
+    const spy: ConventionReader = { list: inner.list, read: (rel, maxBytes) => { if (rel === P) asked.push(maxBytes); return inner.read(rel, maxBytes); } };
+    expect(await repoConventionsConfig(spy)).toEqual({ conventions: [], path: P, state: 'over-bound' });
+    expect(asked).toEqual([REPO_CONVENTIONS_CONFIG_MAX_BYTES + 1]); // bounded read, one byte past the bound to detect it
+    const { manifest } = await gatherConventions(spy, ['src/x.ts'], { capBytes: 6_000 });
+    expect(manifest.repoConfig?.state).toBe('over-bound');
+    expect(tierOf(manifest, 'docs/rule-1.md')?.tier).toBe(2); // swept as a docs/ page, NOT promoted to MANDATORY by the cut list
+    // a config exactly AT the bound still reads
+    const pad = JSON.stringify({ conventions: ['docs/rule-1.md'], pad: 'x'.repeat(REPO_CONVENTIONS_CONFIG_MAX_BYTES - 60) });
+    const at = pad.length <= REPO_CONVENTIONS_CONFIG_MAX_BYTES ? pad : pad.slice(0, REPO_CONVENTIONS_CONFIG_MAX_BYTES);
+    expect(Buffer.byteLength(at, 'utf8')).toBeLessThanOrEqual(REPO_CONVENTIONS_CONFIG_MAX_BYTES);
+    expect((await repoConventionsConfig(memoryConventionReader({ [P]: at }))).state).toBe(at === pad ? 'read' : 'invalid');
   });
 });
