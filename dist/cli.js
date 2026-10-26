@@ -7592,6 +7592,8 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
   let sawCut = false;
   const ranges = [];
   const pending = /* @__PURE__ */ new Map();
+  const codexPending = /* @__PURE__ */ new Map();
+  let codexUnkeyed = 0;
   for (const line of stream.split("\n")) {
     if (!line.trim()) continue;
     let e;
@@ -7606,7 +7608,20 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
     if (ev.type === STREAM_CUT_EVENT) sawCut = true;
     if ((ev.type === "item.started" || ev.type === "item.completed") && ev.item && typeof ev.item === "object") {
       const it = ev.item;
-      if (it.type === "command_execution" && typeof it.command === "string" && ev.type === "item.started") ranges.push(...codexRanges(it.command, needle));
+      if (it.type !== "command_execution") continue;
+      const id = typeof it.id === "string" ? it.id : null;
+      if (ev.type === "item.started") {
+        const rs2 = typeof it.command === "string" ? codexRanges(it.command, needle) : [];
+        if (rs2.length === 0) continue;
+        if (id === null) codexUnkeyed++;
+        else codexPending.set(id, rs2);
+        continue;
+      }
+      const rs = id !== null ? codexPending.get(id) : void 0;
+      if (id !== null) codexPending.delete(id);
+      const ran = it.status === "completed" && (it.exit_code === void 0 || it.exit_code === 0);
+      if (rs && ran) ranges.push(...rs);
+      if (!rs && ran && typeof it.command === "string") ranges.push(...codexRanges(it.command, needle));
       continue;
     }
     if (ev.type === "assistant" && ev.message && typeof ev.message === "object") {
@@ -7648,7 +7663,8 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
   }
   ranges.push(...pending.values());
   if (first === null) return void 0;
-  const whole = first === "init" && !sawCut;
+  const attempted = codexPending.size > 0 || codexUnkeyed > 0;
+  const whole = first === "init" && !sawCut && !attempted;
   if (ranges.length === 0) return whole ? { docsRead: [], state: "unread" } : void 0;
   if (!layout) return { docsRead: [], state: "read" };
   const beyondIndex = ranges.some((r) => r.grep || r.end > layout.indexEndLine);
