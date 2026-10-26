@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { claimEngineDir, type RootEntriesAtHead, writeExclusive } from './conventions-write';
 import { STRIPPED_INSTRUCTION_PATHS } from './worktree';
 
 // COMPANION REPOS for a worktree review (`--companion <name>=<dir>`, repeatable — hugin spec
@@ -57,39 +58,77 @@ const STRIPPED_BASENAMES = new Set(STRIPPED_INSTRUCTION_PATHS.map((p: string) =>
 // Copy each companion into `<worktree>/.companions/<name>/`. Symlinks are dropped (a link could
 // point outside the read root); the instruction files the worktree rule strips are stripped
 // here too, defensively — the caller normally already did.
-export function installCompanions(worktreeDir: string, companions: readonly Companion[]): InstalledCompanion[] {
+//
+// The install is a SANDBOX-BOUNDARY WRITE into the PR's own tree (Munin's review of #145): the
+// worktree is the author's content, and `mkdirSync(recursive)` + `cpSync(force)` both follow a
+// committed symlink, so a PR that committed `.companions` as a link to a writable directory had
+// the engine copy the companion repos — as the operator's user — wherever the link pointed. The
+// base directory is now CLAIMED (conventions-write claimEngineDir: head tracks nothing there,
+// nothing on disk, non-recursive mkdir 0700) and each companion lands in a directory the engine
+// created the same way, so no copy ever crosses a link. A REFUSAL throws CompanionsRefusedError —
+// the one error the CLI downgrades to "the review runs without companion context" — while a
+// missing or unreadable companion source, or an IO failure mid-copy, propagates as before (the
+// review fails; Hugin's cross-vendor review of this change: a blanket catch had hidden those).
+// Any failure after the claim removes the directory, and the clause is reset FIRST so a refusal
+// can never leave a previous install's names pointing seats at PR-authored `.companions` content.
+export class CompanionsRefusedError extends Error {
+  readonly why: string;
+  constructor(why: string) {
+    super(`companions not installed: ${why}`);
+    this.name = 'CompanionsRefusedError';
+    this.why = why;
+  }
+}
+
+export function installCompanions(
+  worktreeDir: string,
+  companions: readonly Companion[],
+  headSha = '',
+  rootEntriesAtHead?: RootEntriesAtHead
+): InstalledCompanion[] {
   const installed: InstalledCompanion[] = [];
+  setCompanionNames([]); // never a stale clause from an earlier install in this process
   if (companions.length === 0) return installed;
-  const base = path.join(worktreeDir, COMPANIONS_DIR);
-  fs.mkdirSync(base, { recursive: true });
-  for (const c of companions) {
-    const dest = path.join(base, c.name);
-    fs.cpSync(c.dir, dest, { recursive: true, dereference: false, errorOnExist: false, force: true, filter: (src) => !fs.lstatSync(src).isSymbolicLink() });
-    let files = 0;
-    const stripped: string[] = [];
-    const walk = (d: string, rel: string) => {
-      for (const n of fs.readdirSync(d)) {
-        const full = path.join(d, n);
-        const st = fs.lstatSync(full);
-        const r = rel ? `${rel}/${n}` : n;
-        if (st.isSymbolicLink()) {
-          fs.rmSync(full, { force: true });
-          continue;
+  const claim = claimEngineDir(worktreeDir, headSha, COMPANIONS_DIR, ...(rootEntriesAtHead ? [rootEntriesAtHead] : []));
+  if (!claim.ok) throw new CompanionsRefusedError(claim.why);
+  const base = claim.dir;
+  try {
+    // Ignore-all beside the copies, like the conventions dir: a seat's `git status` in the worktree
+    // never shows the engine's companions as the PR's own untracked change.
+    writeExclusive(path.join(base, '.gitignore'), '*\n');
+    for (const c of companions) {
+      const dest = path.join(base, c.name);
+      fs.mkdirSync(dest, { mode: 0o700 }); // non-recursive, inside the directory the engine just created
+      fs.cpSync(c.dir, dest, { recursive: true, dereference: false, errorOnExist: false, force: true, filter: (src) => !fs.lstatSync(src).isSymbolicLink() });
+      let files = 0;
+      const stripped: string[] = [];
+      const walk = (d: string, rel: string) => {
+        for (const n of fs.readdirSync(d)) {
+          const full = path.join(d, n);
+          const st = fs.lstatSync(full);
+          const r = rel ? `${rel}/${n}` : n;
+          if (st.isSymbolicLink()) {
+            fs.rmSync(full, { force: true });
+            continue;
+          }
+          if (st.isDirectory()) {
+            walk(full, r);
+            continue;
+          }
+          if (STRIPPED_BASENAMES.has(n)) {
+            fs.rmSync(full, { force: true });
+            stripped.push(r);
+            continue;
+          }
+          files += 1;
         }
-        if (st.isDirectory()) {
-          walk(full, r);
-          continue;
-        }
-        if (STRIPPED_BASENAMES.has(n)) {
-          fs.rmSync(full, { force: true });
-          stripped.push(r);
-          continue;
-        }
-        files += 1;
-      }
-    };
-    walk(dest, '');
-    installed.push({ ...c, installedAt: dest, files, strippedInstructionFiles: stripped });
+      };
+      walk(dest, '');
+      installed.push({ ...c, installedAt: dest, files, strippedInstructionFiles: stripped });
+    }
+  } catch (e) {
+    fs.rmSync(base, { force: true, recursive: true });
+    throw e;
   }
   setCompanionNames(installed.map((c) => c.name));
   return installed;

@@ -3204,7 +3204,7 @@ async function runGrokReview(prompt, config, opts = {}) {
 }
 
 // src/modes/review/claude.ts
-import fs18 from "fs";
+import fs19 from "fs";
 import os10 from "os";
 
 // src/modes/brainstorm/claude.ts
@@ -4619,10 +4619,70 @@ function writeHistoryPacket(cwd, files) {
 }
 
 // src/modes/review/companions.ts
+import fs18 from "fs";
+import path16 from "path";
+
+// src/modes/review/conventions-write.ts
 import fs17 from "fs";
 import path15 from "path";
+var CONVENTIONS_IN_TREE_DIR = ".ensemble-conventions";
+var CONVENTIONS_IN_TREE_FILE = "CONVENTIONS.md";
+var IGNORE_ALL = "*\n";
+function gitRootEntriesAtHead(worktreeDir, headSha) {
+  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(headSha)) return null;
+  const res = execGit()(["ls-tree", "--name-only", headSha], { cwd: worktreeDir });
+  if (!res.ok) return null;
+  return res.text.split("\n").filter((l) => l !== "");
+}
+function writeExclusive(file, body, mode = 384) {
+  const flags = fs17.constants.O_WRONLY | fs17.constants.O_CREAT | fs17.constants.O_EXCL | (fs17.constants.O_NOFOLLOW ?? 0);
+  const fd = fs17.openSync(file, flags, mode);
+  try {
+    fs17.writeFileSync(fd, body);
+  } finally {
+    fs17.closeSync(fd);
+  }
+}
+function claimEngineDir(worktreeDir, headSha, dirName, rootEntries = gitRootEntriesAtHead) {
+  const dir = path15.join(worktreeDir, dirName);
+  const tracked = rootEntries(worktreeDir, headSha)?.find((n) => n.toLowerCase() === dirName.toLowerCase());
+  if (tracked !== void 0) return { ok: false, why: `the PR head tracks \`${tracked}\` \u2014 the engine never writes over the author's path` };
+  try {
+    const st = fs17.lstatSync(dir);
+    const kind = st.isSymbolicLink() ? "a symlink" : st.isDirectory() ? "a directory" : "a file";
+    return { ok: false, why: `${kind} already sits at ${dirName} in the checkout` };
+  } catch (e) {
+    if (e.code !== "ENOENT") return { ok: false, why: `could not inspect ${dirName}: ${e.message}` };
+  }
+  try {
+    fs17.mkdirSync(dir, { mode: 448 });
+  } catch (e) {
+    return { ok: false, why: `could not create ${dirName}: ${e.message}` };
+  }
+  return { dir, ok: true };
+}
+function writeConventionsInTree(worktreeDir, headSha, body, seams = {}) {
+  const exclusive = seams.writeExclusive ?? writeExclusive;
+  const claim = claimEngineDir(worktreeDir, headSha, CONVENTIONS_IN_TREE_DIR, seams.rootEntriesAtHead ?? gitRootEntriesAtHead);
+  if (!claim.ok) return claim;
+  const dir = claim.dir;
+  const file = path15.join(dir, CONVENTIONS_IN_TREE_FILE);
+  try {
+    exclusive(file, body);
+    exclusive(path15.join(dir, ".gitignore"), IGNORE_ALL);
+    return { file, ok: true };
+  } catch (e) {
+    try {
+      fs17.rmSync(dir, { force: true, recursive: true });
+    } catch {
+    }
+    return { ok: false, why: `could not write ${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}: ${e.message}` };
+  }
+}
+
+// src/modes/review/companions.ts
 var COMPANIONS_DIR = ".companions";
-var STRIPPED_BASENAMES = new Set(STRIPPED_INSTRUCTION_PATHS.map((p) => path15.basename(p)));
+var STRIPPED_BASENAMES = new Set(STRIPPED_INSTRUCTION_PATHS.map((p) => path16.basename(p)));
 var companionNames = [];
 function companionsClause() {
   if (companionNames.length === 0) return "";
@@ -4766,7 +4826,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
     }
   } finally {
     try {
-      fs18.rmSync(cwd, { force: true, recursive: true });
+      fs19.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
   }
@@ -4809,8 +4869,8 @@ function scrubControl(s) {
 }
 
 // src/modes/review/chunk-merge.ts
-import fs19 from "fs";
-import path16 from "path";
+import fs20 from "fs";
+import path17 from "path";
 function mergedDiagnostics(runs) {
   const ds = runs.map((r) => r.seat.review.diagnostics).filter((d) => Boolean(d));
   if (ds.length === 0) return void 0;
@@ -4848,7 +4908,7 @@ function mergeChunkSeatRuns(args) {
   const dir = reviewDir(args.out, args.runId);
   const raws = runs.map((r) => {
     try {
-      const raw = fs19.readFileSync(path16.join(dir, `${args.reviewer.id}-review.c${r.index}.raw.md`), "utf8");
+      const raw = fs20.readFileSync(path17.join(dir, `${args.reviewer.id}-review.c${r.index}.raw.md`), "utf8");
       return `## Part ${r.index} of ${n} \u2014 ${r.label}
 
 ${raw}`;
@@ -4876,59 +4936,6 @@ ${raw}`;
     realized,
     review
   };
-}
-
-// src/modes/review/conventions-write.ts
-import fs20 from "fs";
-import path17 from "path";
-var CONVENTIONS_IN_TREE_DIR = ".ensemble-conventions";
-var CONVENTIONS_IN_TREE_FILE = "CONVENTIONS.md";
-var IGNORE_ALL = "*\n";
-function gitRootEntriesAtHead(worktreeDir, headSha) {
-  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(headSha)) return null;
-  const res = execGit()(["ls-tree", "--name-only", headSha], { cwd: worktreeDir });
-  if (!res.ok) return null;
-  return res.text.split("\n").filter((l) => l !== "");
-}
-function writeExclusive(file, body, mode = 384) {
-  const flags = fs20.constants.O_WRONLY | fs20.constants.O_CREAT | fs20.constants.O_EXCL | (fs20.constants.O_NOFOLLOW ?? 0);
-  const fd = fs20.openSync(file, flags, mode);
-  try {
-    fs20.writeFileSync(fd, body);
-  } finally {
-    fs20.closeSync(fd);
-  }
-}
-function writeConventionsInTree(worktreeDir, headSha, body, seams = {}) {
-  const rootEntries = seams.rootEntriesAtHead ?? gitRootEntriesAtHead;
-  const exclusive = seams.writeExclusive ?? writeExclusive;
-  const dir = path17.join(worktreeDir, CONVENTIONS_IN_TREE_DIR);
-  const file = path17.join(dir, CONVENTIONS_IN_TREE_FILE);
-  const tracked = rootEntries(worktreeDir, headSha)?.find((n) => n.toLowerCase() === CONVENTIONS_IN_TREE_DIR.toLowerCase());
-  if (tracked !== void 0) return { ok: false, why: `the PR head tracks \`${tracked}\` \u2014 the engine never writes over the author's path` };
-  try {
-    const st = fs20.lstatSync(dir);
-    const kind = st.isSymbolicLink() ? "a symlink" : st.isDirectory() ? "a directory" : "a file";
-    return { ok: false, why: `${kind} already sits at ${CONVENTIONS_IN_TREE_DIR} in the checkout` };
-  } catch (e) {
-    if (e.code !== "ENOENT") return { ok: false, why: `could not inspect ${CONVENTIONS_IN_TREE_DIR}: ${e.message}` };
-  }
-  try {
-    fs20.mkdirSync(dir, { mode: 448 });
-  } catch (e) {
-    return { ok: false, why: `could not create ${CONVENTIONS_IN_TREE_DIR}: ${e.message}` };
-  }
-  try {
-    exclusive(file, body);
-    exclusive(path17.join(dir, ".gitignore"), IGNORE_ALL);
-    return { file, ok: true };
-  } catch (e) {
-    try {
-      fs20.rmSync(dir, { force: true, recursive: true });
-    } catch {
-    }
-    return { ok: false, why: `could not write ${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}: ${e.message}` };
-  }
 }
 
 // src/modes/review/dep-surface.ts

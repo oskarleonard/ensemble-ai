@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 
-import { companionsClause, installCompanions, parseCompanionFlags, setCompanionNames } from './companions';
+import { companionsClause, CompanionsRefusedError, installCompanions, parseCompanionFlags, setCompanionNames } from './companions';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'companions-'));
 afterAll(() => fs.rmSync(tmp, { force: true, recursive: true }));
@@ -45,6 +45,40 @@ describe('installCompanions', () => {
     expect(c.files).toBe(1);
     expect(companionsClause()).toContain('`.companions/<name>/`');
     expect(companionsClause()).toContain('`acme-infra`');
+  });
+  it('refuses when the PR committed `.companions` as a symlink — nothing lands at the link\'s target, and no clause is set', () => {
+    const wt = fs.mkdtempSync(path.join(tmp, 'worktree-link-'));
+    const elsewhere = fs.mkdtempSync(path.join(tmp, 'elsewhere-'));
+    fs.symlinkSync(elsewhere, path.join(wt, '.companions'));
+    setCompanionNames(['stale-from-an-earlier-install']);
+    expect(() => installCompanions(wt, [{ name: 'acme-infra', dir: makeExport('c') }])).toThrow(CompanionsRefusedError);
+    expect(() => installCompanions(wt, [{ name: 'acme-infra', dir: makeExport('c2') }])).toThrow(/a symlink already sits at \.companions/);
+    expect(fs.readdirSync(elsewhere)).toEqual([]);
+    expect(companionsClause()).toBe(''); // the stale clause is gone, not kept
+  });
+  it('refuses when the head TRACKS the path (case-folded) before touching the disk', () => {
+    const wt = fs.mkdtempSync(path.join(tmp, 'worktree-tracked-'));
+    expect(() => installCompanions(wt, [{ name: 'acme-infra', dir: makeExport('d') }], 'a'.repeat(40), () => ['.Companions', 'README.md'])).toThrow(/tracks `\.Companions`/);
+    expect(fs.readdirSync(wt)).toEqual([]);
+  });
+  it('a failure mid-install removes the directory it created', () => {
+    const wt = fs.mkdtempSync(path.join(tmp, 'worktree-fail-'));
+    const good = makeExport('e');
+    let caught: unknown;
+    try {
+      installCompanions(wt, [{ name: 'ok', dir: good }, { name: 'gone', dir: path.join(tmp, 'does-not-exist') }]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(CompanionsRefusedError); // an IO failure is NOT a refusal — the CLI lets it fail the command
+    expect(fs.existsSync(path.join(wt, '.companions'))).toBe(false);
+    expect(companionsClause()).toBe('');
+  });
+  it('writes an ignore-all beside the copies, like the conventions dir', () => {
+    const wt = fs.mkdtempSync(path.join(tmp, 'worktree-ignore-'));
+    installCompanions(wt, [{ name: 'acme-infra', dir: makeExport('f') }]);
+    expect(fs.readFileSync(path.join(wt, '.companions', '.gitignore'), 'utf8')).toBe('*\n');
   });
   it('no companions → no clause', () => {
     expect(installCompanions(tmp, [])).toEqual([]);

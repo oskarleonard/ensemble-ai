@@ -3325,36 +3325,20 @@ ${index}`;
 }
 
 // src/modes/review/companions.ts
-import fs16 from "fs";
-import path14 from "path";
+import fs17 from "fs";
+import path15 from "path";
 
-// src/modes/review/worktree.ts
-import fs15 from "fs";
-import path13 from "path";
-
-// src/modes/review/ensemble-config.ts
+// src/modes/review/conventions-write.ts
 import fs14 from "fs";
-import os11 from "os";
-import path11 from "path";
-var ENSEMBLE_CONFIG_PATH = path11.join(os11.homedir(), ".ensemble-ai", "config.json");
-function asRecord(v) {
-  return v && typeof v === "object" && !Array.isArray(v) ? v : null;
-}
-function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
-  try {
-    return asRecord(JSON.parse(fs14.readFileSync(configPath, "utf8"))) ?? {};
-  } catch {
-    return {};
-  }
-}
+import path12 from "path";
 
 // src/modes/review/git-exec.ts
 import { execFileSync as execFileSync3 } from "child_process";
-import path12 from "path";
+import path11 from "path";
 function nonInteractiveSshCommand(configured = process.env.GIT_SSH_COMMAND) {
   const cmd = configured?.trim();
   if (!cmd) return "ssh -o BatchMode=yes";
-  const bin = path12.basename(cmd.split(/\s+/)[0]);
+  const bin = path11.basename(cmd.split(/\s+/)[0]);
   return bin === "ssh" ? `${cmd} -o BatchMode=yes` : null;
 }
 function effectiveSshCommand(cwd, cache) {
@@ -3457,6 +3441,82 @@ function execGit() {
   };
 }
 
+// src/modes/review/conventions-write.ts
+var CONVENTIONS_IN_TREE_DIR = ".ensemble-conventions";
+var CONVENTIONS_IN_TREE_FILE = "CONVENTIONS.md";
+var IGNORE_ALL = "*\n";
+function gitRootEntriesAtHead(worktreeDir, headSha) {
+  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(headSha)) return null;
+  const res = execGit()(["ls-tree", "--name-only", headSha], { cwd: worktreeDir });
+  if (!res.ok) return null;
+  return res.text.split("\n").filter((l) => l !== "");
+}
+function writeExclusive(file, body, mode = 384) {
+  const flags = fs14.constants.O_WRONLY | fs14.constants.O_CREAT | fs14.constants.O_EXCL | (fs14.constants.O_NOFOLLOW ?? 0);
+  const fd = fs14.openSync(file, flags, mode);
+  try {
+    fs14.writeFileSync(fd, body);
+  } finally {
+    fs14.closeSync(fd);
+  }
+}
+function claimEngineDir(worktreeDir, headSha, dirName, rootEntries = gitRootEntriesAtHead) {
+  const dir = path12.join(worktreeDir, dirName);
+  const tracked = rootEntries(worktreeDir, headSha)?.find((n) => n.toLowerCase() === dirName.toLowerCase());
+  if (tracked !== void 0) return { ok: false, why: `the PR head tracks \`${tracked}\` \u2014 the engine never writes over the author's path` };
+  try {
+    const st = fs14.lstatSync(dir);
+    const kind = st.isSymbolicLink() ? "a symlink" : st.isDirectory() ? "a directory" : "a file";
+    return { ok: false, why: `${kind} already sits at ${dirName} in the checkout` };
+  } catch (e) {
+    if (e.code !== "ENOENT") return { ok: false, why: `could not inspect ${dirName}: ${e.message}` };
+  }
+  try {
+    fs14.mkdirSync(dir, { mode: 448 });
+  } catch (e) {
+    return { ok: false, why: `could not create ${dirName}: ${e.message}` };
+  }
+  return { dir, ok: true };
+}
+function writeConventionsInTree(worktreeDir, headSha, body, seams = {}) {
+  const exclusive = seams.writeExclusive ?? writeExclusive;
+  const claim = claimEngineDir(worktreeDir, headSha, CONVENTIONS_IN_TREE_DIR, seams.rootEntriesAtHead ?? gitRootEntriesAtHead);
+  if (!claim.ok) return claim;
+  const dir = claim.dir;
+  const file = path12.join(dir, CONVENTIONS_IN_TREE_FILE);
+  try {
+    exclusive(file, body);
+    exclusive(path12.join(dir, ".gitignore"), IGNORE_ALL);
+    return { file, ok: true };
+  } catch (e) {
+    try {
+      fs14.rmSync(dir, { force: true, recursive: true });
+    } catch {
+    }
+    return { ok: false, why: `could not write ${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}: ${e.message}` };
+  }
+}
+
+// src/modes/review/worktree.ts
+import fs16 from "fs";
+import path14 from "path";
+
+// src/modes/review/ensemble-config.ts
+import fs15 from "fs";
+import os11 from "os";
+import path13 from "path";
+var ENSEMBLE_CONFIG_PATH = path13.join(os11.homedir(), ".ensemble-ai", "config.json");
+function asRecord(v) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : null;
+}
+function readEnsembleConfig(configPath = ENSEMBLE_CONFIG_PATH) {
+  try {
+    return asRecord(JSON.parse(fs15.readFileSync(configPath, "utf8"))) ?? {};
+  } catch {
+    return {};
+  }
+}
+
 // src/modes/review/worktree.ts
 function isPreflightError(v) {
   return typeof v === "object" && v !== null && "kind" in v && "message" in v;
@@ -3488,18 +3548,18 @@ function allowedRootsFromConfig(configPath) {
   const roots = readEnsembleConfig(configPath).allowedRepoRoots;
   if (!Array.isArray(roots) || roots.length === 0) return null;
   const strs = roots.filter((r) => typeof r === "string" && r.trim().length > 0);
-  return strs.length > 0 ? strs.map((r) => path13.resolve(r)) : null;
+  return strs.length > 0 ? strs.map((r) => path14.resolve(r)) : null;
 }
 function rootAllowed(repoRoot, allowed) {
   if (!allowed) return true;
-  const real = path13.resolve(repoRoot);
+  const real = path14.resolve(repoRoot);
   return allowed.some((root) => {
-    const rel = path13.relative(root, real);
-    return rel === "" || !rel.startsWith("..") && !path13.isAbsolute(rel);
+    const rel = path14.relative(root, real);
+    return rel === "" || !rel.startsWith("..") && !path14.isAbsolute(rel);
   });
 }
 function resolveRepoLocation(args, deps) {
-  const repoPath = path13.resolve(args.repoPath);
+  const repoPath = path14.resolve(args.repoPath);
   const top = deps.git(["rev-parse", "--show-toplevel"], { cwd: repoPath });
   if (!top.ok) {
     return {
@@ -3649,7 +3709,7 @@ function stripAgentInstructions(dir) {
   const removed = [];
   const remove = (rel) => {
     try {
-      fs15.rmSync(path13.join(dir, rel), { force: true, recursive: true });
+      fs16.rmSync(path14.join(dir, rel), { force: true, recursive: true });
       removed.push(rel);
     } catch {
     }
@@ -3657,7 +3717,7 @@ function stripAgentInstructions(dir) {
   const walk = (rel) => {
     let entries;
     try {
-      entries = fs15.readdirSync(path13.join(dir, rel), { withFileTypes: true });
+      entries = fs16.readdirSync(path14.join(dir, rel), { withFileTypes: true });
     } catch {
       return;
     }
@@ -3667,7 +3727,7 @@ function stripAgentInstructions(dir) {
       if (isInstructionName(e.name)) {
         remove(childRel);
       } else if (e.isDirectory() && isCursorDir(e.name)) {
-        if (fs15.existsSync(path13.join(dir, childRel, CURSOR_RULES))) {
+        if (fs16.existsSync(path14.join(dir, childRel, CURSOR_RULES))) {
           remove(`${childRel}/${CURSOR_RULES}`);
         }
         walk(childRel);
@@ -3683,14 +3743,14 @@ function isStrippedPath(p, stripped) {
   return stripped.some((s) => p === s || p.startsWith(`${s}/`));
 }
 var PARTIAL_CLONE_CONFIG_RE = "^(extensions\\.partialclone|remote\\..*\\.promisor)$";
-var ALTERNATES_REL = path13.join("objects", "info", "alternates");
+var ALTERNATES_REL = path14.join("objects", "info", "alternates");
 function completeSharedStore(repoRoot, git2) {
   const common = git2(["rev-parse", "--git-common-dir"], { cwd: repoRoot });
   if (!common.ok) return null;
-  const commonDir = path13.resolve(repoRoot, common.text.trim());
-  if (!fs15.existsSync(path13.join(commonDir, "objects"))) return null;
-  if (fs15.existsSync(path13.join(commonDir, "shallow"))) return null;
-  if (fs15.existsSync(path13.join(commonDir, ALTERNATES_REL))) return null;
+  const commonDir = path14.resolve(repoRoot, common.text.trim());
+  if (!fs16.existsSync(path14.join(commonDir, "objects"))) return null;
+  if (fs16.existsSync(path14.join(commonDir, "shallow"))) return null;
+  if (fs16.existsSync(path14.join(commonDir, ALTERNATES_REL))) return null;
   if (git2(["config", "--get-regexp", PARTIAL_CLONE_CONFIG_RE], { cwd: repoRoot }).ok) return null;
   return commonDir;
 }
@@ -3762,7 +3822,7 @@ function materializeWorktree(args, deps) {
   let parent = null;
   try {
     parent = makeOwnerOnlyTempDir(WORKTREE_PARENT_PREFIX, args.worktreeRoot);
-    const bare = path13.join(parent, "repo");
+    const bare = path14.join(parent, "repo");
     const created = deps.git(createPrivateRepoArgs(shared, bare, args.headSha), { env: INERT_ENV });
     if (!created.ok) {
       return { kind: "materialize-failed", message: privateRepoFailure(shared, created.error) };
@@ -3813,7 +3873,7 @@ function materializeWorktree(args, deps) {
       const tip = baseFetched.ok ? deps.git(["rev-parse", "--verify", BASE_TIP_REF], { cwd: bare, env: INERT_ENV }) : null;
       baseTip = tip && tip.ok && /^[0-9a-f]{40,64}$/.test(tip.text.trim()) ? tip.text.trim() : null;
     }
-    const dir = path13.join(parent, "head");
+    const dir = path14.join(parent, "head");
     const added = deps.git(
       [...INERT_GIT_CONFIG, "worktree", "add", "--detach", dir, args.headSha],
       { cwd: bare, env: INERT_ENV }
@@ -3845,14 +3905,14 @@ function materializeWorktree(args, deps) {
 }
 var REAP_RM_OPTS = { force: true, maxRetries: 3, recursive: true, retryDelay: 50 };
 function reapParent(parent) {
-  if (!path13.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
+  if (!path14.basename(parent).startsWith(WORKTREE_PARENT_PREFIX)) return;
   try {
-    fs15.rmSync(parent, REAP_RM_OPTS);
+    fs16.rmSync(parent, REAP_RM_OPTS);
   } catch {
   }
 }
 function reapWorktree(dir) {
-  reapParent(path13.dirname(dir));
+  reapParent(path14.dirname(dir));
 }
 
 // src/modes/review/companions.ts
@@ -3866,53 +3926,70 @@ function parseCompanionFlags(values) {
     const name2 = raw.slice(0, eq).trim();
     const dir = raw.slice(eq + 1).trim();
     if (!NAME_RE.test(name2)) throw new Error(`--companion name "${name2}" must match ${NAME_RE}`);
-    if (!path14.isAbsolute(dir)) throw new Error(`--companion ${name2}: dir must be absolute (got "${dir}")`);
+    if (!path15.isAbsolute(dir)) throw new Error(`--companion ${name2}: dir must be absolute (got "${dir}")`);
     let real;
     try {
-      real = fs16.realpathSync(dir);
+      real = fs17.realpathSync(dir);
     } catch {
       throw new Error(`--companion ${name2}: ${dir} does not exist`);
     }
-    if (!fs16.statSync(real).isDirectory()) throw new Error(`--companion ${name2}: ${dir} is not a directory`);
+    if (!fs17.statSync(real).isDirectory()) throw new Error(`--companion ${name2}: ${dir} is not a directory`);
     if (out.some((c) => c.name === name2)) throw new Error(`--companion ${name2} given twice`);
     out.push({ name: name2, dir: real });
   }
   return out;
 }
-var STRIPPED_BASENAMES = new Set(STRIPPED_INSTRUCTION_PATHS.map((p) => path14.basename(p)));
-function installCompanions(worktreeDir, companions) {
+var STRIPPED_BASENAMES = new Set(STRIPPED_INSTRUCTION_PATHS.map((p) => path15.basename(p)));
+var CompanionsRefusedError = class extends Error {
+  why;
+  constructor(why) {
+    super(`companions not installed: ${why}`);
+    this.name = "CompanionsRefusedError";
+    this.why = why;
+  }
+};
+function installCompanions(worktreeDir, companions, headSha = "", rootEntriesAtHead) {
   const installed = [];
+  setCompanionNames([]);
   if (companions.length === 0) return installed;
-  const base = path14.join(worktreeDir, COMPANIONS_DIR);
-  fs16.mkdirSync(base, { recursive: true });
-  for (const c of companions) {
-    const dest = path14.join(base, c.name);
-    fs16.cpSync(c.dir, dest, { recursive: true, dereference: false, errorOnExist: false, force: true, filter: (src) => !fs16.lstatSync(src).isSymbolicLink() });
-    let files = 0;
-    const stripped = [];
-    const walk = (d, rel) => {
-      for (const n of fs16.readdirSync(d)) {
-        const full = path14.join(d, n);
-        const st = fs16.lstatSync(full);
-        const r = rel ? `${rel}/${n}` : n;
-        if (st.isSymbolicLink()) {
-          fs16.rmSync(full, { force: true });
-          continue;
+  const claim = claimEngineDir(worktreeDir, headSha, COMPANIONS_DIR, ...rootEntriesAtHead ? [rootEntriesAtHead] : []);
+  if (!claim.ok) throw new CompanionsRefusedError(claim.why);
+  const base = claim.dir;
+  try {
+    writeExclusive(path15.join(base, ".gitignore"), "*\n");
+    for (const c of companions) {
+      const dest = path15.join(base, c.name);
+      fs17.mkdirSync(dest, { mode: 448 });
+      fs17.cpSync(c.dir, dest, { recursive: true, dereference: false, errorOnExist: false, force: true, filter: (src) => !fs17.lstatSync(src).isSymbolicLink() });
+      let files = 0;
+      const stripped = [];
+      const walk = (d, rel) => {
+        for (const n of fs17.readdirSync(d)) {
+          const full = path15.join(d, n);
+          const st = fs17.lstatSync(full);
+          const r = rel ? `${rel}/${n}` : n;
+          if (st.isSymbolicLink()) {
+            fs17.rmSync(full, { force: true });
+            continue;
+          }
+          if (st.isDirectory()) {
+            walk(full, r);
+            continue;
+          }
+          if (STRIPPED_BASENAMES.has(n)) {
+            fs17.rmSync(full, { force: true });
+            stripped.push(r);
+            continue;
+          }
+          files += 1;
         }
-        if (st.isDirectory()) {
-          walk(full, r);
-          continue;
-        }
-        if (STRIPPED_BASENAMES.has(n)) {
-          fs16.rmSync(full, { force: true });
-          stripped.push(r);
-          continue;
-        }
-        files += 1;
-      }
-    };
-    walk(dest, "");
-    installed.push({ ...c, installedAt: dest, files, strippedInstructionFiles: stripped });
+      };
+      walk(dest, "");
+      installed.push({ ...c, installedAt: dest, files, strippedInstructionFiles: stripped });
+    }
+  } catch (e) {
+    fs17.rmSync(base, { force: true, recursive: true });
+    throw e;
   }
   setCompanionNames(installed.map((c) => c.name));
   return installed;
@@ -3939,7 +4016,7 @@ PR must still anchor in the PR's own files; a companion citation supports it.`;
 
 // src/modes/review/diff.ts
 import { execFileSync as execFileSync4 } from "child_process";
-import fs17 from "fs";
+import fs18 from "fs";
 import nodePath from "path";
 
 // src/core/hash.ts
@@ -4260,7 +4337,7 @@ function worktreeFirstLineReader(dir) {
   const root = nodePath.resolve(dir);
   let realRoot;
   try {
-    realRoot = fs17.realpathSync(root);
+    realRoot = fs18.realpathSync(root);
   } catch {
     return () => null;
   }
@@ -4269,19 +4346,19 @@ function worktreeFirstLineReader(dir) {
     if (full !== root && !full.startsWith(root + nodePath.sep)) return null;
     let fd = null;
     try {
-      const real = fs17.realpathSync(full);
+      const real = fs18.realpathSync(full);
       if (real !== realRoot && !real.startsWith(realRoot + nodePath.sep)) return null;
-      fd = fs17.openSync(full, fs17.constants.O_RDONLY | fs17.constants.O_NOFOLLOW);
-      if (!fs17.fstatSync(fd).isFile()) return null;
+      fd = fs18.openSync(full, fs18.constants.O_RDONLY | fs18.constants.O_NOFOLLOW);
+      if (!fs18.fstatSync(fd).isFile()) return null;
       const buf = Buffer.alloc(512);
-      const n = fs17.readSync(fd, buf, 0, 512, 0);
+      const n = fs18.readSync(fd, buf, 0, 512, 0);
       const text = buf.subarray(0, n).toString("utf8");
       const nl = text.indexOf("\n");
       return nl < 0 ? text : text.slice(0, nl);
     } catch {
       return null;
     } finally {
-      if (fd !== null) fs17.closeSync(fd);
+      if (fd !== null) fs18.closeSync(fd);
     }
   };
 }
@@ -4492,16 +4569,16 @@ function acquireDiff(opts) {
 }
 
 // src/modes/review/claude.ts
-import fs21 from "fs";
+import fs22 from "fs";
 import os12 from "os";
 
 // src/modes/review/history-packet.ts
-import fs20 from "fs";
-import path17 from "path";
+import fs21 from "fs";
+import path18 from "path";
 
 // src/modes/review/gate-hunks.ts
-import fs19 from "fs";
-import path16 from "path";
+import fs20 from "fs";
+import path17 from "path";
 
 // src/modes/review/secret-scan.ts
 var SENSITIVE_PATH_PATTERNS = [
@@ -5054,12 +5131,12 @@ function assembleCodePacket(input) {
 }
 
 // src/modes/review/trail-io.ts
-import fs18 from "fs";
-import path15 from "path";
+import fs19 from "fs";
+import path16 from "path";
 function readTrailJson(baseDir, runId, name2) {
   try {
     return JSON.parse(
-      fs18.readFileSync(path15.join(reviewDir(baseDir, runId), name2), "utf8")
+      fs19.readFileSync(path16.join(reviewDir(baseDir, runId), name2), "utf8")
     );
   } catch {
     return null;
@@ -5100,8 +5177,8 @@ function readGatePacketHeadSha(baseDir, runId) {
   return raw && typeof raw.headSha === "string" && raw.headSha.trim() && raw.schemaVersion === GATE_PACKET_SCHEMA_VERSION ? raw.headSha : null;
 }
 function readGatePacket(baseDir, runId, expectedHeadSha) {
-  const file = path16.join(reviewDir(baseDir, runId), "packet.gate.json");
-  if (!fs19.existsSync(file)) return { ok: false, reason: "missing" };
+  const file = path17.join(reviewDir(baseDir, runId), "packet.gate.json");
+  if (!fs20.existsSync(file)) return { ok: false, reason: "missing" };
   const raw = readTrailJson(baseDir, runId, "packet.gate.json");
   if (raw === null || typeof raw.diff !== "string" || typeof raw.headSha !== "string" || raw.schemaVersion !== GATE_PACKET_SCHEMA_VERSION) {
     return { ok: false, reason: "corrupt" };
@@ -5506,16 +5583,16 @@ function buildHistoryPacket(args) {
   return { bytes, files, shallow: false, truncated };
 }
 function containedPath(root, rel) {
-  const abs = path17.resolve(root, rel);
-  const back = path17.relative(path17.resolve(root), abs);
+  const abs = path18.resolve(root, rel);
+  const back = path18.relative(path18.resolve(root), abs);
   return back !== "" && !escapesRoot(back) ? abs : null;
 }
 function writeHistoryPacket(cwd, files) {
   for (const f of files) {
     const abs = containedPath(cwd, f.path);
     if (!abs) continue;
-    fs20.mkdirSync(path17.dirname(abs), { recursive: true });
-    fs20.writeFileSync(abs, f.contents, { mode: 256 });
+    fs21.mkdirSync(path18.dirname(abs), { recursive: true });
+    fs21.writeFileSync(abs, f.contents, { mode: 256 });
   }
 }
 
@@ -5648,7 +5725,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
     }
   } finally {
     try {
-      fs21.rmSync(cwd, { force: true, recursive: true });
+      fs22.rmSync(cwd, { force: true, recursive: true });
     } catch {
     }
   }
@@ -7166,8 +7243,8 @@ var REVIEW_ADAPTERS = {
 };
 
 // src/modes/review/chunk-merge.ts
-import fs22 from "fs";
-import path18 from "path";
+import fs23 from "fs";
+import path19 from "path";
 function mergedDiagnostics(runs) {
   const ds = runs.map((r) => r.seat.review.diagnostics).filter((d) => Boolean(d));
   if (ds.length === 0) return void 0;
@@ -7205,7 +7282,7 @@ function mergeChunkSeatRuns(args) {
   const dir = reviewDir(args.out, args.runId);
   const raws = runs.map((r) => {
     try {
-      const raw = fs22.readFileSync(path18.join(dir, `${args.reviewer.id}-review.c${r.index}.raw.md`), "utf8");
+      const raw = fs23.readFileSync(path19.join(dir, `${args.reviewer.id}-review.c${r.index}.raw.md`), "utf8");
       return `## Part ${r.index} of ${n} \u2014 ${r.label}
 
 ${raw}`;
@@ -7233,59 +7310,6 @@ ${raw}`;
     realized,
     review
   };
-}
-
-// src/modes/review/conventions-write.ts
-import fs23 from "fs";
-import path19 from "path";
-var CONVENTIONS_IN_TREE_DIR = ".ensemble-conventions";
-var CONVENTIONS_IN_TREE_FILE = "CONVENTIONS.md";
-var IGNORE_ALL = "*\n";
-function gitRootEntriesAtHead(worktreeDir, headSha) {
-  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(headSha)) return null;
-  const res = execGit()(["ls-tree", "--name-only", headSha], { cwd: worktreeDir });
-  if (!res.ok) return null;
-  return res.text.split("\n").filter((l) => l !== "");
-}
-function writeExclusive(file, body, mode = 384) {
-  const flags = fs23.constants.O_WRONLY | fs23.constants.O_CREAT | fs23.constants.O_EXCL | (fs23.constants.O_NOFOLLOW ?? 0);
-  const fd = fs23.openSync(file, flags, mode);
-  try {
-    fs23.writeFileSync(fd, body);
-  } finally {
-    fs23.closeSync(fd);
-  }
-}
-function writeConventionsInTree(worktreeDir, headSha, body, seams = {}) {
-  const rootEntries = seams.rootEntriesAtHead ?? gitRootEntriesAtHead;
-  const exclusive = seams.writeExclusive ?? writeExclusive;
-  const dir = path19.join(worktreeDir, CONVENTIONS_IN_TREE_DIR);
-  const file = path19.join(dir, CONVENTIONS_IN_TREE_FILE);
-  const tracked = rootEntries(worktreeDir, headSha)?.find((n) => n.toLowerCase() === CONVENTIONS_IN_TREE_DIR.toLowerCase());
-  if (tracked !== void 0) return { ok: false, why: `the PR head tracks \`${tracked}\` \u2014 the engine never writes over the author's path` };
-  try {
-    const st = fs23.lstatSync(dir);
-    const kind = st.isSymbolicLink() ? "a symlink" : st.isDirectory() ? "a directory" : "a file";
-    return { ok: false, why: `${kind} already sits at ${CONVENTIONS_IN_TREE_DIR} in the checkout` };
-  } catch (e) {
-    if (e.code !== "ENOENT") return { ok: false, why: `could not inspect ${CONVENTIONS_IN_TREE_DIR}: ${e.message}` };
-  }
-  try {
-    fs23.mkdirSync(dir, { mode: 448 });
-  } catch (e) {
-    return { ok: false, why: `could not create ${CONVENTIONS_IN_TREE_DIR}: ${e.message}` };
-  }
-  try {
-    exclusive(file, body);
-    exclusive(path19.join(dir, ".gitignore"), IGNORE_ALL);
-    return { file, ok: true };
-  } catch (e) {
-    try {
-      fs23.rmSync(dir, { force: true, recursive: true });
-    } catch {
-    }
-    return { ok: false, why: `could not write ${CONVENTIONS_IN_TREE_DIR}/${CONVENTIONS_IN_TREE_FILE}: ${e.message}` };
-  }
 }
 
 // src/modes/review/dep-surface.ts
@@ -15272,9 +15296,14 @@ async function reviewCommand(args, profile = "code") {
       opened.baseTip ? `\xB7 base tip: ${opened.baseRef} @ ${opened.baseTip.slice(0, 12)} fetched beside the head \u2014 a pre-existing finding can say whether the base already changed its file` : `\xB7 base tip: not fetched${opened.baseRef ? ` (${opened.baseRef})` : " (no base ref)"} \u2014 base-drift labels off this run`
     );
     if (companions.length > 0) {
-      const installed = installCompanions(worktree.dir, companions);
-      for (const c of installed)
-        console.error(`\xB7 companion ${c.name}: ${c.files} file(s) under .companions/${c.name}/${c.strippedInstructionFiles.length ? ` (${c.strippedInstructionFiles.length} instruction file(s) stripped)` : ""}`);
+      try {
+        const installed = installCompanions(worktree.dir, companions, worktree.headSha);
+        for (const c of installed)
+          console.error(`\xB7 companion ${c.name}: ${c.files} file(s) under .companions/${c.name}/${c.strippedInstructionFiles.length ? ` (${c.strippedInstructionFiles.length} instruction file(s) stripped)` : ""}`);
+      } catch (e) {
+        if (!(e instanceof CompanionsRefusedError)) throw e;
+        console.error(`\xB7 companions: ${e.message} \u2014 the review runs without companion context`);
+      }
     }
   }
   try {
