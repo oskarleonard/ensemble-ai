@@ -46,6 +46,26 @@ describe('installCompanions', () => {
     expect(companionsClause()).toContain('`.companions/<name>/`');
     expect(companionsClause()).toContain('`acme-infra`');
   });
+  it('refuses when the PR committed `.companions` as a symlink — nothing lands at the link\'s target, and no clause is set', () => {
+    const wt = fs.mkdtempSync(path.join(tmp, 'worktree-link-'));
+    const elsewhere = fs.mkdtempSync(path.join(tmp, 'elsewhere-'));
+    fs.symlinkSync(elsewhere, path.join(wt, '.companions'));
+    expect(() => installCompanions(wt, [{ name: 'acme-infra', dir: makeExport('c') }])).toThrow(/a symlink already sits at \.companions/);
+    expect(fs.readdirSync(elsewhere)).toEqual([]);
+    expect(companionsClause()).toBe('');
+  });
+  it('refuses when the head TRACKS the path (case-folded) before touching the disk', () => {
+    const wt = fs.mkdtempSync(path.join(tmp, 'worktree-tracked-'));
+    expect(() => installCompanions(wt, [{ name: 'acme-infra', dir: makeExport('d') }], 'a'.repeat(40), () => ['.Companions', 'README.md'])).toThrow(/tracks `\.Companions`/);
+    expect(fs.readdirSync(wt)).toEqual([]);
+  });
+  it('a failure mid-install removes the directory it created', () => {
+    const wt = fs.mkdtempSync(path.join(tmp, 'worktree-fail-'));
+    const good = makeExport('e');
+    expect(() => installCompanions(wt, [{ name: 'ok', dir: good }, { name: 'gone', dir: path.join(tmp, 'does-not-exist') }])).toThrow();
+    expect(fs.existsSync(path.join(wt, '.companions'))).toBe(false);
+    expect(companionsClause()).toBe('');
+  });
   it('no companions → no clause', () => {
     expect(installCompanions(tmp, [])).toEqual([]);
     expect(companionsClause()).toBe('');

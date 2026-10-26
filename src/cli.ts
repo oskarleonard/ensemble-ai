@@ -1468,9 +1468,15 @@ async function reviewCommand(
     // Companion repos (hugin spec doc-review-evidence §8): placed INSIDE the worktree before any
     // seat spawns, so every fenced seat reaches them through the one read root it already has.
     if (companions.length > 0) {
-      const installed = installCompanions(worktree.dir, companions);
-      for (const c of installed)
-        console.error(`· companion ${c.name}: ${c.files} file(s) under .companions/${c.name}/${c.strippedInstructionFiles.length ? ` (${c.strippedInstructionFiles.length} instruction file(s) stripped)` : ''}`);
+      try {
+        const installed = installCompanions(worktree.dir, companions, worktree.headSha);
+        for (const c of installed)
+          console.error(`· companion ${c.name}: ${c.files} file(s) under .companions/${c.name}/${c.strippedInstructionFiles.length ? ` (${c.strippedInstructionFiles.length} instruction file(s) stripped)` : ''}`);
+      } catch (e) {
+        // A refused install (the PR committed something at `.companions`) is LOUD and not fatal:
+        // the seats review without companion context and the clause stays empty.
+        console.error(`· companions: ${(e as Error).message} — the review runs without companion context`);
+      }
     }
   }
 

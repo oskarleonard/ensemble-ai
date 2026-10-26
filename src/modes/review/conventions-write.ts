@@ -64,36 +64,54 @@ export interface ConventionsWriteSeams {
   writeExclusive?: typeof writeExclusive;
 }
 
-export function writeConventionsInTree(
+// Fences 1–3 for ANY directory the engine wants to own at the worktree root (`.ensemble-conventions`,
+// `.companions`, …): the head tracks nothing there (case-folded), nothing sits there on disk (lstat),
+// and the directory is created non-recursively at 0700. Ok ⇒ the engine owns a fresh, empty, link-free
+// directory and may write into it with O_EXCL|O_NOFOLLOW (fence 4). The companions install (Munin's
+// review of #145 flagged its `mkdirSync(recursive)` + `cpSync(force)` as the same class) shares it.
+export type EngineDirClaim = { dir: string; ok: true } | { ok: false; why: string };
+
+export function claimEngineDir(
   worktreeDir: string,
   headSha: string,
-  body: string,
-  seams: ConventionsWriteSeams = {}
-): ConventionsWriteResult {
-  const rootEntries = seams.rootEntriesAtHead ?? gitRootEntriesAtHead;
-  const exclusive = seams.writeExclusive ?? writeExclusive;
-  const dir = path.join(worktreeDir, CONVENTIONS_IN_TREE_DIR);
-  const file = path.join(dir, CONVENTIONS_IN_TREE_FILE);
+  dirName: string,
+  rootEntries: RootEntriesAtHead = gitRootEntriesAtHead
+): EngineDirClaim {
+  const dir = path.join(worktreeDir, dirName);
 
   // 1. The head tracks nothing at the path (case-folded).
-  const tracked = rootEntries(worktreeDir, headSha)?.find((n) => n.toLowerCase() === CONVENTIONS_IN_TREE_DIR.toLowerCase());
+  const tracked = rootEntries(worktreeDir, headSha)?.find((n) => n.toLowerCase() === dirName.toLowerCase());
   if (tracked !== undefined) return { ok: false, why: `the PR head tracks \`${tracked}\` — the engine never writes over the author's path` };
 
   // 2. Nothing sits at the path in the checkout — lstat does not follow a link.
   try {
     const st = fs.lstatSync(dir);
     const kind = st.isSymbolicLink() ? 'a symlink' : st.isDirectory() ? 'a directory' : 'a file';
-    return { ok: false, why: `${kind} already sits at ${CONVENTIONS_IN_TREE_DIR} in the checkout` };
+    return { ok: false, why: `${kind} already sits at ${dirName} in the checkout` };
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return { ok: false, why: `could not inspect ${CONVENTIONS_IN_TREE_DIR}: ${(e as Error).message}` };
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return { ok: false, why: `could not inspect ${dirName}: ${(e as Error).message}` };
   }
 
   // 3. The directory, non-recursively: EEXIST if anything appeared since the lstat.
   try {
     fs.mkdirSync(dir, { mode: 0o700 });
   } catch (e) {
-    return { ok: false, why: `could not create ${CONVENTIONS_IN_TREE_DIR}: ${(e as Error).message}` };
+    return { ok: false, why: `could not create ${dirName}: ${(e as Error).message}` };
   }
+  return { dir, ok: true };
+}
+
+export function writeConventionsInTree(
+  worktreeDir: string,
+  headSha: string,
+  body: string,
+  seams: ConventionsWriteSeams = {}
+): ConventionsWriteResult {
+  const exclusive = seams.writeExclusive ?? writeExclusive;
+  const claim = claimEngineDir(worktreeDir, headSha, CONVENTIONS_IN_TREE_DIR, seams.rootEntriesAtHead ?? gitRootEntriesAtHead);
+  if (!claim.ok) return claim;
+  const dir = claim.dir;
+  const file = path.join(dir, CONVENTIONS_IN_TREE_FILE);
 
   // 4. The file and the ignore-all beside it, each a NEW regular file. The ignore file is written
   // AFTER the conventions file exists: an ignore rule for a file that is not there yet is a
