@@ -31,9 +31,49 @@ export interface GatherConfig {
   capBytes?: number;
   // Hard ceiling on distinct files visited — terminates any import cycle / runaway.
   maxFiles?: number;
-  // Explicit extra entry paths (`.ensemble-ai.json` `conventions:[]` / `--conventions`)
-  // — a belt for non-standard layouts. Additive to the auto-detected set.
+  // Explicit extra entry paths from the CALLER (`--conventions`) — a belt for non-standard
+  // layouts. Additive to the auto-detected set AND to the repo's own list: the gatherer reads
+  // `.ensemble-ai.json` `conventions:[]` itself, through the same reader (so at the same ref).
   conventions?: string[];
+}
+
+// The repo's own opt-in: `{ "conventions": ["docs/style.md", …] }` at its root. Documented on
+// GatherConfig since the first gather and read by nothing until Munin's engine ask 4
+// (2026-10-23) — a consumer that wanted it had to read the file itself and pass it as
+// `conventions`, so two hosts could disagree on one repo's list.
+//
+// WHICH REF: the one the reader serves — this helper trusts the reader. A review hands over a
+// reader at the PR BASE (cli.ts: gitConventionReader at prBaseSha, or the gh reader at the base
+// ref), so the author's PR cannot promote its own paths to MANDATORY; a host that builds a reader
+// at the head has handed the author that lever, and this helper cannot tell.
+//
+// THE BOUND is this file's own, fixed, never the caller's gather budget: the config is a path list,
+// not gathered text, and its size has nothing to do with how much conventions prose a run wants.
+// The read asks for ONE byte more than the bound; a reply that long means the file is over the
+// bound, and the answer is `over-bound` with no paths — never a partial list from a cut JSON.
+// Every outcome is NAMED (RepoConventionsConfig.state) and lands on the manifest, so a repo's
+// MANDATORY list can never vanish silently (gate on #148's review, claude#1 / grok#1).
+export const REPO_CONVENTIONS_CONFIG = '.ensemble-ai.json';
+export const REPO_CONVENTIONS_CONFIG_MAX_BYTES = 64_000;
+
+export async function repoConventionsConfig(reader: ConventionReader): Promise<RepoConventionsConfig> {
+  const path = REPO_CONVENTIONS_CONFIG;
+  let text: string | null;
+  try {
+    text = await reader.read(path, REPO_CONVENTIONS_CONFIG_MAX_BYTES + 1);
+  } catch {
+    return { conventions: [], path, state: 'invalid' };
+  }
+  if (text === null) return { conventions: [], path, state: 'absent' };
+  if (Buffer.byteLength(text, 'utf8') > REPO_CONVENTIONS_CONFIG_MAX_BYTES) return { conventions: [], path, state: 'over-bound' };
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    const list = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>).conventions : undefined;
+    if (!Array.isArray(list)) return { conventions: [], path, state: 'invalid' };
+    return { conventions: list.filter((x): x is string => typeof x === 'string'), path, state: 'read' };
+  } catch {
+    return { conventions: [], path, state: 'invalid' };
+  }
 }
 
 // How strongly the repo asked for a file to be read — the budget is filled tier by tier.
@@ -65,6 +105,19 @@ export interface ConventionManifest {
   // (modes/review CONVENTIONS_IN_TREE_*): where it is and how it is laid out, so the trail can
   // say which docs a seat's reads reached (seat-usage.ts conventionsReadOf).
   inTree?: { file: string; indexEndLine: number; jumpTo: string[]; readInFull: string[]; spans: ConventionSpan[] };
+  // The repo's own `.ensemble-ai.json` `conventions` list, as the gatherer saw it at the reader's
+  // ref — the gatherer ALWAYS sets it, so a MANDATORY list can never vanish without a word (gate
+  // on #148's review): `absent` (no file), `read` (the paths taken, possibly none), `invalid` (not
+  // JSON / no string list), `over-bound` (larger than REPO_CONVENTIONS_CONFIG_MAX_BYTES — read as
+  // nothing, never as a partial list). Optional in the TYPE only so a manifest built by hand (a
+  // fixture, an older host) still types; a gathered manifest carries it.
+  repoConfig?: RepoConventionsConfig;
+}
+
+export interface RepoConventionsConfig {
+  conventions: string[];
+  path: string;
+  state: 'absent' | 'invalid' | 'over-bound' | 'read';
 }
 
 export interface GatheredConventions {
@@ -349,7 +402,9 @@ export async function gatherConventions(
   const queue: string[] = [];
   // Explicitly configured paths are the one way to lift a README above SWEPT.
   const explicit = new Set<string>();
-  for (const c of config.conventions ?? []) {
+  // The repo's own list rides beside the caller's; its state lands on the manifest below.
+  const repoConfig = await repoConventionsConfig(reader);
+  for (const c of [...(config.conventions ?? []), ...repoConfig.conventions]) {
     const rel = resolveInRepo('', c);
     if (rel) explicit.add(rel);
   }
@@ -683,7 +738,7 @@ export async function gatherConventions(
   // pushed at discovery time, so sort by path-stability is unnecessary — consumers key by path.
   return {
     text: chunks.join('').replace(/^\n+/, ''),
-    manifest: { capBytes, files, totalBytes: used },
+    manifest: { capBytes, files, repoConfig, totalBytes: used },
   };
 }
 

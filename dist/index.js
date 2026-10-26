@@ -1000,6 +1000,27 @@ ${ask}
 import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
+var REPO_CONVENTIONS_CONFIG = ".ensemble-ai.json";
+var REPO_CONVENTIONS_CONFIG_MAX_BYTES = 64e3;
+async function repoConventionsConfig(reader) {
+  const path23 = REPO_CONVENTIONS_CONFIG;
+  let text;
+  try {
+    text = await reader.read(path23, REPO_CONVENTIONS_CONFIG_MAX_BYTES + 1);
+  } catch {
+    return { conventions: [], path: path23, state: "invalid" };
+  }
+  if (text === null) return { conventions: [], path: path23, state: "absent" };
+  if (Buffer.byteLength(text, "utf8") > REPO_CONVENTIONS_CONFIG_MAX_BYTES) return { conventions: [], path: path23, state: "over-bound" };
+  try {
+    const parsed = JSON.parse(text);
+    const list = parsed && typeof parsed === "object" ? parsed.conventions : void 0;
+    if (!Array.isArray(list)) return { conventions: [], path: path23, state: "invalid" };
+    return { conventions: list.filter((x) => typeof x === "string"), path: path23, state: "read" };
+  } catch {
+    return { conventions: [], path: path23, state: "invalid" };
+  }
+}
 var DEFAULT_CAP_BYTES = 15e4;
 var CAP_PROBE_MARGIN = 8;
 var DEFAULT_MAX_FILES = 60;
@@ -1156,7 +1177,8 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   const tierOf = /* @__PURE__ */ new Map();
   const queue = [];
   const explicit = /* @__PURE__ */ new Set();
-  for (const c of config.conventions ?? []) {
+  const repoConfig = await repoConventionsConfig(reader);
+  for (const c of [...config.conventions ?? [], ...repoConfig.conventions]) {
     const rel = resolveInRepo("", c);
     if (rel) explicit.add(rel);
   }
@@ -1374,7 +1396,7 @@ async function gatherConventions(reader, changedPaths, config = {}) {
   }
   return {
     text: chunks.join("").replace(/^\n+/, ""),
-    manifest: { capBytes, files, totalBytes: used }
+    manifest: { capBytes, files, repoConfig, totalBytes: used }
   };
 }
 function fsConventionReader(repoRoot) {
@@ -7059,6 +7081,11 @@ async function runReviewMode(opts) {
     log(
       `Conventions: ${inc}/${gathered.manifest.files.length} file(s), ${gathered.manifest.totalBytes} bytes gathered`
     );
+    const rc = gathered.manifest.repoConfig;
+    if (!rc) {
+    } else if (rc.state === "read" && rc.conventions.length > 0) log(`Conventions: ${rc.path} names ${rc.conventions.length} MANDATORY path(s)`);
+    else if (rc.state === "invalid") log(`Conventions: ${rc.path} is present but not a JSON object with a string list under "conventions" \u2014 ignored`);
+    else if (rc.state === "over-bound") log(`Conventions: ${rc.path} is over ${REPO_CONVENTIONS_CONFIG_MAX_BYTES} bytes \u2014 ignored whole, never read as a partial list`);
   }
   const resolved = loadReviewers(opts.reviewersFile);
   const configs = Object.fromEntries(
@@ -9172,6 +9199,8 @@ export {
   POLICY_VERSION_LEGACY,
   QUALIFY_PROBE_PORT,
   QUALITY_LENS,
+  REPO_CONVENTIONS_CONFIG,
+  REPO_CONVENTIONS_CONFIG_MAX_BYTES,
   REPO_LOCATION_ENV,
   RETRIES_ON_PACKET,
   REVIEWERS_FILE,
@@ -9392,6 +9421,7 @@ export {
   renderSynthesisPrompt,
   renderVerifySandboxProfile,
   repairBrackets,
+  repoConventionsConfig,
   repoIdFromSlug,
   resolveBase,
   resolveBin,

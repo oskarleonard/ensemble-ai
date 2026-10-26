@@ -1,10 +1,11 @@
 
 import { writeTrailFile } from '../../core/artifacts';
 import {
-  type ConventionManifest,
-  type ConventionReader,
   conventionsIndex,
   gatherConventions,
+  REPO_CONVENTIONS_CONFIG_MAX_BYTES,
+  type ConventionManifest,
+  type ConventionReader,
 } from '../../core/conventions';
 import type { EgressDenial } from '../../core/egress-proxy';
 import {
@@ -441,6 +442,13 @@ export async function runReviewMode(
     log(
       `Conventions: ${inc}/${gathered.manifest.files.length} file(s), ${gathered.manifest.totalBytes} bytes gathered`
     );
+    // The repo's own `.ensemble-ai.json` list is never silent: what it named, or why it added nothing.
+    const rc = gathered.manifest.repoConfig;
+    if (!rc) {
+      // a gathered manifest always carries it; nothing to say otherwise
+    } else if (rc.state === 'read' && rc.conventions.length > 0) log(`Conventions: ${rc.path} names ${rc.conventions.length} MANDATORY path(s)`);
+    else if (rc.state === 'invalid') log(`Conventions: ${rc.path} is present but not a JSON object with a string list under "conventions" — ignored`);
+    else if (rc.state === 'over-bound') log(`Conventions: ${rc.path} is over ${REPO_CONVENTIONS_CONFIG_MAX_BYTES} bytes — ignored whole, never read as a partial list`);
   }
 
   // Load the reviewers config ONCE per run (a file read + JSON parse), then index it per
