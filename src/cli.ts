@@ -3950,7 +3950,7 @@ heals retroactively.
 
 Usage:
   ensemble-ai regate [<pr-url>] --out <dir> --run-id <id> [--repo <path>]
-                     [--gate-model <m>] [--gate-effort <e>] [--premise]
+                     [--gate-model <m>] [--gate-effort <e>] [--premise] [--only-seat <id>]
 
   <pr-url>          the SAME GitHub PR URL the original review took — the gate re-reads the
                     PR's title + description from it (the stated intent the review's gate judged
@@ -3965,6 +3965,10 @@ Usage:
   --gate-effort <e> \`gate\` entry → the claude voice → built-in default)
   --premise         re-earn the opt-in advisory premise \`simplify\` line — pass it to heal a
                     run that was launched with --premise (off ⇒ byte-identical to a plain regate)
+  --only-seat <id>  re-gate ONE seat's findings (e.g. \`product\`): the gate runs over that seat's
+                    persisted review alone and its records replace that seat's in the trail —
+                    every other seat's verdict (posted ones included), the base block and the
+                    synthesis prose stay. A seat the trail does not hold is refused (exit 3)
 
 Exit: 0 = gate completed (verdicts updated) · 1 = gate failed again (still fail-closed) ·
 3 = usage / missing trail.
@@ -3999,6 +4003,7 @@ async function regateCommand(args: string[]): Promise<number> {
         'gate-effort': { type: 'string' },
         'gate-model': { type: 'string' },
         help: { short: 'h', type: 'boolean' },
+        'only-seat': { type: 'string' },
         out: { type: 'string' },
         premise: { type: 'boolean' },
         repo: { type: 'string' },
@@ -4018,6 +4023,11 @@ async function regateCommand(args: string[]): Promise<number> {
   if (!out || !runId) {
     console.error('ensemble-ai regate: --out and --run-id are required\n');
     console.error(REGATE_USAGE);
+    return 3;
+  }
+  const onlySeat = typeof values['only-seat'] === 'string' ? values['only-seat'].trim() : '';
+  if (values['only-seat'] !== undefined && !onlySeat) {
+    console.error('ensemble-ai regate: --only-seat needs a seat id (the voiceId of a persisted review, e.g. product)');
     return 3;
   }
 
@@ -4095,6 +4105,7 @@ async function regateCommand(args: string[]): Promise<number> {
       baseDir: out,
       conventionPaths: readConventionPathsFromTrail(out, runId),
       ...(directive ? { directive } : {}),
+      ...(onlySeat ? { onlySeat } : {}),
       gateConfig: gateSeat.config,
       log: (m) => console.error(`· ${m}`),
       ...(values.premise ? { premise: true } : {}),

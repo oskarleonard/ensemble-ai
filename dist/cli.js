@@ -12709,14 +12709,23 @@ async function runRegate(opts) {
       `run ${opts.runId} has no usable packet.gate.json under ${opts.baseDir} \u2014 nothing to ground a regate against`
     );
   }
-  const reviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
+  let reviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
   if (reviews.length === 0) {
     throw new Error(
       `run ${opts.runId} has no persisted reviews in its trail \u2014 nothing to regate`
     );
   }
+  if (opts.onlySeat) {
+    const only = reviews.filter((r) => r.voiceId === opts.onlySeat);
+    if (only.length === 0) {
+      throw new Error(
+        `run ${opts.runId} has no persisted review for seat "${opts.onlySeat}" (it holds ${reviews.map((r) => r.voiceId).join(", ")}) \u2014 nothing to regate`
+      );
+    }
+    reviews = only;
+  }
   log(
-    `regate: ${reviews.length} persisted reviewer voice(s) rehydrated \xB7 head ${headSha.slice(0, 12)} \xB7 ${opts.worktree ? "worktree evidence" : "packet evidence"}`
+    `regate: ${reviews.length} persisted reviewer voice(s) rehydrated${opts.onlySeat ? ` (seat ${opts.onlySeat} only \u2014 every other seat's verdict is kept)` : ""} \xB7 head ${headSha.slice(0, 12)} \xB7 ${opts.worktree ? "worktree evidence" : "packet evidence"}`
   );
   const priorDrift = readTrailJson(opts.baseDir, opts.runId, "gate-verdicts.json");
   const conventionsFile = opts.worktree ? readConventionsFileFromTrail(opts.baseDir, opts.runId, opts.worktree) : null;
@@ -12745,6 +12754,18 @@ async function runRegate(opts) {
     timeoutMs: opts.timeoutMs ?? (opts.worktree ? GATE_WORKTREE_TIMEOUT_MS : void 0),
     ...opts.worktree ? { worktree: opts.worktree } : {}
   });
+  let verdicts = gate.verdicts;
+  if (opts.onlySeat) {
+    const prefix = `${opts.onlySeat}#`;
+    const prior = priorDrift?.verdicts ?? [];
+    const at = prior.findIndex((v) => v.findingId.startsWith(prefix));
+    const kept = prior.filter((v) => !v.findingId.startsWith(prefix));
+    const insertAt = at < 0 ? kept.length : at;
+    verdicts = [...kept.slice(0, insertAt), ...gate.verdicts, ...kept.slice(insertAt)];
+    if (!writeGateVerdictsTrail(opts.baseDir, opts.runId, verdicts, priorDrift?.base ?? null))
+      log(`regate: gate-verdicts.json could not be rewritten with the other seats' records \u2014 it holds seat ${opts.onlySeat}'s alone`);
+    else log(`regate: seat ${opts.onlySeat} \u2014 ${gate.verdicts.length} record(s) re-gated, ${kept.length} other kept`);
+  }
   try {
     const p = path23.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
     const existing = fs29.existsSync(p) ? JSON.parse(fs29.readFileSync(p, "utf8")) : {};
@@ -12757,9 +12778,12 @@ async function runRegate(opts) {
           ...existing,
           gateSpawned: gate.gateSpawned,
           gateTrailWritten: gate.gateTrailWritten,
-          gateVerdicts: gate.verdicts,
+          gateVerdicts: verdicts,
           regatedAt: (/* @__PURE__ */ new Date()).toISOString(),
-          synthesis: gate.synthesis
+          // One seat: the run's synthesis prose stays (it was written over every seat); the
+          // one-seat gate's own prose would describe one seat as if it were the run.
+          ...opts.onlySeat ? { regatedSeat: opts.onlySeat } : {},
+          synthesis: opts.onlySeat && existing.synthesis ? existing.synthesis : gate.synthesis
         },
         null,
         2
@@ -12773,7 +12797,7 @@ async function runRegate(opts) {
     ok: !gate.synthesis.degraded,
     reviews: reviews.length,
     synthesis: gate.synthesis,
-    verdicts: gate.verdicts
+    verdicts
   };
 }
 
@@ -17219,7 +17243,7 @@ heals retroactively.
 
 Usage:
   ensemble-ai regate [<pr-url>] --out <dir> --run-id <id> [--repo <path>]
-                     [--gate-model <m>] [--gate-effort <e>] [--premise]
+                     [--gate-model <m>] [--gate-effort <e>] [--premise] [--only-seat <id>]
 
   <pr-url>          the SAME GitHub PR URL the original review took \u2014 the gate re-reads the
                     PR's title + description from it (the stated intent the review's gate judged
@@ -17234,6 +17258,10 @@ Usage:
   --gate-effort <e> \`gate\` entry \u2192 the claude voice \u2192 built-in default)
   --premise         re-earn the opt-in advisory premise \`simplify\` line \u2014 pass it to heal a
                     run that was launched with --premise (off \u21D2 byte-identical to a plain regate)
+  --only-seat <id>  re-gate ONE seat's findings (e.g. \`product\`): the gate runs over that seat's
+                    persisted review alone and its records replace that seat's in the trail \u2014
+                    every other seat's verdict (posted ones included), the base block and the
+                    synthesis prose stay. A seat the trail does not hold is refused (exit 3)
 
 Exit: 0 = gate completed (verdicts updated) \xB7 1 = gate failed again (still fail-closed) \xB7
 3 = usage / missing trail.
@@ -17257,6 +17285,7 @@ async function regateCommand(args) {
         "gate-effort": { type: "string" },
         "gate-model": { type: "string" },
         help: { short: "h", type: "boolean" },
+        "only-seat": { type: "string" },
         out: { type: "string" },
         premise: { type: "boolean" },
         repo: { type: "string" },
@@ -17276,6 +17305,11 @@ async function regateCommand(args) {
   if (!out || !runId) {
     console.error("ensemble-ai regate: --out and --run-id are required\n");
     console.error(REGATE_USAGE);
+    return 3;
+  }
+  const onlySeat = typeof values["only-seat"] === "string" ? values["only-seat"].trim() : "";
+  if (values["only-seat"] !== void 0 && !onlySeat) {
+    console.error("ensemble-ai regate: --only-seat needs a seat id (the voiceId of a persisted review, e.g. product)");
     return 3;
   }
   const headSha = readGatePacketHeadSha(out, runId);
@@ -17341,6 +17375,7 @@ async function regateCommand(args) {
       baseDir: out,
       conventionPaths: readConventionPathsFromTrail(out, runId),
       ...directive ? { directive } : {},
+      ...onlySeat ? { onlySeat } : {},
       gateConfig: gateSeat.config,
       log: (m) => console.error(`\xB7 ${m}`),
       ...values.premise ? { premise: true } : {},

@@ -134,6 +134,67 @@ describe('runRegate — heal a dead gate from the persisted trail, no reviewer r
     expect(on[0]).toContain('Premise pass'); // --premise threaded through ⇒ the clause is appended
   });
 
+  it("--only-seat gates ONE seat's review and splices its records into the prior trail — every other seat's verdict, the base block and the synthesis prose stay", async () => {
+    const { base, runId } = seedRun();
+    persistSeatReview(
+      base,
+      runId,
+      'product',
+      {
+        findings: [{ body: 'the doc says X; the change does Y', confidence: 'high', evidence: { file: 'src/x.ts', line: 3 }, id: 'p1', severity: 'medium', title: 'promise undelivered' }],
+        ok: true,
+        summary: 'product',
+        voiceId: 'product',
+      },
+      null
+    );
+    // The run's own gate: three records, a synthesis written over every seat.
+    const FULL = JSON.stringify({
+      schemaVersion: 1,
+      synthesis: { agreements: [{ point: 'shared bug', voices: ['codex', 'grok'] }], bottomLine: 'the whole run', disagreements: [] },
+      verdicts: [
+        { findingId: 'codex#1', reason: 'confirmed', verdict: 'agree' },
+        { findingId: 'grok#1', reason: 'overstated', verdict: 'partial' },
+        { findingId: 'product#1', reason: 'first reading', verdict: 'partial' },
+      ],
+    });
+    await runRegate({ baseDir: base, gateConfig: CFG, run: async () => okRun(FULL), runId });
+    // Then the product seat alone, with a fresh reading of its one finding.
+    const ONLY = JSON.stringify({
+      schemaVersion: 1,
+      synthesis: { agreements: [], bottomLine: 'one seat', disagreements: [] },
+      verdicts: [{ findingId: 'product#1', reason: 'second reading', verdict: 'agree' }],
+    });
+    const prompts: string[] = [];
+    const res = await runRegate({ baseDir: base, gateConfig: CFG, onlySeat: 'product', run: async (p) => (prompts.push(p), okRun(ONLY)), runId });
+    expect(res.reviews).toBe(1);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('product#1');
+    expect(prompts[0]).not.toContain('grok#1'); // the other seats' findings were not re-judged
+    const trail = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'gate-verdicts.json'), 'utf8')) as {
+      verdicts: Array<{ findingId: string; effectiveVerdict: string; reason: string }>;
+    };
+    expect(trail.verdicts.map((v) => v.findingId)).toEqual(['codex#1', 'grok#1', 'product#1']); // in place, not appended
+    const byId = new Map(trail.verdicts.map((v) => [v.findingId, v]));
+    expect(byId.get('codex#1')?.effectiveVerdict).toBe('agree'); // untouched
+    expect(byId.get('grok#1')?.effectiveVerdict).toBe('partial'); // untouched
+    expect(byId.get('product#1')?.reason).toContain('second reading'); // replaced
+    expect(res.verdicts.map((v) => v.findingId)).toEqual(['codex#1', 'grok#1', 'product#1']);
+    const synth = JSON.parse(fs.readFileSync(path.join(reviewDir(base, runId), 'claude-synthesis.json'), 'utf8')) as Record<string, unknown>;
+    expect((synth.synthesis as { bottomLine: string }).bottomLine).toBe('the whole run'); // the run's prose kept
+    expect(synth.regatedSeat).toBe('product');
+    expect((synth.gateVerdicts as unknown[]).length).toBe(3);
+  });
+
+  it('--only-seat for a seat the trail does not hold refuses before any spawn', async () => {
+    const { base, runId } = seedRun();
+    let spawned = 0;
+    await expect(
+      runRegate({ baseDir: base, gateConfig: CFG, onlySeat: 'product', run: async () => (spawned++, okRun(GATE)), runId })
+    ).rejects.toThrow(/no persisted review for seat "product" \(it holds codex, grok\)/);
+    expect(spawned).toBe(0);
+  });
+
   it("threads the PR's own title + body into the gate — the stated intent the review's gate judged with", async () => {
     const { base, runId } = seedRun();
     const seen: string[] = [];
