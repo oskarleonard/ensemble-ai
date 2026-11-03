@@ -95,6 +95,8 @@ export function parseReviewers(
       ...(sandbox ? { sandbox } : {}),
       ...(disabledUntil === undefined ? {} : { disabledUntil }),
       ...(enabled === undefined ? {} : { enabled }),
+      // Exactly `true` turns it on; anything else is the default (off) — never a string "yes".
+      ...(r.web === true ? { web: true } : {}),
     };
   }
   return out;

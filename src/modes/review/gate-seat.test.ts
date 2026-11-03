@@ -471,3 +471,13 @@ describe('shadowChampionConfig — a codex gate is shadowed by the claude seat r
     expect(warnings.some((w) => w.includes('--shadow-gate-effort "ultra" is not a known effort'))).toBe(true);
   });
 });
+
+describe('web search on the Anthropic review seats — each entry\'s own `web`, no inheritance', () => {
+  it('the gate reads `gate.web` (anthropic only); the reviewer seat reads `claude.web`', () => {
+    expect(resolve({ gate: { web: true } }).seat.config.web).toBe(true);
+    expect(resolve({ claude: { web: true }, gate: { model: 'opus' } }).seat.config).not.toHaveProperty('web');
+    expect(resolve({ gate: { web: 'yes' } }).seat.config).not.toHaveProperty('web');
+    expect(resolveClaudeReviewerSeat({ claude: { web: true } }, {}, () => {}).config.web).toBe(true);
+    expect(resolveClaudeReviewerSeat({ gate: { web: true } }, {}, () => {}).config).not.toHaveProperty('web');
+  });
+});

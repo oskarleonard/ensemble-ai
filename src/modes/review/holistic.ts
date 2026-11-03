@@ -140,7 +140,8 @@ export function resolveVoicesSeat(
         );
     }
   }
-  return { ...VOICE_DEFAULTS.claude, ...(advisor === undefined ? {} : { advisor }), effort, model };
+  // `web` from the seat's own entry (WebSearch for this seat; the deny-list keeps WebFetch).
+  return { ...VOICE_DEFAULTS.claude, ...(advisor === undefined ? {} : { advisor }), ...(entry?.web === true ? { web: true } : {}), effort, model };
 }
 
 // Read + resolve the lens seat from voices.json + flag overrides. A missing file is the

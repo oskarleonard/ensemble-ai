@@ -16,6 +16,8 @@ import type { ReviewerExecOpts } from '../../core/spawn';
 
 import {
   buildClaudeReviewArgs,
+  CLAUDE_CAPABILITY_FENCE,
+  claudeFenceProfile,
   CLAUDE_REVIEW_DENIED_TOOLS,
   extractStreamResult,
   isTransientApiErrorReply,
@@ -327,5 +329,24 @@ describe('runClaudeReviewVoice — operator usage limit is named, never retried 
     expect(res.raw).toBeNull();
     expect(res.failWhy).toContain('operator usage limit reached');
     expect(res.failWhy).toContain('resets 5:10pm');
+  });
+});
+
+describe('buildClaudeReviewArgs — vendor-side web search (`web: true` on the seat)', () => {
+  it('pre-approves WebSearch and keeps it off the deny-list; WebFetch stays denied; off by default', () => {
+    const off = buildClaudeReviewArgs(CFG());
+    expect(off).not.toContain('--allowedTools');
+    expect(off.slice(off.indexOf('--disallowedTools'))).toContain('WebSearch');
+    const on = buildClaudeReviewArgs(CFG({ web: true }));
+    expect(on[on.indexOf('--allowedTools') + 1]).toBe('WebSearch');
+    const denied = on.slice(on.indexOf('--disallowedTools') + 1);
+    expect(denied).not.toContain('WebSearch');
+    expect(denied).toContain('WebFetch'); // the local fetch is the exfiltration channel — never
+    expect(denied).toContain('Bash');
+    for (const t of CLAUDE_REVIEW_DENIED_TOOLS) if (t !== 'WebSearch') expect(denied).toContain(t);
+  });
+  it('the profile a web seat attests is distinct from the fence, same version', () => {
+    expect(claudeFenceProfile(false)).toEqual(CLAUDE_CAPABILITY_FENCE);
+    expect(claudeFenceProfile(true)).toEqual({ id: 'claude-capability-fence+websearch', version: CLAUDE_CAPABILITY_FENCE.version });
   });
 });

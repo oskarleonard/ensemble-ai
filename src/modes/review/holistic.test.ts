@@ -260,3 +260,11 @@ describe('renderHolisticPrompt — the stated intent', () => {
     expect(renderHolisticPrompt(base)).not.toContain("## The author's stated intent");
   });
 });
+
+describe('resolveHolisticSeat — the lens seat\'s own `web`', () => {
+  it('reads `holistic.web` only; exactly true', () => {
+    expect(resolveHolisticSeat({ holistic: { web: true } }).web).toBe(true);
+    expect(resolveHolisticSeat({ claude: { web: true }, holistic: { model: 'opus' } })).not.toHaveProperty('web');
+    expect(resolveHolisticSeat({ holistic: { web: 1 } })).not.toHaveProperty('web');
+  });
+});

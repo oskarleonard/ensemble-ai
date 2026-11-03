@@ -189,7 +189,9 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
   if (!wt || !args.qualification?.qualified || !args.worktreePrompt) {
     const unqualified = wt ? (args.qualification?.reason ?? null) : null;
     if (unqualified) log(`  · ⚠ ${unqualified}`);
-    const { result, timing } = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
+    const { result, timing } = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {
+      ...(reviewer.web === true ? { web: true } : {}),
+    });
     return {
       // A packet seat runs unfenced by design — it has no worktree, so no proxy and no denials.
       egressDenials: [],
@@ -204,7 +206,7 @@ export async function runCoreSeat(args: RunCoreSeatArgs): Promise<SeatRunResult>
     args.adapter,
     args.worktreePrompt,
     reviewer,
-    { worktree: wt }
+    { ...(reviewer.web === true ? { web: true } : {}), worktree: wt }
   );
   const review = persistAttempt(args, args.worktreePrompt, first, firstTiming);
   const egressDenials = first.egressDenials ?? [];

@@ -284,6 +284,9 @@ export function resolveGateSeat(
     config: {
       ...VOICE_DEFAULTS.claude,
       ...(gateAdvisor === undefined ? {} : { advisor: gateAdvisor }),
+      // The gate's own `web` (an anthropic gate only: `WebSearch` kept out of the deny-list and
+      // pre-approved — ./claude buildClaudeReviewArgs). No inheritance from the claude entry.
+      ...(vendor === 'anthropic' && gate?.web === true ? { web: true } : {}),
       effort,
       model,
     },
@@ -397,6 +400,8 @@ export function resolveClaudeReviewerSeat(
     config: {
       ...VOICE_DEFAULTS.claude,
       ...(advisor === undefined ? {} : { advisor }),
+      // `web` from the claude entry: WebSearch (vendor-side) for the reviewer seat — never WebFetch.
+      ...(claude?.web === true ? { web: true } : {}),
       effort: effort.value,
       model: model.value,
     },
