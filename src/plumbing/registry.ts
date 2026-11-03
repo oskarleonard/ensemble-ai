@@ -24,6 +24,8 @@ export interface GateSeatView {
   // rendering; absent renders as anthropic — the only vendor that existed before the axis.
   vendor?: string;
   vendorSource?: SeatSource;
+  // Vendor-side web search on an anthropic gate (its entry's `web: true`).
+  web?: boolean;
 }
 
 // The holistic LENS seat (`review --holistic --repo`), resolved for display: model/effort through
@@ -32,6 +34,8 @@ export interface HolisticSeatView {
   advisor?: unknown;
   effort: string;
   model: string;
+  // Vendor-side web search on this seat (its entry's `web: true`).
+  web?: boolean;
 }
 
 export interface RegistryView {
@@ -101,8 +105,10 @@ function advisorNote(advisor: unknown): string {
   return ` · advisor ${JSON.stringify(advisor)} (INVALID — a command that runs this seat refuses it)`;
 }
 
+const webNote = (web: boolean | undefined): string => (web === true ? ' · web' : '');
+
 function gateLine(gate: GateSeatView): string {
-  return `    ${'gate'.padEnd(7)} ${gate.vendor ?? 'anthropic'} · ${gate.model} @ ${gate.effort}${advisorNote(gate.advisor)}  · source model:${gate.modelSource} · effort:${gate.effortSource}${gate.vendor && gate.vendor !== 'anthropic' ? ` · vendor:${gate.vendorSource ?? 'default'}` : ''}`;
+  return `    ${'gate'.padEnd(7)} ${gate.vendor ?? 'anthropic'} · ${gate.model} @ ${gate.effort}${advisorNote(gate.advisor)}${webNote(gate.web)}  · source model:${gate.modelSource} · effort:${gate.effortSource}${gate.vendor && gate.vendor !== 'anthropic' ? ` · vendor:${gate.vendorSource ?? 'default'}` : ''}`;
 }
 
 function sourceNote(file: string, exists: boolean): string {
@@ -138,12 +144,12 @@ export function renderRegistry(view: RegistryView): string {
   out.push('');
   out.push('  holistic lens  (review --holistic --repo — always claude -p; {model,effort,advisor})');
   out.push(
-    `    holistic anthropic · ${view.holistic.model} @ ${view.holistic.effort}${advisorNote(view.holistic.advisor)}`
+    `    holistic anthropic · ${view.holistic.model} @ ${view.holistic.effort}${advisorNote(view.holistic.advisor)}${webNote(view.holistic.web)}`
   );
   out.push('');
   out.push('  product seat  (review --product-docs — always claude -p; {model,effort,advisor})');
   out.push(
-    `    product  anthropic · ${view.product.model} @ ${view.product.effort}${advisorNote(view.product.advisor)}`
+    `    product  anthropic · ${view.product.model} @ ${view.product.effort}${advisorNote(view.product.advisor)}${webNote(view.product.web)}`
   );
   out.push('');
   return out.join('\n');
