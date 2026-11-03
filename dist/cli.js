@@ -1069,7 +1069,9 @@ function parseReviewers(raw) {
       vendor: str(r.vendor, REVIEWER_DEFAULTS[id].vendor),
       ...sandbox ? { sandbox } : {},
       ...disabledUntil === void 0 ? {} : { disabledUntil },
-      ...enabled === void 0 ? {} : { enabled }
+      ...enabled === void 0 ? {} : { enabled },
+      // Exactly `true` turns it on; anything else is the default (off) — never a string "yes".
+      ...r.web === true ? { web: true } : {}
     };
   }
   return out;
@@ -5601,6 +5603,9 @@ var CLAUDE_CAPABILITY_FENCE = {
   id: "claude-capability-fence",
   version: 2
 };
+function claudeFenceProfile(web = false) {
+  return web ? { id: `${CLAUDE_CAPABILITY_FENCE.id}+websearch`, version: CLAUDE_CAPABILITY_FENCE.version } : CLAUDE_CAPABILITY_FENCE;
+}
 function buildClaudeReviewArgs(config, fence = {}) {
   const homeDir = fence.homeDir ?? os12.homedir();
   if (fence.readRoot && isUnder(fence.readRoot, homeDir)) {
@@ -5611,12 +5616,14 @@ function buildClaudeReviewArgs(config, fence = {}) {
   const args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "plan"];
   if (fence.readRoot) args.push("--add-dir", fence.readRoot);
   args.push("--strict-mcp-config");
+  if (config?.web === true) args.push("--allowedTools", "WebSearch");
   if (config?.model && config.model !== "default")
     args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort))
     args.push("--effort", config.effort);
   args.push(...claudeAdvisorArgs(config));
-  args.push("--disallowedTools", ...CLAUDE_REVIEW_DENIED_TOOLS, ...homeReadDenyRules(homeDir));
+  const denied = CLAUDE_REVIEW_DENIED_TOOLS.filter((t) => !(config?.web === true && t === "WebSearch"));
+  args.push("--disallowedTools", ...denied, ...homeReadDenyRules(homeDir));
   return args;
 }
 function makeNeutralSeatCwd() {
@@ -7790,7 +7797,9 @@ async function runCoreSeat(args) {
   if (!wt || !args.qualification?.qualified || !args.worktreePrompt) {
     const unqualified = wt ? args.qualification?.reason ?? null : null;
     if (unqualified) log(`  \xB7 \u26A0 ${unqualified}`);
-    const { result, timing } = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
+    const { result, timing } = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {
+      ...reviewer.web === true ? { web: true } : {}
+    });
     return {
       // A packet seat runs unfenced by design — it has no worktree, so no proxy and no denials.
       egressDenials: [],
@@ -7803,7 +7812,7 @@ async function runCoreSeat(args) {
     args.adapter,
     args.worktreePrompt,
     reviewer,
-    { worktree: wt }
+    { ...reviewer.web === true ? { web: true } : {}, worktree: wt }
   );
   const review = persistAttempt(args, args.worktreePrompt, first, firstTiming);
   const egressDenials = first.egressDenials ?? [];
@@ -9300,7 +9309,7 @@ function resolveVoicesSeat(spec, raw, flags = {}, warn = () => {
         );
     }
   }
-  return { ...VOICE_DEFAULTS.claude, ...advisor === void 0 ? {} : { advisor }, effort, model };
+  return { ...VOICE_DEFAULTS.claude, ...advisor === void 0 ? {} : { advisor }, ...entry?.web === true ? { web: true } : {}, effort, model };
 }
 function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
 }, parseAdvisor = parseSeatAdvisor) {
@@ -11634,8 +11643,11 @@ function isDiffReviewed(live, deps) {
 }
 
 // src/modes/review/seat-evidence.ts
-function qualifyCodexSeat(worktree, deps = {}) {
-  const profile = CODEX_SANDBOX_PROFILE;
+function webProfile(profile, web) {
+  return web ? { id: `${profile.id}+websearch`, version: profile.version } : profile;
+}
+function qualifyCodexSeat(worktree, deps = {}, web = false) {
+  const profile = webProfile(CODEX_SANDBOX_PROFILE, web);
   const supported = deps.supported ?? codexSandboxSupported();
   if (!supported) {
     return {
@@ -11651,8 +11663,8 @@ function qualifyCodexSeat(worktree, deps = {}) {
   }
   return { profile, qualified: true, reason: null };
 }
-function qualifyGrokSeat(configuredSandbox) {
-  const profile = GROK_SANDBOX_PROFILE;
+function qualifyGrokSeat(configuredSandbox, web = false) {
+  const profile = webProfile(GROK_SANDBOX_PROFILE, web);
   const resolved = resolveReviewSandbox(configuredSandbox);
   if (resolved !== GROK_CLI_SANDBOX) {
     return {
@@ -11663,16 +11675,16 @@ function qualifyGrokSeat(configuredSandbox) {
   }
   return { profile, qualified: true, reason: null };
 }
-function qualifyHarnessSeat() {
-  return { profile: CLAUDE_CAPABILITY_FENCE, qualified: true, reason: null };
+function qualifyHarnessSeat(web = false) {
+  return { profile: claudeFenceProfile(web), qualified: true, reason: null };
 }
 var SEAT_QUALIFIERS = {
   // The Anthropic registry seat qualifies exactly like the CLI's claude layer:
   // the capability fence (tools removed, strict MCP, neutral cwd, $HOME
   // read-denied) is CLI-flag-based — no kernel wrapper, no platform dependency.
-  claude: () => qualifyHarnessSeat(),
-  codex: ({ worktree }) => qualifyCodexSeat(worktree),
-  grok: ({ config }) => qualifyGrokSeat(config.sandbox)
+  claude: ({ config }) => qualifyHarnessSeat(config.web === true),
+  codex: ({ config, worktree }) => qualifyCodexSeat(worktree, {}, config.web === true),
+  grok: ({ config }) => qualifyGrokSeat(config.sandbox, config.web === true)
 };
 function intendedEvidenceFor(seats) {
   const map = {};
@@ -12197,6 +12209,8 @@ async function runReviewMode(opts) {
   );
   const wt = opts.worktree;
   const quals = wt ? qualifyCoreSeats(reviewers, wt.dir, configs) : {};
+  const webSeats = [...reviewers.filter((id) => configs[id].web === true), ...(opts.peerSeats ?? []).filter((s) => opts.peerWeb?.[s] === true)];
+  if (webSeats.length > 0) log(`Web search ON for ${webSeats.join(", ")} (vendor-side; their receipt profiles carry +websearch)`);
   const everySeatReadsTree = Boolean(wt) && reviewers.every((id) => quals[id]?.qualified);
   let conventionsPath;
   if (wt && everySeatReadsTree && agentsMd && agentsMd.length > CONVENTIONS_INLINE_MAX) {
@@ -12415,7 +12429,7 @@ async function runReviewMode(opts) {
   const intended = wt ? intendedEvidenceFor([...reviewers, ...opts.peerSeats ?? []]) : {};
   const sandboxProfiles = wt ? sandboxProfilesFor({
     ...quals,
-    ...Object.fromEntries((opts.peerSeats ?? []).map((s) => [s, qualifyHarnessSeat()]))
+    ...Object.fromEntries((opts.peerSeats ?? []).map((s) => [s, qualifyHarnessSeat(opts.peerWeb?.[s] === true)]))
   }) : {};
   const realized = {};
   const fallbacks = [];
@@ -12620,6 +12634,9 @@ function resolveGateSeat(raw, flags, warn, parseAdvisor = parseSeatAdvisor) {
     config: {
       ...VOICE_DEFAULTS.claude,
       ...gateAdvisor === void 0 ? {} : { advisor: gateAdvisor },
+      // The gate's own `web` (an anthropic gate only: `WebSearch` kept out of the deny-list and
+      // pre-approved — ./claude buildClaudeReviewArgs). No inheritance from the claude entry.
+      ...vendor === "anthropic" && gate?.web === true ? { web: true } : {},
       effort,
       model
     },
@@ -12685,6 +12702,8 @@ function resolveClaudeReviewerSeat(raw, flags, warn) {
     config: {
       ...VOICE_DEFAULTS.claude,
       ...advisor === void 0 ? {} : { advisor },
+      // `web` from the claude entry: WebSearch (vendor-side) for the reviewer seat — never WebFetch.
+      ...claude?.web === true ? { web: true } : {},
       effort: effort.value,
       model: model.value
     },
@@ -15892,6 +15911,7 @@ async function runReviewPipeline(input) {
       onProgress: stampProgress((line) => console.error(line)),
       out,
       peerSeats,
+      ...anthropicSeats ? { peerWeb: { claude: anthropicSeats.claude.config.web === true, gate: anthropicSeats.gate.config.web === true } } : {},
       profile,
       repoIdOverride: source.postTarget?.repoSlug ? repoIdFromSlug(source.postTarget.repoSlug) : void 0,
       reviewers,

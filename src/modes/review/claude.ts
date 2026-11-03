@@ -74,6 +74,14 @@ export const CLAUDE_CAPABILITY_FENCE: SandboxProfileRef = {
   version: 2,
 };
 
+// The profile a seat attests: the fence, or the fence WITH vendor-side web search — a distinct id,
+// so a web-enabled run never verifies as equivalent to a fully fenced one (the deny-list is one
+// tool shorter: `WebSearch` is the vendor's search behind Anthropic's own host; `WebFetch` — the
+// local CLI reaching an arbitrary URL, the exfiltration channel the fence closes — stays denied).
+export function claudeFenceProfile(web = false): SandboxProfileRef {
+  return web ? { id: `${CLAUDE_CAPABILITY_FENCE.id}+websearch`, version: CLAUDE_CAPABILITY_FENCE.version } : CLAUDE_CAPABILITY_FENCE;
+}
+
 // The effort whitelist, the transient/usage-limit predicates, the liveness bar and the stream-json
 // result extractor live in core/claude-stream.ts (shared with the brainstorm/consult voice since
 // 2026-10-09); re-exported here so every existing importer keeps its path.
@@ -140,12 +148,18 @@ export function buildClaudeReviewArgs(config?: VoiceConfig, fence: ClaudeSeatFen
   const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'plan'];
   if (fence.readRoot) args.push('--add-dir', fence.readRoot);
   args.push('--strict-mcp-config');
+  // Vendor-side web search for this seat (`web: true` on its voices.json entry): `WebSearch` is
+  // pre-approved for the headless spawn (`--allowedTools` is load-bearing — a `-p` spawn silently
+  // denies a permission-gated tool) and left off the deny-list below. `WebFetch` never is: that is
+  // the local CLI reaching an arbitrary URL. The seat then attests `claude-capability-fence+websearch`.
+  if (config?.web === true) args.push('--allowedTools', 'WebSearch');
   if (config?.model && config.model !== 'default')
     args.push('--model', config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort))
     args.push('--effort', config.effort);
   args.push(...claudeAdvisorArgs(config));
-  args.push('--disallowedTools', ...CLAUDE_REVIEW_DENIED_TOOLS, ...homeReadDenyRules(homeDir));
+  const denied = CLAUDE_REVIEW_DENIED_TOOLS.filter((t) => !(config?.web === true && t === 'WebSearch'));
+  args.push('--disallowedTools', ...denied, ...homeReadDenyRules(homeDir));
   return args;
 }
 

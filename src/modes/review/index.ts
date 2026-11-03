@@ -174,6 +174,9 @@ export interface ReviewModeOptions {
   // part of the run's evidence INTENT — and therefore of `policyHash` — but this mode never spawns
   // them, so it records their intent and the caller records what they realized.
   peerSeats?: readonly EvidenceSeat[];
+  // Which of those peer seats run with vendor-side web search (their voices.json `web`): the
+  // profile they attest is the `+websearch` variant, hashed into the receipt like any other.
+  peerWeb?: Partial<Record<EvidenceSeat, boolean>>;
   // Called ONCE, the moment the packet is pinned and BEFORE any core seat spawns, with everything
   // the Anthropic producer and the lens need (they depend on the packet, never on the core seats'
   // replies). A caller uses it to START those stages so they overlap the cross-vendor fan-out
@@ -463,6 +466,10 @@ export async function runReviewMode(
   ) as Record<ReviewerId, ReviewerConfig>;
   const wt = opts.worktree;
   const quals = wt ? qualifyCoreSeats(reviewers, wt.dir, configs) : {};
+  // Said once, up front: which seats search the web (vendor-side), so a reader of the run header
+  // knows the receipt will carry `+websearch` profiles for them.
+  const webSeats = [...reviewers.filter((id) => configs[id].web === true), ...((opts.peerSeats ?? []).filter((s) => opts.peerWeb?.[s] === true))];
+  if (webSeats.length > 0) log(`Web search ON for ${webSeats.join(', ')} (vendor-side; their receipt profiles carry +websearch)`);
   const everySeatReadsTree = Boolean(wt) && reviewers.every((id) => quals[id]?.qualified);
 
   // CONVENTIONS ONCE (2026-10-10 architecture review, item 3): a full review gathered ~350 KB of
@@ -789,7 +796,7 @@ export async function runReviewMode(
   const sandboxProfiles = wt
     ? sandboxProfilesFor({
         ...quals,
-        ...Object.fromEntries((opts.peerSeats ?? []).map((s) => [s, qualifyHarnessSeat()])),
+        ...Object.fromEntries((opts.peerSeats ?? []).map((s) => [s, qualifyHarnessSeat(opts.peerWeb?.[s] === true)])),
       })
     : {};
   const realized: EvidenceMap = {};

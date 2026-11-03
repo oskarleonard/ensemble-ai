@@ -1958,6 +1958,7 @@ async function runReviewPipeline(input: ReviewPipelineInput): Promise<number> {
       onProgress: stampProgress((line) => console.error(line)),
       out,
       peerSeats,
+      ...(anthropicSeats ? { peerWeb: { claude: anthropicSeats.claude.config.web === true, gate: anthropicSeats.gate.config.web === true } } : {}),
       profile,
       repoIdOverride: source.postTarget?.repoSlug
         ? repoIdFromSlug(source.postTarget.repoSlug)

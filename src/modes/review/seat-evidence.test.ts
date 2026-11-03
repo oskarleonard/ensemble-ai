@@ -234,3 +234,18 @@ describe('formatEgressDenialCounts — the run-log rollup', () => {
     expect(line).toBe('4 connection(s) DENIED — a.example:443 ×2 · b.example:443 ×2');
   });
 });
+
+describe('the +websearch profile variants — a web-enabled seat never attests the fully fenced profile', () => {
+  it('each qualifier returns the +websearch id (same version) when the seat has web, the plain one otherwise', () => {
+    expect(qualifyHarnessSeat().profile.id).toBe('claude-capability-fence');
+    expect(qualifyHarnessSeat(true).profile).toEqual({ id: 'claude-capability-fence+websearch', version: qualifyHarnessSeat().profile.version });
+    expect(qualifyGrokSeat('ensemble-review', true).profile).toEqual({ id: `${GROK_SANDBOX_PROFILE.id}+websearch`, version: GROK_SANDBOX_PROFILE.version });
+    expect(qualifyGrokSeat('ensemble-review').profile).toEqual(GROK_SANDBOX_PROFILE);
+    expect(qualifyCodexSeat('/tmp/whatever', { supported: false }, true).profile).toEqual({ id: `${CODEX_SANDBOX_PROFILE.id}+websearch`, version: CODEX_SANDBOX_PROFILE.version });
+  });
+  it('SEAT_QUALIFIERS read the seat config\'s `web`', () => {
+    const grok = { cmd: 'grok', effort: 'high', id: 'grok' as const, model: 'm', sandbox: 'ensemble-review', vendor: 'xai', web: true };
+    expect(SEAT_QUALIFIERS.grok({ config: grok, worktree: '/tmp/x' }).profile.id).toBe(`${GROK_SANDBOX_PROFILE.id}+websearch`);
+    expect(SEAT_QUALIFIERS.claude({ config: { ...grok, id: 'claude' as const, web: undefined }, worktree: '/tmp/x' }).profile.id).toBe('claude-capability-fence');
+  });
+});

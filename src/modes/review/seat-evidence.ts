@@ -14,7 +14,7 @@ import {
   resolveReviewSandbox,
 } from '../../reviewers/grok';
 
-import { CLAUDE_CAPABILITY_FENCE } from './claude';
+import { claudeFenceProfile } from './claude';
 import type {
   EvidenceClass,
   EvidenceMap,
@@ -59,11 +59,19 @@ export interface SeatQualification {
 // because an interpolated read root is `/` or contains `$HOME` (renderCodexSandboxProfile throws
 // rather than emit a costume). We render it here — a pure, no-write dry run — so an unsafe root is
 // discovered BEFORE the seat is spawned, not after a 12-minute review.
+// A seat with vendor-side web search attests its profile under a DISTINCT id (`…+websearch`): the
+// same fence, one more thing the seat can reach (the vendor's search, behind the API host the
+// fence already allows) — so a web run never verifies as equivalent to a fully fenced one.
+export function webProfile(profile: SandboxProfileRef, web: boolean): SandboxProfileRef {
+  return web ? { id: `${profile.id}+websearch`, version: profile.version } : profile;
+}
+
 export function qualifyCodexSeat(
   worktree: string,
-  deps: { supported?: boolean } = {}
+  deps: { supported?: boolean } = {},
+  web = false
 ): SeatQualification {
-  const profile = CODEX_SANDBOX_PROFILE;
+  const profile = webProfile(CODEX_SANDBOX_PROFILE, web);
   const supported = deps.supported ?? codexSandboxSupported();
   if (!supported) {
     return {
@@ -87,8 +95,8 @@ export function qualifyCodexSeat(
 // already the shape §2 requires; pointing it at the worktree root is config-only. But
 // `resolveReviewSandbox` also admits bare `strict`, which lacks the secret deny-list — and the
 // receipt would then attest `ensemble-review`, a profile the seat never ran under. Fail closed.
-export function qualifyGrokSeat(configuredSandbox?: string): SeatQualification {
-  const profile = GROK_SANDBOX_PROFILE;
+export function qualifyGrokSeat(configuredSandbox?: string, web = false): SeatQualification {
+  const profile = webProfile(GROK_SANDBOX_PROFILE, web);
   const resolved = resolveReviewSandbox(configuredSandbox);
   // Compared against the CLI sandbox NAME, not the receipt's profile id: since codex-f3 the id also
   // names the egress fence (`+proxy-env-noshell`), which grok's own sandbox schema cannot express.
@@ -108,8 +116,8 @@ export function qualifyGrokSeat(configuredSandbox?: string): SeatQualification {
 // seats now is CLAUDE_CAPABILITY_FENCE: no Bash, no network, no MCP, a neutral cwd, the worktree as
 // the sole `--add-dir` read root, and `$HOME` denied to every read tool (see ./claude for the probe
 // results behind each clause).
-export function qualifyHarnessSeat(): SeatQualification {
-  return { profile: CLAUDE_CAPABILITY_FENCE, qualified: true, reason: null };
+export function qualifyHarnessSeat(web = false): SeatQualification {
+  return { profile: claudeFenceProfile(web), qualified: true, reason: null };
 }
 
 // The per-reviewer qualifier, keyed by id. EXHAUSTIVE over ReviewerId, like REVIEW_ADAPTERS and
@@ -124,9 +132,9 @@ export const SEAT_QUALIFIERS: Record<
   // The Anthropic registry seat qualifies exactly like the CLI's claude layer:
   // the capability fence (tools removed, strict MCP, neutral cwd, $HOME
   // read-denied) is CLI-flag-based — no kernel wrapper, no platform dependency.
-  claude: () => qualifyHarnessSeat(),
-  codex: ({ worktree }) => qualifyCodexSeat(worktree),
-  grok: ({ config }) => qualifyGrokSeat(config.sandbox),
+  claude: ({ config }) => qualifyHarnessSeat(config.web === true),
+  codex: ({ config, worktree }) => qualifyCodexSeat(worktree, {}, config.web === true),
+  grok: ({ config }) => qualifyGrokSeat(config.sandbox, config.web === true),
 };
 
 export type SeatQualifications = Partial<Record<EvidenceSeat, SeatQualification>>;
