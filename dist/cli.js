@@ -3,7 +3,7 @@
 // src/cli.ts
 import { execFileSync as execFileSync5 } from "child_process";
 import crypto2 from "crypto";
-import fs32 from "fs";
+import fs33 from "fs";
 import os14 from "os";
 import path26 from "path";
 import { fileURLToPath as fileURLToPath2 } from "url";
@@ -7400,7 +7400,7 @@ function scanDependencySurface(files) {
 }
 
 // src/modes/review/receipt.ts
-import fs27 from "fs";
+import fs28 from "fs";
 import os13 from "os";
 import path22 from "path";
 
@@ -7485,15 +7485,15 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/gate.ts
-import fs26 from "fs";
+import fs27 from "fs";
 import path21 from "path";
 
 // src/modes/review/holistic-gate.ts
-import fs25 from "fs";
+import fs26 from "fs";
 import path20 from "path";
 
 // src/modes/review/holistic.ts
-import fs24 from "fs";
+import fs25 from "fs";
 
 // src/modes/review/seat-usage.ts
 function num(v) {
@@ -7859,6 +7859,9 @@ var RETRIES_ON_PACKET = Object.freeze({
   codex: true,
   grok: false
 });
+
+// src/modes/review/self-contained.ts
+import fs24 from "fs";
 
 // src/modes/review/code-review-seat.ts
 var COLD_PEER_ROLE = "You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.";
@@ -8605,6 +8608,22 @@ var CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS = 108e5;
 var HOLISTIC_WORKTREE_TIMEOUT_MS = 18e5;
 var GATE_WORKTREE_TIMEOUT_MS = 72e5;
 var PRODUCER_PART_CONCURRENCY = 3;
+var PRODUCER_PROMPT_SIDECAR = "prompt.claude.json";
+var CONVENTIONS_TRAIL_COPY = "conventions.in-tree.md";
+function producerPromptFile(partIndex) {
+  return partIndex === void 0 ? "prompt.claude.md" : `prompt.claude.c${partIndex}.md`;
+}
+function persistProducerPrompts(baseDir, runId, sidecar, prompts, log) {
+  try {
+    for (const p of prompts) writeTrailFile(baseDir, runId, producerPromptFile(p.index), p.prompt);
+    writeTrailFile(baseDir, runId, PRODUCER_PROMPT_SIDECAR, JSON.stringify(sidecar, null, 2));
+    if (sidecar.conventionsPath) {
+      writeTrailFile(baseDir, runId, CONVENTIONS_TRAIL_COPY, fs24.readFileSync(sidecar.conventionsPath, "utf8"));
+    }
+  } catch (e) {
+    log(`  \xB7 claude: the pinned producer prompt could not be written (${e.message}) \u2014 this seat cannot be re-run from the trail`);
+  }
+}
 async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log, worktree, historyPacket, conventionsFile) {
   let res;
   const startedAt = Date.now();
@@ -8683,6 +8702,25 @@ async function runClaudeProducer(opts) {
   });
   const parts = opts.parts && opts.parts.length > 1 ? opts.parts : [{ diff: opts.pinnedDiff ?? "", index: 1, label: "(the change)", prompt: opts.reviewPrompt }];
   const producerTimeout = opts.timeoutMs ?? (opts.worktree ? CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS : void 0);
+  const promptByIndex = new Map(parts.map((p) => [p.index, producerPromptFor(p)]));
+  const promptOf = (part) => promptByIndex.get(part.index) ?? producerPromptFor(part);
+  if (opts.includeClaudeReviewer) {
+    persistProducerPrompts(
+      opts.baseDir,
+      opts.runId,
+      {
+        baseSha: opts.baseSha ?? null,
+        conventionsPath: opts.worktree && opts.conventionsPath ? opts.conventionsPath : null,
+        headSha: opts.expectedHeadSha,
+        history: Boolean(opts.worktree) && hasHistory,
+        parts: parts.length,
+        schemaVersion: 1,
+        worktree: opts.worktree ?? null
+      },
+      parts.map((p) => ({ ...parts.length > 1 ? { index: p.index } : {}, prompt: promptOf(p) })),
+      log
+    );
+  }
   let claudeReview = null;
   let claudeSpawned = false;
   let claudeParts;
@@ -8691,7 +8729,7 @@ async function runClaudeProducer(opts) {
       opts.worktree ? `  \xB7 claude (anthropic/${modelLabel}) reviewing the whole project at the PR head (cold single-pass peer)\u2026` : `  \xB7 claude (anthropic/${modelLabel}) reviewing the diff (cold)\u2026`
     );
     const { review, raw, spawned, stream } = await runClaudeReviewer(
-      producerPromptFor(parts[0]),
+      promptOf(parts[0]),
       opts.claudeConfig,
       run,
       // A worktree producer gets the bigger watchdog UNLESS the caller set one explicitly.
@@ -8725,7 +8763,7 @@ async function runClaudeProducer(opts) {
         const part = parts[i];
         log(`  \xB7 claude: part ${part.index}/${n} \u2014 ${part.label}\u2026`);
         const res = await runClaudeReviewer(
-          producerPromptFor(part),
+          promptOf(part),
           opts.claudeConfig,
           run,
           producerTimeout,
@@ -9272,7 +9310,7 @@ function loadVoicesSeat(spec, file = VOICES_FILE, flags = {}, warn = () => {
 }, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
-    raw = JSON.parse(fs24.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs25.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`${spec.name} seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -9456,7 +9494,7 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs25.realpathSync(path20.resolve(worktreeDir));
+    root = fs26.realpathSync(path20.resolve(worktreeDir));
   } catch {
     return () => null;
   }
@@ -9469,11 +9507,11 @@ function worktreeReader(worktreeDir) {
       if (!file || file.includes("\0") || path20.isAbsolute(file)) return null;
       const target = path20.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs25.realpathSync(target);
+      const real = fs26.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs25.statSync(real);
+      const st = fs26.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs25.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs26.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
@@ -9486,14 +9524,14 @@ function conventionsAwareReader(base, conventionsFile, gathered = [], root) {
     cached = null;
     if (conventionsFile) {
       try {
-        const st = fs25.lstatSync(conventionsFile);
+        const st = fs26.lstatSync(conventionsFile);
         if (!st.isFile() || st.size > MAX_FILE_BYTES) return cached;
-        const real = fs25.realpathSync(conventionsFile);
+        const real = fs26.realpathSync(conventionsFile);
         if (root !== void 0) {
-          const rel = path20.relative(fs25.realpathSync(path20.resolve(root)), real);
+          const rel = path20.relative(fs26.realpathSync(path20.resolve(root)), real);
           if (rel === "" || escapesRoot(rel)) return cached;
         }
-        cached = fs25.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+        cached = fs26.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
       } catch {
         cached = null;
       }
@@ -11051,7 +11089,7 @@ function renderGateVerdicts(records, opts) {
 var SHADOW_GATE_SCHEMA_VERSION = 1;
 function readPinnedProductDocs(baseDir, runId) {
   try {
-    return indexProductDocs(fs26.readFileSync(path21.join(reviewDir(baseDir, runId), PRODUCT_DOCS_TRAIL_FILE), "utf8"));
+    return indexProductDocs(fs27.readFileSync(path21.join(reviewDir(baseDir, runId), PRODUCT_DOCS_TRAIL_FILE), "utf8"));
   } catch {
     return null;
   }
@@ -11381,11 +11419,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs27.mkdirSync(path22.dirname(file), { recursive: true, mode: 448 });
+  fs28.mkdirSync(path22.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs27.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs27.chmodSync(tmp, 384);
-  fs27.renameSync(tmp, file);
+  fs28.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs28.chmodSync(tmp, 384);
+  fs28.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -11467,7 +11505,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs27.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs28.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -12447,7 +12485,7 @@ async function runReviewMode(opts) {
 }
 
 // src/modes/review/gate-seat.ts
-import fs28 from "fs";
+import fs29 from "fs";
 var GATE_VENDORS = /* @__PURE__ */ new Set(["anthropic", "codex"]);
 var CODEX_GATE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
 var CODEX_GATE_DEFAULTS = { effort: "xhigh", model: "gpt-5.6-sol" };
@@ -12593,7 +12631,7 @@ function resolveGateSeat(raw, flags, warn, parseAdvisor = parseSeatAdvisor) {
 }
 function readVoicesRaw(file, warn, seatLabel, fallbackNote) {
   try {
-    return JSON.parse(fs28.readFileSync(file, "utf8"));
+    return JSON.parse(fs29.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(
@@ -12675,12 +12713,12 @@ function shadowChampionConfig(claudeSeat, effort, warn) {
 }
 
 // src/modes/review/regate.ts
-import fs29 from "fs";
+import fs30 from "fs";
 import path23 from "path";
 function readConventionPathsFromTrail(baseDir, runId) {
   try {
     const raw = JSON.parse(
-      fs29.readFileSync(path23.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
+      fs30.readFileSync(path23.join(reviewDir(baseDir, runId), "conventions.json"), "utf8")
     );
     const paths = (raw.files ?? []).filter((f) => f.included === true && typeof f.path === "string").map((f) => f.path);
     return paths.length > 0 ? paths : void 0;
@@ -12690,7 +12728,7 @@ function readConventionPathsFromTrail(baseDir, runId) {
 }
 function readConventionsFileFromTrail(baseDir, runId, worktree) {
   try {
-    const raw = JSON.parse(fs29.readFileSync(path23.join(reviewDir(baseDir, runId), "conventions.json"), "utf8"));
+    const raw = JSON.parse(fs30.readFileSync(path23.join(reviewDir(baseDir, runId), "conventions.json"), "utf8"));
     const file = raw.inTree?.file;
     if (typeof file !== "string" || !path23.isAbsolute(file)) return null;
     const rel = path23.relative(path23.resolve(worktree), path23.resolve(file));
@@ -12768,7 +12806,7 @@ async function runRegate(opts) {
   }
   try {
     const p = path23.join(reviewDir(opts.baseDir, opts.runId), "claude-synthesis.json");
-    const existing = fs29.existsSync(p) ? JSON.parse(fs29.readFileSync(p, "utf8")) : {};
+    const existing = fs30.existsSync(p) ? JSON.parse(fs30.readFileSync(p, "utf8")) : {};
     writeTrailFile(
       opts.baseDir,
       opts.runId,
@@ -12802,7 +12840,7 @@ async function runRegate(opts) {
 }
 
 // src/modes/review/reparse-seat.ts
-import fs31 from "fs";
+import fs32 from "fs";
 import path25 from "path";
 
 // src/modes/review/evidence-manifest.ts
@@ -12842,7 +12880,7 @@ function writeEvidenceManifest(baseDir, runId, manifest) {
 }
 
 // src/modes/review/reseat.ts
-import fs30 from "fs";
+import fs31 from "fs";
 import path24 from "path";
 function splitWorktreePrompt(prompt) {
   const asPacket = {
@@ -12898,7 +12936,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   if (!stored) return { error: `run ${runId} has no review.${seat}.json under ${baseDir}` };
   let parsed;
   try {
-    parsed = JSON.parse(fs30.readFileSync(path24.join(dir, `packet.${seat}.json`), "utf8"));
+    parsed = JSON.parse(fs31.readFileSync(path24.join(dir, `packet.${seat}.json`), "utf8"));
   } catch {
     return { error: `run ${runId} has no readable packet.${seat}.json` };
   }
@@ -12908,7 +12946,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
   const packet = parsed;
   let prompt;
   try {
-    prompt = fs30.readFileSync(path24.join(dir, `prompt.${seat}.md`), "utf8");
+    prompt = fs31.readFileSync(path24.join(dir, `prompt.${seat}.md`), "utf8");
   } catch {
     return { error: `run ${runId} has no readable prompt.${seat}.md` };
   }
@@ -12918,7 +12956,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
     for (const c of trail.chunks) {
       let partPacket;
       try {
-        partPacket = JSON.parse(fs30.readFileSync(path24.join(dir, `packet.${seat}.c${c.index}.json`), "utf8"));
+        partPacket = JSON.parse(fs31.readFileSync(path24.join(dir, `packet.${seat}.c${c.index}.json`), "utf8"));
       } catch {
         return { error: `run ${runId} reviewed in ${trail.chunks.length} parts but has no readable packet.${seat}.c${c.index}.json` };
       }
@@ -12927,7 +12965,7 @@ function readSeatArtifacts(baseDir, runId, seat) {
       }
       let partPrompt;
       try {
-        partPrompt = fs30.readFileSync(path24.join(dir, `prompt.${seat}.c${c.index}.md`), "utf8");
+        partPrompt = fs31.readFileSync(path24.join(dir, `prompt.${seat}.c${c.index}.md`), "utf8");
       } catch {
         return { error: `run ${runId} reviewed in ${trail.chunks.length} parts but has no readable prompt.${seat}.c${c.index}.md` };
       }
@@ -13013,14 +13051,14 @@ function readReseatLock(p) {
   let startedMs;
   let since;
   try {
-    const st = fs30.statSync(p);
+    const st = fs31.statSync(p);
     startedMs = st.mtimeMs;
     since = new Date(st.mtimeMs).toISOString();
   } catch {
     return null;
   }
   try {
-    const held = JSON.parse(fs30.readFileSync(p, "utf8"));
+    const held = JSON.parse(fs31.readFileSync(p, "utf8"));
     if (typeof held.at === "string") since = held.at;
   } catch {
   }
@@ -13031,7 +13069,7 @@ function acquireReseatLock(baseDir, runId) {
   const held = () => `another reseat is already running on run ${runId} (lock ${RESEAT_LOCK_FILE}, since ${readReseatLock(p)?.since ?? "unknown"})`;
   const claim = () => {
     try {
-      return fs30.openSync(p, "wx");
+      return fs31.openSync(p, "wx");
     } catch {
       return null;
     }
@@ -13041,20 +13079,20 @@ function acquireReseatLock(baseDir, runId) {
     const prior = readReseatLock(p);
     if (prior && Date.now() - prior.startedMs <= RESEAT_LOCK_STALE_MS) throw new ReseatLockedError(held());
     try {
-      fs30.rmSync(p, { force: true });
+      fs31.rmSync(p, { force: true });
     } catch {
     }
     fd = claim();
     if (fd === null) throw new ReseatLockedError(held());
   }
   try {
-    fs30.writeFileSync(fd, JSON.stringify({ at: (/* @__PURE__ */ new Date()).toISOString(), pid: process.pid }));
+    fs31.writeFileSync(fd, JSON.stringify({ at: (/* @__PURE__ */ new Date()).toISOString(), pid: process.pid }));
   } finally {
-    fs30.closeSync(fd);
+    fs31.closeSync(fd);
   }
   return () => {
     try {
-      fs30.rmSync(p, { force: true });
+      fs31.rmSync(p, { force: true });
     } catch {
     }
   };
@@ -13062,7 +13100,7 @@ function acquireReseatLock(baseDir, runId) {
 function foldSynthesis(baseDir, runId, patch, log) {
   try {
     const p = path24.join(reviewDir(baseDir, runId), "claude-synthesis.json");
-    const existing = fs30.existsSync(p) ? JSON.parse(fs30.readFileSync(p, "utf8")) : {};
+    const existing = fs31.existsSync(p) ? JSON.parse(fs31.readFileSync(p, "utf8")) : {};
     writeTrailFile(baseDir, runId, "claude-synthesis.json", JSON.stringify(patch(existing), null, 2));
     return true;
   } catch (e) {
@@ -13075,7 +13113,7 @@ function appendEgressDenials(baseDir, runId, denials, log) {
   try {
     log(`reseat: \u26A0 egress fence: ${formatEgressDenialCounts(denials)}`);
     const p = path24.join(reviewDir(baseDir, runId), "egress-denials.json");
-    const prior = fs30.existsSync(p) ? JSON.parse(fs30.readFileSync(p, "utf8")) : [];
+    const prior = fs31.existsSync(p) ? JSON.parse(fs31.readFileSync(p, "utf8")) : [];
     if (!Array.isArray(prior)) {
       log(
         "reseat: egress-denials.json is not an array \u2014 leaving it untouched; this retry's denials are in the result only"
@@ -13147,7 +13185,7 @@ async function reseatUnderLock(opts, pre) {
     const runs = [];
     const manifestRealized = (() => {
       try {
-        const m = JSON.parse(fs30.readFileSync(path24.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE), "utf8"));
+        const m = JSON.parse(fs31.readFileSync(path24.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE), "utf8"));
         return m.realizedEvidence?.[seat] === "worktree" ? "worktree" : "packet";
       } catch {
         return "packet";
@@ -13246,8 +13284,8 @@ async function reseatUnderLock(opts, pre) {
   );
   try {
     const mp = path24.join(reviewDir(baseDir, runId), EVIDENCE_MANIFEST_FILE);
-    if (fs30.existsSync(mp)) {
-      const manifest = JSON.parse(fs30.readFileSync(mp, "utf8"));
+    if (fs31.existsSync(mp)) {
+      const manifest = JSON.parse(fs31.readFileSync(mp, "utf8"));
       manifest.realizedEvidence = {
         ...manifest.realizedEvidence ?? {},
         [seat]: seatRun.realized
@@ -13308,7 +13346,7 @@ async function reseatUnderLock(opts, pre) {
 }
 function readPartReview(baseDir, runId, seat, index) {
   try {
-    const raw = JSON.parse(fs30.readFileSync(path24.join(reviewDir(baseDir, runId), `review.${seat}.c${index}.json`), "utf8"));
+    const raw = JSON.parse(fs31.readFileSync(path24.join(reviewDir(baseDir, runId), `review.${seat}.c${index}.json`), "utf8"));
     if (typeof raw !== "object" || raw === null) return null;
     const r = raw;
     if (!Array.isArray(r.findings) || typeof r.terminalState !== "string" || typeof r.summary !== "string") return null;
@@ -13353,6 +13391,43 @@ var REPARSE_SEATS = ["claude"];
 function isReparseSeat(v) {
   return REPARSE_SEATS.includes(v);
 }
+var isRerun = (g) => "rerun" in g;
+function readPinnedProducerPrompts(dir) {
+  let sidecar;
+  try {
+    const raw = JSON.parse(fs32.readFileSync(path25.join(dir, PRODUCER_PROMPT_SIDECAR), "utf8"));
+    if (raw.schemaVersion !== 1 || typeof raw.headSha !== "string" || typeof raw.parts !== "number" || raw.parts < 1) return null;
+    sidecar = {
+      baseSha: typeof raw.baseSha === "string" ? raw.baseSha : null,
+      conventionsPath: typeof raw.conventionsPath === "string" ? raw.conventionsPath : null,
+      headSha: raw.headSha,
+      history: raw.history === true,
+      parts: raw.parts,
+      schemaVersion: 1,
+      worktree: typeof raw.worktree === "string" ? raw.worktree : null
+    };
+  } catch {
+    return null;
+  }
+  const prompts = /* @__PURE__ */ new Map();
+  try {
+    if (sidecar.parts === 1) prompts.set(1, fs32.readFileSync(path25.join(dir, producerPromptFile()), "utf8"));
+    else for (let k = 1; k <= sidecar.parts; k++) prompts.set(k, fs32.readFileSync(path25.join(dir, producerPromptFile(k)), "utf8"));
+  } catch {
+    return null;
+  }
+  return { prompts, sidecar };
+}
+function reusablePart(raw) {
+  if (raw === null) return null;
+  const parsed = parseFindings(raw);
+  return parsed.parseError ? null : { findings: parsed.findings, raw, summary: parsed.summary };
+}
+function rerunNeedsWorktree(pre, worktree) {
+  if (pre.sidecar.worktree && !worktree)
+    return `the claude seat's pinned prompt names a worktree (${pre.sidecar.worktree}) \u2014 a re-run needs the PR head re-materialized: pass --repo <clone> with the PR URL`;
+  return null;
+}
 function checkReparse(baseDir, runId, seat) {
   const existing = readTrailJson(baseDir, runId, `review.${seat}.json`);
   if (!existing || typeof existing !== "object" || typeof existing.voiceId !== "string") {
@@ -13365,50 +13440,229 @@ function checkReparse(baseDir, runId, seat) {
       refusal: `seat ${seat} completed in run ${runId} \u2014 nothing to heal (re-running a healthy seat is a new review)`
     };
   }
+  const dir = reviewDir(baseDir, runId);
+  const pinned = readPinnedProducerPrompts(dir);
+  const rerun = (why) => {
+    if (!pinned) return { refusal: `${why}; re-fire the review (this run has no pinned producer prompt, so the seat cannot be re-run from the trail)` };
+    const parts2 = [];
+    for (const [index, prompt] of [...pinned.prompts].sort((a, b) => a[0] - b[0])) {
+      const rawFile = path25.join(dir, pinned.sidecar.parts === 1 ? `${seat}-review.raw.md` : `${seat}-review.c${index}.raw.md`);
+      const raw2 = fs32.existsSync(rawFile) ? fs32.readFileSync(rawFile, "utf8") : null;
+      parts2.push({ index, prompt, reuse: reusablePart(raw2) });
+    }
+    return { existing, parts: parts2, rerun: true, sidecar: pinned.sidecar, why };
+  };
   const diag = existing.diagnostics;
   if (diag && typeof diag === "object" && typeof diag.timedOutReason === "string") {
-    return {
-      refusal: `seat ${seat} was cut off on run ${runId} (${diag.timedOutReason}) \u2014 its reply is not a complete review and will not be re-read; re-fire the review`
-    };
+    const r = rerun(`seat ${seat} was cut off on run ${runId} (${diag.timedOutReason}) \u2014 its reply is not a complete review and will not be re-read`);
+    if (isRerun(r) && r.sidecar.parts === 1) r.parts = r.parts.map((p) => ({ ...p, reuse: null }));
+    return r;
   }
-  const dir = reviewDir(baseDir, runId);
   let names;
   try {
-    names = fs31.readdirSync(dir);
+    names = fs32.readdirSync(dir);
   } catch {
     names = [];
   }
   const partRe = new RegExp(`^${seat}-review\\.c\\d+\\.raw\\.md$`);
   const parts = names.filter((n) => partRe.test(n));
-  if (parts.length > 0) {
-    return {
-      refusal: `seat ${seat} reviewed run ${runId} in ${parts.length} parts \u2014 re-reading a multi-part reply is not supported yet; re-fire the review`
-    };
+  if (parts.length > 0 || pinned && pinned.sidecar.parts > 1) {
+    return rerun(`seat ${seat} reviewed run ${runId} in ${parts.length > 0 ? parts.length : pinned?.sidecar.parts} parts \u2014 a multi-part reply is not re-read`);
   }
   const rawPath = path25.join(dir, `${seat}-review.raw.md`);
-  if (!fs31.existsSync(rawPath)) {
-    return {
-      refusal: `seat ${seat} left no reply on run ${runId} (no ${seat}-review.raw.md) \u2014 nothing to re-read; re-fire the review`
-    };
+  if (!fs32.existsSync(rawPath)) {
+    return rerun(`seat ${seat} left no reply on run ${runId} (no ${seat}-review.raw.md) \u2014 nothing to re-read`);
   }
-  const raw = fs31.readFileSync(rawPath, "utf8");
+  const raw = fs32.readFileSync(rawPath, "utf8");
   const parsed = parseFindings(raw);
   if (parsed.parseError) {
-    return {
-      refusal: `seat ${seat}'s persisted reply on run ${runId} still does not parse under this engine (${parsed.parseError}) \u2014 a re-run of this seat is not supported yet; re-fire the review`
-    };
+    return rerun(`seat ${seat}'s persisted reply on run ${runId} still does not parse under this engine (${parsed.parseError})`);
   }
   return { existing, findings: parsed.findings, raw, summary: parsed.summary };
 }
 async function runReparseSeat(opts) {
   const pre = checkReparse(opts.baseDir, opts.runId, opts.seat);
   if ("refusal" in pre) throw new Error(pre.refusal);
+  if (isRerun(pre)) {
+    const needs = rerunNeedsWorktree(pre, opts.worktree);
+    if (needs) throw new Error(needs);
+    if (!opts.seatConfig) throw new Error("a re-run of the claude seat needs its reviewer seat config (seatConfig)");
+  }
   const release = acquireReseatLock(opts.baseDir, opts.runId);
   try {
-    return await reparseUnderLock(opts, pre);
+    return isRerun(pre) ? await rerunUnderLock(opts, pre, opts.seatConfig) : await reparseUnderLock(opts, pre);
   } finally {
     release();
   }
+}
+function recordClaudeChunkStates(baseDir, runId, seat, states, log) {
+  try {
+    const trail = readTrailJson(baseDir, runId, CHUNKS_TRAIL_FILE);
+    if (!trail || !Array.isArray(trail.chunks)) return false;
+    let touched = false;
+    for (const c of trail.chunks) {
+      const st = states.get(c.index);
+      const rec = c.seats?.[seat];
+      if (!st || !rec) continue;
+      const { why: _why, ...rest } = rec;
+      void _why;
+      c.seats[seat] = { ...rest, findings: st.findings, state: st.ok ? "reviewed" : "failed-reviewer", ...st.why ? { why: st.why } : {} };
+      touched = true;
+    }
+    if (touched) writeTrailFile(baseDir, runId, CHUNKS_TRAIL_FILE, JSON.stringify(trail, null, 2));
+    return touched;
+  } catch (e) {
+    log(`reseat: ${CHUNKS_TRAIL_FILE} could not be updated (${e.message})`);
+    return false;
+  }
+}
+async function rerunUnderLock(opts, pre, seatConfig) {
+  const log = opts.log ?? (() => {
+  });
+  const { baseDir, runId, seat } = opts;
+  const { existing, sidecar } = pre;
+  const wt = opts.worktree;
+  const previousSummary = typeof existing.summary === "string" ? existing.summary : "";
+  const repoint = (text) => sidecar.worktree && wt ? text.split(sidecar.worktree).join(wt) : text;
+  let conventionsFile;
+  let conventionsNote;
+  if (sidecar.conventionsPath && wt) {
+    const want = repoint(sidecar.conventionsPath);
+    let body = null;
+    try {
+      body = fs32.readFileSync(path25.join(reviewDir(baseDir, runId), CONVENTIONS_TRAIL_COPY), "utf8");
+    } catch {
+      body = null;
+    }
+    if (body === null) conventionsNote = `the conventions file was not re-created (no ${CONVENTIONS_TRAIL_COPY} in the trail) \u2014 the seat reviewed without the gathered rules`;
+    else {
+      const w = writeConventionsInTree(wt, sidecar.headSha, body);
+      if (!w.ok) conventionsNote = `the conventions file was not re-created (${w.why}) \u2014 the seat reviewed without the gathered rules`;
+      else if (w.file !== want) conventionsNote = `the conventions file was written at ${w.file} but the prompt names ${want}`;
+      else conventionsFile = w.file;
+    }
+    if (conventionsNote) log(scrubControl(`reseat: ${conventionsNote}`));
+  }
+  const run = opts.run ?? runClaudeReviewVoice;
+  const timeoutMs = opts.timeoutMs ?? (wt ? CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS : void 0);
+  const historyPacket = sidecar.history && wt ? opts.historyPacket : void 0;
+  const n = pre.parts.length;
+  log(
+    `reseat: re-running ${seat} on run ${runId} from its pinned prompt \u2014 ${pre.why}; ${wt ? "worktree evidence" : "packet evidence"}${n > 1 ? ` \xB7 ${pre.parts.filter((p) => !p.reuse).length} of ${n} part(s) to re-run` : ""}`
+  );
+  const partsRerun = [];
+  const results = [];
+  for (const part of pre.parts) {
+    if (part.reuse) {
+      log(`reseat: ${seat} part ${part.index}/${n}: its reply parses, reused (${part.reuse.findings.length} finding(s))`);
+      results.push({ part, raw: part.reuse.raw, review: { findings: part.reuse.findings, ok: true, summary: part.reuse.summary, voiceId: seat }, stream: null });
+      continue;
+    }
+    partsRerun.push(part.index);
+    if (n > 1) log(`reseat: ${seat} part ${part.index}/${n}\u2026`);
+    const res = await runClaudeReviewer(repoint(part.prompt), seatConfig, run, timeoutMs, log, wt, historyPacket, conventionsFile);
+    results.push({ part, raw: res.raw, review: res.review, stream: res.stream });
+    if (n > 1) {
+      try {
+        writeTrailFile(baseDir, runId, `findings.${seat}.c${part.index}.json`, JSON.stringify(res.review.findings, null, 2));
+        if (res.raw !== null) writeTrailFile(baseDir, runId, `${seat}-review.c${part.index}.raw.md`, res.raw);
+        if (res.stream) writeTrailFile(baseDir, runId, `${seat}-stream.c${part.index}.jsonl`, res.stream);
+      } catch (e) {
+        log(`reseat: ${seat} part ${part.index} trail write failed (${e.message}) \u2014 continuing`);
+      }
+    }
+  }
+  let review;
+  let raw;
+  let stream = null;
+  if (n === 1) {
+    ({ review, raw, stream } = results[0]);
+  } else {
+    const failed = results.filter((r) => !r.review.ok);
+    const findings = [];
+    for (const r of results) for (const f of r.review.findings) findings.push({ ...f, chunk: r.part.index, id: `f${findings.length + 1}` });
+    const line = (r) => `Part ${r.part.index}/${n}: ${r.review.summary}`;
+    const summary = failed.length === 0 ? results.map(line).join("\n") : [
+      `Reviewed in ${n} part(s); ${failed.length} part(s) did not complete, so this reviewer is INCOMPLETE for the change.`,
+      ...failed.map((r) => `Part ${r.part.index}/${n} FAILED: ${r.review.summary}`),
+      ...results.filter((r) => r.review.ok).map(line)
+    ].join("\n");
+    review = { findings, ok: failed.length === 0, summary, voiceId: seat };
+    const raws = results.filter((r) => r.raw !== null).map((r) => `## Part ${r.part.index} of ${n}
+
+${r.raw}`);
+    raw = raws.length > 0 ? raws.join("\n\n") : null;
+  }
+  const healed = withSeatAdvisor(review, seatConfig);
+  persistSeatReview(baseDir, runId, seat, healed, raw, stream);
+  try {
+    writeTrailFile(baseDir, runId, `review.${seat}.md`, renderReviewMarkdown(healed));
+  } catch (e) {
+    log(`reseat: review.${seat}.md could not be written (${e.message})`);
+  }
+  const chunksTouched = recordClaudeChunkStates(
+    baseDir,
+    runId,
+    seat,
+    new Map(results.map((r) => [r.part.index, { findings: r.review.findings.length, ok: r.review.ok, ...r.review.ok ? {} : { why: r.review.summary.slice(0, 160) } }])),
+    log
+  );
+  const realized = wt ? "worktree" : "packet";
+  try {
+    const m = readTrailJson(baseDir, runId, EVIDENCE_MANIFEST_FILE);
+    if (m && m.realizedEvidence && m.realizedEvidence[seat] !== realized) {
+      writeTrailFile(baseDir, runId, EVIDENCE_MANIFEST_FILE, JSON.stringify({ ...m, realizedEvidence: { ...m.realizedEvidence, [seat]: realized } }, null, 2));
+    }
+  } catch (e) {
+    log(`reseat: ${EVIDENCE_MANIFEST_FILE} could not be updated (${e.message})`);
+  }
+  const stampWritten = foldSynthesis(
+    baseDir,
+    runId,
+    (synth) => ({
+      ...synth,
+      [`${seat}Review`]: healed,
+      reseats: [
+        ...synth.reseats ?? [],
+        {
+          at: (/* @__PURE__ */ new Date()).toISOString(),
+          baseSha: sidecar.baseSha,
+          ...conventionsNote ? { conventionsNote } : {},
+          evidenceDowngraded: false,
+          fallbackReason: null,
+          outcome: healed.ok ? "reviewed" : "failed-reviewer",
+          partsRerun,
+          previous: { ok: false, summary: previousSummary },
+          realized,
+          // The one field that tells this heal from a re-read: the seat WAS re-spawned.
+          rerun: true,
+          seat,
+          summary: healed.summary.slice(0, 600),
+          why: pre.why
+        }
+      ]
+    }),
+    log
+  );
+  const headSha = readGatePacketHeadSha(baseDir, runId);
+  if (!healed.ok) {
+    log(scrubControl(`reseat: ${seat} FAILED AGAIN \u2014 ${healed.summary.slice(0, 300)}; the gate was not re-run`));
+    if (chunksTouched && headSha) rerenderOverview(baseDir, runId, headSha, void 0, log);
+    return { gate: null, ok: false, rerun: { parts: partsRerun }, review: healed, stampWritten };
+  }
+  log(`reseat: ${seat} reviewed \u2014 ${healed.findings.length} finding(s) \xB7 evidence ${realized} \xB7 regating the union\u2026`);
+  const gate = await (opts.regate ?? runRegate)({
+    baseDir,
+    conventionPaths: opts.conventionPaths ?? readConventionPathsFromTrail(baseDir, runId),
+    gateConfig: opts.gateConfig,
+    log,
+    ...opts.premise ? { premise: true } : {},
+    ...opts.gateRun ? { run: opts.gateRun } : {},
+    runId,
+    ...wt ? { worktree: wt } : {}
+  });
+  if (chunksTouched && headSha) rerenderOverview(baseDir, runId, headSha, gate.ok ? verdictCounts(gate.verdicts) : void 0, log);
+  return { gate, ok: gate.ok, rerun: { parts: partsRerun }, review: healed, stampWritten };
 }
 async function reparseUnderLock(opts, pre) {
   const log = opts.log ?? (() => {
@@ -14663,15 +14917,15 @@ function genRunId() {
 }
 function clearReusedRunTrail(baseDir, trailDir) {
   try {
-    if (fs32.lstatSync(trailDir).isSymbolicLink()) return;
+    if (fs33.lstatSync(trailDir).isSymbolicLink()) return;
   } catch {
     return;
   }
   let realBase;
   let realTarget;
   try {
-    realBase = fs32.realpathSync(baseDir);
-    realTarget = fs32.realpathSync(trailDir);
+    realBase = fs33.realpathSync(baseDir);
+    realTarget = fs33.realpathSync(trailDir);
   } catch {
     return;
   }
@@ -14679,12 +14933,12 @@ function clearReusedRunTrail(baseDir, trailDir) {
   if (!rel || escapesRoot(rel)) {
     return;
   }
-  fs32.rmSync(realTarget, { force: true, recursive: true });
+  fs33.rmSync(realTarget, { force: true, recursive: true });
 }
 function readStdinIfPiped() {
   if (process.stdin.isTTY) return void 0;
   try {
-    const s = fs32.readFileSync(0, "utf8");
+    const s = fs33.readFileSync(0, "utf8");
     return s.trim() ? s : void 0;
   } catch {
     return void 0;
@@ -14861,7 +15115,7 @@ function resolveSource(selection, cwd, stdinContent, cmd = "review") {
     case "diff-file": {
       let text;
       try {
-        text = fs32.readFileSync(String(selection.diffFile), "utf8");
+        text = fs33.readFileSync(String(selection.diffFile), "utf8");
       } catch (e) {
         console.error(
           `ensemble-ai ${cmd}: cannot read --diff-file: ${e.message}`
@@ -15405,7 +15659,7 @@ async function runReviewPipeline(input) {
   let intent;
   if (typeof values.intent === "string" && values.intent) {
     try {
-      const text = fs32.readFileSync(values.intent, "utf8").trim();
+      const text = fs33.readFileSync(values.intent, "utf8").trim();
       if (text) {
         intent = text;
         console.error(`\xB7 intent: ${text.length} chars from ${values.intent} \u2014 handed to every seat and the gate as a stated-intent section`);
@@ -15419,7 +15673,7 @@ async function runReviewPipeline(input) {
     const file = values["product-docs"];
     let text;
     try {
-      text = fs32.readFileSync(file, "utf8");
+      text = fs33.readFileSync(file, "utf8");
     } catch (e) {
       console.error(`\xB7 product: skipped \u2014 ${file} unreadable (${e.message}); product seat not spawned`);
     }
@@ -16158,14 +16412,14 @@ async function brainstormCommand(args) {
   if (typeof values.file === "string") {
     const filePath = path26.resolve(cwd, values.file);
     try {
-      const bytes = fs32.statSync(filePath).size;
+      const bytes = fs33.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai brainstorm: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs32.readFileSync(filePath, "utf8");
+      fileContext = fs33.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai brainstorm: cannot read --file ${values.file}: ${e.message}`
@@ -16423,14 +16677,14 @@ async function consultCommand(args) {
   if (typeof values.file === "string") {
     const filePath = path26.resolve(cwd, values.file);
     try {
-      const bytes = fs32.statSync(filePath).size;
+      const bytes = fs33.statSync(filePath).size;
       if (bytes > MAX_BRAINSTORM_FILE_BYTES) {
         console.error(
           `ensemble-ai consult: --file ${values.file} is too large (${bytes} bytes > ${MAX_BRAINSTORM_FILE_BYTES}-byte cap)`
         );
         return 3;
       }
-      fileContext = fs32.readFileSync(filePath, "utf8");
+      fileContext = fs33.readFileSync(filePath, "utf8");
     } catch (e) {
       console.error(
         `ensemble-ai consult: cannot read --file ${values.file}: ${e.message}`
@@ -16688,7 +16942,7 @@ async function receiptCommand(args) {
   const readReceiptFile = (p) => {
     let raw;
     try {
-      raw = fs32.readFileSync(p, "utf8");
+      raw = fs33.readFileSync(p, "utf8");
     } catch (e) {
       return { error: `cannot read receipt ${p}: ${e.message}` };
     }
@@ -16897,10 +17151,10 @@ async function reviewersCommand(args) {
     },
     reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,
-    reviewersFileExists: fs32.existsSync(reviewersFile),
+    reviewersFileExists: fs33.existsSync(reviewersFile),
     voices: listVoices(voicesFile),
     voicesFile,
-    voicesFileExists: fs32.existsSync(voicesFile)
+    voicesFileExists: fs33.existsSync(voicesFile)
   };
   if (values.json) console.log(JSON.stringify(view, null, 2));
   else console.log(renderRegistry(view));
@@ -17421,12 +17675,15 @@ Usage:
   --run-id <id>     the original run's id
   --seat <id>       the FAILED seat to heal. A seat that completed is refused \u2014 re-running a
                     healthy seat is a new review. codex|grok are RE-RUN against the pinned
-                    packet. \`claude\` is RE-READ, never re-spawned: its persisted reply
-                    (claude-review.raw.md) is parsed again by THIS engine \u2014 the cure for a reply
-                    the parser of the day could not read (a stray bracket) \u2014 then the union is
-                    regated; nothing is billed but the gate. A claude reply that still does not
-                    parse, was cut off, or came in parts is refused (exit 3): the producer has no
-                    pinned prompt on disk, so re-fire the review instead
+                    packet. \`claude\` is RE-READ when its persisted reply (claude-review.raw.md)
+                    parses under THIS engine \u2014 the cure for a stray bracket; nothing is billed but
+                    the gate. Otherwise (missing, cut off, in parts, still unparseable) it is
+                    RE-RUN from its pinned prompt (prompt.claude.md, runs since 2026-11-03): the
+                    same bytes, re-pointed at the fresh worktree (--repo + the PR URL are required
+                    when the prompt names one), failed parts only, then the union is regated. A
+                    run with no pinned prompt is refused (exit 3): re-fire the review instead
+  --reviewer-model  the claude seat's pin for a RE-RUN \u2014 same chain as review (flag \u2192 voices.json
+  --reviewer-effort \`claude\` entry \u2192 built-in default); ignored by a re-read
   --repo <path>     local clone of the PR's repo \u2014 re-materializes the head read-only so the
                     seat (when its sandbox qualifies) and the gate are evidence-bearing.
                     Unavailable/failed \u2192 LOUD fallback: the seat AND the regate of the WHOLE
@@ -17465,6 +17722,8 @@ async function reseatCommand(args) {
         out: { type: "string" },
         premise: { type: "boolean" },
         repo: { type: "string" },
+        "reviewer-effort": { type: "string" },
+        "reviewer-model": { type: "string" },
         "reviewers-file": { type: "string" },
         "run-id": { type: "string" },
         sandbox: { type: "string" },
@@ -17632,11 +17891,32 @@ async function reparseSeatCommand(seat, values, positionals) {
     )
   );
   if (!gateSeat) return 3;
-  console.error(
-    `\xB7 ${seat}'s persisted reply parses under this engine: ${pre.findings.length} finding(s) \u2014 re-reading it, no seat is re-run`
-  );
-  let session = null;
+  const rerun = isRerun(pre);
+  const reviewerSeat = rerun ? loadSeatsOrRefuse(
+    () => loadClaudeReviewerSeat(
+      VOICES_FILE,
+      {
+        effort: typeof values["reviewer-effort"] === "string" ? values["reviewer-effort"] : void 0,
+        model: typeof values["reviewer-model"] === "string" ? values["reviewer-model"] : void 0
+      },
+      (m) => console.error(`\xB7 ${m}`)
+    )
+  ) : null;
+  if (rerun && !reviewerSeat) return 3;
   const repoFlag = typeof values.repo === "string" ? values.repo.trim() : "";
+  if (rerun) {
+    console.error(`\xB7 ${pre.why} \u2014 re-running the seat from its pinned prompt${pre.parts.length > 1 ? ` (${pre.parts.filter((p) => !p.reuse).length} of ${pre.parts.length} part(s); the rest reused)` : ""}`);
+    const needs = rerunNeedsWorktree(pre, repoFlag ? "(pending)" : void 0);
+    if (needs) {
+      console.error(`ensemble-ai reseat: ${needs}`);
+      return 3;
+    }
+  } else {
+    console.error(
+      `\xB7 ${seat}'s persisted reply parses under this engine: ${pre.findings.length} finding(s) \u2014 re-reading it, no seat is re-run`
+    );
+  }
+  let session = null;
   if (repoFlag) {
     const url = positionals[0]?.trim() ?? "";
     const ref = url ? parsePrUrl(url) : null;
@@ -17645,35 +17925,70 @@ async function reparseSeatCommand(seat, values, positionals) {
       return 3;
     }
     console.error(`\xB7 re-materializing the PR head as a read-only worktree of ${repoFlag}\u2026`);
-    const made = openWorktree({ baseRef: null, baseSha: null, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
+    const made = openWorktree({ baseRef: null, baseSha: rerun ? pre.sidecar.baseSha : null, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
     if (isPreflightError(made)) {
       const why = redactUrlCredentials(scrubControl(made.message)).slice(0, 300);
-      console.error(`\xB7 \u26A0 worktree unavailable (${made.kind}: ${why}) \u2014 regating on PACKET evidence (reference-not-found + holistic verification OFF)`);
+      if (rerun && pre.sidecar.worktree) {
+        console.error(`ensemble-ai reseat: worktree unavailable (${made.kind}: ${why}) \u2014 the claude seat's pinned prompt names a worktree, so it cannot be re-run on packet evidence`);
+        return 3;
+      }
+      console.error(`\xB7 \u26A0 worktree unavailable (${made.kind}: ${why}) \u2014 ${rerun ? "re-running the seat and " : ""}regating on PACKET evidence (reference-not-found + holistic verification OFF)`);
     } else {
       session = made;
       if (made.headFetchedBySha) console.error(`\xB7 note: pull/${ref.pr}/head has moved since the review \u2014 grounded at the pinned head ${headSha.slice(0, 12)} by SHA`);
     }
   }
+  let historyPacket;
+  if (rerun && session && pre.sidecar.history) {
+    const packet = readGatePacket(out, runId, headSha);
+    if (packet.ok) {
+      try {
+        const { capBytes, logCommits } = historyPacketConfig(readEnsembleConfig());
+        historyPacket = buildHistoryPacket({
+          baseSha: session.baseSha,
+          capBytes,
+          diff: packet.diff,
+          git: execGit(),
+          headSha: session.headSha,
+          logCommits,
+          strippedInstructionFiles: session.strippedInstructionFiles,
+          worktree: session.dir
+        });
+        console.error(`\xB7 history packet: ${historyPacket.files.length - 1} file(s), ${historyPacket.bytes} bytes${historyPacket.truncated ? " (truncated to the cap)" : ""}`);
+      } catch (e) {
+        console.error(`\xB7 history packet: could not be rebuilt (${e.message}) \u2014 the seat reviews without it`);
+      }
+    } else console.error(`\xB7 history packet: the pinned packet is ${packet.reason} \u2014 the seat reviews without history`);
+  }
   try {
     const res = await runReparseSeat({
       baseDir: out,
       gateConfig: gateSeat.config,
+      ...historyPacket ? { historyPacket } : {},
       log: (m) => console.error(`\xB7 ${m}`),
       ...values.premise ? { premise: true } : {},
       runId,
       seat,
+      ...reviewerSeat ? { seatConfig: reviewerSeat.config } : {},
       ...session ? { worktree: session.dir } : {}
     });
     if (!res.stampWritten) {
       console.error("\xB7 \u26A0 the reseats[] provenance stamp could not be written \u2014 the trail does not record this heal");
     }
+    if (!res.gate) {
+      console.log(`
+reseat: seat ${seat} FAILED AGAIN \u2014 ${scrubControl(res.review.summary).slice(0, 300)}
+(the new failure is now the trail's record; the gate was not re-run)`);
+      return 1;
+    }
     console.log(renderGateVerdicts(res.gate.verdicts, { scrub: scrubControl, trailWritten: true }).join("\n"));
     const simplify = renderPremiseSimplify(res.gate.synthesis.simplify, scrubControl);
     if (simplify.length) console.log(simplify.join("\n"));
+    const how = res.rerun ? `re-run (${res.review.findings.length} finding(s)${(isRerun(pre) ? pre.parts.length : 1) > 1 ? `, part(s) ${res.rerun.parts.join(", ")} re-spawned` : ""})` : `re-read (${res.review.findings.length} finding(s), no seat re-run)`;
     console.log(
       res.ok ? `
-reseat: ${seat} re-read (${res.review.findings.length} finding(s), no seat re-run) \u2014 gate completed over ${res.gate.reviews} voice(s); verdicts updated in ${out}/${runId}/` : `
-reseat: ${seat} re-read, but the gate FAILED \u2014 verdicts remain fail-closed unverified (see stderr for the cause)`
+reseat: ${seat} ${how} \u2014 gate completed over ${res.gate.reviews} voice(s); verdicts updated in ${out}/${runId}/` : `
+reseat: ${seat} ${how}, but the gate FAILED \u2014 verdicts remain fail-closed unverified (see stderr for the cause)`
     );
     return res.ok ? 0 : 1;
   } catch (e) {
@@ -17765,7 +18080,7 @@ async function probeCommand(rest) {
   let brief = null;
   if (briefPath) {
     try {
-      brief = fs32.readFileSync(path26.resolve(cwd, briefPath), "utf8");
+      brief = fs33.readFileSync(path26.resolve(cwd, briefPath), "utf8");
       console.error(`\xB7 operator brief: ${briefPath} (${brief.length} chars)`);
     } catch (e) {
       if (briefFlag) {

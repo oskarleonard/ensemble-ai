@@ -342,7 +342,12 @@ Two plumbing commands rehydrate an existing run's **trail** instead of re-runnin
   read-only clause is still refused) is **re-rendered, not refused**: the pinned packet before its
   header is what stays byte-identical, and the `reseats[]` entry says so with
   `preambleRerendered: true`. A seat that completed is refused
-  (re-running a healthy seat is a new review); `claude` is not supported yet. Without `--repo` (or when
+  (re-running a healthy seat is a new review). `claude` is RE-READ when its persisted reply parses under this
+  engine (a stray bracket; nothing billed but the gate) and otherwise RE-RUN from its pinned prompt (runs
+  since 2026-11-03 keep `prompt.claude.md`, one per part on a review in parts, plus `prompt.claude.json`):
+  the same bytes re-pointed at the fresh worktree — `--repo` + the PR URL are required when the prompt
+  names one — with the conventions file re-created from the trail's copy and the history packet rebuilt,
+  failed parts only, stamped `rerun: true`. Without `--repo` (or when
   the worktree cannot be made) the seat **and the regate of the whole run** fall to packet evidence —
   reference-not-found + holistic verification OFF. **A packet-mode retry is PERMANENT for that seat** —
   it overwrites the seat's persisted prompt and a reviewed seat is never retried — so pass `--repo`

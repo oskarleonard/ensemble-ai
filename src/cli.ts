@@ -105,10 +105,10 @@ import {
 import { runClaudeReviewVoice } from './modes/review/claude';
 import { runCodexReview } from './reviewers/codex';
 import { REVIEW_ADAPTERS } from './reviewers/registry';
-import { readGatePacketHeadSha } from './modes/review/gate-hunks';
+import { readGatePacketHeadSha, readGatePacket } from './modes/review/gate-hunks';
 import { type GateSeat, loadClaudeReviewerSeat, loadGateSeat, shadowChampionConfig } from './modes/review/gate-seat';
 import { readConventionPathsFromTrail, runRegate } from './modes/review/regate';
-import { checkReparse, isReparseSeat, type ReparseSeat, runReparseSeat } from './modes/review/reparse-seat';
+import { checkReparse, isReparseSeat, isRerun, type ReparseSeat, rerunNeedsWorktree, runReparseSeat } from './modes/review/reparse-seat';
 import { checkReseat, ReseatLockedError, reseatRefusal, runReseat } from './modes/review/reseat';
 import { loadHolisticSeat } from './modes/review/holistic';
 import { loadProductSeat } from './modes/review/product';
@@ -4154,12 +4154,15 @@ Usage:
   --run-id <id>     the original run's id
   --seat <id>       the FAILED seat to heal. A seat that completed is refused — re-running a
                     healthy seat is a new review. codex|grok are RE-RUN against the pinned
-                    packet. \`claude\` is RE-READ, never re-spawned: its persisted reply
-                    (claude-review.raw.md) is parsed again by THIS engine — the cure for a reply
-                    the parser of the day could not read (a stray bracket) — then the union is
-                    regated; nothing is billed but the gate. A claude reply that still does not
-                    parse, was cut off, or came in parts is refused (exit 3): the producer has no
-                    pinned prompt on disk, so re-fire the review instead
+                    packet. \`claude\` is RE-READ when its persisted reply (claude-review.raw.md)
+                    parses under THIS engine — the cure for a stray bracket; nothing is billed but
+                    the gate. Otherwise (missing, cut off, in parts, still unparseable) it is
+                    RE-RUN from its pinned prompt (prompt.claude.md, runs since 2026-11-03): the
+                    same bytes, re-pointed at the fresh worktree (--repo + the PR URL are required
+                    when the prompt names one), failed parts only, then the union is regated. A
+                    run with no pinned prompt is refused (exit 3): re-fire the review instead
+  --reviewer-model  the claude seat's pin for a RE-RUN — same chain as review (flag → voices.json
+  --reviewer-effort \`claude\` entry → built-in default); ignored by a re-read
   --repo <path>     local clone of the PR's repo — re-materializes the head read-only so the
                     seat (when its sandbox qualifies) and the gate are evidence-bearing.
                     Unavailable/failed → LOUD fallback: the seat AND the regate of the WHOLE
@@ -4202,6 +4205,8 @@ async function reseatCommand(args: string[]): Promise<number> {
         out: { type: 'string' },
         premise: { type: 'boolean' },
         repo: { type: 'string' },
+        'reviewer-effort': { type: 'string' },
+        'reviewer-model': { type: 'string' },
         'reviewers-file': { type: 'string' },
         'run-id': { type: 'string' },
         sandbox: { type: 'string' },
@@ -4426,13 +4431,40 @@ async function reparseSeatCommand(
     )
   );
   if (!gateSeat) return 3;
-  console.error(
-    `· ${seat}'s persisted reply parses under this engine: ${pre.findings.length} finding(s) — re-reading it, no seat is re-run`
-  );
-
-  // Worktree evidence for the REGATE, opt-in and best-effort exactly as `regate` does it.
-  let session: WorktreeSession | null = null;
+  const rerun = isRerun(pre);
+  // The RE-RUN's own seat: the claude reviewer pin (flag → voices.json `claude` entry → default),
+  // resolved before any worktree work so an invalid advisor refuses here, nothing billed.
+  const reviewerSeat = rerun
+    ? loadSeatsOrRefuse(() =>
+        loadClaudeReviewerSeat(
+          VOICES_FILE,
+          {
+            effort: typeof values['reviewer-effort'] === 'string' ? values['reviewer-effort'] : undefined,
+            model: typeof values['reviewer-model'] === 'string' ? values['reviewer-model'] : undefined,
+          },
+          (m) => console.error(`· ${m}`)
+        )
+      )
+    : null;
+  if (rerun && !reviewerSeat) return 3;
   const repoFlag = typeof values.repo === 'string' ? values.repo.trim() : '';
+  if (rerun) {
+    console.error(`· ${pre.why} — re-running the seat from its pinned prompt${pre.parts.length > 1 ? ` (${pre.parts.filter((p) => !p.reuse).length} of ${pre.parts.length} part(s); the rest reused)` : ''}`);
+    // A prompt that names a worktree needs one; said BEFORE any materialization, nothing billed.
+    const needs = rerunNeedsWorktree(pre, repoFlag ? '(pending)' : undefined);
+    if (needs) {
+      console.error(`ensemble-ai reseat: ${needs}`);
+      return 3;
+    }
+  } else {
+    console.error(
+      `· ${seat}'s persisted reply parses under this engine: ${pre.findings.length} finding(s) — re-reading it, no seat is re-run`
+    );
+  }
+
+  // Worktree evidence — for the REGATE on a re-read (opt-in, best-effort as `regate` does it); for
+  // the SEAT ITSELF on a re-run of a worktree prompt (required there, refused above without --repo).
+  let session: WorktreeSession | null = null;
   if (repoFlag) {
     const url = positionals[0]?.trim() ?? '';
     const ref = url ? parsePrUrl(url) : null;
@@ -4441,36 +4473,73 @@ async function reparseSeatCommand(
       return 3;
     }
     console.error(`· re-materializing the PR head as a read-only worktree of ${repoFlag}…`);
-    const made = openWorktree({ baseRef: null, baseSha: null, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
+    const made = openWorktree({ baseRef: null, baseSha: rerun ? pre.sidecar.baseSha : null, headSha, pr: ref.pr, prSlug: `${ref.owner}/${ref.repo}`, repoPath: repoFlag });
     if (isPreflightError(made)) {
       const why = redactUrlCredentials(clean(made.message)).slice(0, 300);
-      console.error(`· ⚠ worktree unavailable (${made.kind}: ${why}) — regating on PACKET evidence (reference-not-found + holistic verification OFF)`);
+      if (rerun && pre.sidecar.worktree) {
+        // The seat cannot be re-run against a prompt naming a reaped tree — refused, nothing billed.
+        console.error(`ensemble-ai reseat: worktree unavailable (${made.kind}: ${why}) — the claude seat's pinned prompt names a worktree, so it cannot be re-run on packet evidence`);
+        return 3;
+      }
+      console.error(`· ⚠ worktree unavailable (${made.kind}: ${why}) — ${rerun ? 're-running the seat and ' : ''}regating on PACKET evidence (reference-not-found + holistic verification OFF)`);
     } else {
       session = made;
       if (made.headFetchedBySha) console.error(`· note: pull/${ref.pr}/head has moved since the review — grounded at the pinned head ${headSha.slice(0, 12)} by SHA`);
     }
+  }
+  // The history packet the pinned prompt's history clause promises — rebuilt from the fresh tree
+  // and the pinned diff, exactly as the review built it. Best-effort: without it the seat reviews
+  // without history, a degraded review, never a failed one.
+  let historyPacket: HistoryPacket | undefined;
+  if (rerun && session && pre.sidecar.history) {
+    const packet = readGatePacket(out, runId, headSha);
+    if (packet.ok) {
+      try {
+        const { capBytes, logCommits } = historyPacketConfig(readEnsembleConfig());
+        historyPacket = buildHistoryPacket({
+          baseSha: session.baseSha,
+          capBytes,
+          diff: packet.diff,
+          git: execGit(),
+          headSha: session.headSha,
+          logCommits,
+          strippedInstructionFiles: session.strippedInstructionFiles,
+          worktree: session.dir,
+        });
+        console.error(`· history packet: ${historyPacket.files.length - 1} file(s), ${historyPacket.bytes} bytes${historyPacket.truncated ? ' (truncated to the cap)' : ''}`);
+      } catch (e) {
+        console.error(`· history packet: could not be rebuilt (${(e as Error).message}) — the seat reviews without it`);
+      }
+    } else console.error(`· history packet: the pinned packet is ${packet.reason} — the seat reviews without history`);
   }
 
   try {
     const res = await runReparseSeat({
       baseDir: out,
       gateConfig: gateSeat.config,
+      ...(historyPacket ? { historyPacket } : {}),
       log: (m) => console.error(`· ${m}`),
       ...(values.premise ? { premise: true } : {}),
       runId,
       seat,
+      ...(reviewerSeat ? { seatConfig: reviewerSeat.config } : {}),
       ...(session ? { worktree: session.dir } : {}),
     });
     if (!res.stampWritten) {
       console.error('· ⚠ the reseats[] provenance stamp could not be written — the trail does not record this heal');
     }
+    if (!res.gate) {
+      console.log(`\nreseat: seat ${seat} FAILED AGAIN — ${clean(res.review.summary).slice(0, 300)}\n(the new failure is now the trail's record; the gate was not re-run)`);
+      return 1;
+    }
     console.log(renderGateVerdicts(res.gate.verdicts, { scrub: clean, trailWritten: true }).join('\n'));
     const simplify = renderPremiseSimplify(res.gate.synthesis.simplify, clean);
     if (simplify.length) console.log(simplify.join('\n'));
+    const how = res.rerun ? `re-run (${res.review.findings.length} finding(s)${(isRerun(pre) ? pre.parts.length : 1) > 1 ? `, part(s) ${res.rerun.parts.join(', ')} re-spawned` : ''})` : `re-read (${res.review.findings.length} finding(s), no seat re-run)`;
     console.log(
       res.ok
-        ? `\nreseat: ${seat} re-read (${res.review.findings.length} finding(s), no seat re-run) — gate completed over ${res.gate.reviews} voice(s); verdicts updated in ${out}/${runId}/`
-        : `\nreseat: ${seat} re-read, but the gate FAILED — verdicts remain fail-closed unverified (see stderr for the cause)`
+        ? `\nreseat: ${seat} ${how} — gate completed over ${res.gate.reviews} voice(s); verdicts updated in ${out}/${runId}/`
+        : `\nreseat: ${seat} ${how}, but the gate FAILED — verdicts remain fail-closed unverified (see stderr for the cause)`
     );
     return res.ok ? 0 : 1;
   } catch (e) {

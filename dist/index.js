@@ -5029,7 +5029,7 @@ function hasDepSurface(r) {
 }
 
 // src/modes/review/receipt.ts
-import fs25 from "fs";
+import fs26 from "fs";
 import os12 from "os";
 import path21 from "path";
 
@@ -5117,15 +5117,15 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/gate.ts
-import fs24 from "fs";
+import fs25 from "fs";
 import path20 from "path";
 
 // src/modes/review/holistic-gate.ts
-import fs23 from "fs";
+import fs24 from "fs";
 import path19 from "path";
 
 // src/modes/review/holistic.ts
-import fs22 from "fs";
+import fs23 from "fs";
 
 // src/modes/brainstorm/voices.ts
 import fs21 from "fs";
@@ -5626,6 +5626,9 @@ var RETRIES_ON_PACKET = Object.freeze({
   grok: false
 });
 
+// src/modes/review/self-contained.ts
+import fs22 from "fs";
+
 // src/modes/review/code-review-seat.ts
 var COLD_PEER_ROLE = "You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.";
 function conventionsStep(file) {
@@ -5828,7 +5831,7 @@ function loadVoicesSeat(spec, file = VOICES_FILE, flags = {}, warn = () => {
 }, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
-    raw = JSON.parse(fs22.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs23.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`${spec.name} seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -6012,7 +6015,7 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs23.realpathSync(path19.resolve(worktreeDir));
+    root = fs24.realpathSync(path19.resolve(worktreeDir));
   } catch {
     return () => null;
   }
@@ -6025,11 +6028,11 @@ function worktreeReader(worktreeDir) {
       if (!file || file.includes("\0") || path19.isAbsolute(file)) return null;
       const target = path19.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs23.realpathSync(target);
+      const real = fs24.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs23.statSync(real);
+      const st = fs24.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs23.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs24.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
@@ -6042,14 +6045,14 @@ function conventionsAwareReader(base, conventionsFile, gathered = [], root) {
     cached = null;
     if (conventionsFile) {
       try {
-        const st = fs23.lstatSync(conventionsFile);
+        const st = fs24.lstatSync(conventionsFile);
         if (!st.isFile() || st.size > MAX_FILE_BYTES) return cached;
-        const real = fs23.realpathSync(conventionsFile);
+        const real = fs24.realpathSync(conventionsFile);
         if (root !== void 0) {
-          const rel = path19.relative(fs23.realpathSync(path19.resolve(root)), real);
+          const rel = path19.relative(fs24.realpathSync(path19.resolve(root)), real);
           if (rel === "" || escapesRoot(rel)) return cached;
         }
-        cached = fs23.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+        cached = fs24.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
       } catch {
         cached = null;
       }
@@ -6335,11 +6338,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs25.mkdirSync(path21.dirname(file), { recursive: true, mode: 448 });
+  fs26.mkdirSync(path21.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs25.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs25.chmodSync(tmp, 384);
-  fs25.renameSync(tmp, file);
+  fs26.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs26.chmodSync(tmp, 384);
+  fs26.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -6421,7 +6424,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs25.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs26.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -7754,7 +7757,7 @@ function stageReview(payload, target, deps) {
 }
 
 // src/modes/review/holistic-fixture.ts
-import fs26 from "fs";
+import fs27 from "fs";
 import path22 from "path";
 function anchor(v, where) {
   const e = v ?? {};
@@ -7763,7 +7766,7 @@ function anchor(v, where) {
   return { file: e.file, line: e.line, symbol: e.symbol };
 }
 function loadHolisticFixture(dir) {
-  const raw = JSON.parse(fs26.readFileSync(path22.join(dir, "expectations.json"), "utf8"));
+  const raw = JSON.parse(fs27.readFileSync(path22.join(dir, "expectations.json"), "utf8"));
   const positives = Array.isArray(raw.plantedPositives) ? raw.plantedPositives : [];
   const misses = Array.isArray(raw.nearMisses) ? raw.nearMisses : [];
   if (positives.length === 0 || misses.length === 0)
@@ -7796,7 +7799,7 @@ function verifyFixtureAnchors(dir, fixture) {
   const check = (a, label2) => {
     let lines;
     try {
-      lines = fs26.readFileSync(path22.join(dir, a.file), "utf8").split(/\r?\n/);
+      lines = fs27.readFileSync(path22.join(dir, a.file), "utf8").split(/\r?\n/);
     } catch {
       broken.push(`${label2}: ${a.file} is unreadable`);
       return;
