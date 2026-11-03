@@ -48,14 +48,16 @@ function num(v: unknown): number | undefined {
 // one `system`/`thinking_tokens` per turn, so a lost-head tail starts with one of those more
 // often than not, which is how run d5a1f648's part 1 passed as intact), else what it was.
 // `undefined` = not the head's verdict yet: a claude CLI whose user has a SessionStart hook prints
-// that hook's `hook_started`/`hook_response` events BEFORE its `init` (every anthropic seat of
-// munin-dashboard#323's eight rounds, 2026-10-27 — three read as a lost head, their true fact
-// `unread`). Only the SessionStart hook sits before init; a tail resuming on a mid-session hook
-// (PreToolUse, …) is still a lost head.
+// that hook's events BEFORE its `init` (every anthropic seat of munin-dashboard#323's eight
+// rounds, 2026-10-27 — three read as a lost head, their true fact `unread`). The skip keys on the
+// hook EVENT, not a list of subtypes: the CLI (2.1.317) emits `hook_started`, then a
+// `hook_progress` each time a still-running hook's output changes, then `hook_response`, and
+// itself groups all three by `hook_event`. Only the SessionStart hook sits before init; a tail
+// resuming on a mid-session hook (PreToolUse, …) is still a lost head.
 function streamHeadKind(ev: Record<string, unknown>): string | undefined {
   if (ev.type === 'thread.started') return 'init';
   if (ev.type === 'system' && ev.subtype === 'init') return 'init';
-  if (ev.type === 'system' && (ev.subtype === 'hook_started' || ev.subtype === 'hook_response') && ev.hook_event === 'SessionStart') return undefined;
+  if (ev.type === 'system' && typeof ev.subtype === 'string' && ev.subtype.startsWith('hook_') && ev.hook_event === 'SessionStart') return undefined;
   return typeof ev.type === 'string' ? ev.type : '';
 }
 

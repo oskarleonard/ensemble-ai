@@ -7509,7 +7509,7 @@ function num(v) {
 function streamHeadKind(ev) {
   if (ev.type === "thread.started") return "init";
   if (ev.type === "system" && ev.subtype === "init") return "init";
-  if (ev.type === "system" && (ev.subtype === "hook_started" || ev.subtype === "hook_response") && ev.hook_event === "SessionStart") return void 0;
+  if (ev.type === "system" && typeof ev.subtype === "string" && ev.subtype.startsWith("hook_") && ev.hook_event === "SessionStart") return void 0;
   return typeof ev.type === "string" ? ev.type : "";
 }
 function parseSeatUsage(stream) {

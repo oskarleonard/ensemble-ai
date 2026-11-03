@@ -50,8 +50,13 @@ describe('parseSeatUsage — tokens, tool calls and turns off the persisted stre
     const hook = (subtype: string, hook_event: string) => JSON.stringify({ hook_event, hook_id: 'h', hook_name: `${hook_event}:x`, subtype, type: 'system' });
     const hooked = [hook('hook_started', 'SessionStart'), hook('hook_response', 'SessionStart'), grokInit, ...grokBody, JSON.stringify({ subtype: 'success', type: 'result', num_turns: 3 })].join('\n');
     expect(parseSeatUsage(hooked).streamTruncated).toBeUndefined();
+    // a slow hook's `hook_progress` between started and response is the same hook (claude CLI 2.1.317)
+    const slow = [hook('hook_started', 'SessionStart'), hook('hook_progress', 'SessionStart'), hook('hook_progress', 'SessionStart'), hook('hook_response', 'SessionStart'), grokInit, ...grokBody, JSON.stringify({ subtype: 'success', type: 'result', num_turns: 3 })].join('\n');
+    expect(parseSeatUsage(slow).streamTruncated).toBeUndefined();
     const midSession = [hook('hook_started', 'PreToolUse'), ...grokBody, JSON.stringify({ subtype: 'success', type: 'result', num_turns: 3 })].join('\n');
     expect(parseSeatUsage(midSession).streamTruncated).toBe(true);
+    const midProgress = [hook('hook_progress', 'PreToolUse'), ...grokBody, JSON.stringify({ subtype: 'success', type: 'result', num_turns: 3 })].join('\n');
+    expect(parseSeatUsage(midProgress).streamTruncated).toBe(true);
   });
   it('yields nothing for an absent or unreadable stream — never a guess', () => {
     expect(parseSeatUsage(undefined)).toEqual({});
@@ -130,6 +135,9 @@ describe('conventionsReadOf — how far a seat read into the conventions file (n
     const hooked = (...events: string[]) => [hook('hook_started'), hook('hook_response'), init, ...events].join('\n');
     expect(conventionsReadOf(hooked(read('t1', { file_path: '/wt/src/x.ts' })), layout)).toEqual({ docsRead: [], state: 'unread' });
     expect(conventionsReadOf(hooked(read('t1', { file_path: F, limit: 30 }), result('t1', false)), layout)).toEqual({ docsRead: [], state: 'index-only' });
+    // a slow SessionStart hook prints `hook_progress` between started and response: still the head
+    const slow = (...events: string[]) => [hook('hook_started'), hook('hook_progress'), hook('hook_response'), init, ...events].join('\n');
+    expect(conventionsReadOf(slow(read('t1', { file_path: '/wt/src/x.ts' })), layout)).toEqual({ docsRead: [], state: 'unread' });
     // the hook alone, no init after it: still not a head
     expect(conventionsReadOf([hook('hook_started'), read('t1', { file_path: '/wt/src/x.ts' })].join('\n'), layout)).toBeUndefined();
   });
