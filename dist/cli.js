@@ -14567,8 +14567,9 @@ function advisorNote(advisor) {
   if (isSeatAdvisor(advisor)) return ` \xB7 advisor ${advisor}`;
   return ` \xB7 advisor ${JSON.stringify(advisor)} (INVALID \u2014 a command that runs this seat refuses it)`;
 }
+var webNote = (web) => web === true ? " \xB7 web" : "";
 function gateLine(gate) {
-  return `    ${"gate".padEnd(7)} ${gate.vendor ?? "anthropic"} \xB7 ${gate.model} @ ${gate.effort}${advisorNote(gate.advisor)}  \xB7 source model:${gate.modelSource} \xB7 effort:${gate.effortSource}${gate.vendor && gate.vendor !== "anthropic" ? ` \xB7 vendor:${gate.vendorSource ?? "default"}` : ""}`;
+  return `    ${"gate".padEnd(7)} ${gate.vendor ?? "anthropic"} \xB7 ${gate.model} @ ${gate.effort}${advisorNote(gate.advisor)}${webNote(gate.web)}  \xB7 source model:${gate.modelSource} \xB7 effort:${gate.effortSource}${gate.vendor && gate.vendor !== "anthropic" ? ` \xB7 vendor:${gate.vendorSource ?? "default"}` : ""}`;
 }
 function sourceNote(file, exists) {
   return exists ? file : `${file} \u2014 not present, using baked defaults`;
@@ -14596,12 +14597,12 @@ function renderRegistry(view) {
   out.push("");
   out.push("  holistic lens  (review --holistic --repo \u2014 always claude -p; {model,effort,advisor})");
   out.push(
-    `    holistic anthropic \xB7 ${view.holistic.model} @ ${view.holistic.effort}${advisorNote(view.holistic.advisor)}`
+    `    holistic anthropic \xB7 ${view.holistic.model} @ ${view.holistic.effort}${advisorNote(view.holistic.advisor)}${webNote(view.holistic.web)}`
   );
   out.push("");
   out.push("  product seat  (review --product-docs \u2014 always claude -p; {model,effort,advisor})");
   out.push(
-    `    product  anthropic \xB7 ${view.product.model} @ ${view.product.effort}${advisorNote(view.product.advisor)}`
+    `    product  anthropic \xB7 ${view.product.model} @ ${view.product.effort}${advisorNote(view.product.advisor)}${webNote(view.product.web)}`
   );
   out.push("");
   return out.join("\n");
@@ -17156,18 +17157,21 @@ async function reviewersCommand(args) {
       model: gateSeat.config.model,
       modelSource: gateSeat.modelSource,
       vendor: gateSeat.vendor,
-      vendorSource: gateSeat.vendorSource
+      vendorSource: gateSeat.vendorSource,
+      ...gateSeat.config.web === true ? { web: true } : {}
     },
     holistic: {
       ...holisticAdvisor === void 0 ? {} : { advisor: holisticAdvisor },
       effort: holisticSeat.effort,
-      model: holisticSeat.model
+      model: holisticSeat.model,
+      ...holisticSeat.web === true ? { web: true } : {}
     },
     offSeats: offSeatsOf(reviewersConfig, enabledIds),
     product: {
       ...productAdvisor === void 0 ? {} : { advisor: productAdvisor },
       effort: productSeat.effort,
-      model: productSeat.model
+      model: productSeat.model,
+      ...productSeat.web === true ? { web: true } : {}
     },
     reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,

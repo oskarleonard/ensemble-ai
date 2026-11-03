@@ -182,3 +182,17 @@ describe('renderRegistry — the product seat row (the roster owner lists every 
     );
   });
 });
+
+describe('renderRegistry — the `· web` note on the Anthropic seat rows (vendor-side WebSearch opt-in)', () => {
+  const line = (prefix: string, over: Partial<RegistryView>): string =>
+    renderRegistry(view(over))
+      .split('\n')
+      .find((l) => l.startsWith(prefix))!;
+  it('gate, holistic and product rows carry it when set, nothing otherwise', () => {
+    expect(line('    gate ', { gate: { effort: 'max', effortSource: 'file', model: 'opus', modelSource: 'file', web: true } })).toContain(' · web  · source');
+    expect(line('    gate ', {})).not.toContain('· web');
+    expect(line('    holistic ', { holistic: { effort: 'high', model: 'opus', web: true } })).toBe('    holistic anthropic · opus @ high · web');
+    expect(line('    product ', { product: { effort: 'high', model: 'opus', web: true } })).toBe('    product  anthropic · opus @ high · web');
+    expect(line('    product ', {})).toBe('    product  anthropic · opus @ high');
+  });
+});
