@@ -219,6 +219,12 @@ export interface ConventionsRead {
 
 // A claude-shaped Read with no limit returns up to this many lines (the CLI's default window).
 const CLAUDE_READ_DEFAULT_LINES = 2000;
+// grok's read_file (`target_file`) returns at most `max_lines_read` lines — 1000 by default (xai
+// grok-tools proto, TruncationConfig) — with NO limit AND with a larger one: verified live
+// 2026-11-03 on grok 1.0.70 against a 1,500-line file, a limit-less read and a `limit: 1400` read
+// both returned lines 1–1000 (`total_lines: 1500`, no error). `offset` is the same 1-based line
+// number as claude's. So a grok read is credited min(limit, 1000) lines, never claude's 2000.
+const GROK_READ_MAX_LINES = 1000;
 
 interface LineRange {
   end: number;
@@ -315,7 +321,9 @@ export function conventionsReadOf(
           continue;
         }
         const offset = typeof input.offset === 'number' && input.offset > 0 ? input.offset : 1;
-        const limit = typeof input.limit === 'number' && input.limit > 0 ? input.limit : CLAUDE_READ_DEFAULT_LINES;
+        const asked = typeof input.limit === 'number' && input.limit > 0 ? input.limit : undefined;
+        const grokRead = tu.name === 'read_file' || typeof input.target_file === 'string';
+        const limit = grokRead ? Math.min(asked ?? GROK_READ_MAX_LINES, GROK_READ_MAX_LINES) : (asked ?? CLAUDE_READ_DEFAULT_LINES);
         pending.set(id, { end: offset + limit - 1, grep: false, start: offset });
       }
       continue;

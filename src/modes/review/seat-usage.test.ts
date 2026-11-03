@@ -140,6 +140,16 @@ describe('conventionsReadOf — how far a seat read into the conventions file (n
     const cut = JSON.stringify({ droppedChars: 2_885_307, type: 'ensemble.stream_cut' });
     expect(conventionsReadOf(claude(readFile('r1', F), cut), layout)).toEqual({ docsRead: ['CLAUDE.md', 'backend/CLAUDE.md'], state: 'read' });
   });
+  it("grok's read_file returns at most 1000 lines — with no limit and with a larger one — so a doc past line 1000 is never credited to it; claude's Read keeps its 2000 (live, grok 1.0.70, 2026-11-03)", () => {
+    const long = { indexEndLine: 33, spans: [...layout.spans, { endLine: 1200, path: 'web/AGENTS.md', startLine: 1001 }] };
+    const grokRead = (id: string, input: Record<string, unknown>) => JSON.stringify({ message: { content: [{ id, input: { target_file: F, ...input }, name: 'read_file', type: 'tool_use' }] }, type: 'assistant' });
+    const firstTwo = { docsRead: ['CLAUDE.md', 'backend/CLAUDE.md'], state: 'read' };
+    expect(conventionsReadOf(claude(grokRead('r1', {})), long)).toEqual(firstTwo);
+    expect(conventionsReadOf(claude(grokRead('r1', { limit: 1400, offset: 1 })), long)).toEqual(firstTwo);
+    expect(conventionsReadOf(claude(grokRead('r1', { offset: 1001 })), long)).toEqual({ docsRead: ['web/AGENTS.md'], state: 'read' });
+    expect(conventionsReadOf(claude(read('t1', { file_path: F }), result('t1', false)), long)).toEqual({ docsRead: ['CLAUDE.md', 'backend/CLAUDE.md', 'web/AGENTS.md'], state: 'read' });
+    expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 1400 }), result('t1', false)), long)).toEqual({ docsRead: ['CLAUDE.md', 'backend/CLAUDE.md', 'web/AGENTS.md'], state: 'read' });
+  });
   it('a whole stream with no call on the file is unread; a tool RESULT mentioning the path does not count', () => {
     expect(conventionsReadOf(claude(read('t1', { file_path: '/wt/src/x.ts' })), layout)).toEqual({ docsRead: [], state: 'unread' });
     expect(conventionsReadOf(claude(JSON.stringify({ message: { content: [{ content: `see ${F}`, tool_use_id: 'x', type: 'tool_result' }] }, type: 'user' })), layout)).toEqual({ docsRead: [], state: 'unread' });
