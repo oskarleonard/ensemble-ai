@@ -328,7 +328,10 @@ Two plumbing commands rehydrate an existing run's **trail** instead of re-runnin
   `gate-verdicts.json` + `claude-synthesis.json` in place. No reviewer re-runs. The `<pr-url>` also
   earns the gate the PR's title + body — the author's stated intent the review's gate judged with (the
   trail does not pin it; a product finding's "does this PR claim it" rests on it); without a URL the
-  regate says loudly that it runs WITHOUT the stated intent.
+  regate says loudly that it runs WITHOUT the stated intent. `--only-seat <id>` (e.g. `product`) re-gates ONE
+  seat's findings: the gate runs over that seat's persisted review alone and its records replace that
+  seat's in the trail — every other seat's verdict (posted ones included), the base block and the
+  synthesis prose stay; a seat the trail does not hold is refused.
 - **`ensemble-ai reseat --out <dir> --run-id <id> --seat <codex|grok> [<pr-url> --repo <path>]`** — one
   core seat died (incident 2026-09-02b: a vendor CLI's self-update broke its sandbox twice in a day)
   while every other seat and the gate completed. Re-runs JUST that seat against the run's own
