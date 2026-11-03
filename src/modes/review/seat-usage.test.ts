@@ -46,6 +46,18 @@ describe('parseSeatUsage — tokens, tool calls and turns off the persisted stre
     const cut = [grokInit, JSON.stringify({ droppedChars: 5000, type: 'ensemble.stream_cut' }), ...grokBody, JSON.stringify({ subtype: 'success', type: 'result', num_turns: 3 })].join('\n');
     expect(parseSeatUsage(cut)).toMatchObject({ streamTruncated: true, toolCalls: 2 });
   });
+  it("a SessionStart hook's events before init are the head, not a lost one; a mid-session hook first still is (munin-dashboard#323, 2026-10-27)", () => {
+    const hook = (subtype: string, hook_event: string) => JSON.stringify({ hook_event, hook_id: 'h', hook_name: `${hook_event}:x`, subtype, type: 'system' });
+    const hooked = [hook('hook_started', 'SessionStart'), hook('hook_response', 'SessionStart'), grokInit, ...grokBody, JSON.stringify({ subtype: 'success', type: 'result', num_turns: 3 })].join('\n');
+    expect(parseSeatUsage(hooked).streamTruncated).toBeUndefined();
+    // a slow hook's `hook_progress` between started and response is the same hook (claude CLI 2.1.317)
+    const slow = [hook('hook_started', 'SessionStart'), hook('hook_progress', 'SessionStart'), hook('hook_progress', 'SessionStart'), hook('hook_response', 'SessionStart'), grokInit, ...grokBody, JSON.stringify({ subtype: 'success', type: 'result', num_turns: 3 })].join('\n');
+    expect(parseSeatUsage(slow).streamTruncated).toBeUndefined();
+    const midSession = [hook('hook_started', 'PreToolUse'), ...grokBody, JSON.stringify({ subtype: 'success', type: 'result', num_turns: 3 })].join('\n');
+    expect(parseSeatUsage(midSession).streamTruncated).toBe(true);
+    const midProgress = [hook('hook_progress', 'PreToolUse'), ...grokBody, JSON.stringify({ subtype: 'success', type: 'result', num_turns: 3 })].join('\n');
+    expect(parseSeatUsage(midProgress).streamTruncated).toBe(true);
+  });
   it('yields nothing for an absent or unreadable stream — never a guess', () => {
     expect(parseSeatUsage(undefined)).toEqual({});
     expect(parseSeatUsage('')).toEqual({});
@@ -117,6 +129,34 @@ describe('conventionsReadOf — how far a seat read into the conventions file (n
     expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 30 }), result('t1', false)), layout)).toEqual({ docsRead: [], state: 'index-only' });
     const grep = JSON.stringify({ message: { content: [{ id: 'g1', input: { path: F, pattern: 'bun' }, name: 'Grep', type: 'tool_use' }] }, type: 'assistant' });
     expect(conventionsReadOf(claude(grep), layout)).toEqual({ docsRead: [], state: 'read' });
+  });
+  it("a SessionStart hook before init keeps the head whole: no call on the file is unread, not a lost head (anthropic seats, munin-dashboard#323 rounds 3/4/8)", () => {
+    const hook = (subtype: string) => JSON.stringify({ hook_event: 'SessionStart', hook_id: 'h', hook_name: 'SessionStart:startup', subtype, type: 'system' });
+    const hooked = (...events: string[]) => [hook('hook_started'), hook('hook_response'), init, ...events].join('\n');
+    expect(conventionsReadOf(hooked(read('t1', { file_path: '/wt/src/x.ts' })), layout)).toEqual({ docsRead: [], state: 'unread' });
+    expect(conventionsReadOf(hooked(read('t1', { file_path: F, limit: 30 }), result('t1', false)), layout)).toEqual({ docsRead: [], state: 'index-only' });
+    // a slow SessionStart hook prints `hook_progress` between started and response: still the head
+    const slow = (...events: string[]) => [hook('hook_started'), hook('hook_progress'), hook('hook_response'), init, ...events].join('\n');
+    expect(conventionsReadOf(slow(read('t1', { file_path: '/wt/src/x.ts' })), layout)).toEqual({ docsRead: [], state: 'unread' });
+    // the hook alone, no init after it: still not a head
+    expect(conventionsReadOf([hook('hook_started'), read('t1', { file_path: '/wt/src/x.ts' })].join('\n'), layout)).toBeUndefined();
+  });
+  it("grok-shaped: read_file's `target_file` is the read (the xai seat's every read, munin-dashboard#323); grep keeps `path`", () => {
+    const readFile = (id: string, target_file: string) => JSON.stringify({ message: { content: [{ id, input: { target_file }, name: 'read_file', type: 'tool_use' }] }, type: 'assistant' });
+    expect(conventionsReadOf(claude(readFile('r1', F)), layout)).toEqual({ docsRead: ['CLAUDE.md', 'backend/CLAUDE.md'], state: 'read' });
+    expect(conventionsReadOf(claude(readFile('r1', '/wt/src/x.ts')), layout)).toEqual({ docsRead: [], state: 'unread' });
+    const cut = JSON.stringify({ droppedChars: 2_885_307, type: 'ensemble.stream_cut' });
+    expect(conventionsReadOf(claude(readFile('r1', F), cut), layout)).toEqual({ docsRead: ['CLAUDE.md', 'backend/CLAUDE.md'], state: 'read' });
+  });
+  it("grok's read_file returns at most 1000 lines — with no limit and with a larger one — so a doc past line 1000 is never credited to it; claude's Read keeps its 2000 (live, grok 1.0.70, 2026-11-03)", () => {
+    const long = { indexEndLine: 33, spans: [...layout.spans, { endLine: 1200, path: 'web/AGENTS.md', startLine: 1001 }] };
+    const grokRead = (id: string, input: Record<string, unknown>) => JSON.stringify({ message: { content: [{ id, input: { target_file: F, ...input }, name: 'read_file', type: 'tool_use' }] }, type: 'assistant' });
+    const firstTwo = { docsRead: ['CLAUDE.md', 'backend/CLAUDE.md'], state: 'read' };
+    expect(conventionsReadOf(claude(grokRead('r1', {})), long)).toEqual(firstTwo);
+    expect(conventionsReadOf(claude(grokRead('r1', { limit: 1400, offset: 1 })), long)).toEqual(firstTwo);
+    expect(conventionsReadOf(claude(grokRead('r1', { offset: 1001 })), long)).toEqual({ docsRead: ['web/AGENTS.md'], state: 'read' });
+    expect(conventionsReadOf(claude(read('t1', { file_path: F }), result('t1', false)), long)).toEqual({ docsRead: ['CLAUDE.md', 'backend/CLAUDE.md', 'web/AGENTS.md'], state: 'read' });
+    expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 1400 }), result('t1', false)), long)).toEqual({ docsRead: ['CLAUDE.md', 'backend/CLAUDE.md', 'web/AGENTS.md'], state: 'read' });
   });
   it('a whole stream with no call on the file is unread; a tool RESULT mentioning the path does not count', () => {
     expect(conventionsReadOf(claude(read('t1', { file_path: '/wt/src/x.ts' })), layout)).toEqual({ docsRead: [], state: 'unread' });

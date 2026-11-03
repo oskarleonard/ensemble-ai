@@ -5275,6 +5275,7 @@ function num(v) {
 function streamHeadKind(ev) {
   if (ev.type === "thread.started") return "init";
   if (ev.type === "system" && ev.subtype === "init") return "init";
+  if (ev.type === "system" && typeof ev.subtype === "string" && ev.subtype.startsWith("hook_") && ev.hook_event === "SessionStart") return void 0;
   return typeof ev.type === "string" ? ev.type : "";
 }
 function parseSeatUsage(stream) {
@@ -5299,7 +5300,7 @@ function parseSeatUsage(stream) {
     }
     if (!e || typeof e !== "object") continue;
     const ev = e;
-    if (first === null) first = streamHeadKind(ev);
+    if (first === null) first = streamHeadKind(ev) ?? null;
     if (ev.type === STREAM_CUT_EVENT) sawCut = true;
     if (ev.type === "item.started" && ev.item && typeof ev.item === "object") {
       const it = ev.item;
@@ -5394,6 +5395,7 @@ function describeUsage(u) {
 }
 var CONVENTIONS_TOUCH_NEEDLE = ".ensemble-conventions";
 var CLAUDE_READ_DEFAULT_LINES = 2e3;
+var GROK_READ_MAX_LINES = 1e3;
 function codexRanges(command, needle) {
   if (!command.includes(needle)) return [];
   const out = [];
@@ -5424,7 +5426,7 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
     }
     if (!e || typeof e !== "object") continue;
     const ev = e;
-    if (first === null) first = streamHeadKind(ev);
+    if (first === null) first = streamHeadKind(ev) ?? null;
     if (ev.type === STREAM_CUT_EVENT) sawCut = true;
     if ((ev.type === "item.started" || ev.type === "item.completed") && ev.item && typeof ev.item === "object") {
       const it = ev.item;
@@ -5451,7 +5453,7 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
         if (!c || typeof c !== "object" || c.type !== "tool_use") continue;
         const tu = c;
         const input = tu.input && typeof tu.input === "object" ? tu.input : {};
-        const target = [input.file_path, input.path, input.command].find((v) => typeof v === "string" && v.includes(needle));
+        const target = [input.file_path, input.target_file, input.path, input.command].find((v) => typeof v === "string" && v.includes(needle));
         if (!target) continue;
         const id = typeof tu.id === "string" ? tu.id : `${pending.size}`;
         if (typeof input.command === "string") {
@@ -5463,7 +5465,9 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
           continue;
         }
         const offset = typeof input.offset === "number" && input.offset > 0 ? input.offset : 1;
-        const limit = typeof input.limit === "number" && input.limit > 0 ? input.limit : CLAUDE_READ_DEFAULT_LINES;
+        const asked = typeof input.limit === "number" && input.limit > 0 ? input.limit : void 0;
+        const grokRead = tu.name === "read_file" || typeof input.target_file === "string";
+        const limit = grokRead ? Math.min(asked ?? GROK_READ_MAX_LINES, GROK_READ_MAX_LINES) : asked ?? CLAUDE_READ_DEFAULT_LINES;
         pending.set(id, { end: offset + limit - 1, grep: false, start: offset });
       }
       continue;
