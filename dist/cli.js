@@ -5601,14 +5601,14 @@ var CLAUDE_CAPABILITY_FENCE = {
   id: "claude-capability-fence",
   version: 2
 };
-function buildClaudeReviewArgs(prompt, config, fence = {}) {
+function buildClaudeReviewArgs(config, fence = {}) {
   const homeDir = fence.homeDir ?? os12.homedir();
   if (fence.readRoot && isUnder(fence.readRoot, homeDir)) {
     throw new Error(
       `ensemble-ai: refusing to fence a Claude seat whose read root (${fence.readRoot}) is inside the home directory (${homeDir}) \u2014 the home-read deny would also deny the worktree. Point TMPDIR outside $HOME.`
     );
   }
-  const args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "plan"];
+  const args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "plan"];
   if (fence.readRoot) args.push("--add-dir", fence.readRoot);
   args.push("--strict-mcp-config");
   if (config?.model && config.model !== "default")
@@ -5630,11 +5630,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
   const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
   const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  const args = buildClaudeReviewArgs(
-    prompt,
-    config,
-    opts.worktree ? { readRoot: opts.worktree } : {}
-  );
+  const args = buildClaudeReviewArgs(config, opts.worktree ? { readRoot: opts.worktree } : {});
   const env = claudeAdvisorEnv(config);
   const cwd = makeNeutralSeatCwd();
   try {
@@ -5657,6 +5653,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
         onSpawn: opts.onSpawn,
         ...opts.onStream ? { onStdout: opts.onStream } : {},
         stderrLimit: 2e3,
+        stdin: prompt,
         timeoutMs
       });
       const elapsedMs = Date.now() - startedAt;
@@ -13265,6 +13262,7 @@ async function reseatUnderLock(opts, pre) {
   const gate = await (opts.regate ?? runRegate)({
     baseDir,
     conventionPaths: opts.conventionPaths ?? readConventionPathsFromTrail(baseDir, runId),
+    ...opts.directive ? { directive: opts.directive } : {},
     gateConfig: opts.gateConfig,
     log,
     ...opts.premise ? { premise: true } : {},
@@ -14302,6 +14300,11 @@ function renderRegistry(view) {
   out.push("  holistic lens  (review --holistic --repo \u2014 always claude -p; {model,effort,advisor})");
   out.push(
     `    holistic anthropic \xB7 ${view.holistic.model} @ ${view.holistic.effort}${advisorNote(view.holistic.advisor)}`
+  );
+  out.push("");
+  out.push("  product seat  (review --product-docs \u2014 always claude -p; {model,effort,advisor})");
+  out.push(
+    `    product  anthropic \xB7 ${view.product.model} @ ${view.product.effort}${advisorNote(view.product.advisor)}`
   );
   out.push("");
   return out.join("\n");
@@ -16839,6 +16842,11 @@ async function reviewersCommand(args) {
     holisticAdvisor = v;
     return void 0;
   });
+  let productAdvisor;
+  const productSeat = loadProductSeat(voicesFile, {}, warn, (v) => {
+    productAdvisor = v;
+    return void 0;
+  });
   const reviewersConfig = loadReviewers(reviewersFile);
   const enabledIds = enabledReviewerIds(reviewersConfig);
   const view = {
@@ -16858,6 +16866,11 @@ async function reviewersCommand(args) {
       model: holisticSeat.model
     },
     offSeats: offSeatsOf(reviewersConfig, enabledIds),
+    product: {
+      ...productAdvisor === void 0 ? {} : { advisor: productAdvisor },
+      effort: productSeat.effort,
+      model: productSeat.model
+    },
     reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,
     reviewersFileExists: fs32.existsSync(reviewersFile),
@@ -17364,8 +17377,11 @@ Usage:
                      [--repo <path>] [--gate-model <m>] [--gate-effort <e>]
                      [--reviewers-file <p>] [--sandbox <profile>] [--premise]
 
-  <pr-url>          the SAME GitHub PR URL the original review took \u2014 required only with
-                    --repo (the worktree re-materialization fetches pull/<N>/head)
+  <pr-url>          the SAME GitHub PR URL the original review took. Required with --repo (the
+                    worktree re-materialization fetches pull/<N>/head); on its own it still earns
+                    the regate the PR's title + body \u2014 the author's stated intent the review's gate
+                    judged with (directive parity, as \`regate\` has it). Without it the union is
+                    regated WITHOUT the stated intent, said loudly
   --out <dir>       the trail base the original run wrote (its <run-id>/ dir lives here)
   --run-id <id>     the original run's id
   --seat <id>       the FAILED seat to heal. A seat that completed is refused \u2014 re-running a
@@ -17471,9 +17487,9 @@ async function reseatCommand(args) {
   let session = null;
   let worktreeUnavailable;
   const repoFlag = typeof values.repo === "string" ? values.repo.trim() : "";
+  const prUrl = positionals[0]?.trim() ?? "";
+  const ref = prUrl ? parsePrUrl(prUrl) : null;
   if (repoFlag) {
-    const url = positionals[0]?.trim() ?? "";
-    const ref = url ? parsePrUrl(url) : null;
     if (!ref) {
       console.error("ensemble-ai reseat: --repo needs the original PR URL as the positional (the head is re-fetched as pull/<N>/head)");
       return 3;
@@ -17500,10 +17516,19 @@ async function reseatCommand(args) {
     );
   }
   try {
+    let directive;
+    if (ref) {
+      const fetched = fetchPrDirective({ pr: ref.pr, repoSlug: `${ref.owner}/${ref.repo}` }, process.cwd());
+      if ("directive" in fetched) directive = fetched.directive;
+      else console.error(`\xB7 directive: PR #${ref.pr} description unavailable (${fetched.error}) \u2014 regating WITHOUT the author's stated intent`);
+    } else {
+      console.error("\xB7 directive: no PR URL given \u2014 regating WITHOUT the author's stated intent (pass the PR URL as the positional)");
+    }
     const res = await runReseat({
       adapter: REVIEW_ADAPTERS[seat],
       baseDir: out,
       // conventionPaths: left to the module, which defaults to THIS run's own trail.
+      ...directive ? { directive } : {},
       gateConfig: gateSeat.config,
       log: (m) => console.error(`\xB7 ${m}`),
       ...values.premise ? { premise: true } : {},

@@ -43,6 +43,9 @@ export interface RegistryView {
   gate: GateSeatView;
   // The holistic lens (from the voices.json `holistic` entry → the built-in opus @ high).
   holistic: HolisticSeatView;
+  // The product seat (review --product-docs; from the voices.json `product` entry → opus @ high).
+  // Same shape as the lens: single anthropic seat, {model, effort, advisor}.
+  product: HolisticSeatView;
   // Every seat that is OFF, with its quota window when that is what holds it off. `until` is
   // null for an indefinite `enabled: false` (an `enabled: false` seat that also carries a date
   // reports null too — the date is not what the switch honours). Same rule as the fan-out.
@@ -136,6 +139,11 @@ export function renderRegistry(view: RegistryView): string {
   out.push('  holistic lens  (review --holistic --repo — always claude -p; {model,effort,advisor})');
   out.push(
     `    holistic anthropic · ${view.holistic.model} @ ${view.holistic.effort}${advisorNote(view.holistic.advisor)}`
+  );
+  out.push('');
+  out.push('  product seat  (review --product-docs — always claude -p; {model,effort,advisor})');
+  out.push(
+    `    product  anthropic · ${view.product.model} @ ${view.product.effort}${advisorNote(view.product.advisor)}`
   );
   out.push('');
   return out.join('\n');

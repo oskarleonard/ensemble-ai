@@ -4702,14 +4702,14 @@ var CLAUDE_CAPABILITY_FENCE = {
   id: "claude-capability-fence",
   version: 2
 };
-function buildClaudeReviewArgs(prompt, config, fence = {}) {
+function buildClaudeReviewArgs(config, fence = {}) {
   const homeDir = fence.homeDir ?? os10.homedir();
   if (fence.readRoot && isUnder(fence.readRoot, homeDir)) {
     throw new Error(
       `ensemble-ai: refusing to fence a Claude seat whose read root (${fence.readRoot}) is inside the home directory (${homeDir}) \u2014 the home-read deny would also deny the worktree. Point TMPDIR outside $HOME.`
     );
   }
-  const args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "plan"];
+  const args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "plan"];
   if (fence.readRoot) args.push("--add-dir", fence.readRoot);
   args.push("--strict-mcp-config");
   if (config?.model && config.model !== "default")
@@ -4731,11 +4731,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
   const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
   const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  const args = buildClaudeReviewArgs(
-    prompt,
-    config,
-    opts.worktree ? { readRoot: opts.worktree } : {}
-  );
+  const args = buildClaudeReviewArgs(config, opts.worktree ? { readRoot: opts.worktree } : {});
   const env = claudeAdvisorEnv(config);
   const cwd = makeNeutralSeatCwd();
   try {
@@ -4758,6 +4754,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
         onSpawn: opts.onSpawn,
         ...opts.onStream ? { onStdout: opts.onStream } : {},
         stderrLimit: 2e3,
+        stdin: prompt,
         timeoutMs
       });
       const elapsedMs = Date.now() - startedAt;

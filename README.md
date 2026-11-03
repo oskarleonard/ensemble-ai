@@ -16,7 +16,7 @@ It's the portable engine behind a cross-vendor *code review* workflow: give it a
 | `ensemble-ai consult "<q>"` (alias `ask`) | Cross-vendor Q&A: each voice answers independently → one synthesizes AGREE (confident) vs DIVERGE (look closer) + a bottom line; `--debate` then argues each split with evidence and an independent judge rules. | `--file <p>` · `--critique` · `--debate` · `--debate-rounds <n>` · `--judge <id>` · `--voices <ids>` · `--synthesizer <id>` · `--json` |
 | `ensemble-ai receipt verify\|show` | The content-tied gate primitive: `verify` exits 0 iff the current diff is reviewed & current; `show` pretty-prints a receipt. | `--strict`/`--require-artifacts` · `--trail <dir>` · `--store <dir>` · `--staged` · `--working-tree` · `--reviewers <ids>` · **`--repo <dir>`** (ask for worktree evidence) · `--accept-degraded` |
 | `ensemble-ai push-fence --pr <N\|url>` | The **fix tail's** fence: exit 0 iff you own the PR's head ref; exit 5 = REFUSED (fork / no push access) → stage a pending review instead. Never pushes, never routes. | `--pr <N\|url>` · `--cwd <dir>` |
-| `ensemble-ai reviewers` (alias `config`) | Print the **resolved** seats — reviewers (`reviewers.json`) + voices (`voices.json`): id · vendor · model · effort · advisor · sandbox + source file. Read-only. | `--json` · `--reviewers-file <p>` · `--voices-file <p>` |
+| `ensemble-ai reviewers` (alias `config`) | Print the **resolved** seats — reviewers (`reviewers.json`) + voices (`voices.json`) + the gate, holistic and product seats: id · vendor · model · effort · advisor · sandbox + source file. Read-only. | `--json` · `--reviewers-file <p>` · `--voices-file <p>` |
 | `ensemble-ai diff [<pr-url>]` | Cost-preview / debug: the exact packet the reviewers WOULD get (identity + coverage + prompt size) — no vendor called. | same diff sources as `review` · `--profile code\|security` · `--full` · `--json` |
 | `ensemble-ai pin-check` | Is your **pinned** ensemble-ai current with `main`? Compares the checkout's commit against `origin/main` and reports the drift (`current` / `STALE — N behind` / `ahead` / `diverged`), so a consumer's own doctor/health check catches a silently-stale pin instead of running the old engine unnoticed. Exit 0 = current/ahead, 3 = stale/diverged, 1 = error. | `--repo <dir>` · `--pin <ref>` · `--main-ref <ref>` · `--no-fetch` · `--json` |
 | **Claude skills** | Slash wrappers: `/ensemble-ai-review` · `/ensemble-ai-security` · `/ensemble-ai-brainstorm` · `/ensemble-ai-consult` (thin) + **`/ensemble-ai-review-fix`** — the pre-PR ritual (simplify → review → fix the gate verdicts → re-review → offer a PR). | installed per config dir via `entrypoints/install.sh` |
@@ -325,12 +325,16 @@ Two plumbing commands rehydrate an existing run's **trail** instead of re-runnin
 - **`ensemble-ai regate --out <dir> --run-id <id> [<pr-url> --repo <path>]`** — the synthesis gate died
   (timeout, quota) and fail-closed every verdict to `unverified` while the reviewer work sat complete
   on disk. Re-spawns ONE gate seat over the persisted reviews + pinned packet and rewrites
-  `gate-verdicts.json` + `claude-synthesis.json` in place. No reviewer re-runs.
+  `gate-verdicts.json` + `claude-synthesis.json` in place. No reviewer re-runs. The `<pr-url>` also
+  earns the gate the PR's title + body — the author's stated intent the review's gate judged with (the
+  trail does not pin it; a product finding's "does this PR claim it" rests on it); without a URL the
+  regate says loudly that it runs WITHOUT the stated intent.
 - **`ensemble-ai reseat --out <dir> --run-id <id> --seat <codex|grok> [<pr-url> --repo <path>]`** — one
   core seat died (incident 2026-09-02b: a vendor CLI's self-update broke its sandbox twice in a day)
   while every other seat and the gate completed. Re-runs JUST that seat against the run's own
   `prompt.<seat>.md` — byte-identical to what every seat saw, with the worktree preamble re-issued for
-  the freshly re-materialized head — then regates the union. A preamble written by **another engine
+  the freshly re-materialized head — then regates the union, with the same stated intent the `<pr-url>`
+  earns `regate` (directive parity — the URL is read for it with or without `--repo`). A preamble written by **another engine
   version** (the suffix's prose changed after the run was persisted — a reworded header line or
   read-only clause is still refused) is **re-rendered, not refused**: the pinned packet before its
   header is what stays byte-identical, and the `reseats[]` entry says so with

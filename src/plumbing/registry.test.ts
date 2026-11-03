@@ -21,6 +21,7 @@ function view(over: Partial<RegistryView> = {}): RegistryView {
     gate: { effort: 'default', effortSource: 'default', model: 'default', modelSource: 'default' },
     holistic: { effort: 'high', model: 'opus' },
     offSeats: [],
+    product: { effort: 'high', model: 'opus' },
     reviewers,
     reviewersFile: '/home/x/.ensemble-ai/reviewers.json',
     reviewersFileExists: true,
@@ -154,6 +155,30 @@ describe('renderRegistry — the holistic lens row', () => {
   it('an invalid advisor is shown as written and marked, the model and effort kept', () => {
     expect(holisticLine({ advisor: 7, effort: 'high', model: 'opus' })).toBe(
       '    holistic anthropic · opus @ high · advisor 7 (INVALID — a command that runs this seat refuses it)'
+    );
+  });
+});
+
+describe('renderRegistry — the product seat row (the roster owner lists every seat a review can spawn)', () => {
+  const productLine = (product: RegistryView['product']): string =>
+    renderRegistry(view({ product }))
+      .split('\n')
+      .find((l) => l.startsWith('    product '))!;
+
+  it('renders model @ effort and a stated advisor, under its own heading', () => {
+    expect(productLine({ advisor: 'claude-fable-5-1', effort: 'max', model: 'fable' })).toBe(
+      '    product  anthropic · fable @ max · advisor claude-fable-5-1'
+    );
+    expect(renderRegistry(view())).toContain('  product seat  (review --product-docs — always claude -p; {model,effort,advisor})');
+  });
+
+  it('no advisor note when the seat inherits', () => {
+    expect(productLine({ effort: 'high', model: 'opus' })).toBe('    product  anthropic · opus @ high');
+  });
+
+  it('an invalid advisor is shown marked, never dropped', () => {
+    expect(productLine({ advisor: 7, effort: 'high', model: 'opus' })).toBe(
+      '    product  anthropic · opus @ high · advisor 7 (INVALID — a command that runs this seat refuses it)'
     );
   });
 });
