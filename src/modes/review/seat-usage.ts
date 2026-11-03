@@ -47,9 +47,15 @@ function num(v: unknown): number | undefined {
 // `thread.started`; claude-shaped `system`/`init` — NOT any `system` event: a claude seat emits
 // one `system`/`thinking_tokens` per turn, so a lost-head tail starts with one of those more
 // often than not, which is how run d5a1f648's part 1 passed as intact), else what it was.
-function streamHeadKind(ev: Record<string, unknown>): string {
+// `undefined` = not the head's verdict yet: a claude CLI whose user has a SessionStart hook prints
+// that hook's `hook_started`/`hook_response` events BEFORE its `init` (every anthropic seat of
+// munin-dashboard#323's eight rounds, 2026-10-27 — three read as a lost head, their true fact
+// `unread`). Only the SessionStart hook sits before init; a tail resuming on a mid-session hook
+// (PreToolUse, …) is still a lost head.
+function streamHeadKind(ev: Record<string, unknown>): string | undefined {
   if (ev.type === 'thread.started') return 'init';
   if (ev.type === 'system' && ev.subtype === 'init') return 'init';
+  if (ev.type === 'system' && (ev.subtype === 'hook_started' || ev.subtype === 'hook_response') && ev.hook_event === 'SessionStart') return undefined;
   return typeof ev.type === 'string' ? ev.type : '';
 }
 
@@ -75,7 +81,7 @@ export function parseSeatUsage(stream: string | null | undefined): SeatUsage {
     }
     if (!e || typeof e !== 'object') continue;
     const ev = e as Record<string, unknown>;
-    if (first === null) first = streamHeadKind(ev);
+    if (first === null) first = streamHeadKind(ev) ?? null;
     if (ev.type === STREAM_CUT_EVENT) sawCut = true;
     // codex
     if (ev.type === 'item.started' && ev.item && typeof ev.item === 'object') {
@@ -264,7 +270,7 @@ export function conventionsReadOf(
     }
     if (!e || typeof e !== 'object') continue;
     const ev = e as Record<string, unknown>;
-    if (first === null) first = streamHeadKind(ev);
+    if (first === null) first = streamHeadKind(ev) ?? null;
     if (ev.type === STREAM_CUT_EVENT) sawCut = true;
     if ((ev.type === 'item.started' || ev.type === 'item.completed') && ev.item && typeof ev.item === 'object') {
       const it = ev.item as Record<string, unknown>;
@@ -294,7 +300,10 @@ export function conventionsReadOf(
         if (!c || typeof c !== 'object' || (c as Record<string, unknown>).type !== 'tool_use') continue;
         const tu = c as Record<string, unknown>;
         const input = (tu.input && typeof tu.input === 'object' ? tu.input : {}) as Record<string, unknown>;
-        const target = [input.file_path, input.path, input.command].find((v) => typeof v === 'string' && v.includes(needle));
+        // `file_path` is claude's Read, `path` its Grep, `command` its Bash; `target_file` is the grok
+        // CLI's read_file (its grep takes `path`) — the key the xai seat's every read rode on, unseen
+        // (munin-dashboard#323 rounds 1–8: the read at line ~45 of each stream, the fact `head-lost`).
+        const target = [input.file_path, input.target_file, input.path, input.command].find((v) => typeof v === 'string' && v.includes(needle));
         if (!target) continue;
         const id = typeof tu.id === 'string' ? tu.id : `${pending.size}`;
         if (typeof input.command === 'string') {
