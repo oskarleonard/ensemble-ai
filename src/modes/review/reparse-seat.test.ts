@@ -6,10 +6,12 @@ import { describe, expect, it } from 'vitest';
 
 import { reviewDir } from '../../core/artifacts';
 import type { ResolvedVoiceConfig } from '../brainstorm/types';
+import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { persistGatePacket } from './gate-hunks';
 import type { RegateOptions, RegateResult } from './regate';
-import { checkReparse, reparseRefusal, runReparseSeat } from './reparse-seat';
+import { checkReparse, isRerun, reparseRefusal, runReparseSeat } from './reparse-seat';
+import { CONVENTIONS_TRAIL_COPY, PRODUCER_PROMPT_SIDECAR, producerPromptFile } from './self-contained';
 
 const GATE_CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'max', id: 'claude', model: 'opus', vendor: 'anthropic' };
 const REGATE_OK: RegateResult = {
@@ -105,23 +107,23 @@ describe('checkReparse — the pre-touch refusals', () => {
     expect(reparseRefusal(base, runId, 'claude')).toMatch(/cut off .* \(inactivity\)/);
   });
 
-  it('refuses a reply this engine still cannot read — a re-run is not what this path does', () => {
+  it('refuses a reply this engine still cannot read when the run has no pinned prompt — a re-run needs one', () => {
     const { base, runId } = seedRun({ raw: "You've hit your session limit · resets 5:10pm" });
-    expect(reparseRefusal(base, runId, 'claude')).toMatch(/still does not parse .* re-run of this seat is not supported yet/);
+    expect(reparseRefusal(base, runId, 'claude')).toMatch(/still does not parse .* no pinned producer prompt/);
   });
 
-  it('refuses a multi-part reply for now', () => {
+  it('refuses a multi-part reply when the run has no pinned prompts', () => {
     const { base, dir, runId } = seedRun();
     fs.writeFileSync(path.join(dir, 'claude-review.c1.raw.md'), BROKEN_RAW);
     fs.writeFileSync(path.join(dir, 'claude-review.c2.raw.md'), BROKEN_RAW);
-    expect(reparseRefusal(base, runId, 'claude')).toMatch(/in 2 parts/);
+    expect(reparseRefusal(base, runId, 'claude')).toMatch(/in 2 parts .* no pinned producer prompt/);
   });
 
   it('reads the broken reply into findings when nothing refuses', () => {
     const { base, runId } = seedRun();
     const pre = checkReparse(base, runId, 'claude');
     expect('refusal' in pre).toBe(false);
-    if ('refusal' in pre) return;
+    if ('refusal' in pre || isRerun(pre)) return;
     expect(pre.findings.map((f) => f.evidence.line)).toEqual([162, 103]);
     expect(pre.summary).toBe('Two lows.');
   });
@@ -223,5 +225,196 @@ describe('runReparseSeat — heals the trail without a spawn, then regates the u
     const { base, dir, runId } = seedRun();
     await runReparseSeat({ baseDir: base, gateConfig: GATE_CFG, regate: async () => REGATE_OK, runId, seat: 'claude' });
     expect(fs.existsSync(path.join(dir, 'reseat.lock'))).toBe(false);
+  });
+});
+
+// ── The RE-RUN half (2026-11-03): a reply the re-read cannot heal, with the producer's prompt pinned ──
+
+const SEAT_CFG: ResolvedVoiceConfig = { cmd: 'claude', effort: 'xhigh', id: 'claude', model: 'opus', vendor: 'anthropic' };
+// A reply this engine CANNOT read: prose, no JSON block at all.
+const UNREADABLE_RAW = 'I looked at the change and have thoughts, but no block follows.';
+const GOOD_RAW = [
+  'One medium.',
+  '```json',
+  '{"summary":"One medium.","findings":[{"title":"Rate rounds the wrong way","body":"b","severity":"medium","confidence":"high","evidence":{"file":"src/row.tsx","line":12}}]}',
+  '```',
+].join('\n');
+const PART_RAW = (n: number) => [
+  `Part ${n}.`,
+  '```json',
+  `{"summary":"Part ${n} summary.","findings":[{"title":"Finding of part ${n}","body":"b","severity":"low","confidence":"high","evidence":{"file":"src/p${n}.tsx","line":${n}}}]}`,
+  '```',
+].join('\n');
+const okRun = (raw: string): VoiceRunResult => ({ ok: true, raw, stderrTail: '', timedOut: false });
+
+function pinPrompt(dir: string, over: Partial<{ worktree: string | null; parts: number; conventionsPath: string | null; history: boolean }> = {}, prompts?: Record<number, string>): void {
+  const parts = over.parts ?? 1;
+  fs.writeFileSync(
+    path.join(dir, PRODUCER_PROMPT_SIDECAR),
+    JSON.stringify({ baseSha: 'b'.repeat(40), conventionsPath: over.conventionsPath ?? null, headSha: 'd'.repeat(40), history: over.history ?? false, parts, schemaVersion: 1, worktree: over.worktree ?? null })
+  );
+  if (parts === 1) fs.writeFileSync(path.join(dir, producerPromptFile()), prompts?.[1] ?? 'THE PINNED PRODUCER PROMPT');
+  else for (let k = 1; k <= parts; k++) fs.writeFileSync(path.join(dir, producerPromptFile(k)), prompts?.[k] ?? `PINNED PROMPT PART ${k}`);
+}
+
+describe('checkReparse — the re-run branch when the producer prompt is pinned', () => {
+  it('an unreadable reply with a pinned prompt is a re-run, not a refusal; without the pin the refusal says why', () => {
+    const a = seedRun({ raw: UNREADABLE_RAW });
+    expect(reparseRefusal(a.base, a.runId, 'claude')).toMatch(/no pinned producer prompt/);
+    pinPrompt(a.dir);
+    const pre = checkReparse(a.base, a.runId, 'claude');
+    expect(isRerun(pre)).toBe(true);
+    if (!isRerun(pre)) return;
+    expect(pre.why).toMatch(/still does not parse/);
+    expect(pre.parts).toEqual([{ index: 1, prompt: 'THE PINNED PRODUCER PROMPT', reuse: null }]);
+  });
+
+  it('a cut-off reply with a pinned prompt is a re-run — and never reuses what survived', () => {
+    const { base, dir, runId } = seedRun({ raw: GOOD_RAW, review: { ...FAILED_STUB, diagnostics: { ...FAILED_STUB.diagnostics, timedOutReason: 'inactivity' } } });
+    pinPrompt(dir);
+    const pre = checkReparse(base, runId, 'claude');
+    expect(isRerun(pre) && pre.why).toMatch(/cut off .*inactivity/);
+    expect(isRerun(pre) && pre.parts[0].reuse).toBeNull();
+  });
+
+  it('a missing reply with a pinned prompt is a re-run', () => {
+    const { base, dir, runId } = seedRun({ raw: null });
+    pinPrompt(dir);
+    expect(isRerun(checkReparse(base, runId, 'claude'))).toBe(true);
+  });
+
+  it('a review in parts: the part whose reply parses is reused, the unreadable one is to be re-run', () => {
+    const { base, dir, runId } = seedRun({ raw: null });
+    pinPrompt(dir, { parts: 2 });
+    fs.writeFileSync(path.join(dir, 'claude-review.c1.raw.md'), UNREADABLE_RAW);
+    fs.writeFileSync(path.join(dir, 'claude-review.c2.raw.md'), PART_RAW(2));
+    const pre = checkReparse(base, runId, 'claude');
+    expect(isRerun(pre)).toBe(true);
+    if (!isRerun(pre)) return;
+    expect(pre.parts.map((p) => [p.index, p.reuse === null])).toEqual([[1, true], [2, false]]);
+    expect(pre.parts[1].reuse?.findings[0].title).toBe('Finding of part 2');
+  });
+});
+
+describe('runReparseSeat — the re-run: the seat is re-spawned from its pinned prompt, then the union regated', () => {
+  it('re-runs a single-part seat, persists the new reply, stamps rerun: true, regates once', async () => {
+    const { base, dir, runId } = seedRun({ raw: UNREADABLE_RAW });
+    pinPrompt(dir);
+    const prompts: string[] = [];
+    const regates: RegateOptions[] = [];
+    const res = await runReparseSeat({
+      baseDir: base,
+      gateConfig: GATE_CFG,
+      regate: async (o) => (regates.push(o), REGATE_OK),
+      run: async (p) => (prompts.push(p), okRun(GOOD_RAW)),
+      runId,
+      seat: 'claude',
+      seatConfig: SEAT_CFG,
+    });
+    expect(res.ok).toBe(true);
+    expect(res.rerun).toEqual({ parts: [1] });
+    expect(prompts).toEqual(['THE PINNED PRODUCER PROMPT']); // byte-identical: a packet prompt names no tree
+    expect(regates).toHaveLength(1);
+    const review = JSON.parse(fs.readFileSync(path.join(dir, 'review.claude.json'), 'utf8')) as { ok: boolean; findings: { title: string }[] };
+    expect(review.ok).toBe(true);
+    expect(review.findings.map((f) => f.title)).toEqual(['Rate rounds the wrong way']);
+    expect(fs.readFileSync(path.join(dir, 'claude-review.raw.md'), 'utf8')).toBe(GOOD_RAW); // the new reply is the record
+    const synth = JSON.parse(fs.readFileSync(path.join(dir, 'claude-synthesis.json'), 'utf8')) as { reseats: Array<Record<string, unknown>> };
+    expect(synth.reseats).toHaveLength(1);
+    expect(synth.reseats[0].rerun).toBe(true);
+    expect(synth.reseats[0].reparsed).toBeUndefined();
+    expect(synth.reseats[0].partsRerun).toEqual([1]);
+    expect(synth.reseats[0].realized).toBe('packet');
+    expect(synth.reseats[0].why).toMatch(/still does not parse/);
+    const chunks = JSON.parse(fs.readFileSync(path.join(dir, 'chunks.json'), 'utf8')) as { chunks: Array<{ seats: Record<string, { state: string; findings: number }> }> };
+    expect(chunks.chunks[0].seats.claude).toMatchObject({ findings: 1, state: 'reviewed' });
+  });
+
+  it('a worktree prompt is refused without a worktree, before any spawn; with one, the prompt is re-pointed at it', async () => {
+    const { base, dir, runId } = seedRun({ raw: UNREADABLE_RAW });
+    const OLD = '/tmp/ensemble-wt-OLD/tree';
+    pinPrompt(dir, { worktree: OLD }, { 1: `Read the project at ${OLD} (detached). Conventions: ${OLD}/.ensemble-conventions/CONVENTIONS.md` });
+    let spawned = 0;
+    await expect(
+      runReparseSeat({ baseDir: base, gateConfig: GATE_CFG, regate: async () => REGATE_OK, run: async () => (spawned++, okRun(GOOD_RAW)), runId, seat: 'claude', seatConfig: SEAT_CFG })
+    ).rejects.toThrow(/names a worktree .* pass --repo/);
+    expect(spawned).toBe(0);
+    const NEW = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-wt-NEW-'));
+    const prompts: string[] = [];
+    const res = await runReparseSeat({
+      baseDir: base,
+      gateConfig: GATE_CFG,
+      regate: async () => REGATE_OK,
+      run: async (p) => (prompts.push(p), okRun(GOOD_RAW)),
+      runId,
+      seat: 'claude',
+      seatConfig: SEAT_CFG,
+      worktree: NEW,
+    });
+    expect(res.ok).toBe(true);
+    expect(prompts[0]).toBe(`Read the project at ${NEW} (detached). Conventions: ${NEW}/.ensemble-conventions/CONVENTIONS.md`);
+    expect(prompts[0]).not.toContain(OLD);
+    const synth = JSON.parse(fs.readFileSync(path.join(dir, 'claude-synthesis.json'), 'utf8')) as { reseats: Array<Record<string, unknown>> };
+    expect(synth.reseats[0].realized).toBe('worktree');
+  });
+
+  it('a review in parts re-runs ONLY the unreadable part, reuses the rest, and merges with chunk ids', async () => {
+    const { base, dir, runId } = seedRun({ raw: null });
+    pinPrompt(dir, { parts: 2 });
+    fs.writeFileSync(path.join(dir, 'claude-review.c1.raw.md'), UNREADABLE_RAW);
+    fs.writeFileSync(path.join(dir, 'claude-review.c2.raw.md'), PART_RAW(2));
+    const prompts: string[] = [];
+    const res = await runReparseSeat({
+      baseDir: base,
+      gateConfig: GATE_CFG,
+      regate: async () => REGATE_OK,
+      run: async (p) => (prompts.push(p), okRun(PART_RAW(1))),
+      runId,
+      seat: 'claude',
+      seatConfig: SEAT_CFG,
+    });
+    expect(res.ok).toBe(true);
+    expect(prompts).toEqual(['PINNED PROMPT PART 1']); // part 2 was never re-billed
+    expect(res.rerun).toEqual({ parts: [1] });
+    expect(res.review.findings.map((f) => [f.id, f.chunk, f.title])).toEqual([
+      ['f1', 1, 'Finding of part 1'],
+      ['f2', 2, 'Finding of part 2'],
+    ]);
+    expect(res.review.summary).toBe('Part 1/2: Part 1 summary.\nPart 2/2: Part 2 summary.');
+    expect(fs.readFileSync(path.join(dir, 'claude-review.c1.raw.md'), 'utf8')).toBe(PART_RAW(1));
+    expect(fs.readFileSync(path.join(dir, 'claude-review.raw.md'), 'utf8')).toContain('## Part 2 of 2');
+  });
+
+  it('a seat that fails AGAIN stops before the gate — stamped, no regate', async () => {
+    const { base, dir, runId } = seedRun({ raw: UNREADABLE_RAW });
+    pinPrompt(dir);
+    let regated = 0;
+    const res = await runReparseSeat({
+      baseDir: base,
+      gateConfig: GATE_CFG,
+      regate: async () => (regated++, REGATE_OK),
+      run: async () => okRun('still nothing readable here'),
+      runId,
+      seat: 'claude',
+      seatConfig: SEAT_CFG,
+    });
+    expect(res.ok).toBe(false);
+    expect(res.gate).toBeNull();
+    expect(regated).toBe(0);
+    const synth = JSON.parse(fs.readFileSync(path.join(dir, 'claude-synthesis.json'), 'utf8')) as { reseats: Array<Record<string, unknown>> };
+    expect(synth.reseats[0]).toMatchObject({ outcome: 'failed-reviewer', rerun: true });
+  });
+
+  it('the conventions file the prompt names is re-created in the fresh tree from the trail copy', async () => {
+    const { base, dir, runId } = seedRun({ raw: UNREADABLE_RAW });
+    const OLD = '/tmp/ensemble-wt-OLD/tree';
+    pinPrompt(dir, { conventionsPath: `${OLD}/.ensemble-conventions/CONVENTIONS.md`, worktree: OLD });
+    fs.writeFileSync(path.join(dir, CONVENTIONS_TRAIL_COPY), '# the gathered rules\n');
+    const NEW = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-wt-NEW-'));
+    const res = await runReparseSeat({ baseDir: base, gateConfig: GATE_CFG, regate: async () => REGATE_OK, run: async () => okRun(GOOD_RAW), runId, seat: 'claude', seatConfig: SEAT_CFG, worktree: NEW });
+    expect(res.ok).toBe(true);
+    expect(fs.readFileSync(path.join(NEW, '.ensemble-conventions', 'CONVENTIONS.md'), 'utf8')).toBe('# the gathered rules\n');
+    const synth = JSON.parse(fs.readFileSync(path.join(dir, 'claude-synthesis.json'), 'utf8')) as { reseats: Array<Record<string, unknown>> };
+    expect(synth.reseats[0].conventionsNote).toBeUndefined();
   });
 });
