@@ -74,6 +74,14 @@ export const CLAUDE_CAPABILITY_FENCE: SandboxProfileRef = {
   version: 2,
 };
 
+// The profile a seat attests: the fence, or the fence WITH vendor-side web search — a distinct id,
+// so a web-enabled run never verifies as equivalent to a fully fenced one (the deny-list is one
+// tool shorter: `WebSearch` is the vendor's search behind Anthropic's own host; `WebFetch` — the
+// local CLI reaching an arbitrary URL, the exfiltration channel the fence closes — stays denied).
+export function claudeFenceProfile(web = false): SandboxProfileRef {
+  return web ? { id: `${CLAUDE_CAPABILITY_FENCE.id}+websearch`, version: CLAUDE_CAPABILITY_FENCE.version } : CLAUDE_CAPABILITY_FENCE;
+}
+
 // The effort whitelist, the transient/usage-limit predicates, the liveness bar and the stream-json
 // result extractor live in core/claude-stream.ts (shared with the brainstorm/consult voice since
 // 2026-10-09); re-exported here so every existing importer keeps its path.
@@ -125,26 +133,33 @@ export interface ClaudeSeatFence {
 // worktree, and a seat that silently reviewed nothing is exactly the fail-open this fence exists to
 // prevent. THROWS, too, on an invalid `advisor` (claudeAdvisorArgs). Callers turn the throw into a
 // loud, failed seat.
-export function buildClaudeReviewArgs(
-  prompt: string,
-  config?: VoiceConfig,
-  fence: ClaudeSeatFence = {}
-): string[] {
+// The PROMPT is not an arg: it rides stdin (runClaudeReviewVoice) — `-p` with no positional prompt
+// reads it from stdin. The product seat's prompt carries whole documents (≤ 400 KB) plus a skeleton,
+// the same class as the probe's E2BIG (incident 2026-10-16); argv is capped, a pipe is not. Not a
+// fence change: the capability profile is the tool deny-list, the mode and the read root — none of
+// which moved — so the seat's {id, version} stays.
+export function buildClaudeReviewArgs(config?: VoiceConfig, fence: ClaudeSeatFence = {}): string[] {
   const homeDir = fence.homeDir ?? os.homedir();
   if (fence.readRoot && isUnder(fence.readRoot, homeDir)) {
     throw new Error(
       `ensemble-ai: refusing to fence a Claude seat whose read root (${fence.readRoot}) is inside the home directory (${homeDir}) — the home-read deny would also deny the worktree. Point TMPDIR outside $HOME.`
     );
   }
-  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--permission-mode', 'plan'];
+  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'plan'];
   if (fence.readRoot) args.push('--add-dir', fence.readRoot);
   args.push('--strict-mcp-config');
+  // Vendor-side web search for this seat (`web: true` on its voices.json entry): `WebSearch` is
+  // pre-approved for the headless spawn (`--allowedTools` is load-bearing — a `-p` spawn silently
+  // denies a permission-gated tool) and left off the deny-list below. `WebFetch` never is: that is
+  // the local CLI reaching an arbitrary URL. The seat then attests `claude-capability-fence+websearch`.
+  if (config?.web === true) args.push('--allowedTools', 'WebSearch');
   if (config?.model && config.model !== 'default')
     args.push('--model', config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort))
     args.push('--effort', config.effort);
   args.push(...claudeAdvisorArgs(config));
-  args.push('--disallowedTools', ...CLAUDE_REVIEW_DENIED_TOOLS, ...homeReadDenyRules(homeDir));
+  const denied = CLAUDE_REVIEW_DENIED_TOOLS.filter((t) => !(config?.web === true && t === 'WebSearch'));
+  args.push('--disallowedTools', ...denied, ...homeReadDenyRules(homeDir));
   return args;
 }
 
@@ -198,11 +213,7 @@ export async function runClaudeReviewVoice(
   const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   // Built BEFORE the neutral cwd exists, so an unfenceable read root throws without leaking a dir.
-  const args = buildClaudeReviewArgs(
-    prompt,
-    config,
-    opts.worktree ? { readRoot: opts.worktree } : {}
-  );
+  const args = buildClaudeReviewArgs(config, opts.worktree ? { readRoot: opts.worktree } : {});
   const env = claudeAdvisorEnv(config);
   // WORKTREE EVIDENCE (§2): the worktree is the seat's READ ROOT (`--add-dir`), never its cwd. The
   // seat never owns the worktree; the run reaps it. The neutral cwd is ours, and we reap it here.
@@ -235,6 +246,7 @@ export async function runClaudeReviewVoice(
         onSpawn: opts.onSpawn,
         ...(opts.onStream ? { onStdout: opts.onStream } : {}),
         stderrLimit: 2000,
+        stdin: prompt,
         timeoutMs,
       });
       const elapsedMs = Date.now() - startedAt;

@@ -11,6 +11,8 @@
 // writeTrailFile. The Opus reviewer/synthesizer spawn is best-effort read-only (see
 // ./claude), accepted by design (the user runs it on their own diffs).
 
+import fs from 'node:fs';
+
 import { readReviewsForRun, writeTrailFile } from '../../core/artifacts';
 import { evidenceRef, parseFindings } from '../../core/findings';
 import { scrubControl as scrub } from '../../core/sanitize';
@@ -162,7 +164,7 @@ export function persistSeatReview(
 // An Anthropic seat's review with the advisor its RESOLVED config stated — attached before the
 // persist so the in-memory review and review.<seat>.json are one shape. Absent stays absent (the
 // seat inherited the operator's settings), so the trail tells "off" from inherit.
-function withSeatAdvisor(review: VoiceReview, config: ResolvedVoiceConfig): VoiceReview {
+export function withSeatAdvisor(review: VoiceReview, config: ResolvedVoiceConfig): VoiceReview {
   return config.advisor === undefined ? review : { ...review, advisor: config.advisor };
 }
 
@@ -190,7 +192,7 @@ export function loadVoiceReviewsFromTrail(
   return out;
 }
 
-type ClaudeRunner = (
+export type ClaudeRunner = (
   prompt: string,
   config: VoiceConfig,
   opts?: RunReviewOpts
@@ -227,7 +229,54 @@ export const GATE_WORKTREE_TIMEOUT_MS = 7_200_000; // 120 min runaway backstop
 // How many parts the Claude producer reads at once on a review in parts (see runClaudeProducer).
 export const PRODUCER_PART_CONCURRENCY = 3;
 
-async function runClaudeReviewer(
+// ── The pinned producer prompt (2026-11-03) ───────────────────────────────────────────
+//
+// What the Claude producer is SENT, on disk beside its reply — `prompt.claude.md` (one part) or
+// `prompt.claude.c<k>.md` (a review in parts) — plus a sidecar naming the render-time facts a later
+// re-run must re-derive (the worktree dir the prompt names, the conventions file inside it, whether a
+// history packet was present). The core seats always had `prompt.<seat>.md`; the producer rendered
+// its prompt on the fly and kept nothing, so a reply that did not parse could only be re-read, never
+// re-run (reparse-seat.ts). Best-effort: a trail that cannot take these costs the retry, not the review.
+export const PRODUCER_PROMPT_SIDECAR = 'prompt.claude.json';
+export const CONVENTIONS_TRAIL_COPY = 'conventions.in-tree.md';
+export function producerPromptFile(partIndex?: number): string {
+  return partIndex === undefined ? 'prompt.claude.md' : `prompt.claude.c${partIndex}.md`;
+}
+export interface ProducerPromptSidecar {
+  schemaVersion: 1;
+  // The worktree the prompt names (its absolute path appears in the prompt text) — null for a
+  // packet-mode prompt, which names no tree and re-sends byte-identical.
+  worktree: string | null;
+  headSha: string;
+  baseSha: string | null;
+  // The engine-written conventions file the prompt points the seat at (inside the worktree), when
+  // the run handed the conventions over as a file. Its bytes are kept as CONVENTIONS_TRAIL_COPY.
+  conventionsPath: string | null;
+  // Whether the seat's cwd carried a history packet (the prompt's history clause is rendered iff).
+  history: boolean;
+  parts: number;
+}
+export function persistProducerPrompts(
+  baseDir: string,
+  runId: string,
+  sidecar: ProducerPromptSidecar,
+  prompts: readonly { index?: number; prompt: string }[],
+  log: (m: string) => void
+): void {
+  try {
+    for (const p of prompts) writeTrailFile(baseDir, runId, producerPromptFile(p.index), p.prompt);
+    writeTrailFile(baseDir, runId, PRODUCER_PROMPT_SIDECAR, JSON.stringify(sidecar, null, 2));
+    if (sidecar.conventionsPath) {
+      // The seat's conventions step names a file inside a worktree the run reaps: keep its bytes so
+      // a re-run can write the same file into a fresh tree.
+      writeTrailFile(baseDir, runId, CONVENTIONS_TRAIL_COPY, fs.readFileSync(sidecar.conventionsPath, 'utf8'));
+    }
+  } catch (e) {
+    log(`  · claude: the pinned producer prompt could not be written (${(e as Error).message}) — this seat cannot be re-run from the trail`);
+  }
+}
+
+export async function runClaudeReviewer(
   reviewPrompt: string,
   config: VoiceConfig,
   run: ClaudeRunner,
@@ -601,6 +650,26 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
       ? opts.parts
       : [{ diff: opts.pinnedDiff ?? '', index: 1, label: '(the change)', prompt: opts.reviewPrompt }];
   const producerTimeout = opts.timeoutMs ?? (opts.worktree ? CLAUDE_WORKTREE_REVIEW_TIMEOUT_MS : undefined);
+  // Rendered ONCE per part: the bytes pinned to the trail are the bytes the seat is sent.
+  const promptByIndex = new Map(parts.map((p) => [p.index, producerPromptFor(p)] as const));
+  const promptOf = (part: ProducerPart): string => promptByIndex.get(part.index) ?? producerPromptFor(part);
+  if (opts.includeClaudeReviewer) {
+    persistProducerPrompts(
+      opts.baseDir,
+      opts.runId,
+      {
+        baseSha: opts.baseSha ?? null,
+        conventionsPath: opts.worktree && opts.conventionsPath ? opts.conventionsPath : null,
+        headSha: opts.expectedHeadSha,
+        history: Boolean(opts.worktree) && hasHistory,
+        parts: parts.length,
+        schemaVersion: 1,
+        worktree: opts.worktree ?? null,
+      },
+      parts.map((p) => ({ ...(parts.length > 1 ? { index: p.index } : {}), prompt: promptOf(p) })),
+      log
+    );
+  }
 
   let claudeReview: VoiceReview | null = null;
   let claudeSpawned = false;
@@ -612,7 +681,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
         : `  · claude (anthropic/${modelLabel}) reviewing the diff (cold)…`
     );
     const { review, raw, spawned, stream } = await runClaudeReviewer(
-      producerPromptFor(parts[0]),
+      promptOf(parts[0]),
       opts.claudeConfig,
       run,
       // A worktree producer gets the bigger watchdog UNLESS the caller set one explicitly.
@@ -655,7 +724,7 @@ export async function runClaudeProducer(opts: ClaudeProducerOptions): Promise<Cl
         const part = parts[i];
         log(`  · claude: part ${part.index}/${n} — ${part.label}…`);
         const res = await runClaudeReviewer(
-          producerPromptFor(part),
+          promptOf(part),
           opts.claudeConfig,
           run,
           producerTimeout,

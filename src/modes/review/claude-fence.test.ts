@@ -48,7 +48,7 @@ describe('the capability fence — what the seat CANNOT do (spec §2, probed 202
       'Bash', 'Agent', 'Task', 'WebFetch', 'WebSearch', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
     ]);
     for (const seat of [{}, { readRoot: WORKTREE }]) {
-      const args = buildClaudeReviewArgs('P', CFG(), { homeDir: HOME, ...seat });
+      const args = buildClaudeReviewArgs(CFG(), { homeDir: HOME, ...seat });
       for (const tool of ['Bash', 'WebFetch', 'WebSearch']) expect(denied(args)).toContain(tool);
       // No MCP servers: a connector that writes to an external service is an egress channel.
       expect(args).toContain('--strict-mcp-config');
@@ -56,7 +56,7 @@ describe('the capability fence — what the seat CANNOT do (spec §2, probed 202
   });
 
   it('denies every READ tool on the home directory — vendor auth is not a model input (§9)', () => {
-    const args = buildClaudeReviewArgs('P', CFG(), { homeDir: HOME, readRoot: WORKTREE });
+    const args = buildClaudeReviewArgs(CFG(), { homeDir: HOME, readRoot: WORKTREE });
     expect(homeReadDenyRules(HOME)).toEqual([
       'Read(//Users/somebody/**)',
       'Grep(//Users/somebody/**)',
@@ -66,15 +66,15 @@ describe('the capability fence — what the seat CANNOT do (spec §2, probed 202
   });
 
   it('grants the worktree as an --add-dir READ ROOT, and only for a worktree seat', () => {
-    const wt = buildClaudeReviewArgs('P', CFG(), { homeDir: HOME, readRoot: WORKTREE });
+    const wt = buildClaudeReviewArgs(CFG(), { homeDir: HOME, readRoot: WORKTREE });
     expect(wt[wt.indexOf('--add-dir') + 1]).toBe(WORKTREE);
     // `--add-dir` is variadic: a non-variadic flag MUST follow it or the CLI swallows the next arg.
     expect(wt[wt.indexOf('--add-dir') + 2]).toBe('--strict-mcp-config');
-    expect(buildClaudeReviewArgs('P', CFG(), { homeDir: HOME })).not.toContain('--add-dir');
+    expect(buildClaudeReviewArgs(CFG(), { homeDir: HOME })).not.toContain('--add-dir');
   });
 
   it('`--disallowedTools` is LAST — it is variadic, so nothing may follow it', () => {
-    const args = buildClaudeReviewArgs('P', CFG({ effort: 'max', model: 'opus' }), {
+    const args = buildClaudeReviewArgs(CFG({ effort: 'max', model: 'opus' }), {
       homeDir: HOME,
       readRoot: WORKTREE,
     });
@@ -87,11 +87,11 @@ describe('the capability fence — what the seat CANNOT do (spec §2, probed 202
 
   it('REFUSES to fence a read root inside $HOME — the home deny would deny the worktree', () => {
     expect(() =>
-      buildClaudeReviewArgs('P', CFG(), { homeDir: HOME, readRoot: `${HOME}/tmp/wt` })
+      buildClaudeReviewArgs(CFG(), { homeDir: HOME, readRoot: `${HOME}/tmp/wt` })
     ).toThrow(/inside the home directory/);
     // Not a prefix-string confusion: a sibling dir that merely starts with the home path is fine.
     expect(() =>
-      buildClaudeReviewArgs('P', CFG(), { homeDir: HOME, readRoot: `${HOME}-evil/wt` })
+      buildClaudeReviewArgs(CFG(), { homeDir: HOME, readRoot: `${HOME}-evil/wt` })
     ).not.toThrow();
   });
 

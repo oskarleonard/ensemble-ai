@@ -16,6 +16,8 @@ import type { ReviewerExecOpts } from '../../core/spawn';
 
 import {
   buildClaudeReviewArgs,
+  CLAUDE_CAPABILITY_FENCE,
+  claudeFenceProfile,
   CLAUDE_REVIEW_DENIED_TOOLS,
   extractStreamResult,
   isTransientApiErrorReply,
@@ -30,8 +32,10 @@ const CFG = (over: Partial<VoiceConfig> = {}): VoiceConfig => ({
 
 describe('buildClaudeReviewArgs — the capability fence (pinned as data)', () => {
   it('always headless, plain output, plan-mode + the execution/egress deny-list', () => {
-    const args = buildClaudeReviewArgs('THE PROMPT', CFG());
-    expect(args.slice(0, 5)).toEqual(['-p', 'THE PROMPT', '--output-format', 'stream-json', '--verbose']);
+    const args = buildClaudeReviewArgs(CFG());
+    // `-p` with no positional prompt: the prompt rides stdin (the product seat's prompt carries whole
+    // documents — the probe's E2BIG class, incident 2026-10-16).
+    expect(args.slice(0, 4)).toEqual(['-p', '--output-format', 'stream-json', '--verbose']);
     // Plan mode alone is NOT a fence — it still executes Bash. Removing the tools is.
     expect(args).toContain('--permission-mode');
     expect(args[args.indexOf('--permission-mode') + 1]).toBe('plan');
@@ -43,15 +47,15 @@ describe('buildClaudeReviewArgs — the capability fence (pinned as data)', () =
   });
 
   it('omits --model/--effort at the "default" sentinel, includes them when configured', () => {
-    expect(buildClaudeReviewArgs('p', CFG())).not.toContain('--model');
-    expect(buildClaudeReviewArgs('p', CFG())).not.toContain('--effort');
-    const args = buildClaudeReviewArgs('p', CFG({ model: 'claude-opus-4-8', effort: 'high' }));
+    expect(buildClaudeReviewArgs(CFG())).not.toContain('--model');
+    expect(buildClaudeReviewArgs(CFG())).not.toContain('--effort');
+    const args = buildClaudeReviewArgs(CFG({ model: 'claude-opus-4-8', effort: 'high' }));
     expect(args[args.indexOf('--model') + 1]).toBe('claude-opus-4-8');
     expect(args[args.indexOf('--effort') + 1]).toBe('high');
   });
 
   it('rejects an invalid effort (leaves it to the CLI default)', () => {
-    expect(buildClaudeReviewArgs('p', CFG({ effort: 'bogus' }))).not.toContain('--effort');
+    expect(buildClaudeReviewArgs(CFG({ effort: 'bogus' }))).not.toContain('--effort');
   });
 });
 
@@ -61,24 +65,24 @@ describe('buildClaudeReviewArgs — the advisor, explicit and in an order that b
   const settingsOf = (args: string[]): unknown => JSON.parse(args[args.indexOf('--settings') + 1]);
 
   it('absent → no --settings at all (today\'s inherit behavior, byte-identical argv)', () => {
-    const args = buildClaudeReviewArgs('p', CFG({ effort: 'max', model: 'opus' }), { homeDir: HOME, readRoot: READ_ROOT });
+    const args = buildClaudeReviewArgs(CFG({ effort: 'max', model: 'opus' }), { homeDir: HOME, readRoot: READ_ROOT });
     expect(args).not.toContain('--settings');
   });
 
   it('a model id → {"advisorModel":"<id>"}; "off" → no --settings at all', () => {
-    expect(settingsOf(buildClaudeReviewArgs('p', CFG({ advisor: 'claude-fable-5-1' })))).toEqual({
+    expect(settingsOf(buildClaudeReviewArgs(CFG({ advisor: 'claude-fable-5-1' })))).toEqual({
       advisorModel: 'claude-fable-5-1',
     });
     // "off" is the env kill switch (claudeAdvisorEnv) — no settings value disables the advisor — so
     // the fenced argv is byte-identical to the inherit argv.
     const fence = { homeDir: HOME, readRoot: READ_ROOT };
-    expect(buildClaudeReviewArgs('p', CFG({ advisor: 'off', effort: 'max', model: 'opus' }), fence)).toEqual(
-      buildClaudeReviewArgs('p', CFG({ effort: 'max', model: 'opus' }), fence)
+    expect(buildClaudeReviewArgs(CFG({ advisor: 'off', effort: 'max', model: 'opus' }), fence)).toEqual(
+      buildClaudeReviewArgs(CFG({ effort: 'max', model: 'opus' }), fence)
     );
   });
 
   it('a model id + a read root: --add-dir is still followed by --strict-mcp-config, --disallowedTools still LAST', () => {
-    const args = buildClaudeReviewArgs('p', CFG({ advisor: 'claude-opus-5-5', effort: 'max', model: 'opus' }), {
+    const args = buildClaudeReviewArgs(CFG({ advisor: 'claude-opus-5-5', effort: 'max', model: 'opus' }), {
       homeDir: HOME,
       readRoot: READ_ROOT,
     });
@@ -95,7 +99,7 @@ describe('buildClaudeReviewArgs — the advisor, explicit and in an order that b
   });
 
   it('an invalid advisor throws (callers turn it into a loud failed seat)', () => {
-    expect(() => buildClaudeReviewArgs('p', CFG({ advisor: 'Opus Five' }))).toThrow(/`advisor` must be/);
+    expect(() => buildClaudeReviewArgs(CFG({ advisor: 'Opus Five' }))).toThrow(/`advisor` must be/);
   });
 });
 
@@ -325,5 +329,24 @@ describe('runClaudeReviewVoice — operator usage limit is named, never retried 
     expect(res.raw).toBeNull();
     expect(res.failWhy).toContain('operator usage limit reached');
     expect(res.failWhy).toContain('resets 5:10pm');
+  });
+});
+
+describe('buildClaudeReviewArgs — vendor-side web search (`web: true` on the seat)', () => {
+  it('pre-approves WebSearch and keeps it off the deny-list; WebFetch stays denied; off by default', () => {
+    const off = buildClaudeReviewArgs(CFG());
+    expect(off).not.toContain('--allowedTools');
+    expect(off.slice(off.indexOf('--disallowedTools'))).toContain('WebSearch');
+    const on = buildClaudeReviewArgs(CFG({ web: true }));
+    expect(on[on.indexOf('--allowedTools') + 1]).toBe('WebSearch');
+    const denied = on.slice(on.indexOf('--disallowedTools') + 1);
+    expect(denied).not.toContain('WebSearch');
+    expect(denied).toContain('WebFetch'); // the local fetch is the exfiltration channel — never
+    expect(denied).toContain('Bash');
+    for (const t of CLAUDE_REVIEW_DENIED_TOOLS) if (t !== 'WebSearch') expect(denied).toContain(t);
+  });
+  it('the profile a web seat attests is distinct from the fence, same version', () => {
+    expect(claudeFenceProfile(false)).toEqual(CLAUDE_CAPABILITY_FENCE);
+    expect(claudeFenceProfile(true)).toEqual({ id: 'claude-capability-fence+websearch', version: CLAUDE_CAPABILITY_FENCE.version });
   });
 });

@@ -5,9 +5,7 @@ import { escapesRoot, reviewDir, writeTrailFile } from '../../core/artifacts';
 import type { ResolvedVoiceConfig } from '../brainstorm/types';
 
 import { runClaudeReviewVoice } from './claude';
-import { type GateVerdictRecord, runGate,
-  type GateBaseTrail,
-} from './gate';
+import { type GateBaseTrail, type GateVerdictRecord, runGate, writeGateVerdictsTrail } from './gate';
 import { readGatePacketHeadSha } from './gate-hunks';
 import { worktreeReader, conventionsAwareReader } from './holistic-gate';
 import { readTrailJson } from './trail-io';
@@ -47,6 +45,12 @@ export interface RegateOptions {
   // stated intent the review's gate had (a product finding's "does this PR claim it" rests on it).
   // Absent ⇒ no stated-intent clause, the pre-parity regate.
   directive?: string;
+  // Re-gate ONE seat's findings only (`--only-seat product`): the gate runs over that seat's
+  // persisted review alone, and its records REPLACE that seat's in the prior gate-verdicts.json —
+  // every other seat's verdict (posted ones included) and the base block stay as they were, and the
+  // synthesis prose is kept (a one-seat gate's bottom line describes one seat). Born of the hand-run
+  // of 2026-10-22: a scratch trail holding only the product review, its records spliced back in.
+  onlySeat?: string;
   // Injected for tests; the default is the real capability-fenced claude spawn.
   run?: typeof runClaudeReviewVoice;
   runId: string;
@@ -113,20 +117,31 @@ export async function runRegate(opts: RegateOptions): Promise<RegateResult> {
       `run ${opts.runId} has no usable packet.gate.json under ${opts.baseDir} — nothing to ground a regate against`
     );
   }
-  const reviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
+  let reviews = loadVoiceReviewsFromTrail(opts.baseDir, opts.runId);
   if (reviews.length === 0) {
     throw new Error(
       `run ${opts.runId} has no persisted reviews in its trail — nothing to regate`
     );
   }
+  if (opts.onlySeat) {
+    const only = reviews.filter((r) => r.voiceId === opts.onlySeat);
+    if (only.length === 0) {
+      throw new Error(
+        `run ${opts.runId} has no persisted review for seat "${opts.onlySeat}" (it holds ${reviews.map((r) => r.voiceId).join(', ')}) — nothing to regate`
+      );
+    }
+    reviews = only;
+  }
   log(
-    `regate: ${reviews.length} persisted reviewer voice(s) rehydrated · head ${headSha.slice(0, 12)} · ${
+    `regate: ${reviews.length} persisted reviewer voice(s) rehydrated${opts.onlySeat ? ` (seat ${opts.onlySeat} only — every other seat's verdict is kept)` : ''} · head ${headSha.slice(0, 12)} · ${
       opts.worktree ? 'worktree evidence' : 'packet evidence'
     }`
   );
 
   // Base drift (trail v12): a regate carries the REVIEW-TIME facts forward (the head is unchanged,
   // the base is not) — read before runGate overwrites the trail.
+  // Read before runGate overwrites the trail: the drift block for every regate, and the OTHER
+  // seats' records when only one seat is re-gated.
   const priorDrift = readTrailJson<{ base?: GateBaseTrail | null; verdicts?: GateVerdictRecord[] }>(opts.baseDir, opts.runId, 'gate-verdicts.json');
   const conventionsFile = opts.worktree ? readConventionsFileFromTrail(opts.baseDir, opts.runId, opts.worktree) : null;
   if (opts.worktree && !conventionsFile) log('regate: no engine-written conventions file in this worktree — gathered-doc citations verify from the tree only');
@@ -157,6 +172,21 @@ export async function runRegate(opts: RegateOptions): Promise<RegateResult> {
     ...(opts.worktree ? { worktree: opts.worktree } : {}),
   });
 
+  // One seat only: splice its fresh records into the prior trail at the place that seat's records
+  // held, and write THAT as the trail of record (runGate wrote the one-seat records alone).
+  let verdicts = gate.verdicts;
+  if (opts.onlySeat) {
+    const prefix = `${opts.onlySeat}#`;
+    const prior = priorDrift?.verdicts ?? [];
+    const at = prior.findIndex((v) => v.findingId.startsWith(prefix));
+    const kept = prior.filter((v) => !v.findingId.startsWith(prefix));
+    const insertAt = at < 0 ? kept.length : at;
+    verdicts = [...kept.slice(0, insertAt), ...gate.verdicts, ...kept.slice(insertAt)];
+    if (!writeGateVerdictsTrail(opts.baseDir, opts.runId, verdicts, priorDrift?.base ?? null))
+      log(`regate: gate-verdicts.json could not be rewritten with the other seats' records — it holds seat ${opts.onlySeat}'s alone`);
+    else log(`regate: seat ${opts.onlySeat} — ${gate.verdicts.length} record(s) re-gated, ${kept.length} other kept`);
+  }
+
   // Fold the new gate outcome into claude-synthesis.json IN PLACE — merge, never clobber:
   // the claudeReview/holistic fields in there are the durable record of seats this regate
   // deliberately did not run. `regatedAt` marks the synthesis as healed-after-the-fact.
@@ -174,9 +204,12 @@ export async function runRegate(opts: RegateOptions): Promise<RegateResult> {
           ...existing,
           gateSpawned: gate.gateSpawned,
           gateTrailWritten: gate.gateTrailWritten,
-          gateVerdicts: gate.verdicts,
+          gateVerdicts: verdicts,
           regatedAt: new Date().toISOString(),
-          synthesis: gate.synthesis,
+          // One seat: the run's synthesis prose stays (it was written over every seat); the
+          // one-seat gate's own prose would describe one seat as if it were the run.
+          ...(opts.onlySeat ? { regatedSeat: opts.onlySeat } : {}),
+          synthesis: opts.onlySeat && existing.synthesis ? existing.synthesis : gate.synthesis,
         },
         null,
         2
@@ -193,6 +226,6 @@ export async function runRegate(opts: RegateOptions): Promise<RegateResult> {
     ok: !gate.synthesis.degraded,
     reviews: reviews.length,
     synthesis: gate.synthesis,
-    verdicts: gate.verdicts,
+    verdicts,
   };
 }

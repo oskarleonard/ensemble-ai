@@ -1590,7 +1590,9 @@ function parseReviewers(raw) {
       vendor: str(r.vendor, REVIEWER_DEFAULTS[id].vendor),
       ...sandbox ? { sandbox } : {},
       ...disabledUntil === void 0 ? {} : { disabledUntil },
-      ...enabled === void 0 ? {} : { enabled }
+      ...enabled === void 0 ? {} : { enabled },
+      // Exactly `true` turns it on; anything else is the default (off) — never a string "yes".
+      ...r.web === true ? { web: true } : {}
     };
   }
   return out;
@@ -4702,22 +4704,27 @@ var CLAUDE_CAPABILITY_FENCE = {
   id: "claude-capability-fence",
   version: 2
 };
-function buildClaudeReviewArgs(prompt, config, fence = {}) {
+function claudeFenceProfile(web = false) {
+  return web ? { id: `${CLAUDE_CAPABILITY_FENCE.id}+websearch`, version: CLAUDE_CAPABILITY_FENCE.version } : CLAUDE_CAPABILITY_FENCE;
+}
+function buildClaudeReviewArgs(config, fence = {}) {
   const homeDir = fence.homeDir ?? os10.homedir();
   if (fence.readRoot && isUnder(fence.readRoot, homeDir)) {
     throw new Error(
       `ensemble-ai: refusing to fence a Claude seat whose read root (${fence.readRoot}) is inside the home directory (${homeDir}) \u2014 the home-read deny would also deny the worktree. Point TMPDIR outside $HOME.`
     );
   }
-  const args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "plan"];
+  const args = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "plan"];
   if (fence.readRoot) args.push("--add-dir", fence.readRoot);
   args.push("--strict-mcp-config");
+  if (config?.web === true) args.push("--allowedTools", "WebSearch");
   if (config?.model && config.model !== "default")
     args.push("--model", config.model);
   if (config && CLAUDE_EFFORTS.has(config.effort))
     args.push("--effort", config.effort);
   args.push(...claudeAdvisorArgs(config));
-  args.push("--disallowedTools", ...CLAUDE_REVIEW_DENIED_TOOLS, ...homeReadDenyRules(homeDir));
+  const denied = CLAUDE_REVIEW_DENIED_TOOLS.filter((t) => !(config?.web === true && t === "WebSearch"));
+  args.push("--disallowedTools", ...denied, ...homeReadDenyRules(homeDir));
   return args;
 }
 function makeNeutralSeatCwd() {
@@ -4731,11 +4738,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
   const fastFailMs = seams.fastFailMs ?? TRANSIENT_FAST_FAIL_MS;
   const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
-  const args = buildClaudeReviewArgs(
-    prompt,
-    config,
-    opts.worktree ? { readRoot: opts.worktree } : {}
-  );
+  const args = buildClaudeReviewArgs(config, opts.worktree ? { readRoot: opts.worktree } : {});
   const env = claudeAdvisorEnv(config);
   const cwd = makeNeutralSeatCwd();
   try {
@@ -4758,6 +4761,7 @@ async function runClaudeReviewVoice(prompt, config, opts = {}, seams = {}) {
         onSpawn: opts.onSpawn,
         ...opts.onStream ? { onStdout: opts.onStream } : {},
         stderrLimit: 2e3,
+        stdin: prompt,
         timeoutMs
       });
       const elapsedMs = Date.now() - startedAt;
@@ -5032,7 +5036,7 @@ function hasDepSurface(r) {
 }
 
 // src/modes/review/receipt.ts
-import fs25 from "fs";
+import fs26 from "fs";
 import os12 from "os";
 import path21 from "path";
 
@@ -5120,15 +5124,15 @@ function formatEvidenceShortfall(gaps) {
 }
 
 // src/modes/review/gate.ts
-import fs24 from "fs";
+import fs25 from "fs";
 import path20 from "path";
 
 // src/modes/review/holistic-gate.ts
-import fs23 from "fs";
+import fs24 from "fs";
 import path19 from "path";
 
 // src/modes/review/holistic.ts
-import fs22 from "fs";
+import fs23 from "fs";
 
 // src/modes/brainstorm/voices.ts
 import fs21 from "fs";
@@ -5559,7 +5563,9 @@ async function runCoreSeat(args) {
   if (!wt || !args.qualification?.qualified || !args.worktreePrompt) {
     const unqualified = wt ? args.qualification?.reason ?? null : null;
     if (unqualified) log(`  \xB7 \u26A0 ${unqualified}`);
-    const { result, timing } = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {});
+    const { result, timing } = await adapterOnce(args.adapter, args.packetPrompt, reviewer, {
+      ...reviewer.web === true ? { web: true } : {}
+    });
     return {
       // A packet seat runs unfenced by design — it has no worktree, so no proxy and no denials.
       egressDenials: [],
@@ -5572,7 +5578,7 @@ async function runCoreSeat(args) {
     args.adapter,
     args.worktreePrompt,
     reviewer,
-    { worktree: wt }
+    { ...reviewer.web === true ? { web: true } : {}, worktree: wt }
   );
   const review = persistAttempt(args, args.worktreePrompt, first, firstTiming);
   const egressDenials = first.egressDenials ?? [];
@@ -5628,6 +5634,9 @@ var RETRIES_ON_PACKET = Object.freeze({
   codex: true,
   grok: false
 });
+
+// src/modes/review/self-contained.ts
+import fs22 from "fs";
 
 // src/modes/review/code-review-seat.ts
 var COLD_PEER_ROLE = "You are a cold peer reviewer: ONE single-conversation review pass, done directly by you with Read, Grep, and Glob. Do NOT delegate to subagents or any orchestration tool.";
@@ -5821,7 +5830,7 @@ function resolveVoicesSeat(spec, raw, flags = {}, warn = () => {
         );
     }
   }
-  return { ...VOICE_DEFAULTS.claude, ...advisor === void 0 ? {} : { advisor }, effort, model };
+  return { ...VOICE_DEFAULTS.claude, ...advisor === void 0 ? {} : { advisor }, ...entry?.web === true ? { web: true } : {}, effort, model };
 }
 function loadHolisticSeat(file = VOICES_FILE, flags = {}, warn = () => {
 }, parseAdvisor = parseSeatAdvisor) {
@@ -5831,7 +5840,7 @@ function loadVoicesSeat(spec, file = VOICES_FILE, flags = {}, warn = () => {
 }, parseAdvisor = parseSeatAdvisor) {
   let raw = {};
   try {
-    raw = JSON.parse(fs22.readFileSync(file, "utf8"));
+    raw = JSON.parse(fs23.readFileSync(file, "utf8"));
   } catch (e) {
     if (e.code !== "ENOENT")
       warn(`${spec.name} seat: could not read \`${file}\` (${e.message.split("\n")[0]}) \u2014 using the built-in default`);
@@ -6015,7 +6024,7 @@ function parseConventionCitation(v) {
 function worktreeReader(worktreeDir) {
   let root;
   try {
-    root = fs23.realpathSync(path19.resolve(worktreeDir));
+    root = fs24.realpathSync(path19.resolve(worktreeDir));
   } catch {
     return () => null;
   }
@@ -6028,11 +6037,11 @@ function worktreeReader(worktreeDir) {
       if (!file || file.includes("\0") || path19.isAbsolute(file)) return null;
       const target = path19.resolve(root, file);
       if (!inside(target)) return null;
-      const real = fs23.realpathSync(target);
+      const real = fs24.realpathSync(target);
       if (!inside(real)) return null;
-      const st = fs23.statSync(real);
+      const st = fs24.statSync(real);
       if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
-      return fs23.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+      return fs24.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
     } catch {
       return null;
     }
@@ -6045,14 +6054,14 @@ function conventionsAwareReader(base, conventionsFile, gathered = [], root) {
     cached = null;
     if (conventionsFile) {
       try {
-        const st = fs23.lstatSync(conventionsFile);
+        const st = fs24.lstatSync(conventionsFile);
         if (!st.isFile() || st.size > MAX_FILE_BYTES) return cached;
-        const real = fs23.realpathSync(conventionsFile);
+        const real = fs24.realpathSync(conventionsFile);
         if (root !== void 0) {
-          const rel = path19.relative(fs23.realpathSync(path19.resolve(root)), real);
+          const rel = path19.relative(fs24.realpathSync(path19.resolve(root)), real);
           if (rel === "" || escapesRoot(rel)) return cached;
         }
-        cached = fs23.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
+        cached = fs24.readFileSync(real, "utf8").split(/\r?\n/).slice(0, MAX_FILE_LINES);
       } catch {
         cached = null;
       }
@@ -6338,11 +6347,11 @@ function receiptIdentityMatches(receipt, key) {
 }
 function writeReceipt(storeDir, receipt) {
   const file = receiptPath(storeDir, keyOf(receipt));
-  fs25.mkdirSync(path21.dirname(file), { recursive: true, mode: 448 });
+  fs26.mkdirSync(path21.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.tmp`;
-  fs25.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
-  fs25.chmodSync(tmp, 384);
-  fs25.renameSync(tmp, file);
+  fs26.writeFileSync(tmp, JSON.stringify(receipt, null, 2), { mode: 384 });
+  fs26.chmodSync(tmp, 384);
+  fs26.renameSync(tmp, file);
   return file;
 }
 function isVerdictCounts(v) {
@@ -6424,7 +6433,7 @@ function validateReceiptShape(value) {
 function readReceipt(storeDir, key) {
   try {
     return validateReceiptShape(
-      JSON.parse(fs25.readFileSync(receiptPath(storeDir, key), "utf8"))
+      JSON.parse(fs26.readFileSync(receiptPath(storeDir, key), "utf8"))
     );
   } catch {
     return null;
@@ -6553,8 +6562,11 @@ function isDiffReviewed(live, deps) {
 }
 
 // src/modes/review/seat-evidence.ts
-function qualifyCodexSeat(worktree, deps = {}) {
-  const profile = CODEX_SANDBOX_PROFILE;
+function webProfile(profile, web) {
+  return web ? { id: `${profile.id}+websearch`, version: profile.version } : profile;
+}
+function qualifyCodexSeat(worktree, deps = {}, web = false) {
+  const profile = webProfile(CODEX_SANDBOX_PROFILE, web);
   const supported = deps.supported ?? codexSandboxSupported();
   if (!supported) {
     return {
@@ -6570,8 +6582,8 @@ function qualifyCodexSeat(worktree, deps = {}) {
   }
   return { profile, qualified: true, reason: null };
 }
-function qualifyGrokSeat(configuredSandbox) {
-  const profile = GROK_SANDBOX_PROFILE;
+function qualifyGrokSeat(configuredSandbox, web = false) {
+  const profile = webProfile(GROK_SANDBOX_PROFILE, web);
   const resolved = resolveReviewSandbox(configuredSandbox);
   if (resolved !== GROK_CLI_SANDBOX) {
     return {
@@ -6582,16 +6594,16 @@ function qualifyGrokSeat(configuredSandbox) {
   }
   return { profile, qualified: true, reason: null };
 }
-function qualifyHarnessSeat() {
-  return { profile: CLAUDE_CAPABILITY_FENCE, qualified: true, reason: null };
+function qualifyHarnessSeat(web = false) {
+  return { profile: claudeFenceProfile(web), qualified: true, reason: null };
 }
 var SEAT_QUALIFIERS = {
   // The Anthropic registry seat qualifies exactly like the CLI's claude layer:
   // the capability fence (tools removed, strict MCP, neutral cwd, $HOME
   // read-denied) is CLI-flag-based — no kernel wrapper, no platform dependency.
-  claude: () => qualifyHarnessSeat(),
-  codex: ({ worktree }) => qualifyCodexSeat(worktree),
-  grok: ({ config }) => qualifyGrokSeat(config.sandbox)
+  claude: ({ config }) => qualifyHarnessSeat(config.web === true),
+  codex: ({ config, worktree }) => qualifyCodexSeat(worktree, {}, config.web === true),
+  grok: ({ config }) => qualifyGrokSeat(config.sandbox, config.web === true)
 };
 function intendedEvidenceFor(seats) {
   const map = {};
@@ -7103,6 +7115,8 @@ async function runReviewMode(opts) {
   );
   const wt = opts.worktree;
   const quals = wt ? qualifyCoreSeats(reviewers, wt.dir, configs) : {};
+  const webSeats = [...reviewers.filter((id) => configs[id].web === true), ...(opts.peerSeats ?? []).filter((s) => opts.peerWeb?.[s] === true)];
+  if (webSeats.length > 0) log(`Web search ON for ${webSeats.join(", ")} (vendor-side; their receipt profiles carry +websearch)`);
   const everySeatReadsTree = Boolean(wt) && reviewers.every((id) => quals[id]?.qualified);
   let conventionsPath;
   if (wt && everySeatReadsTree && agentsMd && agentsMd.length > CONVENTIONS_INLINE_MAX) {
@@ -7321,7 +7335,7 @@ async function runReviewMode(opts) {
   const intended = wt ? intendedEvidenceFor([...reviewers, ...opts.peerSeats ?? []]) : {};
   const sandboxProfiles = wt ? sandboxProfilesFor({
     ...quals,
-    ...Object.fromEntries((opts.peerSeats ?? []).map((s) => [s, qualifyHarnessSeat()]))
+    ...Object.fromEntries((opts.peerSeats ?? []).map((s) => [s, qualifyHarnessSeat(opts.peerWeb?.[s] === true)]))
   }) : {};
   const realized = {};
   const fallbacks = [];
@@ -7757,7 +7771,7 @@ function stageReview(payload, target, deps) {
 }
 
 // src/modes/review/holistic-fixture.ts
-import fs26 from "fs";
+import fs27 from "fs";
 import path22 from "path";
 function anchor(v, where) {
   const e = v ?? {};
@@ -7766,7 +7780,7 @@ function anchor(v, where) {
   return { file: e.file, line: e.line, symbol: e.symbol };
 }
 function loadHolisticFixture(dir) {
-  const raw = JSON.parse(fs26.readFileSync(path22.join(dir, "expectations.json"), "utf8"));
+  const raw = JSON.parse(fs27.readFileSync(path22.join(dir, "expectations.json"), "utf8"));
   const positives = Array.isArray(raw.plantedPositives) ? raw.plantedPositives : [];
   const misses = Array.isArray(raw.nearMisses) ? raw.nearMisses : [];
   if (positives.length === 0 || misses.length === 0)
@@ -7799,7 +7813,7 @@ function verifyFixtureAnchors(dir, fixture) {
   const check = (a, label2) => {
     let lines;
     try {
-      lines = fs26.readFileSync(path22.join(dir, a.file), "utf8").split(/\r?\n/);
+      lines = fs27.readFileSync(path22.join(dir, a.file), "utf8").split(/\r?\n/);
     } catch {
       broken.push(`${label2}: ${a.file} is unreadable`);
       return;
@@ -9268,6 +9282,7 @@ export {
   classifySecurityFinding,
   claudeAdvisorArgs,
   claudeAdvisorEnv,
+  claudeFenceProfile,
   claudeWorktreePromptSuffix,
   codexRetryNote,
   codexSandboxSupported,

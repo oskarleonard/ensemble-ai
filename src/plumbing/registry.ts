@@ -24,6 +24,8 @@ export interface GateSeatView {
   // rendering; absent renders as anthropic — the only vendor that existed before the axis.
   vendor?: string;
   vendorSource?: SeatSource;
+  // Vendor-side web search on an anthropic gate (its entry's `web: true`).
+  web?: boolean;
 }
 
 // The holistic LENS seat (`review --holistic --repo`), resolved for display: model/effort through
@@ -32,6 +34,8 @@ export interface HolisticSeatView {
   advisor?: unknown;
   effort: string;
   model: string;
+  // Vendor-side web search on this seat (its entry's `web: true`).
+  web?: boolean;
 }
 
 export interface RegistryView {
@@ -43,6 +47,9 @@ export interface RegistryView {
   gate: GateSeatView;
   // The holistic lens (from the voices.json `holistic` entry → the built-in opus @ high).
   holistic: HolisticSeatView;
+  // The product seat (review --product-docs; from the voices.json `product` entry → opus @ high).
+  // Same shape as the lens: single anthropic seat, {model, effort, advisor}.
+  product: HolisticSeatView;
   // Every seat that is OFF, with its quota window when that is what holds it off. `until` is
   // null for an indefinite `enabled: false` (an `enabled: false` seat that also carries a date
   // reports null too — the date is not what the switch honours). Same rule as the fan-out.
@@ -82,7 +89,7 @@ export function offSeatsOf(
 // structurally a ReviewerConfig — same fields). Only reviewer rows can carry an OFF note.
 function agentLine(c: ReviewerConfig | VoiceConfig, off?: OffSeat): string {
   const sandbox = c.sandbox ? ` · sandbox ${c.sandbox}` : '';
-  // Voices only (ReviewerConfig has no `web`): the claude voice's web research opt-in.
+  // The seat's vendor-side web search opt-in (a voice's research, a review seat's `web: true`).
   const web = 'web' in c && c.web === true ? ' · web' : '';
   const offNote = off ? (off.until ? ` · OFF until ${off.until}` : ' · OFF (enabled: false)') : '';
   return `    ${c.id.padEnd(7)} ${c.vendor} · ${c.model} @ ${c.effort}${advisorNote(c.advisor)}${web}${sandbox}${offNote}`;
@@ -98,8 +105,10 @@ function advisorNote(advisor: unknown): string {
   return ` · advisor ${JSON.stringify(advisor)} (INVALID — a command that runs this seat refuses it)`;
 }
 
+const webNote = (web: boolean | undefined): string => (web === true ? ' · web' : '');
+
 function gateLine(gate: GateSeatView): string {
-  return `    ${'gate'.padEnd(7)} ${gate.vendor ?? 'anthropic'} · ${gate.model} @ ${gate.effort}${advisorNote(gate.advisor)}  · source model:${gate.modelSource} · effort:${gate.effortSource}${gate.vendor && gate.vendor !== 'anthropic' ? ` · vendor:${gate.vendorSource ?? 'default'}` : ''}`;
+  return `    ${'gate'.padEnd(7)} ${gate.vendor ?? 'anthropic'} · ${gate.model} @ ${gate.effort}${advisorNote(gate.advisor)}${webNote(gate.web)}  · source model:${gate.modelSource} · effort:${gate.effortSource}${gate.vendor && gate.vendor !== 'anthropic' ? ` · vendor:${gate.vendorSource ?? 'default'}` : ''}`;
 }
 
 function sourceNote(file: string, exists: boolean): string {
@@ -135,7 +144,12 @@ export function renderRegistry(view: RegistryView): string {
   out.push('');
   out.push('  holistic lens  (review --holistic --repo — always claude -p; {model,effort,advisor})');
   out.push(
-    `    holistic anthropic · ${view.holistic.model} @ ${view.holistic.effort}${advisorNote(view.holistic.advisor)}`
+    `    holistic anthropic · ${view.holistic.model} @ ${view.holistic.effort}${advisorNote(view.holistic.advisor)}${webNote(view.holistic.web)}`
+  );
+  out.push('');
+  out.push('  product seat  (review --product-docs — always claude -p; {model,effort,advisor})');
+  out.push(
+    `    product  anthropic · ${view.product.model} @ ${view.product.effort}${advisorNote(view.product.advisor)}${webNote(view.product.web)}`
   );
   out.push('');
   return out.join('\n');

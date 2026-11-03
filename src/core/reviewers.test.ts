@@ -237,3 +237,12 @@ describe('parseReviewers — reviewers.json carries no advisor', () => {
     }
   });
 });
+
+describe('parseReviewers — vendor-side web search (`web`)', () => {
+  it('exactly `true` turns it on; absent or anything else is off (never a string "yes")', () => {
+    expect(parseReviewers({ codex: { web: true }, grok: { web: 'yes' } }).codex.web).toBe(true);
+    expect(parseReviewers({ codex: { web: true }, grok: { web: 'yes' } }).grok).not.toHaveProperty('web');
+    expect(parseReviewers({})).not.toHaveProperty('codex.web');
+    expect(parseReviewers({ grok: { web: false } }).grok).not.toHaveProperty('web');
+  });
+});

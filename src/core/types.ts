@@ -74,6 +74,12 @@ export interface ReviewerConfig {
   id: ReviewerId;
   model: string;
   sandbox?: string;
+  // Vendor-side WEB SEARCH for this review seat (codex `--search`; grok's `web_search` on its tool
+  // allowlist) — the same opt-in the brainstorm/consult voices carry. Off by default; exactly `true`
+  // turns it on. A web-enabled seat attests a DISTINCT sandbox profile (`…+websearch`), so a run
+  // with it never verifies as equivalent to a fully fenced one. Never a local fetch: the vendor
+  // searches behind the API host the fence already allows.
+  web?: boolean;
   vendor: string;
 }
 

@@ -21,10 +21,10 @@ function resolve(raw: unknown, flags: GateSeatFlags = {}) {
 // The gate argv the run actually spawns — the model/effort resolution is only meaningful through
 // buildClaudeReviewArgs, so every case asserts the ARGV, not just the intermediate config.
 const gateArgv = (raw: unknown, flags: GateSeatFlags = {}) =>
-  buildClaudeReviewArgs('P', resolve(raw, flags).seat.config);
+  buildClaudeReviewArgs(resolve(raw, flags).seat.config);
 
 // today's default gate argv (no --model/--effort → the CLI's Opus default) — DC6 baseline.
-const DEFAULT_ARGV = buildClaudeReviewArgs('P', {
+const DEFAULT_ARGV = buildClaudeReviewArgs({
   cmd: 'claude',
   effort: 'default',
   id: 'claude',
@@ -57,7 +57,7 @@ describe('resolveGateSeat — per-seat gate model/effort (done-criterion 6)', ()
   it('the Opus-reviewer argv is UNCHANGED when only the gate seat is configured', () => {
     // The reviewer reads the `claude` voice (absent here → default), NOT the gate seat: the two
     // seats DIVERGE. The reviewer stays on the built-in default while the gate flips to fable.
-    const reviewerArgv = buildClaudeReviewArgs('P', {
+    const reviewerArgv = buildClaudeReviewArgs({
       cmd: 'claude',
       effort: 'default',
       id: 'claude',
@@ -108,7 +108,7 @@ describe('resolveGateSeat — per-seat gate model/effort (done-criterion 6)', ()
     expect(warnings.some((w) => w.includes('`cmd` is ignored'))).toBe(true);
     // model still applies; the deny-list belt (proof the spawn stays claude -p) is present
     const args = gateArgv(raw);
-    expect(args.slice(0, 2)).toEqual(['-p', 'P']);
+    expect(args[0]).toBe('-p'); // headless; the prompt rides stdin
     expect(args[args.indexOf('--model') + 1]).toBe('fable');
     expect(args).toContain('--disallowedTools');
     expect(args[args.indexOf('--permission-mode') + 1]).toBe('plan');
@@ -220,7 +220,7 @@ describe('resolveClaudeReviewerSeat — headless seat never rides the CLI defaul
     expect(seat.config.model).toBe(CLAUDE_REVIEWER_SEAT_DEFAULTS.model);
     expect(seat.config.effort).toBe(CLAUDE_REVIEWER_SEAT_DEFAULTS.effort);
     expect(seat.modelSource).toBe('default');
-    const argv = buildClaudeReviewArgs('P', seat.config);
+    const argv = buildClaudeReviewArgs(seat.config);
     expect(argv).toContain('--model');
     expect(argv).toContain('opus');
     expect(argv).toContain('--effort');
@@ -232,7 +232,7 @@ describe('resolveClaudeReviewerSeat — headless seat never rides the CLI defaul
     expect(warnings).toEqual([]);
     expect(seat.config.model).toBe('opus');
     expect(seat.modelSource).toBe('default');
-    expect(buildClaudeReviewArgs('P', seat.config)).toContain('--model');
+    expect(buildClaudeReviewArgs(seat.config)).toContain('--model');
   });
 
   it('the voices.json `claude` entry overrides the baked default', () => {
@@ -353,7 +353,7 @@ describe('the advisor on the gate + claude reviewer seats — own entry only, ne
   it('the gate reads its OWN `gate.advisor` and the argv carries it', () => {
     const { seat } = resolve({ gate: { advisor: 'claude-fable-5-1', model: 'opus' } });
     expect(seat.config.advisor).toBe('claude-fable-5-1');
-    expect(settingsOf(buildClaudeReviewArgs('P', seat.config))).toEqual({ advisorModel: 'claude-fable-5-1' });
+    expect(settingsOf(buildClaudeReviewArgs(seat.config))).toEqual({ advisorModel: 'claude-fable-5-1' });
     expect(resolve({ gate: { advisor: 'off' } }).seat.config.advisor).toBe('off');
   });
 
@@ -398,7 +398,7 @@ describe('the advisor on the gate + claude reviewer seats — own entry only, ne
     expect(off.seat.vendor).toBe('anthropic');
     expect(off.seat.config.advisor).toBe('off');
     // "off" is the env kill switch on the spawn, never a settings value.
-    expect(settingsOf(buildClaudeReviewArgs('P', off.seat.config))).toBeUndefined();
+    expect(settingsOf(buildClaudeReviewArgs(off.seat.config))).toBeUndefined();
     expect(claudeAdvisorEnv(off.seat.config)).toEqual({ CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' });
     // The entry's own advisor is ignored loudly; the claude entry's wins.
     const both = resolve(
@@ -469,5 +469,15 @@ describe('shadowChampionConfig — a codex gate is shadowed by the claude seat r
     const warnings: string[] = [];
     expect(shadowChampionConfig(seat, 'ultra', (m) => warnings.push(m))).toEqual(seat.config);
     expect(warnings.some((w) => w.includes('--shadow-gate-effort "ultra" is not a known effort'))).toBe(true);
+  });
+});
+
+describe('web search on the Anthropic review seats — each entry\'s own `web`, no inheritance', () => {
+  it('the gate reads `gate.web` (anthropic only); the reviewer seat reads `claude.web`', () => {
+    expect(resolve({ gate: { web: true } }).seat.config.web).toBe(true);
+    expect(resolve({ claude: { web: true }, gate: { model: 'opus' } }).seat.config).not.toHaveProperty('web');
+    expect(resolve({ gate: { web: 'yes' } }).seat.config).not.toHaveProperty('web');
+    expect(resolveClaudeReviewerSeat({ claude: { web: true } }, {}, () => {}).config.web).toBe(true);
+    expect(resolveClaudeReviewerSeat({ gate: { web: true } }, {}, () => {}).config).not.toHaveProperty('web');
   });
 });
