@@ -3538,6 +3538,11 @@ async function reviewersCommand(args: string[]): Promise<number> {
     holisticAdvisor = v;
     return undefined;
   });
+  let productAdvisor: unknown;
+  const productSeat = loadProductSeat(voicesFile, {}, warn, (v) => {
+    productAdvisor = v;
+    return undefined;
+  });
   // ONE parse of reviewers.json feeds the roster, the enabled set and the off list, so the
   // three cannot disagree about a `disabledUntil` boundary crossing between two reads.
   const reviewersConfig = loadReviewers(reviewersFile);
@@ -3559,6 +3564,11 @@ async function reviewersCommand(args: string[]): Promise<number> {
       model: holisticSeat.model,
     },
     offSeats: offSeatsOf(reviewersConfig, enabledIds),
+    product: {
+      ...(productAdvisor === undefined ? {} : { advisor: productAdvisor }),
+      effort: productSeat.effort,
+      model: productSeat.model,
+    },
     reviewers: REVIEWER_IDS.map((id) => reviewersConfig[id]),
     reviewersFile,
     reviewersFileExists: fs.existsSync(reviewersFile),
@@ -4124,8 +4134,11 @@ Usage:
                      [--repo <path>] [--gate-model <m>] [--gate-effort <e>]
                      [--reviewers-file <p>] [--sandbox <profile>] [--premise]
 
-  <pr-url>          the SAME GitHub PR URL the original review took — required only with
-                    --repo (the worktree re-materialization fetches pull/<N>/head)
+  <pr-url>          the SAME GitHub PR URL the original review took. Required with --repo (the
+                    worktree re-materialization fetches pull/<N>/head); on its own it still earns
+                    the regate the PR's title + body — the author's stated intent the review's gate
+                    judged with (directive parity, as \`regate\` has it). Without it the union is
+                    regated WITHOUT the stated intent, said loudly
   --out <dir>       the trail base the original run wrote (its <run-id>/ dir lives here)
   --run-id <id>     the original run's id
   --seat <id>       the FAILED seat to heal. A seat that completed is refused — re-running a
@@ -4251,9 +4264,9 @@ async function reseatCommand(args: string[]): Promise<number> {
   // cannot tell apart. The module makes it the run's fallback reason and records it durably.
   let worktreeUnavailable: string | undefined;
   const repoFlag = typeof values.repo === 'string' ? values.repo.trim() : '';
+  const prUrl = positionals[0]?.trim() ?? '';
+  const ref = prUrl ? parsePrUrl(prUrl) : null;
   if (repoFlag) {
-    const url = positionals[0]?.trim() ?? '';
-    const ref = url ? parsePrUrl(url) : null;
     if (!ref) {
       console.error('ensemble-ai reseat: --repo needs the original PR URL as the positional (the head is re-fetched as pull/<N>/head)');
       return 3;
@@ -4298,10 +4311,22 @@ async function reseatCommand(args: string[]): Promise<number> {
   }
 
   try {
+    // The stated intent the review's gate judged with — the PR's own title + body, re-fetched (the
+    // trail does not pin it). Best-effort and LOUD, exactly as `regate` does it: without it the
+    // regate over the union judges the findings without the author's intent.
+    let directive: string | undefined;
+    if (ref) {
+      const fetched = fetchPrDirective({ pr: ref.pr, repoSlug: `${ref.owner}/${ref.repo}` }, process.cwd());
+      if ('directive' in fetched) directive = fetched.directive;
+      else console.error(`· directive: PR #${ref.pr} description unavailable (${fetched.error}) — regating WITHOUT the author's stated intent`);
+    } else {
+      console.error('· directive: no PR URL given — regating WITHOUT the author\'s stated intent (pass the PR URL as the positional)');
+    }
     const res = await runReseat({
       adapter: REVIEW_ADAPTERS[seat],
       baseDir: out,
       // conventionPaths: left to the module, which defaults to THIS run's own trail.
+      ...(directive ? { directive } : {}),
       gateConfig: gateSeat.config,
       log: (m) => console.error(`· ${m}`),
       ...(values.premise ? { premise: true } : {}),

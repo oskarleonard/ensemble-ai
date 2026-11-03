@@ -125,18 +125,19 @@ export interface ClaudeSeatFence {
 // worktree, and a seat that silently reviewed nothing is exactly the fail-open this fence exists to
 // prevent. THROWS, too, on an invalid `advisor` (claudeAdvisorArgs). Callers turn the throw into a
 // loud, failed seat.
-export function buildClaudeReviewArgs(
-  prompt: string,
-  config?: VoiceConfig,
-  fence: ClaudeSeatFence = {}
-): string[] {
+// The PROMPT is not an arg: it rides stdin (runClaudeReviewVoice) — `-p` with no positional prompt
+// reads it from stdin. The product seat's prompt carries whole documents (≤ 400 KB) plus a skeleton,
+// the same class as the probe's E2BIG (incident 2026-10-16); argv is capped, a pipe is not. Not a
+// fence change: the capability profile is the tool deny-list, the mode and the read root — none of
+// which moved — so the seat's {id, version} stays.
+export function buildClaudeReviewArgs(config?: VoiceConfig, fence: ClaudeSeatFence = {}): string[] {
   const homeDir = fence.homeDir ?? os.homedir();
   if (fence.readRoot && isUnder(fence.readRoot, homeDir)) {
     throw new Error(
       `ensemble-ai: refusing to fence a Claude seat whose read root (${fence.readRoot}) is inside the home directory (${homeDir}) — the home-read deny would also deny the worktree. Point TMPDIR outside $HOME.`
     );
   }
-  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--permission-mode', 'plan'];
+  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'plan'];
   if (fence.readRoot) args.push('--add-dir', fence.readRoot);
   args.push('--strict-mcp-config');
   if (config?.model && config.model !== 'default')
@@ -198,11 +199,7 @@ export async function runClaudeReviewVoice(
   const inactivityTimeoutMs = seams.inactivityTimeoutMs ?? CLAUDE_INACTIVITY_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? REVIEW_TIMEOUT_MS;
   // Built BEFORE the neutral cwd exists, so an unfenceable read root throws without leaking a dir.
-  const args = buildClaudeReviewArgs(
-    prompt,
-    config,
-    opts.worktree ? { readRoot: opts.worktree } : {}
-  );
+  const args = buildClaudeReviewArgs(config, opts.worktree ? { readRoot: opts.worktree } : {});
   const env = claudeAdvisorEnv(config);
   // WORKTREE EVIDENCE (§2): the worktree is the seat's READ ROOT (`--add-dir`), never its cwd. The
   // seat never owns the worktree; the run reaps it. The neutral cwd is ours, and we reap it here.
@@ -235,6 +232,7 @@ export async function runClaudeReviewVoice(
         onSpawn: opts.onSpawn,
         ...(opts.onStream ? { onStdout: opts.onStream } : {}),
         stderrLimit: 2000,
+        stdin: prompt,
         timeoutMs,
       });
       const elapsedMs = Date.now() - startedAt;

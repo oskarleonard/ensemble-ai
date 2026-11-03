@@ -611,6 +611,17 @@ describe('runReseat — re-run the dead seat on the pinned packet, then regate t
     expect(captured).toHaveLength(2);
   });
 
+  it('forwards the PR directive into the regate over the union; omitted ⇒ absent (directive parity with regate)', async () => {
+    const captured: RegateOptions[] = [];
+    const regate = async (o: RegateOptions): Promise<RegateResult> => { captured.push(o); return REGATE_OK; };
+    const on = seedRun();
+    await runReseat({ adapter: adapterOk, baseDir: on.base, directive: 'Title\n\nThe PR claims X.', gateConfig: GATE_CFG, regate, reviewer: GROK, runId: on.runId, seat: 'grok' });
+    expect(captured[0].directive).toBe('Title\n\nThe PR claims X.'); // the regate judges with the stated intent the review's gate had
+    const off = seedRun();
+    await runReseat({ adapter: adapterOk, baseDir: off.base, gateConfig: GATE_CFG, regate, reviewer: GROK, runId: off.runId, seat: 'grok' });
+    expect(captured[1].directive).toBeUndefined(); // omitted ⇒ the pre-parity regate
+  });
+
   it('refuses a worktree checked out at a DIFFERENT head than the pinned packet', async () => {
     const { base, runId } = seedRun();
     let spawns = 0;

@@ -374,6 +374,10 @@ export interface ReseatOptions {
   adapter: ReviewAdapter;
   baseDir: string;
   conventionPaths?: string[];
+  // The PR's own title + body, re-fetched by the CLI (the trail does not pin it): the regate over the
+  // union judges with the same stated intent the review's gate had — directive parity, as `regate`
+  // has it. Absent ⇒ the pre-parity regate.
+  directive?: string;
   gateConfig: ResolvedVoiceConfig;
   // Injected for tests — the gate seat spawn runRegate uses.
   gateRun?: RegateOptions['run'];
@@ -845,6 +849,7 @@ async function reseatUnderLock(opts: ReseatOptions, pre: ReseatReady): Promise<R
   const gate = await (opts.regate ?? runRegate)({
     baseDir,
     conventionPaths: opts.conventionPaths ?? readConventionPathsFromTrail(baseDir, runId),
+    ...(opts.directive ? { directive: opts.directive } : {}),
     gateConfig: opts.gateConfig,
     log,
     ...(opts.premise ? { premise: true } : {}),

@@ -1477,7 +1477,7 @@ interface ClaudeSeatFence {
     homeDir?: string;
     readRoot?: string;
 }
-declare function buildClaudeReviewArgs(prompt: string, config?: VoiceConfig, fence?: ClaudeSeatFence): string[];
+declare function buildClaudeReviewArgs(config?: VoiceConfig, fence?: ClaudeSeatFence): string[];
 declare function makeNeutralSeatCwd(): string;
 type ReviewerExec = typeof runReviewerExec;
 interface ClaudeVoiceSeams {
