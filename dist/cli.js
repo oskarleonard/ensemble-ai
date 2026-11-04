@@ -1470,6 +1470,49 @@ function stripStreamPayloads(stream) {
   }
   return out.join("\n");
 }
+function advisorCallCount(stream) {
+  if (!stream) return 0;
+  const seen = /* @__PURE__ */ new Set();
+  let n = 0;
+  const count = (b) => {
+    if (!isAdvisorUse(b)) return;
+    const id = b.id;
+    if (typeof id === "string" && id) {
+      if (seen.has(id)) return;
+      seen.add(id);
+    }
+    n++;
+  };
+  for (const line of stream.split("\n")) {
+    if (!line.includes("advisor")) continue;
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!e || typeof e !== "object") continue;
+    const ev = e;
+    if (ev.type === "assistant" && ev.message && typeof ev.message === "object") {
+      const content = ev.message.content;
+      if (Array.isArray(content)) for (const b of content) count(b);
+      continue;
+    }
+    if (ev.type === "stream_event" && ev.event && typeof ev.event === "object") {
+      const inner = ev.event;
+      if (inner.type === "content_block_start") count(inner.content_block);
+    }
+  }
+  return n;
+}
+var isAdvisorUse = (b) => !!b && typeof b === "object" && b.type === "server_tool_use" && b.name === "advisor";
+function advisorStateOf(config) {
+  if (!config) return void 0;
+  if (config.id === "codex" || config.id === "grok") return void 0;
+  if (config.vendor !== void 0 && config.vendor !== "anthropic") return void 0;
+  const stated = parseSeatAdvisor(config.advisor, typeof config.id === "string" ? config.id : "claude");
+  return stated === void 0 ? "inherit" : stated;
+}
 
 // src/core/egress-proxy.ts
 import http from "http";
@@ -7747,10 +7790,12 @@ async function adapterOnce(adapter, prompt, reviewer, opts) {
 function seatDiagnostics(result, timing, opts = {}) {
   const usage = parseSeatUsage(result.stream);
   const conventions = opts.conventionsFile ? conventionsReadOf(result.stream, readConventionsLayout(opts.conventionsFile)) : void 0;
+  const advisor = opts.advisor === void 0 ? void 0 : advisorRecord(opts.advisor, result.stream);
   return {
     elapsedMs: timing.endedAt - timing.startedAt,
     ...Object.keys(usage).length > 0 ? { usage } : {},
     ...conventions ? { conventions } : {},
+    ...advisor ? { advisor } : {},
     endedAt: new Date(timing.endedAt).toISOString(),
     ...result.failWhy ? { failWhy: result.failWhy } : {},
     ...result.preflightWarnings?.length ? { preflightWarnings: [...result.preflightWarnings] } : {},
@@ -7758,6 +7803,27 @@ function seatDiagnostics(result, timing, opts = {}) {
     stderrTail: result.stderrTail.trim().slice(-2e3),
     ...result.timedOutReason ? { timedOutReason: result.timedOutReason } : {}
   };
+}
+function advisorRecord(configured, stream) {
+  const calls = advisorCallCount(stream);
+  const truncated = !!stream && stream.split("\n").some((line) => line.includes(STREAM_CUT_EVENT) && isCutEvent(line));
+  return {
+    calls,
+    configured,
+    ...truncated ? { streamTruncated: true } : {},
+    ...configured === "off" && calls > 0 ? { violation: true } : {}
+  };
+}
+var isCutEvent = (line) => {
+  try {
+    const e = JSON.parse(line);
+    return !!e && typeof e === "object" && e.type === STREAM_CUT_EVENT;
+  } catch {
+    return false;
+  }
+};
+function advisorViolationLine(seat, d) {
+  return d.advisor?.violation ? `  \xB7 ${seat}: \u26A0 advisor configured off, yet the stream shows ${d.advisor.calls} advisor call(s) \u2014 the kill switch did not hold` : null;
 }
 function persistAttempt(args, prompt, result, timing) {
   const parsed = result.raw ? parseFindings(result.raw) : null;
@@ -8655,7 +8721,9 @@ async function runClaudeReviewer(reviewPrompt, config, run, timeoutMs, log, work
       stream: null
     };
   }
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { advisor: advisorStateOf(config), conventionsFile });
+  const advisorLine = advisorViolationLine("claude", diagnostics);
+  if (advisorLine) log(advisorLine);
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
@@ -8939,7 +9007,9 @@ async function runIntegrationStage(opts) {
     log(`  \xB7 integration: failed to run \u2014 ${e.message}`);
     return fail(`the integration seat did not run: ${e.message}`, null);
   }
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { advisor: advisorStateOf(opts.config), conventionsFile: opts.conventionsPath });
+  const advisorLine = advisorViolationLine("integration", diagnostics);
+  if (advisorLine) log(advisorLine);
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
@@ -9021,7 +9091,9 @@ async function runProductStage(opts) {
     log(`product: failed to run \u2014 ${e.message}`);
     return fail(`the product seat did not run: ${e.message}`, null);
   }
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { advisor: advisorStateOf(opts.config), conventionsFile: opts.conventionsPath });
+  const advisorLine = advisorViolationLine("product", diagnostics);
+  if (advisorLine) log(advisorLine);
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
@@ -9442,7 +9514,9 @@ async function runHolisticLens(opts) {
     log(`  \xB7 holistic: failed to run \u2014 ${e.message}`);
     return fail(`the holistic lens did not run: ${e.message}`);
   }
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { advisor: advisorStateOf(opts.config), conventionsFile: opts.conventionsPath });
+  const advisorLine = advisorViolationLine("holistic", diagnostics);
+  if (advisorLine) log(advisorLine);
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");
@@ -11180,7 +11254,7 @@ async function runGate(opts) {
     }
     const res2 = await shadowAttempt2;
     if ("threw" in res2) return stub(`spawn failed (${res2.threw.message})`);
-    persistGateTrail(name2, res2, shadowStartedAt);
+    persistGateTrail(name2, res2, shadowStartedAt, advisorStateOf(seat));
     if (res2.raw) {
       try {
         writeTrailFile(opts.baseDir, opts.runId, `${name2}.raw.md`, res2.raw);
@@ -11271,9 +11345,11 @@ async function runGate(opts) {
     // Per product finding: the host's verdict on its text half, and the quote in context.
     ...productChecks ? { productChecks } : {}
   });
-  const persistGateTrail = (prefix, res2, startedAt) => {
+  const persistGateTrail = (prefix, res2, startedAt, advisor) => {
     try {
-      const diagnostics = seatDiagnostics(res2, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+      const diagnostics = seatDiagnostics(res2, { endedAt: Date.now(), startedAt }, { advisor, conventionsFile: opts.conventionsPath });
+      const advisorLine = advisorViolationLine(prefix, diagnostics);
+      if (advisorLine) log(advisorLine);
       writeTrailFile(opts.baseDir, opts.runId, `${prefix}-diagnostics.json`, JSON.stringify(diagnostics, null, 2));
       if (typeof res2.stream === "string" && res2.stream) writeTrailFile(opts.baseDir, opts.runId, `${prefix}-stream.jsonl`, res2.stream);
       return diagnostics;
@@ -11284,7 +11360,8 @@ async function runGate(opts) {
   const describeGate = (d) => [
     `${Math.max(1, Math.round(d.elapsedMs / 6e4))} min`,
     d.usage?.toolCalls !== void 0 ? `${d.usage.toolCalls}${d.usage.streamTruncated ? "+" : ""} tool calls` : null,
-    d.conventions ? `conventions ${d.conventions.state}${d.conventions.docsRead.length ? ` (${d.conventions.docsRead.length} docs)` : ""}` : null
+    d.conventions ? `conventions ${d.conventions.state}${d.conventions.docsRead.length ? ` (${d.conventions.docsRead.length} docs)` : ""}` : null,
+    d.advisor ? `advisor ${d.advisor.configured}${d.advisor.calls ? ` \xB7 ${d.advisor.calls}${d.advisor.streamTruncated ? "+" : ""} call(s)` : d.advisor.streamTruncated ? " \xB7 stream cut" : ""}` : null
   ].filter(Boolean).join(" \xB7 ");
   if (premiseActive) log(`premise pass: ${premiseCluster.length} cluster(s) \u2014 advisory clause appended`);
   log("Gate: grounding findings against the pinned diff hunks \u2014 verdict tags\u2026");
@@ -11334,7 +11411,7 @@ async function runGate(opts) {
     );
   }
   const res = attempt;
-  const gateDiagnostics = persistGateTrail("gate", res, gateStartedAt);
+  const gateDiagnostics = persistGateTrail("gate", res, gateStartedAt, advisorStateOf(opts.config));
   if (gateDiagnostics) log(`  \xB7 gate seat: ${describeGate(gateDiagnostics)}`);
   if (!res.raw || res.timedOut) {
     const last = res.failWhy ?? (res.timedOut ? "gate timed out" : "gate produced no output");

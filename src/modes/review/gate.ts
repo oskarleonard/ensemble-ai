@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { advisorStateOf } from '../../core/claude-stream';
 import { reviewDir, writeTrailFile } from '../../core/artifacts';
 import { evidenceRef, extractJsonBlock, parseDocRef } from '../../core/findings';
 import { type DocRef, SEVERITIES, type Severity } from '../../core/types';
@@ -25,7 +26,7 @@ import {
   windowHunk,
 } from './gate-hunks';
 import { CHUNKS_TRAIL_FILE } from './chunks';
-import { seatDiagnostics } from './seat-run';
+import { advisorViolationLine, seatDiagnostics } from './seat-run';
 import { readTrailJson } from './trail-io';
 import {
   type FixStatus,
@@ -1673,7 +1674,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     }
     const res = await shadowAttempt;
     if ('threw' in res) return stub(`spawn failed (${res.threw.message})`);
-    persistGateTrail(name, res, shadowStartedAt);
+    persistGateTrail(name, res, shadowStartedAt, advisorStateOf(seat));
     if (res.raw) {
       // Persist the transcript BEFORE parsing, like the primary — an unparseable shadow reply
       // is exactly the one worth reading when judging the challenger.
@@ -1815,9 +1816,11 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
   // Until now no gate, on either vendor, left any: a verdict that said a cited file "was not
   // found" with the tree open could not be checked. Best-effort, like the transcript: losing the
   // facts must never cost the verdicts. Returns the diagnostics for the log line.
-  const persistGateTrail = (prefix: string, res: VoiceRunResult, startedAt: number): ReturnType<typeof seatDiagnostics> | null => {
+  const persistGateTrail = (prefix: string, res: VoiceRunResult, startedAt: number, advisor: string | undefined): ReturnType<typeof seatDiagnostics> | null => {
     try {
-      const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+      const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { advisor, conventionsFile: opts.conventionsPath });
+      const advisorLine = advisorViolationLine(prefix, diagnostics);
+      if (advisorLine) log(advisorLine);
       writeTrailFile(opts.baseDir, opts.runId, `${prefix}-diagnostics.json`, JSON.stringify(diagnostics, null, 2));
       if (typeof res.stream === 'string' && res.stream) writeTrailFile(opts.baseDir, opts.runId, `${prefix}-stream.jsonl`, res.stream);
       return diagnostics;
@@ -1830,6 +1833,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
       `${Math.max(1, Math.round(d.elapsedMs / 60_000))} min`,
       d.usage?.toolCalls !== undefined ? `${d.usage.toolCalls}${d.usage.streamTruncated ? '+' : ''} tool calls` : null,
       d.conventions ? `conventions ${d.conventions.state}${d.conventions.docsRead.length ? ` (${d.conventions.docsRead.length} docs)` : ''}` : null,
+      d.advisor ? `advisor ${d.advisor.configured}${d.advisor.calls ? ` · ${d.advisor.calls}${d.advisor.streamTruncated ? '+' : ''} call(s)` : d.advisor.streamTruncated ? ' · stream cut' : ''}` : null,
     ]
       .filter(Boolean)
       .join(' · ');
@@ -1911,7 +1915,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
     );
   }
   const res: VoiceRunResult = attempt;
-  const gateDiagnostics = persistGateTrail('gate', res, gateStartedAt);
+  const gateDiagnostics = persistGateTrail('gate', res, gateStartedAt, advisorStateOf(opts.config));
   if (gateDiagnostics) log(`  · gate seat: ${describeGate(gateDiagnostics)}`);
   if (!res.raw || res.timedOut) {
     // The RUNNER already named the cause — a persistent transient API error, an operator usage

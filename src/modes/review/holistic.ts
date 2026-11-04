@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 
 import { companionsClause } from './companions';
+import { advisorStateOf } from '../../core/claude-stream';
 import { parseFindings } from '../../core/findings';
 import { parseSeatAdvisor, type Severity } from '../../core/types';
 import type { RunReviewOpts } from '../../reviewers/codex';
@@ -9,7 +10,7 @@ import { VOICE_DEFAULTS, VOICES_FILE } from '../brainstorm/voices';
 import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { CLAUDE_EFFORTS } from './claude';
-import { seatDiagnostics } from './seat-run';
+import { advisorViolationLine, seatDiagnostics } from './seat-run';
 import { describeRun } from './self-contained';
 import { HISTORY_PACKET_CLAUSE, historyPacketHasData, type HistoryPacket } from './history-packet';
 import type { VoiceReview } from './synthesis';
@@ -383,7 +384,9 @@ export async function runHolisticLens(
   }
   // The lens's run facts — timing and read depth off its stream — on review.holistic.json, the
   // same record every other seat keeps (2026-10-13: the fast runs could not say how long it read).
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { advisor: advisorStateOf(opts.config), conventionsFile: opts.conventionsPath });
+  const advisorLine = advisorViolationLine('holistic', diagnostics);
+  if (advisorLine) log(advisorLine);
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = (res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output'));

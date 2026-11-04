@@ -330,6 +330,14 @@ export interface SeatDiagnostics {
   // conventionsReadOf): `read` with the docs reached, `index-only`, or `unread`. Set only on a
   // run that handed the conventions over as a file AND whose stream could answer — never a guess.
   conventions?: { docsRead: string[]; state: 'read' | 'index-only' | 'unread' };
+  // A Claude seat's advisor, both halves apart: what the spawn STATED (`off`, a model id, or
+  // `inherit` — the key was absent and the operator's own setting decided) and how many advisor
+  // calls its stream shows (core/claude-stream advisorCallCount). `violation` when the seat was told
+  // off and still called it: the env kill switch did not hold, and the run must say so loudly. Zero
+  // calls never proves the tool was absent — only `configured: 'off'` + zero on a WHOLE stream is a
+  // kept promise: `streamTruncated` says the persisted stream was cut (core/spawn STREAM_CUT_EVENT),
+  // so `calls` is a floor and zero claims nothing. Absent on a seat that is not a Claude spawn.
+  advisor?: { calls: number; configured: string; streamTruncated?: true; violation?: true };
   // The seat's pre-flight warnings (today: grok's login pre-flight), kept apart from `stderrTail`.
   preflightWarnings?: string[];
   startedAt: string;

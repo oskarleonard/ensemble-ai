@@ -13,6 +13,7 @@
 
 import fs from 'node:fs';
 
+import { advisorStateOf } from '../../core/claude-stream';
 import { readReviewsForRun, writeTrailFile } from '../../core/artifacts';
 import { evidenceRef, parseFindings } from '../../core/findings';
 import { scrubControl as scrub } from '../../core/sanitize';
@@ -30,7 +31,7 @@ import type { VoiceRunResult } from '../brainstorm/voices';
 
 import { resolveCiEvidence } from './ci-evidence';
 import { claudeWorktreePromptSuffix, runClaudeReviewVoice } from './claude';
-import { seatDiagnostics } from './seat-run';
+import { advisorViolationLine, seatDiagnostics } from './seat-run';
 import { describeUsage } from './seat-usage';
 import type { SeatDiagnostics } from '../../core/types';
 import { renderCodeReviewSeatPrompt } from './code-review-seat';
@@ -313,7 +314,9 @@ export async function runClaudeReviewer(
   }
   // The seat's run facts — the same record the core seats keep — so review.claude.json says how
   // long the read took and how deep it went, not only what it found.
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { advisor: advisorStateOf(config), conventionsFile });
+  const advisorLine = advisorViolationLine('claude', diagnostics);
+  if (advisorLine) log(advisorLine);
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output');
@@ -961,7 +964,9 @@ export async function runIntegrationStage(opts: IntegrationStageOptions): Promis
   }
   // The seat's run facts, like the producer's and the lens's (2026-10-13: this seat was the one
   // Anthropic stage left without timing, usage or a stream on run d5a1f648).
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { advisor: advisorStateOf(opts.config), conventionsFile: opts.conventionsPath });
+  const advisorLine = advisorViolationLine('integration', diagnostics);
+  if (advisorLine) log(advisorLine);
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output');
@@ -1079,7 +1084,9 @@ export async function runProductStage(opts: ProductStageOptions): Promise<Produc
     log(`product: failed to run — ${(e as Error).message}`);
     return fail(`the product seat did not run: ${(e as Error).message}`, null);
   }
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { advisor: advisorStateOf(opts.config), conventionsFile: opts.conventionsPath });
+  const advisorLine = advisorViolationLine('product', diagnostics);
+  if (advisorLine) log(advisorLine);
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? 'timed out' : 'produced no output');
