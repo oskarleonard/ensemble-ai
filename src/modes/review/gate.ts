@@ -1833,7 +1833,7 @@ export async function runGate(opts: RunGateOptions): Promise<GateRunResult> {
       `${Math.max(1, Math.round(d.elapsedMs / 60_000))} min`,
       d.usage?.toolCalls !== undefined ? `${d.usage.toolCalls}${d.usage.streamTruncated ? '+' : ''} tool calls` : null,
       d.conventions ? `conventions ${d.conventions.state}${d.conventions.docsRead.length ? ` (${d.conventions.docsRead.length} docs)` : ''}` : null,
-      d.advisor ? `advisor ${d.advisor.configured}${d.advisor.calls ? ` · ${d.advisor.calls} call(s)` : ''}` : null,
+      d.advisor ? `advisor ${d.advisor.configured}${d.advisor.calls ? ` · ${d.advisor.calls}${d.advisor.streamTruncated ? '+' : ''} call(s)` : d.advisor.streamTruncated ? ' · stream cut' : ''}` : null,
     ]
       .filter(Boolean)
       .join(' · ');

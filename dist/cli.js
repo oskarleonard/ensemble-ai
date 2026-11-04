@@ -1472,7 +1472,17 @@ function stripStreamPayloads(stream) {
 }
 function advisorCallCount(stream) {
   if (!stream) return 0;
+  const seen = /* @__PURE__ */ new Set();
   let n = 0;
+  const count = (b) => {
+    if (!isAdvisorUse(b)) return;
+    const id = b.id;
+    if (typeof id === "string" && id) {
+      if (seen.has(id)) return;
+      seen.add(id);
+    }
+    n++;
+  };
   for (const line of stream.split("\n")) {
     if (!line.includes("advisor")) continue;
     let e;
@@ -1485,22 +1495,23 @@ function advisorCallCount(stream) {
     const ev = e;
     if (ev.type === "assistant" && ev.message && typeof ev.message === "object") {
       const content = ev.message.content;
-      if (Array.isArray(content)) {
-        for (const b of content) if (isAdvisorUse(b)) n++;
-      }
+      if (Array.isArray(content)) for (const b of content) count(b);
       continue;
     }
     if (ev.type === "stream_event" && ev.event && typeof ev.event === "object") {
       const inner = ev.event;
-      if (inner.type === "content_block_start" && isAdvisorUse(inner.content_block)) n++;
+      if (inner.type === "content_block_start") count(inner.content_block);
     }
   }
   return n;
 }
 var isAdvisorUse = (b) => !!b && typeof b === "object" && b.type === "server_tool_use" && b.name === "advisor";
 function advisorStateOf(config) {
-  if (!config || config.vendor !== void 0 && config.vendor !== "anthropic") return void 0;
-  return typeof config.advisor === "string" && config.advisor ? config.advisor : "inherit";
+  if (!config) return void 0;
+  if (config.id === "codex" || config.id === "grok") return void 0;
+  if (config.vendor !== void 0 && config.vendor !== "anthropic") return void 0;
+  const stated = parseSeatAdvisor(config.advisor, typeof config.id === "string" ? config.id : "claude");
+  return stated === void 0 ? "inherit" : stated;
 }
 
 // src/core/egress-proxy.ts
@@ -7795,8 +7806,22 @@ function seatDiagnostics(result, timing, opts = {}) {
 }
 function advisorRecord(configured, stream) {
   const calls = advisorCallCount(stream);
-  return { calls, configured, ...configured === "off" && calls > 0 ? { violation: true } : {} };
+  const truncated = !!stream && stream.split("\n").some((line) => line.includes(STREAM_CUT_EVENT) && isCutEvent(line));
+  return {
+    calls,
+    configured,
+    ...truncated ? { streamTruncated: true } : {},
+    ...configured === "off" && calls > 0 ? { violation: true } : {}
+  };
 }
+var isCutEvent = (line) => {
+  try {
+    const e = JSON.parse(line);
+    return !!e && typeof e === "object" && e.type === STREAM_CUT_EVENT;
+  } catch {
+    return false;
+  }
+};
 function advisorViolationLine(seat, d) {
   return d.advisor?.violation ? `  \xB7 ${seat}: \u26A0 advisor configured off, yet the stream shows ${d.advisor.calls} advisor call(s) \u2014 the kill switch did not hold` : null;
 }
@@ -11336,7 +11361,7 @@ async function runGate(opts) {
     `${Math.max(1, Math.round(d.elapsedMs / 6e4))} min`,
     d.usage?.toolCalls !== void 0 ? `${d.usage.toolCalls}${d.usage.streamTruncated ? "+" : ""} tool calls` : null,
     d.conventions ? `conventions ${d.conventions.state}${d.conventions.docsRead.length ? ` (${d.conventions.docsRead.length} docs)` : ""}` : null,
-    d.advisor ? `advisor ${d.advisor.configured}${d.advisor.calls ? ` \xB7 ${d.advisor.calls} call(s)` : ""}` : null
+    d.advisor ? `advisor ${d.advisor.configured}${d.advisor.calls ? ` \xB7 ${d.advisor.calls}${d.advisor.streamTruncated ? "+" : ""} call(s)` : d.advisor.streamTruncated ? " \xB7 stream cut" : ""}` : null
   ].filter(Boolean).join(" \xB7 ");
   if (premiseActive) log(`premise pass: ${premiseCluster.length} cluster(s) \u2014 advisory clause appended`);
   log("Gate: grounding findings against the pinned diff hunks \u2014 verdict tags\u2026");

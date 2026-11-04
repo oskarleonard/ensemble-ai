@@ -1,3 +1,4 @@
+import { STREAM_CUT_EVENT } from '../../core/spawn';
 import { advisorCallCount } from '../../core/claude-stream';
 import { persistReview } from '../../core/artifacts';
 import { type ParsedReview, parseFindings } from '../../core/findings';
@@ -131,8 +132,24 @@ export function seatDiagnostics(
 // records the same shape and the same rule.
 export function advisorRecord(configured: string, stream: string | null | undefined): NonNullable<SeatDiagnostics['advisor']> {
   const calls = advisorCallCount(stream);
-  return { calls, configured, ...(configured === 'off' && calls > 0 ? { violation: true as const } : {}) };
+  // A cut stream (the persisted copy's bound bit — core/spawn STREAM_CUT_EVENT) makes `calls` a
+  // floor: a violation still stands on what IS there, but zero is not a kept promise.
+  const truncated = !!stream && stream.split('\n').some((line) => line.includes(STREAM_CUT_EVENT) && isCutEvent(line));
+  return {
+    calls,
+    configured,
+    ...(truncated ? { streamTruncated: true as const } : {}),
+    ...(configured === 'off' && calls > 0 ? { violation: true as const } : {}),
+  };
 }
+const isCutEvent = (line: string): boolean => {
+  try {
+    const e = JSON.parse(line) as { type?: unknown };
+    return !!e && typeof e === 'object' && e.type === STREAM_CUT_EVENT;
+  } catch {
+    return false;
+  }
+};
 // The one loud line for a broken kill switch, for every seat's log.
 export function advisorViolationLine(seat: string, d: Pick<SeatDiagnostics, 'advisor'>): string | null {
   return d.advisor?.violation

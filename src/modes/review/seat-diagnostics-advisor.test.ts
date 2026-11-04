@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { STREAM_CUT_EVENT } from '../../core/spawn';
 import type { CodexReviewResult } from '../../reviewers/codex';
 
 import { advisorViolationLine, seatDiagnostics } from './seat-run';
@@ -23,6 +24,13 @@ describe('seatDiagnostics — the advisor half: stated vs observed', () => {
     const d = seatDiagnostics(result(advisorLine), timing, { advisor: 'inherit' });
     expect(d.advisor).toEqual({ calls: 1, configured: 'inherit' });
     expect(advisorViolationLine('holistic', d)).toBeNull();
+  });
+  it('a cut stream makes zero calls a floor, never a kept promise', () => {
+    const cut = JSON.stringify({ type: STREAM_CUT_EVENT });
+    const d = seatDiagnostics(result(cut), timing, { advisor: 'off' });
+    expect(d.advisor).toEqual({ calls: 0, configured: 'off', streamTruncated: true });
+    const d2 = seatDiagnostics(result([advisorLine, cut].join('\n')), timing, { advisor: 'off' });
+    expect(d2.advisor).toEqual({ calls: 1, configured: 'off', streamTruncated: true, violation: true });
   });
   it('a seat that is not a Claude spawn writes no field', () => {
     expect(seatDiagnostics(result(advisorLine), timing, {}).advisor).toBeUndefined();
