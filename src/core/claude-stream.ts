@@ -183,3 +183,49 @@ export function stripStreamPayloads(stream: string): string {
   }
   return out.join('\n');
 }
+
+// ── The advisor on a Claude seat's stream ────────────────────────────────────
+// A Claude seat may carry the CLI's advisor tool (a second model it consults mid-task). It shows in
+// stream-json as a `server_tool_use` content block named "advisor" on an assistant event (or, on a
+// partial-message stream, as a content_block_start of that type). Counting them is the ONE way to
+// know whether a seat ran with an advisor: the init event's `tools` never lists a server tool, and a
+// configured "off" is a promise the env kill switch keeps — or does not. Pure; junk lines skipped.
+export function advisorCallCount(stream: string | null | undefined): number {
+  if (!stream) return 0;
+  let n = 0;
+  for (const line of stream.split('\n')) {
+    if (!line.includes('advisor')) continue; // cheap pre-filter: most lines carry no server tool
+    let e: unknown;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!e || typeof e !== 'object') continue;
+    const ev = e as Record<string, unknown>;
+    if (ev.type === 'assistant' && ev.message && typeof ev.message === 'object') {
+      const content = (ev.message as Record<string, unknown>).content;
+      if (Array.isArray(content)) for (const b of content) if (isAdvisorUse(b)) n++;
+      continue;
+    }
+    if (ev.type === 'stream_event' && ev.event && typeof ev.event === 'object') {
+      const inner = ev.event as Record<string, unknown>;
+      if (inner.type === 'content_block_start' && isAdvisorUse(inner.content_block)) n++;
+    }
+  }
+  return n;
+}
+const isAdvisorUse = (b: unknown): boolean =>
+  !!b &&
+  typeof b === 'object' &&
+  (b as Record<string, unknown>).type === 'server_tool_use' &&
+  (b as Record<string, unknown>).name === 'advisor';
+
+// What a Claude seat's spawn STATED about its advisor, for the trail: "off" or a model id when the
+// config carries one, `inherit` when it left the key absent (the operator's own setting decided —
+// the accident core/types `advisor` exists to end). Undefined for a seat that is not a Claude spawn
+// (a codex-vendor gate), so no field is recorded for it.
+export function advisorStateOf(config: { advisor?: unknown; vendor?: unknown } | null | undefined): string | undefined {
+  if (!config || (config.vendor !== undefined && config.vendor !== 'anthropic')) return undefined;
+  return typeof config.advisor === 'string' && config.advisor ? config.advisor : 'inherit';
+}

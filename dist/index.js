@@ -2126,6 +2126,38 @@ function stripStreamPayloads(stream) {
   }
   return out.join("\n");
 }
+function advisorCallCount(stream) {
+  if (!stream) return 0;
+  let n = 0;
+  for (const line of stream.split("\n")) {
+    if (!line.includes("advisor")) continue;
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!e || typeof e !== "object") continue;
+    const ev = e;
+    if (ev.type === "assistant" && ev.message && typeof ev.message === "object") {
+      const content = ev.message.content;
+      if (Array.isArray(content)) {
+        for (const b of content) if (isAdvisorUse(b)) n++;
+      }
+      continue;
+    }
+    if (ev.type === "stream_event" && ev.event && typeof ev.event === "object") {
+      const inner = ev.event;
+      if (inner.type === "content_block_start" && isAdvisorUse(inner.content_block)) n++;
+    }
+  }
+  return n;
+}
+var isAdvisorUse = (b) => !!b && typeof b === "object" && b.type === "server_tool_use" && b.name === "advisor";
+function advisorStateOf(config) {
+  if (!config || config.vendor !== void 0 && config.vendor !== "anthropic") return void 0;
+  return typeof config.advisor === "string" && config.advisor ? config.advisor : "inherit";
+}
 
 // src/core/egress-proxy.ts
 import http from "http";
@@ -5513,10 +5545,12 @@ async function adapterOnce(adapter, prompt, reviewer, opts) {
 function seatDiagnostics(result, timing, opts = {}) {
   const usage = parseSeatUsage(result.stream);
   const conventions = opts.conventionsFile ? conventionsReadOf(result.stream, readConventionsLayout(opts.conventionsFile)) : void 0;
+  const advisor = opts.advisor === void 0 ? void 0 : advisorRecord(opts.advisor, result.stream);
   return {
     elapsedMs: timing.endedAt - timing.startedAt,
     ...Object.keys(usage).length > 0 ? { usage } : {},
     ...conventions ? { conventions } : {},
+    ...advisor ? { advisor } : {},
     endedAt: new Date(timing.endedAt).toISOString(),
     ...result.failWhy ? { failWhy: result.failWhy } : {},
     ...result.preflightWarnings?.length ? { preflightWarnings: [...result.preflightWarnings] } : {},
@@ -5524,6 +5558,13 @@ function seatDiagnostics(result, timing, opts = {}) {
     stderrTail: result.stderrTail.trim().slice(-2e3),
     ...result.timedOutReason ? { timedOutReason: result.timedOutReason } : {}
   };
+}
+function advisorRecord(configured, stream) {
+  const calls = advisorCallCount(stream);
+  return { calls, configured, ...configured === "off" && calls > 0 ? { violation: true } : {} };
+}
+function advisorViolationLine(seat, d) {
+  return d.advisor?.violation ? `  \xB7 ${seat}: \u26A0 advisor configured off, yet the stream shows ${d.advisor.calls} advisor call(s) \u2014 the kill switch did not hold` : null;
 }
 function persistAttempt(args, prompt, result, timing) {
   const parsed = result.raw ? parseFindings(result.raw) : null;
@@ -5963,7 +6004,9 @@ async function runHolisticLens(opts) {
     log(`  \xB7 holistic: failed to run \u2014 ${e.message}`);
     return fail(`the holistic lens did not run: ${e.message}`);
   }
-  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { conventionsFile: opts.conventionsPath });
+  const diagnostics = seatDiagnostics(res, { endedAt: Date.now(), startedAt }, { advisor: advisorStateOf(opts.config), conventionsFile: opts.conventionsPath });
+  const advisorLine = advisorViolationLine("holistic", diagnostics);
+  if (advisorLine) log(advisorLine);
   const stream = res.stream ?? null;
   if (!res.raw || res.timedOut) {
     const why = res.failWhy ?? (res.timedOut ? "timed out" : "produced no output");

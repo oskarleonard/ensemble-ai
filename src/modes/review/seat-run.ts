@@ -1,3 +1,4 @@
+import { advisorCallCount } from '../../core/claude-stream';
 import { persistReview } from '../../core/artifacts';
 import { type ParsedReview, parseFindings } from '../../core/findings';
 import type { assembleCodePacket } from '../../core/packet';
@@ -103,14 +104,19 @@ export function seatDiagnostics(
   timing: SeatTiming,
   // `conventionsFile`: this run handed the conventions over as a file at this path, so how far
   // the seat read into it is a fact worth recording. Absent (inline) ⇒ the field is never written.
-  opts: { conventionsFile?: string } = {}
+  // `advisor`: what a Claude seat's spawn stated about its advisor (core/claude-stream
+  // advisorStateOf) — the stream then says how many times it was called. Absent ⇒ not a Claude
+  // spawn, no field written.
+  opts: { advisor?: string; conventionsFile?: string } = {}
 ): SeatDiagnostics {
   const usage = parseSeatUsage(result.stream);
   const conventions = opts.conventionsFile ? conventionsReadOf(result.stream, readConventionsLayout(opts.conventionsFile)) : undefined;
+  const advisor = opts.advisor === undefined ? undefined : advisorRecord(opts.advisor, result.stream);
   return {
     elapsedMs: timing.endedAt - timing.startedAt,
     ...(Object.keys(usage).length > 0 ? { usage } : {}),
     ...(conventions ? { conventions } : {}),
+    ...(advisor ? { advisor } : {}),
     endedAt: new Date(timing.endedAt).toISOString(),
     ...(result.failWhy ? { failWhy: result.failWhy } : {}),
     ...(result.preflightWarnings?.length ? { preflightWarnings: [...result.preflightWarnings] } : {}),
@@ -118,6 +124,20 @@ export function seatDiagnostics(
     stderrTail: result.stderrTail.trim().slice(-2000),
     ...(result.timedOutReason ? { timedOutReason: result.timedOutReason } : {}),
   };
+}
+
+// The advisor half of the diagnostics: stated vs observed, and the violation when "off" was not
+// kept. One place, so every Claude seat (producer, lens, gate, shadow gate, integration, product)
+// records the same shape and the same rule.
+export function advisorRecord(configured: string, stream: string | null | undefined): NonNullable<SeatDiagnostics['advisor']> {
+  const calls = advisorCallCount(stream);
+  return { calls, configured, ...(configured === 'off' && calls > 0 ? { violation: true as const } : {}) };
+}
+// The one loud line for a broken kill switch, for every seat's log.
+export function advisorViolationLine(seat: string, d: Pick<SeatDiagnostics, 'advisor'>): string | null {
+  return d.advisor?.violation
+    ? `  · ${seat}: ⚠ advisor configured off, yet the stream shows ${d.advisor.calls} advisor call(s) — the kill switch did not hold`
+    : null;
 }
 
 // Parse + persist one attempt's reply as this seat's trail artifact. A watchdog timeout or a parse
