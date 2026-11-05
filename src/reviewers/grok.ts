@@ -51,7 +51,7 @@ export const GROK_INACTIVITY_TIMEOUT_MS = 900_000; // 15 min of SILENCE
 // The NDJSON stream persisted beside the reply — the post-mortem of a reclaimed seat AND, since
 // 2026-10-10, the read-depth telemetry's source (seat-usage.ts counts tool calls and proves the
 // conventions read over it). It was 100 KB, then 1 MB, and both were cuts through per-TOKEN deltas:
-// 23 of 33 grok PR-review streams 2026-10-01 → 11-04 carried the cut marker (run
+// most grok PR-review streams since 2026-10-01 carried the cut marker (run
 // 2026-11-04-15-08-41-d8a5382a: ≈4.5 M raw chars, 3 509 057 dropped), and a conventions read in the
 // dropped middle left the seat's read fact `head-lost`. So the persisted copy first drops the
 // deltas every `assistant` line restates (core/claude-stream dropDeliveredDeltas — most of the raw
