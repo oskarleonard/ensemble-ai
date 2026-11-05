@@ -1862,6 +1862,7 @@ function killTree(child, signal, signalGroup = (pid, sig) => process.kill(-pid, 
 var STREAM_TAIL_LIMIT = 1e6;
 var STREAM_HEAD_LIMIT = 65536;
 var STREAM_CUT_EVENT = "ensemble.stream_cut";
+var STREAM_DELTAS_KEPT_EVENT = "ensemble.stream_deltas_kept";
 function joinStreamHeadTail(head, tail, total, headLimit = STREAM_HEAD_LIMIT) {
   if (total <= tail.length) return tail;
   const room = Math.min(headLimit, total - tail.length);
@@ -2126,6 +2127,108 @@ function stripStreamPayloads(stream) {
   }
   return out.join("\n");
 }
+var DELTA_PAYLOAD = /* @__PURE__ */ new Map([
+  ["input_json_delta", "partial_json"],
+  ["signature_delta", "signature"],
+  ["text_delta", "text"],
+  ["thinking_delta", "thinking"]
+]);
+function dropDeliveredDeltas(stream) {
+  const lines = stream.split("\n");
+  const drop = /* @__PURE__ */ new Set();
+  const kept = [];
+  let open = null;
+  const opened = (id) => ({ blocks: /* @__PURE__ */ new Map(), deltas: [], doubt: id === null ? "no message_start named its message" : null, id, mayHoldCall: false });
+  const blockAt = (m, index) => {
+    let b = m.blocks.get(index);
+    if (!b) m.blocks.set(index, b = { spelled: /* @__PURE__ */ new Map() });
+    return b;
+  };
+  const keep = (m, why) => {
+    if (m.deltas.length > 0 || m.mayHoldCall) kept.push({ deltas: m.deltas.length, id: m.id, mayHoldCall: m.mayHoldCall, why });
+  };
+  for (const [i, line] of lines.entries()) {
+    const ev = parseObject(line);
+    if (!ev) continue;
+    if (ev.type === "stream_event" && isObject(ev.event)) {
+      const inner = ev.event;
+      if (inner.type === "message_start") {
+        if (open) keep(open, open.doubt ?? "no assistant line before the next message");
+        open = opened(isObject(inner.message) && typeof inner.message.id === "string" ? inner.message.id : null);
+        continue;
+      }
+      if (inner.type === "content_block_delta") {
+        open ??= opened(null);
+        open.deltas.push(i);
+        const d = inner.delta;
+        const field2 = isObject(d) && typeof d.type === "string" ? DELTA_PAYLOAD.get(d.type) : void 0;
+        if (field2 === "partial_json") open.mayHoldCall = true;
+        if (field2 === void 0 || typeof inner.index !== "number" || !isObject(d) || typeof d[field2] !== "string") {
+          open.doubt ??= "a delta this reader cannot place";
+          open.mayHoldCall = true;
+          continue;
+        }
+        const b = blockAt(open, inner.index);
+        b.spelled.set(field2, (b.spelled.get(field2) ?? "") + d[field2]);
+        continue;
+      }
+      const block = inner.content_block;
+      if (inner.type === "content_block_start" && isObject(block) && block.type === "tool_use") {
+        open ??= opened(null);
+        open.mayHoldCall = true;
+        if (typeof inner.index === "number") blockAt(open, inner.index).tool = typeof block.id === "string" ? block.id : "";
+        else open.doubt ??= "a content_block_start tool_use with no block index";
+      }
+      continue;
+    }
+    if (ev.type !== "assistant" || !open || !isObject(ev.message)) continue;
+    const id = typeof ev.message.id === "string" ? ev.message.id : null;
+    if (open.id !== null && id !== open.id) continue;
+    const content = Array.isArray(ev.message.content) ? ev.message.content : [];
+    const why = open.doubt ?? unrestated(open.blocks, content);
+    if (why) keep(open, why);
+    else for (const d of open.deltas) drop.add(d);
+    open = null;
+  }
+  if (open) keep(open, open.doubt ?? "no assistant line (the stream ended mid-message)");
+  if (drop.size === 0 && kept.length === 0) return stream;
+  const out = lines.filter((_, i) => !drop.has(i));
+  if (kept.length > 0) {
+    const flag = JSON.stringify({ messages: kept, type: STREAM_DELTAS_KEPT_EVENT });
+    if (out[out.length - 1] === "") out.splice(out.length - 1, 0, flag);
+    else out.push(flag);
+  }
+  return out.join("\n");
+}
+function unrestated(blocks, content) {
+  for (const [index, b] of blocks) {
+    const c = content[index];
+    if (b.tool !== void 0 && (b.tool === "" || !isObject(c) || c.type !== "tool_use" || c.id !== b.tool)) return "a content_block_start tool_use its assistant line does not carry";
+    for (const [field2, spelled] of b.spelled) {
+      const same = isObject(c) && (field2 === "partial_json" ? c.type === "tool_use" && sameJson(spelled, c.input) : c[field2] === spelled);
+      if (!same) return `its assistant line does not restate block ${index}'s ${field2}`;
+    }
+  }
+  return null;
+}
+function sameJson(spelled, value) {
+  try {
+    return canonicalJson(JSON.parse(spelled)) === canonicalJson(value);
+  } catch {
+    return false;
+  }
+}
+var canonicalJson = (v) => JSON.stringify(v, (_key, x) => isObject(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x);
+function parseObject(line) {
+  if (!line.startsWith("{")) return null;
+  try {
+    const v = JSON.parse(line);
+    return isObject(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+var isObject = (v) => !!v && typeof v === "object" && !Array.isArray(v);
 function advisorCallCount(stream) {
   if (!stream) return 0;
   const seen = /* @__PURE__ */ new Set();
@@ -2943,7 +3046,10 @@ async function decide(opts, cwd, proceed) {
 var GROK_PACKET_REVIEW_TIMEOUT_MS = 18e5;
 var GROK_WORKTREE_REVIEW_TIMEOUT_MS = 36e5;
 var GROK_INACTIVITY_TIMEOUT_MS = 9e5;
-var GROK_STREAM_TAIL_LIMIT = 1e6;
+var GROK_STREAM_LIMIT = 8e6;
+function persistedGrokStream(raw) {
+  return boundedStreamHeadTail(dropDeliveredDeltas(raw), GROK_STREAM_LIMIT);
+}
 var GROK_SEAT_STDERR_LIMIT = 2e3;
 var GROK_BIN_CANDIDATES = [path8.join(os7.homedir(), ".grok", "bin", "grok")];
 function resolveGrokBin() {
@@ -3209,7 +3315,7 @@ async function runGrokReview(prompt, config, opts = {}) {
         ok: false,
         raw: null,
         stderrTail: verdict.why,
-        ...raw ? { stream: boundedStreamHeadTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
+        ...raw ? { stream: persistedGrokStream(raw) } : {},
         timedOut,
         ...timedOutReason ? { timedOutReason } : {}
       };
@@ -3231,11 +3337,11 @@ async function runGrokReview(prompt, config, opts = {}) {
       ...preflight,
       raw: text,
       stderrTail,
-      // The bounded NDJSON stream — its HEAD (init, the step-0 conventions read) + a cut marker +
-      // the tail, so a reclaimed seat leaves a record of what it was doing AND the read-depth
-      // telemetry keeps its head (a bare tail left grok head-lost on every long seat). Cut on
-      // line boundaries — the trail persists it as .jsonl.
-      ...raw ? { stream: boundedStreamHeadTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
+      // The persisted NDJSON stream — whole once its delivered deltas are dropped, so a reclaimed
+      // seat leaves a record of what it was doing AND the read-depth telemetry sees every call.
+      // Past the backstop it keeps its HEAD (init, the step-0 conventions read) + a cut marker +
+      // the tail, cut on line boundaries — the trail persists it as .jsonl.
+      ...raw ? { stream: persistedGrokStream(raw) } : {},
       timedOut,
       ...timedOutReason ? { timedOutReason } : {}
     };
@@ -5333,6 +5439,15 @@ function parseSeatUsage(stream) {
   let resultUsage = null;
   let first = null;
   let sawCut = false;
+  const seenTools = /* @__PURE__ */ new Set();
+  const countTool = (block) => {
+    if (typeof block.id === "string" && block.id) {
+      if (seenTools.has(block.id)) return;
+      seenTools.add(block.id);
+    }
+    toolCalls++;
+    sawTool = true;
+  };
   for (const line of stream.split("\n")) {
     if (!line.trim()) continue;
     let e;
@@ -5372,10 +5487,7 @@ function parseSeatUsage(stream) {
       }
       if (inner.type === "content_block_start" && inner.content_block && typeof inner.content_block === "object") {
         const cb = inner.content_block;
-        if (cb.type === "tool_use") {
-          toolCalls++;
-          sawTool = true;
-        }
+        if (cb.type === "tool_use") countTool(cb);
       }
       continue;
     }
@@ -5383,10 +5495,7 @@ function parseSeatUsage(stream) {
       const m = ev.message;
       if (Array.isArray(m.content)) {
         for (const c of m.content) {
-          if (c && typeof c === "object" && c.type === "tool_use") {
-            toolCalls++;
-            sawTool = true;
-          }
+          if (c && typeof c === "object" && c.type === "tool_use") countTool(c);
         }
       }
       continue;
@@ -5455,6 +5564,7 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
   if (!stream) return void 0;
   let first = null;
   let sawCut = false;
+  let sawKept = false;
   const ranges = [];
   const pending = /* @__PURE__ */ new Map();
   const codexPending = /* @__PURE__ */ new Map();
@@ -5471,6 +5581,7 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
     const ev = e;
     if (first === null) first = streamHeadKind(ev) ?? null;
     if (ev.type === STREAM_CUT_EVENT) sawCut = true;
+    if (ev.type === STREAM_DELTAS_KEPT_EVENT && (!Array.isArray(ev.messages) || ev.messages.some((m) => !m || typeof m !== "object" || m.mayHoldCall !== false))) sawKept = true;
     if ((ev.type === "item.started" || ev.type === "item.completed") && ev.item && typeof ev.item === "object") {
       const it = ev.item;
       if (it.type !== "command_execution") continue;
@@ -5531,7 +5642,7 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
   ranges.push(...pending.values());
   if (first === null) return void 0;
   const attempted = codexPending.size > 0 || codexUnkeyed > 0;
-  const whole = first === "init" && !sawCut && !attempted;
+  const whole = first === "init" && !sawCut && !sawKept && !attempted;
   if (ranges.length === 0) return whole ? { docsRead: [], state: "unread" } : void 0;
   if (!layout) return { docsRead: [], state: "read" };
   const beyondIndex = ranges.some((r) => r.grep || r.end > layout.indexEndLine);
@@ -9271,6 +9382,7 @@ export {
   GROK_STATUS_AUTHENTICATED_VIA_PREFIX,
   GROK_STATUS_LOGGED_IN_PREFIX,
   GROK_STATUS_NOT_AUTHENTICATED,
+  GROK_STREAM_LIMIT,
   GROK_WEB_TOOL,
   GROK_WORKTREE_REVIEW_TIMEOUT_MS,
   GrokLoginExpiryError,
@@ -9312,6 +9424,7 @@ export {
   SKELETON_TRAIL_FILE,
   STAGE_MARKER,
   STREAM_CUT_EVENT,
+  STREAM_DELTAS_KEPT_EVENT,
   STRIPPED_INSTRUCTION_PATHS,
   SUGGESTION_HARD_CAP,
   TERMINAL_STATES,
@@ -9485,6 +9598,7 @@ export {
   parseVoiceIds,
   parseVoices,
   persistReview,
+  persistedGrokStream,
   pickSynthesizer,
   planPlacement,
   proxyEnv,

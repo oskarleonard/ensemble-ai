@@ -1,4 +1,4 @@
-import { STREAM_CUT_EVENT } from '../../core/spawn';
+import { STREAM_CUT_EVENT, STREAM_DELTAS_KEPT_EVENT } from '../../core/spawn';
 
 // READ-DEPTH TELEMETRY (step 1 of the 2026-10-10 architecture review). The gate verifies the
 // findings a seat returns; nothing verified that the seat READ. Run 2026-10-10-22-31-50-485c0df5
@@ -73,6 +73,18 @@ export function parseSeatUsage(stream: string | null | undefined): SeatUsage {
   let resultUsage: { cached: number; input: number; output: number } | null = null;
   let first: string | null = null;
   let sawCut = false;
+  // A claude-shaped stream names each tool call TWICE — its `content_block_start` and its
+  // `assistant` line (12 for 6 calls on run 2026-11-04-15-08-41-d8a5382a) — so a call counts once,
+  // keyed by its tool_use id; a block without an id counts per occurrence (advisorCallCount's rule).
+  const seenTools = new Set<string>();
+  const countTool = (block: Record<string, unknown>): void => {
+    if (typeof block.id === 'string' && block.id) {
+      if (seenTools.has(block.id)) return;
+      seenTools.add(block.id);
+    }
+    toolCalls++;
+    sawTool = true;
+  };
   for (const line of stream.split('\n')) {
     if (!line.trim()) continue;
     let e: unknown;
@@ -114,10 +126,7 @@ export function parseSeatUsage(stream: string | null | undefined): SeatUsage {
       }
       if (inner.type === 'content_block_start' && inner.content_block && typeof inner.content_block === 'object') {
         const cb = inner.content_block as Record<string, unknown>;
-        if (cb.type === 'tool_use') {
-          toolCalls++;
-          sawTool = true;
-        }
+        if (cb.type === 'tool_use') countTool(cb);
       }
       continue;
     }
@@ -125,10 +134,7 @@ export function parseSeatUsage(stream: string | null | undefined): SeatUsage {
       const m = ev.message as Record<string, unknown>;
       if (Array.isArray(m.content)) {
         for (const c of m.content) {
-          if (c && typeof c === 'object' && (c as Record<string, unknown>).type === 'tool_use') {
-            toolCalls++;
-            sawTool = true;
-          }
+          if (c && typeof c === 'object' && (c as Record<string, unknown>).type === 'tool_use') countTool(c as Record<string, unknown>);
         }
       }
       continue;
@@ -256,6 +262,11 @@ export function conventionsReadOf(
   if (!stream) return undefined;
   let first: string | null = null;
   let sawCut = false;
+  // The persisted copy kept some deltas no assistant line accounts for (core/spawn
+  // STREAM_DELTAS_KEPT_EVENT). When a kept message may hold a call (a tool_use start, an
+  // `input_json_delta`), that call may live only in lines no reader parses; a thinking- or
+  // text-only one cannot hide a read, so it leaves the absence claim standing.
+  let sawKept = false;
   const ranges: LineRange[] = [];
   // claude-shaped: a Read/Grep is recorded by tool_use id so an errored tool_result can drop it.
   const pending = new Map<string, LineRange>();
@@ -280,6 +291,7 @@ export function conventionsReadOf(
     const ev = e as Record<string, unknown>;
     if (first === null) first = streamHeadKind(ev) ?? null;
     if (ev.type === STREAM_CUT_EVENT) sawCut = true;
+    if (ev.type === STREAM_DELTAS_KEPT_EVENT && (!Array.isArray(ev.messages) || ev.messages.some((m) => !m || typeof m !== 'object' || (m as Record<string, unknown>).mayHoldCall !== false))) sawKept = true;
     if ((ev.type === 'item.started' || ev.type === 'item.completed') && ev.item && typeof ev.item === 'object') {
       const it = ev.item as Record<string, unknown>;
       if (it.type !== 'command_execution') continue;
@@ -347,9 +359,10 @@ export function conventionsReadOf(
   if (first === null) return undefined;
   // A truncated stream — head gone, or a cut marker between head and tail — can still PROVE a
   // read (the call survived); it can never prove "unread" or "index-only", because the call that
-  // reached a doc may be in the part that was dropped. Those two need the WHOLE stream.
+  // reached a doc may be in the part that was dropped. Those two need the WHOLE stream — and a
+  // stream whose kept deltas may hold a call no assistant line accounts for is not one.
   const attempted = codexPending.size > 0 || codexUnkeyed > 0;
-  const whole = first === 'init' && !sawCut && !attempted;
+  const whole = first === 'init' && !sawCut && !sawKept && !attempted;
   if (ranges.length === 0) return whole ? { docsRead: [], state: 'unread' } : undefined;
   if (!layout) return { docsRead: [], state: 'read' };
   const beyondIndex = ranges.some((r) => r.grep || r.end > layout.indexEndLine);

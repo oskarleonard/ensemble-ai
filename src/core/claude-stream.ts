@@ -1,3 +1,4 @@
+import { STREAM_DELTAS_KEPT_EVENT } from './spawn';
 import { parseSeatAdvisor } from './types';
 // The `claude -p` STREAM CONTRACT shared by every headless Anthropic seat — the review voice,
 // the gate, the holistic lens, the exec seats (modes/review) AND the brainstorm/consult voice
@@ -184,6 +185,148 @@ export function stripStreamPayloads(stream: string): string {
   }
   return out.join('\n');
 }
+
+// DROP THE DELIVERED DELTAS (2026-11-04). A `--include-partial-messages` stream (grok's seat) is
+// dominated by `content_block_delta` lines — one per token of thinking, text, signature and tool
+// input: 2 967 of 2 977 persisted lines on run 2026-11-04-15-08-41-d8a5382a, whose raw stream was
+// ≈4.5 M chars and lost 3.5 M of its middle to the 1 MB head+tail cut — and with them the read of
+// the conventions file. A message's `assistant` line RESTATES its deltas (the full thinking, text,
+// signature and tool_use inputs), and no reader parses a delta: the tool calls come off the
+// assistant lines, the tokens off `message_delta` and `result`. So a message's deltas are dropped
+// only once its assistant line is PROVED to restate them: the same message id on both, every block
+// the deltas spelled — text, thinking, signature, the tool input's JSON (compared parsed, keys in
+// any order) — equal to the assistant line's block at that index, every tool_use a
+// `content_block_start` opened carried there under its id (on run 2026-11-05-02-40-09-a734f8d3's
+// grok tail every block of all 13 messages matched). Every other line (`message_start`,
+// `content_block_start` / `_stop`, `message_delta`, `message_stop`, `assistant`, `user`, `result`,
+// anything unparseable) is kept byte-identical and in order. Decided on the PARSED line, never a
+// string match.
+//
+// Every doubt KEEPS the message's deltas — no assistant line (the seat was killed mid-turn, or the
+// next message started), a delta or tool_use start with no `message_start` id before it, an
+// assistant line that does not restate a block, a delta this function cannot place — and appends
+// ONE STREAM_DELTAS_KEPT_EVENT line naming those messages, so a reader can tell such a stream from
+// a whole one. Each names `mayHoldCall`: whether its kept lines could carry a tool call (a tool_use
+// start, an `input_json_delta`, a delta it could not place) — a thinking- or text-only message
+// cannot hide a read. An assistant line for another message leaves the open one open. One message
+// is open at a time (grok's fenced seat has no subagent to interleave one); a stream shaped
+// otherwise (claude emits an assistant line per content block) only ever falls to keep-and-flag.
+// PURE.
+const DELTA_PAYLOAD = new Map([
+  ['input_json_delta', 'partial_json'],
+  ['signature_delta', 'signature'],
+  ['text_delta', 'text'],
+  ['thinking_delta', 'thinking'],
+]);
+// One content block of the open message: what its deltas spelled, keyed by the delta's payload
+// field, and the id its tool_use start named ('' = none).
+type DeltaBlock = { spelled: Map<string, string>; tool?: string };
+type DeltaMessage = { blocks: Map<number, DeltaBlock>; deltas: number[]; doubt: string | null; id: string | null; mayHoldCall: boolean };
+
+export function dropDeliveredDeltas(stream: string): string {
+  const lines = stream.split('\n');
+  const drop = new Set<number>();
+  const kept: { deltas: number; id: string | null; mayHoldCall: boolean; why: string }[] = [];
+  let open: DeltaMessage | null = null;
+  const opened = (id: string | null): DeltaMessage => ({ blocks: new Map(), deltas: [], doubt: id === null ? 'no message_start named its message' : null, id, mayHoldCall: false });
+  const blockAt = (m: DeltaMessage, index: number): DeltaBlock => {
+    let b = m.blocks.get(index);
+    if (!b) m.blocks.set(index, (b = { spelled: new Map() }));
+    return b;
+  };
+  const keep = (m: DeltaMessage, why: string): void => {
+    if (m.deltas.length > 0 || m.mayHoldCall) kept.push({ deltas: m.deltas.length, id: m.id, mayHoldCall: m.mayHoldCall, why });
+  };
+  for (const [i, line] of lines.entries()) {
+    const ev = parseObject(line);
+    if (!ev) continue;
+    if (ev.type === 'stream_event' && isObject(ev.event)) {
+      const inner = ev.event;
+      if (inner.type === 'message_start') {
+        if (open) keep(open, open.doubt ?? 'no assistant line before the next message');
+        open = opened(isObject(inner.message) && typeof inner.message.id === 'string' ? inner.message.id : null);
+        continue;
+      }
+      if (inner.type === 'content_block_delta') {
+        open ??= opened(null);
+        open.deltas.push(i);
+        const d = inner.delta;
+        const field = isObject(d) && typeof d.type === 'string' ? DELTA_PAYLOAD.get(d.type) : undefined;
+        if (field === 'partial_json') open.mayHoldCall = true;
+        if (field === undefined || typeof inner.index !== 'number' || !isObject(d) || typeof d[field] !== 'string') {
+          open.doubt ??= 'a delta this reader cannot place';
+          open.mayHoldCall = true;
+          continue;
+        }
+        const b = blockAt(open, inner.index);
+        b.spelled.set(field, (b.spelled.get(field) ?? '') + d[field]);
+        continue;
+      }
+      const block = inner.content_block;
+      if (inner.type === 'content_block_start' && isObject(block) && block.type === 'tool_use') {
+        open ??= opened(null);
+        open.mayHoldCall = true;
+        if (typeof inner.index === 'number') blockAt(open, inner.index).tool = typeof block.id === 'string' ? block.id : '';
+        else open.doubt ??= 'a content_block_start tool_use with no block index';
+      }
+      continue;
+    }
+    if (ev.type !== 'assistant' || !open || !isObject(ev.message)) continue;
+    const id = typeof ev.message.id === 'string' ? ev.message.id : null;
+    if (open.id !== null && id !== open.id) continue; // another message's line — this one stays open
+    const content = Array.isArray(ev.message.content) ? ev.message.content : [];
+    const why = open.doubt ?? unrestated(open.blocks, content);
+    if (why) keep(open, why);
+    else for (const d of open.deltas) drop.add(d);
+    open = null;
+  }
+  if (open) keep(open, open.doubt ?? 'no assistant line (the stream ended mid-message)');
+  if (drop.size === 0 && kept.length === 0) return stream;
+  const out = lines.filter((_, i) => !drop.has(i));
+  if (kept.length > 0) {
+    const flag = JSON.stringify({ messages: kept, type: STREAM_DELTAS_KEPT_EVENT });
+    // Before the trailing empty line a newline-terminated stream ends with, so it stays terminated.
+    if (out[out.length - 1] === '') out.splice(out.length - 1, 0, flag);
+    else out.push(flag);
+  }
+  return out.join('\n');
+}
+
+// Why the assistant line's `content` does not restate the blocks the deltas spelled — or null when
+// it restates every one: each tool_use start's id at that index, each spelled field equal (the tool
+// input's JSON compared parsed, key order free).
+function unrestated(blocks: Map<number, DeltaBlock>, content: unknown[]): string | null {
+  for (const [index, b] of blocks) {
+    const c = content[index];
+    if (b.tool !== undefined && (b.tool === '' || !isObject(c) || c.type !== 'tool_use' || c.id !== b.tool)) return 'a content_block_start tool_use its assistant line does not carry';
+    for (const [field, spelled] of b.spelled) {
+      const same = isObject(c) && (field === 'partial_json' ? c.type === 'tool_use' && sameJson(spelled, c.input) : c[field] === spelled);
+      if (!same) return `its assistant line does not restate block ${index}'s ${field}`;
+    }
+  }
+  return null;
+}
+
+function sameJson(spelled: string, value: unknown): boolean {
+  try {
+    return canonicalJson(JSON.parse(spelled)) === canonicalJson(value);
+  } catch {
+    return false; // deltas that do not spell one JSON value restate nothing
+  }
+}
+const canonicalJson = (v: unknown): string | undefined =>
+  JSON.stringify(v, (_key, x: unknown) => (isObject(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x));
+
+function parseObject(line: string): Record<string, unknown> | null {
+  if (!line.startsWith('{')) return null;
+  try {
+    const v: unknown = JSON.parse(line);
+    return isObject(v) ? v : null;
+  } catch {
+    return null; // a line cut mid-write, or noise — kept verbatim
+  }
+}
+const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
 // ── The advisor on a Claude seat's stream ────────────────────────────────────
 // A Claude seat may carry the CLI's advisor tool (a second model it consults mid-task). It shows in

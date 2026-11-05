@@ -58,6 +58,12 @@ describe('parseSeatUsage — tokens, tool calls and turns off the persisted stre
     const midProgress = [hook('hook_progress', 'PreToolUse'), ...grokBody, JSON.stringify({ subtype: 'success', type: 'result', num_turns: 3 })].join('\n');
     expect(parseSeatUsage(midProgress).streamTruncated).toBe(true);
   });
+  it('a claude-shaped stream names each call twice (content_block_start + assistant): counted once by tool_use id; id-less blocks per occurrence', () => {
+    const start = (id?: string) => JSON.stringify({ event: { content_block: { ...(id ? { id } : {}), input: {}, name: 'read_file', type: 'tool_use' }, index: 1, type: 'content_block_start' }, type: 'stream_event' });
+    const asst = (...ids: string[]) => JSON.stringify({ message: { content: ids.map((id) => ({ id, input: {}, name: 'read_file', type: 'tool_use' })) }, type: 'assistant' });
+    const s = [grokInit, start('c1'), start('c2'), asst('c1', 'c2'), start('c3'), asst('c3'), start(), JSON.stringify({ subtype: 'success', type: 'result', num_turns: 2 })].join('\n');
+    expect(parseSeatUsage(s)).toEqual({ toolCalls: 4, turns: 2 });
+  });
   it('yields nothing for an absent or unreadable stream — never a guess', () => {
     expect(parseSeatUsage(undefined)).toEqual({});
     expect(parseSeatUsage('')).toEqual({});
@@ -168,6 +174,19 @@ describe('conventionsReadOf — how far a seat read into the conventions file (n
     expect(conventionsReadOf(claude(cut, read('t1', { file_path: F, limit: 30 }), result('t1', false)), layout)).toBeUndefined();
     expect(conventionsReadOf(claude(cut, read('t1', { file_path: F, limit: 80 }), result('t1', false)), layout)).toEqual({ docsRead: ['CLAUDE.md'], state: 'read' });
     expect(conventionsReadOf([JSON.stringify({ type: 'thread.started' }), cut, JSON.stringify({ item: { command: "sed -n '1,30p' .ensemble-conventions/CONVENTIONS.md", type: 'command_execution' }, type: 'item.started' })].join('\n'), layout)).toBeUndefined();
+  });
+  it('a stream whose persisted copy KEPT deltas that may hold a call proves a read, never an unread or an index-only', () => {
+    const kept = JSON.stringify({ messages: [{ deltas: 43, id: 'msg_1', mayHoldCall: true, why: 'no assistant line (the stream ended mid-message)' }], type: 'ensemble.stream_deltas_kept' });
+    expect(conventionsReadOf(claude(read('t1', { file_path: '/wt/src/x.ts' }), kept), layout)).toBeUndefined();
+    expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 30 }), result('t1', false), kept), layout)).toBeUndefined();
+    expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 80 }), result('t1', false), kept), layout)).toEqual({ docsRead: ['CLAUDE.md'], state: 'read' });
+    // a flag that does not say its messages hold no call is read as one that may
+    expect(conventionsReadOf(claude(read('t1', { file_path: '/wt/src/x.ts' }), JSON.stringify({ type: 'ensemble.stream_deltas_kept' })), layout)).toBeUndefined();
+  });
+  it('kept deltas that cannot hold a call (thinking or text only) leave the absence claims standing', () => {
+    const kept = JSON.stringify({ messages: [{ deltas: 248, id: 'msg_1', mayHoldCall: false, why: 'no assistant line (the stream ended mid-message)' }], type: 'ensemble.stream_deltas_kept' });
+    expect(conventionsReadOf(claude(read('t1', { file_path: '/wt/src/x.ts' }), kept), layout)).toEqual({ docsRead: [], state: 'unread' });
+    expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 30 }), result('t1', false), kept), layout)).toEqual({ docsRead: [], state: 'index-only' });
   });
   it('no layout (file unreadable after the fact) ⇒ read vs unread only; a headless stream cannot say no', () => {
     expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 30 })), null)).toEqual({ docsRead: [], state: 'read' });

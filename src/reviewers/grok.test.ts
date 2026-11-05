@@ -16,11 +16,14 @@ import {
   grokToolFence,
   GROK_INACTIVITY_TIMEOUT_MS,
   GROK_PACKET_REVIEW_TIMEOUT_MS,
+  GROK_STREAM_LIMIT,
   GROK_WORKTREE_REVIEW_TIMEOUT_MS,
   parseGrokStream,
+  persistedGrokStream,
   resolveReviewSandbox,
   runGrokReview,
 } from './grok';
+import { reviewStream } from './grok-stream.fixture';
 import { REVIEW_TIMEOUT_MS } from './codex';
 import { startSeatEgressProxy } from './egress-seat';
 import {
@@ -493,11 +496,12 @@ describe('runGrokReview (stdout capture)', () => {
     expect(result.failWhy).toMatch(/tool fence — .*did not announce its tools/);
   });
 
-  it('a stream over the bound keeps its HEAD (init) beside the tail with a cut marker — the read-depth telemetry needs the first events', async () => {
+  it('a stream still over the 8 M backstop keeps its HEAD (init) beside the tail with a cut marker — the read-depth telemetry needs the first events', async () => {
     const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
     await untilSpawned();
     const [init, ...rest] = grokStream('REVIEW BODY').split('\n');
-    const filler = Array.from({ length: 12_000 }, (_, i) => JSON.stringify({ event: { delta: { text: `t${i} ${'x'.repeat(80)}`, type: 'text_delta' }, type: 'content_block_delta' }, type: 'stream_event' })).join('\n');
+    // Deltas no assistant line accounts for are KEPT (dropDeliveredDeltas), so this one stays big.
+    const filler = Array.from({ length: 12_000 }, (_, i) => JSON.stringify({ event: { delta: { text: `t${i} ${'x'.repeat(700)}`, type: 'text_delta' }, type: 'content_block_delta' }, type: 'stream_event' })).join('\n');
     child?.stdout.emit('data', Buffer.from(`${init}\n${filler}\n${rest.join('\n')}`));
     child?.emit('close');
     const result = await p;
@@ -505,7 +509,25 @@ describe('runGrokReview (stdout capture)', () => {
     expect(result.stream?.startsWith(init)).toBe(true);
     expect(result.stream).toContain('"type":"ensemble.stream_cut"');
     expect(result.stream).toContain('"subtype":"success"');
-    expect(result.stream!.length).toBeLessThan(1_000_000 + 70_000);
+    expect(result.stream).toContain('"type":"ensemble.stream_deltas_kept"');
+    expect(result.stream!.length).toBeLessThan(GROK_STREAM_LIMIT + 70_000);
+  });
+
+  it("a real-shaped review of today's size (≥ 5 M chars) is persisted WHOLE — its delivered deltas dropped, no cut marker", async () => {
+    const p = runGrokReview('PROMPT', { ...CONFIG, sandbox: 'strict' });
+    await untilSpawned();
+    const [, ...body] = reviewStream({ conventionsRead: true, deltasPerMessage: 5_500 }).split('\n');
+    const raw = [INIT_LINE, ...body].join('\n');
+    expect(raw.length).toBeGreaterThan(5_000_000);
+    child?.stdout.emit('data', Buffer.from(raw));
+    child?.emit('close');
+    const result = await p;
+    expect(result.ok).toBe(true);
+    expect(result.raw).toContain('"summary":"synthetic"');
+    expect(result.stream?.trimEnd()).toBe(persistedGrokStream(raw).trimEnd()); // the exec hands back stdout trimmed
+    expect(result.stream!.startsWith(INIT_LINE)).toBe(true);
+    expect(result.stream).not.toContain('"type":"ensemble.stream_cut"');
+    expect(result.stream).not.toContain('"type":"content_block_delta"');
   });
 
   it('onStream receives every stdout chunk, in order — the full stream for a caller that keeps it (engine ask 2)', async () => {
