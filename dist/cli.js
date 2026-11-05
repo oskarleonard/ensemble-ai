@@ -1361,6 +1361,223 @@ import fs8 from "fs";
 import os5 from "os";
 import path6 from "path";
 
+// src/core/spawn.ts
+import { spawn } from "child_process";
+import fs6 from "fs";
+import os3 from "os";
+
+// src/core/bin.ts
+import { execFileSync as execFileSync2 } from "child_process";
+import fs5 from "fs";
+import path4 from "path";
+var binCache = /* @__PURE__ */ new Map();
+function resolveBin(name2, opts = {}) {
+  const override = opts.envVar ? process.env[opts.envVar] : void 0;
+  if (override) {
+    const bin = path4.resolve(override);
+    if (fs5.existsSync(bin)) return bin;
+    const shown = bin === override ? override : `${override} (resolved to ${bin})`;
+    throw new Error(
+      `${opts.envVar}=${shown} does not exist \u2014 unset it to use the default resolution`
+    );
+  }
+  const cached = binCache.get(name2);
+  if (cached) return cached;
+  for (const c of opts.candidates ?? []) {
+    if (fs5.existsSync(c)) {
+      binCache.set(name2, c);
+      return c;
+    }
+  }
+  const found = execFileSync2("/bin/zsh", ["-ic", `whence -p ${name2}`], {
+    encoding: "utf8"
+  }).trim().split("\n").pop();
+  if (!found) throw new Error(`${name2} binary not found`);
+  binCache.set(name2, found);
+  return found;
+}
+
+// src/core/spawn.ts
+function resolveCodexBin() {
+  return resolveBin("codex", { envVar: "CODEX_BIN" });
+}
+var KILL_GRACE_MS = 3e3;
+var EXIT_DRAIN_GRACE_MS = 250;
+function makeEscalatingKill(child, graceMs, schedule = setTimeout, cancel = clearTimeout) {
+  let hard = null;
+  return {
+    clear: () => {
+      if (hard) cancel(hard);
+      hard = null;
+    },
+    kill: () => {
+      child.kill("SIGTERM");
+      if (!hard) hard = schedule(() => child.kill("SIGKILL"), graceMs);
+    }
+  };
+}
+function killTree(child, signal, signalGroup = (pid, sig) => process.kill(-pid, sig)) {
+  const pid = child.pid;
+  if (typeof pid === "number" && pid > 0) {
+    try {
+      signalGroup(pid, signal);
+      return;
+    } catch {
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+  }
+}
+var STREAM_TAIL_LIMIT = 1e6;
+var STREAM_HEAD_LIMIT = 65536;
+var STREAM_CUT_EVENT = "ensemble.stream_cut";
+var STREAM_DELTAS_KEPT_EVENT = "ensemble.stream_deltas_kept";
+function joinStreamHeadTail(head, tail, total, headLimit = STREAM_HEAD_LIMIT) {
+  if (total <= tail.length) return tail;
+  const room = Math.min(headLimit, total - tail.length);
+  let keep = head.slice(0, room);
+  const nl = keep.lastIndexOf("\n");
+  keep = nl >= 0 ? keep.slice(0, nl + 1) : "";
+  const dropped = total - keep.length - tail.length;
+  if (dropped <= 0) return keep + tail;
+  return `${keep}${JSON.stringify({ droppedChars: dropped, type: STREAM_CUT_EVENT })}
+${tail}`;
+}
+function boundedStreamTail(tail, limit) {
+  if (tail.length <= limit) return tail;
+  return tail.slice(-limit).replace(/^[^\n]*\n/, "");
+}
+function boundedStreamHeadTail(raw, limit) {
+  if (raw.length <= limit) return raw;
+  const headLimit = Math.min(STREAM_HEAD_LIMIT, limit);
+  return joinStreamHeadTail(raw.slice(0, headLimit), boundedStreamTail(raw, limit), raw.length, headLimit);
+}
+function runReviewerExec(opts) {
+  const { bin, args, outFile, timeoutMs, stderrLimit, onSpawn } = opts;
+  const capture2 = opts.capture ?? "outfile";
+  const streamStdout = capture2 !== "stdout" && opts.streamStdout === true;
+  const pipeStdout = capture2 === "stdout" || streamStdout;
+  const streamLimit = opts.streamLimit ?? STREAM_TAIL_LIMIT;
+  return new Promise((resolve) => {
+    const child = spawn(bin, args, {
+      cwd: opts.cwd ?? os3.tmpdir(),
+      detached: true,
+      ...opts.env ? { env: { ...process.env, ...opts.env } } : {},
+      // stdout is piped when we read the reply from it (grok) or stream it for
+      // liveness (codex `--json`); an outfile-only seat keeps it 'ignore'.
+      stdio: [opts.stdin === void 0 ? "ignore" : "pipe", pipeStdout ? "pipe" : "ignore", "pipe"]
+    });
+    if (opts.stdin !== void 0) {
+      child.stdin?.on("error", () => {
+      });
+      child.stdin?.end(opts.stdin);
+    }
+    const killer = makeEscalatingKill(
+      { kill: (sig) => killTree(child, sig) },
+      KILL_GRACE_MS
+    );
+    onSpawn?.(killer.kill);
+    let settled = false;
+    let timedOut = false;
+    let timedOutReason;
+    const killTimer = setTimeout(() => {
+      if (timedOut) return;
+      timedOut = true;
+      timedOutReason = "absolute";
+      killer.kill();
+    }, timeoutMs);
+    const inactivityMs = opts.inactivityTimeoutMs;
+    let idleTimer = null;
+    const armIdle = () => {
+      if (settled || !inactivityMs || !pipeStdout) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (timedOut) return;
+        timedOut = true;
+        timedOutReason = "inactivity";
+        killer.kill();
+      }, inactivityMs);
+    };
+    armIdle();
+    let stderrTail = "";
+    child.stderr?.on("data", (chunk) => {
+      armIdle();
+      stderrTail = (stderrTail + chunk.toString("utf8")).slice(-stderrLimit);
+    });
+    let stdoutBuf = "";
+    let streamTail = "";
+    let streamHead = "";
+    let streamTotal = 0;
+    if (capture2 === "stdout") {
+      child.stdout?.on("data", (chunk) => {
+        armIdle();
+        const text = chunk.toString("utf8");
+        stdoutBuf += text;
+        opts.onStdout?.(text);
+      });
+    } else if (streamStdout) {
+      child.stdout?.on("data", (chunk) => {
+        armIdle();
+        const text = chunk.toString("utf8");
+        opts.onStdout?.(text);
+        streamTotal += text.length;
+        if (streamHead.length < Math.min(STREAM_HEAD_LIMIT, streamLimit)) streamHead += text;
+        streamTail += text;
+        if (streamTail.length > streamLimit * 2) streamTail = streamTail.slice(-streamLimit);
+      });
+    }
+    let exitDrain = null;
+    let exitCode;
+    let error;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killTimer);
+      clearTimeout(backstop);
+      if (idleTimer) clearTimeout(idleTimer);
+      if (exitDrain) clearTimeout(exitDrain);
+      killer.clear();
+      let raw = null;
+      if (capture2 === "stdout") {
+        const text = stdoutBuf.trim();
+        if (text) raw = text;
+      } else {
+        try {
+          const text = fs6.readFileSync(outFile ?? "", "utf8").trim();
+          if (text) raw = text;
+          fs6.unlinkSync(outFile ?? "");
+        } catch {
+        }
+      }
+      resolve({
+        ...error ? { error } : {},
+        ...exitCode !== void 0 ? { exitCode } : {},
+        raw,
+        stderrTail,
+        ...streamStdout ? { streamTail: joinStreamHeadTail(streamHead, boundedStreamTail(streamTail, streamLimit), streamTotal, Math.min(STREAM_HEAD_LIMIT, streamLimit)) } : {},
+        timedOut,
+        ...timedOutReason ? { timedOutReason } : {}
+      });
+    };
+    const backstop = setTimeout(settle, timeoutMs + KILL_GRACE_MS + 5e3);
+    child.on("exit", (code2) => {
+      exitCode = code2;
+      if (pipeStdout) exitDrain = setTimeout(settle, EXIT_DRAIN_GRACE_MS);
+      else settle();
+    });
+    child.on("close", (code2) => {
+      if (exitCode === void 0) exitCode = code2;
+      settle();
+    });
+    child.on("error", (e) => {
+      error = e;
+      settle();
+    });
+  });
+}
+
 // src/core/claude-stream.ts
 var CLAUDE_EFFORTS = /* @__PURE__ */ new Set(["low", "medium", "high", "xhigh", "max"]);
 function isTransientApiErrorReply(raw) {
@@ -1470,6 +1687,66 @@ function stripStreamPayloads(stream) {
   }
   return out.join("\n");
 }
+function dropDeliveredDeltas(stream) {
+  const lines = stream.split("\n");
+  const drop = /* @__PURE__ */ new Set();
+  const kept = [];
+  let open = null;
+  const keep = (m, why) => {
+    if (m.deltas.length > 0 || m.tools.length > 0) kept.push({ deltas: m.deltas.length, id: m.id, why });
+  };
+  lines.forEach((line, i) => {
+    const ev = parseObject(line);
+    if (!ev) return;
+    if (ev.type === "stream_event" && isObject(ev.event)) {
+      const inner = ev.event;
+      if (inner.type === "message_start") {
+        if (open) keep(open, "no assistant line before the next message");
+        const id2 = isObject(inner.message) && typeof inner.message.id === "string" ? inner.message.id : null;
+        open = { deltas: [], id: id2, tools: [] };
+        return;
+      }
+      if (inner.type === "content_block_delta") {
+        open ??= { deltas: [], id: null, tools: [] };
+        open.deltas.push(i);
+        return;
+      }
+      const block = inner.content_block;
+      if (inner.type === "content_block_start" && isObject(block) && block.type === "tool_use") {
+        open ??= { deltas: [], id: null, tools: [] };
+        open.tools.push(typeof block.id === "string" ? block.id : "");
+      }
+      return;
+    }
+    if (ev.type !== "assistant" || !open || !isObject(ev.message)) return;
+    const id = typeof ev.message.id === "string" ? ev.message.id : null;
+    if (open.id !== null && id !== open.id) return;
+    const content = Array.isArray(ev.message.content) ? ev.message.content : [];
+    const delivered = new Set(content.filter((b) => isObject(b) && b.type === "tool_use" && typeof b.id === "string").map((b) => b.id));
+    if (open.tools.every((t) => t !== "" && delivered.has(t))) for (const d of open.deltas) drop.add(d);
+    else keep(open, "a content_block_start tool_use its assistant line does not carry");
+    open = null;
+  });
+  if (open) keep(open, "no assistant line (the stream ended mid-message)");
+  if (drop.size === 0 && kept.length === 0) return stream;
+  const out = lines.filter((_, i) => !drop.has(i));
+  if (kept.length > 0) {
+    const flag = JSON.stringify({ messages: kept, type: STREAM_DELTAS_KEPT_EVENT });
+    if (out[out.length - 1] === "") out.splice(out.length - 1, 0, flag);
+    else out.push(flag);
+  }
+  return out.join("\n");
+}
+function parseObject(line) {
+  if (!line.startsWith("{")) return null;
+  try {
+    const v = JSON.parse(line);
+    return isObject(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+var isObject = (v) => !!v && typeof v === "object" && !Array.isArray(v);
 function advisorCallCount(stream) {
   if (!stream) return 0;
   const seen = /* @__PURE__ */ new Set();
@@ -1633,222 +1910,6 @@ function tunnel(clientSocket, head, target, sockets) {
     clientSocket.destroy();
   });
   clientSocket.on("error", () => upstream.destroy());
-}
-
-// src/core/spawn.ts
-import { spawn } from "child_process";
-import fs6 from "fs";
-import os3 from "os";
-
-// src/core/bin.ts
-import { execFileSync as execFileSync2 } from "child_process";
-import fs5 from "fs";
-import path4 from "path";
-var binCache = /* @__PURE__ */ new Map();
-function resolveBin(name2, opts = {}) {
-  const override = opts.envVar ? process.env[opts.envVar] : void 0;
-  if (override) {
-    const bin = path4.resolve(override);
-    if (fs5.existsSync(bin)) return bin;
-    const shown = bin === override ? override : `${override} (resolved to ${bin})`;
-    throw new Error(
-      `${opts.envVar}=${shown} does not exist \u2014 unset it to use the default resolution`
-    );
-  }
-  const cached = binCache.get(name2);
-  if (cached) return cached;
-  for (const c of opts.candidates ?? []) {
-    if (fs5.existsSync(c)) {
-      binCache.set(name2, c);
-      return c;
-    }
-  }
-  const found = execFileSync2("/bin/zsh", ["-ic", `whence -p ${name2}`], {
-    encoding: "utf8"
-  }).trim().split("\n").pop();
-  if (!found) throw new Error(`${name2} binary not found`);
-  binCache.set(name2, found);
-  return found;
-}
-
-// src/core/spawn.ts
-function resolveCodexBin() {
-  return resolveBin("codex", { envVar: "CODEX_BIN" });
-}
-var KILL_GRACE_MS = 3e3;
-var EXIT_DRAIN_GRACE_MS = 250;
-function makeEscalatingKill(child, graceMs, schedule = setTimeout, cancel = clearTimeout) {
-  let hard = null;
-  return {
-    clear: () => {
-      if (hard) cancel(hard);
-      hard = null;
-    },
-    kill: () => {
-      child.kill("SIGTERM");
-      if (!hard) hard = schedule(() => child.kill("SIGKILL"), graceMs);
-    }
-  };
-}
-function killTree(child, signal, signalGroup = (pid, sig) => process.kill(-pid, sig)) {
-  const pid = child.pid;
-  if (typeof pid === "number" && pid > 0) {
-    try {
-      signalGroup(pid, signal);
-      return;
-    } catch {
-    }
-  }
-  try {
-    child.kill(signal);
-  } catch {
-  }
-}
-var STREAM_TAIL_LIMIT = 1e6;
-var STREAM_HEAD_LIMIT = 65536;
-var STREAM_CUT_EVENT = "ensemble.stream_cut";
-function joinStreamHeadTail(head, tail, total, headLimit = STREAM_HEAD_LIMIT) {
-  if (total <= tail.length) return tail;
-  const room = Math.min(headLimit, total - tail.length);
-  let keep = head.slice(0, room);
-  const nl = keep.lastIndexOf("\n");
-  keep = nl >= 0 ? keep.slice(0, nl + 1) : "";
-  const dropped = total - keep.length - tail.length;
-  if (dropped <= 0) return keep + tail;
-  return `${keep}${JSON.stringify({ droppedChars: dropped, type: STREAM_CUT_EVENT })}
-${tail}`;
-}
-function boundedStreamTail(tail, limit) {
-  if (tail.length <= limit) return tail;
-  return tail.slice(-limit).replace(/^[^\n]*\n/, "");
-}
-function boundedStreamHeadTail(raw, limit) {
-  if (raw.length <= limit) return raw;
-  const headLimit = Math.min(STREAM_HEAD_LIMIT, limit);
-  return joinStreamHeadTail(raw.slice(0, headLimit), boundedStreamTail(raw, limit), raw.length, headLimit);
-}
-function runReviewerExec(opts) {
-  const { bin, args, outFile, timeoutMs, stderrLimit, onSpawn } = opts;
-  const capture2 = opts.capture ?? "outfile";
-  const streamStdout = capture2 !== "stdout" && opts.streamStdout === true;
-  const pipeStdout = capture2 === "stdout" || streamStdout;
-  const streamLimit = opts.streamLimit ?? STREAM_TAIL_LIMIT;
-  return new Promise((resolve) => {
-    const child = spawn(bin, args, {
-      cwd: opts.cwd ?? os3.tmpdir(),
-      detached: true,
-      ...opts.env ? { env: { ...process.env, ...opts.env } } : {},
-      // stdout is piped when we read the reply from it (grok) or stream it for
-      // liveness (codex `--json`); an outfile-only seat keeps it 'ignore'.
-      stdio: [opts.stdin === void 0 ? "ignore" : "pipe", pipeStdout ? "pipe" : "ignore", "pipe"]
-    });
-    if (opts.stdin !== void 0) {
-      child.stdin?.on("error", () => {
-      });
-      child.stdin?.end(opts.stdin);
-    }
-    const killer = makeEscalatingKill(
-      { kill: (sig) => killTree(child, sig) },
-      KILL_GRACE_MS
-    );
-    onSpawn?.(killer.kill);
-    let settled = false;
-    let timedOut = false;
-    let timedOutReason;
-    const killTimer = setTimeout(() => {
-      if (timedOut) return;
-      timedOut = true;
-      timedOutReason = "absolute";
-      killer.kill();
-    }, timeoutMs);
-    const inactivityMs = opts.inactivityTimeoutMs;
-    let idleTimer = null;
-    const armIdle = () => {
-      if (settled || !inactivityMs || !pipeStdout) return;
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        if (timedOut) return;
-        timedOut = true;
-        timedOutReason = "inactivity";
-        killer.kill();
-      }, inactivityMs);
-    };
-    armIdle();
-    let stderrTail = "";
-    child.stderr?.on("data", (chunk) => {
-      armIdle();
-      stderrTail = (stderrTail + chunk.toString("utf8")).slice(-stderrLimit);
-    });
-    let stdoutBuf = "";
-    let streamTail = "";
-    let streamHead = "";
-    let streamTotal = 0;
-    if (capture2 === "stdout") {
-      child.stdout?.on("data", (chunk) => {
-        armIdle();
-        const text = chunk.toString("utf8");
-        stdoutBuf += text;
-        opts.onStdout?.(text);
-      });
-    } else if (streamStdout) {
-      child.stdout?.on("data", (chunk) => {
-        armIdle();
-        const text = chunk.toString("utf8");
-        opts.onStdout?.(text);
-        streamTotal += text.length;
-        if (streamHead.length < Math.min(STREAM_HEAD_LIMIT, streamLimit)) streamHead += text;
-        streamTail += text;
-        if (streamTail.length > streamLimit * 2) streamTail = streamTail.slice(-streamLimit);
-      });
-    }
-    let exitDrain = null;
-    let exitCode;
-    let error;
-    const settle = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(killTimer);
-      clearTimeout(backstop);
-      if (idleTimer) clearTimeout(idleTimer);
-      if (exitDrain) clearTimeout(exitDrain);
-      killer.clear();
-      let raw = null;
-      if (capture2 === "stdout") {
-        const text = stdoutBuf.trim();
-        if (text) raw = text;
-      } else {
-        try {
-          const text = fs6.readFileSync(outFile ?? "", "utf8").trim();
-          if (text) raw = text;
-          fs6.unlinkSync(outFile ?? "");
-        } catch {
-        }
-      }
-      resolve({
-        ...error ? { error } : {},
-        ...exitCode !== void 0 ? { exitCode } : {},
-        raw,
-        stderrTail,
-        ...streamStdout ? { streamTail: joinStreamHeadTail(streamHead, boundedStreamTail(streamTail, streamLimit), streamTotal, Math.min(STREAM_HEAD_LIMIT, streamLimit)) } : {},
-        timedOut,
-        ...timedOutReason ? { timedOutReason } : {}
-      });
-    };
-    const backstop = setTimeout(settle, timeoutMs + KILL_GRACE_MS + 5e3);
-    child.on("exit", (code2) => {
-      exitCode = code2;
-      if (pipeStdout) exitDrain = setTimeout(settle, EXIT_DRAIN_GRACE_MS);
-      else settle();
-    });
-    child.on("close", (code2) => {
-      if (exitCode === void 0) exitCode = code2;
-      settle();
-    });
-    child.on("error", (e) => {
-      error = e;
-      settle();
-    });
-  });
 }
 
 // src/reviewers/codex-fence.ts
@@ -2422,7 +2483,10 @@ async function decide(opts, cwd, proceed) {
 var GROK_PACKET_REVIEW_TIMEOUT_MS = 18e5;
 var GROK_WORKTREE_REVIEW_TIMEOUT_MS = 36e5;
 var GROK_INACTIVITY_TIMEOUT_MS = 9e5;
-var GROK_STREAM_TAIL_LIMIT = 1e6;
+var GROK_STREAM_LIMIT = 8e6;
+function persistedGrokStream(raw) {
+  return boundedStreamHeadTail(dropDeliveredDeltas(raw), GROK_STREAM_LIMIT);
+}
 var GROK_SEAT_STDERR_LIMIT = 2e3;
 var GROK_BIN_CANDIDATES = [path8.join(os7.homedir(), ".grok", "bin", "grok")];
 function resolveGrokBin() {
@@ -2688,7 +2752,7 @@ async function runGrokReview(prompt, config, opts = {}) {
         ok: false,
         raw: null,
         stderrTail: verdict.why,
-        ...raw ? { stream: boundedStreamHeadTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
+        ...raw ? { stream: persistedGrokStream(raw) } : {},
         timedOut,
         ...timedOutReason ? { timedOutReason } : {}
       };
@@ -2710,11 +2774,11 @@ async function runGrokReview(prompt, config, opts = {}) {
       ...preflight,
       raw: text,
       stderrTail,
-      // The bounded NDJSON stream — its HEAD (init, the step-0 conventions read) + a cut marker +
-      // the tail, so a reclaimed seat leaves a record of what it was doing AND the read-depth
-      // telemetry keeps its head (a bare tail left grok head-lost on every long seat). Cut on
-      // line boundaries — the trail persists it as .jsonl.
-      ...raw ? { stream: boundedStreamHeadTail(raw, GROK_STREAM_TAIL_LIMIT) } : {},
+      // The persisted NDJSON stream — whole once its delivered deltas are dropped, so a reclaimed
+      // seat leaves a record of what it was doing AND the read-depth telemetry sees every call.
+      // Past the backstop it keeps its HEAD (init, the step-0 conventions read) + a cut marker +
+      // the tail, cut on line boundaries — the trail persists it as .jsonl.
+      ...raw ? { stream: persistedGrokStream(raw) } : {},
       timedOut,
       ...timedOutReason ? { timedOutReason } : {}
     };
@@ -7567,6 +7631,15 @@ function parseSeatUsage(stream) {
   let resultUsage = null;
   let first = null;
   let sawCut = false;
+  const seenTools = /* @__PURE__ */ new Set();
+  const countTool = (block) => {
+    if (typeof block.id === "string" && block.id) {
+      if (seenTools.has(block.id)) return;
+      seenTools.add(block.id);
+    }
+    toolCalls++;
+    sawTool = true;
+  };
   for (const line of stream.split("\n")) {
     if (!line.trim()) continue;
     let e;
@@ -7606,10 +7679,7 @@ function parseSeatUsage(stream) {
       }
       if (inner.type === "content_block_start" && inner.content_block && typeof inner.content_block === "object") {
         const cb = inner.content_block;
-        if (cb.type === "tool_use") {
-          toolCalls++;
-          sawTool = true;
-        }
+        if (cb.type === "tool_use") countTool(cb);
       }
       continue;
     }
@@ -7617,10 +7687,7 @@ function parseSeatUsage(stream) {
       const m = ev.message;
       if (Array.isArray(m.content)) {
         for (const c of m.content) {
-          if (c && typeof c === "object" && c.type === "tool_use") {
-            toolCalls++;
-            sawTool = true;
-          }
+          if (c && typeof c === "object" && c.type === "tool_use") countTool(c);
         }
       }
       continue;
@@ -7689,6 +7756,7 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
   if (!stream) return void 0;
   let first = null;
   let sawCut = false;
+  let sawKept = false;
   const ranges = [];
   const pending = /* @__PURE__ */ new Map();
   const codexPending = /* @__PURE__ */ new Map();
@@ -7705,6 +7773,7 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
     const ev = e;
     if (first === null) first = streamHeadKind(ev) ?? null;
     if (ev.type === STREAM_CUT_EVENT) sawCut = true;
+    if (ev.type === STREAM_DELTAS_KEPT_EVENT) sawKept = true;
     if ((ev.type === "item.started" || ev.type === "item.completed") && ev.item && typeof ev.item === "object") {
       const it = ev.item;
       if (it.type !== "command_execution") continue;
@@ -7765,7 +7834,7 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
   ranges.push(...pending.values());
   if (first === null) return void 0;
   const attempted = codexPending.size > 0 || codexUnkeyed > 0;
-  const whole = first === "init" && !sawCut && !attempted;
+  const whole = first === "init" && !sawCut && !sawKept && !attempted;
   if (ranges.length === 0) return whole ? { docsRead: [], state: "unread" } : void 0;
   if (!layout) return { docsRead: [], state: "read" };
   const beyondIndex = ranges.some((r) => r.grep || r.end > layout.indexEndLine);
