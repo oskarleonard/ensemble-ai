@@ -175,11 +175,18 @@ describe('conventionsReadOf — how far a seat read into the conventions file (n
     expect(conventionsReadOf(claude(cut, read('t1', { file_path: F, limit: 80 }), result('t1', false)), layout)).toEqual({ docsRead: ['CLAUDE.md'], state: 'read' });
     expect(conventionsReadOf([JSON.stringify({ type: 'thread.started' }), cut, JSON.stringify({ item: { command: "sed -n '1,30p' .ensemble-conventions/CONVENTIONS.md", type: 'command_execution' }, type: 'item.started' })].join('\n'), layout)).toBeUndefined();
   });
-  it('a stream whose persisted copy KEPT deltas no assistant line accounts for proves a read, never an unread or an index-only', () => {
-    const kept = JSON.stringify({ messages: [{ deltas: 248, id: 'msg_1', why: 'no assistant line (the stream ended mid-message)' }], type: 'ensemble.stream_deltas_kept' });
+  it('a stream whose persisted copy KEPT deltas that may hold a call proves a read, never an unread or an index-only', () => {
+    const kept = JSON.stringify({ messages: [{ deltas: 43, id: 'msg_1', mayHoldCall: true, why: 'no assistant line (the stream ended mid-message)' }], type: 'ensemble.stream_deltas_kept' });
     expect(conventionsReadOf(claude(read('t1', { file_path: '/wt/src/x.ts' }), kept), layout)).toBeUndefined();
     expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 30 }), result('t1', false), kept), layout)).toBeUndefined();
     expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 80 }), result('t1', false), kept), layout)).toEqual({ docsRead: ['CLAUDE.md'], state: 'read' });
+    // a flag that does not say its messages hold no call is read as one that may
+    expect(conventionsReadOf(claude(read('t1', { file_path: '/wt/src/x.ts' }), JSON.stringify({ type: 'ensemble.stream_deltas_kept' })), layout)).toBeUndefined();
+  });
+  it('kept deltas that cannot hold a call (thinking or text only) leave the absence claims standing', () => {
+    const kept = JSON.stringify({ messages: [{ deltas: 248, id: 'msg_1', mayHoldCall: false, why: 'no assistant line (the stream ended mid-message)' }], type: 'ensemble.stream_deltas_kept' });
+    expect(conventionsReadOf(claude(read('t1', { file_path: '/wt/src/x.ts' }), kept), layout)).toEqual({ docsRead: [], state: 'unread' });
+    expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 30 }), result('t1', false), kept), layout)).toEqual({ docsRead: [], state: 'index-only' });
   });
   it('no layout (file unreadable after the fact) ⇒ read vs unread only; a headless stream cannot say no', () => {
     expect(conventionsReadOf(claude(read('t1', { file_path: F, limit: 30 })), null)).toEqual({ docsRead: [], state: 'read' });

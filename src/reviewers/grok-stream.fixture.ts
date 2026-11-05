@@ -102,7 +102,11 @@ export function reviewMessages(opts: { conventionsRead: boolean; deltasPerMessag
 }
 
 export function reviewStream(opts: { conventionsRead: boolean; deltasPerMessage: number }): string {
-  const messages = reviewMessages(opts);
+  return streamOf(reviewMessages(opts));
+}
+
+// The whole stream of these messages: init, each message's lines, the result with the last one's text.
+export function streamOf(messages: StreamMessage[]): string {
   const reply = messages[messages.length - 1].text ?? '';
   return [initLine(), ...messages.flatMap((m, i) => messageLines(i, m)), resultLine(reply)].join('\n') + '\n';
 }

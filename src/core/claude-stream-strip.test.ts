@@ -55,7 +55,7 @@ describe('dropDeliveredDeltas — a delivered message loses only its content_blo
   });
 
   it('decides on the PARSED line, never a string match: a delta in other spacing is dropped, a line that merely quotes one is kept', () => {
-    const spaced = '{ "type": "stream_event", "event": { "type": "content_block_delta", "delta": { "type": "text_delta", "text": "x" } } }';
+    const spaced = '{ "type": "stream_event", "event": { "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "ab" } } }';
     const quoting = JSON.stringify({ message: { content: [{ content: '{"type":"stream_event","event":{"type":"content_block_delta"}}', tool_use_id: 't', type: 'tool_result' }] }, type: 'user' });
     const notJson = '{"type":"stream_event","event":{"type":"content_block_delta"'; // cut mid-write
     const out = dropDeliveredDeltas([init, start('m1'), spaced, assistant('m1'), quoting, notJson, result].join('\n'));
@@ -69,11 +69,50 @@ describe('dropDeliveredDeltas — a delivered message loses only its content_blo
   });
 
   it("keeps a message's deltas and flags when the next message starts before its assistant line, or the assistant line is another message's", () => {
-    const s = [init, start('m1'), delta('a'), start('m2'), delta('b'), assistant('m9'), assistant('m2'), result].join('\n');
+    const s = [init, start('m1'), delta('a'), start('m2'), delta('b'), assistant('m9'), assistant('m2', [{ text: 'b', type: 'text' }]), result].join('\n');
     const out = dropDeliveredDeltas(s).split('\n');
     expect(out).toContain(delta('a'));
     expect(out).not.toContain(delta('b')); // m2 was delivered
-    expect(JSON.parse(out[out.length - 1])).toEqual({ messages: [{ deltas: 1, id: 'm1', why: 'no assistant line before the next message' }], type: STREAM_DELTAS_KEPT_EVENT });
+    expect(JSON.parse(out[out.length - 1])).toEqual({ messages: [{ deltas: 1, id: 'm1', mayHoldCall: false, why: 'no assistant line before the next message' }], type: STREAM_DELTAS_KEPT_EVENT });
+  });
+
+  const flagOf = (out: string) => (JSON.parse(out.split('\n').find((l) => l.includes(STREAM_DELTAS_KEPT_EVENT))!) as { messages: unknown[] }).messages;
+  const toolStart = (id: string, index = 1) => se({ content_block: { id, input: {}, name: 'read_file', type: 'tool_use' }, index, type: 'content_block_start' });
+  const json = (partial: string, index = 1) => se({ delta: { partial_json: partial, type: 'input_json_delta' }, index, type: 'content_block_delta' });
+  const toolUse = (id: string, input: Record<string, unknown>) => ({ id, input, name: 'read_file', type: 'tool_use' });
+
+  it('deltas no message_start named are never vouched for — before any message_start, under an id-less one, or after an assistant line closed theirs', () => {
+    const before = dropDeliveredDeltas([init, delta('ab'), assistant('m1'), result].join('\n'));
+    expect(before).toContain(delta('ab'));
+    expect(flagOf(before)).toEqual([{ deltas: 1, id: null, mayHoldCall: false, why: 'no message_start named its message' }]);
+    const idless = dropDeliveredDeltas([init, se({ message: { content: [] }, type: 'message_start' }), delta('ab'), assistant('m1'), result].join('\n'));
+    expect(idless).toContain(delta('ab'));
+    expect(flagOf(idless)).toEqual([{ deltas: 1, id: null, mayHoldCall: false, why: 'no message_start named its message' }]);
+    // a snapshot closed m1, then a later block's tool input streamed: re-homed id-less, kept, may hold a call
+    const read = '{"target_file":"/wt/head/CONVENTIONS.md"}';
+    const late = dropDeliveredDeltas([init, start('m1'), delta('ab'), assistant('m1'), toolStart('c1'), json(read), assistant('m1', [{ text: 'ab', type: 'text' }, toolUse('c1', {})]), result].join('\n'));
+    expect(late).not.toContain(delta('ab')); // m1's text was delivered
+    expect(late).toContain(json(read));
+    expect(flagOf(late)).toEqual([{ deltas: 1, id: null, mayHoldCall: true, why: 'no message_start named its message' }]);
+  });
+
+  it('drops only what the assistant line RESTATES: a tool input, text or thinking it states otherwise keeps the deltas', () => {
+    const read = '{"target_file":"/wt/head/CONVENTIONS.md","limit":200}';
+    const other = dropDeliveredDeltas([init, start('m1'), toolStart('c1'), json(read), assistant('m1', [{ text: '', type: 'text' }, toolUse('c1', {})]), result].join('\n'));
+    expect(other).toContain(json(read));
+    expect(flagOf(other)).toEqual([{ deltas: 1, id: 'm1', mayHoldCall: true, why: "its assistant line does not restate block 1's partial_json" }]);
+    // the same input with its keys in another order IS a restatement
+    const same = dropDeliveredDeltas([init, start('m1'), toolStart('c1'), json(read), assistant('m1', [{ text: '', type: 'text' }, toolUse('c1', { limit: 200, target_file: '/wt/head/CONVENTIONS.md' })]), result].join('\n'));
+    expect(same).not.toContain('input_json_delta');
+    expect(same).not.toContain(STREAM_DELTAS_KEPT_EVENT);
+    const text = dropDeliveredDeltas([init, start('m1'), delta('a'), delta('b'), assistant('m1', [{ text: 'ax', type: 'text' }]), result].join('\n'));
+    expect(flagOf(text)).toEqual([{ deltas: 2, id: 'm1', mayHoldCall: false, why: "its assistant line does not restate block 0's text" }]);
+    const thinking = se({ delta: { thinking: 'hm', type: 'thinking_delta' }, index: 0, type: 'content_block_delta' });
+    const noThinking = dropDeliveredDeltas([init, start('m1'), thinking, assistant('m1', []), result].join('\n'));
+    expect(noThinking).toContain(thinking);
+    // and a delta of a kind it cannot place is a doubt that may hold a call
+    const odd = se({ delta: { citation: {}, type: 'citations_delta' }, index: 0, type: 'content_block_delta' });
+    expect(flagOf(dropDeliveredDeltas([init, start('m1'), odd, assistant('m1'), result].join('\n')))).toEqual([{ deltas: 1, id: 'm1', mayHoldCall: true, why: 'a delta this reader cannot place' }]);
   });
 
   it('a tool_use block start without an id is never vouched for — its message keeps its deltas', () => {

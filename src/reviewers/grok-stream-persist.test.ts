@@ -4,7 +4,7 @@ import { boundedStreamHeadTail, STREAM_CUT_EVENT, STREAM_DELTAS_KEPT_EVENT } fro
 import { conventionsReadOf, parseSeatUsage } from '../modes/review/seat-usage';
 
 import { GROK_STREAM_LIMIT, persistedGrokStream } from './grok';
-import { initLine, messageLines, RESULT_USAGE, resultLine, reviewMessages, reviewStream } from './grok-stream.fixture';
+import { initLine, messageLines, RESULT_USAGE, resultLine, reviewMessages, reviewStream, streamOf } from './grok-stream.fixture';
 
 // THE INVARIANT (2026-11-04): a grok stream of today's size — ≈4.5 M raw chars on run
 // 2026-11-04-15-08-41-d8a5382a, whose 1 MB head+tail cut dropped 3 509 057 of them — is persisted
@@ -58,8 +58,10 @@ describe('persistedGrokStream — a review of today\'s size keeps its head AND i
 
   it('the same review with no conventions read proves `unread`, and a read inside the index proves `index-only`', () => {
     expect(conventionsReadOf(persistedGrokStream(reviewStream({ conventionsRead: false, deltasPerMessage: TODAY })), layout)).toEqual({ docsRead: [], state: 'unread' });
-    const indexOnly = reviewStream({ conventionsRead: true, deltasPerMessage: TODAY }).replace(/"limit":200,"offset":1,"target_file":"([^"]*CONVENTIONS\.md)"/g, '"limit":30,"offset":1,"target_file":"$1"');
-    expect(conventionsReadOf(persistedGrokStream(indexOnly), layout)).toEqual({ docsRead: [], state: 'index-only' });
+    // The read of the index's 30 lines, in its input_json_delta AND its assistant line alike.
+    const msgs = reviewMessages({ conventionsRead: true, deltasPerMessage: TODAY });
+    msgs[1].tools[0] = { ...msgs[1].tools[0], input: { ...msgs[1].tools[0].input, limit: 30 } };
+    expect(conventionsReadOf(persistedGrokStream(streamOf(msgs)), layout)).toEqual({ docsRead: [], state: 'index-only' });
   });
 
   it("parseSeatUsage reports the result line's usage, and each of the six calls once (not 12) — raw or persisted", () => {
@@ -79,7 +81,7 @@ describe('persistedGrokStream — a review of today\'s size keeps its head AND i
 });
 
 describe('persistedGrokStream — every doubt keeps the deltas and flags the stream', () => {
-  it('a stream killed mid-turn keeps its unfinished message\'s deltas (and its partial last line), and stays factless', () => {
+  it('a stream killed mid-thinking keeps its unfinished message\'s deltas (and its partial last line), and still proves `unread` — thinking cannot hide a read', () => {
     const [m0, m1] = reviewMessages({ conventionsRead: false, deltasPerMessage: 400 });
     const unfinished = messageLines(1, m1, { assistant: false }).slice(0, 250); // cut mid-thinking
     const raw = [initLine(), ...messageLines(0, m0), ...unfinished, '{"type":"stream_event","event":{"type":"content_blo'].join('\n');
@@ -89,9 +91,18 @@ describe('persistedGrokStream — every doubt keeps the deltas and flags the str
     expect(out.split('\n').filter((l) => l.includes('"thinking_delta"') && l.includes('weighing 1.')).length).toBe(248);
     expect(out).toContain('"type":"stream_event","event":{"type":"content_blo'); // the partial line, verbatim
     const flag = JSON.parse(out.split('\n').find((l) => l.includes(keptMarker))!) as { messages: { deltas: number; id: string }[] };
-    expect(flag.messages).toEqual([{ deltas: 248, id: 'msg_1', why: 'no assistant line (the stream ended mid-message)' }]);
-    // Whole by every other measure (init first, no cut) — today's reader would have said `unread`.
+    expect(flag.messages).toEqual([{ deltas: 248, id: 'msg_1', mayHoldCall: false, why: 'no assistant line (the stream ended mid-message)' }]);
+    // Whole by every other measure (init first, no cut), and the kept message holds no call.
     expect(out).not.toContain(cutMarker);
+    expect(conventionsReadOf(out, layout)).toEqual({ docsRead: [], state: 'unread' });
+  });
+
+  it('a stream killed mid-tool-call keeps that message\'s deltas and makes no absence claim — the call is in lines no reader parses', () => {
+    const [m0, m1] = reviewMessages({ conventionsRead: true, deltasPerMessage: 40 });
+    const out = persistedGrokStream([initLine(), ...messageLines(0, m0), ...messageLines(1, m1, { assistant: false })].join('\n'));
+    const flag = JSON.parse(out.split('\n').find((l) => l.includes(keptMarker))!) as { messages: unknown[] };
+    expect(flag.messages).toEqual([{ deltas: 43, id: 'msg_1', mayHoldCall: true, why: 'no assistant line (the stream ended mid-message)' }]);
+    expect(out).toContain('CONVENTIONS.md'); // the read lives only in msg_1's kept input_json_delta
     expect(conventionsReadOf(out, layout)).toBeUndefined();
   });
 
@@ -106,7 +117,7 @@ describe('persistedGrokStream — every doubt keeps the deltas and flags the str
     const lines = [initLine(), ...messageLines(0, msgs[0]), ...messageLines(1, msgs[1], { assistantTools: [msgs[1].tools[1]] }), ...messageLines(2, msgs[2]), ...messageLines(3, msgs[3]), resultLine('ok')];
     const out = persistedGrokStream(lines.join('\n'));
     const flag = JSON.parse(out.split('\n').find((l) => l.includes(keptMarker))!) as { messages: { id: string; why: string }[] };
-    expect(flag.messages).toEqual([{ deltas: 33, id: 'msg_1', why: 'a content_block_start tool_use its assistant line does not carry' }]);
+    expect(flag.messages).toEqual([{ deltas: 33, id: 'msg_1', mayHoldCall: true, why: 'a content_block_start tool_use its assistant line does not carry' }]);
     expect(out.split('\n').filter((l) => l.includes('"input_json_delta"'))).toHaveLength(2); // msg_1's two, kept
     expect(out.split('\n').filter((l) => l.includes('"thinking_delta"') && !l.includes('weighing 1.'))).toHaveLength(0);
     // the call only its deltas carry may have been the read: no absence claim

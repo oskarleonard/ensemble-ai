@@ -263,7 +263,9 @@ export function conventionsReadOf(
   let first: string | null = null;
   let sawCut = false;
   // The persisted copy kept some deltas no assistant line accounts for (core/spawn
-  // STREAM_DELTAS_KEPT_EVENT): a call may live only in an `input_json_delta`, which no reader parses.
+  // STREAM_DELTAS_KEPT_EVENT). When a kept message may hold a call (a tool_use start, an
+  // `input_json_delta`), that call may live only in lines no reader parses; a thinking- or
+  // text-only one cannot hide a read, so it leaves the absence claim standing.
   let sawKept = false;
   const ranges: LineRange[] = [];
   // claude-shaped: a Read/Grep is recorded by tool_use id so an errored tool_result can drop it.
@@ -289,7 +291,7 @@ export function conventionsReadOf(
     const ev = e as Record<string, unknown>;
     if (first === null) first = streamHeadKind(ev) ?? null;
     if (ev.type === STREAM_CUT_EVENT) sawCut = true;
-    if (ev.type === STREAM_DELTAS_KEPT_EVENT) sawKept = true;
+    if (ev.type === STREAM_DELTAS_KEPT_EVENT && (!Array.isArray(ev.messages) || ev.messages.some((m) => !m || typeof m !== 'object' || (m as Record<string, unknown>).mayHoldCall !== false))) sawKept = true;
     if ((ev.type === 'item.started' || ev.type === 'item.completed') && ev.item && typeof ev.item === 'object') {
       const it = ev.item as Record<string, unknown>;
       if (it.type !== 'command_execution') continue;
@@ -358,7 +360,7 @@ export function conventionsReadOf(
   // A truncated stream — head gone, or a cut marker between head and tail — can still PROVE a
   // read (the call survived); it can never prove "unread" or "index-only", because the call that
   // reached a doc may be in the part that was dropped. Those two need the WHOLE stream — and a
-  // stream whose kept deltas no assistant line accounts for (a seat killed mid-turn) is not one.
+  // stream whose kept deltas may hold a call no assistant line accounts for is not one.
   const attempted = codexPending.size > 0 || codexUnkeyed > 0;
   const whole = first === 'init' && !sawCut && !sawKept && !attempted;
   if (ranges.length === 0) return whole ? { docsRead: [], state: 'unread' } : undefined;

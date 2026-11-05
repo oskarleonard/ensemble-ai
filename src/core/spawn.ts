@@ -165,10 +165,11 @@ const STREAM_TAIL_LIMIT = 1_000_000;
 const STREAM_HEAD_LIMIT = 65_536;
 export const STREAM_CUT_EVENT = 'ensemble.stream_cut';
 // The other synthetic line a persisted stream can carry (core/claude-stream dropDeliveredDeltas):
-// some `content_block_delta` lines were KEPT because no `assistant` line accounted for their
-// message — the seat was killed mid-turn, or a tool_use the deltas started is missing from the
-// assistant line. The readers' tool calls come off the assistant lines, so such a stream can
-// still prove a read, never an absence (seat-usage conventionsReadOf), exactly as a cut cannot.
+// some `content_block_delta` lines were KEPT because no `assistant` line was proved to restate
+// their message — the seat was killed mid-turn, the deltas had no message id, or the assistant
+// line's blocks differ. The readers' tool calls come off the assistant lines, so when a kept
+// message `mayHoldCall` the stream can still prove a read, never an absence (seat-usage
+// conventionsReadOf), exactly as a cut cannot.
 export const STREAM_DELTAS_KEPT_EVENT = 'ensemble.stream_deltas_kept';
 
 // PURE: head (whole lines, ≤ limit) + a cut marker + tail, or the whole stream when nothing was

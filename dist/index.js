@@ -2127,47 +2127,70 @@ function stripStreamPayloads(stream) {
   }
   return out.join("\n");
 }
+var DELTA_PAYLOAD = /* @__PURE__ */ new Map([
+  ["input_json_delta", "partial_json"],
+  ["signature_delta", "signature"],
+  ["text_delta", "text"],
+  ["thinking_delta", "thinking"]
+]);
 function dropDeliveredDeltas(stream) {
   const lines = stream.split("\n");
   const drop = /* @__PURE__ */ new Set();
   const kept = [];
   let open = null;
-  const keep = (m, why) => {
-    if (m.deltas.length > 0 || m.tools.length > 0) kept.push({ deltas: m.deltas.length, id: m.id, why });
+  const opened = (id) => ({ blocks: /* @__PURE__ */ new Map(), deltas: [], doubt: id === null ? "no message_start named its message" : null, id, mayHoldCall: false });
+  const blockAt = (m, index) => {
+    let b = m.blocks.get(index);
+    if (!b) m.blocks.set(index, b = { spelled: /* @__PURE__ */ new Map() });
+    return b;
   };
-  lines.forEach((line, i) => {
+  const keep = (m, why) => {
+    if (m.deltas.length > 0 || m.mayHoldCall) kept.push({ deltas: m.deltas.length, id: m.id, mayHoldCall: m.mayHoldCall, why });
+  };
+  for (const [i, line] of lines.entries()) {
     const ev = parseObject(line);
-    if (!ev) return;
+    if (!ev) continue;
     if (ev.type === "stream_event" && isObject(ev.event)) {
       const inner = ev.event;
       if (inner.type === "message_start") {
-        if (open) keep(open, "no assistant line before the next message");
-        const id2 = isObject(inner.message) && typeof inner.message.id === "string" ? inner.message.id : null;
-        open = { deltas: [], id: id2, tools: [] };
-        return;
+        if (open) keep(open, open.doubt ?? "no assistant line before the next message");
+        open = opened(isObject(inner.message) && typeof inner.message.id === "string" ? inner.message.id : null);
+        continue;
       }
       if (inner.type === "content_block_delta") {
-        open ??= { deltas: [], id: null, tools: [] };
+        open ??= opened(null);
         open.deltas.push(i);
-        return;
+        const d = inner.delta;
+        const field2 = isObject(d) && typeof d.type === "string" ? DELTA_PAYLOAD.get(d.type) : void 0;
+        if (field2 === "partial_json") open.mayHoldCall = true;
+        if (field2 === void 0 || typeof inner.index !== "number" || !isObject(d) || typeof d[field2] !== "string") {
+          open.doubt ??= "a delta this reader cannot place";
+          open.mayHoldCall = true;
+          continue;
+        }
+        const b = blockAt(open, inner.index);
+        b.spelled.set(field2, (b.spelled.get(field2) ?? "") + d[field2]);
+        continue;
       }
       const block = inner.content_block;
       if (inner.type === "content_block_start" && isObject(block) && block.type === "tool_use") {
-        open ??= { deltas: [], id: null, tools: [] };
-        open.tools.push(typeof block.id === "string" ? block.id : "");
+        open ??= opened(null);
+        open.mayHoldCall = true;
+        if (typeof inner.index === "number") blockAt(open, inner.index).tool = typeof block.id === "string" ? block.id : "";
+        else open.doubt ??= "a content_block_start tool_use with no block index";
       }
-      return;
+      continue;
     }
-    if (ev.type !== "assistant" || !open || !isObject(ev.message)) return;
+    if (ev.type !== "assistant" || !open || !isObject(ev.message)) continue;
     const id = typeof ev.message.id === "string" ? ev.message.id : null;
-    if (open.id !== null && id !== open.id) return;
+    if (open.id !== null && id !== open.id) continue;
     const content = Array.isArray(ev.message.content) ? ev.message.content : [];
-    const delivered = new Set(content.filter((b) => isObject(b) && b.type === "tool_use" && typeof b.id === "string").map((b) => b.id));
-    if (open.tools.every((t) => t !== "" && delivered.has(t))) for (const d of open.deltas) drop.add(d);
-    else keep(open, "a content_block_start tool_use its assistant line does not carry");
+    const why = open.doubt ?? unrestated(open.blocks, content);
+    if (why) keep(open, why);
+    else for (const d of open.deltas) drop.add(d);
     open = null;
-  });
-  if (open) keep(open, "no assistant line (the stream ended mid-message)");
+  }
+  if (open) keep(open, open.doubt ?? "no assistant line (the stream ended mid-message)");
   if (drop.size === 0 && kept.length === 0) return stream;
   const out = lines.filter((_, i) => !drop.has(i));
   if (kept.length > 0) {
@@ -2177,6 +2200,25 @@ function dropDeliveredDeltas(stream) {
   }
   return out.join("\n");
 }
+function unrestated(blocks, content) {
+  for (const [index, b] of blocks) {
+    const c = content[index];
+    if (b.tool !== void 0 && (b.tool === "" || !isObject(c) || c.type !== "tool_use" || c.id !== b.tool)) return "a content_block_start tool_use its assistant line does not carry";
+    for (const [field2, spelled] of b.spelled) {
+      const same = isObject(c) && (field2 === "partial_json" ? c.type === "tool_use" && sameJson(spelled, c.input) : c[field2] === spelled);
+      if (!same) return `its assistant line does not restate block ${index}'s ${field2}`;
+    }
+  }
+  return null;
+}
+function sameJson(spelled, value) {
+  try {
+    return canonicalJson(JSON.parse(spelled)) === canonicalJson(value);
+  } catch {
+    return false;
+  }
+}
+var canonicalJson = (v) => JSON.stringify(v, (_key, x) => isObject(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x);
 function parseObject(line) {
   if (!line.startsWith("{")) return null;
   try {
@@ -5539,7 +5581,7 @@ function conventionsReadOf(stream, layout, needle = CONVENTIONS_TOUCH_NEEDLE) {
     const ev = e;
     if (first === null) first = streamHeadKind(ev) ?? null;
     if (ev.type === STREAM_CUT_EVENT) sawCut = true;
-    if (ev.type === STREAM_DELTAS_KEPT_EVENT) sawKept = true;
+    if (ev.type === STREAM_DELTAS_KEPT_EVENT && (!Array.isArray(ev.messages) || ev.messages.some((m) => !m || typeof m !== "object" || m.mayHoldCall !== false))) sawKept = true;
     if ((ev.type === "item.started" || ev.type === "item.completed") && ev.item && typeof ev.item === "object") {
       const it = ev.item;
       if (it.type !== "command_execution") continue;
