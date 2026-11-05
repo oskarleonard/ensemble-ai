@@ -1,3 +1,4 @@
+import { STREAM_DELTAS_KEPT_EVENT } from './spawn';
 import { parseSeatAdvisor } from './types';
 // The `claude -p` STREAM CONTRACT shared by every headless Anthropic seat — the review voice,
 // the gate, the holistic lens, the exec seats (modes/review) AND the brainstorm/consult voice
@@ -184,6 +185,88 @@ export function stripStreamPayloads(stream: string): string {
   }
   return out.join('\n');
 }
+
+// DROP THE DELIVERED DELTAS (2026-11-04). A `--include-partial-messages` stream (grok's seat) is
+// dominated by `content_block_delta` lines — one per token of thinking, text, signature and tool
+// input: 2 967 of 2 977 persisted lines on run 2026-11-04-15-08-41-d8a5382a, whose raw stream was
+// ≈4.5 M chars and lost 3.5 M of its middle to the 1 MB head+tail cut — and with them the read of
+// the conventions file. Every delta is RESTATED by its message's `assistant` line (the full
+// thinking, text and tool_use inputs), and no reader parses a delta: the tool calls come off the
+// assistant lines, the tokens off `message_delta` and `result`. So once a message's assistant line
+// has arrived its deltas are dropped; every other line (`message_start`, `content_block_start` /
+// `_stop`, `message_delta`, `message_stop`, `assistant`, `user`, `result`, anything unparseable) is
+// kept byte-identical and in order. Decided on the PARSED line, never a string match.
+//
+// Every doubt KEEPS the deltas — a message with no assistant line (the seat was killed mid-turn),
+// an assistant line for another message, a `content_block_start` tool_use the assistant line does
+// not carry, a delta with no `message_start` before it — and appends ONE STREAM_DELTAS_KEPT_EVENT
+// line naming those messages, so a reader can tell such a stream from a whole one. One message is
+// open at a time (grok's fenced seat has no subagent to interleave one); a stream shaped otherwise
+// (claude emits an assistant line per content block) only ever falls to keep-and-flag. PURE.
+type DeltaMessage = { deltas: number[]; id: string | null; tools: string[] };
+
+export function dropDeliveredDeltas(stream: string): string {
+  const lines = stream.split('\n');
+  const drop = new Set<number>();
+  const kept: { deltas: number; id: string | null; why: string }[] = [];
+  let open: DeltaMessage | null = null;
+  const keep = (m: DeltaMessage, why: string): void => {
+    if (m.deltas.length > 0 || m.tools.length > 0) kept.push({ deltas: m.deltas.length, id: m.id, why });
+  };
+  lines.forEach((line, i) => {
+    const ev = parseObject(line);
+    if (!ev) return;
+    if (ev.type === 'stream_event' && isObject(ev.event)) {
+      const inner = ev.event;
+      if (inner.type === 'message_start') {
+        if (open) keep(open, 'no assistant line before the next message');
+        const id = isObject(inner.message) && typeof inner.message.id === 'string' ? inner.message.id : null;
+        open = { deltas: [], id, tools: [] };
+        return;
+      }
+      if (inner.type === 'content_block_delta') {
+        open ??= { deltas: [], id: null, tools: [] };
+        open.deltas.push(i);
+        return;
+      }
+      const block = inner.content_block;
+      if (inner.type === 'content_block_start' && isObject(block) && block.type === 'tool_use') {
+        open ??= { deltas: [], id: null, tools: [] };
+        open.tools.push(typeof block.id === 'string' ? block.id : '');
+      }
+      return;
+    }
+    if (ev.type !== 'assistant' || !open || !isObject(ev.message)) return;
+    const id = typeof ev.message.id === 'string' ? ev.message.id : null;
+    if (open.id !== null && id !== open.id) return; // not this message's line — it stays open
+    const content = Array.isArray(ev.message.content) ? ev.message.content : [];
+    const delivered = new Set(content.filter((b) => isObject(b) && b.type === 'tool_use' && typeof b.id === 'string').map((b) => (b as { id: string }).id));
+    if (open.tools.every((t) => t !== '' && delivered.has(t))) for (const d of open.deltas) drop.add(d);
+    else keep(open, 'a content_block_start tool_use its assistant line does not carry');
+    open = null;
+  });
+  if (open) keep(open, 'no assistant line (the stream ended mid-message)');
+  if (drop.size === 0 && kept.length === 0) return stream;
+  const out = lines.filter((_, i) => !drop.has(i));
+  if (kept.length > 0) {
+    const flag = JSON.stringify({ messages: kept, type: STREAM_DELTAS_KEPT_EVENT });
+    // Before the trailing empty line a newline-terminated stream ends with, so it stays terminated.
+    if (out[out.length - 1] === '') out.splice(out.length - 1, 0, flag);
+    else out.push(flag);
+  }
+  return out.join('\n');
+}
+
+function parseObject(line: string): Record<string, unknown> | null {
+  if (!line.startsWith('{')) return null;
+  try {
+    const v: unknown = JSON.parse(line);
+    return isObject(v) ? v : null;
+  } catch {
+    return null; // a line cut mid-write, or noise — kept verbatim
+  }
+}
+const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
 // ── The advisor on a Claude seat's stream ────────────────────────────────────
 // A Claude seat may carry the CLI's advisor tool (a second model it consults mid-task). It shows in

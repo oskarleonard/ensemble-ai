@@ -4,6 +4,7 @@ import path from 'node:path';
 
 import { resolveBin } from '../core/bin';
 import { type EgressProxy, proxyEnv } from '../core/egress-proxy';
+import { dropDeliveredDeltas } from '../core/claude-stream';
 import { boundedStreamHeadTail, runReviewerExec } from '../core/spawn';
 import type { ReviewerConfig } from '../core/types';
 import type { SandboxProfileRef } from '../modes/review/evidence';
@@ -47,11 +48,22 @@ export const GROK_WORKTREE_REVIEW_TIMEOUT_MS = 3_600_000; // 60 min runaway back
 // not per-completed-item), so 15 min of true silence is an even stronger wedge signal here.
 export const GROK_INACTIVITY_TIMEOUT_MS = 900_000; // 15 min of SILENCE
 
-// The bounded NDJSON tail persisted beside the reply — the post-mortem of a reclaimed seat AND,
-// since 2026-10-10, the read-depth telemetry's source (seat-usage.ts counts tool calls over it).
-// It was 100 KB because grok streams per-TOKEN deltas; that held about two messages of a 45-turn
-// review, so the head — where the tool calls are — was gone on every real run. Codex's 1 MB.
-const GROK_STREAM_TAIL_LIMIT = 1_000_000; // 1 MB
+// The NDJSON stream persisted beside the reply — the post-mortem of a reclaimed seat AND, since
+// 2026-10-10, the read-depth telemetry's source (seat-usage.ts counts tool calls and proves the
+// conventions read over it). It was 100 KB, then 1 MB, and both were cuts through per-TOKEN deltas:
+// 23 of 33 grok PR-review streams 2026-10-01 → 11-04 carried the cut marker (run
+// 2026-11-04-15-08-41-d8a5382a: ≈4.5 M raw chars, 3 509 057 dropped), and a conventions read in the
+// dropped middle left the seat's read fact `head-lost`. So the persisted copy first drops the
+// deltas every `assistant` line restates (core/claude-stream dropDeliveredDeltas — most of the raw
+// bytes), and this bound is the BACKSTOP on what is left, claude's figure (modes/review/claude
+// CLAUDE_STREAM_TAIL_LIMIT); past it the head+tail cut still applies.
+export const GROK_STREAM_LIMIT = 8_000_000;
+
+// PURE: the copy of a grok stream the trail persists (`<seat>-stream.jsonl`). `raw` itself is
+// untouched — the reply, the tool fence and the caller's onStream sink all read the whole stdout.
+export function persistedGrokStream(raw: string): string {
+  return boundedStreamHeadTail(dropDeliveredDeltas(raw), GROK_STREAM_LIMIT);
+}
 
 // The seat's stderr tail — the noise channel the trail persists (its last 2000 chars, seat-run).
 const GROK_SEAT_STDERR_LIMIT = 2000;
@@ -639,7 +651,7 @@ export async function runGrokReview(
         ok: false,
         raw: null,
         stderrTail: verdict.why,
-        ...(raw ? { stream: boundedStreamHeadTail(raw, GROK_STREAM_TAIL_LIMIT) } : {}),
+        ...(raw ? { stream: persistedGrokStream(raw) } : {}),
         timedOut,
         ...(timedOutReason ? { timedOutReason } : {}),
       };
@@ -670,11 +682,11 @@ export async function runGrokReview(
       ...preflight,
       raw: text,
       stderrTail,
-      // The bounded NDJSON stream — its HEAD (init, the step-0 conventions read) + a cut marker +
-      // the tail, so a reclaimed seat leaves a record of what it was doing AND the read-depth
-      // telemetry keeps its head (a bare tail left grok head-lost on every long seat). Cut on
-      // line boundaries — the trail persists it as .jsonl.
-      ...(raw ? { stream: boundedStreamHeadTail(raw, GROK_STREAM_TAIL_LIMIT) } : {}),
+      // The persisted NDJSON stream — whole once its delivered deltas are dropped, so a reclaimed
+      // seat leaves a record of what it was doing AND the read-depth telemetry sees every call.
+      // Past the backstop it keeps its HEAD (init, the step-0 conventions read) + a cut marker +
+      // the tail, cut on line boundaries — the trail persists it as .jsonl.
+      ...(raw ? { stream: persistedGrokStream(raw) } : {}),
       timedOut,
       ...(timedOutReason ? { timedOutReason } : {}),
     };
