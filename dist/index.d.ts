@@ -1555,7 +1555,7 @@ interface FixtureScore {
 }
 declare function scoreHolisticFixture(findings: readonly ScoredFinding[], fixture: HolisticFixture): FixtureScore;
 
-declare const DEFAULT_VOICE_TIMEOUT_MS$1 = 300000;
+declare const DEFAULT_VOICE_TIMEOUT_MS$1 = 1800000;
 type Adapters$1 = Record<VoiceId, (prompt: string, config: VoiceConfig, opts?: {
     evidenceRoot?: string;
     onSpawn?: (kill: () => void) => void;
@@ -1755,7 +1755,7 @@ interface ConsultResult {
     synthesis: ConsultSynthesis;
 }
 
-declare const DEFAULT_VOICE_TIMEOUT_MS = 300000;
+declare const DEFAULT_VOICE_TIMEOUT_MS = 1800000;
 type Adapters = Record<VoiceId, (prompt: string, config: VoiceConfig, opts?: {
     evidenceRoot?: string;
     onSpawn?: (kill: () => void) => void;

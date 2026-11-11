@@ -3118,7 +3118,7 @@ function listVoices(file = VOICES_FILE) {
 }
 
 // src/modes/brainstorm/index.ts
-var DEFAULT_VOICE_TIMEOUT_MS = 3e5;
+var DEFAULT_VOICE_TIMEOUT_MS = 18e5;
 async function runGenerate(voiceId, adapters, configs, prompt, timeoutMs, log) {
   const config = configs[voiceId];
   log(`  \xB7 ${voiceId} (${config.vendor} \xB7 ${config.model}${config.web ? " \xB7 web" : ""}) generating\u2026`);
@@ -6926,7 +6926,7 @@ function parseConsultSynthesis(raw) {
 }
 
 // src/modes/consult/index.ts
-var DEFAULT_VOICE_TIMEOUT_MS2 = 3e5;
+var DEFAULT_VOICE_TIMEOUT_MS2 = 18e5;
 var DEFAULT_DEBATE_ROUNDS = 2;
 var MAX_DEBATE_ROUNDS = 4;
 async function runAnswer(voiceId, adapters, configs, prompt, timeoutMs, log) {
@@ -15200,6 +15200,25 @@ function resolveTrailBase(gitRoot, localRepoTrail) {
   }
   return path26.join(os14.tmpdir(), "ensemble-ai", "reviews");
 }
+function repoTreeIndex(entries) {
+  const blobs = /* @__PURE__ */ new Set();
+  const children = /* @__PURE__ */ new Map();
+  for (const [type, p] of entries) {
+    if (type === "blob") blobs.add(p);
+    const cut = p.lastIndexOf("/");
+    const dir = cut === -1 ? "" : p.slice(0, cut);
+    const list = children.get(dir);
+    if (list) list.push(p);
+    else children.set(dir, [p]);
+  }
+  return { blobs, children };
+}
+function treePath(rel) {
+  const n = rel.replace(/^\.\//, "").replace(/\/+$/, "");
+  if (n === "" || n === ".") return "";
+  if (path26.isAbsolute(n) || n.split("/").some((seg) => seg === ".." || seg === "" || seg === ".")) return null;
+  return n;
+}
 function ghConventionReader(repoSlug, ref, cwd) {
   const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
   const encRef = encodeURIComponent(ref);
@@ -15212,8 +15231,46 @@ function ghConventionReader(repoSlug, ref, cwd) {
     warned.add(first);
     console.error(`\xB7 conventions probe (gh): ${first}`);
   };
+  let tree;
+  const treeIndex = () => {
+    if (tree !== void 0) return tree;
+    tree = null;
+    const cap4 = capture(
+      "gh",
+      ["api", `repos/${repoSlug}/git/trees/${encRef}?recursive=1`, "--jq", "{truncated, entries: [.tree[] | [.type, .path]]}"],
+      cwd
+    );
+    if (!cap4.ok) {
+      warnUnlessExpectedMiss(cap4.error);
+      return tree;
+    }
+    try {
+      const parsed = JSON.parse(cap4.text);
+      const entries = Array.isArray(parsed.entries) ? parsed.entries.filter((e) => Array.isArray(e) && typeof e[0] === "string" && typeof e[1] === "string") : null;
+      if (parsed.truncated !== false || !entries || entries.length !== parsed.entries.length) {
+        console.error(
+          `\xB7 conventions: the repo tree at ${ref.slice(0, 12)} came back ${parsed.truncated === true ? "truncated" : "unreadable"} \u2014 probing each candidate path through the GitHub API instead (slower)`
+        );
+        return tree;
+      }
+      tree = repoTreeIndex(entries);
+      console.error(
+        `\xB7 conventions: listed the repo tree at ${ref.slice(0, 12)} once (${entries.length} entries) \u2014 a candidate path it does not hold costs no API call`
+      );
+    } catch {
+      console.error(
+        `\xB7 conventions: the repo tree at ${ref.slice(0, 12)} came back unreadable \u2014 probing each candidate path through the GitHub API instead (slower)`
+      );
+    }
+    return tree;
+  };
   return {
     async read(rel, maxBytes) {
+      const index = treeIndex();
+      if (index) {
+        const p = treePath(rel);
+        if (p !== null && !index.blobs.has(p)) return null;
+      }
       const cap4 = capture(
         "gh",
         [
@@ -15240,6 +15297,11 @@ function ghConventionReader(repoSlug, ref, cwd) {
       }
     },
     async list(dirRel) {
+      const index = treeIndex();
+      if (index) {
+        const p = treePath(dirRel);
+        if (p !== null) return (index.children.get(p) ?? []).filter((s) => s.endsWith(".md"));
+      }
       const cap4 = capture(
         "gh",
         ["api", `repos/${repoSlug}/contents/${encPath(dirRel)}?ref=${encRef}`, "--jq", ".[].path"],
@@ -16517,7 +16579,7 @@ Options:
   --file <path>         include a file's contents as shared context for every voice
   --voices <ids>        comma-separated voice ids (default: codex,grok,claude)
   --synthesizer <id>    which voice runs round 3 (default: claude if present)
-  --timeout <seconds>   per-voice timeout (default 300)
+  --timeout <seconds>   per-voice runaway backstop (default 1800; a silent voice is cut sooner)
   --voices-file <path>  voices config json (default ~/.ensemble-ai/voices.json)
   --json                print the full result as JSON instead of formatted text
   --cwd <dir>           working dir for --file resolution (default: cwd)
@@ -16740,7 +16802,7 @@ Options:
   --judge <id>          the voice the judge runs through (default: the synthesizer's);
                         voices.json "judge": {voice, model, effort} pins its model so the
                         seat that rules is not the model that argued
-  --timeout <seconds>   per-voice timeout (default 300)
+  --timeout <seconds>   per-voice runaway backstop (default 1800; a silent voice is cut sooner)
   --voices-file <path>  voices config json (default ~/.ensemble-ai/voices.json)
   --json                print the full result as JSON instead of formatted text
   --cwd <dir>           working dir for --file resolution (default: cwd)
