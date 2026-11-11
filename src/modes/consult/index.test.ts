@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
+import { CLAUDE_INACTIVITY_TIMEOUT_MS } from '../../core/claude-stream';
+import { CODEX_INACTIVITY_TIMEOUT_MS } from '../../reviewers/codex';
+import { GROK_INACTIVITY_TIMEOUT_MS } from '../../reviewers/grok';
 import { VOICE_DEFAULTS, type VoiceRunResult } from '../brainstorm/voices';
 
-import { fallbackSynthesis, pickSynthesizer, runConsultMode } from './index';
+import { DEFAULT_VOICE_TIMEOUT_MS, fallbackSynthesis, pickSynthesizer, runConsultMode } from './index';
 import type { VoiceAnswerResult, VoiceConfig, VoiceId } from './types';
 
 // A fake voice adapter that branches on the prompt round (answer / critique /
@@ -338,5 +341,44 @@ describe('runConsultMode — --debate', () => {
     expect(r2.debate!.rulings).toEqual([]);
     expect(r2.debate!.recommendation).toBe('');
     expect(r2.debate!.rounds.length).toBe(1);
+  });
+});
+
+// A 5-minute default cut codex at 5:02 while it was still working (2026-11-11). The default is a
+// runaway backstop: it must outlive every voice's inactivity watchdog, or a deadline, not the
+// watchdog, decides when a voice dies.
+describe('runConsultMode — the default per-voice timeout is a backstop, not a deadline', () => {
+  const recording = (timeouts: Array<number | undefined>) => {
+    const base = makeAdapters(
+      { claude: { answer: ANS('cl'), synthesis: SYNTH }, codex: { answer: ANS('co') }, grok: { answer: ANS('gr') } },
+      []
+    );
+    const wrap = (fn: (typeof base)['claude']) =>
+      (prompt: string, config: VoiceConfig, opts?: { timeoutMs?: number }): Promise<VoiceRunResult> => {
+        timeouts.push(opts?.timeoutMs);
+        return fn(prompt, config);
+      };
+    return { claude: wrap(base.claude), codex: wrap(base.codex), grok: wrap(base.grok) };
+  };
+
+  it('every call gets the default when the caller names none', async () => {
+    const timeouts: Array<number | undefined> = [];
+    await runConsultMode({ adapters: recording(timeouts), question: 'X or Y?', voiceConfigs: configs });
+
+    expect(timeouts).toHaveLength(4); // three answers and the synthesis
+    expect(new Set(timeouts)).toEqual(new Set([DEFAULT_VOICE_TIMEOUT_MS]));
+  });
+
+  it('the default outlives every inactivity watchdog', () => {
+    expect(DEFAULT_VOICE_TIMEOUT_MS).toBeGreaterThan(
+      Math.max(CLAUDE_INACTIVITY_TIMEOUT_MS, CODEX_INACTIVITY_TIMEOUT_MS, GROK_INACTIVITY_TIMEOUT_MS)
+    );
+  });
+
+  it('a timeout the caller names is the one every call gets', async () => {
+    const timeouts: Array<number | undefined> = [];
+    await runConsultMode({ adapters: recording(timeouts), question: 'X or Y?', timeoutMs: 1234, voiceConfigs: configs });
+
+    expect(new Set(timeouts)).toEqual(new Set([1234]));
   });
 });

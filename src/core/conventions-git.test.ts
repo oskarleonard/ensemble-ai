@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { gitConventionReader, gitHasCommit } from './conventions';
+import { gitConventionReader, gitHasCommit, repoTreePath } from './conventions';
 
 // The git-backed reader reads the repo's conventions AT A REF out of a local clone — the base
 // ref, so a PR's own edits to AGENTS.md never become the rules it is judged against.
@@ -54,8 +54,38 @@ describe('gitConventionReader — conventions at a ref, from the local clone', (
     expect(await reader.list('missing')).toEqual([]);
   });
 
+  it('refuses the repo root and a path a tree cannot be asked about', async () => {
+    const reader = gitConventionReader(repo, baseSha);
+    expect(await reader.list('')).toEqual([]);
+    expect(await reader.list('.')).toEqual([]);
+    expect(await reader.read('')).toBeNull();
+    expect(await reader.read('../AGENTS.md')).toBeNull();
+    expect(await reader.read('docs/./a.md')).toBeNull();
+  });
+
   it('gitHasCommit tells a present ref from an absent one', () => {
     expect(gitHasCommit(repo, baseSha)).toBe(true);
     expect(gitHasCommit(repo, 'f'.repeat(40))).toBe(false);
+  });
+});
+
+
+// ONE normalizer for the readers that answer from a tree (the local clone and the gh reader's
+// tree index): a second copy had already drifted on the root and on a `.` segment.
+describe('repoTreePath — a repo-relative path as a tree spells it', () => {
+  it.each([
+    ['docs/a.md', 'docs/a.md'],
+    ['./docs/a.md', 'docs/a.md'],
+    ['docs/', 'docs'],
+    ['./docs//', 'docs'],
+    ['', ''],
+    ['.', ''],
+    ['./', ''],
+  ])('%j → %j', (rel, want) => {
+    expect(repoTreePath(rel)).toBe(want);
+  });
+
+  it.each(['/abs/a.md', '../a.md', 'a/../b.md', 'a/./b.md', 'a//b.md'])('%j cannot be asked of a tree', (rel) => {
+    expect(repoTreePath(rel)).toBeNull();
   });
 });

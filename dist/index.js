@@ -1489,13 +1489,15 @@ function gitHasCommit(repoDir, sha) {
     return false;
   }
 }
+function repoTreePath(rel) {
+  const n = rel.replace(/^\.\//, "").replace(/\/+$/, "");
+  if (n === "" || n === ".") return "";
+  if (path.isAbsolute(n) || n.split("/").some((seg) => seg === ".." || seg === "." || seg === "")) return null;
+  return n;
+}
 function gitConventionReader(repoDir, ref) {
   const dir = path.resolve(repoDir);
-  const clean = (rel) => {
-    const n = rel.replace(/^\.\//, "").replace(/\/+$/, "");
-    if (!n || path.isAbsolute(n) || n.split("/").some((seg) => seg === ".." || seg === "")) return null;
-    return n;
-  };
+  const clean = (rel) => repoTreePath(rel) || null;
   const MAX_BLOB = 16 * 1024 * 1024;
   return {
     async read(rel, maxBytes) {
@@ -8276,7 +8278,7 @@ ${LEAD_FIELD_DOC}
 }
 
 // src/modes/brainstorm/index.ts
-var DEFAULT_VOICE_TIMEOUT_MS = 3e5;
+var DEFAULT_VOICE_TIMEOUT_MS = 18e5;
 async function runGenerate(voiceId, adapters, configs, prompt, timeoutMs, log) {
   const config = configs[voiceId];
   log(`  \xB7 ${voiceId} (${config.vendor} \xB7 ${config.model}${config.web ? " \xB7 web" : ""}) generating\u2026`);
@@ -9027,7 +9029,7 @@ function parseConsultSynthesis(raw) {
 }
 
 // src/modes/consult/index.ts
-var DEFAULT_VOICE_TIMEOUT_MS2 = 3e5;
+var DEFAULT_VOICE_TIMEOUT_MS2 = 18e5;
 var DEFAULT_DEBATE_ROUNDS = 2;
 var MAX_DEBATE_ROUNDS = 4;
 async function runAnswer(voiceId, adapters, configs, prompt, timeoutMs, log) {
@@ -9631,6 +9633,7 @@ export {
   repairBrackets,
   repoConventionsConfig,
   repoIdFromSlug,
+  repoTreePath,
   resolveBase,
   resolveBin,
   resolveCiEvidence,

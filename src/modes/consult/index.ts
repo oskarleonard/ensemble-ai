@@ -37,10 +37,13 @@ import {
   type VoiceId,
 } from './types';
 
-// Default per-voice timeout for a consult round (a reasoned answer is heavier than a
-// brainstorm idea but lighter than an xhigh code audit; the CLI can override). The
-// shared spawn watchdog enforces it.
-export const DEFAULT_VOICE_TIMEOUT_MS = 300_000; // 5 min
+// Default per-voice RUNAWAY BACKSTOP for a consult round (the CLI can override). It is not a
+// deadline: every voice streams, so a wedged one is reclaimed by its inactivity watchdog after
+// 10 (claude) or 15 (codex, grok) minutes of silence. The old 5-minute default killed honest
+// work instead: a consult on 2026-11-11 lost codex at 5:02 while claude answered at 4:27, and
+// the result said only "timed out". 30 min is the packet-seat backstop (GROK_PACKET_REVIEW_
+// TIMEOUT_MS): past every honest answer seen, and still a bound on a voice that never stops.
+export const DEFAULT_VOICE_TIMEOUT_MS = 1_800_000; // 30 min
 
 type Adapters = Record<
   VoiceId,
