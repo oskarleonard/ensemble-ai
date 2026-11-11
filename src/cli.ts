@@ -547,10 +547,53 @@ export function resolveTrailBase(
   return path.join(os.tmpdir(), 'ensemble-ai', 'reviews');
 }
 
+// The PR repo's tree at one ref, as the two lookups the gh reader needs: every blob path, and
+// each directory's direct entries in tree order (the order `git ls-tree` gives the local-clone
+// reader, so both readers hand the gatherer one discovery order).
+interface RepoTreeIndex {
+  blobs: Set<string>;
+  children: Map<string, string[]>;
+}
+
+// PURE: the index over the tree API's `[type, path]` entries. A symlink is a blob here, so it is
+// still fetched (and judged) by the contents API; a submodule (`commit`) is not a blob, so it
+// reads as null without a call, as the contents API's non-file answer always did.
+function repoTreeIndex(entries: [string, string][]): RepoTreeIndex {
+  const blobs = new Set<string>();
+  const children = new Map<string, string[]>();
+  for (const [type, p] of entries) {
+    if (type === 'blob') blobs.add(p);
+    const cut = p.lastIndexOf('/');
+    const dir = cut === -1 ? '' : p.slice(0, cut);
+    const list = children.get(dir);
+    if (list) list.push(p);
+    else children.set(dir, [p]);
+  }
+  return { blobs, children };
+}
+
+// A repo-relative path as the tree spells it: no leading `./`, no trailing `/`. null for anything
+// the tree cannot be asked about (absolute, a `..` or empty segment) — the caller then asks the
+// API, exactly as before the index existed. '' is the repo root (a directory, never a file).
+function treePath(rel: string): string | null {
+  const n = rel.replace(/^\.\//, '').replace(/\/+$/, '');
+  if (n === '' || n === '.') return '';
+  if (path.isAbsolute(n) || n.split('/').some((seg) => seg === '..' || seg === '' || seg === '.')) return null;
+  return n;
+}
+
 // A gh-backed convention reader (the `--pr <url>` path) — reads repo-relative files
 // + lists dirs from the PR repo at a fixed ref via `gh api …/contents`. Mirrors the
 // dashboard's own gh reader, so both feed the SAME pure gatherConventions. Any gh
 // failure degrades to null/[] (a missing convention file is not fatal).
+//
+// The repo's whole tree at that ref is listed ONCE, on the first probe. The gatherer asks for
+// hundreds of candidate paths that mostly do not exist: on a 40-file change in a monorepo it made
+// 317 reads (242 misses) and 289 listings (272 empty) — 606 sequential `gh api` calls, 7m39s
+// before any reviewer started. With the tree in hand a miss and a listing cost no call; only a
+// file that exists is fetched (76 calls there, under a minute). When the listing is unavailable
+// or GitHub truncated it, every path is probed as before — never a miss decided from a partial
+// tree.
 function ghConventionReader(
   repoSlug: string,
   ref: string,
@@ -576,8 +619,52 @@ function ghConventionReader(
     warned.add(first);
     console.error(`· conventions probe (gh): ${first}`);
   };
+  // undefined = not asked yet · null = unavailable (probe every path) · else the index.
+  let tree: RepoTreeIndex | null | undefined;
+  const treeIndex = (): RepoTreeIndex | null => {
+    if (tree !== undefined) return tree;
+    tree = null;
+    const cap = capture(
+      'gh',
+      ['api', `repos/${repoSlug}/git/trees/${encRef}?recursive=1`, '--jq', '{truncated, entries: [.tree[] | [.type, .path]]}'],
+      cwd
+    );
+    if (!cap.ok) {
+      // Same rule as a probe: a 404 (no such repo or ref) is silent, anything else is said once.
+      warnUnlessExpectedMiss(cap.error);
+      return tree;
+    }
+    try {
+      const parsed = JSON.parse(cap.text) as { entries?: unknown; truncated?: unknown };
+      const entries = Array.isArray(parsed.entries)
+        ? parsed.entries.filter((e): e is [string, string] => Array.isArray(e) && typeof e[0] === 'string' && typeof e[1] === 'string')
+        : null;
+      if (parsed.truncated !== false || !entries || entries.length !== (parsed.entries as unknown[]).length) {
+        console.error(
+          `· conventions: the repo tree at ${ref.slice(0, 12)} came back ${parsed.truncated === true ? 'truncated' : 'unreadable'} — probing each candidate path through the GitHub API instead (slower)`
+        );
+        return tree;
+      }
+      tree = repoTreeIndex(entries);
+      console.error(
+        `· conventions: listed the repo tree at ${ref.slice(0, 12)} once (${entries.length} entries) — a candidate path it does not hold costs no API call`
+      );
+    } catch {
+      console.error(
+        `· conventions: the repo tree at ${ref.slice(0, 12)} came back unreadable — probing each candidate path through the GitHub API instead (slower)`
+      );
+    }
+    return tree;
+  };
   return {
     async read(rel, maxBytes) {
+      // A path the tree does not hold as a blob (missing, a directory, a submodule) is the
+      // contents API's null without asking it.
+      const index = treeIndex();
+      if (index) {
+        const p = treePath(rel);
+        if (p !== null && !index.blobs.has(p)) return null;
+      }
       // `.type=="file"` guard: the contents API returns an ARRAY for a directory (and an
       // object for a file). Only a FILE object carries `.content` — for anything else emit
       // nothing (→ null) rather than base64-decoding a directory listing into garbage.
@@ -609,6 +696,12 @@ function ghConventionReader(
       }
     },
     async list(dirRel) {
+      // The tree answers a listing whole: the entries directly under the dir, in tree order.
+      const index = treeIndex();
+      if (index) {
+        const p = treePath(dirRel);
+        if (p !== null) return (index.children.get(p) ?? []).filter((s) => s.endsWith('.md'));
+      }
       // A directory listing is an array; `.[].path` on a FILE (object) errors → non-zero
       // exit → [] (handled by !cap.ok), so listing a non-dir yields nothing, not garbage.
       const cap = capture(
@@ -2533,7 +2626,7 @@ Options:
   --file <path>         include a file's contents as shared context for every voice
   --voices <ids>        comma-separated voice ids (default: codex,grok,claude)
   --synthesizer <id>    which voice runs round 3 (default: claude if present)
-  --timeout <seconds>   per-voice timeout (default 300)
+  --timeout <seconds>   per-voice runaway backstop (default 1800; a silent voice is cut sooner)
   --voices-file <path>  voices config json (default ~/.ensemble-ai/voices.json)
   --json                print the full result as JSON instead of formatted text
   --cwd <dir>           working dir for --file resolution (default: cwd)
@@ -2794,7 +2887,7 @@ Options:
   --judge <id>          the voice the judge runs through (default: the synthesizer's);
                         voices.json "judge": {voice, model, effort} pins its model so the
                         seat that rules is not the model that argued
-  --timeout <seconds>   per-voice timeout (default 300)
+  --timeout <seconds>   per-voice runaway backstop (default 1800; a silent voice is cut sooner)
   --voices-file <path>  voices config json (default ~/.ensemble-ai/voices.json)
   --json                print the full result as JSON instead of formatted text
   --cwd <dir>           working dir for --file resolution (default: cwd)

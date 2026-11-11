@@ -200,3 +200,114 @@ describe('URL PR conventions probes — misses silent, real gh failures loud ONC
     expect(lines[0]).toContain('bad credentials');
   });
 });
+
+// The gatherer probes hundreds of candidate paths that mostly do not exist, and on this reader
+// every probe was one `gh api` call (606 calls and 7m39s on a 40-file monorepo change). The
+// reader lists the repo tree once, at the SAME base ref, and answers a miss or a listing from
+// it. A partial tree must decide nothing.
+describe('URL PR conventions — the repo tree is listed once, and a path it does not hold costs no call', () => {
+  const BASE = 'b'.repeat(40);
+  const HEAD = 'h'.repeat(40);
+  const TREE: [string, string][] = [
+    ['blob', 'CLAUDE.md'],
+    ['tree', 'docs'],
+    ['blob', 'docs/a.md'],
+    ['blob', 'docs/b.txt'],
+    ['tree', 'docs/sub'],
+    ['blob', 'docs/sub/c.md'],
+    ['blob', 'docs/z.md'],
+    ['commit', 'vendor.md'],
+  ];
+
+  const calls = (): string[] => mockExec.mock.calls.map((c) => ((c[1] ?? []) as string[]).join(' '));
+  const treeCalls = (): string[] => calls().filter((u) => u.includes('/git/trees/'));
+  const contentCalls = (): string[] => calls().filter((u) => u.includes('/contents/'));
+
+  // gh serves the tree answer given, CLAUDE.md's content, and a 404 for every other path.
+  const serve = (treeAnswer: string): void => {
+    mockExec.mockImplementation(((_cmd: string, args: readonly string[] = []) => {
+      const a = args.join(' ');
+      if (a.includes('/git/trees/')) return treeAnswer;
+      if (a.includes('/contents/CLAUDE.md?')) return Buffer.from('# rules\n', 'utf8').toString('base64');
+      throw Object.assign(new Error('gh failed'), { stderr: 'gh: Not Found (HTTP 404)' });
+    }) as unknown as typeof execFileSync);
+  };
+
+  const threadedReader = async () => {
+    resolveShas = true;
+    expect(await main(['review', 'https://github.com/o/r/pull/7'])).toBe(0);
+    const reader = mockRun.mock.calls[0][0].conventionReader;
+    expect(reader).toBeTruthy();
+    mockExec.mockClear();
+    return reader;
+  };
+
+  it('a miss, a directory and a listing are answered from the tree; only a file that exists is fetched', async () => {
+    const reader = await threadedReader();
+    serve(JSON.stringify({ entries: TREE, truncated: false }));
+
+    expect(await reader?.read('AGENTS.md')).toBeNull();
+    expect(await reader?.read('pkg/CLAUDE.md')).toBeNull();
+    expect(await reader?.read('docs')).toBeNull(); // a directory is not a file
+    expect(await reader?.read('vendor.md')).toBeNull(); // nor is a submodule
+    expect(await reader?.list('docs')).toEqual(['docs/a.md', 'docs/z.md']); // one level, *.md, tree order
+    expect(await reader?.list('./docs/')).toEqual(['docs/a.md', 'docs/z.md']);
+    expect(await reader?.list('docs/sub')).toEqual(['docs/sub/c.md']);
+    expect(await reader?.list('ai-spec')).toEqual([]);
+    expect(await reader?.list('CLAUDE.md')).toEqual([]); // a file lists nothing
+    expect(contentCalls()).toEqual([]);
+
+    expect(await reader?.read('CLAUDE.md')).toBe('# rules\n');
+
+    expect(treeCalls()).toHaveLength(1);
+    expect(treeCalls()[0]).toContain(`repos/o/r/git/trees/${BASE}?recursive=1`);
+    expect(contentCalls()).toHaveLength(1);
+    expect(contentCalls()[0]).toContain(`contents/CLAUDE.md?ref=${BASE}`);
+    expect(calls().some((u) => u.includes(HEAD))).toBe(false);
+  });
+
+  it.each([
+    ['truncated by GitHub', JSON.stringify({ entries: TREE, truncated: true }), 'truncated'],
+    ['not JSON', 'gh: something else', 'unreadable'],
+    ['an entry that is not a [type, path] pair', JSON.stringify({ entries: [['blob', 'CLAUDE.md'], ['blob']], truncated: false }), 'unreadable'],
+  ])('a tree that came back %s decides nothing: every path is probed, and it is said once', async (_name, answer, word) => {
+    const reader = await threadedReader();
+    serve(answer);
+
+    expect(await reader?.read('AGENTS.md')).toBeNull();
+    expect(await reader?.list('docs')).toEqual([]);
+    expect(await reader?.read('CLAUDE.md')).toBe('# rules\n');
+
+    expect(treeCalls()).toHaveLength(1); // asked once, not per probe
+    expect(contentCalls()).toHaveLength(3);
+    const notes = vi
+      .mocked(console.error)
+      .mock.calls.map((c) => String(c[0]))
+      .filter((s) => s.includes('the repo tree at'));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain(word);
+    expect(notes[0]).toContain('probing each candidate path');
+  });
+
+  it('a tree call that fails falls back to probing, under the reader\'s own once-per-message rule', async () => {
+    const reader = await threadedReader();
+    mockExec.mockImplementation(((_cmd: string, args: readonly string[] = []) => {
+      const a = args.join(' ');
+      if (a.includes('/git/trees/')) throw Object.assign(new Error('gh failed'), { stderr: 'gh: HTTP 502 — bad gateway' });
+      if (a.includes('/contents/CLAUDE.md?')) return Buffer.from('# rules\n', 'utf8').toString('base64');
+      throw Object.assign(new Error('gh failed'), { stderr: 'gh: Not Found (HTTP 404)' });
+    }) as unknown as typeof execFileSync);
+
+    expect(await reader?.read('AGENTS.md')).toBeNull();
+    expect(await reader?.read('CLAUDE.md')).toBe('# rules\n');
+
+    expect(treeCalls()).toHaveLength(1);
+    expect(contentCalls()).toHaveLength(2);
+    const probes = vi
+      .mocked(console.error)
+      .mock.calls.map((c) => String(c[0]))
+      .filter((s) => s.includes('conventions probe'));
+    expect(probes).toHaveLength(1);
+    expect(probes[0]).toContain('bad gateway');
+  });
+});
