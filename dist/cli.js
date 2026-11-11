@@ -717,13 +717,15 @@ function gitHasCommit(repoDir, sha) {
     return false;
   }
 }
+function repoTreePath(rel) {
+  const n = rel.replace(/^\.\//, "").replace(/\/+$/, "");
+  if (n === "" || n === ".") return "";
+  if (path2.isAbsolute(n) || n.split("/").some((seg) => seg === ".." || seg === "." || seg === "")) return null;
+  return n;
+}
 function gitConventionReader(repoDir, ref) {
   const dir = path2.resolve(repoDir);
-  const clean = (rel) => {
-    const n = rel.replace(/^\.\//, "").replace(/\/+$/, "");
-    if (!n || path2.isAbsolute(n) || n.split("/").some((seg) => seg === ".." || seg === "")) return null;
-    return n;
-  };
+  const clean = (rel) => repoTreePath(rel) || null;
   const MAX_BLOB = 16 * 1024 * 1024;
   return {
     async read(rel, maxBytes) {
@@ -15213,12 +15215,6 @@ function repoTreeIndex(entries) {
   }
   return { blobs, children };
 }
-function treePath(rel) {
-  const n = rel.replace(/^\.\//, "").replace(/\/+$/, "");
-  if (n === "" || n === ".") return "";
-  if (path26.isAbsolute(n) || n.split("/").some((seg) => seg === ".." || seg === "" || seg === ".")) return null;
-  return n;
-}
 function ghConventionReader(repoSlug, ref, cwd) {
   const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
   const encRef = encodeURIComponent(ref);
@@ -15268,7 +15264,7 @@ function ghConventionReader(repoSlug, ref, cwd) {
     async read(rel, maxBytes) {
       const index = treeIndex();
       if (index) {
-        const p = treePath(rel);
+        const p = repoTreePath(rel);
         if (p !== null && !index.blobs.has(p)) return null;
       }
       const cap4 = capture(
@@ -15299,7 +15295,7 @@ function ghConventionReader(repoSlug, ref, cwd) {
     async list(dirRel) {
       const index = treeIndex();
       if (index) {
-        const p = treePath(dirRel);
+        const p = repoTreePath(dirRel);
         if (p !== null) return (index.children.get(p) ?? []).filter((s) => s.endsWith(".md"));
       }
       const cap4 = capture(

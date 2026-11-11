@@ -15,6 +15,7 @@ import {
   gatherConventions,
   gitConventionReader,
   gitHasCommit,
+  repoTreePath,
 } from './core/conventions';
 import { isEntrypoint } from './core/entrypoint';
 import { evidenceRef, SEVERITY_LABEL, SEVERITY_ORDER } from './core/findings';
@@ -572,16 +573,6 @@ function repoTreeIndex(entries: [string, string][]): RepoTreeIndex {
   return { blobs, children };
 }
 
-// A repo-relative path as the tree spells it: no leading `./`, no trailing `/`. null for anything
-// the tree cannot be asked about (absolute, a `..` or empty segment) — the caller then asks the
-// API, exactly as before the index existed. '' is the repo root (a directory, never a file).
-function treePath(rel: string): string | null {
-  const n = rel.replace(/^\.\//, '').replace(/\/+$/, '');
-  if (n === '' || n === '.') return '';
-  if (path.isAbsolute(n) || n.split('/').some((seg) => seg === '..' || seg === '' || seg === '.')) return null;
-  return n;
-}
-
 // A gh-backed convention reader (the `--pr <url>` path) — reads repo-relative files
 // + lists dirs from the PR repo at a fixed ref via `gh api …/contents`. Mirrors the
 // dashboard's own gh reader, so both feed the SAME pure gatherConventions. Any gh
@@ -662,7 +653,8 @@ function ghConventionReader(
       // contents API's null without asking it.
       const index = treeIndex();
       if (index) {
-        const p = treePath(rel);
+        // A path the tree cannot be asked about (repoTreePath → null) goes to the API, as before.
+        const p = repoTreePath(rel);
         if (p !== null && !index.blobs.has(p)) return null;
       }
       // `.type=="file"` guard: the contents API returns an ARRAY for a directory (and an
@@ -699,7 +691,7 @@ function ghConventionReader(
       // The tree answers a listing whole: the entries directly under the dir, in tree order.
       const index = treeIndex();
       if (index) {
-        const p = treePath(dirRel);
+        const p = repoTreePath(dirRel);
         if (p !== null) return (index.children.get(p) ?? []).filter((s) => s.endsWith('.md'));
       }
       // A directory listing is an array; `.[].path` on a FILE (object) errors → non-zero

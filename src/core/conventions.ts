@@ -873,15 +873,24 @@ export function gitHasCommit(repoDir: string, sha: string): boolean {
   }
 }
 
+// A repo-relative path as a git tree spells it: no leading `./`, no trailing `/`. '' is the repo
+// root (a directory, never a file). null for anything a tree cannot be asked about: an absolute
+// path, or a `..`, `.` or empty segment. ONE normalizer for every reader that answers from a
+// tree (the local clone below, the gh reader's tree index in cli.ts), so the two can never come
+// to disagree about which path a candidate names.
+export function repoTreePath(rel: string): string | null {
+  const n = rel.replace(/^\.\//, '').replace(/\/+$/, '');
+  if (n === '' || n === '.') return '';
+  if (path.isAbsolute(n) || n.split('/').some((seg) => seg === '..' || seg === '.' || seg === '')) return null;
+  return n;
+}
+
 export function gitConventionReader(repoDir: string, ref: string): ConventionReader {
   const dir = path.resolve(repoDir);
   // A repo-relative path only: no absolute paths, no `..` — git would otherwise resolve
   // `ref:../x` relative to the tree root anyway, but the rule is explicit, not inherited.
-  const clean = (rel: string): string | null => {
-    const n = rel.replace(/^\.\//, '').replace(/\/+$/, '');
-    if (!n || path.isAbsolute(n) || n.split('/').some((seg) => seg === '..' || seg === '')) return null;
-    return n;
-  };
+  // The root itself is refused, as it always was here: no caller reads or lists it.
+  const clean = (rel: string): string | null => repoTreePath(rel) || null;
   // Blob sizes beyond this are not conventions docs; refusing them keeps the read bounded.
   const MAX_BLOB = 16 * 1024 * 1024;
   return {
