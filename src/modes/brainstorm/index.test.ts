@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
+import { CLAUDE_INACTIVITY_TIMEOUT_MS } from '../../core/claude-stream';
+import { CODEX_INACTIVITY_TIMEOUT_MS } from '../../reviewers/codex';
+import { GROK_INACTIVITY_TIMEOUT_MS } from '../../reviewers/grok';
+import { DEFAULT_VOICE_TIMEOUT_MS as CONSULT_VOICE_TIMEOUT_MS } from '../consult';
+
 import {
+  DEFAULT_VOICE_TIMEOUT_MS,
   fallbackSynthesis,
   pickSynthesizer,
   runBrainstormMode,
@@ -202,5 +208,16 @@ describe('fallbackSynthesis', () => {
     const s = fallbackSynthesis([]);
     expect(s.ranked).toEqual([]);
     expect(s.summary).toContain('No ideas');
+  });
+});
+
+// The default is a runaway backstop, as in the consult mode: a voice that goes silent is the
+// inactivity watchdog's to reclaim, and a deadline shorter than that kills honest work first.
+describe('runBrainstormMode — the default per-voice timeout is a backstop, not a deadline', () => {
+  it('outlives every inactivity watchdog, and is the consult mode\'s figure', () => {
+    expect(DEFAULT_VOICE_TIMEOUT_MS).toBeGreaterThan(
+      Math.max(CLAUDE_INACTIVITY_TIMEOUT_MS, CODEX_INACTIVITY_TIMEOUT_MS, GROK_INACTIVITY_TIMEOUT_MS)
+    );
+    expect(DEFAULT_VOICE_TIMEOUT_MS).toBe(CONSULT_VOICE_TIMEOUT_MS);
   });
 });

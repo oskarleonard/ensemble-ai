@@ -17,9 +17,11 @@ import {
 } from './types';
 import { assertRosterAdvisors, loadVoices, seatFailureMeta, VOICE_ADAPTERS, type VoiceRunResult } from './voices';
 
-// Default per-voice timeout for a brainstorm round (ideation is lighter than an
-// xhigh code audit; the CLI can override). The shared spawn watchdog enforces it.
-export const DEFAULT_VOICE_TIMEOUT_MS = 300_000; // 5 min
+// Default per-voice RUNAWAY BACKSTOP for a brainstorm round (the CLI can override). Not a
+// deadline: every voice streams, so a wedged one is reclaimed by its inactivity watchdog after
+// 10-15 minutes of silence. The old 5-minute default cut voices that were still working (see
+// the consult mode's twin constant); 30 min is the packet-seat backstop.
+export const DEFAULT_VOICE_TIMEOUT_MS = 1_800_000; // 30 min
 
 type Adapters = Record<
   VoiceId,
