@@ -212,6 +212,83 @@ describe('renderGatePrompt — the reference-not-found cause is taught ONLY on w
   });
 });
 
+// REACHABILITY: "who can get into this state" needs the callers, which only a tree-fed gate can
+// read. The rule is asymmetric: a named path or a doubt keeps the finding, and only a cited guard
+// that closes every path drops it, to a plain unverified the host never posts.
+describe('renderGatePrompt — the reachability check is taught ONLY on worktree evidence', () => {
+  const reviews = [review('codex', [f({ title: 'a finding' })])];
+  const { findings, injections } = prepareGateFindings(reviews, parsePacketHunks(DIFF));
+  // The clause is prose: its line breaks carry no meaning, so the tests read it as one line.
+  const flat = (evidence: 'packet' | 'worktree'): string =>
+    renderGatePrompt(findings, injections, evidence).replace(/\s+/g, ' ');
+
+  it('a worktree-fed gate asks who reaches the state, at this commit with the PR included', () => {
+    const prompt = flat('worktree');
+    expect(prompt).toContain('REACHABILITY (worktree evidence)');
+    expect(prompt).toContain('ask WHO gets there before you agree');
+    expect(prompt).toContain("AT THIS COMMIT, this PR's changes included");
+  });
+
+  it('doubt keeps the finding: an unsure gate passes it on this check', () => {
+    const prompt = flat('worktree');
+    expect(prompt).toContain('you are NOT SURE: the finding PASSES this check');
+    expect(prompt).toContain('never downgrade one because you did not find its path');
+  });
+
+  it('the tldr names an actor only when grounded, and otherwise states a condition', () => {
+    const prompt = flat('worktree');
+    expect(prompt).toContain('name the actor and the path only when you grounded them');
+    expect(prompt).toContain('otherwise state the trigger as a condition ("If …"), never a guessed actor');
+  });
+
+  it('a drop is a plain unverified with the unreachable: prefix and the closing guard cited', () => {
+    const prompt = flat('worktree');
+    expect(prompt).toContain('verdict "unverified" with a reason starting "unreachable:"');
+    expect(prompt).toContain('cites, as file:line, the guard that closes EVERY path');
+    expect(prompt).toContain('"I found no path" is not that proof');
+    expect(prompt).toContain('Use "unreachable:" only when the WHOLE claim is unreachable');
+  });
+
+  it('a guard must be enforced at run time: a type, today\'s callers, an unenforced order and a new guard close no path', () => {
+    const prompt = flat('worktree');
+    expect(prompt).toContain('A guard counts only if the code enforces the specific invariant that rules out the claimed failure on every path, including relevant concurrent interleavings');
+    expect(prompt).toContain('putting a check and a write in the same transaction, is not sufficient by itself');
+    expect(prompt).toContain('a static type where data comes in');
+    expect(prompt).toContain('the callers that exist today, when the function, route or topic is open to others');
+    expect(prompt).toContain('an order of writes that no lock, constraint or transaction enforces');
+    expect(prompt).toContain('a guard that is new, when rows or messages written before it can still be in that state');
+  });
+
+  it('a client that never sends it, and rarity, close no path', () => {
+    const prompt = flat('worktree');
+    expect(prompt).toContain('an older client build may send what the current one does not');
+    expect(prompt).toContain('how often it happens never changes the verdict');
+  });
+
+  it('every other rule keeps its own conditions and comes first, and the tree-grounding rule names the new route', () => {
+    const prompt = flat('worktree');
+    expect(prompt).toContain('Every other rule keeps its own conditions and comes first');
+    expect(prompt).toContain('stays "execution-decidable:"');
+    expect(prompt).toContain('stays "pre-existing:" under SCOPE');
+    expect(prompt).toContain('stays "premise-conflict:"');
+    expect(prompt).toContain('or an "unreachable:" reason (REACHABILITY below), which the host cannot verify');
+  });
+
+  it('a packet-fed gate cannot follow a caller out of its hunks: the clause never renders', () => {
+    const prompt = flat('packet');
+    expect(prompt).not.toContain('REACHABILITY');
+    expect(prompt).not.toContain('unreachable:');
+  });
+
+  it('the grounding sentence no longer denies a worktree gate the tree, and a packet gate keeps the hunk alone', () => {
+    const wt = flat('worktree');
+    expect(wt).toContain('Ground findings in their cited hunks and the checked-out tree, as specified under GROUND IN THE TREE');
+    expect(wt).toContain('A "false" verdict still requires an exact refuting line from that finding\'s own cited hunk');
+    expect(wt).not.toContain('Your only grounding authority is the cited hunk');
+    expect(flat('packet')).toContain('Your only grounding authority is the cited hunk shown for that finding.');
+  });
+});
+
 // PREMISE PROVENANCE: testimony-vs-fact is a WEIGHING rule, so it is taught on every evidence
 // class (a comment is quotable inside a hunk or a finding body either way). The contract-artifact
 // CONFLICT check, by contrast, requires opening files the packet does not carry — taught, like
