@@ -251,7 +251,8 @@ describe('renderGatePrompt — the reachability check is taught ONLY on worktree
 
   it('a guard must be enforced at run time: a type, today\'s callers, an unenforced order and a new guard close no path', () => {
     const prompt = flat('worktree');
-    expect(prompt).toContain('A guard counts only if the code ENFORCES it at run time on every path');
+    expect(prompt).toContain('A guard counts only if the code enforces the specific invariant that rules out the claimed failure on every path, including relevant concurrent interleavings');
+    expect(prompt).toContain('putting a check and a write in the same transaction, is not sufficient by itself');
     expect(prompt).toContain('a static type where data comes in');
     expect(prompt).toContain('the callers that exist today, when the function, route or topic is open to others');
     expect(prompt).toContain('an order of writes that no lock, constraint or transaction enforces');
@@ -277,6 +278,14 @@ describe('renderGatePrompt — the reachability check is taught ONLY on worktree
     const prompt = flat('packet');
     expect(prompt).not.toContain('REACHABILITY');
     expect(prompt).not.toContain('unreachable:');
+  });
+
+  it('the grounding sentence no longer denies a worktree gate the tree, and a packet gate keeps the hunk alone', () => {
+    const wt = flat('worktree');
+    expect(wt).toContain('Ground findings in their cited hunks and the checked-out tree, as specified under GROUND IN THE TREE');
+    expect(wt).toContain('A "false" verdict still requires an exact refuting line from that finding\'s own cited hunk');
+    expect(wt).not.toContain('Your only grounding authority is the cited hunk');
+    expect(flat('packet')).toContain('Your only grounding authority is the cited hunk shown for that finding.');
   });
 });
 
