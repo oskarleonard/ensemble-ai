@@ -197,6 +197,36 @@ const REFERENCE_NOT_FOUND_CLAUSE = `
   "premise-conflict:" naming BOTH sources, so a human adjudicates which one is stale — never
   side with prose over a contract artifact.`;
 
+// REACHABILITY, taught ONLY on worktree evidence (2026-11-24). A reviewer reasons from the diff and
+// often describes a state no actor can produce (a guard in every caller, a constraint, a write that
+// always runs first), and a gate that grounds the CLAIM, "the code misbehaves in that state",
+// confirms it without asking who is ever in that state. A packet gate cannot follow a caller out of
+// its hunk window, so it is not asked. ASYMMETRIC on purpose: naming a path is cheap and reliable,
+// proving there is none is not (the tree holds no production data, no older client build, no
+// infrastructure). So a drop needs the closing guard cited, and doubt KEEPS the finding.
+// Prompt-only: the verdict is a plain "unverified", which never posts; the reason prefix is for
+// whoever reads the trail; "execution-decidable:" comes first, so the settler still runs what can
+// be run.
+const REACHABILITY_CLAUSE = `
+- REACHABILITY (worktree evidence): for a finding about an edge case (a state, an input, an
+  ordering or a timing the reviewer says goes wrong), ask WHO gets there before you agree. Name
+  the actor (a person in a screen, any caller the endpoint accepts, a job, a consumer, a
+  migration, rows already stored) and the path through the code AT THIS COMMIT, this PR's
+  changes included, that puts them in that state.
+  · You can name an actor and a path, or you are NOT SURE: the finding PASSES this check, and
+    you judge it as usual. Doubt keeps a finding; never downgrade one because you did not find
+    its path. On the "agree" or "partial", the "tldr" says who hits it and how they get there.
+  · You can show that NOBODY gets there: verdict "unverified" with a reason starting
+    "unreachable:" that cites, as file:line, the guard that closes EVERY path (a check in each
+    caller, a constraint, a type, a write that always runs first). "I found no path" is not
+    that proof.
+  These do NOT close a path: "the UI never sends it" (the endpoint takes any caller it
+  authorises, and an older client build may send what the current one does not), "no test does
+  it", and "it would be rare". Rare is still reachable: how often it happens never changes the
+  verdict. A finding that turns on runtime behavior stays "execution-decidable:", and one this
+  PR did not cause stays "pre-existing:"; both come before "unreachable:". Holistic and product
+  findings are not judged by this clause.`;
+
 // Taught ONLY when the holistic lens actually produced findings this run — so a lens-off run's
 // prompt is byte-identical to the pre-lens one. Every clause here is MECHANIZED by the host in
 // holistic-gate.ts: the two sites are re-read out of the tree at headSha, the conventions citation
@@ -328,7 +358,7 @@ ${gateEvidence === 'worktree' ? `- "dependsOn" (agree/partial on a cite whose fi
   state what THIS finding claims that the primary's body does NOT — the host threads that claim onto
   the primary for the human, so a sharper framing (e.g. one reviewer names the direction that FAILS,
   the other names the direction that wrongly PASSES) is never lost to dedup.${
-    gateEvidence === 'worktree' ? WORKTREE_GROUNDING_CLAUSE + SCOPE_CLAUSE + strippedPathsClause(conventionsFile) + REFERENCE_NOT_FOUND_CLAUSE : ''
+    gateEvidence === 'worktree' ? WORKTREE_GROUNDING_CLAUSE + SCOPE_CLAUSE + strippedPathsClause(conventionsFile) + REFERENCE_NOT_FOUND_CLAUSE + REACHABILITY_CLAUSE : ''
   }${hasHolistic ? holisticClause : ''}${hasProduct ? productClause : ''}`;
 
 // ── The PREMISE PASS (spec 2026-09-09-review-premise-pass §4, opt-in --premise) ─────────

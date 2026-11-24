@@ -10180,6 +10180,25 @@ var REFERENCE_NOT_FOUND_CLAUSE = `
   artifact, the repo disagrees with itself: verdict "unverified" with a reason starting
   "premise-conflict:" naming BOTH sources, so a human adjudicates which one is stale \u2014 never
   side with prose over a contract artifact.`;
+var REACHABILITY_CLAUSE = `
+- REACHABILITY (worktree evidence): for a finding about an edge case (a state, an input, an
+  ordering or a timing the reviewer says goes wrong), ask WHO gets there before you agree. Name
+  the actor (a person in a screen, any caller the endpoint accepts, a job, a consumer, a
+  migration, rows already stored) and the path through the code AT THIS COMMIT, this PR's
+  changes included, that puts them in that state.
+  \xB7 You can name an actor and a path, or you are NOT SURE: the finding PASSES this check, and
+    you judge it as usual. Doubt keeps a finding; never downgrade one because you did not find
+    its path. On the "agree" or "partial", the "tldr" says who hits it and how they get there.
+  \xB7 You can show that NOBODY gets there: verdict "unverified" with a reason starting
+    "unreachable:" that cites, as file:line, the guard that closes EVERY path (a check in each
+    caller, a constraint, a type, a write that always runs first). "I found no path" is not
+    that proof.
+  These do NOT close a path: "the UI never sends it" (the endpoint takes any caller it
+  authorises, and an older client build may send what the current one does not), "no test does
+  it", and "it would be rare". Rare is still reachable: how often it happens never changes the
+  verdict. A finding that turns on runtime behavior stays "execution-decidable:", and one this
+  PR did not cause stays "pre-existing:"; both come before "unreachable:". Holistic and product
+  findings are not judged by this clause.`;
 var holisticClause = `
 - Holistic-lens findings (findingIds beginning \`${HOLISTIC_SEAT_ID}#\`) are ARCHITECTURE claims from
   ONE seat that read the WHOLE project \u2014 not the diff. They post ONLY on "agree", and an "agree"
@@ -10294,7 +10313,7 @@ ${gateEvidence === "worktree" ? `- "dependsOn" (agree/partial on a cite whose fi
   shown), set it to that findingId instead of merely saying so in prose. Your "reason" must still
   state what THIS finding claims that the primary's body does NOT \u2014 the host threads that claim onto
   the primary for the human, so a sharper framing (e.g. one reviewer names the direction that FAILS,
-  the other names the direction that wrongly PASSES) is never lost to dedup.${gateEvidence === "worktree" ? WORKTREE_GROUNDING_CLAUSE + SCOPE_CLAUSE + strippedPathsClause(conventionsFile) + REFERENCE_NOT_FOUND_CLAUSE : ""}${hasHolistic ? holisticClause : ""}${hasProduct ? productClause : ""}`;
+  the other names the direction that wrongly PASSES) is never lost to dedup.${gateEvidence === "worktree" ? WORKTREE_GROUNDING_CLAUSE + SCOPE_CLAUSE + strippedPathsClause(conventionsFile) + REFERENCE_NOT_FOUND_CLAUSE + REACHABILITY_CLAUSE : ""}${hasHolistic ? holisticClause : ""}${hasProduct ? productClause : ""}`;
 function premiseClusters(findings) {
   const eligible = findings.filter(
     (f) => (

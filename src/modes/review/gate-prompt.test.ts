@@ -212,6 +212,47 @@ describe('renderGatePrompt — the reference-not-found cause is taught ONLY on w
   });
 });
 
+// REACHABILITY: "who can get into this state" needs the callers, which only a tree-fed gate can
+// read. The rule is asymmetric: a named path or a doubt keeps the finding, and only a cited guard
+// that closes every path drops it, to a plain unverified the host never posts.
+describe('renderGatePrompt — the reachability check is taught ONLY on worktree evidence', () => {
+  const reviews = [review('codex', [f({ title: 'a finding' })])];
+  const { findings, injections } = prepareGateFindings(reviews, parsePacketHunks(DIFF));
+
+  it('a worktree-fed gate asks who reaches the state, at this commit with the PR included', () => {
+    const prompt = renderGatePrompt(findings, injections, 'worktree');
+    expect(prompt).toContain('REACHABILITY (worktree evidence)');
+    expect(prompt).toMatch(/ask WHO gets there before you agree/);
+    expect(prompt).toMatch(/AT THIS COMMIT, this PR's\s+changes included/);
+  });
+
+  it('doubt keeps the finding: an unsure gate passes it on this check', () => {
+    const prompt = renderGatePrompt(findings, injections, 'worktree');
+    expect(prompt).toMatch(/you are NOT SURE: the finding PASSES this check/);
+    expect(prompt).toMatch(/never downgrade one because you did not find\s+its path/);
+  });
+
+  it('a drop is a plain unverified with the unreachable: prefix and the closing guard cited', () => {
+    const prompt = renderGatePrompt(findings, injections, 'worktree');
+    expect(prompt).toMatch(/verdict "unverified" with a reason starting\s+"unreachable:"/);
+    expect(prompt).toMatch(/cites, as file:line, the guard that closes EVERY path/);
+    expect(prompt).toMatch(/"I found no path" is not\s+that proof/);
+  });
+
+  it('a client that never sends it, and rarity, close no path; runnable and pre-existing findings keep their own prefix', () => {
+    const prompt = renderGatePrompt(findings, injections, 'worktree');
+    expect(prompt).toMatch(/an older client build may send what the current one does not/);
+    expect(prompt).toMatch(/how often it happens never changes the\s+verdict/);
+    expect(prompt).toMatch(/both come before "unreachable:"/);
+  });
+
+  it('a packet-fed gate cannot follow a caller out of its hunks: the clause never renders', () => {
+    const prompt = renderGatePrompt(findings, injections, 'packet');
+    expect(prompt).not.toContain('REACHABILITY');
+    expect(prompt).not.toContain('unreachable:');
+  });
+});
+
 // PREMISE PROVENANCE: testimony-vs-fact is a WEIGHING rule, so it is taught on every evidence
 // class (a comment is quotable inside a hunk or a finding body either way). The contract-artifact
 // CONFLICT check, by contrast, requires opening files the packet does not carry — taught, like
