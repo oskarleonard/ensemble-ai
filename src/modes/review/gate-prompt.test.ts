@@ -218,36 +218,63 @@ describe('renderGatePrompt — the reference-not-found cause is taught ONLY on w
 describe('renderGatePrompt — the reachability check is taught ONLY on worktree evidence', () => {
   const reviews = [review('codex', [f({ title: 'a finding' })])];
   const { findings, injections } = prepareGateFindings(reviews, parsePacketHunks(DIFF));
+  // The clause is prose: its line breaks carry no meaning, so the tests read it as one line.
+  const flat = (evidence: 'packet' | 'worktree'): string =>
+    renderGatePrompt(findings, injections, evidence).replace(/\s+/g, ' ');
 
   it('a worktree-fed gate asks who reaches the state, at this commit with the PR included', () => {
-    const prompt = renderGatePrompt(findings, injections, 'worktree');
+    const prompt = flat('worktree');
     expect(prompt).toContain('REACHABILITY (worktree evidence)');
-    expect(prompt).toMatch(/ask WHO gets there before you agree/);
-    expect(prompt).toMatch(/AT THIS COMMIT, this PR's\s+changes included/);
+    expect(prompt).toContain('ask WHO gets there before you agree');
+    expect(prompt).toContain("AT THIS COMMIT, this PR's changes included");
   });
 
   it('doubt keeps the finding: an unsure gate passes it on this check', () => {
-    const prompt = renderGatePrompt(findings, injections, 'worktree');
-    expect(prompt).toMatch(/you are NOT SURE: the finding PASSES this check/);
-    expect(prompt).toMatch(/never downgrade one because you did not find\s+its path/);
+    const prompt = flat('worktree');
+    expect(prompt).toContain('you are NOT SURE: the finding PASSES this check');
+    expect(prompt).toContain('never downgrade one because you did not find its path');
+  });
+
+  it('the tldr names an actor only when grounded, and otherwise states a condition', () => {
+    const prompt = flat('worktree');
+    expect(prompt).toContain('name the actor and the path only when you grounded them');
+    expect(prompt).toContain('otherwise state the trigger as a condition ("If …"), never a guessed actor');
   });
 
   it('a drop is a plain unverified with the unreachable: prefix and the closing guard cited', () => {
-    const prompt = renderGatePrompt(findings, injections, 'worktree');
-    expect(prompt).toMatch(/verdict "unverified" with a reason starting\s+"unreachable:"/);
-    expect(prompt).toMatch(/cites, as file:line, the guard that closes EVERY path/);
-    expect(prompt).toMatch(/"I found no path" is not\s+that proof/);
+    const prompt = flat('worktree');
+    expect(prompt).toContain('verdict "unverified" with a reason starting "unreachable:"');
+    expect(prompt).toContain('cites, as file:line, the guard that closes EVERY path');
+    expect(prompt).toContain('"I found no path" is not that proof');
+    expect(prompt).toContain('Use "unreachable:" only when the WHOLE claim is unreachable');
   });
 
-  it('a client that never sends it, and rarity, close no path; runnable and pre-existing findings keep their own prefix', () => {
-    const prompt = renderGatePrompt(findings, injections, 'worktree');
-    expect(prompt).toMatch(/an older client build may send what the current one does not/);
-    expect(prompt).toMatch(/how often it happens never changes the\s+verdict/);
-    expect(prompt).toMatch(/both come before "unreachable:"/);
+  it('a guard must be enforced at run time: a type, today\'s callers, an unenforced order and a new guard close no path', () => {
+    const prompt = flat('worktree');
+    expect(prompt).toContain('A guard counts only if the code ENFORCES it at run time on every path');
+    expect(prompt).toContain('a static type where data comes in');
+    expect(prompt).toContain('the callers that exist today, when the function, route or topic is open to others');
+    expect(prompt).toContain('an order of writes that no lock, constraint or transaction enforces');
+    expect(prompt).toContain('a guard that is new, when rows or messages written before it can still be in that state');
+  });
+
+  it('a client that never sends it, and rarity, close no path', () => {
+    const prompt = flat('worktree');
+    expect(prompt).toContain('an older client build may send what the current one does not');
+    expect(prompt).toContain('how often it happens never changes the verdict');
+  });
+
+  it('every other rule keeps its own conditions and comes first, and the tree-grounding rule names the new route', () => {
+    const prompt = flat('worktree');
+    expect(prompt).toContain('Every other rule keeps its own conditions and comes first');
+    expect(prompt).toContain('stays "execution-decidable:"');
+    expect(prompt).toContain('stays "pre-existing:" under SCOPE');
+    expect(prompt).toContain('stays "premise-conflict:"');
+    expect(prompt).toContain('or an "unreachable:" reason (REACHABILITY below), which the host cannot verify');
   });
 
   it('a packet-fed gate cannot follow a caller out of its hunks: the clause never renders', () => {
-    const prompt = renderGatePrompt(findings, injections, 'packet');
+    const prompt = flat('packet');
     expect(prompt).not.toContain('REACHABILITY');
     expect(prompt).not.toContain('unreachable:');
   });
